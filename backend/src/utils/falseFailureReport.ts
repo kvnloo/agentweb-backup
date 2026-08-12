@@ -42,6 +42,12 @@ export interface FalseFailureLedgerEntry {
   name?: string;
   result?: any;
   error?: any;
+  /**
+   * Set by toolDispatch when an identical call was collapsed onto an earlier one.
+   * Neither success nor failure — the call never ran, so it must never be counted
+   * as work that happened (ENG-1054).
+   */
+  duplicateOf?: string;
 }
 
 /**
@@ -78,6 +84,27 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
   'send_email_to_lead',
   'send_email_from_sender',
   'send_dm',
+]);
+
+/**
+ * ENG-1054 (reopened): CRM RECORD writes — irreversible primary work that creates
+ * rows the user can see, and that a re-run duplicates.
+ *
+ * Deliberately a SEPARATE set from `CONFIRMED_PUBLISH_TOOLS` rather than an addition
+ * to it, because that set no longer only annotates a message: `collectConfirmedPublishActions`
+ * also decides whether an abandoned SCHEDULED run may be requeued (the zero-output
+ * path in agentModeController). Anything added there stops a restart. A lead import
+ * is worth correcting the transcript for, but it is not a production publish, and
+ * silently disabling a schedule's auto-recovery is a worse failure than the duplicate
+ * leads it would prevent. So these tools feed the message-annotation entry points
+ * only — `collectConfirmedPublishActions` never reports them.
+ *
+ * Read-only CRM lookups (get_lead_lists, search_leads, get_lead_details) are absent
+ * for the same reason they are absent above: this is about work that HAPPENED.
+ */
+export const CONFIRMED_RECORD_WRITE_TOOLS: ReadonlySet<string> = new Set<string>([
+  'add_leads_to_list',
+  'create_lead_list',
 ]);
 
 /**
@@ -363,6 +390,191 @@ export function collectConfirmedPublishActions(
   return out;
 }
 
+/** What a run is confirmed to have written to the CRM, in records — not in calls. */
+export interface ConfirmedRecordWrites {
+  /** Leads actually written, summed from the batch results. 0 when unknown. */
+  leadsWritten: number;
+  /** Successful `add_leads_to_list` calls — a BATCH count. Never a record count. */
+  calls: number;
+  /** Whether this run created a lead list. */
+  listCreated: boolean;
+  /** Plain-language labels, safe to drop into prose. */
+  actions: string[];
+}
+
+const EMPTY_RECORD_WRITES: ConfirmedRecordWrites = {
+  leadsWritten: 0,
+  calls: 0,
+  listCreated: false,
+  actions: [],
+};
+
+/**
+ * An entry that a re-run would duplicate: it names a record-write tool, it did not
+ * error, and it is not one of the two ledger entries that record a call that never
+ * actually ran — a collapsed duplicate (`duplicateOf`, toolDispatch) or a call
+ * deferred by the media budget (`result.deferred`). Counting either as written work
+ * is exactly the false success this module exists to prevent.
+ */
+function isConfirmedRecordWrite(entry: FalseFailureLedgerEntry | null | undefined): boolean {
+  if (!entry || entry.error !== undefined) return false;
+  if (!entry.name || !CONFIRMED_RECORD_WRITE_TOOLS.has(entry.name)) return false;
+  if (entry.duplicateOf !== undefined) return false;
+  const r = entry.result;
+  if (r && typeof r === 'object') {
+    if ((r as any).deferred === true) return false;
+    if ((r as any).success === false) return false;
+  }
+  return true;
+}
+
+/**
+ * How many leads a single `add_leads_to_list` result says it wrote.
+ *
+ * `null` means UNKNOWN, which is NOT zero. On the throw path the ledger is rebuilt
+ * from the session's success histogram and carries names only, so an unknown must
+ * degrade to an unnumbered statement rather than to "0 leads" — announcing zero
+ * after a successful import is the same lie in the other direction.
+ */
+function leadsWrittenBy(entry: FalseFailureLedgerEntry): number | null {
+  const r = entry.result;
+  if (!r || typeof r !== 'object') return null;
+  const success = (r as any).successCount;
+  if (typeof success === 'number' && Number.isFinite(success)) return Math.max(0, success);
+  const nw = (r as any).newCount;
+  const mg = (r as any).mergedCount;
+  if (typeof nw === 'number' || typeof mg === 'number') {
+    return Math.max(0, (typeof nw === 'number' ? nw : 0) + (typeof mg === 'number' ? mg : 0));
+  }
+  return null;
+}
+
+/**
+ * The CRM records this run is confirmed to have written, summed ACROSS batches.
+ *
+ * The distinction this function exists to hold is `leadsWritten` vs `calls`. The
+ * reopened production session imported 75 leads as three batches of 25 and told the
+ * user it had "successfully added the 3 leads" — a call count published as a record
+ * count. Every label built here states records; the call count is exposed separately
+ * and is never rendered as leads.
+ */
+export function collectConfirmedRecordWrites(
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): ConfirmedRecordWrites {
+  if (!Array.isArray(toolCalls)) return { ...EMPTY_RECORD_WRITES };
+
+  let leadsWritten = 0;
+  let calls = 0;
+  let countsKnown = false;
+  let listCreated = false;
+
+  for (const entry of toolCalls) {
+    if (!isConfirmedRecordWrite(entry)) continue;
+    if (entry.name === 'create_lead_list') {
+      listCreated = true;
+      continue;
+    }
+    const written = leadsWrittenBy(entry);
+    if (written === null) {
+      // Unknown size, but the call succeeded — it still counts as a batch that ran.
+      calls += 1;
+      continue;
+    }
+    if (written === 0) continue; // A batch that wrote nothing is not written work.
+    countsKnown = true;
+    leadsWritten += written;
+    calls += 1;
+  }
+
+  const actions: string[] = [];
+  if (listCreated) actions.push('created a new lead list');
+  if (countsKnown && leadsWritten > 0) {
+    actions.push(`added ${leadsWritten} lead${leadsWritten === 1 ? '' : 's'} to your CRM list`);
+  } else if (calls > 0) {
+    actions.push('added leads to your CRM list');
+  }
+
+  return { leadsWritten: countsKnown ? leadsWritten : 0, calls, listCreated, actions };
+}
+
+/** Publish/deploy labels plus CRM record-write labels — the full confirmed-work list. */
+function collectConfirmedWorkActions(
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string[] {
+  return [
+    ...collectConfirmedPublishActions(toolCalls),
+    ...collectConfirmedRecordWrites(toolCalls).actions,
+  ];
+}
+
+/** Marker on the appended count reconciliation — keeps a second pass idempotent. */
+const COUNT_CORRECTION_MARKER =
+  '⚠️ Correction: the run log is authoritative on how many records were written';
+
+/**
+ * A claim about records WRITTEN. Scoped to write verbs on purpose: "your list now
+ * holds 320 leads" and "your CSV contained 97 rows" are statements about state and
+ * input, not about what this run wrote, and correcting them would be noise.
+ *
+ * The trailing lookahead keeps "created 3 lead lists" out — that is a list count,
+ * and `lead` would otherwise match inside it.
+ */
+const RECORDS_WRITTEN_CLAIM_RE =
+  /\b(?:added|imported|created|inserted|uploaded|synced|wrote|saved)\b[^.!?\n]{0,60}?\b(?:leads?|prospects?|contacts?|rows?)\b(?!\s+lists?\b)/gi;
+
+/**
+ * Append the ledger's record count when the closing message states a different one.
+ *
+ * The complement to `reconcileFalseFailureReport`: that guard catches a close which
+ * DENIES confirmed work, this one catches a close which MISCOUNTS it. Both are
+ * append-only, so neither can rewrite the model into a claim the ledger does not hold.
+ *
+ * Silent unless the ledger holds a real, counted total — a name-only ledger (the
+ * throw path) knows the import happened but not its size, and inventing a number
+ * there would be the very failure being fixed.
+ *
+ * Silent, too, whenever the true total appears ANYWHERE inside a written-count
+ * claim. "Imported 75 of 97 leads" is accurate even though the noun-adjacent number
+ * is 97; only a claim in which the truth is absent is a contradiction.
+ */
+export function reconcileRecordCountReport(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(COUNT_CORRECTION_MARKER)) return content;
+
+  const writes = collectConfirmedRecordWrites(toolCalls);
+  if (writes.leadsWritten <= 0) return content;
+
+  const re = new RegExp(RECORDS_WRITTEN_CLAIM_RE.source, RECORDS_WRITTEN_CLAIM_RE.flags);
+  let sawStatedCount = false;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    if (match[0].length === 0) {
+      re.lastIndex += 1;
+      continue;
+    }
+    const numbers = (match[0].match(/\d[\d,]*/g) || [])
+      .map((n) => Number(n.replace(/,/g, '')))
+      .filter((n) => Number.isFinite(n));
+    if (numbers.length === 0) continue;
+    // The truth is stated somewhere in this claim — nothing to correct.
+    if (numbers.includes(writes.leadsWritten)) return content;
+    sawStatedCount = true;
+  }
+  if (!sawStatedCount) return content;
+
+  const total = writes.leadsWritten;
+  return (
+    `${content.replace(/\s+$/, '')}\n\n`
+    + `${COUNT_CORRECTION_MARKER}: ${total} lead${total === 1 ? '' : 's'} were added to your CRM list`
+    + ` across ${writes.calls} batch call${writes.calls === 1 ? '' : 's'}.`
+    + ' A different number above is not the number of leads written, so please do NOT'
+    + ' re-import the leads that already landed.'
+  );
+}
+
 /** The visible correction appended to a false-failure closing narrative. */
 export function buildFalseFailureCorrection(actions: string[], bookkeepingFailed: boolean): string {
   return (
@@ -406,7 +618,7 @@ export function appendConfirmedPublishNotice(
   if (typeof content !== 'string' || content.trim().length === 0) return content;
   if (content.includes(CORRECTION_MARKER)) return content;
 
-  const actions = collectConfirmedPublishActions(toolCalls);
+  const actions = collectConfirmedWorkActions(toolCalls);
   if (actions.length === 0) return content;
 
   return `${content.replace(/\s+$/, '')}\n\n${buildConfirmedWorkNotice(actions)}`;
@@ -426,7 +638,7 @@ export function reconcileFalseFailureReport(
   if (content.includes(CORRECTION_MARKER)) return content;
   if (!assertsUnsavedInterruption(content)) return content;
 
-  const actions = collectConfirmedPublishActions(toolCalls);
+  const actions = collectConfirmedWorkActions(toolCalls);
   if (actions.length === 0) return content;
 
   const bookkeepingFailed = Array.isArray(toolCalls)
