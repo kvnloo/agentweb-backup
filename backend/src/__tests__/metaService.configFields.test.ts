@@ -212,4 +212,24 @@ describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
     ).rejects.toThrow(/Unsupported campaign field\(s\): not_a_real_field/);
     expect(getCampaigns).not.toHaveBeenCalled();
   });
+
+  it('CAMPAIGN LIST treats an empty fields selection as the default boundary', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token, { fields: ' , ' });
+
+    expect(getCampaigns).toHaveBeenCalledWith(expect.arrayContaining(['spend_cap', 'budget_remaining']));
+  });
+
+  it('CAMPAIGN LIST propagates Graph errors with structured context', async () => {
+    const graphError = Object.assign(new Error('Graph unavailable'), { code: 2 });
+    const getCampaigns = jest.fn().mockRejectedValue(graphError);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await expect(service.listCampaigns(accountId, token)).rejects.toMatchObject({
+      message: 'Graph unavailable',
+      structuredError: expect.objectContaining({ classification: 'RETRYABLE_ERROR', code: 2 }),
+    });
+  });
 });
