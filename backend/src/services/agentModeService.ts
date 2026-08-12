@@ -5871,6 +5871,22 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1133: keep the import ledger out of the default "store {}" fallback.
+    // The turn that truncates is the turn that cannot report — the resume has to
+    // happen on the NEXT turn, which reads this stored result. Reduced to {} it
+    // had nothing to resume from, which is how a 97-row import that stopped at
+    // 75 ended in "please retry the request". The bulky `importedIdentifiers`
+    // echo is dropped (the model already saw it in the tool message); only the
+    // counts and the rows still owed are kept.
+    if (toolName === 'add_leads_to_list') {
+      const keep = ['success', 'complete', 'resumable', 'attempted', 'reconciliation', 'unimportedRows', 'unimportedRowsTruncated'];
+      const minimal: Record<string, any> = {};
+      for (const field of keep) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
