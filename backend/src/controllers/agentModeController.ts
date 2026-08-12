@@ -58,6 +58,12 @@ import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
 import {
+  SCHEDULE_ITEM_BUDGET_BYTES,
+  estimateDynamoItemBytes,
+  isDynamoItemSizeError,
+  trimListToItemBudget,
+} from '../utils/dynamoItemBudget';
+import {
   getAllowedSkills,
   isSubscriptionFeatureEnabled,
   type SubscriptionFeatureId,
@@ -7873,6 +7879,36 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
+      // ENG-1048: DynamoDB caps an item at 400KB, and a schedule row grows without
+      // bound along two axes — promptRevisions (a full prompt snapshot per edit) and
+      // runResults. A schedule with a ~35k-character prompt drifts into the ceiling,
+      // after which EVERY write is rejected and the prompt can never be updated
+      // again (the reported row sat 1KB under the limit with 334KB of revision
+      // history, so even a length-trimmed prompt still failed). Budget the projected
+      // item and shed the oldest history rather than failing the save.
+      const projectedItem: Record<string, any> = { ...existingSchedule, ...updates };
+      const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
+        if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+        const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
+        if (list.length === 0) return;
+        const { kept, dropped } = trimListToItemBudget(projectedItem, listKey, list);
+        if (dropped === 0) return;
+        console.warn(
+          `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
+        );
+        updates[listKey] = kept;
+        projectedItem[listKey] = kept;
+      };
+      // Revision history first: it is pure undo state. Run history is only shed once
+      // revisions are exhausted, because it feeds the run-health summary.
+      shedOldest('promptRevisions');
+      shedOldest('runResults');
+      if (estimateDynamoItemBytes(projectedItem) > SCHEDULE_ITEM_BUDGET_BYTES) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save (about ${Math.round(estimateDynamoItemBytes(projectedItem) / 1024)}KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
+      }
+
       await scheduleDb.updateSchedule(scheduleId, updates);
 
       res.json({
@@ -7881,6 +7917,13 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Update scheduled chat error:', error);
+      // ENG-1048: an item-size rejection is a client-fixable condition, not a
+      // server fault — say so instead of returning an opaque, non-retryable 500.
+      if (isDynamoItemSizeError(error)) {
+        return res.status(400).json({
+          error: "Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. Shorten the starting message and try again.",
+        });
+      }
       res.status(500).json({ error: 'Failed to update scheduled chat' });
     }
   },

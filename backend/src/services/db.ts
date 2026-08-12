@@ -13,6 +13,7 @@ import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -2990,6 +2991,42 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+/**
+ * ENG-1048: `addRunResult` appends with `list_append`, which cannot shed anything,
+ * so once a schedule row reaches DynamoDB's 400KB item limit every subsequent run
+ * silently fails to record its result. Re-read the row, drop the oldest runs until
+ * the item fits, and write the trimmed history back. Returns null when even the
+ * incoming result cannot fit, so the caller surfaces the original error.
+ */
+const appendRunResultWithinBudget = async (scheduleId: string, runResult: any) => {
+  const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+  const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
+  if (!existing) return null;
+
+  const history = Array.isArray(existing.runResults) ? existing.runResults : [];
+  const appended = [...history, runResult];
+  const { kept, dropped } = trimListToItemBudget(
+    { ...existing, runResults: appended },
+    'runResults',
+    appended,
+  );
+  if (kept.length === 0) return null;
+
+  console.warn(
+    `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropped the ${dropped} oldest of ${appended.length} run results to record this run`
+  );
+
+  const result = await dynamodb.update({
+    TableName: tableName,
+    Key: { scheduleId },
+    UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+    ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+    ExpressionAttributeValues: { ':runResults': kept, ':updatedAt': new Date().toISOString() },
+    ReturnValues: 'ALL_NEW',
+  }).promise();
+  return result.Attributes;
+};
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3173,6 +3210,11 @@ export const scheduleDb = {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
+      // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry once.
+      if (isDynamoItemSizeError(error)) {
+        const healed = await appendRunResultWithinBudget(scheduleId, runResult);
+        if (healed) return healed;
+      }
       handleDynamoDbError(error, "addRunResult");
       throw error;
     }
