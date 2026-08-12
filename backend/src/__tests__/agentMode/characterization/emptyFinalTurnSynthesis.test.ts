@@ -11,6 +11,11 @@
  * replace-on-nonempty, so it still held the stale narration — the empty-synthesis
  * nudge never fired and the run shipped the narration as if it were the report.
  *
+ * The placeholder half is now blanked upstream by ENG-1054's `isUnusableSynthesis`
+ * (whose HISTORY_ECHO_PREFIX covers this exact string), so this file keeps it as a
+ * COMPOSED regression: blanked turn -> nudge -> real answer. The plain-empty half is
+ * covered by nothing else, and is what `currentTurnText` exists for.
+ *
  * Only `callLLM` / leaf `executeTool` are scripted; the real loop drives the real
  * termination ladder.
  */
@@ -110,7 +115,10 @@ describe('ENG-946 — the terminating turn, not the accumulator, decides whether
       { content: REPORT },
     ]);
 
-    expect(result.content).toBe(REPORT);
+    // `toContain`, not `toBe`: a run that recovers after a discarded synthesis also
+    // gets ENG-1054's executed-action ledger appended. What matters here is that the
+    // real report is delivered and the placeholder never reaches the user.
+    expect(result.content).toContain(REPORT);
     expect(result.content).not.toContain('Previously called');
   });
 

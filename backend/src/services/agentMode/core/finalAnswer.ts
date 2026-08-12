@@ -14,7 +14,7 @@
  * whole purpose was to speak to the user.
  */
 
-import { isHistoryDegradationEcho } from './geminiNativeClient';
+import { isUnusableSynthesis } from './synthesisResidue';
 
 /** Flatten OpenAI/Claude-shaped message content into plain text. */
 function messageText(content: any): string {
@@ -33,15 +33,18 @@ function messageText(content: any): string {
  * Is this single message a real assistant answer?
  *
  * Excludes: non-assistant roles, tool-call turns (their text is narration about
- * work still in flight), blank text, and a turn that only parrots the degraded
- * cross-provider tool history back at us (see isHistoryDegradationEcho).
+ * work still in flight), blank text, and a turn that emitted characters but no
+ * answer — serialization residue, a repetition collapse, or a transcription of our
+ * own degraded tool history (see ENG-1054's isUnusableSynthesis, which the loop
+ * already uses to blank such a turn before it is persisted; this is the read-side
+ * check for transcripts written before that guard, or with it disabled).
  */
 export function isFinalAssistantAnswer(message: any): boolean {
   if (!message || message.role !== 'assistant') return false;
   if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return false;
   const text = messageText(message.content).trim();
   if (!text) return false;
-  return !isHistoryDegradationEcho(text);
+  return !isUnusableSynthesis(text);
 }
 
 /** Does this persisted transcript contain a real assistant answer? */

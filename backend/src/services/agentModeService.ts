@@ -15,7 +15,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
-import { createGeminiNativeClient, isHistoryDegradationEcho } from './agentMode/core/geminiNativeClient';
+import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -3930,20 +3930,6 @@ export class AgentModeService {
         if (residueDroppedThisTurn) {
           console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
           synthesisResidueDropped = true;
-          responseContent = '';
-          responseMessage.content = '';
-        }
-
-        // ENG-946: a turn whose entire text is the `[Previously called ...]` /
-        // `[Result of ...]` placeholder is the model parroting the degraded history
-        // we hand it after a mid-run cross-provider fallback (Bedrock Claude -> native
-        // Gemini strips unsigned tool calls to text). It carries no answer, so treat it
-        // as no output — both for what the user sees and for the termination decision
-        // below, which would otherwise read it as a finished response. Runs after the
-        // ENG-1054 residue drop and before `turnHadUsableText` so both this turn's
-        // flags agree on "produced nothing".
-        if (responseContent && isHistoryDegradationEcho(responseContent)) {
-          console.warn(`AgentMode: Discarding degraded-history echo from "${llmModel}" in session ${sessionId} — treating turn as empty`);
           responseContent = '';
           responseMessage.content = '';
         }

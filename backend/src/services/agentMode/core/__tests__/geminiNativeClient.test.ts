@@ -14,7 +14,6 @@ import {
   fromGeminiResponse,
   sanitizeGeminiSchema,
   createGeminiNativeClient,
-  isHistoryDegradationEcho,
   type OpenAIChatParams,
 } from '../geminiNativeClient';
 
@@ -854,68 +853,5 @@ describe('createGeminiNativeClient (end-to-end wiring)', () => {
     // response was translated + thought filtered
     expect(res.choices[0].message.content).toBe('clean answer');
     expect(res.usage.completion_tokens).toBe(10);
-  });
-});
-
-describe('isHistoryDegradationEcho (ENG-946)', () => {
-  // When the agent loop falls back mid-run from Bedrock Claude to native Gemini,
-  // every prior Claude tool_call is unsigned, so toGeminiRequest degrades it to a
-  // `[Previously called ...]` MODEL-role text part. Prod (scheduled X Reply Guy)
-  // showed Gemini then parroting that placeholder back as its whole answer — a
-  // non-empty string that the loop happily shipped as the final report.
-  it('detects a turn whose entire text is a degraded tool-call placeholder', () => {
-    expect(
-      isHistoryDegradationEcho(
-        '[Previously called twitter_outreach({"action":"search_tweets","query":"from:chamath","max_results":30})]',
-      ),
-    ).toBe(true);
-  });
-
-  it('detects a degraded tool-result placeholder and multi-line placeholder blocks', () => {
-    expect(isHistoryDegradationEcho('[Result of twitter_outreach: {"success":true}]')).toBe(true);
-    expect(
-      isHistoryDegradationEcho(
-        '[Previously called a({})]\n\n[Result of a: {"ok":1}]\n[Previously called b({})]',
-      ),
-    ).toBe(true);
-  });
-
-  it('does NOT flag a real answer, even one that mentions the placeholder', () => {
-    expect(isHistoryDegradationEcho('Here are the 5 best reply targets today: ...')).toBe(false);
-    expect(
-      isHistoryDegradationEcho('I re-ran the search.\n[Previously called twitter_outreach({})]\nHere are the results.'),
-    ).toBe(false);
-  });
-
-  it('treats blank/whitespace text as not an echo (the empty-turn path owns that case)', () => {
-    expect(isHistoryDegradationEcho('')).toBe(false);
-    expect(isHistoryDegradationEcho('   \n  ')).toBe(false);
-  });
-
-  it('uses the same marker text toGeminiRequest actually emits (no drift)', () => {
-    const req = toGeminiRequest(
-      {
-        model: 'gemini-3.1-pro-preview',
-        messages: [
-          { role: 'user', content: 'go' },
-          {
-            role: 'assistant',
-            content: '',
-            // No thought_signature => cross-provider history => degraded to text.
-            tool_calls: [{ id: 'c1', type: 'function', function: { name: 'twitter_outreach', arguments: '{"a":1}' } }],
-          },
-          { role: 'tool', tool_call_id: 'c1', name: 'twitter_outreach', content: '{"success":true}' },
-        ],
-      } as OpenAIChatParams,
-      OPTS,
-    );
-    const modelText = req.contents
-      .filter((c: any) => c.role === 'model')
-      .flatMap((c: any) => c.parts)
-      .map((p: any) => p.text)
-      .filter(Boolean)
-      .join('\n');
-    expect(modelText).toBeTruthy();
-    expect(isHistoryDegradationEcho(modelText)).toBe(true);
   });
 });
