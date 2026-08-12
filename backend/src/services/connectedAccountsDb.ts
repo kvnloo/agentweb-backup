@@ -312,6 +312,13 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // persisted here so every later delivery reuses it directly — see
   // resolveOrCreateBookingList in calendlyWebhook.ts.
   booking_lead_list_id?: string;
+  // ENG-1141: which Meta pixel/ad account CAPI attribution uses for this connection's
+  // bookings. Unlike landing pages (per-generation choice, no stored default — a human
+  // is present at creation time), a booking webhook is unattended, so this has to be
+  // settable once and reused — see resolveMetaPixelWithDefault in metaService.ts, which
+  // falls back to the caller's first connected account/first pixel when unset.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;

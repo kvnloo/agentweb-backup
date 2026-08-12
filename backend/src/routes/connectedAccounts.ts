@@ -11,6 +11,7 @@ import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
+import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
 
 const router = express.Router();
 
@@ -460,6 +461,47 @@ router.patch('/connected-accounts/calendly/:accountId/booking-list', authenticat
     }
     console.error('Update Calendly booking-list error:', error);
     res.status(500).json({ error: 'Failed to update Calendly booking list' });
+  }
+});
+
+// ENG-1141: which Meta pixel/ad account this Calendly connection's bookings attribute
+// to — a booking webhook is unattended, so unlike landing pages this needs a settable,
+// persisted choice rather than a per-creation prompt (resolveMetaPixelWithDefault falls
+// back to the caller's first connected account/pixel when unset). Never trusts the
+// client to submit a valid pair — assertOwnedMetaPixel re-validates against the
+// caller's own connected Meta accounts before persisting, same as the landing-page
+// generation-time override.
+router.patch('/connected-accounts/calendly/:accountId/attribution', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { pixelId, accountId: metaAccountId } = req.body;
+
+  if (typeof pixelId !== 'string' || !pixelId || typeof metaAccountId !== 'string' || !metaAccountId) {
+    return res.status(400).json({ error: 'pixelId and accountId are required' });
+  }
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { accountId: resolvedAccountId } = await assertOwnedMetaPixel(user, userId, pixelId, metaAccountId);
+
+    await updateAccountConfig(userId, 'calendly', accountId, {
+      attributionPixelId: pixelId,
+      attributionAccountId: resolvedAccountId,
+    });
+    res.json({ success: true, accountId, attributionPixelId: pixelId, attributionAccountId: resolvedAccountId });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No calendly account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (typeof error?.message === 'string' && (
+      error.message.includes('not one of your connected accounts') || error.message.includes('was not found on ad account')
+    )) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Update Calendly attribution error:', error);
+    res.status(500).json({ error: 'Failed to update Calendly attribution' });
   }
 });
 

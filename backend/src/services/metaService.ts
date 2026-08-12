@@ -2393,6 +2393,42 @@ export class MetaService {
   }
 
   /**
+   * Calendly's resolution (ENG-1141) — deliberately NOT resolveMetaPixelForUser, because
+   * a booking webhook is unattended (no human to prompt when ambiguous), so this defaults
+   * to the caller's first connected account and its first pixel instead of refusing. An
+   * explicit `stored` choice (the Calendly card's own account/pixel dropdowns) always wins
+   * when both fields are present. Never throws, same AC3 guarantee as resolveMetaPixelForUser.
+   */
+  public async resolveMetaPixelWithDefault(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string } | undefined,
+  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+    if (stored?.pixelId && stored?.accountId) {
+      return { pixelId: stored.pixelId, accountId: stored.accountId };
+    }
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+
+      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, accounts[0].accountId);
+      const pixels = await this.listPixels(accountId, accessToken);
+
+      if (!pixels || pixels.length === 0) {
+        return { unresolved: true, reason: `No Meta pixel found on ad account ${accountId}` };
+      }
+
+      return { pixelId: pixels[0].id, accountId };
+    } catch (error: any) {
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
    * Server-side Meta Conversions API (CAPI) send. Fires a `Lead` event directly to
    * Meta from our own trusted backend — never from a generated customer repo, which would
    * require shipping an access token into code we push to a customer-owned deployment.

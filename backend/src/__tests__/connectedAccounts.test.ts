@@ -67,6 +67,10 @@ jest.mock('../services/subscriptionService', () => ({
 jest.mock('../routes/calendlyAuth', () => ({
     refreshCalendlyAccessToken: jest.fn(),
 }));
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock('../services/metaAccountCredentials', () => ({
+    assertOwnedMetaPixel: (...a: any[]) => mockAssertOwnedMetaPixel(...a),
+}));
 const mockEnqueueJob = jest.fn();
 const mockUpdateJobPayload = jest.fn();
 jest.mock('../services/asyncJobQueue', () => ({
@@ -1318,6 +1322,101 @@ describe('Connected Accounts Routes', () => {
             const response = await request(app)
                 .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
                 .send({ listId: 'list-1' });
+
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('PATCH /connected-accounts/calendly/:accountId/attribution (ENG-1141)', () => {
+        const mockUser = { userId: 'test_user_id', connected_accounts: [] };
+
+        it('returns 400 when pixelId is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ accountId: 'act-1' });
+
+            expect(response.status).toBe(400);
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 400 when accountId is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1' });
+
+            expect(response.status).toBe(400);
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+        });
+
+        it('returns 404 when the user record cannot be found', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(404);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 400 when the pixel/account pair is not owned by the caller', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockRejectedValue(
+                new Error('Meta ad account "act-1" is not one of your connected accounts.')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('persists attributionPixelId/attributionAccountId and returns success when owned', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({
+                success: true,
+                attributionPixelId: 'px-1',
+                attributionAccountId: 'act-1',
+            }));
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: 'px-1', attributionAccountId: 'act-1' }
+            );
+        });
+
+        it('returns 404 when the calendly account is not connected to the user', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(
+                new Error('No calendly account with id "cal-x" connected')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-x/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(404);
+        });
+
+        it('returns 500 when updateAccountConfig throws an unexpected error', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(new Error('DB down'));
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
 
             expect(response.status).toBe(500);
         });

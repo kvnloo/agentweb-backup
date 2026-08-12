@@ -153,6 +153,11 @@ interface CalendlyJobPayload {
   userId: string;
   accountId: string;
   bookingLeadListId?: string;
+  // ENG-1141: this connection's own Meta attribution choice, if the customer set one on
+  // the Calendly card — resolveMetaPixelWithDefault uses it directly when both are
+  // present, falling back to the caller's first connected account/pixel otherwise.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
   email?: string;
   firstName?: string;
   lastName?: string;
@@ -228,7 +233,10 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
   const failures: string[] = [];
 
   try {
-    const pixelResolution = await metaService.resolveMetaPixelForUser(owner, payload.userId);
+    const storedAttribution = payload.attributionPixelId && payload.attributionAccountId
+      ? { pixelId: payload.attributionPixelId, accountId: payload.attributionAccountId }
+      : undefined;
+    const pixelResolution = await metaService.resolveMetaPixelWithDefault(owner, payload.userId, storedAttribution);
     if ('unresolved' in pixelResolution) {
       console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
     } else {
@@ -671,6 +679,8 @@ async function prepareCalendlyDelivery(req: express.Request): Promise<PreparedCa
     userId: resolved.userId,
     accountId: resolved.account.account_id,
     bookingLeadListId: resolved.account.config?.booking_lead_list_id,
+    attributionPixelId: resolved.account.config?.attributionPixelId,
+    attributionAccountId: resolved.account.config?.attributionAccountId,
     email: parsed.payload.email,
     firstName,
     lastName,
