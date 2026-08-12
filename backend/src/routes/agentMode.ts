@@ -275,6 +275,19 @@ router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeCont
 // Test scheduled chat
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+// ENG-827: REVOKE-ONLY. Accepts { authorized: false } and nothing else — the grant
+// direction is deliberately unreachable from the API (see the controller).
+//
+// No portal control calls this yet, and that is deliberate rather than an oversight.
+// The default was NOT flipped to opt-in, so `autopublishAuthorized` is written only by
+// scripts/grant-schedule-autopublish.ts against a recorded owner confirmation. This is
+// how an owner takes such a grant back — needed the moment that migration runs, and the
+// reason the endpoint is not removed as unreachable. The visible control today is
+// ENG-803's `requirePublishApproval` hold, which works on granted and never-asked
+// schedules alike.
+router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
+
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)
 router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));

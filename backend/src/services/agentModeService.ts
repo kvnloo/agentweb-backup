@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
-import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, createHmac, randomUUID } from 'crypto';
@@ -12,6 +12,8 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
+import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import {
   evaluateTurnTimeBudget,
@@ -37,6 +39,7 @@ import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoa
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -3185,23 +3188,41 @@ export class AgentModeService {
    * sessionType and emits nothing for them.
    */
   private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+    return (await this.resolveScheduledPublishAuthorization(currentSession)).authorized;
+  }
+
+  /**
+   * ENG-827: the authorization THIS TURN operates under, as a tool-scoped object.
+   *
+   * Resolved exactly like the dispatch guard — the run's admission stamp intersected
+   * with the live schedule — so the directive the model reads and the refusal it would
+   * hit at dispatch cannot disagree. Deriving them separately is what produced the
+   * prompt-orders-publish / guard-refuses-publish churn this ticket is about.
+   *
+   * An absent stamp reads as NOT authorized, matching the guard exactly: that is the
+   * ordinary state of every draft-only run, and also the state of a run whose stamp
+   * could not be written (which the runner downgrades to draft-only for this reason).
+   */
+  private async resolveScheduledPublishAuthorization(currentSession: any): Promise<SchedulePublishAuthorization> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true, tools: [] };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) {
       console.warn(
         `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
     try {
-      // resolvePublishAuthorized returns false for a null/deleted schedule too.
-      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+      // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
+      // schedule too, so a vanished record withholds rather than publishes.
+      const live = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleId));
+      return narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
         error
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
   }
 
@@ -3253,7 +3274,12 @@ export class AgentModeService {
     // ENG-907: epoch ms at which the CALLER started this turn's wall-clock cap
     // (the controller stamps it right before it hands the promise to
     // withGenerationTimeout). Optional — callers without a cap omit it.
-    turnStartMs?: number
+    turnStartMs?: number,
+    // ENG-827 (Greptile): publish authorization the caller already resolved. Supplied
+    // by the scheduled path so the system prompt is built from the SAME value the
+    // required-function checker holds; absent on the interactive path, which resolves
+    // per turn below.
+    publishAuthorizationOverride?: SchedulePublishAuthorization
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -3356,7 +3382,19 @@ export class AgentModeService {
       // text. This is the UNATTENDED run path, so it always passes a resolved
       // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
       // deliberately passes nothing (see the tri-state note on the override).
-      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
+      // and the publish directive appended after the conversation, so a single read
+      // backs every statement the model sees about publishing.
+      // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
+      // can straddle a revocation, and the disagreement that bites is a prompt saying
+      // "draft only" while the checker still requires a publishing tool — the agent is
+      // then told not to publish and marked incomplete for not publishing, which is the
+      // retry loop this ticket is about. Using one value makes that unrepresentable.
+      // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
+      // turn message, and the publish sinks re-read live consent at the write itself.
+      const publishAuthorization =
+        publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
+      const publishAuthorized = publishAuthorization.authorized;
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
@@ -3469,6 +3507,27 @@ export class AgentModeService {
       }
 
       messages.push(...marketingMessages);
+
+      // ENG-827: the unattended publish directive goes LAST, after the conversation.
+      //
+      // It used to be appended to the system prompt the controller stores as the
+      // session's first message — which `buildMarketingContext` slices off (startIdx=1),
+      // so the model never read it at all. Position then turned out to matter on its own:
+      // on the preview, an authorized run whose base system prompt already carried an
+      // equivalent block still opened with "Should I post this?" and only published after
+      // three checker nudges. Buried ~70k characters up, the instruction lost to the
+      // publishing tools' own "get explicit approval first" text. Placed here it is the
+      // last thing before the model answers, and it is the same authorization object the
+      // dispatch guard enforces.
+      if (currentSession?.sessionType === 'scheduled') {
+        const publishDirective = getUnattendedExecutionDirective(
+          'scheduled',
+          isAdmin,
+          publishAuthorization.authorized ? 'authorized' : 'withheld',
+          publishAuthorization.tools
+        );
+        if (publishDirective) messages.push({ role: 'system', content: publishDirective });
+      }
 
       // Cross-message loop detection: when the user repeats the same message multiple times
       // without providing requested information, stop asking and use available context tools.
@@ -25554,7 +25613,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     status: string = 'draft',
     author?: string,
-    categories: string[] = []
+    categories: string[] = [],
+    // ENG-827 (Greptile): the dispatcher checks consent before this method is entered,
+    // but the very first thing it does is fetch the article HTML over the network with
+    // a 30s budget. The check therefore precedes the slow part rather than the
+    // irreversible one, exactly like the YouTube upload did. Callers that publish on a
+    // schedule pass the hook so the decision is re-made against live consent at the
+    // last reachable point instead.
+    assertStillAuthorized?: () => Promise<{ error: string } | null>
   ): Promise<any> {
     try {
       console.log('AgentMode: Publishing blog article - Title:', title, 'Status:', status);
@@ -25615,6 +25681,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
       }
 
+      // A draft is reversible and invisible, so it is not gated — only going live is.
+      if (status === 'published') {
+        const withdrawnBeforeCms = await assertStillAuthorized?.();
+        if (withdrawnBeforeCms) {
+          console.warn('AgentMode: ENG-827 abandoning blog publish — consent was withdrawn while the article HTML was being fetched.');
+          return { success: false, message: withdrawnBeforeCms.error };
+        }
+      }
+
       const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
       return await publishWithResolvedBlogPublisher(
         {
@@ -25628,9 +25703,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           status: status === 'published' ? 'published' : 'draft',
           publishedAt: new Date().toISOString(),
         },
-        { userId, sessionId }
+        // ENG-827: the check above guards entry to the publisher; this rides all the
+        // way down to the CMS write itself, past the Payload probe, the user lookup
+        // and each publisher's secrets fetch.
+        { userId, sessionId, assertStillAuthorized: status === 'published' ? assertStillAuthorized : undefined }
       );
     } catch (error: any) {
+      // ENG-827: a deliberate stop is not a CMS failure; reporting it as one would
+      // send the run down the retry path.
+      if (isPublishConsentWithdrawn(error)) {
+        return { success: false, message: error.message };
+      }
       console.error('AgentMode: Error publishing blog article:', error);
 
       // Extract detailed error information for better user feedback
@@ -29927,7 +30010,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
@@ -30007,8 +30090,37 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // The adapter handles token refresh internally before making API calls.
       console.log('[AgentMode] Getting adapter for platform:', account.platform);
       const adapter = socialPlatformService.getAdapter(account.platform);
+
+      // ENG-827: LAST MOMENT before the post becomes real and un-makeable. Everything
+      // above — resolving accounts across the org, and inside createPost the media
+      // download and (for YouTube) the video upload — can take minutes, all of it on a
+      // decision taken before that work began. Re-read the owner's consent here, so a
+      // revocation that lands while this call is in flight still stops the post rather
+      // than being noticed only after it is public. Absent hook (interactive session,
+      // direct service call) → nothing changes.
+      const withdrawnMidFlight = await toolContext?.assertPublishStillAuthorized?.();
+      if (withdrawnMidFlight) {
+        console.warn(`[AgentMode] ENG-827: abandoning post on ${account.platform} — publish consent was withdrawn while this call was in flight.`);
+        return { success: false, message: withdrawnMidFlight.error };
+      }
+
       console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+      // ENG-827 (Greptile): the check above is the last moment before ENTERING the
+      // adapter, not before the post becomes real. LinkedIn uploads images and YouTube
+      // downloads then uploads an entire video INSIDE createPost — minutes, on a
+      // decision taken before that work began. Hand the same re-check down so those
+      // adapters can run it immediately before their irreversible request; adapters
+      // that commit straight away (X) need nothing and ignore it.
+      const result = await adapter.createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized
+      );
+
+      // An adapter that abandoned the post on a withdrawn consent reports it as a
+      // refusal, not a platform failure — the run was stopped deliberately.
+      if (result.success === false) {
+        return { success: false, message: result.message };
+      }
 
       return {
         success: true,
@@ -30038,9 +30150,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     parent_comment_urn?: string;
     reaction_type?: string;
     post_ids?: string[];
-  }): Promise<any> {
+  }, toolContext?: any): Promise<any> {
     const { action, account_id } = args;
     console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+    // ENG-827: last-moment publish-consent re-check. A repost or comment is a public
+    // write under the owner's name, so a consent withdrawn after dispatch admitted
+    // this call must still stop it. Self-scoping: the dispatcher attaches the hook
+    // only for a call it classified as publishing, so an analytics or comment-list
+    // read reaches this line with nothing to run.
+    const withdrawn = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawn) return withdrawn;
 
     const requirePostUrn = (a: string) =>
       !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
@@ -30050,10 +30170,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
 
     switch (action) {
+      // ENG-827 (Greptile): the check above still leaves an account lookup and a token
+      // refresh in front of the write, so the hook is handed down and re-run
+      // immediately before the irreversible call. Reads below get nothing to run.
       case 'repost':
-        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary);
+        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary, toolContext);
       case 'comment':
-        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn);
+        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn, toolContext);
       case 'list_comments':
         return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
       case 'react':
@@ -30065,7 +30188,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string): Promise<any> {
+  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
 
     try {
@@ -30094,7 +30217,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'LinkedIn account is no longer connected' };
       }
 
-      const result = await adapter.createRepost(currentAccount, postUrn, commentary, userId);
+      // ENG-827: last point before the repost is public — after the account re-read
+      // above and with the adapter's token refresh still to come inside the call.
+      // Consent is checked LAST so nothing but the write itself follows it.
+      const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+      if (withdrawnNow) return withdrawnNow;
+
+      const result = await adapter.createRepost(
+        currentAccount, postUrn, commentary, userId,
+        toolContext?.assertPublishStillAuthorized
+      );
 
       return {
         success: true,
@@ -30111,7 +30243,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
       accountId,
@@ -30193,8 +30325,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: false, message: 'LinkedIn account is no longer connected' };
         }
 
+        // ENG-827 (Greptile): the duplicate-comment lookup and the account re-read above
+        // are both network calls, and the adapter refreshes the token inside
+        // createComment. Re-check consent here, the last point before the comment is
+        // public under the owner's name.
+        const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+        if (withdrawnNow) return withdrawnNow;
+
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(currentAccount, postUrn, commentText, userId, parentCommentUrn);
+        const result = await adapter.createComment(
+          currentAccount, postUrn, commentText, userId, parentCommentUrn,
+          toolContext?.assertPublishStillAuthorized
+        );
 
         return {
           success: true,
@@ -31334,11 +31476,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // Public entry: bind the acting user into the X metering context so every X
   // call this dispatch makes attributes the shadow ledger to the ACTING user and
   // bills the account owner (ENG-664 Option B, matching the LLM rail).
-  async twitterManagePost(userId: string, args: any): Promise<any> {
-    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  async twitterManagePost(userId: string, args: any, toolContext?: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args, toolContext));
   }
 
-  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
+  private async _twitterManagePostImpl(userId: string, args: any, toolContext?: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -31373,6 +31515,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const ownerUserId = account.userId;
     account_id = account.account_id;
 
+    // ENG-827: last-moment publish-consent re-check, after the account resolution
+    // above (which scans every account shared with the owner's org) and immediately
+    // before the switch — every publishing branch writes on its first statement, so
+    // there is no window left after this point. Self-scoping: the dispatcher attaches
+    // the hook only for a call it classified as publishing, so a metrics or list read
+    // reaches this line with nothing to run and pays nothing.
+    const withdrawnBeforeTweet = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawnBeforeTweet) return withdrawnBeforeTweet;
+
     // Best-effort CRM logging — never fails the action.
     const logCrm = async (
       eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
@@ -31402,9 +31553,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'reply': {
           if (!text) throw new Error('text is required for reply');
           if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          // ENG-827: the hook goes down so the check also covers the client resolution
+          // and any token refresh inside the call — the last work before the write.
           const result = await twitterService.postTweet(ownerUserId, account_id, text, {
             inReplyToTweetId: in_reply_to_tweet_id,
-          });
+          }, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -31416,15 +31569,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (tweets.length < 2) {
             throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
           }
-          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          // ENG-827 (Greptile): a thread is N separate public writes. The check above
+          // covers the first tweet only, so consent is re-read before each subsequent
+          // one and the thread stops the moment it is withdrawn.
+          const result = await twitterService.postThread(
+            ownerUserId, account_id, tweets,
+            toolContext?.assertPublishStillAuthorized
+          );
           if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          if (result.length < tweets.length) {
+            // Report the truncation rather than a clean success: those tweets are
+            // public and cannot be un-made, and the owner needs to know the thread is
+            // a fragment so they can finish or delete it.
+            return {
+              success: false,
+              message:
+                `Publishing consent was withdrawn part-way through the thread. ${result.length} of ` +
+                `${tweets.length} tweets were already posted and cannot be un-posted; the rest were ` +
+                `not sent. Do NOT retry — tell the owner the thread is incomplete so they can finish ` +
+                `or remove it.`,
+              data: result,
+            };
+          }
           return { success: true, data: result };
         }
 
         case 'quote-tweet': {
           if (!text) throw new Error('text is required for quote_tweet');
           if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
-          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -31449,7 +31622,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'retweet': {
           if (!tweet_id) throw new Error('tweet_id is required for retweet');
-          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id, toolContext?.assertPublishStillAuthorized);
           return { success: true, data: result };
         }
 
@@ -31501,6 +31674,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
+      // ENG-827: a write abandoned because the owner withdrew consent is a deliberate
+      // stop, not an X failure. Reporting it as "Twitter action failed" would invite a
+      // retry of the very thing the owner just said no to.
+      if (isPublishConsentWithdrawn(error)) {
+        console.warn('[AgentMode] ENG-827: twitter_manage_post stopped — publish consent was withdrawn before the write.');
+        return { success: false, error: error.message };
+      }
       // Surface X's real ApiResponseError payload (title/detail/errors) instead of
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
