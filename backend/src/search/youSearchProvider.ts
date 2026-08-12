@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { getSecret, secretExists } from '../utils/secretsManager';
-import { extractSignificantTerms, isRelevantToQuery } from './newsRelevance';
+import { extractAnchorTerms, isRelevantToQuery } from './newsRelevance';
 import {
   normalizeSearchCount,
   NormalizedSearchResult,
@@ -114,8 +114,8 @@ export class YouSearchProvider implements SearchProvider {
    */
   private buildNewsResponse(data: any, request: SearchRequest): SearchProviderResponse {
     const limit = normalizeSearchCount(request.count);
-    const significantTerms = extractSignificantTerms(request.query);
-    const isRelevant = (result: NormalizedSearchResult) => isRelevantToQuery(result, significantTerms);
+    const anchorTerms = extractAnchorTerms(request.query);
+    const isRelevant = (result: NormalizedSearchResult) => isRelevantToQuery(result, anchorTerms);
 
     const rawNews = this.normalizeResults(data?.results?.news, 'news');
     const relevantNews = rawNews.filter(isRelevant);

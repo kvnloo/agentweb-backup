@@ -39,6 +39,11 @@ function tokenize(text: string): string[] {
   return (text.toLowerCase().match(/[a-z0-9]+/g) || []);
 }
 
+/** Tokens of the query with their original casing preserved. */
+function tokenizeWithCase(text: string): string[] {
+  return (text.match(/[A-Za-z0-9]+/g) || []);
+}
+
 /**
  * Crude singularization so "payments" in the query matches "payment" in a
  * headline. Deliberately does NOT strip other suffixes: "striped" must not
@@ -53,9 +58,6 @@ function singularize(token: string): string {
 
 /**
  * The terms of a query that identify its subject, in query order, deduplicated.
- * The first one is the primary term — these queries name their subject first
- * ("Stripe payments", "Guesty short-term rental platform") — and relevance is
- * anchored on it.
  * Returns an empty list for a purely generic query ("latest news today") — there
  * is then nothing to judge relevance against, so nothing may be filtered out.
  */
@@ -71,6 +73,37 @@ export function extractSignificantTerms(query: string): string[] {
   return terms;
 }
 
+/**
+ * The terms relevance is actually anchored on: the ones naming the entity the
+ * query is about, as opposed to the descriptors around it.
+ *
+ * Capitalisation in the query is the signal. Callers compose these queries from
+ * a company name plus industry and business-signal words ("AI startup Zenoti
+ * funding", "Grammarly Superhuman email"), and they capitalise the company and
+ * not the descriptors. Anchoring on query order instead would pick "startup"
+ * and "enterprise" as the subject and let the trending feed straight back in.
+ *
+ * Two fallbacks to the first significant term, both meaning "capitalisation told
+ * us nothing here": an all-lowercase query, and a query where every significant
+ * term is capitalised (title case, e.g. "Stripe Payments" — treating "Payments"
+ * as an entity would readmit the noise this exists to block).
+ */
+export function extractAnchorTerms(query: string): string[] {
+  const significantTerms = extractSignificantTerms(query);
+  if (!significantTerms.length) return [];
+
+  const capitalized = new Set(
+    tokenizeWithCase(query || '')
+      .filter((token) => /^[A-Z]/.test(token))
+      .map((token) => singularize(token.toLowerCase())),
+  );
+  const anchors = significantTerms.filter((term) => capitalized.has(term));
+
+  return anchors.length && anchors.length < significantTerms.length
+    ? anchors
+    : significantTerms.slice(0, 1);
+}
+
 export interface RelevanceCandidate {
   title?: string;
   url?: string;
@@ -79,19 +112,22 @@ export interface RelevanceCandidate {
 }
 
 /**
- * True when the article mentions the query's primary term — the entity the
- * query is about. Counting term hits instead would cut both ways: requiring two
- * throws away the headlines a competitor digest exists to find, because a real
- * one names the company and nothing else ("Stripe launches Tempo",
- * "UpKeep raises $50M Series C"), while accepting any one lets the trending feed
- * back in through a descriptor ("vacation resorts" for a Guesty query).
- * Anchoring on the entity keeps the first and rejects the second.
+ * True when the article mentions one of the query's anchor terms — the entities
+ * the query is about. Counting term hits instead would cut both ways: requiring
+ * two throws away the headlines a competitor digest exists to find, because a
+ * real one names the company and nothing else ("Stripe launches Tempo",
+ * "UpKeep raises $50M Series C"), while accepting any one term lets the trending
+ * feed back in through a descriptor ("vacation resorts" for a Guesty query).
+ * Anchoring on the entities keeps the first and rejects the second.
+ *
+ * Pass the output of {@link extractAnchorTerms}; an empty list means the query
+ * named no entity to judge against, so nothing is filtered out.
  *
  * Whole-token matching only (after singularization), so "guest" does not satisfy
  * "guesty" and "striped" does not satisfy "stripe".
  */
-export function isRelevantToQuery(result: RelevanceCandidate, significantTerms: string[]): boolean {
-  if (!significantTerms.length) return true;
+export function isRelevantToQuery(result: RelevanceCandidate, anchorTerms: string[]): boolean {
+  if (!anchorTerms.length) return true;
 
   const haystack = [
     result.title || '',
@@ -101,5 +137,5 @@ export function isRelevantToQuery(result: RelevanceCandidate, significantTerms: 
   ].join(' ');
 
   const tokens = new Set(tokenize(haystack).map(singularize));
-  return tokens.has(significantTerms[0]);
+  return anchorTerms.some((term) => tokens.has(term));
 }
