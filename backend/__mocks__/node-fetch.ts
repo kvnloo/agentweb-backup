@@ -15,7 +15,10 @@ const realFetchFn: (url: unknown, init?: unknown) => unknown =
 
 function resolveUrl(url: unknown): string {
   if (typeof url === 'string') return url;
-  if (url && typeof url === 'object' && 'href' in url) return String((url as { href: unknown }).href);
+  if (url && typeof url === 'object') {
+    if ('href' in url) return String((url as { href: unknown }).href);
+    if ('url' in url) return String((url as { url: unknown }).url);
+  }
   return String(url);
 }
 
