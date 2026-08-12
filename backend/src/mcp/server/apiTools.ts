@@ -3388,8 +3388,8 @@ mcpToolRegistry.register({
     return jsonResult({
       onboarding_progress: state?.onboardingProgress ?? {},
       onboarding_dismissed: state?.onboardingDismissed ?? false,
-      stage: events?.stage ?? null,
-      event_count: events?.eventCount ?? 0,
+      stage: events?.onboardingStage ?? null,
+      event_count: Array.isArray(events?.onboardingEvents) ? events.onboardingEvents.length : 0,
       brand_build: brandBuild?.status ?? brandBuild ?? null,
     });
   },

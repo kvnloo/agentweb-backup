@@ -1380,7 +1380,10 @@ describe('apiTools', () => {
     it('reads onboarding state from the existing authenticated routes', async () => {
       mockMcpFetch
         .mockResolvedValueOnce({ onboardingProgress: { step: 'brand' }, onboardingDismissed: false })
-        .mockResolvedValueOnce({ stage: 'brand_submitted', eventCount: 2 })
+        .mockResolvedValueOnce({
+          onboardingStage: 'brand_submitted',
+          onboardingEvents: [{ event: 'goal_selected' }, { event: 'brand_submitted' }],
+        })
         .mockResolvedValueOnce({ status: 'building' });
 
       const result = await mcpToolRegistry.execute('emma_get_onboarding_status', {}, context);
