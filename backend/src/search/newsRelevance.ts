@@ -285,6 +285,30 @@ const NON_COVERAGE_PATH_MARKERS = [
 ];
 
 /**
+ * Path segments that positively identify an article, so the evergreen markers
+ * above are not consulted for it.
+ *
+ * Those markers are substrings of a whole path, which is right for a listicle
+ * slug but wrong for a dated story that merely mentions the word:
+ * "/2026/08/11/stripe-pricing-overhaul" or "/news/upkeep-raises-series-c-after-review"
+ * are coverage. `blog` is deliberately absent — a vendor blog is where the
+ * "surfer-seo-review" genre actually lives.
+ */
+const EDITORIAL_PATH_SEGMENTS = new Set([
+  'news', 'newsroom', 'newsrooms', 'press', 'pressroom', 'press-release', 'press-releases',
+  'article', 'articles', 'story', 'stories',
+]);
+
+/** A date in the path ("/2026/08/11/…", "/2026-08-11-…") — the strongest article signal there is. */
+const DATED_PATH = /(?:^|\/|-)(?:19|20)\d{2}[/-](?:0?[1-9]|1[0-2])(?:[/-]|$)/;
+
+/** Whether the URL path carries a positive article signal. */
+function hasEditorialSignal(path: string, segments: string[]): boolean {
+  if (segments.some((segment) => EDITORIAL_PATH_SEGMENTS.has(segment))) return true;
+  return DATED_PATH.test(path);
+}
+
+/**
  * Whether a web-bucket URL could be coverage at all.
  *
  * You.com's `page_age` is a crawl/refresh timestamp, not a publication date, so a
@@ -297,7 +321,9 @@ const NON_COVERAGE_PATH_MARKERS = [
  * missed, so pages that cannot be coverage are dropped.
  *
  * Deliberately narrow: it excludes surfaces, not domains. A company's own
- * newsroom, blog or press release still counts as coverage.
+ * newsroom, blog or press release still counts as coverage, and a URL that
+ * positively looks like an article (dated path, /news/, /press-release/) is kept
+ * whatever words its slug happens to contain.
  */
 export function isCoverageCandidate(url: string): boolean {
   let parsed: URL;
@@ -313,6 +339,7 @@ export function isCoverageCandidate(url: string): boolean {
 
   const path = parsed.pathname.toLowerCase();
   const segments = path.split('/').filter(Boolean);
+  if (hasEditorialSignal(path, segments)) return true;
   if (segments.some((segment) => NON_COVERAGE_PATH_SEGMENTS.has(segment))) return false;
   if (NON_COVERAGE_PATH_MARKERS.some((marker) => path.includes(marker))) return false;
 
