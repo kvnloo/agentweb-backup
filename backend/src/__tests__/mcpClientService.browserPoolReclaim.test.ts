@@ -208,6 +208,34 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
     });
   });
 
+  describe('explicit session release', () => {
+    it('leaves a pool alone while a tool call is still running against it', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      buildService();
+      const client = await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      (service as any).markPoolBusy('user-1::session-a', 1);
+
+      await service.releaseSessionClients('session-a');
+
+      expect(poolKeys()).toContain('user-1::session-a');
+      expect((client as any).close).not.toHaveBeenCalled();
+      expect(warn.mock.calls.some(c => String(c[0]).includes('still in flight'))).toBe(true);
+      warn.mockRestore();
+    });
+
+    it('releases the pool normally once nothing is in flight', async () => {
+      buildService();
+      const client = await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      (service as any).markPoolBusy('user-1::session-a', 1);
+      (service as any).markPoolBusy('user-1::session-a', -1);
+
+      await service.releaseSessionClients('session-a');
+
+      expect(poolKeys()).not.toContain('user-1::session-a');
+      expect((client as any).close).toHaveBeenCalled();
+    });
+  });
+
   describe('in-flight accounting', () => {
     it('clears the busy marker and refreshes activity when a call settles', async () => {
       buildService();
