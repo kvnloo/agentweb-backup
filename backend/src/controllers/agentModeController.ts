@@ -88,6 +88,96 @@ async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): 
   return true;
 }
 
+/**
+ * ENG-827 — after an edit moves a schedule's required tools, bring a STORED publish
+ * grant back inside them.
+ *
+ * Consent is recorded against a SPECIFIC set of publishing tools, which is the whole
+ * reason a grant carries a scope. An edit that drops one of those tools would otherwise
+ * leave publishing authority attached to a tool the owner has since removed.
+ *
+ * Runs AFTER the edit, against a FRESH read, and that ordering is the point. Derived
+ * from the read taken at the top of the handler it cannot be made consistent: the grant
+ * endpoint conditions its own write on the required tools it read, so a grant racing
+ * this edit either lands before it — and this re-read narrows it — or after it, already
+ * scoped to the post-edit tools. Both orderings end consistent. Folding the narrowing
+ * into the edit's own write leaves one that does not.
+ *
+ * Narrowing only, and only for a grant that is actually STORED. A legacy row carries no
+ * consent field, so its scope is re-derived from the required tools on every read and
+ * follows the edit by itself; stamping `false` on one would record a refusal the owner
+ * never gave. `true` is never written from here — granting is the consent endpoint's job
+ * and nobody else's.
+ *
+ * Best-effort by construction: the edit is already applied and acknowledged, so a failure
+ * here is logged rather than surfaced, and the next edit runs it again.
+ */
+async function narrowStoredPublishConsentToEditedTools(
+  scheduleId: string,
+  editedRequiredFunctionCalls: string[]
+): Promise<void> {
+  let fresh: any;
+  try {
+    fresh = await scheduleDb.getScheduleById(scheduleId);
+  } catch (readError) {
+    console.warn(
+      `AgentMode: ENG-827 could not re-read schedule ${scheduleId} to narrow its publish consent; ` +
+      'the edit stands and the grant was left as it was:', readError
+    );
+    return;
+  }
+
+  if (!fresh || fresh.autopublishAuthorized !== true) return;
+  const stored = resolveSchedulePublishAuthorization(fresh);
+  if (!stored.authorized) return;
+
+  const stillRequired = getRequiredPublishTools(editedRequiredFunctionCalls);
+  const narrowed = narrowPublishAuthorization(stored, {
+    authorized: stillRequired.length > 0,
+    tools: stillRequired,
+  });
+  if (narrowed.authorized && narrowed.tools.length === stored.tools.length) return;
+
+  const consentUpdates: any = { autopublishAuthorizedTools: narrowed.tools };
+  if (!narrowed.authorized) {
+    consentUpdates.autopublishAuthorized = false;
+    consentUpdates.autopublishAuthorizedAt = null;
+    consentUpdates.autopublishAuthorizedBy = null;
+  }
+
+  try {
+    await scheduleDb.updateSchedule(
+      scheduleId,
+      consentUpdates,
+      // Bind the write to the consent it was derived FROM, so a grant or revocation
+      // arriving in between is not overwritten by a decision made about an older one.
+      { autopublishAuthorized: true, autopublishAuthorizedTools: fresh.autopublishAuthorizedTools }
+    );
+  } catch (writeError: any) {
+    if (
+      writeError?.code === 'ConditionalCheckFailedException' ||
+      writeError?.name === 'ConditionalCheckFailedException'
+    ) {
+      console.warn(
+        `AgentMode: ENG-827 publish consent narrowing skipped for schedule ${scheduleId} — consent ` +
+        'changed during the edit, so the owner\'s newer decision stands.'
+      );
+      return;
+    }
+    console.warn(
+      `AgentMode: ENG-827 publish consent narrowing failed for schedule ${scheduleId}; ` +
+      'the edit stands and the grant was left as it was:', writeError
+    );
+    return;
+  }
+
+  console.log(
+    `AgentMode: ENG-827 publish consent narrowed on edit for schedule ${scheduleId}: ` +
+    `[${stored.tools.join(', ')}] -> [${narrowed.tools.join(', ')}]` +
+    `${narrowed.authorized ? '' : ' (revoked — no approved publishing tool remains)'}.`
+  );
+}
+
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
 // only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
 // longer run, a SIGKILL, or an OOM kills the process before its catch can persist
@@ -8107,96 +8197,14 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
-      // ENG-827 (Greptile): consent was granted against a SPECIFIC set of publishing
-      // tools. Editing the schedule's required functions moves that set, and the
-      // stored grant would otherwise stand unchanged — leaving publishing authority
-      // attached to a tool the owner has since removed.
-      //
-      // Re-derive the scope from the tools this edit leaves behind, intersected with
-      // what was actually approved. Narrowing only: a publishing tool ADDED here does
-      // not inherit consent, because the owner approved the old set, not this one. An
-      // intersection that empties out is no longer an authorization, so the grant goes
-      // with it and the owner has to give it again against what the schedule now does.
-      //
-      // Only a STORED grant can be narrowed. A legacy row carries no consent field at
-      // all, so `resolveSchedulePublishAuthorization` DERIVES its scope from the required
-      // tools on every read — this edit moves those tools and the derived scope follows
-      // on its own. There is nothing stale to correct, and stamping `false` here would
-      // record a refusal the owner never gave, from an edit that never asked them. That
-      // turns a never-asked row into an explicit revocation, which is the same
-      // decide-for-the-owner error the polarity deferral exists to avoid.
-      const priorConsent = resolveSchedulePublishAuthorization(existingSchedule as any);
-      const storedGrant = (existingSchedule as any).autopublishAuthorized === true;
-      // The keys the narrowing writes, so the retry below can take them back out again.
-      const consentKeys: string[] = [];
-      let consentExpectation: Record<string, any> | undefined;
-      if (storedGrant && priorConsent.authorized && updates.requiredFunctionCalls !== undefined) {
-        const stillRequired = getRequiredPublishTools(updates.requiredFunctionCalls);
-        const narrowed = narrowPublishAuthorization(priorConsent, {
-          authorized: stillRequired.length > 0,
-          tools: stillRequired,
-        });
-        if (!narrowed.authorized || narrowed.tools.length !== priorConsent.tools.length) {
-          // Never write `true` from here. `narrowed` is derived from a read taken
-          // earlier in this handler, so writing the flag would let a rename racing a
-          // revocation put the grant BACK — the edit would be restoring permission
-          // from a snapshot the owner has already withdrawn. Only the consent endpoint
-          // grants; this path may narrow and nothing else.
-          //
-          // When the scope merely shrinks, write the smaller tool list and leave the
-          // flag alone. `updateSchedule` builds a PARTIAL SET expression, so omitting
-          // the key preserves whatever is stored — including a revocation that landed
-          // in between, which then wins on its own. Authorization requires the flag
-          // AND a non-empty scope, so a narrowed list can never re-authorize anything.
-          updates.autopublishAuthorizedTools = narrowed.tools;
-          consentKeys.push('autopublishAuthorizedTools');
-          if (!narrowed.authorized) {
-            updates.autopublishAuthorized = false;
-            updates.autopublishAuthorizedAt = null;
-            updates.autopublishAuthorizedBy = null;
-            consentKeys.push('autopublishAuthorized', 'autopublishAuthorizedAt', 'autopublishAuthorizedBy');
-          }
-          // Bind this write to the consent it was derived FROM. The grant path already
-          // does the same against its own read; this is the mirror, and without it a
-          // stale `false` lands on top of a grant the owner made in between and got a
-          // 200 for — their consent silently gone, later runs draft-only, nothing
-          // anywhere saying so.
-          consentExpectation = {
-            autopublishAuthorized: true,
-            autopublishAuthorizedTools: (existingSchedule as any).autopublishAuthorizedTools,
-          };
-          console.log(
-            `AgentMode: ENG-827 publish consent narrowed on edit for schedule ${scheduleId}: ` +
-            `[${priorConsent.tools.join(', ')}] -> [${narrowed.tools.join(', ')}]` +
-            `${narrowed.authorized ? '' : ' (revoked — no approved publishing tool remains)'}.`
-          );
-        }
-      }
+      // ENG-827: apply the owner's EDIT first, then bring any stored publish grant back
+      // inside the tools the edit left behind. Sequenced, not folded into one write —
+      // see narrowStoredPublishConsentToEditedTools for why the ordering is what makes
+      // a grant racing this edit come out consistent either way.
+      await scheduleDb.updateSchedule(scheduleId, updates);
 
-      try {
-        // Only pass the condition when there IS one: every other edit stays the plain
-        // two-argument write it has always been.
-        if (consentExpectation) {
-          await scheduleDb.updateSchedule(scheduleId, updates, consentExpectation);
-        } else {
-          await scheduleDb.updateSchedule(scheduleId, updates);
-        }
-      } catch (writeError: any) {
-        const conditionFailed =
-          writeError?.code === 'ConditionalCheckFailedException' ||
-          writeError?.name === 'ConditionalCheckFailedException';
-        if (!conditionFailed || !consentExpectation) throw writeError;
-
-        // Consent moved between this handler's read and its write. The EDIT is the
-        // owner's intent and still has to land; the narrowing is a derived consequence
-        // of a snapshot that is now wrong, so it is what gets dropped. Whatever the
-        // owner did to consent in the meantime stands on its own.
-        consentKeys.forEach((key) => { delete (updates as any)[key]; });
-        console.warn(
-          `AgentMode: ENG-827 publish consent narrowing skipped for schedule ${scheduleId} — ` +
-          `consent changed during the edit. The edit was applied; the newer consent stands.`
-        );
-        await scheduleDb.updateSchedule(scheduleId, updates);
+      if (updates.requiredFunctionCalls !== undefined) {
+        await narrowStoredPublishConsentToEditedTools(scheduleId, updates.requiredFunctionCalls);
       }
 
       res.json({
