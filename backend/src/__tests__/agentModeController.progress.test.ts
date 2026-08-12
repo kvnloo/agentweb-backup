@@ -15,6 +15,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     addMessageToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     incrementCalledFunctions: jest.fn(),
     getMessagesFromMessagesTable: jest.fn()
   }
@@ -28,6 +29,8 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Session Title'),
     getSkillsForDisplay: jest.fn().mockResolvedValue([])
   }

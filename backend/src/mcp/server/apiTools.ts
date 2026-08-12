@@ -188,13 +188,19 @@ mcpToolRegistry.register({
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
         llm_model: { type: 'string', description: 'LLM model to use (optional)' },
+        backup_model: { type: 'string', description: 'Backup model to use if the preferred model is restricted by optimized usage (optional). The server remains authoritative.' },
         media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
     }
   },
   execute: async (args: any, context: any) => {
-    const body: any = { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model };
+    const body: any = {
+      sessionId: args.session_id,
+      userMessage: args.message,
+      llmModel: args.llm_model,
+      llmBackupModel: args.backup_model,
+    };
     if (args.media_urls && args.media_urls.length > 0) {
       body.attachments = args.media_urls.map((url: string) => {
         const filename = url.split('/').pop()?.split('?')[0] || 'image';

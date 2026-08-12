@@ -158,6 +158,11 @@ const stampedModel = () => {
   return call?.[1];
 };
 
+const stampedPolicyDecision = () => {
+  const call = mockChatbotDb.updateSessionLlmModel.mock.calls.find(([id]) => id === SESSION_ID);
+  return call?.[2];
+};
+
 describe('runScheduledChat — stamps the model that will actually run (ENG-892)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -265,6 +270,17 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     } as any, 'test-user-123', false);
 
     expect(stampedModel()).toBe('gpt-5-chat-2');
+    expect(stampedPolicyDecision()).toEqual(expect.objectContaining({
+      requestedModel: 'anthropic.claude-opus-5',
+      effectiveModel: 'gpt-5-chat-2',
+      backupModel: 'gpt-5-chat-2',
+      backupSource: 'user',
+      modelSelection: 'corrected',
+      modelSelectionReason: 'requested_model_blocked_using_user_backup',
+      usageMode: 'optimized',
+      usagePolicyVersion: 'pro-v1',
+      recordedAt: expect.any(String),
+    }));
     expect(mockWorker.runInWorker).toHaveBeenCalledWith(
       expect.objectContaining({ llmModel: 'gpt-5-chat-2' }),
       expect.any(Function),

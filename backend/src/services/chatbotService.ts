@@ -257,6 +257,17 @@ export interface ChatSession {
     threadTs: string;
   }; // Slack thread association for in-thread Q&A
   llmModel?: string; // Selected LLM model for this session
+  llmUsagePolicyDecision?: {
+    requestedModel: string | null;
+    effectiveModel: string | null;
+    backupModel: string | null;
+    backupSource: 'user' | 'system' | null;
+    modelSelection: 'honored' | 'corrected' | 'defaulted' | 'blocked';
+    modelSelectionReason: string;
+    usageMode: 'full_choice' | 'optimized' | 'paused';
+    usagePolicyVersion: string | null;
+    recordedAt: string;
+  };
   delegateInfo?: {
     adminUserId: string;
     adminEmail: string;
@@ -3072,16 +3083,20 @@ export class ChatbotDB {
 
   async updateSessionLlmModel(
     sessionId: string,
-    llmModel: string
+    llmModel: string,
+    policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+      UpdateExpression: policyDecision
+        ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
+        ...(policyDecision ? { ":policyDecision": policyDecision } : {}),
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",

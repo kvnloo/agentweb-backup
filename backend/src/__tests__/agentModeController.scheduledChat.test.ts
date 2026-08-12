@@ -2804,10 +2804,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(updateCall).not.toHaveProperty('nextRunTime');
 
       // Verify response returns the original nextRunTime
-      expect(mockRes.json).toHaveBeenCalledWith({
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         message: 'Scheduled chat updated successfully',
         nextRunTime: originalNextRunTime,
-      });
+      }));
     });
 
     it('should preserve nextRunTime even when changing frequency', async () => {
@@ -2848,10 +2848,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(updateCall).not.toHaveProperty('nextRunTime');
 
       // Verify response returns the original nextRunTime
-      expect(mockRes.json).toHaveBeenCalledWith({
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         message: 'Scheduled chat updated successfully',
         nextRunTime: originalNextRunTime,
-      });
+      }));
     });
 
     it('should return 404 if schedule does not exist', async () => {
