@@ -54,6 +54,8 @@ export interface OAuthAuthorizationCode {
 export interface OAuthSignupIntent {
   code: string;
   clientId: string;
+  userAgentHash: string;
+  ipHash: string;
   purpose: "mcp_signup";
   used: boolean;
   expiresAt: number; // epoch seconds (DynamoDB TTL)
@@ -253,11 +255,15 @@ export class McpOAuthService {
   async createSignupIntent(
     code: string,
     clientId: string,
+    userAgentHash: string,
+    ipHash: string,
   ): Promise<void> {
     const nowSec = Math.floor(Date.now() / 1000);
     const record: OAuthSignupIntent = {
       code,
       clientId,
+      userAgentHash,
+      ipHash,
       purpose: "mcp_signup",
       used: false,
       expiresAt: nowSec + 15 * 60,
@@ -275,6 +281,8 @@ export class McpOAuthService {
   async consumeSignupIntent(
     code: string,
     clientId: string,
+    userAgentHash: string,
+    ipHash: string,
   ): Promise<boolean> {
     const result = await dynamodb
       .get({
@@ -286,6 +294,8 @@ export class McpOAuthService {
     const record = result.Item as OAuthSignupIntent | undefined;
     if (!record) return false;
     if (record.clientId !== clientId) return false;
+    if (record.userAgentHash !== userAgentHash) return false;
+    if (record.ipHash !== ipHash) return false;
     if (record.used) return false;
     if (record.purpose !== "mcp_signup") return false;
 

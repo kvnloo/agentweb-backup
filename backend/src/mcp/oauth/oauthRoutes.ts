@@ -48,6 +48,22 @@ function isApproved(value: unknown): boolean {
 }
 
 export function setupMcpOAuth(app: express.Express) {
+  const computeBindingHash = (value: string): string => {
+    return crypto.createHash("sha256").update(value).digest("hex");
+  };
+
+  const clientIpFromRequest = (req: Request): string => {
+    const forwarded = req.headers["x-forwarded-for"];
+    const direct = req.ip || req.socket.remoteAddress || "";
+    if (Array.isArray(forwarded)) {
+      return forwarded[0]?.split(",")[0]?.trim() || direct;
+    }
+    if (typeof forwarded === "string") {
+      return forwarded.split(",")[0]?.trim() || direct;
+    }
+    return direct || "";
+  };
+
   // ─── Well-Known Metadata (RFC 8414) ─────────────────────────────────────
 
   app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
@@ -214,8 +230,12 @@ export function setupMcpOAuth(app: express.Express) {
     // endpoint accepts MCP attribution only with this server-minted intent,
     // so a normal public signup cannot spoof acquisition source.
     const signupIntentId = crypto.randomBytes(24).toString('hex');
+    const intentContext = {
+      userAgentHash: computeBindingHash(req.get('user-agent') || ''),
+      ipHash: computeBindingHash(clientIpFromRequest(req)),
+    };
     try {
-      await mcpOAuthService.createSignupIntent(signupIntentId, client_id);
+      await mcpOAuthService.createSignupIntent(signupIntentId, client_id, intentContext.userAgentHash, intentContext.ipHash);
     } catch (error) {
       console.error('[MCP-OAuth] Failed to store signup intent:', error);
       return res.status(503).json({ error: 'Unable to initialize MCP signup flow' });

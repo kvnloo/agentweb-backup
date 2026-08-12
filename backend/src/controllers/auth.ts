@@ -17,6 +17,7 @@ import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { mcpOAuthService } from "../mcp/oauth/oauthService";
+import crypto from "crypto";
 
 // ENG-512: domain-based org auto-join. If the new signup's email domain
 // matches an org with autoJoinEnabled, create a pending domain-join request
@@ -75,6 +76,22 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
     // Non-fatal — this is a best-effort convenience feature
   }
 }
+
+const computeBindingHash = (value: string): string => {
+  return crypto.createHash("sha256").update(value).digest("hex");
+};
+
+const requestClientIp = (req: Request): string => {
+  const forwarded = req.headers["x-forwarded-for"];
+  const direct = req.ip || req.socket.remoteAddress || "";
+  if (Array.isArray(forwarded)) {
+    return forwarded[0]?.split(",")[0]?.trim() || direct;
+  }
+  if (typeof forwarded === "string") {
+    return forwarded.split(",")[0]?.trim() || direct;
+  }
+  return direct || "";
+};
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -170,6 +187,8 @@ export const register = async (req: Request, res: Response) => {
           const canUseIntent = await mcpOAuthService.consumeSignupIntent(
             intent.intentId,
             intent.clientId,
+            computeBindingHash(req.get("user-agent") || ""),
+            computeBindingHash(requestClientIp(req)),
           );
           if (canUseIntent) signupSource = "mcp";
         }
