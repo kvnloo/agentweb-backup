@@ -1,6 +1,8 @@
 import {
   collectMediaGeneratedSince,
   buildTimeoutContinuationMessage,
+  collectTurnWorkSince,
+  buildTimeoutPartialWorkMessage,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -90,5 +92,124 @@ describe('buildTimeoutContinuationMessage', () => {
     expect(msg).toContain('here they are');
     expect(msg).toContain('![v1.png](https://s3/v1.png)');
     expect(msg).toContain('![v2.png](https://s3/v2.png)');
+  });
+});
+
+describe('ENG-907 — salvaging a timed-out turn that did real work', () => {
+  // The ENG-907 production window: user message 22:46:57, cap fired 22:56:57.
+  const turnStart = Date.parse('2026-08-04T22:46:57Z');
+  const at = (iso: string) => ({ timestamp: iso });
+
+  const assistant = (iso: string, content: unknown, metadata?: Record<string, unknown>) => ({
+    role: 'assistant',
+    content,
+    ...at(iso),
+    metadata: { timestamp: iso, ...(metadata || {}) },
+  });
+  const tool = (iso: string, name: string) => ({
+    role: 'tool',
+    name,
+    content: '{"ok":true}',
+    ...at(iso),
+    metadata: { timestamp: iso },
+  });
+
+  describe('collectTurnWorkSince', () => {
+    it('returns nothing for non-array input', () => {
+      expect(collectTurnWorkSince(undefined, turnStart)).toEqual({ narrationCount: 0, toolNames: [] });
+      expect(collectTurnWorkSince(null, turnStart)).toEqual({ narrationCount: 0, toolNames: [] });
+    });
+
+    it("ignores an EARLIER turn's work", () => {
+      const msgs = [
+        assistant('2026-08-04T22:40:00Z', 'from a previous turn'),
+        tool('2026-08-04T22:40:05Z', 'twitter_outreach'),
+      ];
+      expect(collectTurnWorkSince(msgs, turnStart)).toEqual({ narrationCount: 0, toolNames: [] });
+    });
+
+    it('counts this turn\'s narration and de-dupes tool names in first-seen order', () => {
+      const msgs = [
+        assistant('2026-08-04T22:47:00Z', 'Scanned batch 1.'),
+        tool('2026-08-04T22:48:21Z', 'twitter_outreach'),
+        assistant('2026-08-04T22:48:30Z', 'Session is logged out but the API works.'),
+        tool('2026-08-04T22:48:56Z', 'you_search_news'),
+        tool('2026-08-04T22:49:30Z', 'twitter_outreach'),
+      ];
+      expect(collectTurnWorkSince(msgs, turnStart)).toEqual({
+        narrationCount: 2,
+        toolNames: ['twitter_outreach', 'you_search_news'],
+      });
+    });
+
+    it('never counts the canned error/diagnostic closing as salvaged work', () => {
+      // This is the exact shape of the ENG-907 final message.
+      const msgs = [
+        assistant(
+          '2026-08-04T22:56:58Z',
+          'The research process for your article took longer than expected and timed out.',
+          { isErrorMessage: true, isDiagnosticMessage: true },
+        ),
+      ];
+      expect(collectTurnWorkSince(msgs, turnStart)).toEqual({ narrationCount: 0, toolNames: [] });
+    });
+
+    it('does not count a previously-persisted continuation message (no compounding on retry)', () => {
+      const msgs = [
+        assistant('2026-08-04T22:56:58Z', 'Partial results …', { kind: 'generation-timeout-continuation' }),
+      ];
+      expect(collectTurnWorkSince(msgs, turnStart).narrationCount).toBe(0);
+    });
+
+    it('ignores blank/non-string assistant content and undated messages', () => {
+      const msgs = [
+        assistant('2026-08-04T22:47:00Z', '   '),
+        assistant('2026-08-04T22:47:01Z', [{ type: 'text', text: 'array form' }]),
+        { role: 'assistant', content: 'no timestamp at all' },
+        null,
+      ];
+      expect(collectTurnWorkSince(msgs as any, turnStart).narrationCount).toBe(0);
+    });
+  });
+
+  describe('buildTimeoutPartialWorkMessage', () => {
+    it('returns null when the turn produced nothing — an empty timeout stays a 504', () => {
+      expect(buildTimeoutPartialWorkMessage({ narrationCount: 0, toolNames: [] })).toBeNull();
+      expect(buildTimeoutPartialWorkMessage(null)).toBeNull();
+      expect(buildTimeoutPartialWorkMessage(undefined)).toBeNull();
+    });
+
+    it('leads with partial results, names the tools, and invites continue', () => {
+      const msg = buildTimeoutPartialWorkMessage({
+        narrationCount: 3,
+        toolNames: ['twitter_outreach', 'you_search_news'],
+      })!;
+      expect(msg).toMatch(/Partial results/i);
+      expect(msg).toContain('`twitter_outreach`');
+      expect(msg).toContain('`you_search_news`');
+      expect(msg).toMatch(/continue/i);
+      expect(msg).toMatch(/won't redo/i);
+      // It must never read as the ENG-907 failure it replaces.
+      expect(msg).not.toMatch(/please try (your request )?again/i);
+    });
+
+    it('salvages a turn that ran tools but never narrated', () => {
+      const msg = buildTimeoutPartialWorkMessage({ narrationCount: 0, toolNames: ['twitter_outreach'] });
+      expect(msg).toMatch(/Partial results/i);
+    });
+
+    it('salvages a turn that narrated but ran no tools', () => {
+      const msg = buildTimeoutPartialWorkMessage({ narrationCount: 1, toolNames: [] })!;
+      expect(msg).toMatch(/Partial results/i);
+      expect(msg).toContain('steps above');
+    });
+
+    it('caps the tool list so a long run stays readable', () => {
+      const many = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'];
+      const msg = buildTimeoutPartialWorkMessage({ narrationCount: 1, toolNames: many })!;
+      expect(msg).toContain('`f`');
+      expect(msg).not.toContain('`g`');
+      expect(msg).toContain('and 3 more');
+    });
   });
 });
