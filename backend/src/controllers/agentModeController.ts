@@ -7050,10 +7050,36 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
-      // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
-      // This ensures anonymous users get the correct model from the session
+      // The anonymous caller cannot choose the model, but the owner's stored
+      // preference is still subject to the same current cost policy as every
+      // authenticated, scheduled, and MCP dispatch.
       const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      const modelPolicyDecision = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: session.llmModel || defaultModel,
+      });
+      if (!modelPolicyDecision.effectiveModel) {
+        // Runtime always exposes this method. The guard preserves older
+        // controller test doubles that intentionally mock only their subject.
+        if (typeof chatbotDb.updateSessionLlmModel === 'function') {
+          await chatbotDb.updateSessionLlmModel(
+            session.sessionId,
+            session.llmModel || defaultModel,
+            toStoredModelPolicyDecision(modelPolicyDecision),
+          );
+        }
+        return res.status(429).json({
+          error: 'AI usage is paused for this shared session. Please contact the owner of this link.',
+        });
+      }
+      const modelToUse = modelPolicyDecision.effectiveModel;
+      if (typeof chatbotDb.updateSessionLlmModel === 'function') {
+        await chatbotDb.updateSessionLlmModel(
+          session.sessionId,
+          modelToUse,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+        );
+      }
 
       // Use the same generateSessionResponse logic as the regular generateResponse,
       // wrapped in wall-clock timeout to guarantee lock release on hung generation.

@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import Stripe from "stripe";
+import crypto from "crypto";
 import { createStripeClient } from "../services/stripeClientFactory";
 import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
@@ -545,6 +546,16 @@ router.post('/create-usage-top-up-session', authenticateToken, async (req: Reque
       await userDb.updateUser(billingUserId, { stripe_customer_id: customerId });
     }
 
+    const topUpGrantId = crypto.randomUUID();
+    const topUpMetadata = {
+      purchaseType: 'llm_usage_top_up',
+      billingUserId,
+      packageId: packageConfig.id,
+      usageCreditMicroUsd: String(packageConfig.usageCreditMicroUsd),
+      minimumMarkupBps: String(tierConfig.llmUsageTopUp.minimumMarkupBps),
+      usagePolicyVersion: tierConfig.llmUsagePolicy?.version || '',
+      topUpGrantId,
+    };
     const session = await stripe.checkout.sessions.create({
       ui_mode: 'embedded',
       customer: customerId,
@@ -557,14 +568,11 @@ router.post('/create-usage-top-up-session', authenticateToken, async (req: Reque
           product_data: { name: packageConfig.label },
         },
       }],
-      metadata: {
-        purchaseType: 'llm_usage_top_up',
-        billingUserId,
-        packageId: packageConfig.id,
-        usageCreditMicroUsd: String(packageConfig.usageCreditMicroUsd),
-        minimumMarkupBps: String(tierConfig.llmUsageTopUp.minimumMarkupBps),
-        usagePolicyVersion: tierConfig.llmUsagePolicy?.version || '',
-      },
+      metadata: topUpMetadata,
+      // Charge refund events do not include Checkout Session metadata. Mirror
+      // the authoritative grant identity onto the PaymentIntent so Stripe
+      // carries it through to charge.refunded.
+      payment_intent_data: { metadata: topUpMetadata },
       return_url: `${CUSTOMER_FRONTEND_URL}/?usage_top_up=success&session_id={CHECKOUT_SESSION_ID}`,
     });
     res.json({ clientSecret: session.client_secret });
