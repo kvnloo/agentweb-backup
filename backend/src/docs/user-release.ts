@@ -16,7 +16,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Schedules with self-improvement switched on were hit hardest: the run could work out exactly how to improve its own prompt and then had no way to save it, so the same faults repeated week after week',
       '- Saving now makes room automatically by dropping the oldest saved prompt versions (and, only if that is still not enough, the oldest run history), so your edit goes through',
       '- If a prompt really is too long to store at all, you now get a clear message saying so and how long it is, instead of a generic failure',
-      '- Run history for an affected schedule was also being dropped silently; those runs are recorded again',
+      '- A schedule that reaches that limit would also have stopped recording its run history within a day or two; that history now makes room for itself instead of quietly stopping',
     ],
   },
   {
