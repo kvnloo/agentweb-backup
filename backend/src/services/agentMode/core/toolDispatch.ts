@@ -27,7 +27,6 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
-import { shouldEmitCrmDataChanged } from '../../../emma/crmMutationEvents';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
@@ -867,7 +866,7 @@ export async function executePreparedTools(
       // Notify the CRM page to refresh after a successful CRM-mutating tool.
       if (ports.socketEmit) {
         const crmPayload = ports.buildCrmDataChangedPayload(toolCall.function.name, functionArgs);
-        const toolSucceeded = shouldEmitCrmDataChanged(processedResult);
+        const toolSucceeded = !(processedResult && (processedResult as any).success === false);
         if (crmPayload && toolSucceeded) {
           ports.socketEmit(`user:${userId}`, ports.crmDataChangedEvent, crmPayload);
         }

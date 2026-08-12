@@ -10570,12 +10570,20 @@ export class AgentModeService {
             + `Re-sending an already-imported row is safe (it merges instead of duplicating).`;
 
       return {
-        success: complete,
+        // An incomplete import is NOT a tool failure, and must not be reported
+        // as one. `success: false` is read at the dispatch boundary
+        // (toolResultError → executePreparedTools) and downgrades the whole call
+        // to a structured tool error: the model is then handed the message
+        // string ALONE — `unimportedRows` and `reconciliation` never reach it —
+        // the call is billed to failedFunctions, the CRM refresh is skipped, and
+        // the appended retryability verdict tells the agent "do NOT retry […]
+        // report the blocker to the user". That is precisely the whole-request
+        // hand-off this ticket exists to remove. So failure is reserved for a
+        // call that landed NOTHING; an import that wrote rows but did not finish
+        // succeeds while carrying `complete: false` and its resume list.
+        success: complete || landed > 0,
         complete,
         ...(complete || attempted === 0 ? {} : { resumable: true }),
-        // Rows are in the list even though the call reports incomplete — the CRM
-        // page still has to refresh for them (see shouldEmitCrmDataChanged).
-        ...(!complete && landed > 0 ? { partial: true } : {}),
         message,
         attempted,
         reconciliation,
