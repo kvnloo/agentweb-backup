@@ -59,6 +59,9 @@ const written = () => (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0]
 describe('ENG-827 — publish consent narrows when an edit changes the required tools', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks only calls mockClear, which does NOT drain queued `once` values.
+    // A test that leaves one unconsumed would otherwise hand it to the next test.
+    mockScheduleDb.updateSchedule.mockReset();
     mockScheduleDb.updateSchedule.mockResolvedValue({} as any);
   });
 
@@ -164,5 +167,103 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
     // Authorization needs the flag AND a non-empty scope, so a narrowed list alone
     // can never re-authorize anything.
     expect(w.autopublishAuthorizedTools).toEqual(['publish_blog_article']);
+  });
+
+  // ENG-827 (Greptile, second pass): narrowing may only ever correct a grant that is
+  // actually STORED. A legacy row carries no consent field, so its scope is re-derived
+  // from the required tools on every read — this edit moves those tools and the derived
+  // scope follows on its own. There is nothing stale to correct, and writing `false`
+  // would record a refusal the owner never gave, from an edit that never asked them.
+  // It also converts a never-asked row into an explicit revocation, which is the exact
+  // "decide for the owner" error the polarity deferral exists to avoid.
+  it('does not stamp an explicit refusal on a legacy schedule that was never asked', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(
+      existing({
+        autopublishAuthorized: undefined,
+        autopublishAuthorizedTools: undefined,
+        autopublishAuthorizedAt: undefined,
+        autopublishAuthorizedBy: undefined,
+      }) as any
+    );
+
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
+      res()
+    );
+
+    const w = written();
+    expect(w).not.toHaveProperty('autopublishAuthorized');
+    expect(w).not.toHaveProperty('autopublishAuthorizedTools');
+    expect(w).not.toHaveProperty('autopublishAuthorizedAt');
+    expect(w).not.toHaveProperty('autopublishAuthorizedBy');
+  });
+
+  // The narrowing is DERIVED from a read taken earlier in this handler. The grant path
+  // already binds its write to its own read; this is the mirror. Without it an edit can
+  // land a stale `false` on top of a grant the owner made in between and got a 200 for —
+  // their consent silently gone, later runs draft-only, nothing anywhere saying so.
+  it('binds the narrowing write to the consent state it read', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
+      res()
+    );
+
+    const expectation = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][2];
+    expect(expectation).toEqual({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    });
+  });
+
+  it('keeps the edit and drops the stale narrowing when consent moved underneath it', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+
+    // The owner re-granted between this handler's read and its write, so the condition
+    // fails. The edit is the owner's intent and must still land; the narrowing is a
+    // derived consequence of a snapshot that is now wrong, so it is what gets dropped.
+    const conditionFailure: any = new Error('The conditional request failed');
+    conditionFailure.name = 'ConditionalCheckFailedException';
+    mockScheduleDb.updateSchedule
+      .mockRejectedValueOnce(conditionFailure)
+      .mockResolvedValueOnce({} as any);
+
+    const r = res();
+    await agentModeController.updateScheduledChat(
+      req({ scheduleName: 'Renamed', requiredFunctionCalls: ['read_brand_guidelines'] }),
+      r
+    );
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+    const retry = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1][1];
+    // The edit survives...
+    expect(retry.scheduleName).toBe('Renamed');
+    expect(retry.requiredFunctionCalls).toEqual(['read_brand_guidelines']);
+    // ...and carries none of the consent fields, so the owner's newer grant stands.
+    expect(retry).not.toHaveProperty('autopublishAuthorized');
+    expect(retry).not.toHaveProperty('autopublishAuthorizedTools');
+    expect(retry).not.toHaveProperty('autopublishAuthorizedAt');
+    expect(retry).not.toHaveProperty('autopublishAuthorizedBy');
+    // The retry is unconditional — it no longer asserts anything about consent.
+    expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1][2]).toBeUndefined();
+    // And the owner is told their edit worked, because it did.
+    expect(r.json).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Scheduled chat updated successfully' })
+    );
+  });
+
+  it('does not swallow a write failure that is not the consent condition', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+    mockScheduleDb.updateSchedule.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+    const r = res();
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
+      r
+    );
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+    expect(r.status).toHaveBeenCalledWith(500);
   });
 });
