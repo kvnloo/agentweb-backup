@@ -269,6 +269,65 @@ describe("Admin CRM sync routes", () => {
     );
   });
 
+  // ENG-1002: this route reports attemptedCount outright, so a refused
+  // placeholder row must be named or the caller sees attempted > everything
+  // reported with no explanation for the difference.
+  it("POST /api/admin/crm-sync/:source/start accounts for rows refused as LinkedIn placeholders", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({
+        listId: "list-1",
+        lastSyncAt: "2026-02-10T00:00:00.000Z",
+        autoSync: false,
+      }),
+    } as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: "list-1",
+      publicAccessEnabled: true,
+    } as any);
+    mockUserDb.getAllUsers.mockResolvedValue([
+      {
+        userId: "new-user",
+        email: "new@example.com",
+        isAdmin: false,
+        isActive: true,
+        roles: ["customer"],
+        createdAt: "2026-02-10T01:00:00.000Z",
+      },
+      {
+        userId: "placeholder-user",
+        email: "placeholder@example.com",
+        isAdmin: false,
+        isActive: true,
+        roles: ["customer"],
+        createdAt: "2026-02-10T02:00:00.000Z",
+      },
+    ] as any);
+    mockCrmDb.batchCreateLeads.mockResolvedValue({
+      successCount: 1,
+      newCount: 1,
+      mergedCount: 0,
+      errorCount: 0,
+      anonymizedSkipped: 1,
+      errors: [],
+    } as any);
+    mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+    const res = await request(app)
+      .post("/api/admin/crm-sync/users/start")
+      .set("Authorization", "Bearer test-token")
+      .send({ forceFullSync: false })
+      .expect(200);
+
+    expect(res.body.attemptedCount).toBe(2);
+    expect(res.body.anonymizedSkipped).toBe(1);
+    // attempted must equal what the response accounts for.
+    expect(res.body.successCount + res.body.errorCount + res.body.anonymizedSkipped).toBe(
+      res.body.attemptedCount
+    );
+    expect(res.body.message).toContain("1 anonymized LinkedIn placeholder(s) skipped");
+  });
+
   it("POST /api/admin/crm-sync/:source/start does not update lastSyncAt when sync has errors", async () => {
     mockSettingsService.getSetting.mockResolvedValue({
       settingName: "admin_crm_sync_waitlist",
