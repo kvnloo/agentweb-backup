@@ -294,8 +294,12 @@ export class McpOAuthService {
     const record = result.Item as OAuthSignupIntent | undefined;
     if (!record) return false;
     if (record.clientId !== clientId) return false;
-    if (record.userAgentHash !== userAgentHash) return false;
-    if (record.ipHash !== ipHash) return false;
+    const userAgentMatches = record.userAgentHash === userAgentHash;
+    const ipMatches = record.ipHash === ipHash;
+    // Avoid brittle handoffs: allow either browser identity or network affinity to
+    // match. Requiring both causes false negatives when users change network or
+    // edge-terminating proxies while continuing the same signup flow.
+    if (!userAgentMatches && !ipMatches) return false;
     if (record.used) return false;
     if (record.purpose !== "mcp_signup") return false;
 

@@ -66,7 +66,7 @@ jest.mock('bcryptjs', () => ({
 
 jest.mock('jsonwebtoken', () => ({
   sign: jest.fn().mockReturnValue('test.jwt.token'),
-  verify: jest.fn().mockReturnValue({ purpose: 'mcp_signup' }),
+  verify: jest.fn().mockReturnValue({ purpose: 'mcp_signup', clientId: 'mcp-client', intentId: 'intent-123' }),
 }));
 
 // Import the controller AFTER mocks are set up.
