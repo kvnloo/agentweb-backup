@@ -165,15 +165,49 @@ describe('resolveMetaPixelWithDefault', () => {
     expect(getMetaAccountCredentials).not.toHaveBeenCalled();
   });
 
-  it('is unresolved when the first connected account has zero pixels (does not try a second account)', async () => {
+  it('REGRESSION (live-test caught this): falls through to a second account when the first has zero pixels, instead of stopping at the first account', async () => {
+    // The whole point of this resolver is "always resolvable once ANY connected
+    // account has a pixel" — a customer whose first-listed account happens to have
+    // none must not be told unresolved when a later account would have worked.
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }, { accountId: 'acc2' }]);
-    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+    (getMetaAccountCredentials as jest.Mock)
+      .mockResolvedValueOnce({ accountId: 'acc1', accessToken: 'tok1', accountName: 'Acc 1' })
+      .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })
+      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'secondAccountPixel' }] }) });
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
+
+    expect(result).toEqual({ pixelId: 'secondAccountPixel', accountId: 'acc2' });
+    expect(getMetaAccountCredentials).toHaveBeenCalledTimes(2);
+    expect(getMetaAccountCredentials).toHaveBeenNthCalledWith(1, user, 'user1', 'acc1');
+    expect(getMetaAccountCredentials).toHaveBeenNthCalledWith(2, user, 'user1', 'acc2');
+  });
+
+  it('is unresolved when every connected account has zero pixels', async () => {
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }, { accountId: 'acc2' }]);
+    (getMetaAccountCredentials as jest.Mock)
+      .mockResolvedValueOnce({ accountId: 'acc1', accessToken: 'tok1', accountName: 'Acc 1' })
+      .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
     mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) });
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
 
     expect('unresolved' in result && result.unresolved).toBe(true);
-    expect(getMetaAccountCredentials).toHaveBeenCalledTimes(1);
+    expect(getMetaAccountCredentials).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips an account whose credential lookup fails and tries the next one', async () => {
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }, { accountId: 'acc2' }]);
+    (getMetaAccountCredentials as jest.Mock)
+      .mockRejectedValueOnce(new Error('token expired'))
+      .mockResolvedValueOnce({ accountId: 'acc2', accessToken: 'tok2', accountName: 'Acc 2' });
+    mockFetch.mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'workingPixel' }] }) });
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', undefined);
+
+    expect(result).toEqual({ pixelId: 'workingPixel', accountId: 'acc2' });
   });
 
   it('is unresolved (not rethrown) when the Graph call throws', async () => {

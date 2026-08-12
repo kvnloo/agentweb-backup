@@ -2415,14 +2415,27 @@ export class MetaService {
         return { unresolved: true, reason: 'No Meta ad account connected' };
       }
 
-      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, accounts[0].accountId);
-      const pixels = await this.listPixels(accountId, accessToken);
-
-      if (!pixels || pixels.length === 0) {
-        return { unresolved: true, reason: `No Meta pixel found on ad account ${accountId}` };
+      // Search every connected account in order for the first one that actually has
+      // a pixel — the whole point of this resolver is "always resolvable once ANY
+      // connected account has a pixel," so it can't stop at accounts[0] just because
+      // that particular account happens to have none (a real regression caught live:
+      // a customer's first-listed account had 0 pixels while a later one had 1, and
+      // the naive accounts[0]-only version reproduced the exact silent-skip bug this
+      // resolver exists to fix). One account's failure (expired token, Graph error)
+      // is skipped, not fatal — the next account still gets a fair try.
+      let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      for (const account of accounts) {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
+          const pixels = await this.listPixels(accountId, accessToken);
+          if (pixels && pixels.length > 0) {
+            return { pixelId: pixels[0].id, accountId };
+          }
+        } catch (error: any) {
+          lastReason = error?.message || lastReason;
+        }
       }
-
-      return { pixelId: pixels[0].id, accountId };
+      return { unresolved: true, reason: lastReason };
     } catch (error: any) {
       return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
     }
