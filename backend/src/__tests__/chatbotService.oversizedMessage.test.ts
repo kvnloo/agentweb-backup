@@ -89,9 +89,17 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
 
     const storedContent = writeRequests[0].PutRequest.Item.message.content as string;
 
-    // Content should be truncated to 350,000 chars + notice
-    expect(storedContent.startsWith('x'.repeat(350_000))).toBe(true);
+    // ENG-946: the budget is the WHOLE ITEM in UTF-8 bytes, not the content string in
+    // characters. The old guard sliced content to exactly 350,000 chars and ignored the
+    // rest of the item, so the result could still exceed DynamoDB's 400KB limit and be
+    // rejected — that is the defect, not the contract. Assert what actually matters:
+    // the content is truncated, it keeps its leading data, and the ITEM fits.
+    expect(storedContent.startsWith('xxx')).toBe(true);
+    expect(storedContent.length).toBeLessThan(400_000);
     expect(storedContent).toContain('[Truncated — original size:');
+    expect(
+      Buffer.byteLength(JSON.stringify(writeRequests[0].PutRequest.Item.message), 'utf8'),
+    ).toBeLessThanOrEqual(350_000);
 
     // Should have logged a warning
     expect(warnSpy).toHaveBeenCalledWith(
