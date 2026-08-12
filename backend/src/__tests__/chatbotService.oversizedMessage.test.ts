@@ -140,3 +140,67 @@ describe('addMessagesToMessagesTable oversized message truncation', () => {
     warnSpy.mockRestore();
   });
 });
+
+/**
+ * ENG-1048: ENG-946 bounded ONLY addMessagesToMessagesTable. Three other paths
+ * write a message item to AW-ChatMessages — the session→table migration, the
+ * repair pass, and the single-message update — and each wrote the message raw,
+ * so an oversized item still threw `ValidationException: Item size has exceeded
+ * the maximum allowed size` there. Same table, same 400KB ceiling, same guard.
+ */
+describe('every AW-ChatMessages write path is size-bounded', () => {
+  const tableName = (chatbotDb as any).messagesTableName;
+  // Comfortably over the 350,000-byte budget.
+  const huge = () => ({ role: 'assistant', content: 'z'.repeat(500_000) });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    lastBatchWriteParams = null;
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  const fits = (message: any) =>
+    Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8') <= 350_000;
+
+  // FAIL: the migration path wrote the raw message
+  it('bounds messages migrated from the session record', async () => {
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-migrate', [huge()]);
+
+    const written = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message;
+    expect(fits(written)).toBe(true);
+    expect(written.content).toContain('[Truncated — original size:');
+  });
+
+  // FAIL: the repair pass wrote the raw message
+  it('bounds messages rewritten by the repair pass', async () => {
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+
+    await (chatbotDb as any).updateMessagesInDatabase('sess-repair', [
+      { messageIndex: 4, message: huge() },
+    ]);
+
+    const request = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item;
+    expect(request.messageIndex).toBe(4);
+    expect(fits(request.message)).toBe(true);
+  });
+
+  // SUCCESS: a message that already fits is written through untouched
+  it('leaves a normal message alone on both paths', async () => {
+    const small = { role: 'assistant', content: 'short answer' };
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-ok', [small]);
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(small);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).updateMessagesInDatabase('sess-ok', [{ messageIndex: 0, message: small }]);
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(small);
+  });
+});
