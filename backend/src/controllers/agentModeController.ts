@@ -15,6 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
+import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -2712,11 +2713,20 @@ async function waitForVerifiedChatRetry(attempt: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, delayMs));
 }
 
+/**
+ * Did this session actually answer? (ENG-946)
+ *
+ * Deliberately stricter than "has an assistant message": an assistant tool-call turn
+ * is not an answer, and the agent narrates one line alongside its tool calls, so the
+ * old check passed for runs that gathered data for minutes and then died before
+ * synthesising anything — recorded `success`, never requeued, transcript ending on
+ * tool results. Requires a real final answer instead (see core/finalAnswer).
+ */
 async function sessionHasAssistantMessage(sessionId: string): Promise<boolean | undefined> {
   try {
     const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     if (!Array.isArray(messages)) return undefined;
-    return messages.some((message: any) => message?.role === 'assistant');
+    return transcriptHasFinalAssistantAnswer(messages);
   } catch (error) {
     console.error(`Scheduled chat zero-output check failed for session ${sessionId}:`, error);
     return undefined;
@@ -3557,7 +3567,7 @@ export async function runScheduledChat(
       const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
       if (hasAssistantMessage === false) {
         throw new ZeroAssistantOutputError(
-          `Scheduled chat produced zero persisted assistant messages for session ${sessionId}`
+          `Scheduled chat produced no persisted assistant answer for session ${sessionId}`
         );
       }
     }

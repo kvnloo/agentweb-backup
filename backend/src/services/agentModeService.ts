@@ -4014,6 +4014,12 @@ export class AgentModeService {
             // residue-only final turn look answered — the ladder would return
             // final_response and the bounded synthesis retry would never fire.
             content: residueDroppedThisTurn ? '' : content,
+            // ENG-946: the empty-synthesis decision keys off THIS turn's text, not the
+            // accumulator — `content` is replace-on-nonempty, so a mid-run narration
+            // survived into an empty final turn and suppressed the nudge. This
+            // generalises the ENG-1054 line above, which only unsticks `content` for the
+            // residue case; a terminating turn that comes back plain-empty needs it too.
+            currentTurnText: responseContent,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
