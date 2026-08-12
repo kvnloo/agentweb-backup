@@ -22707,11 +22707,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // nothing", and never presents a web page as a news article.
       const newsArticleCount = normalizedResults.filter((result: any) => result.sourceType === 'news').length;
       const recentPageCount = normalizedResults.length - newsArticleCount;
-      const message = resultSource === 'news'
-        ? `Found ${normalizedResults.length} results for "${query}" within the ${freshness || 'week'} window `
-          + `(${newsArticleCount} news article${newsArticleCount === 1 ? '' : 's'}, `
-          + `${recentPageCount} recent web page${recentPageCount === 1 ? '' : 's'})`
-        : `Found ${normalizedResults.length} web search results for "${query}"`;
+      const isEmptyNewsSearch = resultSource === 'news' && normalizedResults.length === 0;
+      const message = isEmptyNewsSearch
+        // "Found 0 results" reads as a broken search, which is the ambiguity this
+        // ticket is about. Say the same thing the LLM-facing content says.
+        ? `No coverage found for "${query}" within the ${freshness || 'week'} window — `
+          + `the search itself succeeded, there is simply nothing published`
+        : resultSource === 'news'
+          ? `Found ${normalizedResults.length} results for "${query}" within the ${freshness || 'week'} window `
+            + `(${newsArticleCount} news article${newsArticleCount === 1 ? '' : 's'}, `
+            + `${recentPageCount} recent web page${recentPageCount === 1 ? '' : 's'})`
+          : `Found ${normalizedResults.length} web search results for "${query}"`;
 
       return {
         success: true,
