@@ -8818,22 +8818,36 @@ export const agentModeController = {
           // an unconditional write records consent for a tool set the owner never saw.
           // Bind the write to the read: same tools, or no grant.
           //
+          // The consent field itself is part of that read and is bound too. Without it a
+          // grant that lost the race still lands: the owner revokes, the revoke completes,
+          // and this older grant then overwrites it — permission they withdrew, restored
+          // by a request that predates the withdrawal. `undefined` compiles to
+          // `attribute_not_exists`, so a grant derived from a never-asked row lands only
+          // while that row is still never-asked.
+          //
           // A REVOKE is not conditioned. It narrows permission no matter what else
           // changed, and making it fail on a concurrent edit would be a refusal to
           // take away a permission — the one direction that must always be available.
-          authorized ? { requiredFunctionCalls: schedule.requiredFunctionCalls } : undefined
+          authorized
+            ? {
+                requiredFunctionCalls: schedule.requiredFunctionCalls,
+                autopublishAuthorized: schedule.autopublishAuthorized,
+              }
+            : undefined
         );
       } catch (writeError: any) {
         if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
           console.warn(
-            `AgentMode: ENG-827 publish consent grant for schedule ${scheduleId} refused — its required tools changed during the request.`
+            `AgentMode: ENG-827 publish consent grant for schedule ${scheduleId} refused — its required ` +
+            'tools or its consent state changed during the request.'
           );
           return res.status(409).json({
             error:
-              'This schedule\'s required functions changed while you were authorizing it, so nothing was ' +
-              'saved — the authorization would have covered a different set of tools than the one you ' +
-              'approved. Reopen the schedule to see its current tools, then turn on "Publish without my ' +
-              'review" again if it still looks right.',
+              'This schedule changed while you were authorizing it, so nothing was saved — either its ' +
+              'required functions moved, so the authorization would have covered a different set of tools ' +
+              'than the one you approved, or its publishing permission was changed from somewhere else. ' +
+              'Reopen the schedule to see where it stands, then turn on "Publish without my review" again ' +
+              'if it still looks right.',
           });
         }
         throw writeError;
