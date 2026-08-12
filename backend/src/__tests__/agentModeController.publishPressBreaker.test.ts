@@ -299,3 +299,77 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect((result as any).publishHeldForApproval).toBeUndefined();
   });
 });
+
+/**
+ * ENG-947 — the real 2026-08-11 run of schedule 34154af9 "Kevin — X Evening
+ * Post". requiredFunctionCalls names post_on_connected_account, but the prompt
+ * asks for a 2-3 tweet THREAD, so the model published via twitter_manage_post
+ * (once, successfully, summary "Thread Published") and never touched the named
+ * tool. The requirement stayed unmet and the run pressed to attempt 20.
+ *
+ * Stopping early is right. Calling it held-for-approval is not: the thread is
+ * live on X, so that marker would tell the owner to approve something already
+ * published, and would hide the thing they actually need to fix — the schedule's
+ * required function.
+ */
+describe('runScheduledChat — published through a different tool (ENG-947)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockChatbotDb.createChatSession.mockResolvedValue(session as any);
+    mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([{ role: 'assistant', content: 'x' }]);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(session as any);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    (mockAgentModeService as any).generateScheduledChatSummary.mockResolvedValue('Thread Published');
+    mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
+    mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule as any);
+    mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([] as any);
+    mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined as any);
+  });
+
+  it('reports a requirement mismatch, NOT held-for-approval, when the thread went out', async () => {
+    mockWorker.runInWorker.mockResolvedValue(
+      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post' } }], 'Thread published.') as any,
+    );
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
+    expect(result.functionCallMisses).toEqual(['post_on_connected_account']);
+    expect((result as any).publishRequirementMismatch).toBe(true);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+    // Still a failure — the requirement genuinely is unmet and the owner must fix
+    // the schedule; it just is not waiting on their approval.
+    expect(result.status).toBe('failure');
+  });
+
+  it('persists the mismatch marker, and never the held marker, on the stored run result', async () => {
+    mockWorker.runInWorker.mockResolvedValue(
+      workerReply([{ name: 'twitter_manage_post', arguments: { action: 'post' } }], 'Thread published.') as any,
+    );
+
+    await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+      'schedule-947',
+      expect.objectContaining({ status: 'failure', publishRequirementMismatch: true }),
+    );
+    const stored = (mockScheduleDb.addRunResult as jest.Mock).mock.calls[0][1] as any;
+    expect(stored.publishHeldForApproval).toBeUndefined();
+  });
+
+  it('a FAILED write through the other tool is still a genuine withhold', async () => {
+    // Nothing reached X, so the content really is waiting on the owner.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerReply([{ name: 'twitter_manage_post', arguments: {}, error: 'rate limited' } as any]) as any,
+    );
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
+  });
+});

@@ -1,4 +1,4 @@
-import { isPublishName } from './hardeningGaps';
+import { isPublishName, isPowerTool } from './hardeningGaps';
 
 /**
  * ENG-947 — the publish-press circuit breaker.
@@ -80,4 +80,58 @@ export function shouldStopPressingForPublish(params: {
   const budget = params.maxPressAttempts ?? MAX_PUBLISH_PRESS_ATTEMPTS;
   if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return false;
   return pressAttempt >= budget;
+}
+
+/**
+ * Why the run stalled on an unmet publish requirement. The distinction matters
+ * because the two states need OPPOSITE things from the owner.
+ *
+ * - `held-for-approval`   nothing was published. The content is waiting on them.
+ * - `requirement-names-unused-publish-tool`
+ *                         the run DID write externally, just not through the
+ *                         tool the schedule names. Nothing is waiting on them;
+ *                         their schedule's requiredFunctionCalls is wrong.
+ *
+ * Observed: schedule 34154af9 "Kevin — X Evening Post" requires
+ * post_on_connected_account, but its prompt asks for a 2-3 tweet thread, so the
+ * model reaches for twitter_manage_post and publishes. Reporting that run as
+ * held-for-approval would tell the owner to approve a thread already live on X —
+ * the same class of false report this ticket family keeps producing.
+ */
+export type PublishStallReason = 'held-for-approval' | 'requirement-names-unused-publish-tool';
+
+/**
+ * Decide whether to stop pressing, and if so, WHY. `null` means keep pressing.
+ *
+ * `externalWritesSucceeded` is the set of irreversible external writes this run
+ * actually completed — publish tools and send/post tools alike (isPowerTool),
+ * filtered by the caller to SUCCEEDED calls only. A failed publish wrote nothing,
+ * so it must not suppress the approval signal; that filtering is the caller's job
+ * because only it can see each call's error.
+ *
+ * A name that is itself still unmet is ignored: an unmet requirement is by
+ * definition one the run did not satisfy, so counting it as evidence of a write
+ * would let a malformed caller silently downgrade a genuine withhold.
+ */
+export function classifyPublishStall(params: {
+  pressAttempt: number;
+  unmetRequiredFunctions: string[];
+  externalWritesSucceeded: string[];
+  maxPressAttempts?: number;
+}): PublishStallReason | null {
+  const { unmetRequiredFunctions, externalWritesSucceeded } = params;
+  if (
+    !shouldStopPressingForPublish({
+      pressAttempt: params.pressAttempt,
+      unmetRequiredFunctions,
+      maxPressAttempts: params.maxPressAttempts,
+    })
+  ) {
+    return null;
+  }
+  const unmet = new Set(unmetRequiredFunctions);
+  const wroteSomethingElse = (externalWritesSucceeded || []).some(
+    (name) => typeof name === 'string' && !unmet.has(name) && isPowerTool(name),
+  );
+  return wroteSomethingElse ? 'requirement-names-unused-publish-tool' : 'held-for-approval';
 }

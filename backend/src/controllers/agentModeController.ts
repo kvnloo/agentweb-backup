@@ -21,7 +21,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
-import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
@@ -1931,6 +1931,7 @@ type RunVerifiedChatResult = {
   // WHY it ended early, so the outcome is distinguishable from a run that
   // exhausted all 20 attempts for some other reason.
   publishHeldForApproval?: boolean;
+  publishRequirementMismatch?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -2610,24 +2611,42 @@ export async function runVerifiedChat(
       if (publishIsTheOnlyThingLeft) {
         publishPressAttempts++;
       }
-      if (
-        publishIsTheOnlyThingLeft &&
-        shouldStopPressingForPublish({
-          pressAttempt: publishPressAttempts,
-          unmetRequiredFunctions: functionCallMisses,
-        })
-      ) {
+      // A stalled publish requirement has two causes and they need opposite things
+      // from the owner, so the marker must not conflate them. Only SUCCEEDED
+      // external writes count as evidence the run published — a failed publish
+      // wrote nothing and is still a genuine withhold.
+      const externalWritesSucceeded = publishIsTheOnlyThingLeft
+        ? allToolCalls
+            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
+            .map((tc: any) => tc.name as string)
+        : [];
+      const publishStall = publishIsTheOnlyThingLeft
+        ? classifyPublishStall({
+            pressAttempt: publishPressAttempts,
+            unmetRequiredFunctions: functionCallMisses,
+            externalWritesSucceeded,
+          })
+        : null;
+      if (publishStall) {
+        const heldForApproval = publishStall === 'held-for-approval';
         console.warn(
           `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
           `with [${functionCallMisses.join(', ')}] still ` +
-          `uncalled. Ending the run instead of re-pressing to ${maxAttempts} attempts — the content is held ` +
-          `for approval, and repeating an identical press for an irreversible publish only burns prompt-cache ` +
-          `writes (ENG-947).`
+          `uncalled. Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
+          (heldForApproval
+            ? `the content is held for approval, and repeating an identical press for an irreversible ` +
+              `publish only burns prompt-cache writes`
+            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+              `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
+              `succeed`) +
+          ` (ENG-947).`
         );
         return {
           success: false,
-          publishHeldForApproval: true,
+          ...(heldForApproval
+            ? { publishHeldForApproval: true }
+            : { publishRequirementMismatch: true }),
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -2885,6 +2904,7 @@ export async function runScheduledChat(
   // ENG-947: present only when the run stopped early on the publish-press budget
   // with the publish tool still uncalled (content drafted and held, not published).
   publishHeldForApproval?: boolean;
+  publishRequirementMismatch?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -3738,6 +3758,14 @@ export async function runScheduledChat(
       // escalation must keep firing), but marked so a held run is distinguishable
       // from a run that exhausted all 20 attempts for some other reason.
       ...(result.publishHeldForApproval ? { publishHeldForApproval: true } : {}),
+      // ENG-947: same early exit, opposite cause — the run DID write externally,
+      // just not through the tool requiredFunctionCalls names (a thread goes out
+      // via twitter_manage_post, not post_on_connected_account). Also a `failure`,
+      // because the requirement really is unmet, but it must never be reported as
+      // held-for-approval: nothing is waiting on the owner, and telling them to
+      // approve a post already live on X is the false report this ticket is about.
+      // What they need to fix is the schedule's required function.
+      ...(result.publishRequirementMismatch ? { publishRequirementMismatch: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
