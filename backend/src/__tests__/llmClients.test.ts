@@ -76,6 +76,68 @@ const meterCtx = { userId: 'user-1', feature: 'chat', sessionId: 'sess-1' };
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe('llmClients normalizers', () => {
+  // ENG-1134: the Bedrock Converse wrapper answers in OpenAI shape while carrying
+  // Anthropic's cache counters, so it dispatches to normalizeOpenAIUsage rather
+  // than normalizeAnthropicUsage. Reading only prompt_tokens_details recorded its
+  // cache as zero — and cache is the bulk of Bedrock traffic, so that under-counted
+  // the spend roughly fourfold in the ledger the cost cap is enforced against.
+
+  it('falls back to Anthropic-style cache reads when OpenAI details are absent', () => {
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_read_input_tokens: 4000,
+      })
+    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 4000 });
+  });
+
+  it('prefers the OpenAI cached_tokens field when both shapes are present', () => {
+    // A genuine OpenAI response must not be reinterpreted through the fallback.
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        prompt_tokens_details: { cached_tokens: 40 },
+        cache_read_input_tokens: 4000,
+      })
+    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 });
+  });
+
+  it('carries Anthropic cache writes and their TTL split when reported', () => {
+    // ENG-893 prices writes by the TTL actually applied, so the breakdown has to
+    // survive normalization or 1h writes bill at the 5m rate.
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_creation_input_tokens: 700,
+        cache_creation: { ephemeral_1h_input_tokens: 700 },
+      })
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 25,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 700,
+      cacheWriteByTtl: { '1h': 700 },
+    });
+  });
+
+  it('emits a cache-write count without a TTL split when none is reported', () => {
+    expect(
+      normalizeOpenAIUsage({
+        prompt_tokens: 100,
+        completion_tokens: 25,
+        cache_creation_input_tokens: 700,
+      })
+    ).toEqual({
+      inputTokens: 100,
+      outputTokens: 25,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 700,
+    });
+  });
+
   it('normalizes OpenAI chat usage including cached prompt tokens', () => {
     expect(
       normalizeOpenAIUsage({
