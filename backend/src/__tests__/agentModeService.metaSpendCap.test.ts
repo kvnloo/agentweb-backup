@@ -38,6 +38,7 @@ jest.mock('../utils/secretsManager', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { toolResultError } from '../utils/toolResultError';
 
 const mockUser = {
   id: 'user123',
@@ -87,8 +88,21 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.spend_cap).toBe(100000);
     });
 
+    it('names the requested campaign even though Meta returns only an id', async () => {
+      // metaService.createCampaign asks the Graph API for `id` only, so this is the real
+      // create response shape. It used to render as `Campaign "undefined" created
+      // successfully` in production (session 5ac8aeef-db88-4ccc-85ca-347b13c99542).
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', spend_cap: '100000' });
+
+      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+
+      expect(result.message).toContain('Capped campaign');
+      expect(result.message).not.toContain('undefined');
+    });
+
     it('reports the cap as NOT applied when the read-back shows no cap (the reported bug)', async () => {
-      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', name: 'Capped campaign' });
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
       // Exactly what a raw Graph read returned for the two new campaigns: no spend_cap at all.
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
 
@@ -100,6 +114,11 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       // The campaign id must survive so the caller can repair it with an UPDATE
       // instead of creating a duplicate campaign.
       expect(result.campaign).toEqual(expect.objectContaining({ id: 'camp_new' }));
+      // CREATE keeps success:true deliberately: the campaign DOES exist, and a
+      // success:false result is rewritten at the dispatch boundary into a bare error
+      // string, which would hide the campaign id and invite a duplicate create.
+      expect(result.success).toBe(true);
+      expect(toolResultError(result)).toBeNull();
     });
 
     it('reports the cap as unverified (never as applied) when the read-back itself fails', async () => {
@@ -150,8 +169,29 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('SPEND_CAP_NOT_APPLIED');
+      expect(result.error).toMatch(/^SPEND_CAP_NOT_APPLIED/);
       expect(result.message).toMatch(/NOT applied/i);
+      expect(result.spend_cap_requested).toBe(300000);
+      expect(result.spend_cap_applied).toBe(100000);
+    });
+
+    it('carries the whole story in the reason the model actually sees', async () => {
+      // A success:false result never reaches the model as JSON: the dispatch boundary
+      // (utils/toolResultError → extractToolResultMessage) replaces it with ONE reason
+      // string taken from `error` before `message`, and extractMinimalToolResult keeps
+      // nothing for this tool. So the reason itself has to name the requested cap, the
+      // campaign, and what to tell the user — a bare code told the model nothing.
+      (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1' });
+
+      const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
+
+      const modelVisibleReason = toolResultError(result)?.message ?? '';
+      expect(modelVisibleReason).toContain('SPEND_CAP_NOT_APPLIED');
+      expect(modelVisibleReason).toContain('300000');
+      expect(modelVisibleReason).toContain('camp_1');
+      expect(modelVisibleReason).toMatch(/NO spend cap set/i);
+      expect(modelVisibleReason).toMatch(/tell the user/i);
     });
 
     it('does not claim success-with-cap when the read-back itself fails', async () => {
