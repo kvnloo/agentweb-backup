@@ -66,9 +66,10 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
     process.send = originalSend;
   });
 
-  it('passes turnStartMs and publishAuthorizationOverride in the order the service declares', async () => {
+  it('passes turnStartMs, publishAuthorizationOverride, and the policy fallback in declaration order', async () => {
     const authorization = { authorized: true, tools: ['post_on_connected_account'] };
     const turnStartMs = 1_760_000_000_000;
+    const transientFallbackModel = 'gemini-3.1-flash-lite';
 
     await handleMessage({
       type: 'generateMarketingResponse',
@@ -81,17 +82,19 @@ describe('ENG-827 — the worker forwards the publish authorization in the right
         sessionId: 'sess-1',
         publishAuthorizationOverride: authorization,
         turnStartMs,
+        transientFallbackModel,
       },
     });
 
     expect(generateMarketingResponse).toHaveBeenCalledTimes(1);
     const args = generateMarketingResponse.mock.calls[0];
 
-    // The two trailing arguments, in the order generateMarketingResponse declares them.
+    // The trailing arguments, in the order generateMarketingResponse declares them.
     // Asserted by VALUE SHAPE as well as position, so a swap cannot pass: a number is
     // never an authorization, and an authorization is never a deadline.
-    expect(args[args.length - 2]).toBe(turnStartMs);
-    expect(args[args.length - 1]).toEqual(authorization);
-    expect(typeof args[args.length - 2]).toBe('number');
+    expect(args[args.length - 3]).toBe(turnStartMs);
+    expect(args[args.length - 2]).toEqual(authorization);
+    expect(args[args.length - 1]).toBe(transientFallbackModel);
+    expect(typeof args[args.length - 3]).toBe('number');
   });
 });

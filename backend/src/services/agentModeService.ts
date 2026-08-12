@@ -1724,7 +1724,21 @@ export class AgentModeService {
     );
   }
 
-  async getBackupModel(primaryModel: string): Promise<string | null> {
+  async getBackupModel(
+    primaryModel: string,
+    // undefined = preserve the admin-managed global fallback. A string or null is
+    // an explicit dispatch policy: use only that model, or do not retry at all.
+    // This distinction prevents optimized-mode requests from escaping to a premium
+    // global backup after the admission policy selected a cheaper model.
+    transientFallbackModel?: string | null,
+  ): Promise<string | null> {
+    if (transientFallbackModel !== undefined) {
+      return transientFallbackModel &&
+        transientFallbackModel !== primaryModel &&
+        Boolean(this.llmModels[transientFallbackModel])
+        ? transientFallbackModel
+        : null;
+    }
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
       const configured = setting?.settingValue?.trim();
@@ -3289,7 +3303,10 @@ export class AgentModeService {
     // by the scheduled path so the system prompt is built from the SAME value the
     // required-function checker holds; absent on the interactive path, which resolves
     // per turn below.
-    publishAuthorizationOverride?: SchedulePublishAuthorization
+    publishAuthorizationOverride?: SchedulePublishAuthorization,
+    // Cost-policy-owned retry target. undefined preserves the global admin backup;
+    // null explicitly disables retry. Optimized callers always send string|null.
+    transientFallbackModel?: string | null,
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4102,7 +4119,7 @@ export class AgentModeService {
           if (synthesisRetryUnaffordable) {
             // handled above — fall through to the break after the span is closed
           } else if (isTransientLLMError(callError) && !backupModelUsed) {
-            const backup = await this.getBackupModel(llmModel);
+            const backup = await this.getBackupModel(llmModel, transientFallbackModel);
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
               if (onProgress) {
