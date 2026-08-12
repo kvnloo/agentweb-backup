@@ -116,6 +116,46 @@ describe('McpClientService browser session isolation (ENG-1118)', () => {
     expect(keyA).not.toBe(keyB);
   });
 
+  // The server-name/command heuristic is our own naming; the TOOL names come from the
+  // server itself (Playwright MCP exposes browser_navigate, browser_evaluate, ...). Keying
+  // isolation on the tool means renaming or re-hosting the server cannot silently drop a
+  // browser back into a shared per-user pool — which would reinstate ENG-1118 with no signal.
+  it('isolates per session when the TOOL is a browser tool, however opaque the server', async () => {
+    (service as any).serverConfigs.set('automation-gateway', {
+      config: { transport: 'sse', url: 'https://gateway.example.com/sse' },
+      toolPrefix: 'automation',
+    });
+
+    const keyA = (service as any).getPoolKey('automation-gateway', 'chat-session-a', 'user-1', 'browser_navigate');
+    const keyB = (service as any).getPoolKey('automation-gateway', 'chat-session-b', 'user-1', 'browser_navigate');
+
+    expect(keyA).toBe('user-1::chat-session-a');
+    expect(keyB).toBe('user-1::chat-session-b');
+    expect(keyA).not.toBe(keyB);
+  });
+
+  it('hands two sessions separate clients for a browser tool on an opaque server', async () => {
+    await registerServer('automation-gateway', { transport: 'sse', url: 'https://gateway.example.com/sse' }, 'automation');
+
+    const clientA = await (service as any).getSessionClient('automation-gateway', 'chat-session-a', 'user-1', 'browser_navigate');
+    const clientB = await (service as any).getSessionClient('automation-gateway', 'chat-session-b', 'user-1', 'browser_navigate');
+
+    expect(clientA).not.toBe(clientB);
+  });
+
+  it('keeps per-user pooling for a non-browser tool on that same server', async () => {
+    (service as any).serverConfigs.set('automation-gateway', {
+      config: { transport: 'sse', url: 'https://gateway.example.com/sse' },
+      toolPrefix: 'automation',
+    });
+
+    const keyA = (service as any).getPoolKey('automation-gateway', 'chat-session-a', 'user-1', 'list_records');
+    const keyB = (service as any).getPoolKey('automation-gateway', 'chat-session-b', 'user-1', 'list_records');
+
+    expect(keyA).toBe('user-1');
+    expect(keyB).toBe('user-1');
+  });
+
   it('falls back to per-user pooling for a server with no stored config', async () => {
     const keyA = (service as any).getPoolKey('unknown-server', 'chat-session-a', 'user-1');
     const keyB = (service as any).getPoolKey('unknown-server', 'chat-session-b', 'user-1');
