@@ -172,7 +172,7 @@ export class MetaService {
    */
   private static readonly CAMPAIGN_READ_FIELDS = [
     'id', 'name', 'status', 'objective',
-    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
   ] as const;
 
@@ -875,7 +875,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
       const result = await campaign.get(fields);
       return result._data;
