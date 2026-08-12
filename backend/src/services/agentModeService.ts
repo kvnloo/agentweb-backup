@@ -3960,13 +3960,21 @@ export class AgentModeService {
               hardCapMs: turnHardCapMs,
               longestLlmCallMs: longestLlmCallMsThisRun,
             });
+            // What the retry will cost is a FULL call, so size it against the slowest full
+            // call this run actually made — not against the attempt that just failed. A
+            // primary that fails fast (an immediate 429, a dropped socket) burns almost no
+            // clock, so comparing to it alone waves through a backup that is slower than the
+            // time left and crosses the cap anyway, discarding the very partial answer this
+            // guard protects. Take whichever estimate is larger.
             const failedCallMs = Date.now() - llmStart;
-            if (retryBudget.remainingMs <= failedCallMs) {
+            const estimatedRetryMs = Math.max(failedCallMs, longestLlmCallMsThisRun);
+            if (retryBudget.remainingMs <= estimatedRetryMs) {
               console.warn(
                 `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
                 `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
-                `${Math.round(failedCallMs / 1000)}s) — not starting a retry that would run past the ` +
-                'turn cap; delivering the work gathered so far'
+                `${Math.round(failedCallMs / 1000)}s; a full call has taken up to ` +
+                `${Math.round(longestLlmCallMsThisRun / 1000)}s this run) — not starting a retry that ` +
+                'would run past the turn cap; delivering the work gathered so far'
               );
               recordSpanError(chatSpan, callError);
               synthesisRetryUnaffordable = true;
