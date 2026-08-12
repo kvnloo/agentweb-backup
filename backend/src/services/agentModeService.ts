@@ -16141,9 +16141,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const campaign = await metaService.createCampaign(accountId, accessToken, params);
 
+      // metaService.createCampaign requests only `id` back from the Graph API, so the
+      // created object carries no `name` — in production this printed
+      // `Campaign "undefined" created successfully` (prod session
+      // 5ac8aeef-db88-4ccc-85ca-347b13c99542), which the agent then had to explain away
+      // to the user mid-verification. Fall back to the name that was requested.
+      const campaignName = campaign?.name || params.name;
       const created = {
         success: true,
-        message: `Campaign "${campaign.name}" created successfully`,
+        message: `Campaign "${campaignName}" created successfully`,
         campaign: campaign
       };
 
@@ -16164,7 +16170,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (check.readFailed) {
         return {
           ...created,
-          message: `Campaign "${campaign.name}" was created, but its spend cap could not be verified ` +
+          message: `Campaign "${campaignName}" was created, but its spend cap could not be verified ` +
             `(${check.detail}). Do NOT tell the user a spend cap is in place — re-read it with ` +
             `CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap") first.`,
           spend_cap_requested: params.spend_cap,
@@ -16173,7 +16179,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       return {
         ...created,
-        message: `⚠️ Campaign "${campaign.name}" was created, but the requested spend cap of ` +
+        message: `⚠️ Campaign "${campaignName}" was created, but the requested spend cap of ` +
           `${params.spend_cap} was NOT applied — ${check.detail}. This campaign has no hard spend stop. ` +
           `Apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, params.spend_cap=${params.spend_cap}) ` +
           `and tell the user the cap is not yet in place. Do NOT create the campaign again.`,
@@ -16725,15 +16731,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           spend_cap_verified: false,
         };
       }
+      // This is the one path that returns success:false, so it is also the one path the
+      // dispatch boundary rewrites: utils/toolResultError turns a success:false result into
+      // a tool error whose model-visible reason is extractToolResultMessage(result), which
+      // reads `error` BEFORE `message` — and the per-tool minimizer keeps nothing for this
+      // tool. A bare `error: 'SPEND_CAP_NOT_APPLIED'` therefore reached the model as that
+      // code and nothing else: not the amount, not the campaign, not the instruction to
+      // tell the user. For a money-affecting field that is the whole point of the message,
+      // so the reason itself carries the detail (the code stays as its prefix so callers
+      // and the tool contract can still match on it).
+      const notApplied =
+        `SPEND_CAP_NOT_APPLIED: the requested spend cap of ${normalizedParams.spend_cap} was NOT applied ` +
+        `to campaign ${campaignId} — ${check.detail}. The campaign does not have the hard spend stop you ` +
+        `asked for. Tell the user the cap is NOT in place and never claim it is set. If they ask you to ` +
+        `try again, the identical CAMPAIGN UPDATE (campaign_id=${campaignId}, ` +
+        `params.spend_cap=${normalizedParams.spend_cap}) is safe to re-send — the write is idempotent.`;
       return {
         success: false,
-        message: `⚠️ The requested spend cap of ${normalizedParams.spend_cap} was NOT applied to campaign ` +
-          `${campaignId} — ${check.detail}. The campaign does not have the hard spend stop you asked for; ` +
-          `tell the user it is not in place.`,
+        message: `⚠️ ${notApplied}`,
         spend_cap_requested: normalizedParams.spend_cap,
         spend_cap_applied: check.applied,
         spend_cap_verified: false,
-        error: 'SPEND_CAP_NOT_APPLIED',
+        error: notApplied,
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
