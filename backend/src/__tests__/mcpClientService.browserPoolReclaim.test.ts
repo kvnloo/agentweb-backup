@@ -298,6 +298,39 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
     });
   });
 
+  describe('one browser per session, even under concurrent calls', () => {
+    // An agent routinely issues parallel browser calls in a single turn (the reporter's run
+    // did: "mining several publisher tracks in parallel"). Both land in getSessionClient
+    // before either has registered a client, so anything awaited between the pending-client
+    // check and its registration lets both build one — the second overwrites the first in
+    // the pool, orphaning a Chromium nothing will ever close and splitting that session's
+    // page across two browsers. Which is ENG-1118's failure, reintroduced from the inside.
+    it('coalesces concurrent requests for the same session onto one browser', async () => {
+      buildService();
+
+      const [first, second] = await Promise.all([
+        (service as any).getSessionClient('playwright', 'session-a', 'user-1'),
+        (service as any).getSessionClient('playwright', 'session-a', 'user-1'),
+      ]);
+
+      expect(first).toBe(second);
+      expect(mockClientFactory).toHaveBeenCalledTimes(1);
+      expect((service as any).sessionClientPools.get('user-1::session-a').clients.size).toBe(1);
+    });
+
+    it('still gives concurrent requests from different sessions their own browser', async () => {
+      buildService();
+
+      const [a, b] = await Promise.all([
+        (service as any).getSessionClient('playwright', 'session-a', 'user-1'),
+        (service as any).getSessionClient('playwright', 'session-b', 'user-1'),
+      ]);
+
+      expect(a).not.toBe(b);
+      expect(mockClientFactory).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('explicit session release', () => {
     it('leaves a pool alone while a tool call is still running against it', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
