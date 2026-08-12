@@ -107,10 +107,17 @@ process.on('message', async (message: any) => {
         screenshotUrl,
         isDelegatedAccess,
         persistIncrementally,
-        publishAuthorizationOverride,
         // ENG-907: the caller's whole-turn deadline stamp, so the loop's time budget
         // measures against the same cap (the fork/IPC hop happens before we get here).
-        turnStartMs
+        turnStartMs,
+        // ENG-827: the authorization the CALLER resolved, so the system prompt is built
+        // from the same value the required-function checker holds.
+        //
+        // Both of these arrive off `message.params` and are therefore `any`, so their
+        // order is NOT type-checked here — passing them the wrong way round compiles
+        // clean and silently swaps a deadline for an authorization. Keep this list in
+        // the same order as generateMarketingResponse's signature.
+        publishAuthorizationOverride
       );
 
       // Clean up cancelled flag
