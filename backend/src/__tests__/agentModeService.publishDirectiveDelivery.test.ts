@@ -158,13 +158,32 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     const messages = await capture(ADMITTED_SESSION, {
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      // no consent recorded — absence is not consent
+      // An explicit revocation. Absence of the field is NOT this state — see the
+      // legacy test below.
+      autopublishAuthorized: false,
     });
 
     const last = messages[messages.length - 1];
     expect(last.role).toBe('system');
     expect(last.content).toContain('NOT pre-authorized to publish');
     expect(last.content).not.toContain('PRE-AUTHORIZED to publish');
+  });
+
+  // The polarity deferral: a schedule created before consent was recordable carries
+  // no field at all, which is a question nobody was asked rather than a refusal. It
+  // keeps publishing under ENG-803's shipped opt-out, scoped to the publish tools the
+  // schedule already designates. Reading absence as "withheld" here would have stopped
+  // every one of the ~900 legacy rows on deploy — the exact failure this ticket is about.
+  it('AUTHORIZED for a legacy schedule that was never asked, scoped to its own publish tool', async () => {
+    const messages = await capture(ADMITTED_SESSION, {
+      scheduleId: SCHEDULE_ID,
+      requiredFunctionCalls: ['post_on_connected_account'],
+      // no consent field — this row predates the flag
+    });
+
+    const last = messages[messages.length - 1];
+    expect(last.content).toContain('PRE-AUTHORIZED to publish');
+    expect(last.content).toContain('covers ONLY post_on_connected_account');
   });
 
   it('WITHHELD: a run admitted draft-only cannot be widened by a mid-run grant', async () => {

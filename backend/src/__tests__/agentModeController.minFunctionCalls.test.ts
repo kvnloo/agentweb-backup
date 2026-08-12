@@ -761,9 +761,11 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       // The owner revokes after the run was admitted: every later re-read is revoked.
+      // An EXPLICIT false — absence of the field is the never-asked legacy state and
+      // still publishes, so it would not exercise the kill switch at all.
       mockScheduleDb.getScheduleById.mockResolvedValue({
         ...publishSchedule,
-        // no consent recorded — absence is not consent
+        autopublishAuthorized: false,
       } as any);
       // The model does NOT publish. Under the admitted (authorized) snapshot the
       // checker would nudge for post_on_connected_account until maxAttempts.
@@ -800,7 +802,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       };
       mockScheduleDb.getScheduleById.mockResolvedValue({
         ...publishSchedule,
-        // no consent recorded — absence is not consent
+        autopublishAuthorized: false,
       } as any);
       // Never satisfies analyze_competitors, so the run takes more than one turn and we
       // can inspect what the SECOND turn actually sent to the model.
