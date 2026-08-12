@@ -222,6 +222,7 @@ type EffectiveModelPolicyDecision = PolicyModelDecision & {
   // undefined keeps unrestricted requests on the global backup behavior; optimized
   // requests always carry string|null so provider retries cannot escape the catalog.
   transientFallbackModel?: string | null;
+  transientFallbackSource?: ModelBackupSource | null;
 };
 
 function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
@@ -279,18 +280,32 @@ async function resolveEffectiveModelForUser(input: {
     policy: usage.policy,
   });
   let transientFallbackModel: string | null | undefined;
+  let transientFallbackSource: ModelBackupSource | null | undefined;
   if (usage.mode.usageMode === 'optimized') {
     const optimizedModels = new Set(usage.policy?.optimizedModelIds || []);
-    transientFallbackModel = [decision.backupModel, usage.policy?.optimizedDefaultModel, ...optimizedModels]
-      .find((model): model is string => Boolean(
-        model && model !== decision.effectiveModel && optimizedModels.has(model) && supportedModelIds.includes(model)
-      )) || null;
+    const fallback = [
+      decision.backupModel
+        ? { model: decision.backupModel, source: (decision.backupSource || 'system') as ModelBackupSource }
+        : null,
+      usage.policy?.optimizedDefaultModel
+        ? { model: usage.policy.optimizedDefaultModel, source: 'system' as ModelBackupSource }
+        : null,
+      ...[...optimizedModels].map((model) => ({ model, source: 'system' as ModelBackupSource })),
+    ].find((candidate): candidate is { model: string; source: ModelBackupSource } => Boolean(
+      candidate &&
+      candidate.model !== decision.effectiveModel &&
+      optimizedModels.has(candidate.model) &&
+      supportedModelIds.includes(candidate.model)
+    ));
+    transientFallbackModel = fallback?.model || null;
+    transientFallbackSource = fallback?.source || null;
   }
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
     transientFallbackModel,
+    transientFallbackSource,
   };
 }
 
@@ -2258,6 +2273,10 @@ export async function runVerifiedChat(
     // Already resolved by the cost policy. Optimized scheduled runs pass string|null
     // so a transient retry remains inside the approved optimized catalog.
     transientFallbackModel?: string | null;
+    // Admission decision snapshot used only for post-dispatch audit correction.
+    // Passing it explicitly avoids consulting the session object loaded before the
+    // caller's admission write (legacy sessions may not have a prior stamp).
+    modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -2657,7 +2676,8 @@ export async function runVerifiedChat(
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
-          params.transientFallbackModel
+          params.transientFallbackModel,
+          params.modelPolicyDecisionForAudit
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2788,7 +2808,8 @@ export async function runVerifiedChat(
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
-        params.transientFallbackModel
+        params.transientFallbackModel,
+        params.modelPolicyDecisionForAudit
       );
 
       if (!hasAssistantOutput(response)) {
@@ -3906,6 +3927,7 @@ export async function runScheduledChat(
       attachments: fileAttachments,
       llmModel: modelToUse,
       transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
+      modelPolicyDecisionForAudit: scheduleModelPolicy,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
       priorToolCalls: resumePriorToolCalls,
@@ -5074,6 +5096,10 @@ export async function generateSessionResponse(
   // Cost-policy-owned transient retry target. Optimized callers always pass a
   // string or null; omission preserves the unrestricted global backup behavior.
   transientFallbackModel?: string | null,
+  // The caller's just-resolved admission decision. This is intentionally not sent
+  // to the worker; it only makes the post-fallback durable audit independent of a
+  // stale pre-admission session read.
+  modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -5364,13 +5390,13 @@ export async function generateSessionResponse(
     response.backupModelUsed &&
     response.backupModel &&
     transientFallbackModel !== undefined &&
-    session.llmUsagePolicyDecision?.usageMode === 'optimized'
+    modelPolicyDecisionForAudit?.usageMode === 'optimized'
   ) {
     await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
-      ...session.llmUsagePolicyDecision,
+      ...toStoredModelPolicyDecision(modelPolicyDecisionForAudit),
       effectiveModel: response.backupModel,
       backupModel: response.backupModel,
-      backupSource: 'system',
+      backupSource: modelPolicyDecisionForAudit.transientFallbackSource || 'system',
       modelSelection: 'corrected',
       modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
       recordedAt: new Date().toISOString(),
@@ -6141,7 +6167,8 @@ export const agentModeController = {
         answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
-        modelPolicyDecision.transientFallbackModel
+        modelPolicyDecision.transientFallbackModel,
+        modelPolicyDecision
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -7155,7 +7182,8 @@ export const agentModeController = {
           // for it, exactly as ENG-907 described.
           sharedTurnStartMs,
           undefined, // publishAuthorizationOverride — shared path has no schedule consent
-          modelPolicyDecision.transientFallbackModel
+          modelPolicyDecision.transientFallbackModel,
+          modelPolicyDecision
         ),
         session.sessionId
       );
