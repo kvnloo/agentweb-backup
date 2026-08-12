@@ -18,6 +18,7 @@ import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
@@ -550,7 +551,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -589,6 +591,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {
@@ -680,27 +683,21 @@ export class ChatbotDB {
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
-          let safeMessage = message;
-          // Check serialized item size — covers both string content and content-block arrays.
-          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
-          const serializedLen = JSON.stringify(message).length;
-          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
-            if (typeof message.content === 'string') {
-              safeMessage = {
-                ...message,
-                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            } else {
-              // Content is an array of blocks — stringify it, truncate, store as plain string
-              const contentStr = JSON.stringify(message.content);
-              safeMessage = {
-                ...message,
-                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            }
+          // Check serialized item size in UTF-8 BYTES — covers both string content and
+          // content-block arrays. DynamoDB hard limit is 400KB per item; we use 350KB as a
+          // safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
+          // a CJK/emoji-heavy message is far bigger encoded than its character count.
+          //
+          // ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
+          // long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
+          // routinely 20x the answer — truncating `content` shed nothing, the item stayed
+          // over 400KB, batchWrite threw, and the report was lost from the transcript while
+          // the run still reported success. shrinkMessageForPersistence sheds the ledger
+          // first and the answer last, and guarantees the item fits.
+          const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
+          const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
+          if (safeMessage !== message) {
+            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
           }
           return {
             PutRequest: {
@@ -3765,17 +3762,29 @@ export async function loadKnowledgeBase(): Promise<void> {
   //printKnowledgeBase();
 }
 
-// Load knowledge base on startup and refresh periodically
-loadKnowledgeBase().catch((error) => {
-  console.error("Error loading knowledge base:", error);
-});
-
-// Refresh knowledge base every hour
-setInterval(() => {
+// Load knowledge base on startup and refresh periodically.
+//
+// Skipped under test. This is module-load network I/O, so merely IMPORTING any
+// route that transitively reaches this file fires a real fetch at the docs
+// corpus — which is what trips org.test.ts's "no route here has any business
+// touching the network" assertion (ENG-1112) even though nothing in that suite
+// asks for docs. The hourly timer has the same problem in reverse: it keeps a
+// handle open after a suite finishes, which is where "Cannot log after tests are
+// done" and the non-graceful worker exits come from. Production behaviour is
+// unchanged; the one test that needs the knowledge base calls
+// loadKnowledgeBase() itself.
+if (process.env.NODE_ENV !== "test") {
   loadKnowledgeBase().catch((error) => {
-    console.error("Error refreshing knowledge base:", error);
+    console.error("Error loading knowledge base:", error);
   });
-}, 60 * 60 * 1000);
+
+  // Refresh knowledge base every hour
+  setInterval(() => {
+    loadKnowledgeBase().catch((error) => {
+      console.error("Error refreshing knowledge base:", error);
+    });
+  }, 60 * 60 * 1000);
+}
 
 const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 

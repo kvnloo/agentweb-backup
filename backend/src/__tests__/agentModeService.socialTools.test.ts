@@ -14,6 +14,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserIdIncludingOrgShared: jest.fn(),
   getAccountsWithOwnerIncludingOrgShared: jest.fn(),
   getAccountById: jest.fn(),
+  getAccountByIdConsistent: jest.fn(),
   isTokenValid: jest.fn(),
 }));
 
@@ -25,7 +26,7 @@ jest.mock('../services/socialPlatformService', () => ({
 
 // Import after mocks
 import { AgentModeService } from '../services/agentModeService';
-import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountsWithOwnerIncludingOrgShared, getAccountById, isTokenValid } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsByUserIdIncludingOrgShared, getAccountsWithOwnerIncludingOrgShared, getAccountById, getAccountByIdConsistent, isTokenValid } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
 describe('AgentModeService - Social Media Tools', () => {
@@ -35,6 +36,7 @@ describe('AgentModeService - Social Media Tools', () => {
   const mockGetAccountsByUserIdIncludingOrgShared = getAccountsByUserIdIncludingOrgShared as jest.MockedFunction<typeof getAccountsByUserIdIncludingOrgShared>;
   const mockGetAccountsWithOwnerIncludingOrgShared = getAccountsWithOwnerIncludingOrgShared as jest.MockedFunction<typeof getAccountsWithOwnerIncludingOrgShared>;
   const mockGetAccountById = getAccountById as jest.MockedFunction<typeof getAccountById>;
+  const mockGetAccountByIdConsistent = getAccountByIdConsistent as jest.MockedFunction<typeof getAccountByIdConsistent>;
   const mockIsTokenValid = isTokenValid as jest.MockedFunction<typeof isTokenValid>;
   const mockSocialPlatformService = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
 
@@ -83,6 +85,9 @@ describe('AgentModeService - Social Media Tools', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetAccountByIdConsistent.mockImplementation((...args: Parameters<typeof getAccountById>) =>
+      mockGetAccountById(...args)
+    );
     service = new AgentModeService();
   });
 
@@ -213,6 +218,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('should successfully post content to account', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockResolvedValue({
         success: true,
         message: 'Posted successfully',
@@ -254,6 +260,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('should return error when adapter fails due to expired token', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.postOnConnectedAccount(
@@ -268,6 +275,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('should handle adapter errors', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn API error'));
 
       const result = await service.postOnConnectedAccount(
@@ -278,6 +286,47 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Failed to post');
+    });
+
+    it('does not create a LinkedIn post after its account disconnects', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(null);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123', 'urn:li:organization:123456', 'Do not publish', []
+      );
+
+      expect(mockGetAccountByIdConsistent).toHaveBeenCalledWith(
+        'urn:li:organization:123456', 'user-123', 'linkedin'
+      );
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+    });
+
+    it('does not create a LinkedIn post after an org-shared account is unshared', async () => {
+      const initiallySharedAccount = {
+        ...mockLinkedInAccount,
+        userId: 'owner-user-456',
+        sharedWithOrg: true,
+      };
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([initiallySharedAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue({
+        ...mockLinkedInAccount,
+        userId: 'owner-user-456',
+        sharedWithOrg: false,
+      } as any);
+
+      const result = await service.postOnConnectedAccount(
+        'user-123', 'urn:li:organization:123456', 'Do not publish', []
+      );
+
+      expect(mockGetAccountByIdConsistent).toHaveBeenCalledWith(
+        'urn:li:organization:123456', 'owner-user-456', 'linkedin'
+      );
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
     });
 
     // ── Auto-resolution (no account_id provided) ──
@@ -748,6 +797,59 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('token expired');
+    });
+  });
+
+  describe('LinkedIn write connection revalidation', () => {
+    it('does not comment when the account disconnects after the duplicate check', async () => {
+      const mockAdapter = {
+        getComments: jest.fn().mockResolvedValue([]),
+        createComment: jest.fn(),
+      };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      mockGetAccountById
+        .mockResolvedValueOnce(mockLinkedInAccount as any)
+        .mockResolvedValueOnce(null);
+
+      const result = await service.commentOnLinkedInPost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123', 'A real comment'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+    });
+
+    it('does not react when the account disconnects after eligibility is checked', async () => {
+      const mockAdapter = { createReaction: jest.fn() };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      mockGetAccountById
+        .mockResolvedValueOnce(mockLinkedInAccount as any)
+        .mockResolvedValueOnce(null);
+
+      const result = await service.reactToLinkedInPost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123', 'LIKE'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+    });
+
+    it('does not repost when the account disconnects after eligibility is checked', async () => {
+      const mockAdapter = { createRepost: jest.fn() };
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
+      mockGetAccountById
+        .mockResolvedValueOnce(mockLinkedInAccount as any)
+        .mockResolvedValueOnce(null);
+
+      const result = await service.linkedinRepost(
+        'user-123', 'urn:li:organization:123456', 'urn:li:share:123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('no longer connected');
+      expect(mockAdapter.createRepost).not.toHaveBeenCalled();
     });
   });
 

@@ -13,8 +13,15 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import {
+  evaluateTurnTimeBudget,
+  buildTurnTimeBudgetNudge,
+  TURN_TIME_BUDGET_FALLBACK_CONTENT,
+} from '../utils/turnTimeBudget';
+import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -53,7 +60,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
+import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -101,10 +109,24 @@ const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predef
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 
+// Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
+// 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
+export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
+
 // Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
-// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed the context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+//
+// ENG-940: this MUST stay at (or below) the context-trim floor. It used to be 10_000 while the
+// trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
+// to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
+// payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
+// get_pr_digest payload (~8,981 chars) that way. Note the actual harm, since the ticket reports
+// it backwards: the model had ALREADY summarized the payload correctly while it was readable, then
+// saw only the preview a few turns later, concluded its own accurate summary must have been
+// invented, deleted the correct memory and reported the digest as unproducible. Losing the key
+// does not just hide data — it makes a run repudiate correct work it has already done.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
@@ -112,6 +134,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
+import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -155,7 +178,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 // re-exported so any importer of the old path keeps working.
 export { normalizeMetaCampaignIds };
 
-const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
 // single big tool-call argument (e.g. create_html_file's content_draft, which
@@ -167,6 +190,13 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 // output ceiling. Models only emit what they need, so raising the cap does not
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// ENG-907: sentinel resolved by `withSynthesisRetryDeadline` when a forced-synthesis backup
+// call outlives the time left. A unique symbol so it can never collide with a real response.
+const SYNTHESIS_RETRY_TIMED_OUT = Symbol('synthesis-retry-timed-out');
+// Slack left between the bounded retry and the caller's cap, so the turn still has room to
+// persist and return its partial answer after giving up on the retry.
+const SYNTHESIS_RETRY_MARGIN_MS = 5_000;
 
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
@@ -844,6 +874,14 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -2797,6 +2835,39 @@ export class AgentModeService {
     return knownGoodModel;
   }
 
+  /**
+   * ENG-907: bound a permitted forced-synthesis backup call to the wall-clock time that is
+   * actually left, rather than trusting the duration estimate that admitted it.
+   *
+   * The estimate is drawn from calls this run already made, and the backup is by definition
+   * a DIFFERENT model — it can be slower than anything measured. If it overruns, the
+   * controller's cap fires and rejects the whole generation, discarding the partial answer
+   * this feature exists to deliver. So stop waiting with time still on the clock and let the
+   * caller fall back to that partial answer.
+   *
+   * Resolves to `SYNTHESIS_RETRY_TIMED_OUT` instead of rejecting, so the timeout is not
+   * mistaken for a model error and misclassified. The in-flight request is left to settle on
+   * its own — there is no abort plumbing through the provider adapters, and the turn is ending
+   * regardless — but its rejection is swallowed so it cannot surface as an unhandled one.
+   * With no deadline the call is awaited unchanged.
+   */
+  private async withSynthesisRetryDeadline(call: Promise<any>, deadlineMs?: number): Promise<any> {
+    if (deadlineMs === undefined) return call;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        call,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(SYNTHESIS_RETRY_TIMED_OUT), deadlineMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      // The loser of the race is still in flight; never let it become an unhandled rejection.
+      void Promise.resolve(call).catch(() => {});
+    }
+  }
+
   async callLLM(
     model: string,
     messages: any[],
@@ -3178,8 +3249,12 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false,
-    persistIncrementally: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
+    persistIncrementally: boolean = false,
+    // ENG-907: epoch ms at which the CALLER started this turn's wall-clock cap
+    // (the controller stamps it right before it hands the promise to
+    // withGenerationTimeout). Optional — callers without a cap omit it.
+    turnStartMs?: number
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3559,6 +3634,57 @@ export class AgentModeService {
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
       const mediaCallKeysThisRun = new Map<string, string>();
 
+      // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
+      // A broad research turn can stay far under `maxIterations` and still burn the whole
+      // 10-minute controller cap issuing discovery calls; when the cap fires the run is
+      // force-rejected and every bit of text it produced is discarded (the user gets a bare
+      // "please try again" after real spend). We track the same deadline here so the loop
+      // can wrap itself up: nudge to stop new discovery at 70% of the budget, then stop
+      // honouring tool calls and force one final synthesis turn while there is still time
+      // to deliver.
+      // Unlike `generationHardCapMs` above this is NOT tied to the media switch — but it is
+      // strictly scoped to callers that actually impose a deadline. Set
+      // AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable it everywhere.
+      //
+      // The deadline belongs to the CALLER, and `turnStartMs` is the ONLY evidence that one
+      // exists. `withGenerationTimeout` wraps exactly two call sites — the interactive
+      // generate endpoint and the ishare endpoint — and both stamp `turnStartMs` right
+      // before arming it. Every other caller (scheduled runs, Slack, GTM plan, admin
+      // replay, email, benchmarks) invokes this loop with NO wall-clock cap whatsoever.
+      // Defaulting those to `Date.now() + generationTimeoutMs` would invent a 10-minute
+      // ceiling that production does not have and truncate work that completes today:
+      // session bd733cb4 (the 5/5/5 LinkedIn queue run ENG-907's own report holds up as
+      // the pattern to copy) spent 683s on a single scheduled turn and would have been
+      // forced into synthesis at ~520s, losing the knowledge-base write that WAS the
+      // deliverable. So: no caller stamp, no budget — behave exactly as before.
+      //
+      // When we do have a stamp, anchor on it rather than on a local Date.now(): the
+      // session and message reads, the title LLM call, the fork IPC hop and the memory
+      // embedding backfill all run before control reaches here, and anchoring locally
+      // would put our cap later than the one actually enforced and silently spend that
+      // setup latency out of the synthesis reserve. Clamped, so a skewed/future stamp
+      // cannot extend the budget past now.
+      const callerDeadlineStamped =
+        Number.isFinite(turnStartMs as number) && (turnStartMs as number) > 0;
+      const turnStartedAtMs = callerDeadlineStamped
+        ? Math.min(turnStartMs as number, Date.now())
+        : Date.now();
+      const turnHardCapMs =
+        callerDeadlineStamped && generationTimeoutMs > 0
+          ? turnStartedAtMs + generationTimeoutMs
+          : undefined;
+      let longestLlmCallMsThisRun = 0;
+      let timeBudgetWrapUpWarned = false;
+      // Sticky: once the loop switches to synthesis it never offers tools again this turn.
+      let forceFinalSynthesis = false;
+      let truncatedByTimeBudget = false;
+      // Set when the forced synthesis call failed with no room left to retry it — the loop
+      // then stops instead of starting a second full call it cannot afford (see below).
+      let synthesisRetryUnaffordable = false;
+      // Hard wall-clock bound for a permitted forced-synthesis retry, so a slower-than-
+      // predicted backup model still cannot run the turn past the caller's cap.
+      let synthesisRetryDeadlineMs: number | undefined;
+
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
@@ -3584,6 +3710,23 @@ export class AgentModeService {
       // after tool calls when the context is large; a single nudge is enough to recover)
       let emptySynthesisRetries = 0;
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
+
+      // ENG-1054: set true once a turn's whole answer was discarded as serialization
+      // residue (e.g. "}]"). It survives the retry so that, if the retry ALSO fails to
+      // synthesize, the loop reports the executed-action ledger instead of ending on a
+      // blank reply — turning one silent-output bug into another would be no fix.
+      let synthesisResidueDropped = false;
+
+      // ENG-1054 kill switch — ON by default; set AGENT_SYNTHESIS_RESIDUE_GUARD=false
+      // to disable the guard and its recap.
+      //
+      // This guard DISCARDS model output it judges unusable, and its failure mode is
+      // silent: a false positive costs the user their answer and only shows up as a
+      // log line, never as an error. Merging here deploys straight to production, so
+      // there needs to be a way to stand it down from config rather than waiting on a
+      // revert — matching how AGENT_FINALIZE_GUARD gates the other output-rewriting
+      // seam. Off restores the exact pre-ENG-1054 behaviour.
+      const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
 
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
@@ -3614,6 +3757,36 @@ export class AgentModeService {
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
           (messages as any[]).push({ role: 'user', content: urgency });
+        }
+
+        // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
+        // exempt from the synthesis switch — with no work done yet there is nothing to
+        // synthesize, and the run should fail loudly rather than emit an empty "partial".
+        if (turnHardCapMs !== undefined && !forceFinalSynthesis) {
+          const timeBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: longestLlmCallMsThisRun,
+          });
+          if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: whole-turn time budget nearly exhausted for session ${sessionId} ` +
+              `(${Math.round(timeBudget.elapsedMs / 1000)}s used, ${Math.round(timeBudget.remainingMs / 1000)}s left) — ` +
+              'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
+            });
+          } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
+            timeBudgetWrapUpWarned = true;
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
+            });
+          }
         }
 
         // 4. Refresh Context if Skills Changed
@@ -3787,6 +3960,17 @@ export class AgentModeService {
         });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
+            // ENG-907: the forced synthesis turn keeps offering the SAME tool list. It is
+            // tempting to withhold it so the model physically cannot start more work, but
+            // that breaks the request: by this point the history is full of tool_use /
+            // tool_result blocks, and both providers we run Claude on reject a request that
+            // replays them with no tool list — Bedrock Converse fails the whole call with
+            // "The toolConfig field must be defined when using toolUse and toolResult
+            // content blocks". That would turn the partial delivery this feature exists to
+            // produce into a hard error, on exactly the model ENG-907 was reported against
+            // (anthropic.claude-opus-5). Tools stay on the wire; the loop instead DISCARDS
+            // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
+            // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
@@ -3796,7 +3980,59 @@ export class AgentModeService {
             humanPaced: humanPacedTurn
           });
         } catch (callError) {
-          if (isTransientLLMError(callError) && !backupModelUsed) {
+          // ENG-907: the backup-model retry below issues a SECOND full call of the same
+          // size. During the forced synthesis the only time left is the reserve held for
+          // that one call, so starting a retry it cannot afford runs the turn past the
+          // controller's cap — and the cap discards the answer, which is the failure this
+          // whole change exists to prevent. The attempt that just failed is the best
+          // available estimate of what the retry would cost, so require at least that much
+          // still on the clock. When there is not enough, end the turn here and deliver
+          // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
+          // one) rather than throwing the turn away.
+          //
+          // Scoped tightly to the retry that would otherwise have run: the SAME
+          // `isTransientLLMError(...) && !backupModelUsed` condition guards it. A
+          // non-transient failure (context limit, content policy, malformed request) has no
+          // retry to skip, and reporting one as "I hit the time limit — reply continue"
+          // would be a lie that walks the user straight back into the same error. Those
+          // keep propagating through their existing classification path untouched, as does
+          // any transient failure outside the forced synthesis.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError) && !backupModelUsed) {
+            const retryBudget = evaluateTurnTimeBudget({
+              startedAtMs: turnStartedAtMs,
+              hardCapMs: turnHardCapMs,
+              longestLlmCallMs: longestLlmCallMsThisRun,
+            });
+            // What the retry will cost is a FULL call, so size it against the slowest full
+            // call this run actually made — not against the attempt that just failed. A
+            // primary that fails fast (an immediate 429, a dropped socket) burns almost no
+            // clock, so comparing to it alone waves through a backup that is slower than the
+            // time left and crosses the cap anyway, discarding the very partial answer this
+            // guard protects. Take whichever estimate is larger.
+            const failedCallMs = Date.now() - llmStart;
+            const estimatedRetryMs = Math.max(failedCallMs, longestLlmCallMsThisRun);
+            if (retryBudget.remainingMs <= estimatedRetryMs) {
+              console.warn(
+                `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
+                `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
+                `${Math.round(failedCallMs / 1000)}s; a full call has taken up to ` +
+                `${Math.round(longestLlmCallMsThisRun / 1000)}s this run) — not starting a retry that ` +
+                'would run past the turn cap; delivering the work gathered so far'
+              );
+              recordSpanError(chatSpan, callError);
+              synthesisRetryUnaffordable = true;
+            } else {
+              // The estimate says a retry fits — but an estimate is not a guarantee. The
+              // backup can be a different, slower model than anything measured this run, so
+              // arm a hard bound too: whatever the retry does, this turn stops waiting on it
+              // with time still on the clock and delivers the partial answer. Without it the
+              // original ENG-907 loss stays reachable through the retry.
+              synthesisRetryDeadlineMs = Math.max(1, retryBudget.remainingMs - SYNTHESIS_RETRY_MARGIN_MS);
+            }
+          }
+          if (synthesisRetryUnaffordable) {
+            // handled above — fall through to the break after the span is closed
+          } else if (isTransientLLMError(callError) && !backupModelUsed) {
             const backup = await this.getBackupModel(llmModel);
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
@@ -3810,7 +4046,7 @@ export class AgentModeService {
               }
               llmModel = backup;
               backupModelUsed = true;
-              response = await this.callLLM(llmModel, trimmedMessages, {
+              response = await this.withSynthesisRetryDeadline(this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
@@ -3818,7 +4054,17 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
-              });
+              }), synthesisRetryDeadlineMs);
+              if (response === SYNTHESIS_RETRY_TIMED_OUT) {
+                console.warn(
+                  `AgentMode: backup model "${llmModel}" did not answer within the ${synthesisRetryDeadlineMs}ms ` +
+                  `left for the forced synthesis in session ${sessionId} — delivering the work gathered so far ` +
+                  'rather than letting the turn cap discard it'
+                );
+                recordSpanError(chatSpan, callError);
+                response = undefined;
+                synthesisRetryUnaffordable = true;
+              }
             } else {
               recordSpanError(chatSpan, callError);
               throw callError;
@@ -3830,7 +4076,21 @@ export class AgentModeService {
         } finally {
           endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
+        // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
+        // loop instead of raising — the caller is milliseconds from its cap, and an
+        // exception here loses everything. `content` at this point can only hold an earlier
+        // tool-calling turn's progress narration ("Scanned batch 9."), never an answer, so
+        // returning it would hand the user stale narration as the deliverable (the ENG-1054
+        // hazard). Say plainly that the time ran out and point at the work in the steps
+        // above, which is what the user can actually act on.
+        if (synthesisRetryUnaffordable) {
+          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          break;
+        }
         const llmDurationMs = Date.now() - llmStart;
+        // ENG-907: size the synthesis reserve off the slowest call actually observed —
+        // a fixed 90s is not enough headroom on a model that takes minutes per turn.
+        if (llmDurationMs > longestLlmCallMsThisRun) longestLlmCallMsThisRun = llmDurationMs;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
@@ -3874,6 +4134,30 @@ export class AgentModeService {
         } else if (responseMessage.content && typeof responseMessage.content === 'object') {
           responseContent = (responseMessage.content as any).text || '';
         }
+
+        // ENG-1054: a turn whose entire text is serialization residue (observed in
+        // production as a closing message of literally "}]") is a FAILED synthesis,
+        // not an answer. Left alone it is non-empty, so the termination ladder below
+        // accepts it as the final response and the turn's deliverables are lost.
+        // Treat it as no text at all: the bounded empty-synthesis nudge then re-asks
+        // for the summary. Blanking responseMessage.content too keeps the debris out
+        // of the persisted transcript AND out of the history sent on the retry (this
+        // runs before the message is appended to `messages` below).
+        const residueDroppedThisTurn = synthesisResidueGuardEnabled && isUnusableSynthesis(responseContent);
+        if (residueDroppedThisTurn) {
+          console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
+          synthesisResidueDropped = true;
+          responseContent = '';
+          responseMessage.content = '';
+        }
+
+        // ENG-1054: did THIS turn produce usable text? `content` below is a sticky
+        // cross-turn accumulator — any earlier turn that narrated alongside its tool
+        // calls (the common case, and the shape of the production session) leaves it
+        // non-empty for the rest of the run. So it cannot answer "did the turn we are
+        // about to terminate on actually answer?", and gating the ENG-1054 remedies on
+        // it would silently disarm both. They gate on this per-turn flag instead.
+        const turnHadUsableText = responseContent.trim().length > 0;
 
         // Update content with LLM's response
         if (responseContent) {
@@ -3930,6 +4214,21 @@ export class AgentModeService {
           delete responseMessage.tool_calls;
         }
 
+        // ENG-907: the wall-clock budget is exhausted, so this turn is the last one that
+        // can still deliver anything. Tools had to stay on the wire (see the callLLM call
+        // above), so enforce the "no more work" half here: drop any calls the model made
+        // instead of executing them, and let the turn fall through to the terminal path
+        // with whatever text it wrote. Same reference-delete as the truncation drop above —
+        // responseMessage is already in `messages`, so this also clears the dangling
+        // tool_use that an empty-synthesis retry would otherwise replay unanswered.
+        if (forceFinalSynthesis && responseMessage.tool_calls?.length) {
+          console.warn(
+            `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
+            `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
+          );
+          delete responseMessage.tool_calls;
+        }
+
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
@@ -3942,7 +4241,17 @@ export class AgentModeService {
           const termination = computeTermination({
             finishReason,
             stopReason,
-            content,
+            // ENG-1054: present THIS turn's (already-blanked) text when the turn's
+            // whole answer was residue. Passing the sticky accumulator would make a
+            // residue-only final turn look answered — the ladder would return
+            // final_response and the bounded synthesis retry would never fire.
+            content: residueDroppedThisTurn ? '' : content,
+            // ENG-946: the empty-synthesis decision keys off THIS turn's text, not the
+            // accumulator — `content` is replace-on-nonempty, so a mid-run narration
+            // survived into an empty final turn and suppressed the nudge. This
+            // generalises the ENG-1054 line above, which only unsticks `content` for the
+            // residue case; a terminating turn that comes back plain-empty needs it too.
+            currentTurnText: responseContent,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
@@ -3955,7 +4264,24 @@ export class AgentModeService {
             content = termination.contentIfEmpty;
           }
 
-          if (termination.reason === 'max_tokens_continuation') {
+          // ENG-907: once the forced synthesis has run, every millisecond left is inside the
+          // reserve held back for it — there is no room for another round trip. Both
+          // continuation ladders below would spend it, and if the hard cap fires mid-call the
+          // controller discards the whole turn: the exact all-or-nothing loss this change
+          // exists to remove. So end here instead and deliver what the synthesis produced. A
+          // max-tokens stop still leaves real (if clipped) text; an empty one falls through to
+          // TURN_TIME_BUDGET_FALLBACK_CONTENT below. Both beat risking a bare timeout.
+          const timeBudgetBlocksContinuation =
+            forceFinalSynthesis &&
+            (termination.reason === 'max_tokens_continuation' || termination.reason === 'empty_synthesis_retry');
+          if (timeBudgetBlocksContinuation) {
+            console.warn(
+              `AgentMode: suppressing ${termination.reason} in session ${sessionId} — the turn's time budget ` +
+              'is spent; delivering the forced synthesis output as-is rather than risking the hard cap'
+            );
+          }
+
+          if (termination.reason === 'max_tokens_continuation' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
@@ -3965,10 +4291,37 @@ export class AgentModeService {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
           }
 
-          if (termination.reason === 'empty_synthesis_retry') {
+          if (termination.reason === 'empty_synthesis_retry' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
+          }
+
+          // ENG-1054: the loop is terminating after a synthesis that was discarded as
+          // residue, and this final turn produced no usable text either. Ending here
+          // would hand the user stale narration from an earlier turn (or a blank reply)
+          // and erase the record of the (already-applied) actions the run executed.
+          // Report that ledger instead — tool names and outcome counts only, so it can
+          // never claim a false success. Gated on the per-turn flag, not on `content`:
+          // `content` still holds any earlier turn's text and would suppress this.
+          if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            if (!turnHadUsableText) {
+              console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+              content = buildExecutedActionsFallback(toolCalls);
+            } else {
+              // The retry DID produce text. Keep it — but do not let "the model
+              // emitted characters" stand in for "the model answered". A retry that
+              // returns a fragment or drifts also satisfies that check, and the
+              // record of what executed would be lost with it. Judging the prose
+              // instead is unbounded and would risk discarding a real answer, so
+              // append the ledger rather than choosing between them.
+              const footer = buildExecutedActionsFooter(toolCalls);
+              if (footer) {
+                console.warn(`AgentMode: Synthesis recovered after residue in session ${sessionId} — appending the executed-action ledger (${toolCalls.length} tool call(s))`);
+                content = `${content}\n\n${footer}`;
+              }
+            }
+            if (responseMessage) responseMessage.content = content;
           }
 
           // Log the stop reason for debugging
@@ -4239,6 +4592,13 @@ export class AgentModeService {
         }
       }
 
+      // ENG-907: same contract for the wall-clock budget. The forced synthesis turn
+      // normally writes the partial deliverable itself; if it came back empty, say the
+      // time limit was hit rather than returning nothing at all.
+      if (truncatedByTimeBudget && !content) {
+        content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+      }
+
       // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
       // the loop edge, AFTER the final message and BEFORE emit/persist.
       // Two independent flags, most-enforcing wins:
@@ -4346,8 +4706,17 @@ export class AgentModeService {
       // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
       // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
       // patch so the persisted transcript matches what the user sees.
+      // ENG-971: the INVERSION of the above — a false FAILURE report. Same shape of
+      // guard (deterministic, always-on, append-only, applied at the same seam): when
+      // the closing narrative claims the session timed out AND that the user's changes
+      // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
+      // append the true outcome so the user does not re-run a production deploy that
+      // already landed. Runs after the landing reconciler so both corrections compose.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        const reconciledContent = reconcileFalseFailureReport(
+          reconcileLandingDeploymentReport(content, toolCalls),
+          toolCalls,
+        );
         if (reconciledContent !== content) {
           content = reconciledContent;
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -4422,6 +4791,9 @@ export class AgentModeService {
         persistedResponseCount,
         ...(wasCancelled ? { cancelled: true } : {}),
         ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
+        // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
+        // because it ran out of time, so a scheduled run must continue it.
+        ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -5044,58 +5416,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
-      // is effectively enabled for this caller (plain members need
-      // enabled=true; editors and the org owner always get fanout). Any
-      // lookup failure degrades to non-org behavior.
-      let sessionUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb, orgDb } = await import('./db');
-        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
-        const sessionUser = await uDb.getUserById(userId);
-        const candidateOrgId = sessionUser?.orgId;
-        if (candidateOrgId) {
-          const org = await orgDb.getOrgById(candidateOrgId);
-          const effectivelyEnabled = isFeatureEffectivelyEnabled(
-            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
-            org,
-            'skills',
-          );
-          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
-        }
-      } catch { /* skip — org-sharing is best-effort */ }
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
-
-      if (!publishedSkills.length)
-        return { message: "No skills available in the library." };
-
       const session = await chatbotDb.getChatSession(sessionId);
-      const currentAssociated = session?.associatedSkills || [];
-      const associatedSkillIds = new Set(currentAssociated);
-
-      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
-
-      // Add admin skill for admin users (if not already installed)
-      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          if (user?.isAdmin) {
-            availableSkills.push({
-              skillId: ADMIN_SKILL_VIRTUAL_ID,
-              name: 'Admin Tools',
-              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-              toolNames: ADMIN_SKILL_TOOL_NAMES,
-              isPublished: true,
-            } as any);
-          }
-        } catch (e) {
-          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      if (!availableSkills.length)
+      const skills = await this.getSkillsForDisplay(session?.associatedSkills || [], userId);
+      if (!skills.length) return { message: "No skills available in the library." };
+      const availableSkills = skills.filter(skill => !skill.installed);
+      if (!availableSkills.length) {
         return { message: "All available skills are already installed." };
+      }
 
       return {
         message: `Found ${availableSkills.length} available skill(s).`,
@@ -5216,7 +5543,8 @@ export class AgentModeService {
     'send_email_from_sender',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
-    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // responses that were offloaded to S3 by the TOOL_RESPONSE_S3_THRESHOLD
+    // overflow mechanism (pinned to CONTEXT_TRIM_TOOL_CONTENT_LIMIT).
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
     // header but has no tool to retrieve the full content.
     'search_tool_response',
@@ -5468,25 +5796,28 @@ export class AgentModeService {
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
-    let userOrgId: string | undefined;
-    if (userId) {
-      try {
-        const { userDb: uDb } = await import('./db');
-        const u = await uDb.getUserById(userId);
-        userOrgId = u?.orgId;
-      } catch { /* skip */ }
-    }
+  private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
+    const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+    return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
+  }
+
+  public async getAuthorizedSkill(skillId: string, userId: string): Promise<Skill | undefined> {
+    return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
+  }
+
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -5538,40 +5869,10 @@ export class AgentModeService {
         return { message: "skillIds must be a non-empty array of skill IDs." };
       }
 
-      let installUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb } = await import('./db');
-        const installUser = await uDb.getUserById(userId);
-        installUserOrgId = installUser?.orgId;
-      } catch { /* skip — org-sharing is best-effort */ }
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
-        getAllowedSkills(userId)
-      ]);
-
-      const isWildcard = userAllowedSkillIds.includes("*");
-      const allowedSkillSet = new Set(userAllowedSkillIds);
-
-      // Check admin status for admin skill gating
-      let isAdmin = false;
-      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          isAdmin = user?.isAdmin === true;
-        } catch (e) {
-          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
+      const availableSkills = await this.getSkillsForDisplay([], userId);
+      const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
       const validSkillIds = skillIds.filter(id => {
-        const skill = publishedSkills.find(s => s.skillId === id);
-        const isOwnSkill = skill && skill.ownerId === userId;
-        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
+        return availableById.has(id) || (id === ADMIN_SKILL_VIRTUAL_ID && isDelegatedAccess);
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -5588,7 +5889,7 @@ export class AgentModeService {
           } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
             installedNames.push('Admin Tools');
           } else {
-            const skill = publishedSkills.find(s => s.skillId === id);
+            const skill = availableById.get(id);
             if (skill) installedNames.push(skill.name);
           }
         });
@@ -10464,6 +10765,13 @@ export class AgentModeService {
       if (result.errorCount > 0) {
         messageParts.push(`${result.errorCount} lead(s) failed`);
       }
+      // ENG-1002 (follow-up): say so when rows were refused as anonymized
+      // placeholders, so the agent cannot report a clean import that silently
+      // wrote fewer records than the caller handed over.
+      const anonymizedSkipped = result.anonymizedSkipped || 0;
+      if (anonymizedSkipped > 0) {
+        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
 
       return {
         success: result.successCount > 0,
@@ -10474,6 +10782,7 @@ export class AgentModeService {
         newCount: result.newCount || 0,
         mergedCount: result.mergedCount || 0,
         errorCount: result.errorCount,
+        anonymizedSkipped,
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {
@@ -14476,7 +14785,18 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14487,6 +14807,9 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
         parts.push(`Work plan status:\n${context.workPlanSummary}`);
       } else {
         parts.push('No work plan.');
+      }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
@@ -16133,13 +16456,76 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // The user-facing message is deliberately unchanged: that string is
       // customer-visible copy and is not this issue's to rewrite. The structured
       // fields below are what make the choice detectable.
-      return {
+      //
+      // ENG-838 AC4: `strategy` above is what this process *resolved*, never
+      // what Meta stored. Read the entity back and compare, so a write Meta
+      // reinterpreted (the Open Future Forum shape: specified parameters,
+      // platform defaults applied, run reports success) is visible instead of
+      // silent.
+      const base = {
         success: true,
         message: `Ad set "${adSet.name}" created successfully`,
         adSet: adSet,
         appliedBidStrategy: strategy,
         bidStrategyWasDefaulted: args.bid_strategy === undefined
       };
+
+      let readBack: any;
+      try {
+        readBack = await metaService.getAdSet(accessToken, adSet.id);
+      } catch (readBackError: any) {
+        // The ad set exists; reporting failure would be a different lie. But
+        // the result must not imply the settings were confirmed.
+        return {
+          ...base,
+          readBackVerified: false,
+          readBackError: readBackError?.message || String(readBackError)
+        };
+      }
+
+      const expected: Array<[string, any]> = [
+        ['bid_strategy', strategy],
+        ['bid_amount', normalizedParams.bid_amount],
+        ['daily_budget', normalizedParams.daily_budget],
+        ['lifetime_budget', normalizedParams.lifetime_budget],
+        ['start_time', normalizedParams.start_time],
+        ['end_time', normalizedParams.end_time]
+      ];
+      // Meta returns monetary fields as strings; compare stringified so
+      // 1000 and "1000" are the same value and not a fake mismatch.
+      const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      const readBackMismatches = expected
+        .filter(([, requested]) => requested !== undefined)
+        .map(([parameter, requested]) => ({
+          parameter,
+          requested: asComparable(requested),
+          applied: asComparable(readBack?.[parameter])
+        }))
+        .filter(m => m.requested !== m.applied);
+
+      if (readBackMismatches.length > 0) {
+        const detail = readBackMismatches
+          .map(m => `${m.parameter}: requested ${m.requested}, Meta applied ${m.applied}`)
+          .join('; ');
+        return {
+          ...base,
+          // The create already committed a live entity. Keep the operation
+          // successful so generic tool retry handling cannot create a
+          // duplicate ad set, while the message remains an explicit loud
+          // failure of the requested settings.
+          success: true,
+          readBackMismatch: true,
+          message:
+            `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
+            `(${detail}). It is live with settings nobody chose — review or pause it in Ads Manager.`,
+          error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
+          readBack,
+          readBackVerified: true,
+          readBackMismatches
+        };
+      }
+
+      return { ...base, readBack, readBackVerified: true, readBackMismatches };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad set:', error);
@@ -19980,17 +20366,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // Helper function to format web search results for AI analysis
   private formatWebSearchResults(searchResult: any): string {
-    const { query, results, totalResults } = searchResult;
+    const { query, results, totalResults, resultSource, freshness } = searchResult;
+    // ENG-1050: news searches mix news articles with recent web pages from the
+    // same freshness window, so label each entry and make an empty result read as
+    // "no coverage found" rather than an ambiguous failure.
+    const isNewsSearch = resultSource === 'news';
+    const heading = isNewsSearch ? '📰 News Search Results' : '🔍 Web Search Results';
 
     if (!results || results.length === 0) {
-      return `<strong>🔍 Web Search Results for "${query}"</strong><br>No results found for your search query.`;
+      const emptyNote = isNewsSearch
+        ? `No news articles or recent web pages were found for this query within the ${freshness || 'week'} freshness window. `
+          + `The search itself succeeded — treat this as "no coverage found", not as a search failure.`
+        : 'No results found for your search query.';
+      return `<strong>${heading} for "${query}"</strong><br>${emptyNote}`;
     }
 
-    let summary = `<strong>🔍 Web Search Results for "${query}"</strong><br>`;
+    let summary = `<strong>${heading} for "${query}"</strong><br>`;
     summary += `I found ${totalResults} relevant search results:<br><br>`;
 
     results.forEach((result: any, index: number) => {
-      summary += `<strong>${index + 1}. ${result.title}</strong><br>`;
+      const sourceLabel = isNewsSearch
+        ? (result.sourceType === 'news' ? '📰 News article — ' : '🌐 Recent web page — ')
+        : '';
+      summary += `<strong>${index + 1}. ${sourceLabel}${result.title}</strong><br>`;
       summary += `🔗 <a href="${result.url}" target="_blank">${result.url}</a><br>`;
       summary += `<em>${result.snippet}</em><br>`;
       if (result.publishedDate) {
@@ -20080,6 +20478,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+    }
+    // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
+    // record a note ABOUT the work — they are not the work. A trailing save_memory
+    // schema rejection got the generic "adjust the plan" guidance below, read like a
+    // failure of the primary task, and was generalized into "the system timed out and
+    // your changes were not saved. Please try again." — after a landing-page publish
+    // that had already gone live in production. Give the criticality verdict
+    // explicitly, and keep it accurate even when the memory note WAS what the user
+    // asked for: the failure is real and must be reported, it is just SCOPED to the note.
+    if (isBookkeepingTool(toolName)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
@@ -22664,12 +23073,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const formattedContent = this.formatWebSearchResults({
         query,
         results: normalizedResults,
-        totalResults: normalizedResults.length
+        totalResults: normalizedResults.length,
+        resultSource,
+        freshness,
       });
+
+      // ENG-1050: a news search can be answered by news articles, by recent web
+      // pages from the same freshness window, or by neither. Say which, so a
+      // digest can tell "no coverage this week" from "the search returned
+      // nothing", and never presents a web page as a news article.
+      const newsArticleCount = normalizedResults.filter((result: any) => result.sourceType === 'news').length;
+      const recentPageCount = normalizedResults.length - newsArticleCount;
+      const isEmptyNewsSearch = resultSource === 'news' && normalizedResults.length === 0;
+      const message = isEmptyNewsSearch
+        // "Found 0 results" reads as a broken search, which is the ambiguity this
+        // ticket is about. Say the same thing the LLM-facing content says.
+        ? `No coverage found for "${query}" within the ${freshness || 'week'} window — `
+          + `the search itself succeeded, there is simply nothing published`
+        : resultSource === 'news'
+          ? `Found ${normalizedResults.length} results for "${query}" within the ${freshness || 'week'} window `
+            + `(${newsArticleCount} news article${newsArticleCount === 1 ? '' : 's'}, `
+            + `${recentPageCount} recent web page${recentPageCount === 1 ? '' : 's'})`
+          : `Found ${normalizedResults.length} web search results for "${query}"`;
 
       return {
         success: true,
-        message: `Found ${normalizedResults.length} ${resultSource === 'news' ? 'news' : 'web search'} results for "${query}"`,
+        message,
         query,
         results: normalizedResults,
         totalResults: normalizedResults.length,
@@ -22747,7 +23176,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = CONTEXT_TRIM_TOOL_CONTENT_LIMIT): any[] {
     // Single linear scan: collect tool-role indices and map each tool_call_id to
     // the index of its (first) resolving tool message. This map replaces the
     // original per-assistant nested forward scan (O(n^2) per call) with O(1)
@@ -22767,8 +23196,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
-    // Most recent N tool results: keep at full size
+    // Most recent N tool results by pure recency. This drives the "old assistant
+    // message" test below ONLY — an assistant whose call was just answered must
+    // keep its arguments intact, and that is a question about recency, not size.
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Size at which THIS tool's result would be compressed (per-tool allowances
+    // may raise the default floor, never lower it).
+    const trimLimitFor = (msg: any): number =>
+      AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+
+    // ENG-940: which results the preserve window actually protects. A result at
+    // or below its trim limit is passed through untouched whether or not it is
+    // preserved, so spending a slot on it protects nothing while evicting a
+    // result that the trimmer really would destroy. The reported run died on
+    // exactly that: three 488-char save_memory schema rejections landed after an
+    // 8,981-char get_pr_digest payload and pushed it out of a 3-slot window
+    // inside one logical turn. So the window keeps the N most recent AT-RISK
+    // results. The worst-case context cost is unchanged — it was always up to N
+    // full-size results — this only stops the window being wasted on results
+    // that were never in danger.
+    const atRiskIndices = toolIndices.filter(
+      (i) => typeof messages[i].content === 'string' && messages[i].content.length > trimLimitFor(messages[i]),
+    );
+    const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
 
     // Track which assistant messages are "old" (none of their tool_calls resolve
     // to a preserved tool result after them). We trim large argument fields on these.
@@ -22798,14 +23249,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
-        !preserveSet.has(idx) &&
+        !atRiskPreserveSet.has(idx) &&
         typeof msg.content === 'string'
       ) {
-        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        const limit = trimLimitFor(msg);
         if (msg.content.length > limit) {
+          // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
+          // header at the very front — or, when the offload failed, the "could NOT be stored"
+          // notice. Preview the payload separately from that header, otherwise the 200-char
+          // slice spends its whole budget on (and can cut in half) the only thing telling the
+          // model how much of this result it is still allowed to trust.
+          const s3Ref = extractToolResponseHeader(msg.content);
+          const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
-          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+          const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
+          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
 
@@ -29590,7 +30049,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -29642,6 +30101,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // account.userId is the token owner (equals userId for own accounts,
       // the org member's userId for org-shared accounts).
       const ownerUserId: string = (account as any).userId || userId;
+
+      // A listing is not an authorization grant for an irreversible LinkedIn
+      // write. Re-read the owner record immediately before posting so a
+      // concurrent disconnect cannot leave this request with a usable token.
+      if (account.platform === 'linkedin') {
+        const currentAccount = await getAccountByIdConsistent(account.account_id, ownerUserId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+        if (ownerUserId !== userId && currentAccount.sharedWithOrg !== true) {
+          return { success: false, message: 'Account not found or access denied' };
+        }
+        account = currentAccount;
+      }
 
       // The adapter handles token refresh internally before making API calls.
       console.log('[AgentMode] Getting adapter for platform:', account.platform);
@@ -29708,10 +30181,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const account = await getAccountById(accountId, userId);
+      const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
       if (!account) {
         return { success: false, message: 'Account not found or access denied' };
       }
@@ -29725,7 +30198,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Repost is not supported for this platform' };
       }
 
-      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+      // A prior lookup is only an eligibility check. Re-read immediately before
+      // the provider write so a concurrent disconnect cannot leave a usable token
+      // in memory for the remainder of this request.
+      const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+      if (!currentAccount) {
+        return { success: false, message: 'LinkedIn account is no longer connected' };
+      }
+
+      const result = await adapter.createRepost(currentAccount, postUrn, commentary, userId);
 
       return {
         success: true,
@@ -29751,12 +30232,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
+        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', account ? {
           found: true,
           platform: account.platform,
@@ -29817,8 +30298,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
         }
 
+        // The duplicate check above can be slow. Re-read the account immediately
+        // before the irreversible write so disconnect wins over an in-flight run.
+        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
+        const result = await adapter.createComment(currentAccount, postUrn, commentText, userId, parentCommentUrn);
 
         return {
           success: true,
@@ -29903,12 +30391,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
+        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', account ? {
           found: true,
           platform: account.platform,
@@ -29943,8 +30431,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+
         console.log('[AgentMode] Calling adapter.createReaction (adapter will handle token refresh if needed)...');
-        const result = await adapter.createReaction(account, postUrn, reactionType, userId);
+        const result = await adapter.createReaction(currentAccount, postUrn, reactionType, userId);
 
         return {
           success: true,

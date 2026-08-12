@@ -11,9 +11,11 @@ jest.mock('../services/db', () => ({
   },
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
   },
   socialEngagementTrackingDb: {
     recordEngagement: jest.fn(),
+    deleteEngagement: jest.fn(),
     getRecentGeneratedTexts: jest.fn().mockResolvedValue([]),
   },
 }));
@@ -65,15 +67,38 @@ const mockConnectedAccount = {
   account_id: 'acc-engager-1',
   account_name: 'John Doe',
   platform: 'linkedin',
-  access_token: 'token-123',
-  token_expiry: new Date(Date.now() + 3600000).toISOString(),
+  config: {
+    access_token: 'token-123',
+    token_expires_at: Date.now() + 3600000,
+    account_type: 'personal',
+  },
+  engagementSettings: {
+    enablePostDiscovery: true,
+    enableAsPostEngager: true,
+    preferredActions: ['like', 'comment'],
+    enableCommentDiscovery: true,
+    commentPreferredActions: ['like', 'reply'],
+  },
+};
+
+const mockOwnerAccount = {
+  ...mockConnectedAccount,
+  account_id: 'acc-owner-1',
+  account_name: 'Jane Doe',
 };
 
 const mockUser = {
   userId: 'user-1',
   email: 'john@example.com',
-  connected_accounts: [mockConnectedAccount],
+  connected_accounts: [mockOwnerAccount, mockConnectedAccount],
 };
+
+function userWithEngager(engager: Record<string, any>) {
+  return {
+    ...mockUser,
+    connected_accounts: [mockOwnerAccount, engager],
+  };
+}
 
 function makeAction(overrides: Record<string, any> = {}) {
   return {
@@ -104,6 +129,11 @@ function makeMockGeminiClient(responseText: string) {
   };
 }
 
+function setCurrentUser(user: any) {
+  mockUserDb.getUserById.mockResolvedValue(user);
+  (mockUserDb as any).getUserByIdConsistent.mockResolvedValue(user);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('SocialEngagementExecutor', () => {
@@ -125,11 +155,12 @@ describe('SocialEngagementExecutor', () => {
 
     (LinkedInAdapter as jest.Mock).mockImplementation(() => mockAdapter);
 
-    mockUserDb.getUserById.mockResolvedValue(mockUser as any);
+    setCurrentUser(mockUser as any);
     mockScheduleDb.claimAction.mockResolvedValue(true);
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined as any);
     mockScheduleDb.updateSchedule.mockResolvedValue(undefined as any);
     mockTrackingDb.recordEngagement.mockResolvedValue(undefined as any);
+    mockTrackingDb.deleteEngagement.mockResolvedValue(undefined as any);
   });
 
   afterEach(() => {
@@ -227,7 +258,7 @@ describe('SocialEngagementExecutor', () => {
 
     it('should mark action done when user not found', async () => {
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
-      mockUserDb.getUserById.mockResolvedValue(undefined);
+      setCurrentUser(undefined);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
@@ -237,7 +268,7 @@ describe('SocialEngagementExecutor', () => {
 
     it('should mark action done when engaging account not found', async () => {
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
-      mockUserDb.getUserById.mockResolvedValue({
+      setCurrentUser({
         ...mockUser,
         connected_accounts: [{ ...mockConnectedAccount, account_id: 'different-id' }],
       } as any);
@@ -255,13 +286,10 @@ describe('SocialEngagementExecutor', () => {
     it('should skip comment action when engager preferredActions no longer includes comment', async () => {
       const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
-      mockUserDb.getUserById.mockResolvedValue({
-        ...mockUser,
-        connected_accounts: [{
-          ...mockConnectedAccount,
-          engagementSettings: { preferredActions: ['like'] },
-        }],
-      } as any);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: ['like'] },
+      }) as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
@@ -275,29 +303,110 @@ describe('SocialEngagementExecutor', () => {
       mockAgentModeService.getGeminiClient.mockResolvedValue(
         makeMockGeminiClient('Great insight!') as any
       );
-      mockUserDb.getUserById.mockResolvedValue({
-        ...mockUser,
-        connected_accounts: [{
-          ...mockConnectedAccount,
-          engagementSettings: { preferredActions: ['like', 'comment'] },
-        }],
-      } as any);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: ['like', 'comment'] },
+      }) as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
       expect(mockAdapter.createComment).toHaveBeenCalled();
     });
 
-    it('should skip reply_comment action when commentPreferredActions no longer includes reply', async () => {
-      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'reply_comment', targetType: 'comment', commentId: 'urn:li:comment:999', commentText: 'Hello' } });
-      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
-      mockUserDb.getUserById.mockResolvedValue({
+    it('should honor scanner defaults when post preference arrays are omitted', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      setCurrentUser({
         ...mockUser,
-        connected_accounts: [{
-          ...mockConnectedAccount,
-          engagementSettings: { commentPreferredActions: ['like'] },
-        }],
+        connected_accounts: [
+          {
+            ...mockOwnerAccount,
+            engagementSettings: { ...mockOwnerAccount.engagementSettings, preferredActions: undefined },
+          },
+          {
+            ...mockConnectedAccount,
+            engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: undefined },
+          },
+        ],
       } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).toHaveBeenCalled();
+    });
+
+    it('should honor the scanner default when a legacy post preference is null', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      setCurrentUser({
+        ...mockUser,
+        connected_accounts: [
+          mockOwnerAccount,
+          {
+            ...mockConnectedAccount,
+            engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: null },
+          },
+        ],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).toHaveBeenCalled();
+    });
+
+    it('should honor the scanner reply default when comment preferences are omitted', async () => {
+      const action = makeAction({
+        variableValues: {
+          ...makeAction().variableValues,
+          ownerAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+          commentId: 'urn:li:comment:999',
+          commentText: 'Hello',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Thanks for sharing!') as any);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, commentPreferredActions: undefined },
+      }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
+    });
+
+    it('should not let the owner default authorize a post comment', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Interesting take!') as any);
+      setCurrentUser({
+        ...mockUser,
+        connected_accounts: [
+          {
+            ...mockOwnerAccount,
+            engagementSettings: { ...mockOwnerAccount.engagementSettings, preferredActions: undefined },
+          },
+          {
+            ...mockConnectedAccount,
+            engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: undefined },
+          },
+        ],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+    });
+
+    it('should skip reply_comment action when commentPreferredActions no longer includes reply', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, ownerAccountId: 'acc-engager-1', actionType: 'reply_comment', targetType: 'comment', commentId: 'urn:li:comment:999', commentText: 'Hello' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, commentPreferredActions: ['like'] },
+      }) as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
@@ -305,20 +414,240 @@ describe('SocialEngagementExecutor', () => {
       expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
     });
 
-    it('should allow comment action when no engagementSettings exist (legacy accounts)', async () => {
+    it('should discard a queued action when no engagementSettings exist', async () => {
       const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment', targetType: 'post' } });
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
       mockAgentModeService.getGeminiClient.mockResolvedValue(
         makeMockGeminiClient('Interesting take!') as any
       );
-      mockUserDb.getUserById.mockResolvedValue({
+      setCurrentUser(userWithEngager({ ...mockConnectedAccount, engagementSettings: undefined }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued reaction when global engagement is paused', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      setCurrentUser({ ...mockUser, engagementPaused: true } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.getPost).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockTrackingDb.deleteEngagement).toHaveBeenCalledWith({
+        userId: 'user-1',
+        postId: 'urn:li:share:123',
+        commentId: undefined,
+        engagingAccountId: 'acc-engager-1',
+        actionType: 'like',
+        scheduleId: 'sched-1',
+      });
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued reaction when the engager disables auto-engagement', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, enableAsPostEngager: false },
+      }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued reaction when the engager revokes likes', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, preferredActions: ['comment'] },
+      }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued reaction when the post owner disables discovery', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      setCurrentUser({
         ...mockUser,
-        connected_accounts: [mockConnectedAccount],
+        connected_accounts: [{
+          ...mockOwnerAccount,
+          engagementSettings: { ...mockOwnerAccount.engagementSettings, enablePostDiscovery: false },
+        }, mockConnectedAccount],
       } as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
-      expect(mockAdapter.createComment).toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued reaction when the post owner revokes likes', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      setCurrentUser({
+        ...mockUser,
+        connected_accounts: [{
+          ...mockOwnerAccount,
+          engagementSettings: { ...mockOwnerAccount.engagementSettings, preferredActions: ['comment'] },
+        }, mockConnectedAccount],
+      } as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a queued comment reply when comment discovery is disabled', async () => {
+      const action = makeAction({
+        variableValues: {
+          ...makeAction().variableValues,
+          ownerAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+          commentId: 'urn:li:comment:999',
+          commentText: 'Hello',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, enableCommentDiscovery: false },
+      }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should use the strongly current user record when the UserIdIndex is stale after a disconnect', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      mockUserDb.getUserById.mockResolvedValue(mockUser as any);
+      (mockUserDb as any).getUserByIdConsistent.mockResolvedValue({
+        ...mockUser,
+        connected_accounts: [mockOwnerAccount],
+      });
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should re-check consent immediately before a delayed LinkedIn reaction', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      (mockUserDb as any).getUserByIdConsistent
+        .mockResolvedValueOnce(mockUser)
+        .mockResolvedValueOnce({
+          ...mockUser,
+          connected_accounts: [mockOwnerAccount],
+        });
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should discard a compound comment action when either current permission is revoked', async () => {
+      const action = makeAction({
+        variableValues: {
+          ...makeAction().variableValues,
+          ownerAccountId: 'acc-engager-1',
+          actionType: 'like_and_reply_comment',
+          targetType: 'comment',
+          commentId: 'urn:li:comment:999',
+          commentText: 'Hello',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      setCurrentUser(userWithEngager({
+        ...mockConnectedAccount,
+        engagementSettings: { ...mockConnectedAccount.engagementSettings, commentPreferredActions: ['reply'] },
+      }) as any);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockTrackingDb.deleteEngagement).toHaveBeenCalledWith({
+        userId: 'user-1',
+        postId: 'urn:li:share:123',
+        commentId: 'urn:li:comment:999',
+        engagingAccountId: 'acc-engager-1',
+        actionType: 'like_and_reply_comment',
+        scheduleId: 'sched-1',
+      });
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('releases a compound post reservation when its comment is skipped and consent is revoked before the reaction', async () => {
+      const action = makeAction({
+        variableValues: {
+          ...makeAction().variableValues,
+          actionType: 'comment_and_like',
+          targetType: 'post',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAdapter.getPost.mockResolvedValue('too short');
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      (mockUserDb as any).getUserByIdConsistent
+        .mockResolvedValueOnce(mockUser)
+        .mockResolvedValueOnce({ ...mockUser, connected_accounts: [mockOwnerAccount] });
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockTrackingDb.deleteEngagement).toHaveBeenCalledWith({
+        userId: 'user-1',
+        postId: 'urn:li:share:123',
+        commentId: undefined,
+        engagingAccountId: 'acc-engager-1',
+        actionType: 'comment_and_like',
+        scheduleId: 'sched-1',
+      });
+    });
+
+    it('releases a compound reply reservation when its reply is skipped and consent is revoked before the reaction', async () => {
+      const action = makeAction({
+        variableValues: {
+          ...makeAction().variableValues,
+          ownerAccountId: 'acc-engager-1',
+          actionType: 'like_and_reply_comment',
+          targetType: 'comment',
+          commentId: 'urn:li:comment:999',
+          commentText: '  ',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      (mockUserDb as any).getUserByIdConsistent
+        .mockResolvedValueOnce(mockUser)
+        .mockResolvedValueOnce({ ...mockUser, connected_accounts: [mockOwnerAccount] });
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).not.toHaveBeenCalled();
+      expect(mockTrackingDb.deleteEngagement).toHaveBeenCalledWith({
+        userId: 'user-1',
+        postId: 'urn:li:share:123',
+        commentId: 'urn:li:comment:999',
+        engagingAccountId: 'acc-engager-1',
+        actionType: 'like_and_reply_comment',
+        scheduleId: 'sched-1',
+      });
     });
   });
 
