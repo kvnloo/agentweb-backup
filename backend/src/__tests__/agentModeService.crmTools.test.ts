@@ -1305,6 +1305,16 @@ describe('AgentModeService - CRM Tools', () => {
         expect(result.attempted).toBe(5);
         const { created, merged, alreadyPresent, duplicateInRequest, anonymizedSkipped, failed, unprocessed } =
           result.reconciliation;
+        // Pin each bucket to the row it came from — the sum alone is a
+        // tautology (every outcome tallies into exactly one bucket), so it
+        // would still hold if two buckets were mislabelled.
+        expect(created).toBe(1);
+        expect(merged).toBe(1);
+        expect(alreadyPresent).toBe(1);
+        expect(duplicateInRequest).toBe(1);
+        expect(anonymizedSkipped).toBe(1);
+        expect(failed).toBe(0);
+        expect(unprocessed).toBe(0);
         expect(created + merged + alreadyPresent + duplicateInRequest + anonymizedSkipped + failed + unprocessed)
           .toBe(result.attempted);
         expect(result.complete).toBe(true);
