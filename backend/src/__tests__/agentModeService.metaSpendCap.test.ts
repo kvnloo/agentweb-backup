@@ -7,6 +7,11 @@
 // These assertions pin the agentMode half: spend_cap is written on CREATE and
 // UPDATE, and every spend_cap write is verified with an independent read-back so
 // a dropped cap is reported loudly instead of as plain success.
+//
+// The verdict is deliberately two-valued — confirmed, or NOT confirmed. It is never
+// "not applied": live against a real ad account, an update that HAD landed read back
+// with no spend_cap for over six seconds before settling, so an absent read proves
+// nothing and asserting failure would send users to re-apply a cap they already have.
 
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({
@@ -101,7 +106,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.message).not.toContain('undefined');
     });
 
-    it('reports the cap as NOT applied when the read-back shows no cap (the reported bug)', async () => {
+    it('refuses to confirm the cap when the read-back shows none (the reported bug)', async () => {
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
       // Exactly what a raw Graph read returned for the two new campaigns: no spend_cap at all.
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
@@ -109,14 +114,17 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       const result = await service.createMetaAdsCampaign('user123', createParams as any);
 
       expect(result.spend_cap_verified).toBe(false);
-      expect(result.error).toBe('SPEND_CAP_NOT_APPLIED');
-      expect(result.message).toMatch(/NOT applied/i);
+      expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
+      // Never asserted as "not applied": a read-back can prove a cap IS set, never that it
+      // is not — live, an absent read persisted >6s on an update that had actually landed.
+      expect(result.message).toMatch(/could NOT be confirmed/i);
+      expect(result.message).not.toMatch(/was NOT applied/i);
       // The campaign id must survive so the caller can repair it with an UPDATE
       // instead of creating a duplicate campaign.
       expect(result.campaign).toEqual(expect.objectContaining({ id: 'camp_new' }));
-      // CREATE keeps success:true deliberately: the campaign DOES exist, and a
-      // success:false result is rewritten at the dispatch boundary into a bare error
-      // string, which would hide the campaign id and invite a duplicate create.
+      // success:true deliberately: the campaign DOES exist, and a success:false result is
+      // rewritten at the dispatch boundary into a bare error string, which would hide the
+      // campaign id and invite a duplicate create.
       expect(result.success).toBe(true);
       expect(toolResultError(result)).toBeNull();
     }, 20000);
@@ -128,8 +136,8 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       const result = await service.createMetaAdsCampaign('user123', createParams as any);
 
       expect(result.spend_cap_verified).toBe(false);
-      expect(result.error).toBeUndefined();
-      expect(result.message).toMatch(/could not be verified/i);
+      expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
+      expect(result.message).toMatch(/could NOT be confirmed/i);
     }, 20000);
 
     it('does not cry wolf on read-after-write lag — a stale read is retried, not believed', async () => {
@@ -206,30 +214,34 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
 
       const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
 
-      expect(result.success).toBe(false);
-      expect(result.error).toMatch(/^SPEND_CAP_NOT_APPLIED/);
-      expect(result.message).toMatch(/NOT applied/i);
+      // NOT success:false — an unconfirmed read is not a failed write, and downgrading it
+      // would count a healthy call as a failure and strip every field below.
+      expect(result.success).toBe(true);
+      expect(toolResultError(result)).toBeNull();
+      expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
+      expect(result.spend_cap_verified).toBe(false);
+      expect(result.message).toMatch(/could NOT be confirmed/i);
       expect(result.spend_cap_requested).toBe(300000);
-      expect(result.spend_cap_applied).toBe(100000);
+      expect(result.spend_cap_read).toBe(100000);
     }, 20000);
 
-    it('carries the whole story in the reason the model actually sees', async () => {
-      // A success:false result never reaches the model as JSON: the dispatch boundary
-      // (utils/toolResultError → extractToolResultMessage) replaces it with ONE reason
-      // string taken from `error` before `message`, and extractMinimalToolResult keeps
-      // nothing for this tool. So the reason itself has to name the requested cap, the
-      // campaign, and what to tell the user — a bare code told the model nothing.
+    it('carries the whole story to the model without pretending the write failed', async () => {
+      // The result stays success:true so it reaches the model as JSON — a success:false
+      // result is collapsed at the dispatch boundary into ONE reason string and this tool
+      // keeps no minimal fields, so everything below would be lost. The message therefore
+      // has to carry it all: the amount, the campaign, what was read, and the ban on
+      // claiming the cap is set.
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
       (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_1' });
 
       const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
 
-      const modelVisibleReason = toolResultError(result)?.message ?? '';
-      expect(modelVisibleReason).toContain('SPEND_CAP_NOT_APPLIED');
-      expect(modelVisibleReason).toContain('300000');
-      expect(modelVisibleReason).toContain('camp_1');
-      expect(modelVisibleReason).toMatch(/NO spend cap set/i);
-      expect(modelVisibleReason).toMatch(/tell the user/i);
+      expect(toolResultError(result)).toBeNull();
+      expect(result.message).toContain('300000');
+      expect(result.message).toContain('camp_1');
+      expect(result.message).toMatch(/NO spend cap set/i);
+      expect(result.message).toMatch(/do NOT tell the user/i);
+      expect(result.message).toMatch(/idempotent/i);
     }, 20000);
 
     it('does not claim success-with-cap when the read-back itself fails', async () => {
@@ -239,7 +251,8 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       const result = await service.updateMetaAdsCampaign('user123', 'camp_1', { spend_cap: 300000 });
 
       expect(result.spend_cap_verified).toBe(false);
-      expect(result.message).toMatch(/could not be verified/i);
+      expect(result.error).toBe('SPEND_CAP_UNCONFIRMED');
+      expect(result.message).toMatch(/could NOT be confirmed/i);
     }, 20000);
 
     it('leaves non-spend_cap updates untouched (no extra read-back)', async () => {

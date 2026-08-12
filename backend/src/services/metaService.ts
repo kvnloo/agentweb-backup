@@ -305,7 +305,7 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
-    MetaService.resolveCampaignCreateParams(params);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
   /**
@@ -324,65 +324,43 @@ export class MetaService {
   ] as const;
 
   /**
-   * Campaign fields this layer deliberately routes somewhere else. Meta really does accept
-   * these ON the campaign (that is how CBO works), but our contract sets them via
-   * `advantage_campaign_budget` + `budget_amount`, so accepting them verbatim would produce
-   * two ways to say the same thing with different units. Rejected with that guidance.
-   */
-  private static readonly CAMPAIGN_CREATE_REROUTED_PARAMS = ['daily_budget', 'lifetime_budget'] as const;
-
-  /**
-   * Every field Meta itself models on a Campaign — the authoritative list, straight from the
-   * SDK, so it tracks Meta rather than a copy of it that would rot here.
+   * Reject a CAMPAIGN CREATE param that would not be applied, BEFORE anything is created.
+   * A silently-dropped param plus a success message is how a campaign was created with no
+   * spend cap while the operator was told the cap was in place (ENG-1018) — money-affecting
+   * fields must fail loudly. Rejecting pre-flight means nothing is created, so the caller
+   * fixes the params and retries with no orphaned campaign to clean up.
    *
-   * Read defensively: if the SDK ever stops exposing `Fields`, this degrades to an empty set,
-   * which makes the passthrough rule below reject unknown params instead of forwarding them.
-   * That is the conservative direction — a caller gets a loud "not supported" rather than an
-   * arbitrary key POSTed to Meta, and NEVER a silent drop, which is the invariant that
-   * matters (ENG-1018). It also must never throw: this runs on the campaign-create path.
+   * This deliberately refuses ANY param outside the mapped set, including genuine Meta
+   * campaign fields. Forwarding those was tried and reverted: a live create with
+   * `start_time` on the test ad account was accepted by Meta with no error and then
+   * IGNORED (the campaign read back the 1969 epoch placeholder — campaign scheduling comes
+   * from the ad sets), while `buying_type` in the same call applied. Passing a field through
+   * therefore does not mean it takes effect, and we cannot tell which is which without
+   * per-field knowledge — so forwarding would have rebuilt this very bug one layer up:
+   * accepted, reported successful, never applied. A loud refusal that names the field is
+   * worse UX and better behaviour.
    */
-  private static campaignFieldNames(): Set<string> {
-    const modelled = (Campaign as any)?.Fields;
-    return new Set<string>(modelled ? Object.values(modelled as Record<string, string>) : []);
-  }
-
-  /**
-   * Decide, BEFORE anything is created, what happens to each CAMPAIGN CREATE param. A
-   * silently-dropped param plus a success message is how a campaign was created with no spend
-   * cap while the operator was told the cap was in place (ENG-1018), so nothing is ever dropped
-   * quietly. But "not in our allow-list" is not the same as "wrong": Meta models 45 campaign
-   * fields and we only map a handful, so a legitimate one (start_time, buying_type,
-   * special_ad_category_country, …) is FORWARDED verbatim and validated by Meta rather than
-   * rejected by us — otherwise closing a silent-drop bug would just trade it for a false
-   * rejection of a field the user genuinely asked for.
-   *
-   * Returns the passthrough keys; throws for params that would not be applied at all.
-   */
-  private static resolveCampaignCreateParams(params: Partial<MetaAdsCampaignParams>): string[] {
+  private static assertNoUnappliedCampaignCreateParams(params: Partial<MetaAdsCampaignParams>): void {
     const handled = new Set<string>([
       ...MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS,
       ...MetaService.CAMPAIGN_CREATE_CONSUMED_PARAMS,
     ]);
-    const rerouted = new Set<string>(MetaService.CAMPAIGN_CREATE_REROUTED_PARAMS);
-    const metaFields = MetaService.campaignFieldNames();
-
-    const present = Object.keys(params || {}).filter(
+    const unapplied = Object.keys(params || {}).filter(
       key => !handled.has(key) && (params as any)[key] !== undefined
     );
-    const passthrough = present.filter(key => metaFields.has(key) && !rerouted.has(key));
-    const unapplied = present.filter(key => !metaFields.has(key) || rerouted.has(key));
-    if (unapplied.length === 0) return passthrough;
+    if (unapplied.length === 0) return;
 
     throw new Error(
       `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
       `to the campaign, so this create was rejected instead of silently ignoring them. ` +
-      `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}, ` +
-      `plus any other field Meta models on a campaign (e.g. start_time, stop_time, buying_type). ` +
+      `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
       `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars) — ` +
       `do NOT pass daily_budget/lifetime_budget here. ` +
       `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Scheduling (start_time/stop_time) comes from the campaign's AD SETS — Meta accepts those ` +
+      `on a campaign create and then ignores them, so set them on AD_SET CREATE. ` +
       `Ad-set fields (bid_strategy, bid_amount, targeting, ` +
-      `optimization_goal, billing_event, end_time) belong on AD_SET CREATE.`
+      `optimization_goal, billing_event, end_time) belong on AD_SET CREATE too.`
     );
   }
 
@@ -416,7 +394,7 @@ export class MetaService {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
 
-    MetaService.resolveCampaignCreateParams(params);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
   /**
@@ -1039,15 +1017,6 @@ export class MetaService {
       // this only guarantees the request reaches Meta.
       if (params.spend_cap !== undefined && params.spend_cap !== null) {
         finalParams.spend_cap = params.spend_cap;
-      }
-
-      // Any OTHER field Meta models on a campaign (start_time, buying_type,
-      // special_ad_category_country, …) is forwarded verbatim and validated by Meta. The
-      // validator above already rejected anything that is NOT a campaign field, so this
-      // list and that rejection are two halves of one rule: a param is applied or it is
-      // refused — never accepted and dropped (ENG-1018).
-      for (const key of MetaService.resolveCampaignCreateParams(params)) {
-        finalParams[key] = (params as any)[key];
       }
 
       this.log(`Attempting createCampaign with literal keys:`, finalParams);

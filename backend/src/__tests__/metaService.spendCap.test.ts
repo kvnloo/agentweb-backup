@@ -145,29 +145,27 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
     ).not.toThrow();
   });
 
-  it('forwards a real Meta campaign field we do not map, instead of rejecting it', async () => {
-    // Closing a silent-drop bug must not create a false-rejection bug: start_time is a
-    // genuine campaign field, so a caller who asks for it gets it — validated by Meta.
+  it('rejects a real Meta campaign field we do not map, rather than forwarding it blind', () => {
+    // Forwarding these was tried and reverted: a live create with start_time was accepted
+    // by Meta and then IGNORED (campaign read back the 1969 epoch placeholder), which is
+    // this very bug one layer up — accepted, reported successful, never applied. Refusing
+    // and naming the field is the only outcome that cannot mislead.
     expect(() =>
       MetaService.validateCampaignParamsExceptObjective('CREATE', {
-        name: 'C', start_time: '2026-09-01T00:00:00-0700', buying_type: 'AUCTION',
+        name: 'C', start_time: '2026-09-01T00:00:00-0700',
       } as any)
-    ).not.toThrow();
-
-    const createCampaign = jest.fn().mockResolvedValue({ _data: { id: 'c1' } });
-    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ createCampaign }));
-
-    await service.createCampaign(accountId, token, {
-      name: 'C', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'],
-      start_time: '2026-09-01T00:00:00-0700',
-    } as any);
-
-    expect(createCampaign.mock.calls[0][1]).toEqual(
-      expect.objectContaining({ start_time: '2026-09-01T00:00:00-0700' })
-    );
+    ).toThrow(/start_time/);
   });
 
-  it('still rejects a param that is not a campaign field at all', () => {
+  it('points scheduling at the ad set instead of just refusing it', () => {
+    expect(() =>
+      MetaService.validateCampaignParamsExceptObjective('CREATE', {
+        name: 'C', start_time: '2026-09-01T00:00:00-0700',
+      } as any)
+    ).toThrow(/AD SETS|AD_SET/i);
+  });
+
+  it('still rejects an ad-set field sent to CAMPAIGN CREATE', () => {
     expect(() =>
       MetaService.validateCampaignParamsExceptObjective('CREATE', {
         name: 'C', optimization_goal: 'OFFSITE_CONVERSIONS', targeting: {},

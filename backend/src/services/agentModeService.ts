@@ -16102,18 +16102,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * money stop, so the write response is never trusted on its own: the campaign is re-read
    * and the applied value compared against what was requested.
    *
-   * Three outcomes, deliberately distinct: applied (proven), NOT applied (proven wrong — the
-   * silent-drop case), and unverified (the read-back itself failed, so nothing is proven
-   * either way). "Unverified" must never be reported as applied.
+   * TWO outcomes, because that is all a read-back can honestly support: CONFIRMED (a read
+   * came back equal to what we asked for — proof the cap is on the campaign) and UNCONFIRMED
+   * (everything else). A read-back can prove a cap IS set; it cannot prove one is NOT.
    *
-   * A single read would make us cry wolf on Meta's read-after-write lag: a cap that DID land
-   * but has not propagated reads back as absent, and we would tell the user their money stop
-   * is missing when it is not. So a negative result is retried before it is believed — the
-   * same shape (and reason) as the creative-swap verification's retry loop. Only reads are
-   * retried; the write is never re-sent.
+   * That asymmetry is not theoretical. Live against the test ad account, an UPDATE to 300000
+   * returned success and then read back with NO spend_cap AT ALL for more than six seconds —
+   * through three retries and an independent raw Graph GET — before settling on the correct
+   * 300000. Timed separately, the same write converged in under a second. So Meta can serve a
+   * transiently field-less view of a campaign it has already updated, and code that treats an
+   * absent read as "the cap was NOT applied" will tell users their money stop is missing when
+   * it is not, and send them to re-apply a cap they already have.
+   *
+   * Retrying narrows that window (the write is never re-sent, only the read), but cannot
+   * close it — so a persistent negative is reported as "could not confirm", never as "not
+   * applied". Unconfirmed is still loud: the caller is told not to claim the cap is in place.
    */
-  private static readonly SPEND_CAP_VERIFY_ATTEMPTS = 3;
-  private static readonly SPEND_CAP_VERIFY_BACKOFF_MS = 2000;
+  private static readonly SPEND_CAP_VERIFY_ATTEMPTS = 4;
+  private static readonly SPEND_CAP_VERIFY_BACKOFF_MS = 3000;
 
   private async verifyCampaignSpendCap(
     accountId: string,
@@ -16204,27 +16210,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           spend_cap_verified: true,
         };
       }
-      if (check.readFailed) {
-        return {
-          ...created,
-          message: `Campaign "${campaignName}" was created, but its spend cap could not be verified ` +
-            `(${check.detail}). Do NOT tell the user a spend cap is in place — re-read it with ` +
-            `CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap") first.`,
-          spend_cap_requested: params.spend_cap,
-          spend_cap_verified: false,
-        };
-      }
       return {
         ...created,
-        message: `⚠️ Campaign "${campaignName}" was created, but the requested spend cap of ` +
-          `${AgentModeService.describeSpendCap(params.spend_cap)} was NOT applied after ${check.attempts} ` +
-          `read-backs — ${check.detail}. This campaign has no hard spend stop. ` +
-          `Apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, params.spend_cap=${params.spend_cap}) ` +
-          `and tell the user the cap is not yet in place. Do NOT create the campaign again.`,
+        message: `⚠️ Campaign "${campaignName}" was created, but its spend cap of ` +
+          `${AgentModeService.describeSpendCap(params.spend_cap)} could NOT be confirmed after ` +
+          `${check.attempts} read-back(s) — ${check.detail}. Do NOT tell the user a spend cap is in ` +
+          `place. Meta sometimes needs a moment to reflect this field, so re-read it with CAMPAIGN ` +
+          `LIST (campaign_id=${campaign?.id} + params.fields="id,name,spend_cap"); if it is still ` +
+          `missing, apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, ` +
+          `params.spend_cap=${params.spend_cap}). Do NOT create the campaign again.`,
         spend_cap_requested: params.spend_cap,
-        spend_cap_applied: check.applied,
+        spend_cap_read: check.applied,
         spend_cap_verified: false,
-        error: 'SPEND_CAP_NOT_APPLIED',
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -16759,40 +16757,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           spend_cap_verified: true,
         };
       }
-      if (check.readFailed) {
-        return {
-          success: true,
-          message: `Campaign update was sent, but the spend cap could not be verified (${check.detail}). ` +
-            `Do NOT tell the user the cap is in place — re-read it with CAMPAIGN LIST ` +
-            `(campaign_id + params.fields="id,name,spend_cap") first.`,
-          spend_cap_requested: normalizedParams.spend_cap,
-          spend_cap_verified: false,
-        };
-      }
-      // This is the one path that returns success:false, so it is also the one path the
-      // dispatch boundary rewrites: utils/toolResultError turns a success:false result into
-      // a tool error whose model-visible reason is extractToolResultMessage(result), which
-      // reads `error` BEFORE `message` — and the per-tool minimizer keeps nothing for this
-      // tool. A bare `error: 'SPEND_CAP_NOT_APPLIED'` therefore reached the model as that
-      // code and nothing else: not the amount, not the campaign, not the instruction to
-      // tell the user. For a money-affecting field that is the whole point of the message,
-      // so the reason itself carries the detail (the code stays as its prefix so callers
-      // and the tool contract can still match on it).
-      const notApplied =
-        `SPEND_CAP_NOT_APPLIED: the requested spend cap of ` +
-        `${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} was NOT applied to campaign ` +
-        `${campaignId} after ${check.attempts} read-backs — ${check.detail}. ` +
-        `The campaign does not have the hard spend stop you ` +
-        `asked for. Tell the user the cap is NOT in place and never claim it is set. If they ask you to ` +
-        `try again, the identical CAMPAIGN UPDATE (campaign_id=${campaignId}, ` +
-        `params.spend_cap=${normalizedParams.spend_cap}) is safe to re-send — the write is idempotent.`;
+      // Deliberately NOT success:false. An unconfirmed read is not a failed write — live,
+      // this exact path fired on an update that HAD landed (see verifyCampaignSpendCap), and
+      // success:false would have downgraded the whole result at the dispatch boundary to a
+      // bare error string, counted a healthy call as a failure, and told the user to re-apply
+      // a cap they already had. success:true with a loud, unmissable message keeps every
+      // structured field in front of the model and still forbids claiming the cap is set.
       return {
-        success: false,
-        message: `⚠️ ${notApplied}`,
+        success: true,
+        message: `⚠️ The spend cap of ${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} ` +
+          `on campaign ${campaignId} could NOT be confirmed after ${check.attempts} read-back(s) — ` +
+          `${check.detail}. The update was accepted by Meta, but do NOT tell the user the cap is in ` +
+          `place and never claim it is set. Meta sometimes needs a moment to reflect this field: ` +
+          `re-read it with CAMPAIGN LIST (campaign_id=${campaignId} + ` +
+          `params.fields="id,name,spend_cap") before reporting anything. If it is still missing, ` +
+          `re-send the identical CAMPAIGN UPDATE — the write is idempotent.`,
         spend_cap_requested: normalizedParams.spend_cap,
-        spend_cap_applied: check.applied,
+        spend_cap_read: check.applied,
         spend_cap_verified: false,
-        error: notApplied,
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
