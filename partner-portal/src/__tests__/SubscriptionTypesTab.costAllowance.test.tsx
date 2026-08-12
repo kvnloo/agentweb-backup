@@ -28,16 +28,20 @@ const mockedAxiosGet = axios.get as jest.Mock;
 const mockedAxiosPost = axios.post as jest.Mock;
 
 function mockMountGets(subTypes: any[]) {
-  // component fires 3 GETs on mount: subscription-types, available-skills, portal-pages
+  // component fires 4 GETs on mount: subscription-types, skills, pages, features
   mockedAxiosGet
     .mockResolvedValueOnce({ data: subTypes })
     .mockResolvedValueOnce({ data: [] })
-    .mockResolvedValueOnce({ data: { pages: [] } });
+    .mockResolvedValueOnce({ data: { pages: [] } })
+    .mockResolvedValueOnce({
+      data: { features: [{ id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.' }] },
+    });
 }
 
 describe('SubscriptionTypesTab — monthlyCostAllowance', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedAxiosGet.mockResolvedValue({ data: [] });
   });
 
   it('renders the cost cap in the list ($ formatted) and "Unlimited" when unset', async () => {
@@ -108,5 +112,37 @@ describe('SubscriptionTypesTab — monthlyCostAllowance', () => {
     const [, body] = mockedAxiosPost.mock.calls[0];
     const starter = body.subscriptionTypes.find((t: any) => t.name === 'Starter');
     expect(starter.monthlyCostAllowance).toBeNull();
+  });
+
+  it('lets an admin disable scheduled chats without changing the plan name', async () => {
+    mockMountGets([
+      {
+        name: 'Community',
+        allowedPages: ['*'],
+        allowedSkills: ['*'],
+        allowedConnectedAccounts: ['*'],
+        allowedFeatures: ['scheduled_chats'],
+      },
+    ]);
+
+    render(<SubscriptionTypesTab />);
+    await waitFor(() => expect(screen.getByText('Community')).toBeInTheDocument());
+
+    const iconButtons = screen.getAllByRole('button').filter(
+      (button) => button.querySelector('svg') !== null && !button.textContent?.trim()
+    );
+    fireEvent.click(iconButtons[0]);
+
+    const featureCheckbox = await screen.findByRole('checkbox', { name: /scheduled chats/i });
+    expect(featureCheckbox).toBeChecked();
+    fireEvent.click(featureCheckbox);
+    fireEvent.click(screen.getByRole('button', { name: /save|update/i }));
+
+    await waitFor(() => expect(mockedAxiosPost).toHaveBeenCalled());
+    const [, body] = mockedAxiosPost.mock.calls[0];
+    expect(body.subscriptionTypes[0]).toEqual(expect.objectContaining({
+      name: 'Community',
+      allowedFeatures: [],
+    }));
   });
 });
