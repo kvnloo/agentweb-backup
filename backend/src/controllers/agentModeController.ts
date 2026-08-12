@@ -505,12 +505,44 @@ export interface ScheduleRunHealth {
   // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
   // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
   consecutiveFailures: number;
+  // ENG-1131: why the most recent run could not do its real work, when it could
+  // not. Distinct from `lastRunStatus` on purpose: a prospecting run blocked by
+  // the LinkedIn people-search outage still writes a report and still records
+  // `status: 'success'`, so the owner's card is green while sourcing is down.
+  // Null when the last run was unblocked.
+  lastRunBlockedBy: string | null;
+}
+
+/**
+ * ENG-1131: recorded on a run result whose LinkedIn people-search was proven
+ * unavailable for the account (the ENG-975 control-query guard fired). The run
+ * itself may well have "succeeded" — produced a report, updated the CRM — while
+ * sourcing zero prospects for a reason that has nothing to do with the filters.
+ */
+export const LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON = 'linkedin_search_unavailable';
+
+/**
+ * ENG-1131: read the run's tool ledger for proof that its sourcing path was down.
+ *
+ * The ENG-975 guard stamps `searchUnavailable: true` on the tool result once a
+ * maximally broad control query has confirmed the account cannot search — so this
+ * can never fire on a search that genuinely matched nobody. `linkedin_outreach`
+ * raises it with `success: false` (the dispatcher downgrades that entry to an
+ * error but still stores its minimal result), `find_leads` raises it on a
+ * `success: true` response; both are read the same way here.
+ */
+export function detectRunBlockedReason(toolCalls: any[] | undefined | null): string | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const blocked = toolCalls.some(
+    (call: any) => call && typeof call === 'object' && call.result?.searchUnavailable === true,
+  );
+  return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
 }
 
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
-    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
   }
   const last = results[results.length - 1] || {};
   let consecutiveFailures = 0;
@@ -522,6 +554,7 @@ export function computeScheduleRunHealth(runResults: any[] | undefined | null): 
     lastRunStatus: last.status ?? null,
     lastRunAt: last.createdAt ?? null,
     consecutiveFailures,
+    lastRunBlockedBy: last.blockedBy ?? null,
   };
 }
 
@@ -4112,6 +4145,15 @@ export async function runScheduledChat(
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
     const runDelivered = result.success && !result.deferredUnresolved;
 
+    // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
+    const blockedBy = detectRunBlockedReason(result.toolCalls);
+    if (blockedBy) {
+      console.log(
+        `AgentMode: scheduled run ${schedule.scheduleId} was blocked by ${blockedBy} — ` +
+        `sourcing was unavailable, not empty`,
+      );
+    }
+
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
@@ -4136,6 +4178,15 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
+      // people-search still delivers a report when that endpoint is down for the
+      // account, so it lands here as a plain `success` and the owner's schedule
+      // card stays green while zero prospects were sourced — reading exactly like
+      // "nobody matched your filters". Persist WHY it was blocked so the card can
+      // say so. Kept separate from `status` deliberately: the outage is upstream
+      // and self-clearing, so flipping these runs to failures would bury the
+      // owner's real failure signal under a fleet-wide vendor incident.
+      ...(blockedBy ? { blockedBy } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
