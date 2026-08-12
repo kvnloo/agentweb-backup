@@ -3187,4 +3187,126 @@ describe('CRM Routes', () => {
       expect(responsePayload.totalFilteredCount).toBe(1);
     });
   });
+
+  // ENG-1002: the structured `anonymizedSkipped` field is only half the
+  // report. Every one of these endpoints also hands back a human-readable
+  // `message`, and that is what the portal actually shows — so a message that
+  // stops at "Imported 0" reproduces the original defect (a response that
+  // under-states what happened to the rows the user submitted) one layer out.
+  describe('anonymizedSkipped in human-readable import summaries', () => {
+    const { taskDb, subscriberDb } = require('../services/db');
+
+    const runSyncSubscribers = async (batchResult: any) => {
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue({
+        taskId: 'task1',
+        name: 'Test Task',
+        userId: 'test-user-id',
+      });
+      (subscriberDb.getAllTaskSubscribers as jest.Mock).mockResolvedValue([
+        { email: 'subscriber1@example.com', unsubscribed: false, subscribedAt: '2024-01-01T00:00:00Z' },
+      ]);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([
+        { listId: 'list1', name: 'Test Task Subscribers', userId: 'test-user-id' },
+      ]);
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue(batchResult);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/sync-subscribers';
+      mockRequest.body = { taskId: 'task1' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/sync-subscribers' && r.route?.methods?.post
+      );
+      expect(handler?.route).toBeDefined();
+      await handler!.route!.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      return (mockResponse.json as jest.Mock).mock.calls[0][0];
+    };
+
+    it('names the skipped placeholders in the subscriber-sync message', async () => {
+      const payload = await runSyncSubscribers({
+        successCount: 1,
+        newCount: 1,
+        mergedCount: 0,
+        errorCount: 0,
+        anonymizedSkipped: 2,
+        errors: [],
+      });
+
+      expect(payload.anonymizedSkipped).toBe(2);
+      expect(payload.message).toContain('2 anonymized LinkedIn placeholder(s) skipped');
+    });
+
+    it('leaves the subscriber-sync message untouched when nothing was skipped', async () => {
+      const payload = await runSyncSubscribers({
+        successCount: 1,
+        newCount: 1,
+        mergedCount: 0,
+        errorCount: 0,
+        anonymizedSkipped: 0,
+        errors: [],
+      });
+
+      expect(payload.anonymizedSkipped).toBe(0);
+      expect(payload.message).not.toContain('placeholder');
+    });
+
+    const runLinkedInImport = async (batchResult: any) => {
+      const AdmZip = require('adm-zip');
+      const zip = new AdmZip();
+      // LinkedIn's export puts a three-line notice above the real header, which
+      // is why the route parses `from_line: 4`.
+      zip.addFile(
+        'Connections.csv',
+        Buffer.from(
+          'Notes:\n"When exporting your connection data..."\n\n' +
+            'First Name,Last Name,URL,Email Address,Company,Position,Connected On\n' +
+            'Ada,Lovelace,https://www.linkedin.com/in/ada,,Analytical Engines,Engineer,01 Jan 2024\n'
+        )
+      );
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list1', userId: 'test-user-id' });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({ items: [], lastEvaluatedKey: undefined });
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue(batchResult);
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/lists/list1/leads/import-linkedin';
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'import' };
+      mockRequest.body = { userLinkedInUrl: 'https://www.linkedin.com/in/test-user' };
+      (mockRequest as any).file = { buffer: zip.toBuffer() };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/import-linkedin' && r.route?.methods?.post
+      );
+      expect(handler?.route).toBeDefined();
+      // stack[0] is multer's upload.single('file'); the request already carries
+      // a parsed `file`, so drive the route handler itself.
+      await handler!.route!.stack[1].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      return (mockResponse.json as jest.Mock).mock.calls[0][0];
+    };
+
+    it('names the skipped placeholders in the LinkedIn-connections import message', async () => {
+      const payload = await runLinkedInImport({
+        successCount: 0,
+        errorCount: 0,
+        anonymizedSkipped: 1,
+        errors: [],
+      });
+
+      expect(payload.anonymizedSkipped).toBe(1);
+      expect(payload.message).toContain('1 anonymized LinkedIn placeholder(s) skipped');
+    });
+
+    it('leaves the LinkedIn-connections import message untouched when nothing was skipped', async () => {
+      const payload = await runLinkedInImport({
+        successCount: 0,
+        errorCount: 0,
+        anonymizedSkipped: 0,
+        errors: [],
+      });
+
+      expect(payload.anonymizedSkipped).toBe(0);
+      expect(payload.message).not.toContain('placeholder');
+    });
+  });
 });

@@ -29,6 +29,11 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import {
+  buildToolResponseS3Header,
+  buildToolResponseUnavailableHeader,
+} from '../../../utils/toolResponseS3Ref';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -212,13 +217,17 @@ export interface ToolDispatchPorts {
   formatToolError: (toolName: string, errorMessage: string) => string;
   /** upload a playwright screenshot data-url to S3; returns { url } or null */
   uploadScreenshotToS3: (dataUrl: string, userId: string) => Promise<{ url: string } | null>;
-  /** upload a large tool response to S3; returns { success, key } */
+  /**
+   * upload a large tool response to S3; returns { success, key }.
+   * It reports failure by RETURNING success:false with `error` — it swallows its
+   * own exceptions — so callers must check the result, not just catch (ENG-940).
+   */
   uploadFileToS3WithPath: (
     content: string,
     fileName: string,
     contentType: string,
     path: string,
-  ) => Promise<{ success: boolean; key?: string }>;
+  ) => Promise<{ success: boolean; key?: string; error?: string }>;
   /** build the CRM-data-changed socket payload for a mutating tool (or null) */
   buildCrmDataChangedPayload: (toolName: string, functionArgs: any) => any;
   /** the socket event name for CRM data changes */
@@ -909,27 +918,60 @@ export async function executePreparedTools(
       // then cap the in-memory copy to prevent worker OOM.
       const S3_IN_MEMORY_CAP = 20_000;
       if (typeof toolContent === 'string' && toolContent.length > toolResponseS3Threshold) {
-        try {
-          const uploadResult = await ports.uploadFileToS3WithPath(
-            toolContent,
-            `${toolCall.id}.txt`,
-            'text/plain',
-            `tool-responses/${sessionId}`,
-          );
-          if (uploadResult.success && uploadResult.key) {
-            const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-            const preview = toolContent.length > S3_IN_MEMORY_CAP
-              ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-              : toolContent;
-            toolContent = header + preview;
+        // ENG-940: this offload is the ONLY thing that keeps the payload readable
+        // once the trimmer compresses this message, so a failure here is not a
+        // cosmetic miss — it is silent data loss on a later turn. Retry once (the
+        // common failure is a transient S3 blip), and if it still cannot be stored
+        // say so in the message rather than letting it pass for a small response.
+        // Note uploadFileToS3WithPath reports failure by RETURNING {success:false};
+        // the catch only covers a port that throws.
+        let uploadedKey: string | undefined;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 2 && !uploadedKey; attempt++) {
+          try {
+            const uploadResult = await ports.uploadFileToS3WithPath(
+              toolContent,
+              `${toolCall.id}.txt`,
+              'text/plain',
+              `tool-responses/${sessionId}`,
+            );
+            if (uploadResult.success && uploadResult.key) uploadedKey = uploadResult.key;
+            else lastError = uploadResult.error;
+          } catch (e) {
+            lastError = e;
           }
-        } catch (e) {
-          console.error('AgentMode: Failed to save large tool response to S3:', e);
+        }
+
+        if (uploadedKey) {
+          const header = buildToolResponseS3Header(uploadedKey, toolContent.length);
+          // ENG-1054: seal the slice instead of leaving the JSON it cut open. A bare
+          // substring lands mid-string/mid-object, and a model handed an unterminated
+          // structure completes it rather than answering — that is where the
+          // production `}]` final answer came from.
+          const preview = toolContent.length > S3_IN_MEMORY_CAP
+            ? sealTruncatedPayload(toolContent.substring(0, S3_IN_MEMORY_CAP))
+            : toolContent;
+          toolContent = header + preview;
+        } else {
+          console.error(
+            `AgentMode: Failed to save large ${toolCall.function.name} response ` +
+            `(${toolContent.length} chars) to S3 after 2 attempts:`,
+            lastError,
+          );
+          // Keep the payload in full for THIS turn — it is now the only copy —
+          // and prepend the notice so the loss is visible on every later turn.
+          toolContent = buildToolResponseUnavailableHeader(toolContent.length) + toolContent;
         }
       }
 
+      // ENG-1054: seal here too. This cap is a SECOND bare cut on the same payload,
+      // reached when the S3 offload above failed and left the content full-size —
+      // an unsealed slice here would reopen the JSON just as the preview one did.
       const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > maxToolContentSize
-        ? toolContent.substring(0, maxToolContentSize) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+        ? sealTruncatedPayloadWithNotice(
+          toolContent.substring(0, maxToolContentSize),
+          '[Content truncated for storage — original size: ' + toolContent.length + ' chars]',
+        )
         : toolContent;
       (messages as any[]).push({
         tool_call_id: toolCall.id,

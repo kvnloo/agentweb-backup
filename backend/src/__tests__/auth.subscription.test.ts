@@ -22,6 +22,7 @@ jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(async () => 'Pro'),
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
   getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
+  getAllowedFeatures: jest.fn(async () => ['scheduled_chats']),
   getHiddenPages: jest.fn(async () => []),
 }));
 
@@ -81,6 +82,7 @@ describe('GET /api/auth/me subscription fields', () => {
       { skillId: 'skill-1', name: 'Web Search' },
       { skillId: 'skill-2', name: 'Image Gen' },
     ]);
+    expect(res.body.allowedFeatures).toEqual(['scheduled_chats']);
 
     expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('user-1');
     expect(mockedGetAllowedPages).toHaveBeenCalledWith('user-1');
