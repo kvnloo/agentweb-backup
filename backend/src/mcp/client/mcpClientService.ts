@@ -160,6 +160,8 @@ interface SessionClientPool {
   pendingClients: Map<string, Promise<Client>>;
   lastActivity: number;
   released: boolean;
+  /** Tool calls currently executing against this pool. A busy pool is never reclaimed. */
+  inFlight: number;
 }
 
 // Circuit breaker state for a server
@@ -241,6 +243,17 @@ export class McpClientService {
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
+
+  // Browser pools are far more expensive than the rest (one Chromium each) and, since
+  // ENG-1118, there is one per chat session rather than one per user. They all live in the
+  // single long-lived generateMarketingResponse worker and no caller releases them at
+  // session end, so they get their own, much shorter idle TTL plus a hard cap. Both are
+  // env-tunable so prod can be retuned without a deploy.
+  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+  private readonly MAX_BROWSER_CLIENTS = parseInt(process.env.MCP_MAX_BROWSER_CLIENTS || '6', 10);
+  // A pool is only evictable once it has been quiet for this long, so a session merely
+  // waiting on the LLM between two tool calls never loses its browser mid-run.
+  private readonly BROWSER_EVICTION_GRACE_MS = parseInt(process.env.MCP_BROWSER_EVICTION_GRACE_MS || '60000', 10);
 
   // Circuit breaker: fail fast when a server has timed out repeatedly
   private readonly CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.MCP_CIRCUIT_BREAKER_THRESHOLD || '3', 10);
@@ -457,7 +470,11 @@ export class McpClientService {
     const staleSessionIds: string[] = [];
 
     for (const [sessionId, pool] of this.sessionClientPools.entries()) {
-      if (now - pool.lastActivity > this.SESSION_TIMEOUT_MS) {
+      // A pool with a call in progress is live work, however old lastActivity looks —
+      // reclaiming it would pull the browser out from under a running step.
+      if (pool.inFlight > 0) continue;
+      const idleLimit = this.isBrowserPool(pool) ? this.BROWSER_IDLE_TIMEOUT_MS : this.SESSION_TIMEOUT_MS;
+      if (now - pool.lastActivity > idleLimit) {
         staleSessionIds.push(sessionId);
       }
     }
@@ -465,6 +482,68 @@ export class McpClientService {
     for (const sessionId of staleSessionIds) {
       console.log(`[MCP-CLEANUP] Removing stale session client pool: ${sessionId.substring(0, 8)}`);
       await this.releasePool(sessionId);
+    }
+  }
+
+  /** True when a pool holds at least one browser-backed client (i.e. owns a Chromium). */
+  private isBrowserPool(pool: SessionClientPool): boolean {
+    for (const serverName of pool.clients.keys()) {
+      if (isBrowserServer(serverName, this.serverConfigs.get(serverName))) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Mark a tool call as started (+1) or settled (-1) against a pool.
+   * Keeps a pool off both reclaim paths for the duration of the call, and refreshes
+   * lastActivity when the call settles so a long step doesn't age out mid-flight.
+   */
+  private markPoolBusy(poolKey: string, delta: 1 | -1): void {
+    const pool = this.sessionClientPools.get(poolKey);
+    if (!pool) return;
+    pool.inFlight = Math.max(0, pool.inFlight + delta);
+    pool.lastActivity = Date.now();
+  }
+
+  /**
+   * Bound the number of live browser clients, evicting the least-recently-used one.
+   *
+   * Only pools that are idle (no in-flight call) and past the grace window are eligible,
+   * and the pool that just asked for a client is never a candidate. If nothing is safely
+   * evictable we deliberately overshoot the cap and say so — memory pressure is recoverable,
+   * yanking a browser out of a running session is exactly the ENG-1118 failure we're fixing.
+   */
+  private async enforceBrowserClientCap(currentPoolKey: string): Promise<void> {
+    if (this.MAX_BROWSER_CLIENTS <= 0) return;
+    const now = Date.now();
+
+    while (true) {
+      const browserPools = Array.from(this.sessionClientPools.entries())
+        .filter(([, pool]) => this.isBrowserPool(pool));
+      if (browserPools.length <= this.MAX_BROWSER_CLIENTS) return;
+
+      const evictable = browserPools
+        .filter(([key, pool]) =>
+          key !== currentPoolKey
+          && pool.inFlight === 0
+          && now - pool.lastActivity >= this.BROWSER_EVICTION_GRACE_MS)
+        .sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+
+      if (evictable.length === 0) {
+        console.warn(
+          `[MCP-SESSION] ${browserPools.length} live browser client(s), over the browser client cap `
+          + `of ${this.MAX_BROWSER_CLIENTS}, but none is idle enough to evict — running over the cap `
+          + `rather than interrupting a live session.`
+        );
+        return;
+      }
+
+      const [victimKey] = evictable[0];
+      console.log(
+        `[MCP-SESSION] Browser client cap (${this.MAX_BROWSER_CLIENTS}) exceeded — evicting `
+        + `least-recently-used idle browser pool: ${victimKey.substring(0, 8)}`
+      );
+      await this.releasePool(victimKey);
     }
   }
 
@@ -505,6 +584,7 @@ export class McpClientService {
         pendingClients: new Map(),
         lastActivity: Date.now(),
         released: false,
+        inFlight: 0,
       };
       this.sessionClientPools.set(poolKey, sessionPool);
     }
@@ -521,7 +601,12 @@ export class McpClientService {
     const creation = this.createSessionClient(serverName, poolKey, userId, sessionPool);
     sessionPool.pendingClients.set(serverName, creation);
     try {
-      return await creation;
+      const client = await creation;
+      // A browser client was just added — re-check the cap now that it is live.
+      if (isBrowserServer(serverName, this.serverConfigs.get(serverName))) {
+        await this.enforceBrowserClientCap(poolKey);
+      }
+      return client;
     } finally {
       if (sessionPool.pendingClients.get(serverName) === creation) {
         sessionPool.pendingClients.delete(serverName);
@@ -715,10 +800,17 @@ export class McpClientService {
                     maxAttempts,
                     phase: 'call',
                   })));
-                  const result = await sessionClient.callTool({
-                    name: originalToolName,
-                    arguments: toolArgs
-                  }, undefined, { timeout: 3600000 });
+                  const callPoolKey = this.getPoolKey(serverName, context.sessionId, context.userId);
+                  this.markPoolBusy(callPoolKey, 1);
+                  let result;
+                  try {
+                    result = await sessionClient.callTool({
+                      name: originalToolName,
+                      arguments: toolArgs
+                    }, undefined, { timeout: 3600000 });
+                  } finally {
+                    this.markPoolBusy(callPoolKey, -1);
+                  }
                   const contentArray = (result.content as any[]) || [];
                   if (result.isError) {
                     throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
@@ -1341,10 +1433,17 @@ export class McpClientService {
                 phase: 'call',
               })));
 
-              const result = await sessionClient.callTool({
-                name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
-                arguments: toolArgs
-              }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
+              const callPoolKey = this.getPoolKey(name, context.sessionId, context.userId);
+              this.markPoolBusy(callPoolKey, 1);
+              let result;
+              try {
+                result = await sessionClient.callTool({
+                  name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
+                  arguments: toolArgs
+                }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
+              } finally {
+                this.markPoolBusy(callPoolKey, -1);
+              }
 
               // Cast content to any to access properties safely
               const contentArray = (result.content as any[]) || [];
