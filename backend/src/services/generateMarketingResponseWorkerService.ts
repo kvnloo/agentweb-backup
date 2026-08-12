@@ -312,6 +312,25 @@ export class GenerateMarketingResponseWorkerService {
   }
 
   /**
+   * ENG-1118: tell the worker to release a finished chat session's MCP clients.
+   *
+   * Browser MCP servers pool per chat session and those pools live in the worker process,
+   * so a caller in this process cannot reclaim them directly — a scheduled run's Chromium
+   * would sit idle until the pool sweep. Fire-and-forget, like cancelSession: never starts
+   * a worker (with no worker there is nothing to release) and never throws into the
+   * caller's `finally`.
+   */
+  releaseSessionClients(sessionId: string): void {
+    if (!sessionId) return;
+    if (!this.worker || this.worker.killed) return;
+    try {
+      this.worker.send({ type: 'releaseSessionClients', sessionId });
+    } catch (error) {
+      console.warn(`[Worker] Could not signal MCP client release for session ${sessionId}:`, (error as Error).message);
+    }
+  }
+
+  /**
    * Shutdown the worker process, draining any in-flight requests first.
    * Blocks until pendingRequests.size === 0 or DRAIN_CEILING_MS elapses.
    */

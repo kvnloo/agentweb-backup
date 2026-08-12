@@ -3045,6 +3045,9 @@ export async function runScheduledChat(
 }> {
   const now = new Date();
   let sessionId: string = '';
+  // ENG-1118: set when the run parks on a user question. A park resumes into the SAME
+  // session, so its browser is kept rather than released in `finally`.
+  let parkedOnUserQuestion = false;
   let generatedSummary: string | undefined;
 
   // ENG-324: durable in-flight lease. Set once the session exists (below), kept
@@ -3847,6 +3850,8 @@ export async function runScheduledChat(
         );
       }
 
+      parkedOnUserQuestion = true;
+
       const parkedResult = {
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
@@ -4455,6 +4460,20 @@ export async function runScheduledChat(
     // Return error result for error reporting
     return errorResult;
   } finally {
+    // ENG-1118: the run is over — hand its browser back now rather than leaving a
+    // Chromium idle until the pool sweep. Browser MCP clients pool per chat session and
+    // live in the generate worker, so this has to be signalled across the process
+    // boundary. A parked run is the exception: it resumes into this same session, so
+    // releasing here would hand the resume a blank page. The idle sweep still reclaims
+    // it if the human never answers.
+    if (sessionId && !parkedOnUserQuestion) {
+      try {
+        generateMarketingResponseWorkerService.releaseSessionClients(sessionId);
+      } catch (releaseError) {
+        console.warn(`Failed to release MCP clients for session ${sessionId}:`, releaseError);
+      }
+    }
+
     // ENG-324: stop heartbeating and release the lease. Conditional on runId, so
     // if the reconciler already reaped this run (heartbeat went stale), the clear
     // no-ops and the requeue it wrote stands.

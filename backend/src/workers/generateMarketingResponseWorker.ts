@@ -65,6 +65,18 @@ process.on('message', async (message: any) => {
     return;
   }
 
+  // ENG-1118: a chat session ended in the parent — hand back the MCP clients it owns
+  // (a browser server pools per session, so this is a real Chromium) instead of waiting
+  // for the idle sweep. Fire-and-forget: there is no reply and nothing to fail into.
+  if (message.type === 'releaseSessionClients') {
+    try {
+      await agentModeService.releaseSessionMcpClients(message.sessionId);
+    } catch (error) {
+      console.warn(`[Worker] Failed to release MCP clients for session ${message.sessionId}:`, error);
+    }
+    return;
+  }
+
   const requestId = message.requestId;
   currentRequestId = requestId;
 
