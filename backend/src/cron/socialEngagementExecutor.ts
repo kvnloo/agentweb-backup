@@ -158,9 +158,18 @@ const COMMENT_ACTION_REQUIREMENTS: Record<string, string[]> = {
     like_and_reply_comment: ['like', 'reply'],
 };
 
-function includesAllActions(preferredActions: unknown, requiredActions: string[]): boolean {
-    return Array.isArray(preferredActions)
-        && requiredActions.every(action => preferredActions.includes(action));
+function includesAllActions(
+    preferredActions: unknown,
+    requiredActions: string[],
+    defaultActions: string[]
+): boolean {
+    // These defaults deliberately mirror the scanner. Nullish legacy arrays mean
+    // "use the product default"; an explicit empty/malformed value is an opt-out
+    // and must fail closed.
+    const actions = preferredActions == null
+        ? defaultActions
+        : Array.isArray(preferredActions) ? preferredActions : [];
+    return requiredActions.every(action => actions.includes(action));
 }
 
 function getLinkedInAdapter(): LinkedInAdapter {
@@ -355,8 +364,8 @@ export class SocialEngagementExecutor {
             if (engagerSettings.enableAsPostEngager !== true || ownerSettings.enablePostDiscovery !== true) {
                 return null;
             }
-            if (!includesAllActions(engagerSettings.preferredActions, requiredActions)
-                || !includesAllActions(ownerSettings.preferredActions, requiredActions)) {
+            if (!includesAllActions(engagerSettings.preferredActions, requiredActions, ['like', 'comment'])
+                || !includesAllActions(ownerSettings.preferredActions, requiredActions, ['like'])) {
                 return null;
             }
             return { engagingConnection, ownerConnection };
@@ -366,7 +375,7 @@ export class SocialEngagementExecutor {
             const requiredActions = COMMENT_ACTION_REQUIREMENTS[input.actionType];
             if (!requiredActions || input.ownerAccountId !== input.engagingAccountId) return null;
             if (engagerSettings.enableCommentDiscovery !== true
-                || !includesAllActions(engagerSettings.commentPreferredActions, requiredActions)) {
+                || !includesAllActions(engagerSettings.commentPreferredActions, requiredActions, ['reply'])) {
                 return null;
             }
             return { engagingConnection, ownerConnection: engagingConnection };

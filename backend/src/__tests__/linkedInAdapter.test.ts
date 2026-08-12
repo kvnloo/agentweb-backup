@@ -209,6 +209,13 @@ describe('LinkedInAdapter', () => {
         adapter.createReaction(expiredAccount, 'urn:li:share:123', 'LIKE', 'user-123'),
       ).rejects.toThrow('changed or disconnected');
 
+      expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
+        'user-123',
+        'linkedin',
+        expect.objectContaining({ access_token: 'refreshed-token' }),
+        expiredAccount.account_id,
+        expiredAccount,
+      );
       expect(mockLinkedInService.createReaction).not.toHaveBeenCalled();
     });
   });

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 
 // ============================================
@@ -524,64 +525,81 @@ export const updateAccountTokens = async (
     refresh_token?: string;
     token_expires_at: number;
   },
-  accountId?: string
+  accountId?: string,
+  expectedAccount?: ConnectedAccount,
 ): Promise<void> => {
-  // Token refresh is an external-credential write. Resolve the primary record
-  // strongly so a just-disconnected account cannot be refreshed from a stale
-  // UserIdIndex result and restored to connected_accounts.
-  const user = await userDb.getUserByIdConsistent(userId);
-  if (!user) {
-    throw new Error('User not found');
-  }
-
-  const storedAccounts = (user as User).connected_accounts;
-  const accounts = normalizeAccounts(storedAccounts);
-  const accountIndex = accountId
-    ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
-    : accounts.findIndex(acc => acc.platform === platform);
-
-  if (accountIndex < 0) {
-    throw Object.assign(
-      new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
-      { code: 'ConnectedAccountChanged' },
-    );
-  }
-
-  const existingAccount = accounts[accountIndex];
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: {
-      ...existingAccount.config,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
-      token_expires_at: tokens.token_expires_at,
-    },
-    updated_at: new Date().toISOString(),
+  const changedError = () => Object.assign(
+    new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
+    { code: 'ConnectedAccountChanged' },
+  );
+  // Accounts returned to callers can carry this non-persisted owner marker.
+  // It is not a credential/config change and must not make the same stored
+  // account look different during a refresh.
+  const snapshot = (account: ConnectedAccount): ConnectedAccountConfig => {
+    const { userId: _userId, ...persistedAccount } = account as ConnectedAccount & { userId?: string };
+    return persistedAccount as ConnectedAccountConfig;
   };
+  let sourceAccount = expectedAccount ? snapshot(expectedAccount) : undefined;
 
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
-
-  try {
-    await userDb.updateUser(userId, {
-      connected_accounts: updatedAccounts,
-    } as Partial<User>, {
-      // Carry the strong-read decision into the write. Otherwise a disconnect
-      // between the read and update could be overwritten with the stale account.
-      condition: {
-        expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
-        names: { '#expectedConnectedAccounts': 'connected_accounts' },
-        values: { ':expectedConnectedAccounts': storedAccounts },
-      },
-    });
-  } catch (error: any) {
-    if (error?.code === 'ConditionalCheckFailedException') {
-      throw Object.assign(
-        new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
-        { code: 'ConnectedAccountChanged' },
-      );
+  // A full-list write is required by the existing User model. CAS it so token
+  // refresh cannot resurrect a disconnected account, but retry once against a
+  // fresh primary record when *another* account changed. The target must still
+  // exactly match the source snapshot on every attempt; a disconnect/reconnect
+  // or target-account edit fails closed rather than accepting an old token.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
     }
-    throw error;
+
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accountId
+      ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
+      : accounts.findIndex(acc => acc.platform === platform);
+
+    if (accountIndex < 0) throw changedError();
+
+    const existingAccount = accounts[accountIndex];
+    // If no caller snapshot was supplied, the first strongly current account
+    // becomes the source snapshot. LinkedIn passes its pre-write account so a
+    // disconnect/reconnect before this lookup is also detected.
+    const expected = sourceAccount || snapshot(existingAccount);
+    if (!isDeepStrictEqual(snapshot(existingAccount), expected)) throw changedError();
+    sourceAccount = expected;
+
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: {
+        ...existingAccount.config,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
+        token_expires_at: tokens.token_expires_at,
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        // Carry the strong-read decision into the write. Otherwise a disconnect
+        // between the read and update could be overwritten with the stale account.
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      if (attempt === 1) throw changedError();
+      // Re-read before retrying: the target must still equal `expected`, while
+      // unrelated account-list changes are retained in the rebuilt write.
+    }
   }
 };
 
