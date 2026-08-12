@@ -61,8 +61,13 @@ describe('scheduled-chat publish consent (ENG-827)', () => {
         autopublishAuthorizedTools: ['post_on_connected_account'],
         autopublishAuthorizedBy: OWNER,
       }),
-      // ENG-827: a grant is conditioned on the tools it was derived from.
-      { requiredFunctionCalls: PUBLISHING_SCHEDULE.requiredFunctionCalls }
+      // ENG-827: a grant is conditioned on the tools AND the consent it was derived
+      // from. PUBLISHING_SCHEDULE has never been asked, so the consent expectation is
+      // `undefined` — which updateSchedule compiles to attribute_not_exists.
+      {
+        requiredFunctionCalls: PUBLISHING_SCHEDULE.requiredFunctionCalls,
+        autopublishAuthorized: undefined,
+      }
     );
     expect(r.json).toHaveBeenCalledWith(
       expect.objectContaining({ autopublishAuthorized: true })
@@ -189,7 +194,33 @@ describe('ENG-827 — a grant is bound to the tools it was derived from', () => 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
       expect.objectContaining({ autopublishAuthorized: true }),
-      { requiredFunctionCalls: (PUBLISHING_SCHEDULE as any).requiredFunctionCalls }
+      {
+        requiredFunctionCalls: (PUBLISHING_SCHEDULE as any).requiredFunctionCalls,
+        autopublishAuthorized: undefined,
+      }
+    );
+  });
+
+  // ENG-827 (Greptile, fifth pass): the consent field is part of the read too, and
+  // binding only the tools left the mirror of the bug already fixed on the edit path.
+  // The owner revokes, the revoke completes, and a grant request that predates the
+  // withdrawal then lands on top of it — permission they took away, put back by a
+  // request older than the taking away.
+  it('conditions the grant on the consent state it read, so it cannot overwrite a completed revoke', async () => {
+    // This schedule was granted once and has since been revoked.
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      ...PUBLISHING_SCHEDULE,
+      autopublishAuthorized: false,
+    } as any);
+    mockScheduleDb.updateSchedule.mockResolvedValue({} as any);
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      expect.objectContaining({ autopublishAuthorized: true }),
+      expect.objectContaining({ autopublishAuthorized: false })
     );
   });
 
@@ -203,7 +234,7 @@ describe('ENG-827 — a grant is bound to the tools it was derived from', () => 
     await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
 
     expect(r.status).toHaveBeenCalledWith(409);
-    expect(r.json.mock.calls[0][0].error).toMatch(/changed while you were authorizing/i);
+    expect(r.json.mock.calls[0][0].error).toMatch(/changed while you were authorizing it/i);
   });
 
   it('does NOT condition a revoke — narrowing must always be available', async () => {
