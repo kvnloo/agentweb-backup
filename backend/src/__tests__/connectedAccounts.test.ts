@@ -503,6 +503,35 @@ describe('Connected Accounts Routes', () => {
             expect(response.body.accounts[0].booking_lead_list_id).toBe('list-1');
         });
 
+        it('surfaces attribution_pixel_id/attribution_account_id for a Calendly account that has them set (ENG-1141)', async () => {
+            const calendlyWithAttribution = {
+                platform: 'calendly',
+                account_id: 'jane@customer.com',
+                account_name: 'Jane Customer',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: {
+                    account_type: 'calendly',
+                    email: 'jane@customer.com',
+                    access_token: 'tok',
+                    refresh_token: 'refresh',
+                    token_expires_at: 9999999999999,
+                    user_uri: 'https://api.calendly.com/users/AAAA',
+                    organization_uri: 'https://api.calendly.com/organizations/BBBB',
+                    booking_tracking_active: true,
+                    attributionPixelId: 'px-1',
+                    attributionAccountId: 'act-1',
+                }
+            };
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([calendlyWithAttribution]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].attribution_pixel_id).toBe('px-1');
+            expect(response.body.accounts[0].attribution_account_id).toBe('act-1');
+        });
+
         it('does not set booking_lead_list_id for non-Calendly accounts', async () => {
             const mockAccounts = [
                 {

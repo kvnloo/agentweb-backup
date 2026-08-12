@@ -296,6 +296,12 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // Calendly only: which lead list bookings land in — explicitly chosen or
         // auto-resolved server-side on first booking (ENG-524 CRM-forward).
         booking_lead_list_id: acc.platform === 'calendly' ? (acc.config as any).booking_lead_list_id : undefined,
+        // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
+        // explicitly chosen, or undefined until the customer picks one (the frontend
+        // defaults the picker's display to the first connected account/pixel, matching
+        // resolveMetaPixelWithDefault's own fallback, but nothing is persisted until set).
+        attribution_pixel_id: acc.platform === 'calendly' ? (acc.config as any).attributionPixelId : undefined,
+        attribution_account_id: acc.platform === 'calendly' ? (acc.config as any).attributionAccountId : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
