@@ -17,6 +17,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Saving now makes room automatically by dropping the oldest saved prompt versions (and, only if that is still not enough, the oldest run history), so your edit goes through',
       '- If a prompt really is too long to store at all, you now get a clear message saying so and how long it is, instead of a generic failure',
       '- A schedule that reaches that limit would also have stopped recording its run history within a day or two; that history now makes room for itself instead of quietly stopping',
+      'Fixed: A Very Long Answer Can No Longer Go Missing From a Chat Transcript',
+      '- An unusually large message — typically the final report of a long run, which carries the whole run\'s tool activity — could be too big to store, and was dropped from the transcript while the run still reported success',
+      '- The safeguard that trims those messages down now runs on every path that saves one, including the repair pass that exists to recover them, so the answer is kept even when the working detail behind it has to be shortened',
     ],
   },
   {
