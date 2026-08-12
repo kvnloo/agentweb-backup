@@ -375,6 +375,72 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(result.content).toMatch(/time limit/i);
   });
 
+  it('stops waiting on a permitted backup that turns out to be slower than the time left', async () => {
+    // The affordability estimate is drawn from calls this run already made, and the backup
+    // is by definition a DIFFERENT model — it can be slower than anything measured. An
+    // estimate is therefore not a guarantee, so the admitted retry is also hard-bounded: if
+    // it overruns, the turn stops waiting and delivers the partial answer instead of letting
+    // the controller's cap fire and discard everything.
+    let call = 0;
+    const modelsCalled: string[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      modelsCalled.push(args[0]);
+      if (isFinalSynthesis) {
+        if (modelsCalled.filter((_, i) => i >= 0).length && args[0] !== service.default_model) {
+          // The backup: never answers within the bound.
+          return new Promise(() => {});
+        }
+        nowMs += 1_000;
+        throw new Error('Too many requests, please try again later');
+      }
+      nowMs += 30_000;
+      return buildLLMResponse({
+        content: `Scanned batch ${++call}.`,
+        tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'getBackupModel').mockResolvedValue('gpt-5-chat-2');
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(
+      JSON.stringify({ success: true, data: 'mock' }),
+    );
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+    // The bound is real wall-clock (minutes), so fire it immediately to keep the test fast.
+    // Restored in `finally` — jest.clearAllMocks() does NOT put the real timer back, and a
+    // leaked instant setTimeout would quietly corrupt every later test in this file.
+    const timerSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((fn: any) => {
+      Promise.resolve().then(() => fn());
+      return { unref() {} } as any;
+    }) as any);
+
+    let result: any;
+    try {
+      result = (await service.generateMarketingResponse(
+        'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+        [] as any,
+        'test-user',
+        service.default_model,
+        'test-session',
+        false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+        nowMs,
+      )) as any;
+    } finally {
+      timerSpy.mockRestore();
+    }
+
+    // The backup WAS attempted (the estimate allowed it) but never answered, and the turn
+    // still came back with the partial-delivery message instead of hanging into the cap.
+    expect(modelsCalled).toContain('gpt-5-chat-2');
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/time limit/i);
+  });
+
   it('lets a NON-transient synthesis failure propagate instead of reporting a timeout', async () => {
     // The affordability guard above must not become a catch-all. A context-limit,
     // content-policy or malformed-request failure has no retry to skip, and dressing one
