@@ -145,7 +145,7 @@ export interface User {
   displayName?: string;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
-  metaAttributionDefault?: { pixelId: string; accountId: string }; // ENG-1141: account-level default pixel/account, used by resolveMetaPixelForUser to disambiguate 2+ connected Meta ad accounts/pixels without a live Graph re-check
+  metaAttributionDefault?: { pixelId: string; accountId: string } | null; // ENG-1141: account-level default pixel/account, used by resolveMetaPixelForUser to disambiguate 2+ connected Meta ad accounts/pixels without a live Graph re-check. Nullable so it can be explicitly cleared (updateUser's REMOVE-on-null convention).
   emailDomain?: string; // Email sender domain
   resendDomainId?: string; // Resend domain ID for domain verification
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)

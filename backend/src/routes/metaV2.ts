@@ -179,6 +179,120 @@ router.get('/campaigns-and-adsets', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/meta/v2/pixels
+// ENG-1141: lists every pixel across every one of the caller's connected Meta
+// accounts, so the frontend can offer one flat picker instead of a two-step
+// "pick account, then pick pixel" flow. No new Graph integration — aggregates
+// the same listPixels() resolveMetaPixelForUser already calls per-account.
+// A single account's lookup failing (e.g. an expired token) is skipped, not
+// fatal to the whole request — same "never let one bad account break
+// everything" philosophy as resolveMetaPixelForUser itself.
+// ---------------------------------------------------------------------------
+router.get('/pixels', async (req, res) => {
+  const userId = (req as any).user.userId;
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const accounts = getConnectedMetaAccountsList(user);
+    const perAccountPixels = await Promise.all(
+      accounts.map(async (acc: any) => {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, acc.accountId);
+          const pixels = await metaService.listPixels(accountId, accessToken);
+          return (pixels || []).map((p: any) => ({ pixelId: p.id, accountId, accountName: acc.accountName }));
+        } catch (err) {
+          console.error(`[MetaV2] /pixels: skipping account ${acc.accountId} (lookup failed):`, err);
+          return [];
+        }
+      })
+    );
+
+    res.json({ pixels: perAccountPixels.flat() });
+  } catch (error: any) {
+    console.error('[MetaV2] /pixels error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/meta/v2/attribution-default
+// ENG-1141: single status endpoint reused by every UI surface (Meta card,
+// Calendly card) instead of each one reimplementing the ambiguity check —
+// reuses resolveMetaPixelForUser rather than duplicating its logic.
+// ---------------------------------------------------------------------------
+router.get('/attribution-default', async (req, res) => {
+  const userId = (req as any).user.userId;
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const resolution = await metaService.resolveMetaPixelForUser(user, userId);
+    res.json({ default: user.metaAttributionDefault ?? null, resolution });
+  } catch (error: any) {
+    console.error('[MetaV2] /attribution-default error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /api/meta/v2/attribution-default
+// ENG-1141: sets the account-level default resolveMetaPixelForUser's tier 2
+// reads. Never trusts the client to submit a valid pair — both the account
+// and the specific pixel must genuinely belong to the caller's own connected
+// accounts before persisting.
+// ---------------------------------------------------------------------------
+router.put('/attribution-default', async (req, res) => {
+  const userId = (req as any).user.userId;
+  const { pixelId, accountId } = req.body || {};
+  try {
+    if (!pixelId || !accountId) {
+      return res.status(400).json({ message: 'pixelId and accountId are required' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const cleaned = cleanAccountId(accountId);
+    const accounts = getConnectedMetaAccountsList(user);
+    if (!accounts.some((acc: any) => acc.accountId === cleaned)) {
+      return res.status(400).json({ message: `Meta ad account "${accountId}" is not one of your connected accounts.` });
+    }
+
+    const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, cleaned);
+    const pixels = await metaService.listPixels(resolvedAccountId, accessToken);
+    if (!(pixels || []).some((p: any) => p.id === pixelId)) {
+      return res.status(400).json({ message: `Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.` });
+    }
+
+    const metaAttributionDefault = { pixelId, accountId: resolvedAccountId };
+    await userDb.updateUser(userId, { metaAttributionDefault });
+    res.json({ default: metaAttributionDefault });
+  } catch (error: any) {
+    console.error('[MetaV2] PUT /attribution-default error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/meta/v2/attribution-default
+// ENG-1141: clears the default, reverting to today's auto-resolve (tier 3).
+// ---------------------------------------------------------------------------
+router.delete('/attribution-default', async (req, res) => {
+  const userId = (req as any).user.userId;
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    await userDb.updateUser(userId, { metaAttributionDefault: null });
+    res.json({ default: null });
+  } catch (error: any) {
+    console.error('[MetaV2] DELETE /attribution-default error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/meta/v2/create-image-ad
 // Single-image ad flow using connected_accounts OAuth token.
 // ---------------------------------------------------------------------------

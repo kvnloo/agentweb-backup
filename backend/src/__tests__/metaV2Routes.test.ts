@@ -15,6 +15,7 @@ jest.mock('../middleware/auth', () => ({
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+    updateUser: jest.fn(),
   },
   taskDb: {
     getTaskExecutionById: jest.fn(),
@@ -31,6 +32,8 @@ jest.mock('../services/metaService', () => ({
     createAd: jest.fn(),
     uploadImage: jest.fn(),
     uploadVideo: jest.fn(),
+    listPixels: jest.fn(),
+    resolveMetaPixelForUser: jest.fn(),
   },
 }));
 
@@ -135,6 +138,165 @@ describe('Meta V2 Routes', () => {
       const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
 
       expect(response.status).toBe(500);
+    });
+  });
+
+  describe('GET /pixels (ENG-1141)', () => {
+    const twoAccountUser = {
+      id: 'user123',
+      connected_accounts: [
+        {
+          platform: 'meta',
+          account_id: 'act_111',
+          account_name: 'Acc A',
+          config: { account_type: 'ad_account', access_token: 'tokA', token_expires_at: Date.now() + 1000000 },
+        },
+        {
+          platform: 'meta',
+          account_id: 'act_222',
+          account_name: 'Acc B',
+          config: { account_type: 'ad_account', access_token: 'tokB', token_expires_at: Date.now() + 1000000 },
+        },
+      ],
+    };
+
+    it('aggregates pixels across every connected account', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock)
+        .mockResolvedValueOnce([{ id: 'pxA1' }])
+        .mockResolvedValueOnce([{ id: 'pxB1' }, { id: 'pxB2' }]);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toHaveLength(3);
+      expect(response.body.pixels).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ pixelId: 'pxA1', accountId: '111' }),
+          expect.objectContaining({ pixelId: 'pxB1', accountId: '222' }),
+          expect.objectContaining({ pixelId: 'pxB2', accountId: '222' }),
+        ])
+      );
+    });
+
+    it('skips an account whose pixel lookup fails rather than failing the whole request', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock)
+        .mockRejectedValueOnce(new Error('token expired'))
+        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toEqual([expect.objectContaining({ pixelId: 'pxB1', accountId: '222' })]);
+    });
+
+    it('returns 404 if user not found', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(404);
+    });
+  });
+
+  describe('GET /attribution-default (ENG-1141)', () => {
+    it('returns the stored default alongside the current resolution', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        ...mockUser,
+        metaAttributionDefault: { pixelId: 'px1', accountId: '123456789' },
+      });
+      (metaService.resolveMetaPixelForUser as jest.Mock).mockResolvedValue({ pixelId: 'px1', accountId: '123456789' });
+
+      const response = await request(app).get('/api/meta/v2/attribution-default');
+
+      expect(response.status).toBe(200);
+      expect(response.body.default).toEqual({ pixelId: 'px1', accountId: '123456789' });
+      expect(response.body.resolution).toEqual({ pixelId: 'px1', accountId: '123456789' });
+    });
+
+    it('returns a null default and the unresolved reason when nothing is set and it is ambiguous', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.resolveMetaPixelForUser as jest.Mock).mockResolvedValue({
+        unresolved: true,
+        reason: 'Multiple Meta ad accounts connected — no default account to resolve a pixel from',
+      });
+
+      const response = await request(app).get('/api/meta/v2/attribution-default');
+
+      expect(response.status).toBe(200);
+      expect(response.body.default).toBeNull();
+      expect(response.body.resolution.unresolved).toBe(true);
+    });
+  });
+
+  describe('PUT /attribution-default (ENG-1141)', () => {
+    it('persists a valid pixel/account pair owned by the caller', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'px1' }]);
+      (userDb.updateUser as jest.Mock).mockResolvedValue({
+        ...mockUser,
+        metaAttributionDefault: { pixelId: 'px1', accountId: '123456789' },
+      });
+
+      const response = await request(app)
+        .put('/api/meta/v2/attribution-default')
+        .send({ pixelId: 'px1', accountId: '123456789' });
+
+      expect(response.status).toBe(200);
+      expect(userDb.updateUser).toHaveBeenCalledWith('user123', {
+        metaAttributionDefault: { pixelId: 'px1', accountId: '123456789' },
+      });
+    });
+
+    it('rejects required fields when missing', async () => {
+      const response = await request(app).put('/api/meta/v2/attribution-default').send({});
+
+      expect(response.status).toBe(400);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("rejects an accountId that is not among the caller's own connected accounts", async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      const response = await request(app)
+        .put('/api/meta/v2/attribution-default')
+        .send({ pixelId: 'px1', accountId: 'not-mine' });
+
+      expect(response.status).toBe(400);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it('rejects a pixelId not actually found on the specified (owned) account', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'some-other-pixel' }]);
+
+      const response = await request(app)
+        .put('/api/meta/v2/attribution-default')
+        .send({ pixelId: 'px1', accountId: '123456789' });
+
+      expect(response.status).toBe(400);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /attribution-default (ENG-1141)', () => {
+    it('clears the stored default', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (userDb.updateUser as jest.Mock).mockResolvedValue({ ...mockUser, metaAttributionDefault: undefined });
+
+      const response = await request(app).delete('/api/meta/v2/attribution-default');
+
+      expect(response.status).toBe(200);
+      expect(userDb.updateUser).toHaveBeenCalledWith('user123', { metaAttributionDefault: null });
+    });
+
+    it('returns 404 if user not found', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+      const response = await request(app).delete('/api/meta/v2/attribution-default');
+
+      expect(response.status).toBe(404);
     });
   });
 
