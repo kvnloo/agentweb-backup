@@ -21,22 +21,31 @@ import {
 } from '../utils/schedulePublishApproval';
 
 describe('resolvePublishAuthorized (ENG-803, re-pointed by ENG-827)', () => {
-  // POLARITY CHANGED. ENG-803 shipped this as an opt-OUT, so absence meant authorized
-  // and no existing schedule changed behaviour. ENG-827 made publishing require the
-  // owner's AFFIRMATIVE, tool-scoped consent, and this resolver now delegates to that
-  // single decision so the two gates on the dispatch path cannot disagree.
+  // POLARITY PRESERVED — and this is the same conclusion the file header reaches.
+  // ENG-827 adds an AFFIRMATIVE, tool-scoped grant, and this resolver delegates to that
+  // single decision so the two gates on the dispatch path cannot disagree. What it does
+  // NOT do is flip the default: a schedule nobody has been asked about stays authorized
+  // under ENG-803's opt-out, because the alternative breaks the 25 working schedules
+  // this header already argued must not break.
   //
-  // The migration in scripts/grant-schedule-autopublish.ts records consent for the
-  // schedules publishing today and MUST run before this ships — otherwise every one of
-  // them stops, which is the ENG-827 bug at larger scale.
+  // So there are three states, not two: never asked, granted, and revoked.
   const GRANT = {
     autopublishAuthorized: true,
     autopublishAuthorizedTools: ['post_on_connected_account'],
   };
 
-  describe('absence is NOT consent', () => {
-    it('withholds for a legacy schedule that predates the field', () => {
+  describe('absence of an ANSWER defers; absence of a RECORD withholds', () => {
+    it('withholds a legacy schedule that designates no publishing tool', () => {
+      // Nothing to authorize — there is no publish tool to scope the default to.
       expect(resolvePublishAuthorized({} as any)).toBe(false);
+    });
+
+    it('authorizes a legacy schedule that designates one', () => {
+      // The 897 rows with no consent field. Reading their silence as a refusal is what
+      // would stop the 25 that publish today.
+      expect(
+        resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)
+      ).toBe(true);
     });
 
     it('withholds when the grant is explicitly false', () => {
@@ -79,10 +88,51 @@ describe('resolvePublishAuthorized (ENG-803, re-pointed by ENG-827)', () => {
       expect(resolvePublishAuthorized({ fullAutonomy: true } as any)).toBe(false);
     });
 
-    it('ignores requiredFunctionCalls — it is MODEL-WRITABLE via manage_scheduled_chat', () => {
+    // requiredFunctionCalls IS model-writable (manage_scheduled_chat forwards
+    // required_function_calls), and under the deferred default it supplies the SCOPE for
+    // a never-asked schedule. So state precisely what it can and cannot do.
+    //
+    // It cannot manufacture an authorization the owner has decided against — that is the
+    // property that has to hold, and both directions are pinned below. What it can do is
+    // scope a row nobody has answered for, which on `main` publishes with no scope check
+    // at all; the model therefore reaches no outcome production does not already allow.
+    // Within a run it cannot even do that: the admitted scope is stamped before turn one
+    // and narrowPublishAuthorization only ever intersects, so a mid-run edit is invisible
+    // to the run that made it. Collecting real consent retires this entirely.
+    it('cannot override an explicit revocation, however it is written', () => {
       expect(
-        resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)
+        resolvePublishAuthorized({
+          autopublishAuthorized: false,
+          requiredFunctionCalls: ['post_on_connected_account'],
+        } as any)
       ).toBe(false);
+    });
+
+    it('cannot override the owner\'s hold', () => {
+      expect(
+        resolvePublishAuthorized({
+          requirePublishApproval: true,
+          requiredFunctionCalls: ['post_on_connected_account'],
+        } as any)
+      ).toBe(false);
+    });
+
+    it('cannot widen a grant onto a tool the owner never approved', () => {
+      // The scope binding that matters wherever consent is real: a granted schedule
+      // stays limited to the approved list no matter what the model adds here.
+      expect(
+        resolvePublishAuthorized({
+          ...GRANT,
+          requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        } as any)
+      ).toBe(true);
+      const { resolveSchedulePublishAuthorization } = require('../utils/schedulePublishAuthorization');
+      expect(
+        resolveSchedulePublishAuthorization({
+          ...GRANT,
+          requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        }).tools
+      ).toEqual(['post_on_connected_account']);
     });
 
     it('ignores the schedule prompt text — authorization is never model-read', () => {
