@@ -189,6 +189,10 @@ function isConnectionError(error: unknown): boolean {
   );
 }
 
+// A page-URL probe is a cheap in-page eval, not a page load — keep it short so a wedged
+// browser can never make it a tax on the caller.
+const PAGE_PROVENANCE_TIMEOUT_MS = 10000;
+
 const BROWSER_TOOL_MAX_RETRIES = 2;
 const BROWSER_TOOL_RETRY_DELAY_MS = 2000;
 
@@ -197,6 +201,16 @@ const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 function isBrowserTool(toolName: string): boolean {
   return toolName.startsWith('playwright_') || toolName.startsWith('browser_');
+}
+
+/**
+ * DOM reads that come back with no indication of which page they were read from.
+ * Playwright MCP reports the page for navigate and run_code but not for evaluate, so an
+ * evaluate() result is the one place a caller cannot tell a real "no results" from a read
+ * of the wrong page (ENG-1118).
+ */
+function isUnattributedDomRead(toolName: string): boolean {
+  return toolName === 'browser_evaluate' || toolName === 'playwright_browser_evaluate';
 }
 
 /**
@@ -634,6 +648,43 @@ export class McpClientService {
     }
   }
 
+  /**
+   * Append the page a DOM read came from, so a caller can tell "this site has no results"
+   * from "this is not the site I asked for".
+   *
+   * Deliberately provenance and not a gate: an assertion strict enough to catch a wrong
+   * page also fails the legitimate redirects this workload relies on (the reporter's own
+   * run needed healthit.gov -> healthit.gov/data/search and gao.gov -> files.gao.gov). And
+   * it is best-effort — if the page cannot be read, the caller's result is returned
+   * untouched rather than failed.
+   */
+  private async attachPageProvenance(
+    toolName: string,
+    content: string,
+    client: Client,
+  ): Promise<string> {
+    if (!isUnattributedDomRead(toolName)) return content;
+    if (typeof content !== 'string' || content.includes('Page URL:')) return content;
+
+    try {
+      const probe = await client.callTool(
+        { name: 'browser_evaluate', arguments: { function: '() => window.location.href' } },
+        undefined,
+        { timeout: PAGE_PROVENANCE_TIMEOUT_MS },
+      );
+      const probeText = ((probe.content as any[]) || [])
+        .filter((c: any) => c.type === 'text')
+        .map((c: any) => c.text)
+        .join('\n');
+      const url = probeText.match(/https?:\/\/[^\s"'\\]+/)?.[0];
+      return url ? `${content}\n### Page\n- Page URL: ${url}` : content;
+    } catch (error) {
+      // Never turn a successful DOM read into a failure over a missing annotation.
+      console.warn(`[MCP-SESSION] Could not read the page URL for ${toolName}:`, (error as Error).message);
+      return content;
+    }
+  }
+
   /** Hand back a slot taken by acquireBrowserSlot once the client is live (or failed). */
   private releaseBrowserSlot(): void {
     this.browserSlotsReserved = Math.max(0, this.browserSlotsReserved - 1);
@@ -969,7 +1020,8 @@ export class McpClientService {
                     .filter((c: any) => c.type === 'text')
                     .map((c: any) => c.text)
                     .join('\n');
-                  return { content, raw: result };
+                  const attributed = await this.attachPageProvenance(originalToolName, content, sessionClient);
+                  return { content: attributed, raw: result };
                 } catch (error) {
                   lastError = error;
                   // Evict dead client from session pool so the next call reconnects
@@ -1628,7 +1680,7 @@ export class McpClientService {
                 .join('\n');
 
               return {
-                content,
+                content: await this.attachPageProvenance(originalToolName, content, sessionClient),
                 raw: result
               };
             } catch (error) {
