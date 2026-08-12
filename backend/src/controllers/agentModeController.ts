@@ -3565,8 +3565,10 @@ export async function runScheduledChat(
     // prompt telling it not to. The guard intersects live state with this stamp
     // instead, so a run keeps the permissions it began with and consent can only ever
     // narrow. Only an authorized run is stamped: the guard reads an absent stamp as
-    // not authorized, which is exactly right for every draft-only run, and costs the
-    // 897 schedules that have never granted consent no extra write at all.
+    // not authorized, which is exactly right for every draft-only run and costs a
+    // schedule that publishes nothing no extra write at all. A legacy schedule that
+    // resolves authorized by the shipped opt-out default IS stamped, so the write-time
+    // guard has a scope to intersect against rather than refusing it for want of one.
     //
     // If the stamp cannot be written we downgrade THIS value rather than carry on,
     // because it is the one the prompt and the required-function filter below are both

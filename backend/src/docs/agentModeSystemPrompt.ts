@@ -695,9 +695,12 @@ PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRI
 // required-tool checker nudges it in a loop (sessions 1b28ae36 / a924892d, ~21
 // refusal cycles and $5.86 for one unpublished draft).
 //
-// The caller derives this via resolveSchedulePublishAuthorization(), primarily from
-// the publish tools the owner listed in the schedule's `requiredFunctionCalls` —
-// see that helper for why `fullAutonomy` alone is not a sufficient signal.
+// The caller derives this via resolveSchedulePublishAuthorization(): from the owner's
+// explicit, tool-scoped grant where they have given one, and otherwise from the
+// opt-out ENG-803 shipped — authorized unless they set `requirePublishApproval`,
+// scoped to the publish tools listed in `requiredFunctionCalls`. See that helper for
+// why absence of the grant field is deferral rather than refusal, and why
+// `fullAutonomy` is not a publish-consent signal in either mode.
 // `authorizedPublishTools` names those exact tools so the directive authorizes
 // precisely what the owner asked for and nothing more.
 //

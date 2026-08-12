@@ -59,8 +59,10 @@ import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedu
 
 export interface SchedulePublishAuthorizationInput extends SchedulePublishApprovalInput {
   /**
-   * AFFIRMATIVE owner consent to publish unattended. Absence is NOT consent — a
-   * schedule nobody has explicitly authorized drafts and notifies.
+   * AFFIRMATIVE owner consent to publish unattended, with `autopublishAuthorizedTools`
+   * as its scope. An explicit `false` is a revocation and holds. ABSENT means the owner
+   * was never asked — see the resolver, which defers that case to ENG-803's opt-out
+   * rather than reading silence as a refusal.
    */
   autopublishAuthorized?: boolean;
   /**
@@ -175,26 +177,48 @@ const UNAUTHORIZED: SchedulePublishAuthorization = { authorized: false, tools: [
  * never approved — a consent for `post_on_connected_account` quietly becoming one for
  * `publish_landing_page_changes`.
  *
- * MIGRATION NOTE — READ BEFORE MERGING. Every schedule that predates this field
- * resolves to NOT authorized, which stops the live publishing schedules. The backfill
- * in scripts/grant-schedule-autopublish.ts records affirmative consent for the
- * currently-publishing schedules and MUST be run before this ships. Writing it early is
- * inert: the field is unread until this code deploys.
+ * THE FIELD BEING ABSENT IS NOT A DECISION — IT IS A QUESTION NOBODY WAS ASKED.
+ * There are 897 existing rows and none of them carries this attribute, because it did
+ * not exist when they were created. Reading that silence as "withheld" would stop the
+ * 25 schedules that publish today — which is precisely the failure ENG-827 was filed
+ * about, reproduced at 25x scale on deploy day. So absence defers to the opt-out
+ * ENG-803 already shipped and production is running: authorized, scoped to the publish
+ * tools the schedule actually designates, unless the owner set `requirePublishApproval`.
  *
- * Everything ambiguous fails closed: an unreadable schedule, a malformed field, or
- * anything short of an explicit `true` gives the reversible draft-and-notify outcome.
+ * Opt-in therefore governs exactly where an owner has ENGAGED the control — an explicit
+ * grant carries their approved scope, and an explicit `false` is a revocation that
+ * holds. Closing the legacy population properly means collecting consent for those 25
+ * schedules FIRST and flipping the default afterwards; the survey/apply script in
+ * scripts/grant-schedule-autopublish.ts is the instrument for that, and it is no longer
+ * a prerequisite for this code shipping.
+ *
+ * Everything ambiguous still fails closed: an unreadable schedule, a malformed field,
+ * or a grant with no scope gives the reversible draft-and-notify outcome.
  */
 export function resolveSchedulePublishAuthorization(
   schedule: SchedulePublishAuthorizationInput | null | undefined
 ): SchedulePublishAuthorization {
+  // Absence of a RECORD is not absence of an answer: a deleted schedule or a read that
+  // failed leaves the owner's choice genuinely unknown, and unknown must not publish.
   if (!schedule) return UNAUTHORIZED;
 
-  // The owner's explicit hold outranks any grant: they asked to review, so review.
+  // The owner's explicit hold outranks everything below: they asked to review, so review.
   if (schedule.requirePublishApproval === true) return UNAUTHORIZED;
 
+  const consent = schedule.autopublishAuthorized;
+
+  // Never asked. Fall back to the shipped opt-out default, scoped to the publish tools
+  // this schedule designates — so the write-time guard still binds to a real scope
+  // rather than becoming a licence to reach for any publishing tool.
+  if (consent === undefined || consent === null) {
+    const required = getRequiredPublishTools(schedule.requiredFunctionCalls);
+    return required.length === 0 ? UNAUTHORIZED : { authorized: true, tools: required };
+  }
+
   // Strict === true, so a truthy string or number from a loosely-typed caller cannot
-  // become permission to post.
-  if (schedule.autopublishAuthorized !== true) return UNAUTHORIZED;
+  // become permission to post. Anything else present-but-not-true — including an
+  // explicit `false` revocation — withholds.
+  if (consent !== true) return UNAUTHORIZED;
 
   const approved = Array.isArray(schedule.autopublishAuthorizedTools)
     ? schedule.autopublishAuthorizedTools.filter(

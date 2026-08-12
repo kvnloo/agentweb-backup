@@ -43,12 +43,50 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     expect(resolveSchedulePublishAuthorization(undefined)).toEqual({ authorized: false, tools: [] });
   });
 
-  it('is NOT authorized for a legacy schedule that has no consent recorded', () => {
-    // Every row predating the field. The migration in scripts/grant-schedule-autopublish.ts
-    // records consent for the schedules publishing today, and MUST run before this ships.
-    expect(resolveSchedulePublishAuthorization({})).toEqual({ authorized: false, tools: [] });
+  it('defers a legacy schedule (never asked) to the shipped opt-out, scoped to its publish tools', () => {
+    // 897 rows predate this field. Reading that silence as "withheld" would stop the 25
+    // schedules that publish today — the exact ENG-827 failure, at 25x scale, on deploy
+    // day. Absence is a question nobody was asked, not a refusal.
     expect(
       resolveSchedulePublishAuthorization({ requiredFunctionCalls: ['post_on_connected_account'] })
+    ).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
+    // Scope still comes from the schedule, so the write-time guard binds to a real
+    // tool list rather than becoming a licence to reach for any publishing tool.
+    expect(
+      resolveSchedulePublishAuthorization({
+        requiredFunctionCalls: ['you_search_web', 'post_on_connected_account', 'publish_blog_article'],
+      }).tools
+    ).toEqual(['post_on_connected_account', 'publish_blog_article']);
+  });
+
+  it('is NOT authorized for a legacy schedule that designates no publishing tool', () => {
+    // Nothing to authorize: there is no publish tool to scope consent to.
+    expect(resolveSchedulePublishAuthorization({})).toEqual({ authorized: false, tools: [] });
+    expect(
+      resolveSchedulePublishAuthorization({ requiredFunctionCalls: ['you_search_web'] })
+    ).toEqual({ authorized: false, tools: [] });
+  });
+
+  it('treats an explicit false as a revocation, not as "never asked"', () => {
+    // The distinction the whole deferral rests on: silence falls back to the shipped
+    // default, but an owner who switched it OFF stays off even though their schedule
+    // still designates a publish tool.
+    expect(
+      resolveSchedulePublishAuthorization({
+        autopublishAuthorized: false,
+        requiredFunctionCalls: ['post_on_connected_account'],
+      })
+    ).toEqual({ authorized: false, tools: [] });
+  });
+
+  it('lets the owner hold a legacy schedule with requirePublishApproval', () => {
+    // The opt-out ENG-803 shipped still works on a row that has no grant recorded —
+    // otherwise deferring to it would be deferring to a control that does nothing.
+    expect(
+      resolveSchedulePublishAuthorization({
+        requirePublishApproval: true,
+        requiredFunctionCalls: ['post_on_connected_account'],
+      })
     ).toEqual({ authorized: false, tools: [] });
   });
 
@@ -132,31 +170,57 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   });
 
   // ── The rejected signals ───────────────────────────────────────────────────
-  it('does NOT authorize on a required publish tool alone', () => {
-    // The picker is a VERIFICATION control and its UI carries no waiver language.
-    expect(
-      resolveSchedulePublishAuthorization({ requiredFunctionCalls: ['post_on_connected_account'] }).authorized
-    ).toBe(false);
-  });
-
-  it('does NOT authorize from approval-waiver wording in the prompt', () => {
+  // These are NOT consent controls. Deferring the never-asked case to ENG-803's
+  // opt-out means a legacy row with a publish tool does resolve authorized — but by
+  // the shipped DEFAULT, never by one of these. The property that still has to hold
+  // is that none of them can override a decision the owner actually made, in either
+  // direction: a revocation and a hold must survive all of them.
+  it.each([
+    ['the Required Functions picker (a verification control, no waiver language)', {}],
+    [
+      'approval-waiver wording in the schedule prompt',
+      // verbatim tail of the real "Kevin — Daily LinkedIn Post" prompt
+      { startingMessage: 'CRITICAL: Post the FULL text automatically. Do not truncate. Do not ask for approval.' },
+    ],
+    // ENG-396/ENG-517: it governs how a blocking AskUserQuestion is ANSWERED.
+    ['fullAutonomy', { fullAutonomy: true }],
+  ])('cannot override an explicit revocation: %s', (_label, signal) => {
     expect(
       resolveSchedulePublishAuthorization({
+        ...(signal as any),
+        autopublishAuthorized: false,
         requiredFunctionCalls: ['post_on_connected_account'],
-        // verbatim tail of the real "Kevin — Daily LinkedIn Post" prompt
-        startingMessage: 'CRITICAL: Post the FULL text automatically. Do not truncate. Do not ask for approval.',
-      } as any).authorized
+      }).authorized
     ).toBe(false);
   });
 
-  it('does NOT authorize on fullAutonomy — it is not a publish-consent control', () => {
-    // ENG-396/ENG-517: it governs how a blocking AskUserQuestion is ANSWERED.
+  it.each([
+    ['the Required Functions picker', {}],
+    [
+      'approval-waiver wording in the schedule prompt',
+      { startingMessage: 'CRITICAL: Post the FULL text automatically. Do not ask for approval.' },
+    ],
+    ['fullAutonomy', { fullAutonomy: true }],
+  ])('cannot override the owner\'s hold: %s', (_label, signal) => {
+    expect(
+      resolveSchedulePublishAuthorization({
+        ...(signal as any),
+        requirePublishApproval: true,
+        requiredFunctionCalls: ['post_on_connected_account'],
+      }).authorized
+    ).toBe(false);
+  });
+
+  it('does not let a rejected signal invent a scope where the schedule designates none', () => {
+    // The one case where the picker's absence is decisive: no publishing tool is
+    // designated, so waiver wording and fullAutonomy have nothing to authorize.
     expect(
       resolveSchedulePublishAuthorization({
         fullAutonomy: true,
-        requiredFunctionCalls: ['post_on_connected_account'],
-      } as any).authorized
-    ).toBe(false);
+        startingMessage: 'Post it automatically without asking for approval.',
+        requiredFunctionCalls: ['you_search_web'],
+      } as any)
+    ).toEqual({ authorized: false, tools: [] });
   });
 
   it('does not mutate or alias the caller\'s approved-tools array', () => {

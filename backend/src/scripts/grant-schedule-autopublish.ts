@@ -1,19 +1,23 @@
 /**
  * ENG-827 — record affirmative publish consent for schedules whose owners have said yes.
  *
- * WHY THIS EXISTS, AND WHY IT MUST RUN BEFORE THE PR MERGES
- * --------------------------------------------------------
- * Publishing consent became affirmative and tool-scoped: a schedule publishes
- * unattended only where `autopublishAuthorized === true` and the tool is in
- * `autopublishAuthorizedTools`. Every schedule created before that field resolves to
- * NOT authorized.
+ * WHAT THIS IS FOR — AND WHY IT IS NO LONGER A PREREQUISITE
+ * ---------------------------------------------------------
+ * ENG-827 adds affirmative, tool-scoped consent (`autopublishAuthorized` +
+ * `autopublishAuthorizedTools`). It deliberately did NOT flip the default: a schedule
+ * that has never been asked still resolves to authorized under the opt-out ENG-803
+ * shipped, because reading that silence as a refusal would stop the ~25 schedules
+ * publishing today — the exact failure ENG-827 was filed about, at larger scale.
  *
- * Roughly 25 active schedules publish today. If the code ships first, all of them stop
- * publishing within minutes of deploy — the exact failure ENG-827 was filed about, at
- * larger scale. Running this first is INERT: nothing reads these fields until the new
- * code deploys, so the safe order is
+ * So nothing depends on this script having run. It exists to CLOSE that gap properly:
+ * record a real consent decision for each legacy schedule, so the default can later be
+ * flipped to opt-in without stopping anyone. Running it is inert with respect to
+ * behaviour — it only turns an implicit yes into an explicit, scoped one.
  *
- *      1. run this against production   →   2. merge the PR   →   3. deploy
+ * The eventual sequence is therefore:
+ *
+ *      1. survey   →   2. ask the owners   →   3. apply   →   4. flip the default
+ *                                                               (a separate ticket)
  *
  * DATA-PLANE CHANGE — REQUIRES HARSHA'S APPROVAL BEFORE IT IS RUN (see CLAUDE.md).
  * This is a bulk mutation of production schedule records. Do not run it unattended.

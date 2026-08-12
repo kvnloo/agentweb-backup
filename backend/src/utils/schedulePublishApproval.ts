@@ -108,11 +108,14 @@ export function resolvePublishAuthorized(
   // setting could — and did — disagree: one ordering the model to publish while the
   // other refused it. Delegating removes that possibility by construction.
   //
-  // NOTE THE POLARITY CHANGE from ENG-803 as originally shipped. Absence of an opt-out
-  // no longer means authorized; publishing now requires the owner's affirmative,
-  // tool-scoped consent. The reasoning is in schedulePublishAuthorization.ts, along with
-  // the migration that MUST run before this deploys — without it, every schedule that
-  // publishes today stops.
+  // ENG-803's POLARITY IS PRESERVED for every row that has never been asked: absence of
+  // the opt-out still means authorized, scoped to the schedule's designated publish
+  // tools. ENG-827 adds an affirmative, tool-scoped grant on top, which governs wherever
+  // the owner has actually engaged the control — an explicit grant carries their
+  // approved scope, and an explicit `false` revokes. Flipping the DEFAULT to opt-in is
+  // deliberately not done here: it would stop the 25 schedules publishing today, which
+  // is the failure ENG-827 was filed about. That belongs to a follow-up that collects
+  // consent first. Reasoning in schedulePublishAuthorization.ts.
   //
   // A missing record still resolves to false, for ENG-803's original reason: absence of
   // a RECORD is not absence of an answer, and withholding is the recoverable error.
