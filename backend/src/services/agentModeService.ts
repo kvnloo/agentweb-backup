@@ -1136,6 +1136,16 @@ export class AgentModeService {
   }
 
   /**
+   * ENG-1118: release the MCP clients a finished chat session owns.
+   * Browser servers pool per chat session, so this hands back that session's browser
+   * process at run end. A no-op for a session that never opened one.
+   */
+  async releaseSessionMcpClients(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    await this.mcpClientService.releaseSessionClients(sessionId);
+  }
+
+  /**
    * Start periodic cleanup of file content cache
    */
   private startFileCacheCleanup() {
