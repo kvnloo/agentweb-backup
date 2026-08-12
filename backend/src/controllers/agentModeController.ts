@@ -56,6 +56,8 @@ import {
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
   collectPublishActionsSince,
+  reconcileRecordCountReport,
+  recordWriteLedgerFromTranscript,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -668,6 +670,12 @@ async function getDiagnosticErrorMessage(
     // diffSucceededFunctions. "What was accomplished" must mean this request.
     const succeededFunctions = diffSucceededFunctions(baseline, session?.calledFunctions || null);
     const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
+    // ENG-1054: the deterministic backstop for the wrong-COUNT half. `publishLedger`
+    // carries names only, so the count reconciler has nothing to check against on
+    // this path — the transcript's own tool results do, and they are scoped to this
+    // turn. The prompt no longer hands the model any numbers; this is what catches it
+    // stating one anyway.
+    const recordLedger = recordWriteLedgerFromTranscript(session?.messages as any);
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -678,7 +686,12 @@ async function getDiagnosticErrorMessage(
     };
     const message = await agentModeService.generateDiagnosticMessage(context);
     return {
-      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      message: message
+        ? reconcileRecordCountReport(
+            reconcileFalseFailureReport(message, publishLedger),
+            recordLedger,
+          )
+        : null,
       publishLedger,
     };
   } catch {

@@ -497,6 +497,78 @@ export function collectConfirmedRecordWrites(
   return { leadsWritten: countsKnown ? leadsWritten : 0, calls, listCreated, actions };
 }
 
+/**
+ * The JSON object a persisted tool message carries, or null when it carries none.
+ *
+ * A tool-role message stores what the MODEL saw (`extractToolContent`): either the
+ * result serialized straight to JSON, or an MCP wrapper's inner text, or a
+ * human-formatted line. Only a parseable object yields counts; anything else is
+ * UNKNOWN and must degrade to a name-only entry rather than to a guessed number.
+ */
+function parseToolMessageResult(content: unknown): Record<string, any> | null {
+  const text = typeof content === 'string'
+    ? content
+    : content && typeof content === 'object' && !Array.isArray(content)
+      ? JSON.stringify(content)
+      : '';
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A COUNTED record-write ledger rebuilt from the persisted transcript.
+ *
+ * The diagnosis path (a thrown turn) has no `toolCalls[]` — it rebuilds the ledger
+ * from the session's success histogram, which carries names only, so
+ * `collectConfirmedRecordWrites` reports `leadsWritten: 0` and the count reconciler
+ * early-returns. That left the exact production failure ("successfully added the 3
+ * leads" after a 75-lead import) with no deterministic backstop on the one path that
+ * produced it. The transcript still holds each `add_leads_to_list` result — the
+ * counts survive it now that `extractMinimalToolResult` preserves them — so it is
+ * the authoritative record this path was missing.
+ *
+ * Scoped to THIS turn: everything after the last persisted user message. The user
+ * message is written before generation starts, so that boundary is present for any
+ * turn that can reach the diagnosis agent. With no boundary the function returns
+ * nothing rather than summing a session's lifetime of imports — an over-count here
+ * would append a correction that is itself wrong.
+ *
+ * A tool result carrying the "⚠️ Tool Error" envelope is a FAILED call and is
+ * dropped; an unparseable one becomes a name-only entry, which counts as a batch
+ * that ran but contributes no records.
+ */
+export function recordWriteLedgerFromTranscript(
+  messages: TranscriptToolMessage[] | null | undefined,
+): FalseFailureLedgerEntry[] {
+  if (!Array.isArray(messages)) return [];
+
+  let turnStart = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') {
+      turnStart = i;
+      break;
+    }
+  }
+  if (turnStart < 0) return [];
+
+  const out: FalseFailureLedgerEntry[] = [];
+  for (const m of messages.slice(turnStart + 1)) {
+    if (!m || m.role !== 'tool' || !m.name || !CONFIRMED_RECORD_WRITE_TOOLS.has(m.name)) continue;
+    const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+    if (text.includes('⚠️ Tool Error')) continue;
+    const result = parseToolMessageResult(m.content);
+    out.push(result ? { name: m.name, result } : { name: m.name });
+  }
+  return out;
+}
+
 /** Publish/deploy labels plus CRM record-write labels — the full confirmed-work list. */
 function collectConfirmedWorkActions(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
