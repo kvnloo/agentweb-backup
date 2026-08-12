@@ -7872,13 +7872,13 @@ export const agentModeController = {
       // flag consecutive failures on the card without fetching full history.
       const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
         ...rest,
-        // Always emit publish consent as a present boolean, never as an absent key.
-        // Spreading alone leaves it undefined on every schedule that predates ENG-827,
-        // which forces the portal to guess what "missing" means — and the two possible
-        // guesses fail in opposite directions: read it as granted and an edit revokes a
-        // setting nobody touched; read it as off and a stored grant survives a user
-        // unticking the box, publishing unreviewed while the UI says it does not.
-        // Absence is not a state this flag has, so don't put it on the wire.
+        // Whether an EXPLICIT grant exists — not whether this schedule will publish.
+        // The two differ, and conflating them is the trap here: a legacy schedule
+        // reports false and still publishes, because the resolver treats a never-asked
+        // row as authorized under ENG-803's opt-out. Read `requirePublishApproval` for
+        // "will it publish"; read this only to decide whether there is a grant to
+        // revoke. Emitted as a present boolean rather than an absent key so a consumer
+        // never has to guess what "missing" meant.
         autopublishAuthorized: rest.autopublishAuthorized === true,
         runHealth: computeScheduleRunHealth(runResults),
       }));
