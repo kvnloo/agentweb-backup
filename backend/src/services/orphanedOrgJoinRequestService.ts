@@ -2,6 +2,7 @@ import { orgDb, userDb, Organization } from './db';
 import { recordAdminAudit } from './adminAuditLog';
 
 const MAX_RESULTS = 100;
+const MAX_ORGANIZATIONS = 1000;
 
 export interface OrphanedOrgJoinReference {
   orgId: string;
@@ -22,7 +23,7 @@ type Dependencies = {
 };
 
 const defaultDependencies: Dependencies = {
-  listOrganizations: () => orgDb.listAll(),
+  listOrganizations: () => orgDb.listAll(MAX_ORGANIZATIONS),
   findUser: (userId) => userDb.getUserById(userId),
   audit: (event) => recordAdminAudit(event as any),
 };
