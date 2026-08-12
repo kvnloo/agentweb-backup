@@ -61,6 +61,9 @@ describe('McpClientService browser session isolation (ENG-1118)', () => {
     jest.clearAllMocks();
     mockGetSetting.mockResolvedValue(null);
     mockClientFactory.mockImplementation(() => makeClient());
+    // See browserPoolReclaim: never let a stdio Playwright config shell out to
+    // `playwright install chromium` and make the test depend on the runner's disk state.
+    (McpClientService as any).playwrightBrowsersInstall = Promise.resolve();
     service = new McpClientService();
   });
 

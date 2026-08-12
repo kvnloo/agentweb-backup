@@ -69,6 +69,11 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
     jest.clearAllMocks();
     mockGetSetting.mockResolvedValue(null);
     mockClientFactory.mockImplementation(() => makeClient());
+    // Creating a stdio Playwright client calls ensurePlaywrightBrowsers(), which shells out
+    // to `playwright install chromium`. That is instant on a machine that already has the
+    // browser and minutes on a cold CI runner, so pre-resolve the memoised install promise
+    // rather than let the test's 5s budget depend on the runner's disk state.
+    (McpClientService as any).playwrightBrowsersInstall = Promise.resolve();
   });
 
   afterEach(async () => {
