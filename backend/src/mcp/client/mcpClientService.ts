@@ -253,12 +253,19 @@ export class McpClientService {
   // single long-lived generateMarketingResponse worker and no caller releases them at
   // session end, so they get their own, much shorter idle TTL plus a hard cap. Both are
   // env-tunable so prod can be retuned without a deploy.
-  // 30 min, not the 1h ordinary pools get: long enough that a user who steps away mid-chat
-  // still comes back to their page (this shortens an existing guarantee, so it is
-  // deliberately not aggressive), short enough to bound idle browsers. Scheduled runs don't
-  // depend on it at all — they hand their browser back at run end.
-  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(30 * 60 * 1000), 10);
+  // Defaults to the ordinary pool TTL: the cap below bounds how many browsers exist at
+  // once, so the TTL is only garbage collection and has no reason to be stricter — and
+  // shortening it would narrow an existing guarantee (a user who steps away mid-chat must
+  // still come back to the page their session left behind). Scheduled runs don't depend on
+  // it at all; they hand their browser back at run end.
+  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(
+    process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(this.SESSION_TIMEOUT_MS), 10);
   private readonly MAX_BROWSER_CLIENTS = parseInt(process.env.MCP_MAX_BROWSER_CLIENTS || '6', 10);
+  // At the cap we wait for a slot rather than spawning another Chromium: a cron burst then
+  // costs a little latency instead of unbounded memory. Bounded, so a genuinely stuck fleet
+  // degrades to running over the cap instead of blocking a run forever.
+  private readonly BROWSER_SLOT_WAIT_MS = parseInt(process.env.MCP_BROWSER_SLOT_WAIT_MS || '30000', 10);
+  private readonly BROWSER_SLOT_POLL_MS = parseInt(process.env.MCP_BROWSER_SLOT_POLL_MS || '1000', 10);
   // A pool is only evictable once it has been quiet for this long. 5 min, because "quiet"
   // is not "finished": an agent turn can easily spend minutes on LLM thinking or a long
   // tool result between two browser calls, and evicting there would hand that session a
@@ -590,34 +597,60 @@ export class McpClientService {
    * evictable we deliberately overshoot the cap and say so — memory pressure is recoverable,
    * yanking a browser out of a running session is exactly the ENG-1118 failure we're fixing.
    */
-  private async enforceBrowserClientCap(currentPoolKey: string): Promise<void> {
+  private async acquireBrowserSlot(currentPoolKey: string): Promise<void> {
     if (this.MAX_BROWSER_CLIENTS <= 0) return;
-    const now = Date.now();
+    const deadline = Date.now() + this.BROWSER_SLOT_WAIT_MS;
 
     while (true) {
-      const browserPools = Array.from(this.sessionClientPools.entries())
-        .filter(([, pool]) => this.isBrowserPool(pool));
-      if (browserPools.length <= this.MAX_BROWSER_CLIENTS) return;
+      // Reclaim whatever is safely reclaimable first — that alone usually frees the slot.
+      await this.evictIdleBrowserPools(currentPoolKey);
 
-      const evictable = browserPools
+      const live = this.countBrowserPools();
+      if (live < this.MAX_BROWSER_CLIENTS) return;
+
+      if (Date.now() >= deadline) {
+        console.warn(
+          `[MCP-SESSION] ${live} live browser client(s), over the browser client cap of `
+          + `${this.MAX_BROWSER_CLIENTS}, and none became idle within ${this.BROWSER_SLOT_WAIT_MS}ms — `
+          + `starting another rather than blocking this run. Raise MCP_MAX_BROWSER_CLIENTS if this recurs.`
+        );
+        return;
+      }
+      // Another session's call may settle and age out while we wait.
+      await sleep(this.BROWSER_SLOT_POLL_MS);
+    }
+  }
+
+  private countBrowserPools(): number {
+    let count = 0;
+    for (const pool of this.sessionClientPools.values()) {
+      if (this.isBrowserPool(pool)) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Release browser pools that are over the cap, least-recently-used first. Only pools
+   * that are idle (no in-flight call) and past the grace window are eligible, and never
+   * the pool asking for the slot.
+   */
+  private async evictIdleBrowserPools(currentPoolKey: string): Promise<void> {
+    const now = Date.now();
+
+    while (this.countBrowserPools() >= this.MAX_BROWSER_CLIENTS) {
+      const evictable = Array.from(this.sessionClientPools.entries())
         .filter(([key, pool]) =>
-          key !== currentPoolKey
+          this.isBrowserPool(pool)
+          && key !== currentPoolKey
           && pool.inFlight === 0
           && now - pool.lastActivity >= this.BROWSER_EVICTION_GRACE_MS)
         .sort((a, b) => a[1].lastActivity - b[1].lastActivity);
 
-      if (evictable.length === 0) {
-        console.warn(
-          `[MCP-SESSION] ${browserPools.length} live browser client(s), over the browser client cap `
-          + `of ${this.MAX_BROWSER_CLIENTS}, but none is idle enough to evict — running over the cap `
-          + `rather than interrupting a live session.`
-        );
-        return;
-      }
+      if (evictable.length === 0) return;
 
       const [victimKey] = evictable[0];
       console.log(
-        `[MCP-SESSION] Browser client cap (${this.MAX_BROWSER_CLIENTS}) exceeded — evicting `
+        `[MCP-SESSION] Browser client cap (${this.MAX_BROWSER_CLIENTS}) reached — evicting `
         + `least-recently-used idle browser pool: ${victimKey.substring(0, 8)}`
       );
       await this.releasePool(victimKey);
@@ -692,15 +725,15 @@ export class McpClientService {
     const pendingClient = sessionPool.pendingClients.get(serverName);
     if (pendingClient) return pendingClient;
 
+    // Take a slot BEFORE spawning, so a burst waits for capacity instead of adding to it.
+    if (this.isBrowserBacked(serverName, toolName)) {
+      await this.acquireBrowserSlot(poolKey);
+    }
+
     const creation = this.createSessionClient(serverName, poolKey, userId, sessionPool);
     sessionPool.pendingClients.set(serverName, creation);
     try {
-      const client = await creation;
-      // A browser client was just added — re-check the cap now that it is live.
-      if (this.isBrowserBacked(serverName, toolName)) {
-        await this.enforceBrowserClientCap(poolKey);
-      }
-      return client;
+      return await creation;
     } finally {
       if (sessionPool.pendingClients.get(serverName) === creation) {
         sessionPool.pendingClients.delete(serverName);
