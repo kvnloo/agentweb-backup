@@ -1204,6 +1204,137 @@ describe('AgentModeService - CRM Tools', () => {
       expect(mockCrmDb.canOrgMemberAccessList).not.toHaveBeenCalled();
       expect(mockCrmDb.batchCreateLeads).not.toHaveBeenCalled();
     });
+
+    // ENG-1133: a 97-row CSV imported in three 25-row calls stopped at 75 when
+    // the whole-turn cap fired. Each call had reported only "25 new lead(s)
+    // created", so the next turn could not tell which 75 of the 97 had landed
+    // and told the user to retry the whole request instead of resuming.
+    describe('resumable import reporting (ENG-1133)', () => {
+      beforeEach(() => {
+        mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      });
+
+      it('names the rows it persisted so the next turn can resume from the remainder', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'merged'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'one@example.com', firstName: 'One' },
+            { linkedin: 'https://www.linkedin.com/in/two', firstName: 'Two', lastName: 'Person' },
+          ],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.attempted).toBe(2);
+        expect(result.importedIdentifiers).toEqual([
+          'one@example.com',
+          'https://www.linkedin.com/in/two',
+        ]);
+        expect(result.unimportedRows).toBeUndefined();
+      });
+
+      it('returns an explicit resumable partial naming the rows that did not land', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 2: b@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['created', 'failed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+          ],
+          userId,
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
+        // Rows landed, so the CRM page must still refresh (shouldEmitCrmDataChanged).
+        expect(result.partial).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 2, identifier: 'b@example.com', reason: 'failed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/1 of 3/);
+        // The agent must be told to resume with the named rows, not to hand a
+        // whole-request retry back to the user.
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 2,
+          newCount: 1,
+          mergedCount: 1,
+          alreadyPresentCount: 1,
+          anonymizedSkipped: 1,
+          errorCount: 1,
+          errors: ['Row 4: Duplicate email "d@example.com" found in upload data'],
+          rowOutcomes: ['created', 'merged', 'already_present', 'duplicate_in_request', 'anonymized_skipped'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [
+            { email: 'a@example.com' },
+            { email: 'b@example.com' },
+            { email: 'c@example.com' },
+            { email: 'c@example.com' },
+            { firstName: 'LinkedIn', lastName: 'Member' },
+          ],
+          userId,
+        );
+
+        expect(result.attempted).toBe(5);
+        const { created, merged, alreadyPresent, duplicateInRequest, anonymizedSkipped, failed, unprocessed } =
+          result.reconciliation;
+        expect(created + merged + alreadyPresent + duplicateInRequest + anonymizedSkipped + failed + unprocessed)
+          .toBe(result.attempted);
+        expect(result.complete).toBe(true);
+      });
+
+      // Re-sending the full CSV after a partial import is the retry the user
+      // was told to do. Every row already being present is a SUCCESSFUL
+      // reconciliation, not "No leads were processed".
+      it('reports success when every re-submitted row is already in the list', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          alreadyPresentCount: 2,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['already_present', 'already_present'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(true);
+        expect(result.message).toMatch(/already/i);
+      });
+    });
   });
 
   // ─── deleteLeads ───────────────────────────────────────────────────────

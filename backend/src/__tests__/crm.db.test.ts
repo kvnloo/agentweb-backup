@@ -2457,4 +2457,119 @@ describe('CRM Database Service', () => {
     });
   });
 
+  // ENG-1133: a large import that dies part-way (agent-mode whole-turn cap)
+  // can only be resumed if the caller can tell, row by row, what landed and
+  // what did not. Aggregate counts alone ("25 new lead(s) created") make a
+  // resume indistinguishable from a restart.
+  describe('per-row import ledger (resumable partial imports)', () => {
+    const listId = 'list_ledger';
+
+    const primeWrites = () => {
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    };
+
+    const primeExisting = (items: any[]) => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: items }),
+      });
+    };
+
+    beforeEach(primeWrites);
+
+    it('classifies every input row in rowOutcomes, aligned to input order', async () => {
+      primeExisting([
+        { leadId: 'lead_merge', listId, email: 'merge@example.com', firstName: 'Old' },
+        { leadId: 'lead_same', listId, email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'brand-new@example.com', firstName: 'Brand', lastName: 'New' },
+        { email: 'merge@example.com', firstName: 'Updated' },
+        { email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { email: 'brand-new@example.com', firstName: 'Dup', lastName: 'Row' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual([
+        'created',
+        'merged',
+        'already_present',
+        'anonymized_skipped',
+        'duplicate_in_request',
+      ]);
+      // A row that was already in the list, unchanged, used to vanish from
+      // every counter — the resume path read that as "nothing happened".
+      expect(result.alreadyPresentCount).toBe(1);
+      expect(result.rowOutcomes).toHaveLength(5);
+    });
+
+    it('marks rows as failed — never unprocessed — when their batch write fails', async () => {
+      primeExisting([]);
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'a@example.com' },
+        { email: 'b@example.com' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual(['failed', 'failed']);
+      expect(result.errorCount).toBe(2);
+    });
+
+    // The customer report calls this one out directly: "rows without email may
+    // not dedupe safely". Without an identity axis for them, re-submitting a
+    // partially-imported CSV duplicates every email-less row it already wrote.
+    it('dedupes an email-less, linkedin-less row against the list by name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Acme', title: 'CTO' },
+      ]);
+
+      expect(result.newCount).toBe(0);
+      expect(result.rowOutcomes).toEqual(['merged']);
+    });
+
+    it('still creates an email-less row when no existing lead shares its name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Globex' },
+      ]);
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+
+    // Narrow by design: a row that carries its own identity (email or
+    // LinkedIn URL) must keep the existing behaviour, or two genuinely
+    // different people who share a name at one company get silently merged.
+    it('does not name-match a row that carries its own email identity', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'ann.lee.2@example.com', firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+  });
+
 });
