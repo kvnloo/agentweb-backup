@@ -253,11 +253,17 @@ export class McpClientService {
   // single long-lived generateMarketingResponse worker and no caller releases them at
   // session end, so they get their own, much shorter idle TTL plus a hard cap. Both are
   // env-tunable so prod can be retuned without a deploy.
-  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(10 * 60 * 1000), 10);
+  // 30 min, not the 1h ordinary pools get: long enough that a user who steps away mid-chat
+  // still comes back to their page (this shortens an existing guarantee, so it is
+  // deliberately not aggressive), short enough to bound idle browsers. Scheduled runs don't
+  // depend on it at all — they hand their browser back at run end.
+  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(30 * 60 * 1000), 10);
   private readonly MAX_BROWSER_CLIENTS = parseInt(process.env.MCP_MAX_BROWSER_CLIENTS || '6', 10);
-  // A pool is only evictable once it has been quiet for this long, so a session merely
-  // waiting on the LLM between two tool calls never loses its browser mid-run.
-  private readonly BROWSER_EVICTION_GRACE_MS = parseInt(process.env.MCP_BROWSER_EVICTION_GRACE_MS || '60000', 10);
+  // A pool is only evictable once it has been quiet for this long. 5 min, because "quiet"
+  // is not "finished": an agent turn can easily spend minutes on LLM thinking or a long
+  // tool result between two browser calls, and evicting there would hand that session a
+  // blank page mid-run — a milder version of the very bug this ticket is about.
+  private readonly BROWSER_EVICTION_GRACE_MS = parseInt(process.env.MCP_BROWSER_EVICTION_GRACE_MS || String(5 * 60 * 1000), 10);
 
   // Circuit breaker: fail fast when a server has timed out repeatedly
   private readonly CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.MCP_CIRCUIT_BREAKER_THRESHOLD || '3', 10);
@@ -980,6 +986,17 @@ export class McpClientService {
     );
 
     for (const poolKey of poolKeys) {
+      // A run can end with a tool call still executing — a timed-out request keeps running
+      // in the worker after the caller's `finally` has moved on. Closing the client there
+      // would abort a live browser call, so leave it to the idle sweep instead.
+      const pool = this.sessionClientPools.get(poolKey);
+      if (pool && pool.inFlight > 0) {
+        console.warn(
+          `[MCP-SESSION] Not releasing pool ${poolKey.substring(0, 8)} — ${pool.inFlight} tool call(s) `
+          + `still in flight; the idle sweep will reclaim it.`
+        );
+        continue;
+      }
       await this.releasePool(poolKey);
     }
   }
