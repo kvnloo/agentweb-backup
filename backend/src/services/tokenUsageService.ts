@@ -263,16 +263,35 @@ export async function incrementUserTokenUsage(
         const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
         newHistory = [...existingHistory, entry].slice(-24);
       }
-      await userDb.updateUser(billingUserId, {
-        tokenUsage: {
-          month: currentMonth,
-          totalTokens: tokens,
-          totalCost: cost,
-          resetDate: getNextResetDate(),
-        },
-        tokenAllowanceBonus: 0,
-        tokenUsageHistory: newHistory,
+      // Conditional: succeeds only while nobody else has rolled the month over.
+      // The previous unconditional write meant two concurrent charges at rollover
+      // both reset the counter and the second silently discarded the first.
+      const didReset = await userDb.resetTokenUsageForMonth({
+        userId: billingUserId,
+        month: currentMonth,
+        tokens,
+        cost,
+        resetDate: getNextResetDate(),
+        history: newHistory,
       });
+
+      if (!didReset) {
+        // Lost the race — the winner already created this month's counter (and
+        // archived the previous month). Apply this charge on top of theirs rather
+        // than dropping it.
+        const updated = await userDb.incrementTokenUsageForMonth(
+          billingUserId,
+          currentMonth,
+          tokens,
+          cost,
+          getNextResetDate()
+        );
+        if (!updated) {
+          console.warn(
+            `[tokenUsageService] Skipped token increment for ${billingUserId}: month changed again during rollover`
+          );
+        }
+      }
     } else {
       const updated = await userDb.incrementTokenUsageForMonth(
         billingUserId,

@@ -1659,6 +1659,75 @@ export class UserDB {
     }
   }
 
+  /**
+   * Roll the monthly usage counter over to a new month, archiving the previous
+   * month into history — but ONLY if nobody has rolled it over already.
+   *
+   * The caller reads the stored month, sees it is stale, and decides to reset.
+   * Between that read and this write, another charge for the same user can do
+   * exactly the same thing. Without the condition below both writes land and the
+   * second discards the first call's tokens and cost entirely — a whole charge
+   * lost, on the one day of the month when every active user rolls over at once.
+   *
+   * Returns false when the condition fails, i.e. somebody else already rolled the
+   * month. The caller then applies its charge as a normal increment onto the
+   * counter the winner created, so no spend is dropped either way.
+   */
+  async resetTokenUsageForMonth(args: {
+    userId: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    history: Array<{ month: string; totalTokens: number; totalCost: number }>;
+  }): Promise<boolean> {
+    const user = await this.getUserById(args.userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${args.userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+      // Succeed only while the stored month is still NOT the new one. A row with
+      // no tokenUsage at all is a first-ever charge and also qualifies.
+      ConditionExpression:
+        "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#history": "tokenUsageHistory",
+        "#bonus": "tokenAllowanceBonus",
+      },
+      ExpressionAttributeValues: {
+        ":userId": args.userId,
+        ":month": args.month,
+        ":usage": {
+          month: args.month,
+          totalTokens: args.tokens,
+          totalCost: args.cost,
+          resetDate: args.resetDate,
+        },
+        ":history": args.history,
+        ":zero": 0,
+      },
+    };
+
+    try {
+      await this.docClient.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return false;
+      }
+      handleDynamoDbError(error, "resetTokenUsageForMonth");
+      throw error;
+    }
+  }
+
   async incrementTokenUsageForMonth(
     userId: string,
     month: string,
