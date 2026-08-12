@@ -22,40 +22,51 @@
  *   4. the remaining metadata, if even an empty message would not fit.
  *
  * Pure: never mutates its input, and guarantees the returned message serializes to
- * at most `maxChars` (short of a message whose bare skeleton exceeds it).
+ * at most `maxBytes` bytes (short of a message whose bare skeleton exceeds it).
  */
 
 export const OMITTED_TOOL_RESULT = '[omitted — message exceeded the persistence size limit]';
 
-const serializedSize = (value: unknown): number => JSON.stringify(value)?.length ?? 0;
+/**
+ * Size of `value` as DynamoDB measures it: UTF-8 BYTES, not UTF-16 code units.
+ *
+ * `JSON.stringify(x).length` undercounts every non-ASCII character — JSON.stringify
+ * leaves them literal rather than \u-escaping them, so one CJK character is 1 unit of
+ * `.length` but 3 bytes on the wire, and an emoji is 2 units but 4 bytes. A 200,000-character
+ * Chinese report would clear a 350,000-"char" budget at 600KB encoded and still be rejected —
+ * the precise failure this module exists to prevent.
+ */
+const serializedSize = (value: unknown): number =>
+  Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
 
 /** Truncate `content` until the whole message fits, then return it. */
-function fitContent(message: any, maxChars: number, originalSize: number): any {
+function fitContent(message: any, maxBytes: number, originalSize: number): any {
   const contentStr =
     typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? '');
-  const notice = `\n\n[Truncated — original size: ${originalSize} chars]`;
+  const notice = `\n\n[Truncated — original size: ${originalSize} bytes]`;
   const overhead = serializedSize({ ...message, content: '' });
 
-  let keep = Math.max(0, maxChars - overhead - notice.length);
-  // JSON escaping can make the serialized form longer than the raw slice, so
-  // converge rather than trusting the first estimate.
+  let keep = Math.max(0, maxBytes - overhead - notice.length);
+  // A character slice is only a guess at a BYTE budget — JSON escaping expands some
+  // characters, and any non-ASCII one costs 2-4 bytes — so converge by re-measuring
+  // rather than trusting the first estimate.
   for (let attempt = 0; attempt < 32 && keep > 0; attempt++) {
     const candidate = { ...message, content: contentStr.slice(0, keep) + notice };
     const candidateSize = serializedSize(candidate);
-    if (candidateSize <= maxChars) return candidate;
-    keep = Math.max(0, keep - Math.max(1, candidateSize - maxChars));
+    if (candidateSize <= maxBytes) return candidate;
+    keep = Math.max(0, keep - Math.max(1, candidateSize - maxBytes));
   }
   return { ...message, content: notice.trim() };
 }
 
 /**
- * Return a copy of `message` that serializes to at most `maxChars`, shedding the
+ * Return a copy of `message` that serializes to at most `maxBytes` bytes, shedding the
  * least valuable parts first. Returns the ORIGINAL reference when it already fits.
  */
-export function shrinkMessageForPersistence(message: any, maxChars: number): any {
+export function shrinkMessageForPersistence(message: any, maxBytes: number): any {
   if (!message || typeof message !== 'object') return message;
   const originalSize = serializedSize(message);
-  if (originalSize <= maxChars) return message;
+  if (originalSize <= maxBytes) return message;
 
   let working: any = message;
 
@@ -75,7 +86,7 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
     // Shedding by size therefore drops the blobs that caused the overflow and leaves
     // the small, load-bearing results untouched.
     const shed = new Set<number>();
-    const budgetToRecover = originalSize - maxChars;
+    const budgetToRecover = originalSize - maxBytes;
     let recovered = 0;
     const bySizeDesc = ledger
       .map((call: any, index: number) => ({
@@ -102,11 +113,11 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
       },
     });
     working = shedResults(shed);
-    if (serializedSize(working) <= maxChars) return working;
+    if (serializedSize(working) <= maxBytes) return working;
 
     // The size estimate was optimistic (JSON escaping) — shed every result.
     working = shedResults(new Set(ledger.map((_: any, index: number) => index)));
-    if (serializedSize(working) <= maxChars) return working;
+    if (serializedSize(working) <= maxBytes) return working;
 
     // 2. Still over — keep only what the ledger is actually read for: which
     //    tools ran. Flagged so a reader knows the ledger is not the full record.
@@ -120,12 +131,12 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
         toolCallsTruncated: true,
       },
     };
-    if (serializedSize(working) <= maxChars) return working;
+    if (serializedSize(working) <= maxBytes) return working;
   }
 
   // 3. Truncate the answer itself.
-  const withFittedContent = fitContent(working, maxChars, originalSize);
-  if (serializedSize(withFittedContent) <= maxChars) return withFittedContent;
+  const withFittedContent = fitContent(working, maxBytes, originalSize);
+  if (serializedSize(withFittedContent) <= maxBytes) return withFittedContent;
 
   // 4. Nothing but the message skeleton left — the metadata alone is over budget.
   //    `toolCalls` names are kept even here: agentModeController's history filter
@@ -139,5 +150,5 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
       metadataTruncated: true,
     },
   };
-  return fitContent(stripped, maxChars, originalSize);
+  return fitContent(stripped, maxBytes, originalSize);
 }

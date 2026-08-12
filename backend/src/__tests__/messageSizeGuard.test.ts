@@ -1,6 +1,7 @@
 import { shrinkMessageForPersistence, OMITTED_TOOL_RESULT } from '../utils/messageSizeGuard';
 
-const size = (value: unknown) => JSON.stringify(value).length;
+/** What DynamoDB actually counts: UTF-8 bytes, not UTF-16 code units. */
+const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
 
 /** A tool-ledger entry whose `result` payload is `chars` long. */
 const ledgerEntry = (i: number, chars: number) => ({
@@ -155,6 +156,41 @@ describe('shrinkMessageForPersistence (ENG-946)', () => {
     expect(size(shrunk)).toBeLessThanOrEqual(MAX);
     expect(shrunk.role).toBe('tool');
     expect(shrunk.content).toContain('Truncated');
+  });
+
+  // Greptile review, PR #2314: the budget is DynamoDB's 400KB, which is measured in
+  // UTF-8 BYTES. JSON.stringify leaves non-ASCII literal rather than \u-escaping it, so
+  // one CJK character is 1 unit of `.length` but 3 bytes — a report that clears a
+  // character-counted budget can still be rejected on the wire. Emoji-heavy marketing
+  // copy makes this an everyday input for this product, not a corner case.
+  it('measures UTF-8 bytes, so multibyte content cannot slip past the budget', () => {
+    // Comfortably under MAX as characters (≈6k), roughly 3x that as bytes.
+    const cjk = '\u6708\u6b21\u30ec\u30dd\u30fc\u30c8'.repeat(1_000);
+    const message = { role: 'assistant', content: cjk, metadata: { timestamp: 't' } };
+    expect(JSON.stringify(message).length).toBeLessThan(MAX);   // a char count says "fits"
+    expect(size(message)).toBeGreaterThan(MAX);                 // the wire says otherwise
+
+    const shrunk: any = shrinkMessageForPersistence(message, MAX);
+
+    expect(shrunk).not.toBe(message);           // it was NOT waved through
+    expect(size(shrunk)).toBeLessThanOrEqual(MAX);
+  });
+
+  it('keeps an emoji-heavy report intact by shedding the ledger instead', () => {
+    // ~1.5KB of 4-byte emoji: well within MAX on its own, so shedding the 12KB
+    // ledger is enough and the report never needs truncating.
+    const report = '\ud83d\ude80 Campaign results \ud83d\udcc8 '.repeat(60);
+    const message = {
+      role: 'assistant',
+      content: report,
+      metadata: { timestamp: 't', toolCalls: [ledgerEntry(0, 12_000)] },
+    };
+
+    const shrunk: any = shrinkMessageForPersistence(message, MAX);
+
+    expect(size(shrunk)).toBeLessThanOrEqual(MAX);
+    expect(shrunk.content).toBe(report);
+    expect(shrunk.metadata.toolCalls[0].result).toBe(OMITTED_TOOL_RESULT);
   });
 
   it('is a no-op for non-object input', () => {
