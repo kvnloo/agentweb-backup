@@ -17,7 +17,6 @@ import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 import { mcpOAuthService } from "../mcp/oauth/oauthService";
-import crypto from "crypto";
 
 // ENG-512: domain-based org auto-join. If the new signup's email domain
 // matches an org with autoJoinEnabled, create a pending domain-join request
