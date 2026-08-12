@@ -3945,9 +3945,16 @@ export class AgentModeService {
           // available estimate of what the retry would cost, so require at least that much
           // still on the clock. When there is not enough, end the turn here and deliver
           // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
-          // one) rather than throwing the turn away. Scoped to the forced synthesis: an
-          // ordinary transient failure keeps its retry untouched.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined) {
+          // one) rather than throwing the turn away.
+          //
+          // Scoped tightly to the retry that would otherwise have run: the SAME
+          // `isTransientLLMError(...) && !backupModelUsed` condition guards it. A
+          // non-transient failure (context limit, content policy, malformed request) has no
+          // retry to skip, and reporting one as "I hit the time limit — reply continue"
+          // would be a lie that walks the user straight back into the same error. Those
+          // keep propagating through their existing classification path untouched, as does
+          // any transient failure outside the forced synthesis.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError) && !backupModelUsed) {
             const retryBudget = evaluateTurnTimeBudget({
               startedAtMs: turnStartedAtMs,
               hardCapMs: turnHardCapMs,
