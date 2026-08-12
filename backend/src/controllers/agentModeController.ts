@@ -214,6 +214,8 @@ async function applyScheduleEditWithConsentNarrowing(
   throw new ScheduleConsentRaceError(
     `Publish consent for schedule ${scheduleId} changed on every attempt to apply this edit.`
   );
+}
+
 type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
