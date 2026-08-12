@@ -1303,6 +1303,52 @@ describe('AgentModeService - CRM Tools', () => {
         expect(result.resumable).toBe(true);
       });
 
+      // The resume list is capped so a huge partial cannot blow the tool result
+      // past the size at which the agent layer swaps it for a preview. Left
+      // unsaid, that cap is silent data loss: the agent imports the 100 rows it
+      // was named, gets a clean `complete: true`, and reports the import
+      // finished while the rest are still missing.
+      it('says so when the resume list is truncated, and that finishing it is not finishing the import', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.complete).toBe(false);
+        expect(result.unimportedRows).toHaveLength(100);
+        expect(result.unimportedRowsTruncated).toEqual({ shown: 100, total: 200 });
+        // The full shortfall, not just the slice that fits.
+        expect(result.message).toMatch(/FIRST 100 of 200 missing rows/);
+        expect(result.message).toMatch(/not done until a result comes back with complete: true/);
+      });
+
+      it('does not claim truncation when the whole resume list fits', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.unimportedRowsTruncated).toBeUndefined();
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
       it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {
         mockCrmDb.batchCreateLeads.mockResolvedValue({
           successCount: 2,
