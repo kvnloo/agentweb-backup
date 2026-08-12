@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-12',
+    changes: [
+      'Fixed: Saving a Long Scheduled-Chat Prompt No Longer Fails With an Unexplained Error',
+      '- A scheduled chat keeps a copy of its previous prompt every time you edit it, so a schedule with a very long prompt could quietly fill up all the space we are allowed to store for it — after which every save was refused with a generic error and no reason',
+      '- Schedules with self-improvement switched on were hit hardest: the run could work out exactly how to improve its own prompt and then had no way to save it, so the same faults repeated week after week',
+      '- Saving now makes room automatically by dropping the oldest saved prompt versions (and, only if that is still not enough, the oldest run history), so your edit goes through',
+      '- If a prompt really is too long to store at all, you now get a clear message saying so and how long it is, instead of a generic failure',
+      '- Run history for an affected schedule was also being dropped silently; those runs are recorded again',
+    ],
+  },
+  {
     date: '2026-08-05',
     changes: [
       'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',
