@@ -3608,7 +3608,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // ENG-827: consent is always on the wire as a boolean, never an absent key —
       // see agentModeController.scheduledChatConsentShape.test.ts for why.
       autopublishAuthorized: s.autopublishAuthorized === true,
-      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
+      // ENG-1131 adds lastRunBlockedBy (why the last run could not source), null here.
+      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null },
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
