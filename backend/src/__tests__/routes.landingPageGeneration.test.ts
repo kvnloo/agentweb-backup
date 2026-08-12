@@ -51,8 +51,18 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLeadListsForUser = jest.fn();
 const mockCreateLeadList = jest.fn();
 const mockCanOrgMemberAccessList = jest.fn();
+// ENG-827: the publish route's last-moment consent re-check reads these two for real.
+const mockGetScheduleById = jest.fn();
+const mockGetChatSession = jest.fn();
+
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+}));
 
 jest.mock("../services/db", () => ({
+  scheduleDb: {
+    getScheduleById: (...args: any[]) => mockGetScheduleById(...args),
+  },
   userDb: {
     getUserById: mockGetUserById,
     setLandingSiteMode: jest.fn(async (_id: string, m: string) => m),
@@ -924,6 +934,132 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockResolveLandingPageLiveUrl).toHaveBeenCalledWith(
       expect.objectContaining({ vercelProjectId: "vercel-proj-123", userId: "test-user-id" })
     );
+  });
+
+  // ===========================================================================
+  // ENG-827 — consent is re-checked at the MERGE, not at the tool that asks for it.
+  //
+  // `publish_landing_page_changes` is gated at dispatch, but the merge that makes
+  // the page public happens here, on the far side of a self-call, after a secrets
+  // fetch and a GitHub read that is allowed 30s. These drive the REAL guard (only
+  // its two storage reads are mocked) so the scope binding and the fail-closed
+  // branches are exercised, not just the wiring.
+  //
+  // The assertion that matters in every case is the SIDE EFFECT — was main
+  // advanced? — because that is the part that cannot be undone.
+  // ===========================================================================
+  const SESSION_HEADER = "X-AgentWeb-Session";
+  const TOOL = "publish_landing_page_changes";
+
+  /** An unattended run admitted with consent for the landing publish tool. */
+  const authorizedRun = () => ({
+    sessionType: "scheduled",
+    pageIdentifier: `Weekly site refresh|scheduleId:3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21`,
+    publishAdmission: { authorized: true, tools: [TOOL] },
+  });
+
+  const expectNothingPublished = () => {
+    expect(mockAxios.post).not.toHaveBeenCalled();
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+  };
+
+  it("FAIL: consent revoked after the tool was admitted → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // The owner switched it off while the route was fetching the token and the SHA.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: false,
+      autopublishAuthorizedTools: [],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/not authorized to publish/i);
+    expectNothingPublished();
+    // Proves the check sits at the LAST moment rather than at the top of the route:
+    // the read work ahead of the merge still ran.
+    expect(mockAxios.get).toHaveBeenCalled();
+  });
+
+  it("FAIL: consent stands but not for THIS tool → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Granted for social posting only. A landing deploy is not what the owner approved.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ["post_on_connected_account"],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("FAIL: the run's session cannot be read → fails closed, main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    // Both the call and its one retry fail. An unconfirmed permission is withheld.
+    mockGetChatSession.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("SUCCESS: consent still held at the merge → the page publishes", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    // The gate must not become a blanket block on authorized runs.
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    // It really did consult live schedule state rather than trusting the admission.
+    expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21");
+  });
+
+  it("BOUNDARY: an interactive publish carries no session header → not gated, no consent read", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // A human clicking Publish must not pay for a session read, let alone be refused.
+    expect(mockGetChatSession).not.toHaveBeenCalled();
+    expect(mockGetScheduleById).not.toHaveBeenCalled();
   });
 });
 
