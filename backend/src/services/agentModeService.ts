@@ -20,7 +20,7 @@ import {
   buildTurnTimeBudgetNudge,
   TURN_TIME_BUDGET_FALLBACK_CONTENT,
 } from '../utils/turnTimeBudget';
-import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
+import { isBookkeepingTool, reconcileFalseFailureReport, reconcileRecordCountReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
@@ -4771,9 +4771,17 @@ export class AgentModeService {
       // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
       // append the true outcome so the user does not re-run a production deploy that
       // already landed. Runs after the landing reconciler so both corrections compose.
+      // ENG-1054: the third member of the same family — a close that neither denies
+      // nor omits the work but MISCOUNTS it ("successfully added the 3 leads" after
+      // a 75-lead import run as three batches). The ledger now carries real record
+      // counts, so a contradicting number is detectable; the correction is appended,
+      // never substituted, and stays silent unless the ledger holds a counted total.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileFalseFailureReport(
-          reconcileLandingDeploymentReport(content, toolCalls),
+        const reconciledContent = reconcileRecordCountReport(
+          reconcileFalseFailureReport(
+            reconcileLandingDeploymentReport(content, toolCalls),
+            toolCalls,
+          ),
           toolCalls,
         );
         if (reconciledContent !== content) {
