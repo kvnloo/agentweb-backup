@@ -61,18 +61,51 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
 
   const ledger = working?.metadata?.toolCalls;
   if (Array.isArray(ledger) && ledger.length > 0) {
-    // 1. Drop the result payloads — by far the dominant term.
-    working = {
+    // 1. Drop result payloads LARGEST-FIRST, and stop the moment the item fits.
+    //
+    // Not all-or-nothing, because result size tracks how much the result is worth
+    // keeping almost exactly inversely. A `generate_image`/`upload_image` result is
+    // ~100 bytes (`{success, imageUrl}`) and is READ downstream — utils/
+    // scanMessagesForAssets builds the session asset cache out of exactly those two
+    // fields, and only generate_image/generate_video are in chatbotService's
+    // REPAIRABLE_TOOL_CALLS, so a shed `upload_image` result is gone for good. A
+    // `search_tool_response` result is ~15KB of paging diagnostics that nothing reads
+    // and whose source tool message is persisted as its own item anyway.
+    //
+    // Shedding by size therefore drops the blobs that caused the overflow and leaves
+    // the small, load-bearing results untouched.
+    const shed = new Set<number>();
+    const budgetToRecover = originalSize - maxChars;
+    let recovered = 0;
+    const bySizeDesc = ledger
+      .map((call: any, index: number) => ({
+        index,
+        cost:
+          call && typeof call === 'object' && call.result !== undefined
+            ? serializedSize(call.result) - OMITTED_TOOL_RESULT.length - 2
+            : 0,
+      }))
+      .filter((entry) => entry.cost > 0)
+      .sort((a, b) => b.cost - a.cost || a.index - b.index);
+    for (const entry of bySizeDesc) {
+      if (recovered >= budgetToRecover) break;
+      shed.add(entry.index);
+      recovered += entry.cost;
+    }
+    const shedResults = (indices: Set<number>) => ({
       ...working,
       metadata: {
         ...working.metadata,
-        toolCalls: ledger.map((call: any) =>
-          call && typeof call === 'object' && call.result !== undefined
-            ? { ...call, result: OMITTED_TOOL_RESULT }
-            : call
+        toolCalls: ledger.map((call: any, index: number) =>
+          indices.has(index) ? { ...call, result: OMITTED_TOOL_RESULT } : call
         ),
       },
-    };
+    });
+    working = shedResults(shed);
+    if (serializedSize(working) <= maxChars) return working;
+
+    // The size estimate was optimistic (JSON escaping) — shed every result.
+    working = shedResults(new Set(ledger.map((_: any, index: number) => index)));
     if (serializedSize(working) <= maxChars) return working;
 
     // 2. Still over — keep only what the ledger is actually read for: which
@@ -95,9 +128,16 @@ export function shrinkMessageForPersistence(message: any, maxChars: number): any
   if (serializedSize(withFittedContent) <= maxChars) return withFittedContent;
 
   // 4. Nothing but the message skeleton left — the metadata alone is over budget.
+  //    `toolCalls` names are kept even here: agentModeController's history filter
+  //    drops an assistant tool-call turn that has no `metadata.toolCalls`, so
+  //    removing the key outright would evict the message from the conversation.
   const stripped = {
     ...working,
-    metadata: { timestamp: working?.metadata?.timestamp, metadataTruncated: true },
+    metadata: {
+      timestamp: working?.metadata?.timestamp,
+      ...(Array.isArray(working?.metadata?.toolCalls) ? { toolCalls: working.metadata.toolCalls } : {}),
+      metadataTruncated: true,
+    },
   };
   return fitContent(stripped, maxChars, originalSize);
 }

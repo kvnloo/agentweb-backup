@@ -42,6 +42,40 @@ describe('shrinkMessageForPersistence (ENG-946)', () => {
     expect(message.metadata.toolCalls[0].result).toEqual({ success: true, content: 'x'.repeat(8_000) });
   });
 
+  // utils/scanMessagesForAssets builds the session asset cache from
+  // toolCall.result.imageUrl / .videoUrl, and chatbotService can only repair
+  // generate_image / generate_video — a shed `upload_image` result is gone for good.
+  // Those results are ~100 bytes; the blobs that blow the budget are ~15KB. So shed
+  // by size and the asset-bearing ones are never touched.
+  it('sheds the big diagnostic blobs and keeps the small asset-bearing results', () => {
+    const message = {
+      role: 'assistant',
+      content: 'Here are your images.',
+      metadata: {
+        timestamp: 't',
+        toolCalls: [
+          ledgerEntry(0, 9_000),
+          { id: 'i1', name: 'upload_image', result: { success: true, imageUrl: 'https://s3/a.png' } },
+          ledgerEntry(1, 9_000),
+          { id: 'i2', name: 'generate_video', result: { success: true, videoUrl: 'https://s3/b.mp4' } },
+        ],
+      },
+    };
+
+    const shrunk: any = shrinkMessageForPersistence(message, MAX);
+    const calls = shrunk.metadata.toolCalls;
+
+    expect(size(shrunk)).toBeLessThanOrEqual(MAX);
+    // The asset URLs the cache is built from survive verbatim...
+    expect(calls[1].result).toEqual({ success: true, imageUrl: 'https://s3/a.png' });
+    expect(calls[3].result).toEqual({ success: true, videoUrl: 'https://s3/b.mp4' });
+    // ...and a paging blob is what paid for it. Only as many as needed are shed —
+    // shedding stops the moment the item fits — so assert at least one, not both.
+    const shedNames = calls.filter((c: any) => c.result === OMITTED_TOOL_RESULT).map((c: any) => c.name);
+    expect(shedNames.length).toBeGreaterThanOrEqual(1);
+    expect(shedNames.every((n: string) => n === 'search_tool_response')).toBe(true);
+  });
+
   it('falls back to a names-only ledger when shedding results is not enough', () => {
     const message = {
       role: 'assistant',
