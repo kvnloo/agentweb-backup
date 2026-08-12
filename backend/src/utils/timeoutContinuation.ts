@@ -15,8 +15,28 @@
  */
 
 export interface TimeoutContinuationMessage {
-  metadata?: { kind?: string; imageUrl?: string; imageFilename?: string; timestamp?: string } | null;
+  metadata?: {
+    kind?: string;
+    imageUrl?: string;
+    imageFilename?: string;
+    timestamp?: string;
+    // ENG-907: set on the canned error/diagnostic closings. Those are NOT the turn's
+    // own work and must never be counted as salvageable output.
+    isErrorMessage?: boolean;
+    isDiagnosticMessage?: boolean;
+  } | null;
   timestamp?: string;
+  role?: string;
+  content?: unknown;
+  name?: string;
+}
+
+/** ENG-907: what a timed-out turn actually managed to persist before the cap fired. */
+export interface SalvagedTurnWork {
+  /** Assistant messages carrying real (non-error) text that this turn wrote. */
+  narrationCount: number;
+  /** Distinct tool names this turn executed, in first-seen order. */
+  toolNames: string[];
 }
 
 export interface GeneratedImageRef {
@@ -69,5 +89,86 @@ export function buildTimeoutContinuationMessage(images: GeneratedImageRef[] | un
     `${gallery}\n\n` +
     `Reply "continue" and I'll pick up where I left off and create anything still missing — ` +
     `I won't redo what's already done.`
+  );
+}
+
+/**
+ * ENG-907: the loop's own wall-clock budget (utils/turnTimeBudget) tries to wrap the turn
+ * up before the cap, but it can only re-check between iterations — a single long tool call
+ * can carry the turn past the synthesis reserve, and then the forced synthesis call is
+ * itself guillotined. Observed live on the preview: the budget fired with 27s left and the
+ * turn still returned 504.
+ *
+ * So the loop is best-effort and this is the backstop. `persistIncrementally` (ENG-473)
+ * has already written every settled turn to the session, so the research the user paid for
+ * is sitting in the thread — a bare 504 just puts a red error on top of it and tells them
+ * to start over. Collect what THIS turn persisted so the caller can acknowledge it instead.
+ *
+ * Deliberately counts only assistant text and executed tool names: enough to prove work
+ * happened and to say what kind, with nothing invented. Error/diagnostic closings are
+ * excluded — counting the "took too long, please try again" message as salvaged work is
+ * exactly the false-success this is meant to prevent.
+ */
+export function collectTurnWorkSince(
+  messages: TimeoutContinuationMessage[] | undefined | null,
+  sinceMs: number,
+): SalvagedTurnWork {
+  const empty: SalvagedTurnWork = { narrationCount: 0, toolNames: [] };
+  if (!Array.isArray(messages)) return empty;
+  let narrationCount = 0;
+  const toolNames: string[] = [];
+  const seenTools = new Set<string>();
+  for (const message of messages) {
+    if (!message) continue;
+    const meta = message.metadata;
+    const rawTs = message.timestamp || meta?.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    if (message.role === 'tool') {
+      const name = typeof message.name === 'string' ? message.name : '';
+      if (name && !seenTools.has(name)) {
+        seenTools.add(name);
+        toolNames.push(name);
+      }
+      continue;
+    }
+    if (message.role !== 'assistant') continue;
+    if (meta?.isErrorMessage || meta?.isDiagnosticMessage) continue;
+    if (meta?.kind === 'generation-timeout-continuation') continue;
+    const text = typeof message.content === 'string' ? message.content.trim() : '';
+    if (text) narrationCount += 1;
+  }
+  return { narrationCount, toolNames };
+}
+
+/** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */
+const MAX_LISTED_TOOLS = 6;
+
+/**
+ * ENG-907: user-facing message for a turn that timed out having done real work but never
+ * got to write its final answer. Points at the steps already in the thread (they are
+ * persisted and visible) rather than restating them, names what ran, and invites
+ * "continue" with an explicit promise not to start over.
+ *
+ * Returns null when the turn persisted nothing — a genuinely empty timeout keeps the 504
+ * rather than being dressed up as a partial success.
+ */
+export function buildTimeoutPartialWorkMessage(work: SalvagedTurnWork | undefined | null): string | null {
+  if (!work) return null;
+  const { narrationCount, toolNames } = work;
+  if (narrationCount < 1 && toolNames.length < 1) return null;
+
+  const listed = toolNames.slice(0, MAX_LISTED_TOOLS);
+  const overflow = toolNames.length - listed.length;
+  const toolSentence = listed.length
+    ? ` I ran ${listed.map((t) => `\`${t}\``).join(', ')}${overflow > 0 ? ` and ${overflow} more` : ''}` +
+      `, and the results are in the steps above.`
+    : ' The work I completed is in the steps above.';
+
+  return (
+    `⚠️ **Partial results — I hit the time limit for this request before I could write the final answer.**\n\n` +
+    `What I did finish is saved in this conversation and is not lost.${toolSentence}\n\n` +
+    `Reply "continue" and I'll pick up from there and produce the parts that are still ` +
+    `missing — I won't redo the research that's already done.`
   );
 }
