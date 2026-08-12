@@ -52,6 +52,11 @@ describe('metering guard: the quota counter is only charged from known sites', (
     // charge once. Recording and charging are split across the two on purpose.
     'emma/tools.ts',
     'services/codingAgentSubpageService.ts',
+    // The agent-engine ingestion route writes one recordUsage per incoming record
+    // (rows are keyed by model+feature and must stay granular) and then charges
+    // ONCE per user with the batch summed. Per-record charging would be hundreds
+    // of contended read-modify-writes on a single user row per task run.
+    'routes/internalUsage.ts',
   ]);
 
   it('has no unapproved direct callers of incrementUserTokenUsage', () => {
