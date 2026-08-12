@@ -83,6 +83,58 @@ describe('YouSearchProvider news searches (ENG-1050)', () => {
     }));
   });
 
+  it('drops web-bucket results that are not about the query entity', async () => {
+    // Live You.com response for "Zenoti" (freshness=week): the web bucket is
+    // query-ranked but still pads a thin entity query with matches on nothing
+    // more than a similar-looking token.
+    const { provider } = makeProvider({
+      results: {
+        web: [
+          { title: 'Zenoti Trust & Compliance Center | Powered by SafeBase', url: 'https://trust.example.com/zenoti', page_age: '2026-08-11T00:00:00' },
+          { title: 'Zenoti Mobile APK Download for Android', url: 'https://apk.example.com/zenoti', page_age: '2026-08-07T00:00:00' },
+          { title: 'Fine Dining Restaurant | Las Vegas Restaurants at ARIA', url: 'https://aria.example.com/dining', page_age: '2026-08-11T00:00:00' },
+          { title: 'Zendaya en EL PAÍS', url: 'https://elpais.example.com/zendaya', page_age: '2026-08-06T00:00:00' },
+        ],
+      },
+      metadata: { query: 'Zenoti' },
+    });
+
+    const response = await provider.search({ query: 'Zenoti', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results.map((r) => r.url)).toEqual([
+      'https://trust.example.com/zenoti',
+      'https://apk.example.com/zenoti',
+    ]);
+    expect(response.metadata).toEqual(expect.objectContaining({
+      newsResultCount: 0,
+      irrelevantWebDropped: 2,
+      webFallbackCount: 2,
+    }));
+  });
+
+  it('reports no coverage rather than padding when nothing matches the entity', async () => {
+    // Live You.com response for the made-up "Zzyxwqq Holdings": the web bucket
+    // still returns six ETF holdings pages, matched on "holdings" alone.
+    const { provider } = makeProvider({
+      results: {
+        web: [
+          { title: 'TSX:ZQQ Holdings List - BMO Nasdaq 100 Equity Hedged to CAD Index ETF', url: 'https://etf.example.com/zqq' },
+          { title: 'Invesco QQQ Trust Series I', url: 'https://etf.example.com/qqq' },
+          { title: 'QQQI Holdings: All 105 Stocks in NEOS Nasdaq 100 High Income ETF', url: 'https://etf.example.com/qqqi' },
+        ],
+      },
+      metadata: { query: 'Zzyxwqq Holdings' },
+    });
+
+    const response = await provider.search({ query: 'Zzyxwqq Holdings', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results).toEqual([]);
+    expect(response.metadata).toEqual(expect.objectContaining({
+      irrelevantWebDropped: 3,
+      webFallbackCount: 0,
+    }));
+  });
+
   it('reports a trustworthy empty result when neither bucket has anything', async () => {
     const { provider } = makeProvider({ results: { web: [], news: [] }, metadata: { query: 'Zenoti' } });
 
