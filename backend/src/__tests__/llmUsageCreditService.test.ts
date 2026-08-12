@@ -3,6 +3,7 @@ import {
   getLlmUsageCreditAdjustment,
   grantMonthlyLlmUsageCredit,
   planRolloutMigrationCredit,
+  reverseMonthlyPurchasedLlmUsageCredit,
   type MonthlyLlmUsageCredits,
 } from '../services/llmUsageCreditService';
 import { userDb } from '../services/db';
@@ -99,6 +100,41 @@ describe('LLM usage credits', () => {
     expect(result.ledger.grants[0]).toMatchObject({
       source: 'admin', reason: 'GROW-106 founder event', grantedBy: 'admin@agentweb.pro',
     });
+    expect(updateUser).toHaveBeenCalledTimes(1);
+    getUser.mockRestore();
+    updateUser.mockRestore();
+  });
+
+  it('reverses a refunded purchase to its cumulative target exactly once', async () => {
+    const purchaseLedger: MonthlyLlmUsageCredits = {
+      month: '2026-08',
+      totalPurchasedMicroUsd: 10_000_000,
+      totalAdminGrantedMicroUsd: 0,
+      totalMigrationOffsetMicroUsd: 0,
+      grantIds: ['stripe:topup-1'],
+      grants: [{
+        id: 'stripe:topup-1', source: 'purchase', amountMicroUsd: 10_000_000,
+        grantedAt: '2026-08-11T12:00:00.000Z',
+      }],
+    };
+    const getUser = jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+      userId: 'u1', email: 'u1@agentweb.pro', llmUsageCredits: purchaseLedger,
+    } as any);
+    const updateUser = jest.spyOn(userDb, 'updateUser').mockResolvedValue({} as any);
+
+    const result = await reverseMonthlyPurchasedLlmUsageCredit({
+      billingUserId: 'u1',
+      grantId: 'stripe:topup-1',
+      reversalId: 'charge:ch_1:refunded:1250',
+      targetReversedMicroUsd: 5_000_000,
+      now: new Date('2026-08-11T13:00:00.000Z'),
+    });
+
+    expect(result.reversed).toBe(true);
+    expect(getLlmUsageCreditAdjustment(result.ledger, '2026-08').purchasedMicroUsd).toBe(5_000_000);
+    expect(result.ledger.reversals).toEqual([
+      expect.objectContaining({ grantId: 'stripe:topup-1', amountMicroUsd: 5_000_000 }),
+    ]);
     expect(updateUser).toHaveBeenCalledTimes(1);
     getUser.mockRestore();
     updateUser.mockRestore();
