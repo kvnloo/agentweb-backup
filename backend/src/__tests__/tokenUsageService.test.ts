@@ -14,6 +14,7 @@ jest.mock("../services/db", () => ({
     getUserById: jest.fn(),
     updateUser: jest.fn(),
     incrementTokenUsageForMonth: jest.fn(),
+    resetTokenUsageForMonth: jest.fn(),
   },
   orgDb: {
     getOrgById: jest.fn(),
@@ -34,6 +35,7 @@ import {
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
+const mockResetTokenUsageForMonth = (userDb as any).resetTokenUsageForMonth as jest.Mock;
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
@@ -46,6 +48,7 @@ function currentMonth(): string {
 beforeEach(() => {
   jest.clearAllMocks();
   mockIncrementTokenUsageForMonth.mockResolvedValue({});
+  mockResetTokenUsageForMonth.mockResolvedValue(true);
 });
 
 // ─── FAIL TESTS ──────────────────────────────────────────────────────────
@@ -466,14 +469,15 @@ describe("incrementUserTokenUsage", () => {
 
     await incrementUserTokenUsage("u1", 1000, 0.1);
 
-    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
-      tokenUsage: expect.objectContaining({
+    // Bonus clearing is now part of the conditional reset write itself.
+    expect(mockResetTokenUsageForMonth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: "u1",
         month: currentMonth(),
-        totalTokens: 1000,
-        totalCost: 0.1,
-      }),
-      tokenAllowanceBonus: 0, // bonus cleared on reset
-    }));
+        tokens: 1000,
+        cost: 0.1,
+      })
+    );
   });
 
   it("saves previous month usage to tokenUsageHistory on monthly reset", async () => {
@@ -488,9 +492,11 @@ describe("incrementUserTokenUsage", () => {
 
     await incrementUserTokenUsage("u1", 1000, 0.1);
 
-    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
-      tokenUsageHistory: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
-    }));
+    expect(mockResetTokenUsageForMonth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        history: [{ month: "2025-01", totalTokens: 50000, totalCost: 5.0 }],
+      })
+    );
   });
 
   it("appends to existing tokenUsageHistory on monthly reset", async () => {
@@ -505,8 +511,9 @@ describe("incrementUserTokenUsage", () => {
 
     await incrementUserTokenUsage("u1", 500, 0.05);
 
-    expect(mockUpdateUser).toHaveBeenCalledWith("u1", expect.objectContaining({
-      tokenUsageHistory: [
+    expect(mockResetTokenUsageForMonth).toHaveBeenCalledWith(
+      expect.objectContaining({
+        history: [
         { month: "2025-01", totalTokens: 50000, totalCost: 5.0 },
         { month: "2025-02", totalTokens: 30000, totalCost: 3.0 },
       ],
@@ -530,12 +537,12 @@ describe("incrementUserTokenUsage", () => {
 
     await incrementUserTokenUsage("u1", 100, 0.01);
 
-    const call = mockUpdateUser.mock.calls[0][1];
-    expect(call.tokenUsageHistory).toHaveLength(24);
+    const call = mockResetTokenUsageForMonth.mock.calls[0][0];
+    expect(call.history).toHaveLength(24);
     // The oldest entry should have been dropped
-    expect(call.tokenUsageHistory[0].month).toBe("2023-02");
+    expect(call.history[0].month).toBe("2023-02");
     // The newest entry should be the just-reset month
-    expect(call.tokenUsageHistory[23].month).toBe("2025-01");
+    expect(call.history[23].month).toBe("2025-01");
   });
 
   it("does not save to history when there is no previous usage", async () => {
@@ -548,9 +555,9 @@ describe("incrementUserTokenUsage", () => {
 
     await incrementUserTokenUsage("u1", 1000, 0.1);
 
-    const call = mockUpdateUser.mock.calls[0][1];
-    // No tokenUsageHistory should be set (or it's empty)
-    expect(call.tokenUsageHistory ?? []).toEqual([]);
+    const call = mockResetTokenUsageForMonth.mock.calls[0][0];
+    // No history should be written for a user with no prior usage.
+    expect(call.history ?? []).toEqual([]);
   });
 
   it("increments within same month", async () => {
@@ -936,5 +943,81 @@ describe("deriveBlockedByCost - respects the enforced dimension (ENG-1116)", () 
 
     expect(result.blockedByCost).toBe(false);
     expect(result.tokenCapTriggered).toBe(true);
+  });
+});
+
+// ─── Month-rollover race (Greptile, ENG-1134) ────────────────────────────
+// The same-month path has always been conditional: incrementTokenUsageForMonth
+// carries `ConditionExpression: #tokenUsage.#month = :month` and reports failure
+// so the caller can react. The month-RESET path did not — it read the stored
+// month and then unconditionally overwrote tokenUsage with its own totals.
+//
+// So on the first calls of a new month, two concurrent charges for one user both
+// see a stale month, both take the reset branch, and the second overwrite
+// discards the first call's tokens and cost outright. Not a rounding error — a
+// whole charge vanishes, silently, on the one day of the month when every active
+// user rolls over at once.
+//
+// This got likelier with ENG-1134: agent-engine ingestion is now a third writer
+// to the same counter alongside agent mode and Emma.
+
+describe("incrementUserTokenUsage - concurrent month rollover (ENG-1134)", () => {
+  it("does not lose a charge when another writer resets the month first", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      // Stale month — this caller believes it must reset.
+      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
+      tokenUsageHistory: [],
+    });
+    // The reset loses the race: someone else already rolled the month.
+    mockResetTokenUsageForMonth.mockResolvedValue(false);
+    mockIncrementTokenUsageForMonth.mockResolvedValue({});
+
+    await incrementUserTokenUsage("u1", 500, 5);
+
+    // It must fall back to the conditional increment rather than dropping the
+    // charge or clobbering the winner's totals.
+    expect(mockIncrementTokenUsageForMonth).toHaveBeenCalledWith(
+      "u1",
+      currentMonth(),
+      500,
+      5,
+      expect.any(String)
+    );
+  });
+
+  it("does not blindly overwrite the counter on the reset path", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
+      tokenUsageHistory: [],
+    });
+    mockResetTokenUsageForMonth.mockResolvedValue(true);
+
+    await incrementUserTokenUsage("u1", 500, 5);
+
+    // The unconditional updateUser write is what made the race lose data.
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockResetTokenUsageForMonth).toHaveBeenCalledTimes(1);
+  });
+
+  it("archives the previous month exactly once, on the winning reset", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: "2026-07", totalTokens: 900, totalCost: 9, resetDate: "2026-08-01T00:00:00.000Z" },
+      tokenUsageHistory: [{ month: "2026-06", totalTokens: 10, totalCost: 1 }],
+    });
+    mockResetTokenUsageForMonth.mockResolvedValue(true);
+
+    await incrementUserTokenUsage("u1", 500, 5);
+
+    const call = mockResetTokenUsageForMonth.mock.calls[0][0];
+    expect(call.history).toEqual([
+      { month: "2026-06", totalTokens: 10, totalCost: 1 },
+      { month: "2026-07", totalTokens: 900, totalCost: 9 },
+    ]);
   });
 });
