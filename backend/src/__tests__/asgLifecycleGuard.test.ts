@@ -291,7 +291,7 @@ describe('startAsgTerminationGuard', () => {
       .mockRejectedValueOnce(lifecycleActionNotReady())
       .mockRejectedValueOnce(lifecycleActionNotReady())
       .mockResolvedValue(undefined);
-    const deps: any = {
+    const deps = {
       fetchImpl: makeFetch({
         stateReplies: [{ status: 200, body: 'Terminated' }],
         instanceId: 'i-dead',
@@ -315,7 +315,7 @@ describe('startAsgTerminationGuard', () => {
     const completeAction = jest.fn(async () => {
       throw lifecycleActionNotReady();
     });
-    const deps: any = {
+    const deps = {
       fetchImpl: makeFetch({
         stateReplies: [{ status: 200, body: 'Terminated' }],
         instanceId: 'i-dead',
@@ -344,7 +344,7 @@ describe('startAsgTerminationGuard', () => {
       .fn<Promise<void>, [string]>()
       .mockRejectedValueOnce(lifecycleActionNotReady())
       .mockResolvedValue(undefined);
-    const deps: any = {
+    const deps = {
       fetchImpl: makeFetch({
         stateReplies: [{ status: 200, body: 'Terminated' }],
         instanceId: 'i-dead',
@@ -372,7 +372,7 @@ describe('startAsgTerminationGuard', () => {
     const completeAction = jest.fn(async () => {
       throw Object.assign(new Error('not authorized'), { code: 'AccessDenied' });
     });
-    const deps: any = {
+    const deps = {
       fetchImpl: makeFetch({
         stateReplies: [{ status: 200, body: 'Terminated' }],
         instanceId: 'i-dead',
