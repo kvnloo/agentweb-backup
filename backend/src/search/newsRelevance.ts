@@ -272,21 +272,27 @@ const NON_COVERAGE_PATH_SEGMENTS = new Set([
 ]);
 
 /**
- * Evergreen commercial-content shapes, matched anywhere in the path because they
- * are usually part of a slug ("/top-stripe-alternatives/", "/surfer-seo-coupons").
- *
- * The vendor-comparison genre is the bulk of what a company-name query returns
- * and none of it is news: "maintainx-vs-upkeep", "guesty-vs-hostaway",
- * "surfer-seo-review", "best-cmms-software", "top-cmms-solutions-uk".
+ * Slug shapes that *define* the evergreen commercial genre, matched anywhere in
+ * the path: "maintainx-vs-upkeep", "guesty-vs-hostaway", "top-stripe-alternatives",
+ * "best-cmms-software", "surfer-seo-coupons". A story is never shaped like this,
+ * so these reject even under an editorial path — a listicle filed at
+ * "/news/best-cmms-software-2026" is still a listicle.
  */
 const NON_COVERAGE_PATH_MARKERS = [
-  'alternative', 'coupon', 'promo-code', 'discount-code', 'pricing',
-  '-vs-', '/vs-', '/compare', 'comparison', 'review', 'best-', '/top-', '-guide',
+  'alternative', 'coupon', 'promo-code', 'discount-code',
+  '-vs-', '/vs-', '/compare', 'best-', '/top-',
 ];
 
 /**
- * Path segments that positively identify an article, so the evergreen markers
- * above are not consulted for it.
+ * Words that usually mark evergreen collateral but are ordinary topic words a
+ * real story may also use ("stripe-pricing-overhaul", "…-after-strategic-review").
+ * They only reject a page that carries no positive article signal.
+ */
+const WEAK_NON_COVERAGE_PATH_MARKERS = ['pricing', 'comparison', 'review', '-guide'];
+
+/**
+ * Path segments that positively identify an article, so the weak markers above
+ * are not consulted for it.
  *
  * Those markers are substrings of a whole path, which is right for a listicle
  * slug but wrong for a dated story that merely mentions the word:
@@ -321,9 +327,10 @@ function hasEditorialSignal(path: string, segments: string[]): boolean {
  * missed, so pages that cannot be coverage are dropped.
  *
  * Deliberately narrow: it excludes surfaces, not domains. A company's own
- * newsroom, blog or press release still counts as coverage, and a URL that
- * positively looks like an article (dated path, /news/, /press-release/) is kept
- * whatever words its slug happens to contain.
+ * newsroom, blog or press release still counts as coverage. A URL that positively
+ * looks like an article (dated path, /news/, /press-release/) survives the weak
+ * markers, but never the genre-defining ones — filing a listicle under /news/
+ * does not make it a story.
  */
 export function isCoverageCandidate(url: string): boolean {
   let parsed: URL;
@@ -339,9 +346,10 @@ export function isCoverageCandidate(url: string): boolean {
 
   const path = parsed.pathname.toLowerCase();
   const segments = path.split('/').filter(Boolean);
-  if (hasEditorialSignal(path, segments)) return true;
-  if (segments.some((segment) => NON_COVERAGE_PATH_SEGMENTS.has(segment))) return false;
   if (NON_COVERAGE_PATH_MARKERS.some((marker) => path.includes(marker))) return false;
+  if (segments.some((segment) => NON_COVERAGE_PATH_SEGMENTS.has(segment))) return false;
+  if (hasEditorialSignal(path, segments)) return true;
+  if (WEAK_NON_COVERAGE_PATH_MARKERS.some((marker) => path.includes(marker))) return false;
 
   return true;
 }
