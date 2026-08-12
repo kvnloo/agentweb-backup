@@ -266,6 +266,12 @@ export class McpClientService {
   // degrades to running over the cap instead of blocking a run forever.
   private readonly BROWSER_SLOT_WAIT_MS = parseInt(process.env.MCP_BROWSER_SLOT_WAIT_MS || '30000', 10);
   private readonly BROWSER_SLOT_POLL_MS = parseInt(process.env.MCP_BROWSER_SLOT_POLL_MS || '1000', 10);
+  // Slots taken by sessions that are still spawning their browser. Without this, sessions
+  // that ask at the same moment all measure capacity before any of them has registered a
+  // client, and every one of them is admitted — which is exactly the burst the cap exists
+  // for. Reserved is incremented at the instant admission is granted (no await in between,
+  // so the check and the reservation cannot interleave) and released once creation settles.
+  private browserSlotsReserved = 0;
   // A pool is only evictable once it has been quiet for this long. 5 min, because "quiet"
   // is not "finished": an agent turn can easily spend minutes on LLM thinking or a long
   // tool result between two browser calls, and evicting there would hand that session a
@@ -598,27 +604,39 @@ export class McpClientService {
    * yanking a browser out of a running session is exactly the ENG-1118 failure we're fixing.
    */
   private async acquireBrowserSlot(currentPoolKey: string): Promise<void> {
-    if (this.MAX_BROWSER_CLIENTS <= 0) return;
+    if (this.MAX_BROWSER_CLIENTS <= 0) {
+      this.browserSlotsReserved++;
+      return;
+    }
     const deadline = Date.now() + this.BROWSER_SLOT_WAIT_MS;
 
     while (true) {
       // Reclaim whatever is safely reclaimable first — that alone usually frees the slot.
       await this.evictIdleBrowserPools(currentPoolKey);
 
-      const live = this.countBrowserPools();
-      if (live < this.MAX_BROWSER_CLIENTS) return;
+      const inUse = this.countBrowserPools() + this.browserSlotsReserved;
+      if (inUse < this.MAX_BROWSER_CLIENTS) {
+        this.browserSlotsReserved++;
+        return;
+      }
 
       if (Date.now() >= deadline) {
         console.warn(
-          `[MCP-SESSION] ${live} live browser client(s), over the browser client cap of `
-          + `${this.MAX_BROWSER_CLIENTS}, and none became idle within ${this.BROWSER_SLOT_WAIT_MS}ms — `
+          `[MCP-SESSION] ${inUse} browser client(s) live or starting, over the browser client cap `
+          + `of ${this.MAX_BROWSER_CLIENTS}, and none became idle within ${this.BROWSER_SLOT_WAIT_MS}ms — `
           + `starting another rather than blocking this run. Raise MCP_MAX_BROWSER_CLIENTS if this recurs.`
         );
+        this.browserSlotsReserved++;
         return;
       }
       // Another session's call may settle and age out while we wait.
       await sleep(this.BROWSER_SLOT_POLL_MS);
     }
+  }
+
+  /** Hand back a slot taken by acquireBrowserSlot once the client is live (or failed). */
+  private releaseBrowserSlot(): void {
+    this.browserSlotsReserved = Math.max(0, this.browserSlotsReserved - 1);
   }
 
   private countBrowserPools(): number {
@@ -637,7 +655,7 @@ export class McpClientService {
   private async evictIdleBrowserPools(currentPoolKey: string): Promise<void> {
     const now = Date.now();
 
-    while (this.countBrowserPools() >= this.MAX_BROWSER_CLIENTS) {
+    while (this.countBrowserPools() + this.browserSlotsReserved >= this.MAX_BROWSER_CLIENTS) {
       const evictable = Array.from(this.sessionClientPools.entries())
         .filter(([key, pool]) =>
           this.isBrowserPool(pool)
@@ -726,8 +744,10 @@ export class McpClientService {
     if (pendingClient) return pendingClient;
 
     // Take a slot BEFORE spawning, so a burst waits for capacity instead of adding to it.
+    let slotReserved = false;
     if (this.isBrowserBacked(serverName, toolName)) {
       await this.acquireBrowserSlot(poolKey);
+      slotReserved = true;
     }
 
     const creation = this.createSessionClient(serverName, poolKey, userId, sessionPool);
@@ -735,6 +755,9 @@ export class McpClientService {
     try {
       return await creation;
     } finally {
+      // The client is now counted as a live pool (or failed outright), so the reservation
+      // that stood in for it while it spawned can go back.
+      if (slotReserved) this.releaseBrowserSlot();
       if (sessionPool.pendingClients.get(serverName) === creation) {
         sessionPool.pendingClients.delete(serverName);
       }

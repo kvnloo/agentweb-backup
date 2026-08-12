@@ -220,6 +220,26 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
       expect(poolKeys()).toEqual(['user-1::session-b']);
     });
 
+    // The burst case the cap exists for. Sessions that all ask at once each check capacity
+    // before any of them has registered a client, so counting only live pools lets every
+    // one of them through — the admission gate has to count reservations too.
+    it('holds the cap when several sessions ask for a browser simultaneously', async () => {
+      buildService({
+        MCP_MAX_BROWSER_CLIENTS: '2',
+        MCP_BROWSER_EVICTION_GRACE_MS: '0',
+        MCP_BROWSER_SLOT_WAIT_MS: '2000',
+        MCP_BROWSER_SLOT_POLL_MS: '10',
+      });
+
+      await Promise.all([
+        (service as any).getSessionClient('playwright', 'session-a', 'user-1'),
+        (service as any).getSessionClient('playwright', 'session-b', 'user-1'),
+        (service as any).getSessionClient('playwright', 'session-c', 'user-1'),
+      ]);
+
+      expect((service as any).countBrowserPools()).toBeLessThanOrEqual(2);
+    });
+
     it('gives up waiting and proceeds rather than blocking a run forever', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       buildService({
