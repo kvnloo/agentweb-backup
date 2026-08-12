@@ -271,6 +271,57 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
   });
 
+  it('does not start an unaffordable backup-model retry when the synthesis call fails', async () => {
+    // The transient-error handler normally retries the whole call on a backup model. On the
+    // forced-synthesis turn the only time left is the reserve for that single call, so a
+    // retry runs past the controller's cap — and the cap discards everything, which is the
+    // ENG-907 failure itself. The turn must end with what it has instead.
+    let call = 0;
+    const modelsCalled: string[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const model = args[0];
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      modelsCalled.push(model);
+      nowMs += 60_000;
+      if (isFinalSynthesis) {
+        // A transient failure, raised after the call burned the rest of the reserve.
+        throw new Error('Connection error.');
+      }
+      return buildLLMResponse({
+        content: `Scanned batch ${++call}.`,
+        tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(
+      JSON.stringify({ success: true, data: 'mock' }),
+    );
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // It did NOT throw the turn away, and it did NOT cross the caller's deadline.
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/time limit/i);
+    // Only one model was ever used — no backup retry was started.
+    expect(new Set(modelsCalled).size).toBe(1);
+  });
+
   it('still honours the max-tokens continuation when the time budget is NOT spent', async () => {
     // The suppression above is scoped to the forced-synthesis phase only. A fast run that
     // hits max_tokens must keep its ordinary continuation, or this fix would silently
