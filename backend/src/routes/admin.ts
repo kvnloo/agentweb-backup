@@ -23,7 +23,8 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
@@ -184,6 +185,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
+  "llmUsageCredits",
   "extraCostUsage",
   "extraCostUsageHistory",
   "googleDriveFolders",
@@ -4756,6 +4758,8 @@ router.get("/subscription-types", async (req, res) => {
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
+        ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
+        ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
       };
     }));
 
@@ -4841,6 +4845,54 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyCostAllowance)
         : null;
 
+      let normalizedLlmUsagePolicy: any = undefined;
+      if (type.llmUsagePolicy != null) {
+        const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
+        const { getModelPrice } = await import('../utils/llmPricing');
+        const { agentModeService } = await import('../services/agentModeService');
+        normalizedLlmUsagePolicy = {
+          version: String(type.llmUsagePolicy.version || '').trim(),
+          enforcementState: type.llmUsagePolicy.enforcementState,
+          optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
+          hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
+          optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            : [],
+          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+        };
+        const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
+        const supportedModels = new Set(await agentModeService.getSupportedModels(true));
+        for (const model of normalizedLlmUsagePolicy.optimizedModelIds) {
+          if (!supportedModels.has(model)) policyErrors.push(`optimized model '${model}' is not supported`);
+          if (!getModelPrice(model)) policyErrors.push(`optimized model '${model}' has no price entry`);
+        }
+        if (policyErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage policy: ${policyErrors.join('; ')}`);
+        }
+      }
+
+      let normalizedLlmUsageTopUp: any = undefined;
+      if (type.llmUsageTopUp != null) {
+        const { validateLlmUsageTopUpConfig } = await import('../services/llmUsageTopUpService');
+        normalizedLlmUsageTopUp = {
+          enabled: type.llmUsageTopUp.enabled === true,
+          minimumMarkupBps: Number(type.llmUsageTopUp.minimumMarkupBps),
+          packages: Array.isArray(type.llmUsageTopUp.packages)
+            ? type.llmUsageTopUp.packages.map((item: any) => ({
+                id: String(item.id || '').trim(),
+                label: String(item.label || '').trim(),
+                priceCents: Number(item.priceCents),
+                usageCreditMicroUsd: Number(item.usageCreditMicroUsd),
+                active: item.active === true,
+              }))
+            : [],
+        };
+        const topUpErrors = validateLlmUsageTopUpConfig(normalizedLlmUsageTopUp);
+        if (topUpErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage top-up: ${topUpErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -4855,6 +4907,8 @@ router.post("/subscription-types", async (req, res) => {
         allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
+        ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
+        ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
       };
     }));
 
@@ -5085,6 +5139,51 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Grant an auditable, idempotent one-time provider-cost credit for this month.
+// This is the cost-based replacement for ad-hoc token bonuses once a tier has a
+// versioned LLM usage policy. Org members resolve to their billing owner so the
+// grant and the enforced counter cannot diverge.
+router.post("/users/:userId/llm-usage-credit", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { amountUsd, reason, idempotencyKey } = req.body || {};
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ message: "amountUsd must be a positive number" });
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ message: "reason is required" });
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+      return res.status(400).json({ message: "idempotencyKey must be 8-100 URL-safe characters" });
+    }
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) return res.status(404).json({ message: "User not found" });
+
+    const billingUserId = await resolveBillingUserId(userId);
+    const amountMicroUsd = Math.round(amountUsd * 1_000_000);
+    const admin = (req as any).user;
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId,
+      grantId: `admin:${billingUserId}:${idempotencyKey}`,
+      source: "admin",
+      amountMicroUsd,
+      reason,
+      grantedBy: admin?.email || admin?.userId || "admin",
+    });
+    return res.json({
+      granted: result.granted,
+      billingUserId,
+      amountUsd: amountMicroUsd / 1_000_000,
+      month: result.ledger.month,
+      totalAdminGrantedUsd: (result.ledger.totalAdminGrantedMicroUsd || 0) / 1_000_000,
+      grants: result.ledger.grants,
+    });
+  } catch (error) {
+    console.error("Error granting LLM usage credit:", error);
+    return res.status(500).json({ message: "Error granting LLM usage credit" });
   }
 });
 

@@ -408,6 +408,33 @@ export async function syncSubscriptionFromStripe(
 
 // ─── Webhook Event Handlers ────────────────────────────────────────────
 
+export async function handleLlmUsageTopUpCheckoutCompleted(session: any): Promise<void> {
+  const metadata = session?.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') throw new Error('Invalid usage top-up checkout metadata');
+  if (session.payment_status !== 'paid') {
+    // Async payment methods are granted by checkout.session.async_payment_succeeded.
+    return;
+  }
+  const billingUserId = String(metadata.billingUserId || '');
+  const amountMicroUsd = Number(metadata.usageCreditMicroUsd);
+  const minimumMarkupBps = Number(metadata.minimumMarkupBps);
+  const paidCents = Number(session.amount_total);
+  if (!billingUserId) throw new Error('billingUserId is required');
+  if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) throw new Error('Invalid usage credit amount');
+  if (!Number.isInteger(minimumMarkupBps) || minimumMarkupBps < 10_000) throw new Error('Invalid usage top-up markup');
+  if (!Number.isInteger(paidCents) || paidCents <= 0) throw new Error('Invalid usage top-up payment amount');
+  if (paidCents * 10_000 * 10_000 < amountMicroUsd * minimumMarkupBps) {
+    throw new Error('Usage top-up payment is below the configured minimum markup');
+  }
+  const { grantMonthlyLlmUsageCredit } = await import('./llmUsageCreditService');
+  await grantMonthlyLlmUsageCredit({
+    billingUserId,
+    grantId: `stripe:${session.id}`,
+    source: 'purchase',
+    amountMicroUsd,
+  });
+}
+
 /**
  * Handle checkout.session.completed — link Stripe customer/subscription to user.
  */

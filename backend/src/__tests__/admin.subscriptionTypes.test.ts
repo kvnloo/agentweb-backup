@@ -49,6 +49,11 @@ jest.mock('../services/skillService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getUnassociatedToolNames: jest.fn(() => ['other_tool_1', 'other_tool_2']),
+    getSupportedModels: jest.fn(async () => [
+      'gemini-3.1-flash-lite',
+      'anthropic.claude-haiku-4-5-20251001-v1:0',
+      'anthropic.claude-opus-5',
+    ]),
   },
 }));
 
@@ -276,6 +281,104 @@ describe('Admin subscription types routes', () => {
     const free = savedTypes.find((t: any) => t.name === 'Free');
     expect(starter.monthlyCostAllowance).toBe(250);
     expect(free.monthlyCostAllowance).toBeUndefined();
+  });
+
+  it('GET /api/admin/subscription-types round-trips the versioned LLM usage policy', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }]),
+    } as any);
+
+    const res = await request(app).get('/api/admin/subscription-types').expect(200);
+
+    expect(res.body[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  it('POST /api/admin/subscription-types validates and persists a cost-only policy', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  it('persists the hard-cap-only rollout state independently of model optimization', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-hard-v1', enforcementState: 'hard_only',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.enforcementState).toBe('hard_only');
+  });
+
+  it('rejects a policy whose hard cost threshold is not above its optimization threshold', async () => {
+    const res = await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'bad-v1', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 60_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+        },
+      }],
+    }).expect(400);
+
+    expect(res.body.message).toContain('hardCostThresholdMicroUsd must be greater');
+    expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+  });
+
+  it('round-trips admin-priced additional usage packages', async () => {
+    const llmUsageTopUp = {
+      enabled: true,
+      minimumMarkupBps: 25_000,
+      packages: [{
+        id: 'aw-10', label: '10 AgentWeb Credits', priceCents: 2_500,
+        usageCreditMicroUsd: 10_000_000, active: true,
+      }],
+    };
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsageTopUp }],
+    }).expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsageTopUp).toEqual(llmUsageTopUp);
+  });
+
+  it('rejects an additional usage package below the configured markup floor', async () => {
+    const res = await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsageTopUp: {
+          enabled: true,
+          minimumMarkupBps: 25_000,
+          packages: [{ id: 'bad', label: 'Bad', priceCents: 2_499, usageCreditMicroUsd: 10_000_000, active: true }],
+        },
+      }],
+    }).expect(400);
+    expect(res.body.message).toContain('below minimumMarkupBps');
   });
 
   describe('POST /api/admin/subscription-types/:typeName/skills', () => {

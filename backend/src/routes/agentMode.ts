@@ -148,6 +148,9 @@ router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.
 // Get user's agent chat sessions
 router.get('/sessions', asyncHandler(agentModeController.getSessions));
 
+// Current user model choices after applying the admin-managed cost policy.
+router.get('/model-options', asyncHandler(agentModeController.getModelOptions));
+
 // POST /api/agent-mode/sessions
 // Create new agent chat session
 router.post('/sessions', asyncHandler(agentModeController.createSession));
