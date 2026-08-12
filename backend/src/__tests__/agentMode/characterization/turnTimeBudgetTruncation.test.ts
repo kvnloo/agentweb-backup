@@ -323,6 +323,58 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(new Set(modelsCalled).size).toBe(1);
   });
 
+  it('sizes the retry against a FULL call, not the attempt that failed fast', async () => {
+    // A primary that fails fast — an immediate 429, a dropped socket — burns almost no
+    // clock. Judging affordability by that attempt alone would wave through a backup call
+    // that is far slower than the time left, and it would cross the cap and discard the
+    // partial answer anyway. The retry costs a full call, so it is measured against the
+    // slowest full call this run actually made.
+    const SLOW_CALL_MS = 150_000;
+    let call = 0;
+    const modelsCalled: string[] = [];
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      modelsCalled.push(args[0]);
+      if (isFinalSynthesis) {
+        nowMs += 1_000; // fails almost immediately
+        throw new Error('Too many requests, please try again later');
+      }
+      nowMs += SLOW_CALL_MS;
+      return buildLLMResponse({
+        content: `Scanned batch ${++call}.`,
+        tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(
+      JSON.stringify({ success: true, data: 'mock' }),
+    );
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const startedAt = nowMs;
+    const result = (await service.generateMarketingResponse(
+      'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+      nowMs,
+    )) as any;
+
+    // There was more clock left than the 1s failure took, but nowhere near enough for
+    // another 150s call — so no backup was started and the turn stayed inside the cap.
+    expect(new Set(modelsCalled).size).toBe(1);
+    expect(nowMs - startedAt).toBeLessThanOrEqual(CAP_MS);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/time limit/i);
+  });
+
   it('lets a NON-transient synthesis failure propagate instead of reporting a timeout', async () => {
     // The affordability guard above must not become a catch-all. A context-limit,
     // content-policy or malformed-request failure has no retry to skip, and dressing one
