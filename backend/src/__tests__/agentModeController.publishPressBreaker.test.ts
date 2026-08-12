@@ -285,6 +285,57 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('reports a THREAD published via twitter_manage_post as a requirement mismatch, not held', async () => {
+    // The live production case as of 2026-08-12. Schedule 34154af9 "Kevin — X
+    // Evening Post" requires post_on_connected_account, but its prompt asks for a
+    // 2-3 tweet THREAD, so the model publishes with twitter_manage_post instead.
+    // Every run since 2026-08-10 ends at attempt 20 with summary "Thread
+    // Published": the thread IS live on X, and post_on_connected_account is still
+    // actual 0. Marking that held-for-approval would tell the owner to approve a
+    // post that already went out.
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'twitter_manage_post', arguments: { action: 'post' } },
+    ], 'Thread published.') as any);
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    // Still capped — pressing for a tool the model has worked around is as futile
+    // as pressing for one it refused.
+    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
+    // Still a failure — the requirement genuinely is unmet.
+    expect(result.status).toBe('failure');
+    // But NOT held for approval: nothing is waiting on the owner.
+    expect((result as any).publishHeldForApproval).toBeUndefined();
+    expect((result as any).publishRequirementMismatch).toBe(true);
+  });
+
+  it('persists the mismatch marker, and never the held marker, on the stored result', async () => {
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'twitter_manage_post', arguments: { action: 'post' } },
+    ], 'Thread published.') as any);
+
+    await runScheduledChat(publishSchedule, 'kevin', false);
+
+    const stored = mockScheduleDb.addRunResult.mock.calls[0][1] as any;
+    expect(stored.publishRequirementMismatch).toBe(true);
+    expect(stored.publishHeldForApproval).toBeUndefined();
+    expect(stored.status).toBe('failure');
+  });
+
+  it('a FAILED thread publish is still held for approval — nothing went out', async () => {
+    // The evidence must be a SUCCEEDED write. If twitter_manage_post errored, the
+    // thread is not live and the owner really is the blocker, so the approval
+    // signal must survive.
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'twitter_manage_post', arguments: { action: 'post' }, error: 'rate limited' } as any,
+    ], 'I could not publish.') as any);
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect((result as any).publishRequirementMismatch).toBeUndefined();
+  });
+
   it('leaves a MIXED requirement set on the full retry budget', async () => {
     const mixedSchedule = {
       ...publishSchedule,
