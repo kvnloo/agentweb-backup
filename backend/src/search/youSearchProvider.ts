@@ -1,6 +1,12 @@
 import axios from 'axios';
 import { getSecret, secretExists } from '../utils/secretsManager';
-import { extractAnchorTerms, isRelevantToQuery } from './newsRelevance';
+import {
+  extractAnchorTerms,
+  extractSupportTerms,
+  hasNewsIntent,
+  isCoverageCandidate,
+  isRelevantToQuery,
+} from './newsRelevance';
 import {
   normalizeSearchCount,
   NormalizedSearchResult,
@@ -41,8 +47,32 @@ export class YouSearchProvider implements SearchProvider {
       throw new Error('You.com Search API key is not configured');
     }
 
+    const data = await this.fetchResults(request, apiKey, request.query);
+    const resultSource = request.resultSource || 'all';
+
+    if (resultSource === 'news') {
+      const response = this.buildNewsResponse(data, request);
+      return response.results.length ? response : this.retryWithNewsIntent(request, apiKey, response);
+    }
+
+    const web = this.normalizeResults(data?.results?.web, 'web');
+    const news = resultSource === 'web' ? [] : this.normalizeResults(data?.results?.news, 'news');
+
+    return {
+      provider: this.name,
+      query: String(data?.metadata?.query || request.query),
+      results: [...web, ...news],
+      metadata: {
+        ...(data?.metadata || {}),
+        provider: this.name,
+        resultSource,
+      },
+    };
+  }
+
+  private async fetchResults(request: SearchRequest, apiKey: string, query: string): Promise<any> {
     const body: Record<string, unknown> = {
-      query: request.query,
+      query,
       count: normalizeSearchCount(request.count),
     };
 
@@ -65,26 +95,56 @@ export class YouSearchProvider implements SearchProvider {
       timeout: Number(process.env.YOU_SEARCH_TIMEOUT_MS || 15_000),
     });
 
-    const data = response.data as any;
-    const resultSource = request.resultSource || 'all';
+    return response.data as any;
+  }
 
-    if (resultSource === 'news') {
-      return this.buildNewsResponse(data, request);
+  /**
+   * ENG-1050 — a news search that came back with nothing gets one more attempt,
+   * with news intent spelled out in the query.
+   *
+   * You.com ranks a bare entity query as a navigational one: "Stripe payments"
+   * over the last week returns only Stripe's own help centre, its Wikipedia entry
+   * and a Trustpilot profile, so an honest filter has nothing to keep and the
+   * digest is told there is no coverage — for one of the most-covered private
+   * companies there is. The same query as "Stripe payments news" returns the
+   * week's actual reporting (a Stripe-PayPal regulatory piece, a PYMNTS feature).
+   *
+   * Only the `web` bucket of the retry is used. Adding news intent also fills the
+   * `news` bucket, and that bucket answers a news-intent query with the trending
+   * feed the ticket complained about ("black stripes removed after camp
+   * practice"), so taking it would trade one reported failure mode for the other.
+   */
+  private async retryWithNewsIntent(
+    request: SearchRequest,
+    apiKey: string,
+    emptyResponse: SearchProviderResponse,
+  ): Promise<SearchProviderResponse> {
+    if (hasNewsIntent(request.query)) return emptyResponse;
+
+    try {
+      const retryData = await this.fetchResults(request, apiKey, `${request.query} news`);
+      const retried = this.buildNewsResponse(
+        {
+          ...retryData,
+          metadata: { ...(retryData?.metadata || {}), query: request.query },
+          results: { web: retryData?.results?.web },
+        },
+        request,
+      );
+
+      return {
+        ...retried,
+        metadata: { ...retried.metadata, newsIntentRetry: true },
+      };
+    } catch (error) {
+      // The first search succeeded; a failed retry must not turn an honest
+      // "no coverage found" into a tool error.
+      console.warn(
+        `You.com news-intent retry failed for query "${request.query}":`,
+        error instanceof Error ? error.message : error,
+      );
+      return emptyResponse;
     }
-
-    const web = this.normalizeResults(data?.results?.web, 'web');
-    const news = resultSource === 'web' ? [] : this.normalizeResults(data?.results?.news, 'news');
-
-    return {
-      provider: this.name,
-      query: String(data?.metadata?.query || request.query),
-      results: [...web, ...news],
-      metadata: {
-        ...(data?.metadata || {}),
-        provider: this.name,
-        resultSource,
-      },
-    };
   }
 
   /**
@@ -115,14 +175,21 @@ export class YouSearchProvider implements SearchProvider {
   private buildNewsResponse(data: any, request: SearchRequest): SearchProviderResponse {
     const limit = normalizeSearchCount(request.count);
     const anchorTerms = extractAnchorTerms(request.query);
-    const isRelevant = (result: NormalizedSearchResult) => isRelevantToQuery(result, anchorTerms);
+    const supportTerms = extractSupportTerms(request.query);
 
+    // The news bucket is a trending feed, so it has to corroborate the anchor with
+    // the rest of the query; the web bucket is query-ranked but full of evergreen
+    // pages, so it has to name the entity in the title or URL and be an article at
+    // all. Same guard, different evidence, matched to how each bucket goes wrong.
     const rawNews = this.normalizeResults(data?.results?.news, 'news');
-    const relevantNews = rawNews.filter(isRelevant);
+    const relevantNews = rawNews.filter((result) => isRelevantToQuery(result, anchorTerms, { supportTerms }));
 
     const rawWeb = this.normalizeResults(data?.results?.web, 'web');
+    const coverageWeb = rawWeb.filter((result) => isCoverageCandidate(result.url));
     const seenUrls = new Set(relevantNews.map((result) => result.url));
-    const relevantWeb = rawWeb.filter((result) => isRelevant(result) && !seenUrls.has(result.url));
+    const relevantWeb = coverageWeb.filter(
+      (result) => isRelevantToQuery(result, anchorTerms, { scope: 'headline' }) && !seenUrls.has(result.url),
+    );
 
     const results = [...relevantNews, ...relevantWeb].slice(0, limit);
     const newsResultCount = results.filter((result) => result.sourceType === 'news').length;
@@ -137,7 +204,8 @@ export class YouSearchProvider implements SearchProvider {
         resultSource: 'news' as const,
         newsResultCount,
         irrelevantNewsDropped: rawNews.length - relevantNews.length,
-        irrelevantWebDropped: rawWeb.length - relevantWeb.length,
+        irrelevantWebDropped: coverageWeb.length - relevantWeb.length,
+        nonCoverageWebDropped: rawWeb.length - coverageWeb.length,
         webFallbackCount: results.length - newsResultCount,
       },
     };
