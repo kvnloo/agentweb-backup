@@ -1480,6 +1480,73 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(fallbackCall![1].content.length).toBeGreaterThan(0);
     });
 
+    it('classifies a run whose transcript has only tool-call turns as zero assistant output (ENG-946)', async () => {
+      // Prod shape: the run narrates one line per tool-call turn ("I'll pull both
+      // datasets in parallel."), gathers data for minutes, then dies before it ever
+      // synthesises a report. Those narration turns used to satisfy the "has an
+      // assistant message" check, so the run was NOT treated as zero-output and the
+      // session was left ending on tool results with no report and no requeue.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+        new Error('worker exited before the final turn')
+      );
+      (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+        { role: 'system', content: 'You are EMMA.' },
+        { role: 'user', content: 'Run the daily report.' },
+        {
+          role: 'assistant',
+          content: "I'll pull both datasets in parallel.",
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'list_all_clients', arguments: '{}' } }],
+        },
+        { role: 'tool', name: 'list_all_clients', tool_call_id: 'c1', content: '{"success":true}' },
+      ]);
+
+      await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        simpleSchedule.scheduleId,
+        expect.objectContaining({ zeroAssistantRetryCount: 1 })
+      );
+    });
+
+    it('does NOT classify a run as zero output when a real assistant answer was persisted (ENG-946)', async () => {
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+        new Error('failed while sending the notification email')
+      );
+      (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+        { role: 'user', content: 'Run the daily report.' },
+        {
+          role: 'assistant',
+          content: 'Working on it.',
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'list_all_clients', arguments: '{}' } }],
+        },
+        { role: 'tool', name: 'list_all_clients', tool_call_id: 'c1', content: '{"success":true}' },
+        { role: 'assistant', content: 'Here is the daily report: 124 sessions, 9 active clients.' },
+      ]);
+
+      await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeUndefined();
+    });
+
     it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
       // The job-incomplete persist runs inside a try/catch (ENG-209): if DynamoDB
       // rejects, the error must be swallowed so the requeue still proceeds and the
