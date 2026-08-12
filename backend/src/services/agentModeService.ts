@@ -16165,15 +16165,133 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Write-then-verify read-back for the campaign spend cap (ENG-1018) — the same shape of
+   * check AD UPDATE already does after a creative swap. spend_cap is the campaign's hard
+   * money stop, so the write response is never trusted on its own: the campaign is re-read
+   * and the applied value compared against what was requested.
+   *
+   * TWO outcomes, because that is all a read-back can honestly support: CONFIRMED (a read
+   * came back equal to what we asked for — proof the cap is on the campaign) and UNCONFIRMED
+   * (everything else). A read-back can prove a cap IS set; it cannot prove one is NOT.
+   *
+   * That asymmetry is not theoretical. Live against the test ad account, an UPDATE to 300000
+   * returned success and then read back with NO spend_cap AT ALL for more than six seconds —
+   * through three retries and an independent raw Graph GET — before settling on the correct
+   * 300000. Timed separately, the same write converged in under a second. So Meta can serve a
+   * transiently field-less view of a campaign it has already updated, and code that treats an
+   * absent read as "the cap was NOT applied" will tell users their money stop is missing when
+   * it is not, and send them to re-apply a cap they already have.
+   *
+   * Retrying narrows that window (the write is never re-sent, only the read), but cannot
+   * close it — so a persistent negative is reported as "could not confirm", never as "not
+   * applied". Unconfirmed is still loud: the caller is told not to claim the cap is in place.
+   */
+  private static readonly SPEND_CAP_VERIFY_ATTEMPTS = 4;
+  private static readonly SPEND_CAP_VERIFY_BACKOFF_MS = 3000;
+
+  private async verifyCampaignSpendCap(
+    accountId: string,
+    accessToken: string,
+    campaignId: string | undefined,
+    requestedSpendCap: number
+  ): Promise<{ verified: boolean; readFailed: boolean; applied?: number; detail: string; attempts: number }> {
+    if (!campaignId) {
+      return { verified: false, readFailed: true, detail: 'Meta returned no campaign id to read back', attempts: 0 };
+    }
+
+    let last: { verified: boolean; readFailed: boolean; applied?: number; detail: string } = {
+      verified: false, readFailed: true, detail: 'not read',
+    };
+
+    for (let attempt = 1; attempt <= AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const fresh: any = await metaService.getCampaign(accountId, accessToken, campaignId);
+        const raw = fresh?.spend_cap;
+        // Graph returns numeric fields as strings; an absent cap means there is no cap at all.
+        const applied = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
+        if (applied !== undefined && Number.isFinite(applied) && applied === Number(requestedSpendCap)) {
+          return { verified: true, readFailed: false, applied, detail: `spend cap is ${applied}`, attempts: attempt };
+        }
+        last = {
+          verified: false,
+          readFailed: false,
+          applied,
+          detail: applied === undefined
+            ? 'the campaign has NO spend cap set'
+            : `the campaign's spend cap is ${applied}`,
+        };
+      } catch (error: any) {
+        last = { verified: false, readFailed: true, detail: error?.message || 'unknown error' };
+      }
+
+      if (attempt < AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, AgentModeService.SPEND_CAP_VERIFY_BACKOFF_MS));
+      }
+    }
+
+    return { ...last, attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS };
+  }
+
+  /**
+   * spend_cap is in the account currency's MINOR units, but `budget_amount` and the ad-set
+   * budgets in the SAME tool are in major units (the backend multiplies those by 100). That
+   * asymmetry is exactly how a model turns "$3,000" into a $30 cap — and our read-back would
+   * then cheerfully confirm 3000 as "verified", because the write DID land; only the meaning
+   * was wrong. Echoing the major-unit equivalent in every spend-cap message makes a 100x slip
+   * visible to the model and the user instead of hiding behind a confident number.
+   */
+  private static describeSpendCap(minorUnits: number): string {
+    const major = (Number(minorUnits) / 100).toLocaleString('en-US', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    return `${minorUnits} (= ${major} in the ad account's currency)`;
+  }
+
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const campaign = await metaService.createCampaign(accountId, accessToken, params);
 
-      return {
+      // metaService.createCampaign requests only `id` back from the Graph API, so the
+      // created object carries no `name` — in production this printed
+      // `Campaign "undefined" created successfully` (prod session
+      // 5ac8aeef-db88-4ccc-85ca-347b13c99542), which the agent then had to explain away
+      // to the user mid-verification. Fall back to the name that was requested.
+      const campaignName = campaign?.name || params.name;
+      const created = {
         success: true,
-        message: `Campaign "${campaign.name}" created successfully`,
+        message: `Campaign "${campaignName}" created successfully`,
         campaign: campaign
+      };
+
+      if (params.spend_cap === undefined || params.spend_cap === null) return created;
+
+      // A requested spend cap is verified independently — a create used to drop it silently
+      // and still report success, leaving the operator believing there was a money backstop
+      // when there was none (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaign?.id, params.spend_cap);
+      if (check.verified) {
+        return {
+          ...created,
+          message: `${created.message} (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      return {
+        ...created,
+        message: `⚠️ Campaign "${campaignName}" was created, but its spend cap of ` +
+          `${AgentModeService.describeSpendCap(params.spend_cap)} could NOT be confirmed after ` +
+          `${check.attempts} read-back(s) — ${check.detail}. Do NOT tell the user a spend cap is in ` +
+          `place. Meta sometimes needs a moment to reflect this field, so re-read it with CAMPAIGN ` +
+          `LIST (campaign_id=${campaign?.id} + params.fields="id,name,spend_cap"); if it is still ` +
+          `missing, apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, ` +
+          `params.spend_cap=${params.spend_cap}). Do NOT create the campaign again.`,
+        spend_cap_requested: params.spend_cap,
+        spend_cap_read: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -16681,16 +16799,52 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const normalizedParams = { ...params };
       if (normalizedParams.budget_amount !== undefined) {
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+
+      if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
+        return {
+          success: true,
+          message: `Campaign updated successfully`
+        };
+      }
+
+      // "Campaign updated successfully" with no way to check was the exact reported failure
+      // mode for this money-affecting field — verify the applied cap by re-reading the
+      // campaign before claiming the change took effect (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaignId, normalizedParams.spend_cap);
+      if (check.verified) {
+        return {
+          success: true,
+          message: `Campaign updated successfully (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      // Deliberately NOT success:false. An unconfirmed read is not a failed write — live,
+      // this exact path fired on an update that HAD landed (see verifyCampaignSpendCap), and
+      // success:false would have downgraded the whole result at the dispatch boundary to a
+      // bare error string, counted a healthy call as a failure, and told the user to re-apply
+      // a cap they already had. success:true with a loud, unmissable message keeps every
+      // structured field in front of the model and still forbids claiming the cap is set.
       return {
         success: true,
-        message: `Campaign updated successfully`
+        message: `⚠️ The spend cap of ${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} ` +
+          `on campaign ${campaignId} could NOT be confirmed after ${check.attempts} read-back(s) — ` +
+          `${check.detail}. The update was accepted by Meta, but do NOT tell the user the cap is in ` +
+          `place and never claim it is set. Meta sometimes needs a moment to reflect this field: ` +
+          `re-read it with CAMPAIGN LIST (campaign_id=${campaignId} + ` +
+          `params.fields="id,name,spend_cap") before reporting anything. If it is still missing, ` +
+          `re-send the identical CAMPAIGN UPDATE — the write is idempotent.`,
+        spend_cap_requested: normalizedParams.spend_cap,
+        spend_cap_read: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -17635,6 +17789,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           MetaService.validateCampaignParams('CREATE', params);
         } else if (action === 'UPDATE' && !campaign_id) {
           throw new Error('CAMPAIGN UPDATE requires "campaign_id".');
+        } else if (action === 'UPDATE') {
+          // UPDATE passes params through verbatim, so the spend-cap shape has to be checked
+          // here or a fractional/negative cap reaches Meta as an opaque "Invalid parameter".
+          MetaService.assertValidSpendCap(params?.spend_cap);
         } else if (action === 'DELETE' && !campaign_id) {
           throw new Error('CAMPAIGN DELETE requires "campaign_id".');
         }
@@ -18213,7 +18371,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return {
           success: false,
           message: validationError.message,
-          error: 'PARAM_VALIDATION_ERROR',
+          // The code alone is useless to the model: a success:false result is rewritten at
+          // the dispatch boundary into ONE reason string taken from `error` before `message`
+          // (utils/toolResultError), so the explanation of WHICH param is wrong and where it
+          // belongs — the entire value of rejecting instead of silently dropping — was being
+          // dropped on the floor. Keep the code as the prefix so callers still match on it.
+          error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
           hint: 'Fix the listed parameters and retry.'
         } as any;
       }
@@ -18239,7 +18402,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: validationError.message,
-        error: 'PARAM_VALIDATION_ERROR',
+        // Same reason as the pre-gate site above: `error` is what the model actually reads.
+        error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
         hint: 'Fix the listed parameters and retry.'
       } as any;
     }
