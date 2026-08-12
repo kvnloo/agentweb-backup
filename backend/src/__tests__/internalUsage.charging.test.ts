@@ -174,6 +174,23 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(tokens).toBe(1_000_000);
   });
 
+  it("does not charge platform overhead attributed to \"system\"", async () => {
+    // "system" is the recorder's stand-in for spend with nobody to bill. Charging
+    // it would invent a user and deduct real allowance from a row that is not a
+    // customer.
+    const systemToken = jwt.sign({ userId: "system", email: "sys@example.com" }, JWT_SECRET);
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${systemToken}`)
+      .send({ records: [record()] });
+
+    expect(res.status).toBe(202);
+    // Still recorded — platform overhead must stay visible in the ledger.
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+  });
+
   it("never lets a metering failure fail the ingestion", async () => {
     // The engine is fail-open by contract; a quota write blip must not turn into
     // a 500 that makes it retry and double-charge.

@@ -231,3 +231,23 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
     expect((mockGetAzureClient.mock.calls[0] as unknown[])[2]).toMatchObject({ metered: false });
   });
 });
+
+describe('ENG-1134: nothing to meter means nothing is charged', () => {
+  it('does not meter a response that carries no usage block', async () => {
+    // A provider can answer without usage (streaming edge cases, truncated
+    // responses). Metering a missing block would charge zero tokens at zero cost
+    // and write a meaningless ledger row on every such call.
+    mockBedrockCreate.mockResolvedValue({
+      choices: [{ message: { role: 'assistant', content: 'Hi', tool_calls: null } }],
+      model: 'test-model',
+    });
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'anthropic.claude-sonnet-4-6',
+    } as never);
+
+    expect(mockMeterUserUsage).not.toHaveBeenCalled();
+  });
+});
