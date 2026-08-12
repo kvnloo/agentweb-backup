@@ -21,6 +21,7 @@ import {
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
+  describeMetaAdsCapability,
   MetaAdsScopeState,
 } from '../utils/metaAdsScope';
 
@@ -384,5 +385,82 @@ describe('buildMetaAdsScopeError', () => {
   it('optionally names the account so a multi-account user knows which to fix', () => {
     const err = buildMetaAdsScopeError({ accountLabel: 'act_922903076601160' });
     expect(err.message).toContain('act_922903076601160');
+  });
+});
+
+/**
+ * ENG-1158 — the same capability annotation has to reach the Settings UI, not
+ * just the agent tool. Both surfaces now read this one helper, so a connection
+ * can never be "degraded" to the model and "Connected" to its owner.
+ */
+describe('describeMetaAdsCapability', () => {
+  const adAccount = (config: Record<string, unknown>) => ({
+    platform: 'meta',
+    account_id: '922903076601160',
+    config: { account_type: 'ad_account', ...config },
+  });
+
+  it('says nothing about accounts on other platforms', () => {
+    expect(
+      describeMetaAdsCapability({
+        platform: 'google_ads',
+        config: { account_type: 'ad_account', granted_scopes: [] },
+      })
+    ).toEqual({});
+  });
+
+  it('says nothing about non-ads Meta connections (pages, instagram)', () => {
+    expect(
+      describeMetaAdsCapability({
+        platform: 'meta',
+        config: { account_type: 'instagram_business', granted_scopes: ['pages_show_list'] },
+      })
+    ).toEqual({});
+  });
+
+  it('reports an affirmative grant as capable, with no warning to cry wolf with', () => {
+    expect(describeMetaAdsCapability(adAccount({ granted_scopes: ['ads_read'] }))).toEqual({
+      ads_capable: true,
+    });
+  });
+
+  it('reports an authoritatively missing grant as incapable, with the actionable message', () => {
+    expect(
+      describeMetaAdsCapability(adAccount({ granted_scopes: ['pages_show_list'] }))
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
+  });
+
+  it('treats a recorded revocation as authoritative even when the retained grant is empty', () => {
+    // The production shape of account 922903076601160: granted_scopes narrowed to
+    // [] by the detection path, with the refusal recorded alongside it.
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
+  });
+
+  it('stays silent on a legacy record we know nothing about', () => {
+    expect(describeMetaAdsCapability(adAccount({}))).toEqual({});
+  });
+
+  it('tolerates a null/undefined account without throwing', () => {
+    expect(describeMetaAdsCapability(null)).toEqual({});
+    expect(describeMetaAdsCapability(undefined)).toEqual({});
+  });
+});
+
+/**
+ * ENG-1158 — the Facebook alias exists in older records; it must not be a
+ * capability blind spot.
+ */
+describe('describeMetaAdsCapability — facebook alias', () => {
+  it('annotates a legacy platform:"facebook" ad account the same way', () => {
+    expect(
+      describeMetaAdsCapability({
+        platform: 'facebook',
+        config: { account_type: 'ad_account', granted_scopes: ['ads_management'] },
+      })
+    ).toEqual({ ads_capable: true });
   });
 });

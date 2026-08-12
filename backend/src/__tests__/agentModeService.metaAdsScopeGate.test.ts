@@ -50,6 +50,11 @@ jest.mock('../services/connectedAccountsDb', () => {
   };
 });
 
+const mockNotifyMetaAdsScopeLost = jest.fn().mockResolvedValue(true);
+jest.mock('../services/metaAdsScopeAlertService', () => ({
+  notifyMetaAdsScopeLost: (...args: any[]) => mockNotifyMetaAdsScopeLost(...args),
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
@@ -88,6 +93,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
     mockIsTokenValid.mockResolvedValue(true);
+    mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
   });
 
   // ── AC2 + AC3: fail closed BEFORE calling Meta when we know scopes are missing ──
@@ -446,6 +452,83 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(account.ads_capable).toBeUndefined();
       expect(account.capability_warning).toBeUndefined();
       expect(account.is_active).toBe(true);
+    });
+  });
+  /**
+   * ENG-1158 — detection only helps if it reaches a human.
+   *
+   * The reconnect is owner-only work, and the detection happens inside an
+   * unattended scheduled run. Without this, the owner of account
+   * 922903076601160 learned about a four-day zero-data reporting outage by
+   * reading a run's output.
+   */
+  describe('owner notification on first detection (ENG-1158)', () => {
+    const legacyUser = {
+      id: 'user1',
+      connected_accounts: [
+        metaAccount({ scopes: ['ads_management', 'ads_read', 'pages_show_list'] }),
+      ],
+    };
+
+    it('alerts the connection owner the first time Meta refuses for lack of an Ads scope', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
+      );
+    });
+
+    it('does not alert again once the revocation is already recorded — one email per episode', async () => {
+      // Second run: the pre-flight gate blocks before Meta is called at all. The
+      // owner has already been told; re-telling them every scheduled run is spam.
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user1',
+        connected_accounts: [
+          metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
+        ],
+      });
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+    });
+
+    it('does not alert when the persist failed — the next run re-detects and alerts then', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      // ...and the user-facing error still surfaces intact.
+      expect(err.isMetaAdsScopeError).toBe(true);
+    });
+
+    it('does not alert on a generic Meta permission error that never names an Ads scope', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      const genericError: any = new Error('(#200) Requires business_management permission');
+      genericError.code = 200;
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(genericError);
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+    });
+
+    it('surfaces the re-consent error even when the alert itself fails', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+      mockNotifyMetaAdsScopeLost.mockRejectedValue(new Error('Resend down'));
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(err.isMetaAdsScopeError).toBe(true);
+      expect(err.message).toContain(META_ADS_RECONSENT_MESSAGE);
     });
   });
 });
