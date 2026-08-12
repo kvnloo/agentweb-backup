@@ -56,6 +56,7 @@ jest.mock('../services/agentModeService', () => ({
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
+    releaseSessionClients: jest.fn(),
   },
 }));
 
@@ -253,6 +254,35 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           functionCallMisses: [],
         })
       );
+    });
+
+    // ENG-1118: a finished run must hand its browser back immediately. The MCP client
+    // pools live in the generate worker, so the controller signals it over IPC; without
+    // this the session's Chromium sits idle until the pool sweep reclaims it.
+    it('releases the session\'s MCP clients when the run finishes', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      });
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(mockGenerateMarketingResponseWorkerService.releaseSessionClients)
+        .toHaveBeenCalledWith(result.sessionId);
+    });
+
+    it('releases the session\'s MCP clients even when the run throws', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(new Error('worker died'));
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(result.status).toBe('failure');
+      expect(mockGenerateMarketingResponseWorkerService.releaseSessionClients)
+        .toHaveBeenCalledWith(result.sessionId);
     });
 
     // ENG-657: resume an abandoned run whose instance was terminated mid-flight
