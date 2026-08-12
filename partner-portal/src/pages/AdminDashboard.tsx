@@ -3386,7 +3386,9 @@ export default function AdminDashboard() {
     "Market Research",
     "Competitor Analysis",
     "Other",
-  ];
+];
+
+const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
   const marketingChannelOptions = [
     "Meta",
@@ -5016,7 +5018,7 @@ export default function AdminDashboard() {
                                           <IconButton size="small" onClick={() => {
                                             setUsageCreditUserId(user.userId);
                                             setUsageCreditEmail(user.email);
-                                            setUsageCreditAmount("");
+                                            setUsageCreditAmount(String(DEFAULT_ADMIN_USAGE_CREDIT_USD));
                                             setUsageCreditReason("");
                                             setUsageCreditIdempotencyKey(globalThis.crypto?.randomUUID?.() || `grant_${Date.now()}`);
                                             setUsageCreditDialogOpen(true);
@@ -6833,6 +6835,7 @@ export default function AdminDashboard() {
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
             Extend <strong>{usageCreditEmail}</strong>&apos;s cost-based hard limit for the current month. This expires at the monthly reset and is recorded in the audit ledger.
+            {" "}The standard one-time grant is ${DEFAULT_ADMIN_USAGE_CREDIT_USD}; edit the amount only when a different approved grant applies.
           </DialogContentText>
           <TextField
             autoFocus
@@ -6840,7 +6843,7 @@ export default function AdminDashboard() {
             label="Provider usage credit (USD)"
             value={usageCreditAmount}
             onChange={(e) => setUsageCreditAmount(e.target.value)}
-            placeholder="e.g. 10.00"
+            placeholder={`${DEFAULT_ADMIN_USAGE_CREDIT_USD}.00`}
             type="number"
             inputProps={{ min: 0.01, step: 0.01 }}
           />
