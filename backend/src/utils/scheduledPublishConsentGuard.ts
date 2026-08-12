@@ -78,6 +78,31 @@ export async function publishWithdrawnMidFlight(context: any): Promise<Scheduled
   return (await context?.assertPublishStillAuthorized?.()) ?? null;
 }
 
+/**
+ * Header the MCP HTTP client puts a scheduled run's session id in, so a route on the
+ * far side of a self-call can rebuild the run's identity. Set in
+ * `mcp/server/httpClient.ts`; read by the routes that do the irreversible work.
+ */
+export const SCHEDULED_SESSION_HEADER = 'X-AgentWeb-Session';
+
+/**
+ * Rebuild the re-validation hook on the far side of a self-call.
+ *
+ * The hook is a closure, so it cannot cross an HTTP boundary — only the session id it
+ * is keyed on can. A route that does the slow, irreversible work for a publishing tool
+ * remakes the identical hook from that id and calls `publishWithdrawnMidFlight` right
+ * before it commits. Absent header means an ordinary interactive call, which is not
+ * gated and gets no hook.
+ */
+export function publishRevalidationForForwardedRun(
+  req: { header(name: string): string | undefined },
+  toolName: string
+): any {
+  const sessionId = req.header(SCHEDULED_SESSION_HEADER);
+  if (!sessionId) return undefined;
+  return attachPublishRevalidation(toolName, { sessionId });
+}
+
 export function attachPublishRevalidation(toolName: string, context: any, args?: any): any {
   if (!isPublishCall(toolName, args)) return context;
   // Capture the ARGS the call was admitted with, so the last-moment re-check

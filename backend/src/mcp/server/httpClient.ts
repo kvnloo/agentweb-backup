@@ -6,6 +6,7 @@
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../../config/jwt';
 import { Agent, setGlobalDispatcher } from 'undici';
+import { SCHEDULED_SESSION_HEADER } from '../../utils/scheduledPublishConsentGuard';
 
 // Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
 // is too short for MCP tools that call slow endpoints (e.g. generate_landing_page
@@ -120,7 +121,7 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   // publish consent against live state at its own last moment. Absent for ordinary
   // interactive calls, which are not gated.
   if (context.sessionId) {
-    headers['X-AgentWeb-Session'] = String(context.sessionId);
+    headers[SCHEDULED_SESSION_HEADER] = String(context.sessionId);
   }
 
   const controller = new AbortController();

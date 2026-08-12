@@ -8,7 +8,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
-import { attachPublishRevalidation } from '../utils/scheduledPublishConsentGuard';
+import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
 
 const router = Router();
 
@@ -305,9 +305,7 @@ router.post('/linkedin-outreach', async (req: Request, res: Response) => {
  * side of the boundary the tool call started on.
  */
 function buildScheduledPublishContext(req: Request): any {
-  const sessionId = req.header('X-AgentWeb-Session');
-  if (!sessionId) return undefined;
-  return attachPublishRevalidation('post_on_connected_account', { sessionId });
+  return publishRevalidationForForwardedRun(req, 'post_on_connected_account');
 }
 
 router.post('/post-on-account', async (req: Request, res: Response) => {

@@ -6,6 +6,10 @@ import { settingsService } from "../services/settingsService";
 import { userDb, orgDb, crmDb } from "../services/db";
 import { resolveOrgProfileField } from "../services/orgProfileResolver";
 import {
+  publishWithdrawnMidFlight,
+  publishRevalidationForForwardedRun,
+} from "../utils/scheduledPublishConsentGuard";
+import {
   generateLandingPage,
   deployLandingPage,
   iterateLandingPage,
@@ -1587,6 +1591,23 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     // work we could clobber. A 409 means the branches diverged (e.g. a previous
     // "resolve conflict with ours" commit was applied to main directly) and the
     // draft still contains the canonical desired state.
+    // ENG-827 (Greptile): last moment before this page goes live.
+    //
+    // `publish_landing_page_changes` is checked at dispatch, but the irreversible act
+    // is the merge below — and it happens here, on the far side of a self-call, after
+    // a Secrets Manager fetch and a GitHub read that is allowed 30s. An owner who
+    // revokes in that window would otherwise still get a public deployment. Rebuild
+    // the run's re-check from the session the tool forwarded and run it now, after all
+    // the reads and immediately before the write, so no window is left after this
+    // point. No session header means an interactive publish, which is not gated.
+    const withdrawn = await publishWithdrawnMidFlight(
+      publishRevalidationForForwardedRun(req, "publish_landing_page_changes")
+    );
+    if (withdrawn) {
+      console.warn(`[LP GENERATION] Publish abandoned for ${page.id}: ${withdrawn.error}`);
+      return res.status(403).json({ error: withdrawn.error });
+    }
+
     try {
       const mergeRes = await axios.post<any>(
         `${repoBase}/merges`,
