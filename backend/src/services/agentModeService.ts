@@ -4139,7 +4139,24 @@ export class AgentModeService {
             content = termination.contentIfEmpty;
           }
 
-          if (termination.reason === 'max_tokens_continuation') {
+          // ENG-907: once the forced synthesis has run, every millisecond left is inside the
+          // reserve held back for it — there is no room for another round trip. Both
+          // continuation ladders below would spend it, and if the hard cap fires mid-call the
+          // controller discards the whole turn: the exact all-or-nothing loss this change
+          // exists to remove. So end here instead and deliver what the synthesis produced. A
+          // max-tokens stop still leaves real (if clipped) text; an empty one falls through to
+          // TURN_TIME_BUDGET_FALLBACK_CONTENT below. Both beat risking a bare timeout.
+          const timeBudgetBlocksContinuation =
+            forceFinalSynthesis &&
+            (termination.reason === 'max_tokens_continuation' || termination.reason === 'empty_synthesis_retry');
+          if (timeBudgetBlocksContinuation) {
+            console.warn(
+              `AgentMode: suppressing ${termination.reason} in session ${sessionId} — the turn's time budget ` +
+              'is spent; delivering the forced synthesis output as-is rather than risking the hard cap'
+            );
+          }
+
+          if (termination.reason === 'max_tokens_continuation' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
@@ -4149,7 +4166,7 @@ export class AgentModeService {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
           }
 
-          if (termination.reason === 'empty_synthesis_retry') {
+          if (termination.reason === 'empty_synthesis_retry' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
