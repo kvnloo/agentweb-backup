@@ -1,5 +1,5 @@
 /**
- * Internal service-to-service usage ingestion route (Ship 1 — shadow metering).
+ * Internal service-to-service usage ingestion route (agent-engine -> backend).
  *
  * Mounted at /api/internal so the path is:
  *   POST /api/internal/usage
@@ -18,13 +18,20 @@
  * the caller is an admin/service token. Otherwise the record is attributed to
  * the authenticated user.
  *
- * This is SHADOW metering — ingestion failures are the engine's problem to
- * swallow (it is fail-open); on our side recordUsage() itself never throws.
+ * Ingestion failures are the engine's problem to swallow (it is fail-open); on
+ * our side recordUsage() itself never throws.
+ *
+ * ENG-1134: this is no longer shadow-only. Records now ALSO draw down the
+ * submitting user's monthly quota, summed per user across the batch. Until then
+ * every browser-automation task's LLM spend was visible as burn but charged to
+ * nobody, which is the same rule violation (a real userId must mean a real
+ * charge) that ENG-200 and ENG-454 fixed on other paths.
  */
 
 import express, { Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
-import { recordUsage } from "../services/usageRecorderService";
+import { recordUsage, computeCostMicroUsd } from "../services/usageRecorderService";
+import { incrementUserTokenUsage } from "../services/tokenUsageService";
 
 const router = express.Router();
 
@@ -45,6 +52,30 @@ interface IncomingUsageRecord {
 
 function isNonNegativeFiniteNumber(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Provenance namespace for everything ingested here.
+ *
+ * The ledger's sort key is `{date}#{model}#{feature}`, so `feature` is the only
+ * component that can carry where the spend came from. The engine reports
+ * `feature="agent_task"` — the same value agent-mode chat writes — so the two
+ * merge into one row and become arithmetically inseparable. `taskId` would have
+ * discriminated but usageRecordDb never persists it, and `provider`/`sessionId`
+ * are written `if_not_exists` (first-write-wins), so neither can be trusted.
+ *
+ * This route is the agent-engine's endpoint by definition, so provenance is known
+ * here regardless of what the caller claims. Namespacing in the backend rather
+ * than the Python engine also means it ships on the normal deploy pipeline
+ * instead of the manual GCP-VM procedure the engine requires.
+ */
+const ENGINE_FEATURE_PREFIX = "engine:";
+
+/** Namespace a reported feature, preserving anything more specific than the default. */
+function namespaceFeature(feature: unknown): string {
+  const raw =
+    typeof feature === "string" && feature.trim() ? feature.trim() : "agent_task";
+  return raw.startsWith(ENGINE_FEATURE_PREFIX) ? raw : `${ENGINE_FEATURE_PREFIX}${raw}`;
 }
 
 /** A record is usable when it names a model and has at least valid token counts. */
@@ -82,6 +113,13 @@ router.post(
       let accepted = 0;
       let skipped = 0;
       const writes: Promise<void>[] = [];
+      // ENG-1134: quota charge, summed per user across the batch rather than
+      // applied per record. A batch carries up to 500 records and
+      // incrementUserTokenUsage is a read-modify-write on one user row, so
+      // charging per record would mean hundreds of contended sequential writes
+      // for a single task run. Ledger rows stay granular (they are keyed by
+      // model+feature); only the deduction is aggregated.
+      const charges = new Map<string, { tokens: number; cost: number }>();
 
       for (const record of records) {
         if (!isValidRecord(record)) {
@@ -95,6 +133,31 @@ router.post(
             ? record.userId
             : authedUserId;
 
+        const cacheReadTokens = isNonNegativeFiniteNumber(record.cacheReadTokens)
+          ? record.cacheReadTokens!
+          : 0;
+        const cacheWriteTokens = isNonNegativeFiniteNumber(record.cacheWriteTokens)
+          ? record.cacheWriteTokens!
+          : 0;
+
+        // Charge the RESOLVED user, never the record's claim — otherwise any
+        // engine token could drain someone else's quota by naming them.
+        // "system" is platform overhead with no one to bill, so it is skipped.
+        if (userId && userId !== "system") {
+          const entry = charges.get(userId) || { tokens: 0, cost: 0 };
+          entry.tokens +=
+            record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
+          entry.cost +=
+            computeCostMicroUsd(
+              record.model!,
+              record.inputTokens!,
+              record.outputTokens!,
+              cacheReadTokens,
+              cacheWriteTokens
+            ) / 1e6;
+          charges.set(userId, entry);
+        }
+
         // recordUsage is fail-open by contract (always resolves).
         writes.push(
           recordUsage({
@@ -105,24 +168,31 @@ router.post(
               typeof record.provider === "string" && record.provider
                 ? record.provider
                 : "unknown",
-            feature:
-              typeof record.feature === "string" && record.feature
-                ? record.feature
-                : "agent_task",
+            feature: namespaceFeature(record.feature),
             inputTokens: record.inputTokens!,
             outputTokens: record.outputTokens!,
-            cacheReadTokens: isNonNegativeFiniteNumber(record.cacheReadTokens)
-              ? record.cacheReadTokens
-              : 0,
-            cacheWriteTokens: isNonNegativeFiniteNumber(record.cacheWriteTokens)
-              ? record.cacheWriteTokens
-              : 0,
+            cacheReadTokens,
+            cacheWriteTokens,
           })
         );
         accepted++;
       }
 
       await Promise.all(writes);
+
+      // Apply the aggregated quota charges. Fail-open, exactly like the ledger
+      // writes above: the engine treats ingestion as best-effort, so surfacing a
+      // 500 here would only make it retry and double-charge.
+      await Promise.all(
+        [...charges.entries()].map(([userId, { tokens, cost }]) =>
+          incrementUserTokenUsage(userId, tokens, cost).catch((err: unknown) =>
+            console.error(
+              `[internalUsage] failed to charge usage for ${userId}:`,
+              err
+            )
+          )
+        )
+      );
 
       return res.status(202).json({ accepted, skipped });
     } catch (error) {

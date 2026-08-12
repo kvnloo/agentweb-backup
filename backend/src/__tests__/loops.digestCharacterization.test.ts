@@ -55,6 +55,24 @@ function fakeResult(over: Partial<LoopRunResult>): LoopRunResult {
   } as unknown as LoopRunResult;
 }
 
+/**
+ * An agent-mode TOOL proposal. Its payload carries `toolName`, which the real
+ * AgentFailureProposalPayload always sets — the generic `proposal()` helper
+ * below builds `payload: {}`, and the agent-mode digest now counts failing
+ * TOOLS specifically (ENG-820), so a payload-less stub is no longer a faithful
+ * stand-in for one.
+ */
+function toolProposal(hypothesis: string, toolName: string): LoopRunResult['proposals'][number] {
+  return {
+    proposalId: 'p1',
+    sourceRuleId: `tool-failure:${toolName}`,
+    hypothesis,
+    kind: 'code_change',
+    payload: { toolName, failures: 6, invocations: 9, failureRate: 0.67, failureType: 'bug', directive: 'd' },
+    triggeringStats: {},
+  } as unknown as LoopRunResult['proposals'][number];
+}
+
 function proposal(hypothesis: string, kind: string, directive?: string): LoopRunResult['proposals'][number] {
   return {
     proposalId: 'p1',
@@ -111,7 +129,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           runId: 'run_agent_silent' as LoopRunResult['runId'],
           eventsScanned: 42,
           proposals: [
-            proposal('Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502', 'code_change'),
+            toolProposal('Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502', 'publish_blog_article'),
           ],
         }),
       );
@@ -132,8 +150,8 @@ describe('loop digest characterization (exact rendered text)', () => {
           runId: 'run_agent_1' as LoopRunResult['runId'],
           eventsScanned: 42,
           proposals: [
-            proposal('Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502', 'code_change'),
-            proposal('Tool `search_leads` failed 3/7 calls (43%) — top error: timeout', 'code_change'),
+            toolProposal('Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502', 'publish_blog_article'),
+            toolProposal('Tool `search_leads` failed 3/7 calls (43%) — top error: timeout', 'search_leads'),
           ],
         }),
       );

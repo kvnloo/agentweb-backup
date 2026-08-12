@@ -17,6 +17,23 @@ process.env.AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https:
 process.env.AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
 process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview';
 
+// agentModeService.ts/growthGeniusService.ts each fall back to their own hardcoded default
+// model id (e.g. 'anthropic.claude-opus-5') only when these are unset — but a local .env
+// that still has the literal unfilled '.env.example' placeholder text (a truthy string, e.g.
+// "your_azure_openai_deployment_agent_mode") silently defeats that `||` fallback and never
+// gets caught by it, causing default_model to resolve to garbage in that dev's own test runs
+// as opposed to the real value CI is expected to produce (a clean checkout's local .env may
+// not define these keys at all).
+//
+// Set to '' rather than `delete` — several service files (chatbotService.ts among them, on
+// agentModeService.ts's own import path) call `dotenv.config()` again at their own module-load
+// time, later than this file runs. dotenv only fills in keys that don't already
+// `hasOwnProperty` on process.env, so a deleted key gets silently re-populated from the .env
+// file on disk the moment one of those modules loads — an empty string keeps the key present
+// (dotenv leaves it alone) while still being falsy for the app's own `|| 'default'` fallback.
+process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE = '';
+process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS = '';
+
 // Set Azure OpenAI embeddings environment variables for tests
 process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
 process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';
@@ -36,4 +53,26 @@ console.log = (...args) => {
     originalConsoleLog(...args);
   }
 };
+
+// ENG-1111: block any test from reaching a real non-local host over Node's native `fetch`
+// (which SDKs like `resend` are built on -- see ENG-1112, __mocks__/resend.ts). The
+// separate `node-fetch` package is not covered by wrapping globalThis.fetch here -- see
+// __mocks__/node-fetch.ts for that call site. Both enforce the same policy defined in
+// networkEgressGuard.ts.
+import { assertLocalOrAllowed } from './networkEgressGuard';
+
+const realFetch = globalThis.fetch;
+if (typeof realFetch === 'function') {
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    assertLocalOrAllowed(url);
+    return realFetch(input, init);
+  }) as typeof fetch;
+}
+
 export {};

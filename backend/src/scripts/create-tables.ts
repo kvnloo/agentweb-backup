@@ -239,6 +239,84 @@ const createTaskExecutionsTable = async () => {
   }
 };
 
+// Create Async Job Queue table — generic crash-safety net for any webhook receiver's
+// fire-and-forget processing (ENG-524). One table for every integration, discriminated
+// by `source`, rather than a table per integration: a new source just registers a
+// processor function, no schema change. See backend/src/services/asyncJobQueue.ts.
+const createAsyncJobQueueTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AsyncJobQueue`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StatusCreatedAtIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Calendly Orphaned Webhooks table — last-resort durable record of a
+// Calendly webhook_id that couldn't be either deleted remotely OR durably
+// enqueued for cleanup retry (both AW-AsyncJobQueue writes exhausted). Greptile
+// P1 on #2291 (round 15/16): the async job queue is itself the thing failing to
+// accept writes in exactly this scenario, so a fallback that ALSO writes to that
+// same table has no value — this is a genuinely separate table so the fallback
+// actually has a chance of succeeding when the queue table specifically (not
+// DynamoDB broadly) is the problem. Keyed by `<userId>_<calendlyUserUri>` so a
+// later /connect for that exact identity can look itself up directly (no listing,
+// preserving the same tenant-safety guarantee as the local-account-record check —
+// see calendlyAuth.ts's provisionCalendlyWebhook). See
+// services/calendlyWebhookCleanupQueue.ts.
+const createCalendlyOrphanedWebhooksTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CalendlyOrphanedWebhooks`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Waitlist table
 const createWaitlistTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -2291,6 +2369,8 @@ const main = async () => {
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
+    await createAsyncJobQueueTable();
+    await createCalendlyOrphanedWebhooksTable();
     await createWaitlistTable();
     await createSubscribersTable();
     await createTaskSchedulesTable();

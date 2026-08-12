@@ -1,10 +1,11 @@
+import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
 
 // ============================================
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -286,7 +287,34 @@ export interface TwitterXConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
+/**
+ * Calendly OAuth configuration (ENG-524).
+ *
+ * `booking_tracking_active` is false when the connecting account's Calendly plan
+ * doesn't support webhooks (Free tier) — OAuth still succeeds and the account is
+ * stored, but no `webhook_id`/`webhook_signing_key` exist and no booking events
+ * will ever arrive. Distinct from `needs_reconnect`, which means the OAuth grant
+ * itself is broken; this means the grant is fine but the plan doesn't qualify.
+ */
+export interface CalendlyConfig extends BaseOAuthConfig {
+  account_type: 'calendly';
+  email?: string;             // From /users/me, used as account_id
+  display_name?: string;
+  user_uri: string;           // Calendly user URI — resolves the webhook scope
+  organization_uri: string;   // Calendly organization URI — required by the webhook subscription body regardless of scope
+  webhook_id?: string;        // Set only when booking_tracking_active is true
+  webhook_signing_key?: string; // HMAC secret WE generate and hand to Calendly at subscription-create time
+  booking_tracking_active: boolean;
+  needs_reconnect?: boolean;
+  // Which of the customer's own lead lists a booking gets created/updated in
+  // (CRM-forward, ENG-524 §6 step 4). Either set explicitly via Settings, or
+  // auto-resolved to an idempotent system-managed list on first booking and
+  // persisted here so every later delivery reuses it directly — see
+  // resolveOrCreateBookingList in calendlyWebhook.ts.
+  booking_lead_list_id?: string;
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -497,40 +525,82 @@ export const updateAccountTokens = async (
     refresh_token?: string;
     token_expires_at: number;
   },
-  accountId?: string
+  accountId?: string,
+  expectedAccount?: ConnectedAccount,
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error('User not found');
-  }
-
-  const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accountId
-    ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
-    : accounts.findIndex(acc => acc.platform === platform);
-
-  if (accountIndex < 0) {
-    throw new Error(`No ${platform} account${accountId ? ` with id "${accountId}"` : ''} connected`);
-  }
-
-  const existingAccount = accounts[accountIndex];
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: {
-      ...existingAccount.config,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
-      token_expires_at: tokens.token_expires_at,
-    },
-    updated_at: new Date().toISOString(),
+  const changedError = () => Object.assign(
+    new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
+    { code: 'ConnectedAccountChanged' },
+  );
+  // Accounts returned to callers can carry this non-persisted owner marker.
+  // It is not a credential/config change and must not make the same stored
+  // account look different during a refresh.
+  const snapshot = (account: ConnectedAccount): ConnectedAccountConfig => {
+    const { userId: _userId, ...persistedAccount } = account as ConnectedAccount & { userId?: string };
+    return persistedAccount as ConnectedAccountConfig;
   };
+  let sourceAccount = expectedAccount ? snapshot(expectedAccount) : undefined;
 
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
+  // A full-list write is required by the existing User model. CAS it so token
+  // refresh cannot resurrect a disconnected account, but retry once against a
+  // fresh primary record when *another* account changed. The target must still
+  // exactly match the source snapshot on every attempt; a disconnect/reconnect
+  // or target-account edit fails closed rather than accepting an old token.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
 
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accountId
+      ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
+      : accounts.findIndex(acc => acc.platform === platform);
+
+    if (accountIndex < 0) throw changedError();
+
+    const existingAccount = accounts[accountIndex];
+    // If no caller snapshot was supplied, the first strongly current account
+    // becomes the source snapshot. LinkedIn passes its pre-write account so a
+    // disconnect/reconnect before this lookup is also detected.
+    const expected = sourceAccount || snapshot(existingAccount);
+    if (!isDeepStrictEqual(snapshot(existingAccount), expected)) throw changedError();
+    sourceAccount = expected;
+
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: {
+        ...existingAccount.config,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
+        token_expires_at: tokens.token_expires_at,
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        // Carry the strong-read decision into the write. Otherwise a disconnect
+        // between the read and update could be overwritten with the stale account.
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      if (attempt === 1) throw changedError();
+      // Re-read before retrying: the target must still equal `expected`, while
+      // unrelated account-list changes are retained in the rebuilt write.
+    }
+  }
 };
 
 /**
@@ -636,6 +706,23 @@ export interface ConnectedAccountWithUser extends ConnectedAccount {
   userId: string;
 }
 
+const findAccountForUser = (
+  user: User | undefined,
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): ConnectedAccountWithUser | null => {
+  const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
+  if (!user) return null;
+
+  const accounts = normalizeAccounts(user.connected_accounts);
+  const account = accounts.find(
+    acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
+  );
+
+  return account ? { ...account, userId } : null;
+};
+
 /**
  * Get a specific connected account by account_id and userId.
  * Directly looks up the user to find the account, avoiding full table scan.
@@ -652,25 +739,29 @@ export const getAccountById = async (
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
     const user = await userDb.getUserById(userId);
-    const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
-
-    if (user) {
-      const accounts = normalizeAccounts((user as User).connected_accounts);
-      const account = accounts.find(
-        acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
-      );
-
-      if (account) {
-        return {
-          ...account,
-          userId: (user as User).userId,
-        };
-      }
-    }
-
-    return null;
+    return findAccountForUser(user as User | undefined, accountId, userId, platform);
   } catch (error) {
     console.error('Error in getAccountById:', error);
+    return null;
+  }
+};
+
+/**
+ * Strongly current account lookup for external writes. This avoids the
+ * eventually consistent UserIdIndex briefly returning an OAuth account after
+ * it was disconnected, without adding an extra base-table read to ordinary
+ * account listing and analytics paths.
+ */
+export const getAccountByIdConsistent = async (
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): Promise<ConnectedAccountWithUser | null> => {
+  try {
+    const user = await userDb.getUserByIdConsistent(userId);
+    return findAccountForUser(user as User | undefined, accountId, userId, platform);
+  } catch (error) {
+    console.error('Error in getAccountByIdConsistent:', error);
     return null;
   }
 };
@@ -701,6 +792,58 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
     return null;
+  }
+};
+
+/**
+ * Find the user (and the specific connected account) that owns a given Calendly
+ * user_uri. Used by the incoming booking webhook (ENG-524) to resolve who a
+ * delivery belongs to. Matches on user_uri, not organization_uri — the webhook
+ * subscription is created with scope 'user' bound to a specific user_uri, and a
+ * real invitee.created payload carries no organization_uri at all (confirmed via
+ * a live test delivery), so organization_uri isn't usable as an anchor here.
+ * Returns every account alongside its userId (not just the userId, unlike
+ * getUserIdByHubSpotPortalId) since the caller needs each candidate's own
+ * config.webhook_signing_key immediately.
+ *
+ * ENG-994 (live-tested, #2291): this used to return only the FIRST matching
+ * account across ALL users, with no awareness of which tenant a given webhook
+ * delivery actually belongs to. Two different AgentWeb tenants can each
+ * independently connect the SAME underlying Calendly identity (same login,
+ * two separate webhook subscriptions) — confirmed live by creating a second
+ * tenant sharing a real connection's user_uri: whichever tenant this function
+ * happened to return first "won" resolution for EVERY delivery targeting that
+ * user_uri, and the other tenant's own genuinely-signed deliveries were
+ * silently dropped (no matching key ever attempted for them). DynamoDB scan
+ * order isn't guaranteed stable, so which tenant lost was arbitrary and could
+ * vary between individual deliveries. Returning every match lets the caller
+ * (calendlyWebhook.ts) try each candidate's own signing key against the
+ * signature, instead of committing to a single guess.
+ */
+export const getAccountsByCalendlyUserUri = async (
+  userUri: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    const users = await userDb.getAllUsers();
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      // normalizeAccounts (not a direct User.connected_accounts iteration, unlike
+      // getUserIdByHubSpotPortalId above) — db.ts's local connected_accounts type is a
+      // stale, narrower union that was never updated to include 'calendly' (or several
+      // other real platforms), separate from this file's richer ConnectedAccountConfig.
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'calendly' && (account.config as CalendlyConfig).user_uri === userUri) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
   }
 };
 

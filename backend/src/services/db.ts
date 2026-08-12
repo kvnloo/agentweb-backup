@@ -8,9 +8,12 @@ import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey }
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
+import type { OrgRole } from "./orgAuthz";
+import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
+import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -18,15 +21,30 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+// An 'in_progress' claimLeadStepOnce claim older than this is treated as
+// abandoned (its release write never landed) and becomes reclaimable — see
+// claimLeadStepOnce for the full reasoning (Greptile P1 on #2291, round 17).
+const CLAIM_STALE_MS = 5 * 60 * 1000;
+
 // For debugging
 
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts.
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -390,6 +408,15 @@ export interface User {
     }>;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Opaque identity of the write that produced this value, stamped only by
+     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * granular and every other brand writer mints its own, so two writes can
+     * share a stamp; pairing it with a revision lets a conditional write
+     * identify the exact value it read. Absent on anything written by another
+     * path, which those conditions match explicitly.
+     */
+    rev?: string;
   };
   marketStrategy?: {
     businessOverview: string;
@@ -462,6 +489,8 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
+  llmUsageCredits?: MonthlyLlmUsageCredits;
   extraCostUsage?: {
     month: string;      // "YYYY-MM" format for current tracking month
     totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
@@ -581,7 +610,20 @@ export interface User {
   allowedPages?: string[];
   allowedSkills?: string[];
   orgId?: string;
-  orgRole?: "owner" | "member";
+  /**
+   * Authority within `orgId`. Every role is plural — an org may have N owners and
+   * N admins — so that no single departure can strand an org. Authorization
+   * decisions go through `services/orgAuthz.ts`, never through a direct comparison
+   * here.
+   *
+   * This is NOT the billing signal. Which member the subscription and pooled quota
+   * resolve to is `Organization.ownerUserId` (the primary owner); use
+   * `orgAuthz.isBillingRoot` / `inheritsOrgBilling`. Testing this field for
+   * "member" as a stand-in for "not the owner" breaks silently as soon as a third
+   * role exists — an admin is neither, and would fall through to their own empty
+   * subscription.
+   */
+  orgRole?: OrgRole;
   // Set when an org owner invites this email; cleared when invite is accepted or cancelled.
   // Used to redirect users straight to accept-invite instead of onboarding.
   // null is used by updateUser to explicitly remove the field from DynamoDB.
@@ -657,6 +699,11 @@ export interface User {
 }
 
 export interface Organization {
+  /**
+   * Optimistic-concurrency counter for owner-losing operations. Absent until
+   * the first one; see orgDb.claimOwnerChange.
+   */
+  ownerEpoch?: number;
   orgId: string;
   name: string;
   ownerUserId: string;
@@ -704,18 +751,6 @@ export interface Organization {
     requestedAt: string;
     requestToken: string;
   }>;
-  maxMembers: number;
-  /**
-   * Denormalized, atomically-maintained member count — used ONLY as a fast
-   * capacity gate at join time (via a DynamoDB transaction pairing the
-   * increment with the joining user's write), never for display. Display
-   * always uses the live GSI-backed member list (getOrgMembers), which can
-   * never drift. Absent on orgs created before this field existed — every
-   * live path (join/leave) fails closed on a missing value rather than
-   * seeding it, since a live count can race with concurrent writes. Only
-   * scripts/backfill-org-member-count.ts is allowed to initialize this field.
-   */
-  memberCount?: number;
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
@@ -737,6 +772,7 @@ export interface OrgShareSettings {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm?: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -1096,6 +1132,20 @@ export class UserDB {
     const item = result.Item;
     if (item?.userId?.startsWith("deleted_")) return undefined;
     return item;
+  }
+
+  /**
+   * Returns a strongly current User record after resolving its stable primary
+   * key from the UserIdIndex. DynamoDB does not support strongly consistent
+   * reads on GSIs, so callers that must not act on recently removed OAuth
+   * credentials need this two-step lookup instead of getUserById alone.
+   */
+  async getUserByIdConsistent(userId: string) {
+    const indexed = await this.getUserById(userId);
+    if (!indexed?.email) return undefined;
+
+    const current = await this.getUserByEmailConsistent(indexed.email);
+    return current?.userId === userId ? current : undefined;
   }
 
   async getUserById(userId: string) {
@@ -1545,88 +1595,47 @@ export class UserDB {
   }
 
   /**
-   * Atomically assigns a user to an org AND enforces the member cap in a
-   * single DynamoDB transaction — a plain read-then-write (check orgId /
-   * check member count, then separately write) has two distinct TOCTOU
-   * races: (1) two concurrent approvals for the SAME user from different
-   * orgs can both pass the "not already in an org" read-check before either
-   * write lands, and (2) two concurrent approvals for DIFFERENT users on
-   * the SAME org can both pass the "under capacity" read-check when only
-   * one slot remains, overshooting maxMembers. TransactWriteItems ties the
-   * org's memberCount increment (conditioned on staying under maxMembers)
-   * and the user's orgId write (conditioned on not already having one) into
-   * one all-or-nothing operation, closing both races at once.
+   * Assigns a user to an org, atomically rejecting a user who already belongs to
+   * one. The `attribute_not_exists(orgId)` condition is the whole point: a plain
+   * read-then-write lets two concurrent approvals for the SAME user from
+   * different orgs both pass the "not already in an org" check before either
+   * write lands, and `orgId` is a scalar on the user row, so a double-write
+   * silently reassigns them.
    *
-   * memberCount is denormalized purely for this atomic check — it is never
-   * used for display (see the field's doc comment on Organization). Orgs
-   * created before this field existed are backfilled by
-   * scripts/backfill-org-member-count.ts, but if a join lands on one before
-   * that runs, this function computes the org's real current count as the
-   * seed value (never a bare 0 default — see below) so the counter starts
-   * accurate on first use instead of silently discarding real membership.
+   * This used to be a two-item TransactWriteItems that also incremented an
+   * org-side `memberCount` under a `memberCount < maxMembers` condition. The seat
+   * cap is gone (tiers are usage-based, not seat-based), and `memberCount`
+   * existed solely to serve that gate — never for display, which always used the
+   * GSI-backed live member list. With the cap removed the counter has no reader,
+   * so the transaction collapses to a single conditional Update, taking with it
+   * the fail-closed not-migrated branch, the disambiguating extra GetItem, the
+   * departure-side decrement, and the accepted backfill/departure race those
+   * required.
    */
-  async joinOrgWithCapacityCheck(
+  async joinOrg(
     userId: string,
     orgId: string,
-    orgRole: "member" | "owner",
-    maxMembers: number
-  ): Promise<"joined" | "org_full" | "already_in_org" | "not_migrated"> {
+    orgRole: OrgRole
+  ): Promise<"joined" | "already_in_org"> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
 
-    // Fail closed if memberCount is missing — never seed it from a live
-    // count here. A live path guessing at the "real" count and initializing
-    // the counter from it is exactly what produced several subtle races
-    // (GSI eventual-consistency staleness, double-accounting against a
-    // concurrent departure/join). The reviewed backfill migration
-    // (scripts/backfill-org-member-count.ts) is the only thing allowed to
-    // initialize memberCount; every live path just requires it to already
-    // exist and be under cap.
     try {
       await this.docClient
-        .transactWrite({
-          TransactItems: [
-            {
-              Update: {
-                TableName: ORGS_TABLE,
-                Key: { orgId },
-                UpdateExpression: "SET memberCount = memberCount + :one",
-                ConditionExpression: "attribute_exists(memberCount) AND memberCount < :maxMembers",
-                ExpressionAttributeValues: { ":one": 1, ":maxMembers": maxMembers },
-              },
-            },
-            {
-              Update: {
-                TableName: this.tableName,
-                Key: { email: user.email },
-                UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
-                ConditionExpression: "attribute_not_exists(orgId)",
-                ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
-              },
-            },
-          ],
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
+          ConditionExpression: "attribute_not_exists(orgId)",
+          ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
         })
         .promise();
       return "joined";
     } catch (error: any) {
-      if (error.code === "TransactionCanceledException") {
-        const reasons: Array<{ Code?: string }> = error.CancellationReasons || [];
-        if (reasons[0]?.Code === "ConditionalCheckFailed") {
-          // Ambiguous by design between "org is full" and "org hasn't been
-          // backfilled yet" — both fail the same condition. Distinguish by
-          // checking which one it actually is, since the caller needs a
-          // different message for each.
-          const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
-          return orgSnapshot.Item?.memberCount === undefined ? "not_migrated" : "org_full";
-        }
-        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_in_org";
-        // Unrecognized cancellation shape — treat conservatively as a
-        // capacity/assignment conflict rather than surfacing a 500.
-        return "already_in_org";
-      }
-      handleDynamoDbError(error, "joinOrgWithCapacityCheck");
+      if (error.code === "ConditionalCheckFailedException") return "already_in_org";
+      handleDynamoDbError(error, "joinOrg");
       throw error;
     }
   }
@@ -1659,6 +1668,75 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Roll the monthly usage counter over to a new month, archiving the previous
+   * month into history — but ONLY if nobody has rolled it over already.
+   *
+   * The caller reads the stored month, sees it is stale, and decides to reset.
+   * Between that read and this write, another charge for the same user can do
+   * exactly the same thing. Without the condition below both writes land and the
+   * second discards the first call's tokens and cost entirely — a whole charge
+   * lost, on the one day of the month when every active user rolls over at once.
+   *
+   * Returns false when the condition fails, i.e. somebody else already rolled the
+   * month. The caller then applies its charge as a normal increment onto the
+   * counter the winner created, so no spend is dropped either way.
+   */
+  async resetTokenUsageForMonth(args: {
+    userId: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    history: Array<{ month: string; totalTokens: number; totalCost: number }>;
+  }): Promise<boolean> {
+    const user = await this.getUserById(args.userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${args.userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+      // Succeed only while the stored month is still NOT the new one. A row with
+      // no tokenUsage at all is a first-ever charge and also qualifies.
+      ConditionExpression:
+        "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#history": "tokenUsageHistory",
+        "#bonus": "tokenAllowanceBonus",
+      },
+      ExpressionAttributeValues: {
+        ":userId": args.userId,
+        ":month": args.month,
+        ":usage": {
+          month: args.month,
+          totalTokens: args.tokens,
+          totalCost: args.cost,
+          resetDate: args.resetDate,
+        },
+        ":history": args.history,
+        ":zero": 0,
+      },
+    };
+
+    try {
+      await this.docClient.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return false;
+      }
+      handleDynamoDbError(error, "resetTokenUsageForMonth");
       throw error;
     }
   }
@@ -1926,24 +2004,16 @@ export class UserDB {
 
   /**
    * Remove orgId and orgRole from a user record (used when removing a member
-   * from an org, or a member leaving on their own). Also best-effort
-   * decrements the org's denormalized memberCount (see Organization.memberCount)
-   * so it stays accurate for the atomic capacity check at join time.
+   * from an org, or a member leaving on their own).
    *
-   * The user-clear is conditioned on orgId still matching what was just
-   * read — this is what prevents a double-decrement when two concurrent
-   * calls target the same membership (e.g. an owner-initiated remove racing
-   * a self-initiated leave): only whichever call's conditioned REMOVE
-   * actually wins decrements the counter; the loser's condition fails
-   * (orgId is already gone) and it correctly skips decrementing, since the
-   * winner already accounted for the one real departure.
+   * The clear is conditioned on orgId still matching what was just read, so two
+   * concurrent calls targeting the same membership (e.g. an owner-initiated
+   * remove racing a self-initiated leave) resolve to exactly one real departure —
+   * the loser's condition fails because orgId is already gone.
    *
-   * The decrement is intentionally NOT in the same transaction as the
-   * membership clear, and intentionally non-fatal: leaving an org must never
-   * fail because of a counter-bookkeeping issue (missing/stale memberCount
-   * on an org predating this field, a rare inconsistency, etc.) — that
-   * failure mode would be worse than a temporarily-stale count, which only
-   * risks blocking one future join until reconciled, never overflow.
+   * This used to also best-effort decrement an org-side `memberCount` to keep the
+   * join-time capacity check accurate. The seat cap is gone, so there is no
+   * counter to maintain and no second write to reconcile.
    */
   async clearOrgMembership(userId: string): Promise<void> {
     const user = await this.getUserById(userId);
@@ -1973,39 +2043,6 @@ export class UserDB {
       throw error;
     }
 
-    // Fail closed: if memberCount isn't set yet, skip the decrement entirely
-    // rather than seeding it here. Only the reviewed backfill migration
-    // (scripts/backfill-org-member-count.ts) is allowed to initialize this
-    // field — a live path guessing at the "real" count via OrgIdIndex (a
-    // GSI, eventually consistent relative to the write we just made) is
-    // exactly what produced the earlier staleness bug. Skipping is safe:
-    // once the org is backfilled, decrements apply normally; until then,
-    // there's nothing to decrement from.
-    //
-    // Known narrow residual race (accepted, Greptile review): the orgId
-    // clear above and this decrement are two separate writes. If the
-    // backfill runs in that gap, it queries the live member list (which
-    // already excludes this departure, since orgId is already cleared) and
-    // seeds memberCount at the post-departure count — then this decrement
-    // still fires and subtracts again, leaving the counter one too low.
-    // Only possible during the brief backfill-run window, only ever
-    // under-counts (never lets capacity overshoot from this bug alone), and
-    // self-heals on the next join/leave. Mitigated operationally by running
-    // the backfill during low-traffic hours rather than a code-level fix.
-    try {
-      await this.docClient
-        .update({
-          TableName: ORGS_TABLE,
-          Key: { orgId },
-          UpdateExpression: "SET memberCount = memberCount - :one",
-          ConditionExpression: "attribute_exists(memberCount) AND memberCount > :zero",
-          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
-        })
-        .promise();
-    } catch (error: any) {
-      if (error.code === "ConditionalCheckFailedException") return; // Not backfilled yet, or already 0 — nothing to do.
-      console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
-    }
   }
 }
 
@@ -3028,6 +3065,13 @@ export const waitlistDb = {
   },
 };
 
+// Legacy recurring task schedules predate the `type: scheduled_chat` discriminator.
+// Direct polling for those rows was removed from agent-engine in fb83fc151, but old
+// active rows can remain indefinitely overdue. Keep a per-process record so the
+// scheduled-chat poll makes each newly observed orphan visible without emitting the
+// same warning every five seconds.
+const reportedUnsupportedLegacyScheduleIds = new Set<string>();
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3053,6 +3097,10 @@ export const scheduleDb = {
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
+    llmModel?: string;
+    llmBackupModel?: string;
+    llmBackupSource?: 'user' | 'system';
+    llmBackupNeedsConfirmation?: boolean;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
     variables?: Array<{ name: string; description?: string }>;
     variableValues?: { [variableName: string]: string };
@@ -3109,6 +3157,23 @@ export const scheduleDb = {
     }
   },
 
+  /**
+   * Every schedule in the table, paginated. A full scan, so this is for one-off
+   * operator work (the ENG-827 consent migration) — never a request path. The
+   * prefixed table name stays inside this module, which is the only reason a
+   * script can enumerate schedules without knowing about TABLE_PREFIX.
+   */
+  async getAllSchedules(): Promise<any[]> {
+    try {
+      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+    } catch (error) {
+      // Rethrows. A scan that dies halfway must not read as "no schedules" — that
+      // would turn a transient failure into a migration that silently grants nothing.
+      handleDynamoDbError(error, "getAllSchedules");
+      return [];
+    }
+  },
+
   async updateSchedule(
     scheduleId: string,
     updates: Partial<{
@@ -3131,10 +3196,34 @@ export const scheduleDb = {
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions). Default off.
       fullAutonomy?: boolean;
+      // ENG-803: owner opt-OUT holding this schedule's unattended runs at the publish
+      // step. Distinct from fullAutonomy on purpose: that waives "pause and ask me"
+      // on mid-run decisions, which is not the same consent as "post to the world on
+      // my behalf". Settable ONLY by the owner — deliberately absent from the
+      // manage_scheduled_chat MCP allowlist so the model can neither grant itself
+      // publishing authority nor silence its own publishing. Default off (= publish).
+      // ENG-803: owner's explicit hold. Outranks any grant below — an owner who asked
+      // to review stays reviewing.
+      requirePublishApproval?: boolean;
+      // ENG-827: AFFIRMATIVE consent to publish unattended to a live connected account
+      // without the owner seeing the content first. Absence is NOT consent. Settable
+      // only by the owner (portal checkbox / owner-only endpoint); the MCP surface can
+      // REVOKE it but never grant it.
+      autopublishAuthorized?: boolean;
+      // ENG-827: the publish tools the owner approved when consenting. Consent is bound
+      // to THIS list, so a later edit to requiredFunctionCalls cannot re-scope it onto a
+      // tool they never saw. An empty list authorizes nothing.
+      autopublishAuthorizedTools?: string[];
+      autopublishAuthorizedAt?: string | null;
+      autopublishAuthorizedBy?: string | null;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
       runCount: number;
+      llmModel: string;
+      llmBackupModel: string;
+      llmBackupSource: 'user' | 'system';
+      llmBackupNeedsConfirmation: boolean;
       variables: Array<{ name: string; description?: string }>;
       variableValues: { [variableName: string]: string };
       variableRequestStatus: 'idle' | 'pending' | 'provided';
@@ -3144,9 +3233,18 @@ export const scheduleDb = {
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
       zeroAssistantRetryCount: number;
+      // ENG-971: marks the requeued zero-output run to CONTINUE the abandoned
+      // session rather than restart it, so work that already published is not
+      // repeated. Consumed (at most once) by the next dispatch.
+      pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-    }>
+    }>,
+    /**
+     * ENG-827: attributes that must STILL hold for this write to land, as read a
+     * moment ago. `undefined` means the attribute must still be absent.
+     */
+    expect?: Record<string, any>
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3159,7 +3257,25 @@ export const scheduleDb = {
         expressionAttributeValues[`:${key}`] = value;
       });
 
-      const params = {
+      // ENG-827: an optional "only if this is still true" clause. A caller that
+      // DERIVES what it writes from what it read cannot write unconditionally — a
+      // concurrent edit between the two turns the write into a decision nobody made.
+      // Expressed as expected attribute values so the check and the write are one
+      // operation; on mismatch DynamoDB throws ConditionalCheckFailedException and
+      // the caller decides what to tell the user.
+      const conditionExpressions: string[] = [];
+      Object.entries(expect || {}).forEach(([key, value], index) => {
+        const alias = `expected${index}`;
+        expressionAttributeNames[`#${alias}`] = key;
+        if (value === undefined) {
+          conditionExpressions.push(`attribute_not_exists(#${alias})`);
+          return;
+        }
+        conditionExpressions.push(`#${alias} = :${alias}`);
+        expressionAttributeValues[`:${alias}`] = value;
+      });
+
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
@@ -3169,6 +3285,9 @@ export const scheduleDb = {
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      if (conditionExpressions.length > 0) {
+        params.ConditionExpression = conditionExpressions.join(" AND ");
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
@@ -3229,20 +3348,41 @@ export const scheduleDb = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         IndexName: 'StatusStartTimeIndex',
         KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
-        FilterExpression: '#type = :type',
         ExpressionAttributeNames: {
           '#status': 'status',
           '#nextRunTime': 'nextRunTime',
-          '#type': 'type',
         },
         ExpressionAttributeValues: {
           ':status': 'active',
           ':now': now,
-          ':type': 'scheduled_chat',
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      const dueSchedules = await paginatedQuery(dynamodb, params);
+      const newlyDetectedLegacyIds: string[] = [];
+
+      for (const schedule of dueSchedules) {
+        const isLegacyTaskSchedule = !schedule.type && Boolean(schedule.taskId);
+        if (
+          isLegacyTaskSchedule &&
+          typeof schedule.scheduleId === 'string' &&
+          !reportedUnsupportedLegacyScheduleIds.has(schedule.scheduleId)
+        ) {
+          reportedUnsupportedLegacyScheduleIds.add(schedule.scheduleId);
+          newlyDetectedLegacyIds.push(schedule.scheduleId);
+        }
+      }
+
+      if (newlyDetectedLegacyIds.length > 0) {
+        console.warn(JSON.stringify({
+          event: 'scheduled_chat_schedule_skipped',
+          reason: 'legacy_task_schedule_unsupported',
+          count: newlyDetectedLegacyIds.length,
+          scheduleIds: newlyDetectedLegacyIds.sort(),
+        }));
+      }
+
+      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -4539,16 +4679,25 @@ export const crmDb = {
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
     listType?: 'sales' | 'customers',
-    isSystemManaged?: boolean
+    isSystemManaged?: boolean,
+    // Idempotent-create support (ENG-524): pass a caller-chosen deterministic ID
+    // (instead of the usual random one) to get a race-safe "create if absent" —
+    // the write is conditioned on the ID not already existing, so concurrent
+    // callers (e.g. two backend instances resolving the same customer's
+    // auto-created default list at once) can't create duplicates. A caller
+    // that loses the race gets a ConditionalCheckFailedException and should
+    // fetch the winner's record via getLeadListById instead.
+    explicitListId?: string
   ) {
     try {
-      const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const listId = explicitListId ?? `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const normalizedAlertEvents = Array.isArray(alertEvents)
         ? alertEvents
         : ['email.received'];
 
-      const params = {
+      const params: AWS.DynamoDB.DocumentClient.PutItemInput = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ...(explicitListId ? { ConditionExpression: 'attribute_not_exists(listId)' } : {}),
         Item: {
           listId,
           userId,
@@ -4676,21 +4825,37 @@ export const crmDb = {
     return items;
   },
 
-  // Returns true if userId owns the list OR is an org member of the same org as the list owner.
+  // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
+  // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
+  // and listed crm.editors retain cross-member read access.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
     const [user, owner] = await Promise.all([
       userDb.getUserById(userId),
       userDb.getUserById(list.userId),
     ]);
-    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+    if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    if (crmEnabled) return true;
+    if (org?.ownerUserId === userId) return true;
+    return !!(crmCfg?.editors && crmCfg.editors.includes(userId));
   },
 
   // Org-aware version: returns the user's own lists plus all org members' lists.
+  // When shareSettings.crm.enabled is false the fan-out is suppressed for plain
+  // members; org owners and crm.editors still receive the full org list.
   async getLeadListsForUser(userId: string) {
     const ownLists = await this.getLeadListsByUserId(userId);
     const user = await userDb.getUserById(userId);
     if (!user?.orgId) return ownLists;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    const isPrivileged =
+      org?.ownerUserId === userId || !!(crmCfg?.editors && crmCfg.editors.includes(userId));
+    if (!crmEnabled && !isPrivileged) return ownLists;
     const members = await orgDb.getOrgMembers(user.orgId);
     const memberListArrays = await Promise.all(
       members
@@ -5103,6 +5268,19 @@ export const crmDb = {
       handleDynamoDbError(error, 'setLeadListSearchCursor');
       throw error;
     }
+  },
+
+  async transferLeadListOwner(listId: string, newUserId: string): Promise<void> {
+    const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-LeadLists`,
+      Key: { listId },
+      UpdateExpression: "SET userId = :uid, updatedAt = :ts",
+      ExpressionAttributeValues: {
+        ":uid": newUserId,
+        ":ts": new Date().toISOString(),
+      },
+    }).promise();
   },
 
   async deleteLeadList(listId: string) {
@@ -6474,19 +6652,29 @@ export const crmDb = {
      *  lead-filter UI. */
     system?: Record<string, any>;
   }>) {
-    try {
-      const results = {
-        successCount: 0,
-        newCount: 0,
-        mergedCount: 0,
-        errorCount: 0,
-        errors: [] as string[],
-        // IDs of newly created leads (excludes merged updates). Used by callers
-        // that need to act on freshly-imported leads — e.g., the CSV importer
-        // queues these for enrich.so email validation when the user opts in.
-        created: [] as Array<{ leadId: string; email?: string }>,
-      };
+    // Declared OUTSIDE the try so the catch below can still see what was
+    // already classified. Refused placeholders are counted before any write
+    // happens, and a later DynamoDB failure must not relabel them as database
+    // errors (ENG-1002 follow-up).
+    const results = {
+      successCount: 0,
+      newCount: 0,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [] as string[],
+      // IDs of newly created leads (excludes merged updates). Used by callers
+      // that need to act on freshly-imported leads — e.g., the CSV importer
+      // queues these for enrich.so email validation when the user opts in.
+      // `sourceIndex` is the position in the input `leads` array the record
+      // was written from, so callers can join a created leadId back to the
+      // row it came from even when the row carries no email (ENG-1002).
+      created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+      // Rows refused because they are LinkedIn's anonymized placeholder
+      // rather than a person (ENG-1002). Reported, never dropped silently.
+      anonymizedSkipped: 0,
+    };
 
+    try {
       // Get existing leads to check for duplicates by email
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
@@ -6516,9 +6704,20 @@ export const crmDb = {
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
-      const uniqueLeads = new Map<string, typeof leads[0]>();
+      // The map value carries the row's original index so `results.created` can
+      // report which input row each written lead came from (ENG-1002).
+      const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
+        // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
+        // one point every write path converges, so no caller can reintroduce
+        // the nameless, un-dedupable rows by routing around the import tool.
+        // `return` (not a re-indexed filter) keeps every surviving row's
+        // sourceIndex pointing at its ORIGINAL position for callers joining on it.
+        if (isLinkedInPlaceholderName(lead)) {
+          results.anonymizedSkipped++;
+          return;
+        }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
         const liKey = normalizeLinkedInUrl(lead.linkedin);
 
@@ -6556,12 +6755,14 @@ export const crmDb = {
           seenLinkedIn.add(liKey);
         }
 
-        uniqueLeads.set(emailKey, lead);
+        uniqueLeads.set(emailKey, { lead, index });
       });
 
-      // Add unique new leads
-      uniqueLeads.forEach((lead) => {
+      // Add unique new leads (keeping each one's input-array position aligned).
+      const newLeadSourceIndices: number[] = [];
+      uniqueLeads.forEach(({ lead, index }) => {
         newLeads.push(lead);
+        newLeadSourceIndices.push(index);
       });
 
       // Process new leads in batches of 25 (DynamoDB batch write limit)
@@ -6569,11 +6770,11 @@ export const crmDb = {
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
 
-        const batchCreated: Array<{ leadId: string; email?: string }> = [];
-        const writeRequests = batch.map(lead => {
+        const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
+        const writeRequests = batch.map((lead, batchIndex) => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
-          batchCreated.push({ leadId, email: emailValue });
+          batchCreated.push({ leadId, email: emailValue, sourceIndex: newLeadSourceIndices[i + batchIndex] });
 
           const item: any = {
             listId,
@@ -6825,13 +7026,22 @@ export const crmDb = {
       return results;
     } catch (error: any) {
       handleDynamoDbError(error, "batchCreateLeads");
+      // NOTE: handleDynamoDbError above always rethrows, so this return is not
+      // reached today — callers see the exception, not this object. It is kept
+      // consistent anyway: the placeholder refusals happened before the failure
+      // and are still true, so they are carried through and the failure is
+      // billed only to the rows actually attempted. Zeroing them would report a
+      // refused placeholder as a database error — the same misreporting
+      // ENG-1002 is about — while still summing to `leads.length` and so
+      // slipping past the accounting invariant unnoticed.
       return {
         successCount: 0,
         newCount: 0,
         mergedCount: 0,
-        errorCount: leads.length,
+        errorCount: leads.length - results.anonymizedSkipped,
         errors: [`Batch upload failed: ${error.message}`],
-        created: [] as Array<{ leadId: string; email?: string }>,
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+        anonymizedSkipped: results.anonymizedSkipped,
       };
     }
   },
@@ -7910,8 +8120,14 @@ export const crmDb = {
       topLevel?: Record<string, string>;
       enrichmentMetadata?: Record<string, any>;
       customFields?: Record<string, string>;
+      /** CRM-internal bookkeeping sidecar (see updateLead's `system` param) — same
+       *  atomic per-key document-path SET as customFields/enrichmentMetadata, but
+       *  never triggers the customFields fieldNames sync below, since these keys
+       *  must NOT show up in CSV exports or the Configure Display Fields UI. */
+      system?: Record<string, any>;
       removeEnrichmentMetadataKeys?: string[];
       removeCustomFieldKeys?: string[];
+      removeSystemKeys?: string[];
       /** When true, all SET clauses use if_not_exists() — atomically skips any
        *  field already present in the DB. Use for bulk enrichment paths that
        *  must never overwrite user-entered or concurrently-written data. */
@@ -7925,22 +8141,31 @@ export const crmDb = {
       : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
     const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
+    const hasSystemKeys = Object.keys(options.system ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
-    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
+    const hasRemoveSystem = (options.removeSystemKeys ?? []).length > 0;
+    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasSystemKeys && !hasRemoveMeta && !hasRemoveCustom && !hasRemoveSystem) return;
 
     // Step 1: ensure parent maps exist so document-path SETs/REMOVEs don't throw.
     // REMOVE on a nested path (e.g. customFields.key) also requires the parent
     // map to exist — bootstrap whenever we touch either map at all.
-    if (hasMetaKeys || hasCustomKeys || hasRemoveMeta || hasRemoveCustom) {
+    if (hasMetaKeys || hasCustomKeys || hasSystemKeys || hasRemoveMeta || hasRemoveCustom || hasRemoveSystem) {
       try {
         await dynamodb.update({
           TableName: tableName,
           Key: key,
+          // `system` is a DynamoDB reserved keyword — confirmed live against a real
+          // table (round 15/16 smoke test): using it unescaped throws
+          // ValidationException, invisible to unit tests since they mock
+          // dynamodb.update() and never validate expression syntax. #system placeholder
+          // required wherever it appears as a top-level attribute name in an expression.
           UpdateExpression:
             'SET customFields = if_not_exists(customFields, :emptyMap), ' +
-            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap), ' +
+            '#system = if_not_exists(#system, :emptyMap)',
+          ExpressionAttributeNames: { '#system': 'system' },
           ExpressionAttributeValues: { ':emptyMap': {} },
           ConditionExpression: 'attribute_exists(leadId)',
         }).promise();
@@ -8013,6 +8238,17 @@ export const crmDb = {
       idx++;
     }
 
+    idx = 0;
+    for (const [k, v] of Object.entries(options.system ?? {})) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
+      attrNames[`#sys${idx}`] = k;
+      attrValues[`:sys${idx}`] = v;
+      setClauses.push(ine
+        ? `#system.#sys${idx} = if_not_exists(#system.#sys${idx}, :sys${idx})`
+        : `#system.#sys${idx} = :sys${idx}`);
+      idx++;
+    }
+
     let rmIdx = 0;
     for (const k of options.removeEnrichmentMetadataKeys ?? []) {
       attrNames[`#rmem${rmIdx}`] = k;
@@ -8024,6 +8260,14 @@ export const crmDb = {
     for (const k of options.removeCustomFieldKeys ?? []) {
       attrNames[`#rmcf${rmIdx}`] = k;
       removeClauses.push(`customFields.#rmcf${rmIdx}`);
+      rmIdx++;
+    }
+
+    rmIdx = 0;
+    for (const k of options.removeSystemKeys ?? []) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
+      attrNames[`#rmsys${rmIdx}`] = k;
+      removeClauses.push(`#system.#rmsys${rmIdx}`);
       rmIdx++;
     }
 
@@ -8074,6 +8318,91 @@ export const crmDb = {
         // eslint-disable-next-line no-console
         console.warn('[setLeadFields] fieldNames sync failed:', (err as Error).message);
       }
+    }
+  },
+
+  /**
+   * Atomic claim-before-act lock on a single `system` sub-key: SETs it ONLY if it
+   * doesn't already exist, returning whether THIS caller won the claim.
+   *
+   * Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+   * queue (asyncJobQueue.ts — if every heartbeat write for a claimed job fails
+   * across the whole staleness window) can, in the worst case, let two instances
+   * both start processing the SAME booking concurrently. Per-step completion
+   * markers (setLeadFields's `system` writes) already stop a THIRD run from
+   * repeating a step once one instance finishes it, but two instances racing
+   * to the SAME not-yet-done step would both pass that check and both fire the
+   * external side effect (a duplicate HubSpot/Attio sync call, a duplicate
+   * customer alert) before either gets to write "done".
+   *
+   * This closes that specific gap: callers claim the step BEFORE doing the
+   * side-effecting work, not after. Only one of two concurrent claimants can
+   * ever win (DynamoDB's conditional write is the actual mutex — not a
+   * probabilistic reduction like more retries would be), so at most one
+   * instance ever performs the real side effect, regardless of how the race
+   * that caused two instances to run in the first place happened.
+   *
+   * Callers MUST release the claim (removeSystemKeys) if the guarded work then
+   * fails, or the step is wedged forever — see calendlyWebhook.ts's runStepOnce.
+   */
+  async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        // `system` is a DynamoDB reserved keyword — confirmed live against a real
+        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
+        // invisible to unit tests since they mock dynamodb.update() and never
+        // validate expression syntax against DynamoDB's actual reserved-word list.
+        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+        ExpressionAttributeNames: { '#system': 'system' },
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
+      throw err;
+    }
+
+    // Greptile P1 on #2291 (round 17): the release-on-failure write in
+    // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
+    // errors) — if THAT write also fails, a bare-value claim would stay
+    // 'in_progress' forever, and every future retry's claim attempt would keep
+    // losing to it indefinitely: not a probability reduction problem, a
+    // structural one, the same class already fixed twice this session for the
+    // async queue's own staleness model. So the claim carries its own
+    // timestamp and the condition below allows reclaiming an 'in_progress'
+    // claim that's older than CLAIM_STALE_MS — recoverable within a bounded
+    // window even if the release write is never seen again, while still
+    // conservative enough (5 minutes, same order of magnitude as the queue's
+    // own STALE_PROCESSING_MS) that a genuinely still-running external call
+    // is never reclaimed out from under itself.
+    const now = new Date().toISOString();
+    const staleThreshold = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :claim, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key, '#status': 'status', '#claimedAt': 'claimedAt' },
+        ExpressionAttributeValues: {
+          ':claim': { status: 'in_progress', claimedAt: now },
+          ':ts': now,
+          ':inProgress': 'in_progress',
+          ':staleThreshold': staleThreshold,
+        },
+        ConditionExpression:
+          'attribute_not_exists(#system.#k) OR ' +
+          '(#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
     }
   },
 
@@ -8816,7 +9145,8 @@ export const socialEngagementTrackingDb = {
     commentId?: string;
     engagingAccountId: string;
     actionType: string;
-  }) {
+    scheduleId: string;
+  }): Promise<boolean> {
     try {
       const dedupId = params.commentId || params.postId;
       const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
@@ -8827,8 +9157,22 @@ export const socialEngagementTrackingDb = {
       await dynamodb.delete({
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Key: { userId: params.userId, postId_engagingAccountId: key },
+        // Only remove the queued reservation that belongs to this schedule.
+        // A failed attempt can be rescheduled under a new ID before an older
+        // schedule reaches cleanup; deleting by key alone would erase that
+        // newer reservation and allow duplicate LinkedIn activity.
+        ConditionExpression: 'scheduleId = :scheduleId AND #status = :queued',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':scheduleId': params.scheduleId,
+          ':queued': 'queued',
+        },
       }).promise();
+      return true;
     } catch (error) {
+      if ((error as any)?.code === 'ConditionalCheckFailedException') {
+        return false;
+      }
       handleDynamoDbError(error, "deleteEngagement");
       throw error;
     }
@@ -8957,7 +9301,6 @@ export const socialEngagementTrackingDb = {
 // ==================== Organization DB Operations ====================
 
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
-const ORG_MAX_MEMBERS = 5;
 
 export const orgDb = {
   async createOrg(org: Organization): Promise<Organization> {
@@ -8979,7 +9322,62 @@ export const orgDb = {
     return (result.Item as Organization) || null;
   },
 
-  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+  /**
+   * Serialize owner-losing operations on one org.
+   *
+   * The "an org always keeps an owner" invariant spans MEMBER items, so no
+   * single conditional write can express it: two concurrent departures each
+   * read the roster, each see the other owner, and both proceed to zero.
+   *
+   * This makes the org item the serialization point. A caller reads
+   * `ownerEpoch` alongside the roster it validated, then claims the change
+   * conditionally. Whoever wins bumps the epoch; the loser's condition fails,
+   * so it must re-read and re-validate against the roster the winner left
+   * behind — where it will correctly find itself removing the last owner.
+   *
+   * No backfill: `attribute_not_exists` treats an org that has never had an
+   * owner change as epoch 0, so the attribute appears on first use.
+   *
+   * Returns false when another departure claimed the same epoch.
+   */
+  async claimOwnerChange(orgId: string, expectedEpoch: number): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET ownerEpoch = :next",
+          ConditionExpression:
+            expectedEpoch === 0
+              ? "attribute_not_exists(ownerEpoch) OR ownerEpoch = :expected"
+              : "ownerEpoch = :expected",
+          ExpressionAttributeValues: { ":next": expectedEpoch + 1, ":expected": expectedEpoch },
+        })
+        .promise();
+      return true;
+    } catch (e: any) {
+      if (e?.code === "ConditionalCheckFailedException") return false;
+      throw e;
+    }
+  },
+
+  /**
+   * `options.condition` mirrors `userDb.updateUser`'s: an optional guard so a
+   * caller doing read-modify-write on an org can refuse to clobber a value that
+   * moved underneath it. Unmet conditions are rethrown verbatim so the caller
+   * can tell "my guard fired" apart from a real DynamoDB fault.
+   */
+  async updateOrg(
+    orgId: string,
+    updates: Partial<Organization>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ): Promise<Organization> {
     const { orgId: _, createdAt: __, ...updatableFields } = updates;
 
     if (Object.keys(updatableFields).length === 0) {
@@ -9022,7 +9420,7 @@ export const orgDb = {
     updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
     if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
-    const params = {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: updateExpressionParts.join(" "),
@@ -9030,6 +9428,11 @@ export const orgDb = {
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes as Organization;
@@ -9192,41 +9595,78 @@ export const orgDb = {
     throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
-  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+  // Optimistic-concurrency guard is MANDATORY: every caller does a
+  // read-modify-write of the whole shareSettings document, so every caller
+  // must pass the updatedAt it read (or `undefined` for a legacy org record
+  // that has no updatedAt yet). An overlapping writer then surfaces as a
+  // ConditionalCheckFailedException instead of a silent last-writer-wins
+  // that erases the other writer's grants.
+  async updateShareSettings(
+    orgId: string,
+    settings: OrgShareSettings,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
     await dynamodb.update({
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "updatedAt = :expected"
+          : "attribute_not_exists(updatedAt)",
       ExpressionAttributeValues: {
         ":s": settings,
-        ":u": new Date().toISOString(),
+        ":u": nextUpdatedAt,
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
       },
     }).promise();
+    return nextUpdatedAt;
   },
 
   async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
-    const got = await dynamodb.get({
-      TableName: ORGS_TABLE,
-      Key: { orgId },
-    }).promise();
-    const org = got.Item as Organization | undefined;
-    if (!org?.shareSettings) return;
-    const ss = org.shareSettings;
-    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
-    const next: OrgShareSettings = {
-      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
-      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
-      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
-      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
-      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
-      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
-      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
-      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
-    };
-    await this.updateShareSettings(orgId, next);
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const got = await dynamodb.get({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+      }).promise();
+      const org = got.Item as Organization | undefined;
+      if (!org?.shareSettings) return;
+      const ss = org.shareSettings;
+      const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+      const next: OrgShareSettings = {
+        knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+        htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+        landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+        workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+        skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+        analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
+        crm:               { ...(ss.crm ?? { enabled: true, editors: [] }), editors: strip((ss.crm?.editors) ?? []) },
+        brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+        marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+      };
+      try {
+        await this.updateShareSettings(orgId, next, org.updatedAt);
+        return;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`pruneEditorListsForUser: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
-  ORG_MAX_MEMBERS,
 
   /**
    * Persist an encrypted secret value to the org record.

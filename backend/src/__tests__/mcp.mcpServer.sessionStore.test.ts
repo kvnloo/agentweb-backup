@@ -254,4 +254,84 @@ describe('setupMcpServer durable session store wiring', () => {
     expect(res.status).toBe(204); // idempotent, no existence leak
     expect((store as any).delete).not.toHaveBeenCalled();
   });
+
+  describe('ENG-984: anonymous discovery sessions across instances', () => {
+    // Each unauthenticated request mints a fresh anon_ id, so an exact-match
+    // ownership check can never reunite an anonymous caller with its session on
+    // another instance. Anon-owned sessions rehydrate for any anonymous-permitted
+    // request instead — the allowlist already confines those to discovery.
+    it('rehydrates an anon-owned session for an unauthenticated discovery request', async () => {
+      process.env.MCP_ANONYMOUS_DISCOVERY = 'true';
+      const store = makeSpyStore({
+        get: jest.fn().mockResolvedValue(
+          record({ isInternal: false, agentUserId: 'anon_1111-2222' }),
+        ),
+      });
+      const app = makeApp(store);
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('mcp-session-id', 'sess-A')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.rehydrated).toBe(true);
+      expect(rehydrateAndServe as jest.Mock).toHaveBeenCalledTimes(1);
+      expect((store as any).touch).toHaveBeenCalledWith('sess-A');
+    });
+
+    it('does NOT hand an anonymous caller a real user’s session (IDOR guard holds)', async () => {
+      process.env.MCP_ANONYMOUS_DISCOVERY = 'true';
+      const store = makeSpyStore({
+        get: jest.fn().mockResolvedValue(record({ isInternal: false, agentUserId: 'userX' })),
+      });
+      const app = makeApp(store);
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('mcp-session-id', 'sess-A')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+
+      expect(res.status).toBe(404);
+      expect(rehydrateAndServe as jest.Mock).not.toHaveBeenCalled();
+    });
+
+    it('does NOT hand an authenticated caller an anon-owned session', async () => {
+      process.env.MCP_ANONYMOUS_DISCOVERY = 'true';
+      const store = makeSpyStore({
+        get: jest.fn().mockResolvedValue(
+          record({ isInternal: false, agentUserId: 'anon_1111-2222' }),
+        ),
+      });
+      const app = makeApp(store);
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${INTERNAL_TOKEN}`)
+        .set('mcp-session-id', 'sess-A')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+
+      expect(res.status).toBe(404);
+      expect(rehydrateAndServe as jest.Mock).not.toHaveBeenCalled();
+    });
+
+    it('with the flag OFF, an unauthenticated request is 401d before rehydration', async () => {
+      delete process.env.MCP_ANONYMOUS_DISCOVERY;
+      const store = makeSpyStore({
+        get: jest.fn().mockResolvedValue(
+          record({ isInternal: false, agentUserId: 'anon_1111-2222' }),
+        ),
+      });
+      const app = makeApp(store);
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('mcp-session-id', 'sess-A')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+
+      expect(res.status).toBe(401);
+      expect(rehydrateAndServe as jest.Mock).not.toHaveBeenCalled();
+      expect((store as any).get).not.toHaveBeenCalled();
+    });
+  });
 });

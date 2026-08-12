@@ -53,11 +53,27 @@ jest.mock('../services/agentModeService', () => ({
     getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getReportsModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getCustomerSupportDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getSupportedModels: jest.fn().mockResolvedValue(['gpt-5-chat-2']),
+    resolveGenerationModel: jest.fn((model: string) => ({
+      model,
+      fellBack: false,
+      requestedModel: model,
+    })),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateDiagnosticMessage: jest.fn().mockResolvedValue(null),
   },
   AgentModeService: jest.fn(),
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn().mockResolvedValue({
+    billingUserId: 'user-owner',
+    policy: null,
+    costUsedMicroUsd: 0,
+    tokenUsed: 0,
+    mode: { usageMode: 'full_choice', reason: 'no_policy' },
+  }),
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
@@ -106,10 +122,13 @@ import { agentModeController, activeSessionGenerations } from '../controllers/ag
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import { __setDocumentClientForTests } from '../services/agentMode/runStore';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockGetEffectiveLlmUsagePolicy = getEffectiveLlmUsagePolicy as jest.Mock;
+const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 
 /** Conditional-put-aware in-memory DocumentClient fake (mirrors sessionIdempotency.test.ts). */
 class DdbFake {
@@ -241,7 +260,25 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
     mockChatbotDb.addMessageToSession.mockResolvedValue(ownedSession as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue(ownedSession as any);
     mockWorkerService.runInWorker.mockResolvedValue(workerResult as any);
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: ownerId,
+      policy: null,
+      costUsedMicroUsd: 0,
+      tokenUsed: 0,
+      mode: { usageMode: 'full_choice', reason: 'no_policy' },
+    });
+    mockCheckTokenUsage.mockResolvedValue({
+      allowed: true,
+      warning: false,
+      used: 0,
+      allowance: null,
+      bonus: 0,
+      effectiveAllowance: null,
+      percentUsed: 0,
+      month: '2026-07',
+    });
   });
 
   describe('run store OFF (default lane)', () => {
@@ -280,6 +317,67 @@ describe('generateResponse session ownership (acceptance — ENG-346)', () => {
       expect(res.statusCode).toBe(200);
       expect(res.body).toEqual(expect.objectContaining({ content: 'OK' }));
       expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        sessionId,
+        'gpt-5-chat-2',
+        expect.objectContaining({
+          requestedModel: 'gpt-5-chat-2',
+          effectiveModel: 'gpt-5-chat-2',
+          modelSelection: 'honored',
+          usageMode: 'full_choice',
+        }),
+      );
+      expect(res.body).toEqual(expect.objectContaining({
+        requestedModel: 'gpt-5-chat-2',
+        effectiveModel: 'gpt-5-chat-2',
+        modelSelection: 'honored',
+        usageMode: 'full_choice',
+      }));
+    });
+
+    it('records a blocked hard-cap decision without invoking the provider', async () => {
+      mockCheckTokenUsage.mockResolvedValue({
+        allowed: false,
+        warning: false,
+        used: 1,
+        allowance: null,
+        bonus: 0,
+        effectiveAllowance: null,
+        percentUsed: 0,
+        month: '2026-07',
+        usageMode: 'paused',
+        usagePolicyVersion: 'policy-v1',
+      });
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: ownerId,
+        policy: {
+          version: 'policy-v1',
+          enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+        },
+        costUsedMicroUsd: 60_000_000,
+        tokenUsed: 1,
+        mode: { usageMode: 'paused', reason: 'hard_cost_cap_reached' },
+      });
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq({ userId: ownerId }), res);
+
+      expect(res.statusCode).toBe(429);
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        sessionId,
+        'gpt-5-chat-2',
+        expect.objectContaining({
+          effectiveModel: null,
+          modelSelection: 'blocked',
+          usageMode: 'paused',
+          usagePolicyVersion: 'policy-v1',
+        }),
+      );
     });
 
     it('ACCEPTANCE 2: a delegated admin (token targeting the owner) can generate — req.user is already the target user', async () => {

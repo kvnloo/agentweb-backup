@@ -23,7 +23,8 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
@@ -184,6 +185,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
+  "llmUsageCredits",
   "extraCostUsage",
   "extraCostUsageHistory",
   "googleDriveFolders",
@@ -228,20 +230,87 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
     }
-    const org = await orgDb.getOrgById(orgId);
-    if (!org) {
-      return res.status(404).json({ message: "Organization not found" });
+    // Guarded read-modify-write with retry: an overlapping share-settings
+    // writer fails the conditional write and we re-apply the toggle on top of
+    // the fresh document instead of clobbering its changes.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; ; attempt++) {
+      const org = await orgDb.getOrgById(orgId);
+      if (!org) {
+        return res.status(404).json({ message: "Organization not found" });
+      }
+      const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
+      const shareSettings = {
+        ...(org.shareSettings ?? {}),
+        analytics: { enabled, editors: existing.editors ?? [] },
+      };
+      try {
+        await orgDb.updateShareSettings(orgId, shareSettings as any, org.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
+          throw writeError;
+        }
+      }
     }
-    const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
-    const shareSettings = {
-      ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors ?? [] },
-    };
-    await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
   } catch (error: any) {
     console.error("Error updating org analytics-sharing:", error.message);
     return res.status(500).json({ message: "Failed to update analytics sharing" });
+  }
+});
+
+// ─── Org billing owner (admin-controlled) ────────────────────────────────
+// PATCH /api/admin/orgs/:orgId/billing-owner  { userId }
+//
+// The escape hatch for the refusal in routes/org.ts: a paying billing owner
+// cannot be removed, because their card cannot follow the badge. When a
+// customer is genuinely stuck — the payer has left the company, say — this
+// moves the pointer deliberately, by a human who knows the plan will now
+// resolve to the new owner's subscription.
+//
+// It does NOT move money. Whatever the new owner is paying becomes what the
+// org gets, which is why the response says so explicitly rather than leaving
+// the operator to infer it.
+router.patch("/orgs/:orgId/billing-owner", async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { userId } = req.body ?? {};
+    if (!userId || typeof userId !== "string") {
+      return res.status(400).json({ message: "Body field 'userId' is required" });
+    }
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+    if (org.ownerUserId === userId) {
+      return res.json({ orgId, ownerUserId: userId, unchanged: true });
+    }
+
+    const target = await userDb.getUserById(userId);
+    if (!target || target.orgId !== orgId) {
+      return res.status(400).json({ message: "That user is not a member of this organization" });
+    }
+    // Owner-only, so the pointer can never rest on someone without the
+    // authority to manage what it pays for.
+    if (target.orgRole !== "owner") {
+      return res.status(400).json({ message: "The billing owner must be an owner of the organization" });
+    }
+
+    const previous = org.ownerUserId;
+    await orgDb.updateOrg(orgId, { ownerUserId: userId });
+    console.log(`[admin] billing owner for ${orgId}: ${previous} -> ${userId} (by ${(req as any).user?.userId})`);
+
+    return res.json({
+      orgId,
+      ownerUserId: userId,
+      previousOwnerUserId: previous,
+      // Said out loud: this moved the pointer, not the payment method.
+      note: "Billing pointer moved. The org's plan now resolves to the new owner's own subscription; the previous owner's Stripe subscription is untouched and still bills them.",
+      newOwnerSubscription: target.subscriptionType ?? "Free",
+      newOwnerSubscriptionStatus: target.subscription_status ?? "none",
+    });
+  } catch (error: any) {
+    console.error("Error updating org billing owner:", error.message);
+    return res.status(500).json({ message: "Failed to update billing owner" });
   }
 });
 
@@ -626,7 +695,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
       ? await crmDb.batchCreateLeads(parsed.listId, leads)
-      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
     if (results.errorCount === 0) {
@@ -644,6 +713,16 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       );
     }
 
+    // ENG-1002: this route reports `attemptedCount` outright, so a row refused
+    // as a LinkedIn placeholder leaves attempted > success + errors with
+    // nothing to explain the difference. Report it in both the payload and the
+    // message, as the other import paths do.
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
+    const skippedNote =
+      syncAnonymizedSkipped > 0
+        ? ` ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped.`
+        : "";
+
     return res.json({
       success: true,
       source,
@@ -656,11 +735,13 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
       message:
-        results.errorCount === 0
+        (results.errorCount === 0
           ? `Synced ${results.successCount} record(s) from ${source}.`
-          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`) +
+        skippedNote,
     });
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
@@ -1195,15 +1276,24 @@ router.put("/users/:userId/email-sender", async (req, res) => {
 router.get("/slack/channel-info", async (req, res) => {
   try {
     const { channelId } = req.query;
-    if (!channelId || typeof channelId !== "string") {
+    if (typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const configuredChannelId = channelId.trim();
+    if (!configuredChannelId) {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const info = await getSlackChannelInfo(channelId.trim());
+    const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
-      return res.status(404).json({ message: "Channel not found or bot not a member" });
+      return res.json({
+        channelId: configuredChannelId,
+        displayName: configuredChannelId,
+        resolved: false,
+        message: "Channel not found or bot not a member",
+      });
     }
-    res.json(info);
+    res.json({ ...info, channelId: configuredChannelId, resolved: true });
   } catch (error: any) {
     console.error("Error fetching Slack channel info:", error);
     res.status(500).json({ message: "Error fetching channel info", details: error.message });
@@ -4607,6 +4697,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4615,6 +4706,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
+        allowedFeatures: allAvailableFeatures,
       }];
     }
 
@@ -4647,6 +4739,11 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
 
@@ -4656,10 +4753,13 @@ router.get("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
+        ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
+        ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
       };
     }));
 
@@ -4684,6 +4784,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4695,6 +4796,9 @@ router.post("/subscription-types", async (req, res) => {
       }
       if (!Array.isArray(type.allowedSkills)) {
         throw new Error("Each subscription type must have allowedSkills array");
+      }
+      if (type.allowedFeatures !== undefined && !Array.isArray(type.allowedFeatures)) {
+        throw new Error("allowedFeatures must be an array when provided");
       }
 
       // Remove "/marketing" prefix from allowedPages if present
@@ -4724,6 +4828,11 @@ router.post("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4736,6 +4845,54 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyCostAllowance)
         : null;
 
+      let normalizedLlmUsagePolicy: any = undefined;
+      if (type.llmUsagePolicy != null) {
+        const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
+        const { getModelPrice } = await import('../utils/llmPricing');
+        const { agentModeService } = await import('../services/agentModeService');
+        normalizedLlmUsagePolicy = {
+          version: String(type.llmUsagePolicy.version || '').trim(),
+          enforcementState: type.llmUsagePolicy.enforcementState,
+          optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
+          hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
+          optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            : [],
+          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+        };
+        const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
+        const supportedModels = new Set(await agentModeService.getSupportedModels(true));
+        for (const model of normalizedLlmUsagePolicy.optimizedModelIds) {
+          if (!supportedModels.has(model)) policyErrors.push(`optimized model '${model}' is not supported`);
+          if (!getModelPrice(model)) policyErrors.push(`optimized model '${model}' has no price entry`);
+        }
+        if (policyErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage policy: ${policyErrors.join('; ')}`);
+        }
+      }
+
+      let normalizedLlmUsageTopUp: any = undefined;
+      if (type.llmUsageTopUp != null) {
+        const { validateLlmUsageTopUpConfig } = await import('../services/llmUsageTopUpService');
+        normalizedLlmUsageTopUp = {
+          enabled: type.llmUsageTopUp.enabled === true,
+          minimumMarkupBps: Number(type.llmUsageTopUp.minimumMarkupBps),
+          packages: Array.isArray(type.llmUsageTopUp.packages)
+            ? type.llmUsageTopUp.packages.map((item: any) => ({
+                id: String(item.id || '').trim(),
+                label: String(item.label || '').trim(),
+                priceCents: Number(item.priceCents),
+                usageCreditMicroUsd: Number(item.usageCreditMicroUsd),
+                active: item.active === true,
+              }))
+            : [],
+        };
+        const topUpErrors = validateLlmUsageTopUpConfig(normalizedLlmUsageTopUp);
+        if (topUpErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage top-up: ${topUpErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -4747,8 +4904,11 @@ router.post("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
+        ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
+        ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
       };
     }));
 
@@ -4765,6 +4925,11 @@ router.post("/subscription-types", async (req, res) => {
     console.error("Error saving subscription types:", error);
     res.status(400).json({ message: error.message || "Error saving subscription types" });
   }
+});
+
+router.get("/subscription-features", async (_req, res) => {
+  const subscriptionService = await import('../services/subscriptionService');
+  res.json({ features: subscriptionService.getAllAvailableSubscriptionFeatures() });
 });
 
 // Add or remove a single skill from a subscription type
@@ -4974,6 +5139,51 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Grant an auditable, idempotent one-time provider-cost credit for this month.
+// This is the cost-based replacement for ad-hoc token bonuses once a tier has a
+// versioned LLM usage policy. Org members resolve to their billing owner so the
+// grant and the enforced counter cannot diverge.
+router.post("/users/:userId/llm-usage-credit", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { amountUsd, reason, idempotencyKey } = req.body || {};
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ message: "amountUsd must be a positive number" });
+    }
+    if (typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ message: "reason is required" });
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+      return res.status(400).json({ message: "idempotencyKey must be 8-100 URL-safe characters" });
+    }
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) return res.status(404).json({ message: "User not found" });
+
+    const billingUserId = await resolveBillingUserId(userId);
+    const amountMicroUsd = Math.round(amountUsd * 1_000_000);
+    const admin = (req as any).user;
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId,
+      grantId: `admin:${billingUserId}:${idempotencyKey}`,
+      source: "admin",
+      amountMicroUsd,
+      reason,
+      grantedBy: admin?.email || admin?.userId || "admin",
+    });
+    return res.json({
+      granted: result.granted,
+      billingUserId,
+      amountUsd: amountMicroUsd / 1_000_000,
+      month: result.ledger.month,
+      totalAdminGrantedUsd: (result.ledger.totalAdminGrantedMicroUsd || 0) / 1_000_000,
+      grants: result.ledger.grants,
+    });
+  } catch (error) {
+    console.error("Error granting LLM usage credit:", error);
+    return res.status(500).json({ message: "Error granting LLM usage credit" });
   }
 });
 

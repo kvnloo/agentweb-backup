@@ -1,5 +1,8 @@
 import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
+import { inheritsOrgBilling } from "./orgAuthz";
+import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
+import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -16,11 +19,14 @@ export interface TokenUsageStatus {
   costUsed: number; // USD spent this month
   costAllowance: number | null; // null = unlimited
   costPercentUsed: number; // 0-100+, 0 if unlimited (cost dimension)
-  // Whether the cost cap is the ENFORCED gate right now (ENFORCE_COST_CAP). While
-  // false the dollar figures are observe-only — we're gathering spend data to
-  // decide the cost quota. UIs use this to know when a real cost denominator
-  // exists: the customer-facing meter only surfaces cost once this is true.
+  // Whether the cost cap is the dimension actually gating THIS user right now.
+  // Requires both ENFORCE_COST_CAP and a configured costAllowance — the flag alone
+  // is not enough, because an unpriced tier falls back to its token cap (ENG-1116).
+  // While false the dollar figures are observe-only. UIs use this to know which
+  // dimension to render as the quota: true means a real cost denominator exists.
   costEnforced: boolean;
+  usageMode?: LlmUsageMode;
+  usagePolicyVersion?: string | null;
 }
 
 /**
@@ -30,10 +36,27 @@ export interface TokenUsageStatus {
  */
 export async function resolveBillingUserId(userId: string): Promise<string> {
   const user = await userDb.getUserById(userId);
-  if (!user || !user.orgId || user.orgRole !== "member") return userId;
+  if (!user || !user.orgId) return userId;
 
   const org = await orgDb.getOrgById(user.orgId);
   if (!org) return userId;
+
+  // Anchored on the billing root, not on a role. The previous test was
+  // `user.orgRole !== "member"`, which treated "member" as a synonym for "not the
+  // owner". With admins (or a second owner) that is false: they are not "member",
+  // so usage stopped landing on the org counter and started burning their own
+  // quota — silently. Everyone except the billing root pools onto it.
+  // ENG-1084: a member holding their own live subscription no longer pools onto
+  // the root — `inheritsOrgBilling` is now the single predicate entitlement and
+  // quota both resolve through, so the two cannot drift a fourth time.
+  if (
+    !inheritsOrgBilling(
+      { userId, orgId: user.orgId, subscription_status: user.subscription_status },
+      org,
+    )
+  ) {
+    return userId;
+  }
 
   return org.ownerUserId;
 }
@@ -94,17 +117,19 @@ export async function getUserTokenAllowance(
   bonus: number;
   effectiveAllowance: number | null;
   costAllowance: number | null;
+  llmUsagePolicy: LlmUsagePolicy | null;
 }> {
   const subscriptionTypeName = await getUserSubscriptionType(userId);
   const config = await getSubscriptionTypeConfig(subscriptionTypeName);
 
   const baseAllowance = config?.monthlyTokenAllowance ?? null;
   const costAllowance = config?.monthlyCostAllowance ?? null;
+  const llmUsagePolicy = config?.llmUsagePolicy ?? null;
   const user = await userDb.getUserById(userId);
   const bonus = user?.tokenAllowanceBonus || 0;
 
   if (baseAllowance === null || baseAllowance === undefined) {
-    return { allowance: null, bonus, effectiveAllowance: null, costAllowance };
+    return { allowance: null, bonus, effectiveAllowance: null, costAllowance, llmUsagePolicy };
   }
 
   return {
@@ -112,6 +137,7 @@ export async function getUserTokenAllowance(
     bonus,
     effectiveAllowance: baseAllowance + bonus,
     costAllowance,
+    llmUsagePolicy,
   };
 }
 
@@ -122,14 +148,25 @@ export async function getUserTokenAllowance(
 export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
-  const { allowance, bonus, effectiveAllowance, costAllowance } = await getUserTokenAllowance(
-    billingUserId
-  );
+  const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy }, billingUser] = await Promise.all([
+    getUserTokenAllowance(billingUserId),
+    userDb.getUserById(billingUserId),
+  ]);
 
-  // Two independent limits: token-count and dollar cost. The cost dimension is
-  // what will eventually make higher-cost models (e.g. Fable) safe to enable — a
-  // token-count cap alone can't bound dollar spend.
+  // Two dimensions are measured — token-count and dollar cost — but only ONE of
+  // them gates at a time. Dollars are the real unit of consumption: a token-count
+  // cap cannot bound spend once models are priced differently (ENG-207), so a
+  // token allowance sized for cheap models silently becomes either a giveaway or,
+  // as happened here, a wall. ENFORCE_COST_CAP selects which dimension gates.
   //
+  // ENG-1116 — this used to AND the two caps (cost as an *additional* limit).
+  // It now REPLACES: with the flag on, cost gates and the token counter is
+  // observe-only. Keeping the token cap live alongside cost would defeat the flip
+  // entirely, because the token allowances are the thing being retired — four prod
+  // users are already past them, one at 1600% of a Free tier's 3M.
+  // Versioned admin policy is the explicit cost-gating switch. The legacy env
+  // flag retains the same replacement semantics for tiers without a versioned
+  // policy: when cost is gated, token volume is observe-only.
   // Cost enforcement is OFF by default (observe-only): we accumulate and surface
   // per-user cost so we can gather real spend data before deciding to gate on it,
   // but we do NOT block users on cost yet. Token-count remains the only hard gate.
@@ -139,20 +176,59 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   // validated real per-user spend against the shadow book. Flip
   // ENFORCE_COST_CAP=true to enable the cost cap; the enforcement path stays
   // tested below.
-  const enforceCostCap = process.env.ENFORCE_COST_CAP === "true";
+  const versionedCostPolicyEnforced = !!llmUsagePolicy && llmUsagePolicy.enforcementState !== "observe";
+  const enforceCostCap = versionedCostPolicyEnforced || process.env.ENFORCE_COST_CAP === "true";
+
+  const rawCostUsedMicroUsd = Math.max(0, Math.round((usage.totalCost || 0) * 1_000_000));
+  const creditAdjustment = getLlmUsageCreditAdjustment(billingUser?.llmUsageCredits, usage.month);
+  const adjustedUsage = llmUsagePolicy
+    ? applyLlmUsageCredits({
+        rawCostUsedMicroUsd,
+        hardThresholdMicroUsd: llmUsagePolicy.hardCostThresholdMicroUsd,
+        adjustment: creditAdjustment,
+      })
+    : { policyCostUsedMicroUsd: rawCostUsedMicroUsd, effectiveHardThresholdMicroUsd: 0 };
+  const effectiveLlmUsagePolicy = llmUsagePolicy
+    ? { ...llmUsagePolicy, hardCostThresholdMicroUsd: adjustedUsage.effectiveHardThresholdMicroUsd }
+    : null;
+  const costUsedMicroUsd = adjustedUsage.policyCostUsedMicroUsd;
+  const usageDecision = evaluateLlmUsageMode({
+    costUsedMicroUsd,
+    tokenUsed: usage.totalTokens,
+    policy: effectiveLlmUsagePolicy,
+  });
+  const effectiveCostAllowance = versionedCostPolicyEnforced
+    ? effectiveLlmUsagePolicy!.hardCostThresholdMicroUsd / 1_000_000
+    : costAllowance;
 
   const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
-  const costPercentUsed = computePercentUsed(usage.totalCost, costAllowance);
+  const policyCostUsed = costUsedMicroUsd / 1_000_000;
+  const costPercentUsed = computePercentUsed(policyCostUsed, effectiveCostAllowance);
+
+  // A tier with no configured dollar allowance would become completely ungated the
+  // moment the flag flips — a strictly worse failure than the cap being replaced.
+  // Such tiers keep their token cap until someone prices them. That guard is also
+  // what makes the rollout order-independent: this code can ship to prod, where
+  // every tier is currently unpriced, and change nothing until the allowances land.
+  const costIsGate = enforceCostCap && effectiveCostAllowance !== null;
 
   const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
-  const costAllowed = costAllowance === null || costPercentUsed < 100;
-  const allowed = tokenAllowed && (enforceCostCap ? costAllowed : true);
+  const costAllowed = effectiveCostAllowance === null || costPercentUsed < 100;
+  // Once a versioned cost policy is enforced, raw token volume is observe-only:
+  // admission is governed exclusively by provider/model cost. Legacy rows retain
+  // the old token gate until an admin explicitly saves a versioned policy.
+  const allowed = versionedCostPolicyEnforced
+    ? usageDecision.admissionAllowed
+    : costIsGate
+      ? costAllowed
+      : tokenAllowed;
 
-  const tokenWarning = effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
-  // Only surface a cost warning to users when the cost cap is actually enforced —
-  // otherwise we'd nag about a limit that can't block them.
+  // Warn only on the dimension that can actually block. Warning about an
+  // observe-only cap is the same stale nag ENG-951 removed from customer surfaces.
+  const tokenWarning =
+    !costIsGate && effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
   const costWarning =
-    enforceCostCap && costAllowance !== null && costPercentUsed >= 80 && costPercentUsed < 100;
+    costIsGate && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
     allowed,
@@ -163,10 +239,12 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     effectiveAllowance,
     percentUsed: effectiveAllowance === null ? 0 : tokenPercentUsed,
     month: usage.month,
-    costUsed: usage.totalCost,
-    costAllowance,
-    costPercentUsed: costAllowance === null ? 0 : costPercentUsed,
-    costEnforced: enforceCostCap,
+    costUsed: versionedCostPolicyEnforced ? policyCostUsed : usage.totalCost,
+    costAllowance: effectiveCostAllowance,
+    costPercentUsed: effectiveCostAllowance === null ? 0 : costPercentUsed,
+    costEnforced: costIsGate,
+    usageMode: versionedCostPolicyEnforced ? usageDecision.usageMode : (allowed ? "full_choice" : "paused"),
+    usagePolicyVersion: llmUsagePolicy?.version || null,
   };
 }
 
@@ -186,6 +264,7 @@ export function deriveBlockedByCost(status: {
   percentUsed?: number;
   costAllowance?: number | null;
   costPercentUsed?: number;
+  costEnforced?: boolean;
 }): { costCapTriggered: boolean; tokenCapTriggered: boolean; blockedByCost: boolean } {
   const costCapTriggered =
     status.costAllowance != null && (status.costPercentUsed ?? 0) >= 100;
@@ -193,11 +272,18 @@ export function deriveBlockedByCost(status: {
     status.effectiveAllowance != null ? status.effectiveAllowance : status.allowance;
   const tokenCapTriggered =
     effectiveTokenAllowance != null && (status.percentUsed ?? 0) >= 100;
-  return {
-    costCapTriggered,
-    tokenCapTriggered,
-    blockedByCost: costCapTriggered && !tokenCapTriggered,
-  };
+
+  // ENG-1116: when cost is the gate, the token counter cannot block anyone, so a
+  // block over both caps is a COST block and must be worded in dollars. The old
+  // `!tokenCapTriggered` veto was right only while the caps were ANDed — under
+  // replacement it would tell a user they had run out of tokens, pointing them at
+  // a limit that no longer exists. When cost is not the gate the original
+  // attribution stands: a token block reads in tokens.
+  const blockedByCost = status.costEnforced
+    ? costCapTriggered
+    : costCapTriggered && !tokenCapTriggered;
+
+  return { costCapTriggered, tokenCapTriggered, blockedByCost };
 }
 
 /**
@@ -231,16 +317,35 @@ export async function incrementUserTokenUsage(
         const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
         newHistory = [...existingHistory, entry].slice(-24);
       }
-      await userDb.updateUser(billingUserId, {
-        tokenUsage: {
-          month: currentMonth,
-          totalTokens: tokens,
-          totalCost: cost,
-          resetDate: getNextResetDate(),
-        },
-        tokenAllowanceBonus: 0,
-        tokenUsageHistory: newHistory,
+      // Conditional: succeeds only while nobody else has rolled the month over.
+      // The previous unconditional write meant two concurrent charges at rollover
+      // both reset the counter and the second silently discarded the first.
+      const didReset = await userDb.resetTokenUsageForMonth({
+        userId: billingUserId,
+        month: currentMonth,
+        tokens,
+        cost,
+        resetDate: getNextResetDate(),
+        history: newHistory,
       });
+
+      if (!didReset) {
+        // Lost the race — the winner already created this month's counter (and
+        // archived the previous month). Apply this charge on top of theirs rather
+        // than dropping it.
+        const updated = await userDb.incrementTokenUsageForMonth(
+          billingUserId,
+          currentMonth,
+          tokens,
+          cost,
+          getNextResetDate()
+        );
+        if (!updated) {
+          console.warn(
+            `[tokenUsageService] Skipped token increment for ${billingUserId}: month changed again during rollover`
+          );
+        }
+      }
     } else {
       const updated = await userDb.incrementTokenUsageForMonth(
         billingUserId,

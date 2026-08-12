@@ -494,6 +494,50 @@ describe('ChatbotDB - Messages Table', () => {
       expect(mockDocClient.batchWrite).toHaveBeenCalled();
     });
 
+    // ENG-946: the final assistant turn of a long run carries the whole tool-call
+    // ledger on metadata.toolCalls. Truncating only `content` left those items over
+    // DynamoDB's 400KB limit, batchWrite threw, and the report was lost from the
+    // transcript while the scheduled run still reported success (prod 82e0ee50…).
+    it('sheds the tool-call ledger, not the report, when an item exceeds the item-size limit', async () => {
+      const report = '<h2>Daily User Activity Report</h2>'.repeat(400);
+      const oversized: ChatMessage[] = [{
+        role: 'assistant',
+        content: report,
+        timestamp: '2024-01-01T00:00:03Z',
+        metadata: {
+          timestamp: '2024-01-01T00:00:03Z',
+          toolCalls: Array.from({ length: 40 }, (_, i) => ({
+            id: `tooluse_${i}`,
+            name: 'search_tool_response',
+            result: { success: true, content: 'x'.repeat(16_000) },
+          })),
+        },
+      } as any];
+      expect(JSON.stringify(oversized[0]).length).toBeGreaterThan(350_000);
+
+      mockDocClient.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockSession }),
+      });
+      mockDocClient.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+      mockDocClient.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await chatbotDb.addMessagesToSession(sessionId, oversized);
+
+      const written = mockDocClient.batchWrite.mock.calls[0][0]
+        .RequestItems[messagesTableName][0].PutRequest.Item.message;
+      // Small enough to actually persist...
+      expect(JSON.stringify(written).length).toBeLessThanOrEqual(350_000);
+      // ...and the user's report survived intact.
+      expect(written.content).toBe(report);
+    });
+
     it('should return session unchanged when messages array is empty', async () => {
       // Mock get session
       mockDocClient.get.mockReturnValue({
