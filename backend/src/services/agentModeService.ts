@@ -20180,17 +20180,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // Helper function to format web search results for AI analysis
   private formatWebSearchResults(searchResult: any): string {
-    const { query, results, totalResults } = searchResult;
+    const { query, results, totalResults, resultSource, freshness } = searchResult;
+    // ENG-1050: news searches mix news articles with recent web pages from the
+    // same freshness window, so label each entry and make an empty result read as
+    // "no coverage found" rather than an ambiguous failure.
+    const isNewsSearch = resultSource === 'news';
+    const heading = isNewsSearch ? '📰 News Search Results' : '🔍 Web Search Results';
 
     if (!results || results.length === 0) {
-      return `<strong>🔍 Web Search Results for "${query}"</strong><br>No results found for your search query.`;
+      const emptyNote = isNewsSearch
+        ? `No news articles or recent web pages were found for this query within the ${freshness || 'week'} freshness window. `
+          + `The search itself succeeded — treat this as "no coverage found", not as a search failure.`
+        : 'No results found for your search query.';
+      return `<strong>${heading} for "${query}"</strong><br>${emptyNote}`;
     }
 
-    let summary = `<strong>🔍 Web Search Results for "${query}"</strong><br>`;
+    let summary = `<strong>${heading} for "${query}"</strong><br>`;
     summary += `I found ${totalResults} relevant search results:<br><br>`;
 
     results.forEach((result: any, index: number) => {
-      summary += `<strong>${index + 1}. ${result.title}</strong><br>`;
+      const sourceLabel = isNewsSearch
+        ? (result.sourceType === 'news' ? '📰 News article — ' : '🌐 Recent web page — ')
+        : '';
+      summary += `<strong>${index + 1}. ${sourceLabel}${result.title}</strong><br>`;
       summary += `🔗 <a href="${result.url}" target="_blank">${result.url}</a><br>`;
       summary += `<em>${result.snippet}</em><br>`;
       if (result.publishedDate) {
@@ -22875,12 +22887,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const formattedContent = this.formatWebSearchResults({
         query,
         results: normalizedResults,
-        totalResults: normalizedResults.length
+        totalResults: normalizedResults.length,
+        resultSource,
+        freshness,
       });
+
+      // ENG-1050: a news search can be answered by news articles, by recent web
+      // pages from the same freshness window, or by neither. Say which, so a
+      // digest can tell "no coverage this week" from "the search returned
+      // nothing", and never presents a web page as a news article.
+      const newsArticleCount = normalizedResults.filter((result: any) => result.sourceType === 'news').length;
+      const recentPageCount = normalizedResults.length - newsArticleCount;
+      const isEmptyNewsSearch = resultSource === 'news' && normalizedResults.length === 0;
+      const message = isEmptyNewsSearch
+        // "Found 0 results" reads as a broken search, which is the ambiguity this
+        // ticket is about. Say the same thing the LLM-facing content says.
+        ? `No coverage found for "${query}" within the ${freshness || 'week'} window — `
+          + `the search itself succeeded, there is simply nothing published`
+        : resultSource === 'news'
+          ? `Found ${normalizedResults.length} results for "${query}" within the ${freshness || 'week'} window `
+            + `(${newsArticleCount} news article${newsArticleCount === 1 ? '' : 's'}, `
+            + `${recentPageCount} recent web page${recentPageCount === 1 ? '' : 's'})`
+          : `Found ${normalizedResults.length} web search results for "${query}"`;
 
       return {
         success: true,
-        message: `Found ${normalizedResults.length} ${resultSource === 'news' ? 'news' : 'web search'} results for "${query}"`,
+        message,
         query,
         results: normalizedResults,
         totalResults: normalizedResults.length,
