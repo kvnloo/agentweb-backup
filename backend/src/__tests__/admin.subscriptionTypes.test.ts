@@ -27,6 +27,9 @@ jest.mock('../services/subscriptionService', () => ({
   getAllAvailablePages: jest.fn(() => ['/', '/agent-mode', '/settings', '/guide', '/tasks']),
   getAllAvailableSkills: jest.fn(async () => ['skill-1', 'skill-2', '__other_skills__']),
   getAllAvailableConnectedAccounts: jest.fn(() => ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram']),
+  getAllAvailableSubscriptionFeatures: jest.fn(() => [
+    { id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.' },
+  ]),
   getPublicAllowedSkills: jest.fn(async () => []),
   // Keep getAllAvailableFunctionCalls for backward compat if referenced elsewhere
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
@@ -139,6 +142,15 @@ describe('Admin subscription types routes', () => {
     );
     // Should not have allowedFunctionCalls in the response (replaced by allowedSkills)
     expect(legacy.allowedSkills).toContain('skill-1');
+    expect(legacy.allowedFeatures).toEqual(['scheduled_chats']);
+  });
+
+  it('GET /api/admin/subscription-features returns reusable feature metadata', async () => {
+    const res = await request(app)
+      .get('/api/admin/subscription-features')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+    expect(res.body.features).toEqual([expect.objectContaining({ id: 'scheduled_chats' })]);
   });
 
   it('POST /api/admin/subscription-types should save expanded skills instead of "*"', async () => {
@@ -194,6 +206,20 @@ describe('Admin subscription types routes', () => {
       '__other_skills__',
     ]);
     expect(pro.allowedSkills).not.toContain('*');
+    expect(pro.allowedFeatures).toEqual(['scheduled_chats']);
+  });
+
+  it('POST /api/admin/subscription-types persists an explicit feature denial', async () => {
+    mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+    await request(app)
+      .post('/api/admin/subscription-types')
+      .set('Authorization', 'Bearer test-token')
+      .send({ subscriptionTypes: [{
+        name: 'Community', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], allowedFeatures: [],
+      }] })
+      .expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].allowedFeatures).toEqual([]);
   });
 
   // ENG-200: the per-user cost cap lives on the tier as monthlyCostAllowance. The

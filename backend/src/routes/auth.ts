@@ -99,7 +99,7 @@ router.get('/me', authenticateToken, async (req, res) => {
     // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
-        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getHiddenPages } = await import('../services/subscriptionService');
+        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getAllowedFeatures, getHiddenPages } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
         // Resolution (including the org-owner fallback and the own-active-
@@ -114,6 +114,7 @@ router.get('/me', authenticateToken, async (req, res) => {
 
         // Get allowed pages (expands "*" to actual list)
         response.allowedPages = await getAllowedPages(userId);
+        response.allowedFeatures = await getAllowedFeatures(userId);
 
         // Get hidden pages
         response.hiddenPages = await getHiddenPages(userId);
@@ -162,6 +163,7 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.subscriptionType = 'Free';
         response.allowedPages = await getAllowedPages(userId);
         response.allowedSkills = [];
+        response.allowedFeatures = [];
       }
     }
 

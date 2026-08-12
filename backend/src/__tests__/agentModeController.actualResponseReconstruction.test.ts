@@ -6,6 +6,7 @@ jest.mock('../services/subscriptionService', () => ({
     'get_marketing_tips',
     'analyze_competitors',
   ]),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({

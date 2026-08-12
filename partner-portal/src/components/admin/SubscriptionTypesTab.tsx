@@ -51,8 +51,15 @@ interface SubscriptionType {
   hiddenPages?: string[];
   allowedSkills: string[];
   allowedConnectedAccounts?: string[];
+  allowedFeatures?: string[];
   monthlyTokenAllowance?: number | null;
   monthlyCostAllowance?: number | null;
+}
+
+interface AvailableFeature {
+  id: string;
+  label: string;
+  description: string;
 }
 
 const AVAILABLE_CONNECTED_ACCOUNTS = [
@@ -90,6 +97,7 @@ const SubscriptionTypesTab: React.FC = () => {
   const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
   const [availableSkills, setAvailableSkills] = useState<AvailableSkill[]>([]);
   const [availablePages, setAvailablePages] = useState<CustomerPortalPage[]>([]);
+  const [availableFeatures, setAvailableFeatures] = useState<AvailableFeature[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -101,6 +109,7 @@ const SubscriptionTypesTab: React.FC = () => {
     hiddenPages: [],
     allowedSkills: [],
     allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
+    allowedFeatures: [],
     monthlyTokenAllowance: null,
     monthlyCostAllowance: null,
   });
@@ -112,6 +121,7 @@ const SubscriptionTypesTab: React.FC = () => {
     loadSubscriptionTypes();
     loadAvailableSkills();
     loadAvailablePages();
+    loadAvailableFeatures();
   }, []);
 
   // Update formData when availableSkills or availablePages loads (for new types or when editing types with "*")
@@ -125,6 +135,7 @@ const SubscriptionTypesTab: React.FC = () => {
             allowedPages: availablePages.map((p) => p.path),
             hiddenPages: [],
             allowedSkills: availableSkills.map((s) => s.skillId),
+            allowedFeatures: availableFeatures.map((feature) => feature.id),
           }));
         }
       } else if (
@@ -151,8 +162,14 @@ const SubscriptionTypesTab: React.FC = () => {
           }));
         }
       }
+      if (editingType && !Array.isArray(editingType.allowedFeatures) && availableFeatures.length > 0) {
+        setFormData((prev) => ({
+          ...prev,
+          allowedFeatures: availableFeatures.map((feature) => feature.id),
+        }));
+      }
     }
-  }, [availableSkills, availablePages, editDialogOpen, editingType]);
+  }, [availableSkills, availablePages, availableFeatures, editDialogOpen, editingType]);
 
   const loadSubscriptionTypes = async () => {
     try {
@@ -197,6 +214,19 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
+  const loadAvailableFeatures = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-features'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (Array.isArray(response.data?.features)) {
+        setAvailableFeatures(response.data.features);
+      }
+    } catch (error) {
+      console.error('Error loading subscription features:', error);
+    }
+  };
+
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {
       setEditingType(type);
@@ -227,6 +257,9 @@ const SubscriptionTypesTab: React.FC = () => {
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
         allowedConnectedAccounts: expandedConnectedAccounts,
+        allowedFeatures: Array.isArray(type.allowedFeatures)
+          ? type.allowedFeatures
+          : availableFeatures.map((feature) => feature.id),
         monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
         monthlyCostAllowance: type.monthlyCostAllowance ?? null,
       };
@@ -242,6 +275,7 @@ const SubscriptionTypesTab: React.FC = () => {
         hiddenPages: [],
         allowedSkills: availableSkills.map((s) => s.skillId),
         allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
+        allowedFeatures: availableFeatures.map((feature) => feature.id),
         monthlyTokenAllowance: null,
         monthlyCostAllowance: null,
       });
@@ -261,6 +295,7 @@ const SubscriptionTypesTab: React.FC = () => {
       hiddenPages: [],
       allowedSkills: [],
       allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
+      allowedFeatures: [],
       monthlyTokenAllowance: null,
       monthlyCostAllowance: null,
     });
@@ -310,6 +345,7 @@ const SubscriptionTypesTab: React.FC = () => {
           (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
             ? ['*']
             : formData.allowedConnectedAccounts || [],
+        allowedFeatures: formData.allowedFeatures || [],
         monthlyTokenAllowance: parsedAllowance,
         monthlyCostAllowance: parsedCostAllowance,
       };
@@ -443,6 +479,16 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
+  const handleToggleFeature = (featureId: string) => {
+    const current = formData.allowedFeatures || [];
+    setFormData({
+      ...formData,
+      allowedFeatures: current.includes(featureId)
+        ? current.filter((id) => id !== featureId)
+        : [...current, featureId],
+    });
+  };
+
   const toggleSkillExpanded = (skillId: string) => {
     setExpandedSkills((prev) => {
       const next = new Set(prev);
@@ -499,13 +545,14 @@ const SubscriptionTypesTab: React.FC = () => {
                 <TableCell>Allowed Pages</TableCell>
                 <TableCell>Allowed Skills</TableCell>
                 <TableCell>Connected Accounts</TableCell>
+                <TableCell>Product Features</TableCell>
                 <TableCell>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {subscriptionTypes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} align="center">
+                  <TableCell colSpan={8} align="center">
                     <Typography variant="body2" color="text.secondary">
                       No subscription types defined. Using default "Basic" type.
                     </Typography>
@@ -591,6 +638,15 @@ const SubscriptionTypesTab: React.FC = () => {
                       )}
                     </TableCell>
                     <TableCell>
+                      {(type.allowedFeatures || []).length === 0 ? (
+                        <Typography variant="body2" color="text.secondary">None</Typography>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          {(type.allowedFeatures || []).length} enabled
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       <IconButton
                         size="small"
                         onClick={() => handleOpenEditDialog(type)}
@@ -654,6 +710,34 @@ const SubscriptionTypesTab: React.FC = () => {
               type="text"
               inputProps={{ inputMode: 'decimal', pattern: '[0-9.,$]*' }}
             />
+
+            <Typography variant="h6" gutterBottom>
+              Product Features
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+              These entitlements are enforced by the API, background jobs, and customer portal.
+            </Typography>
+            <FormGroup sx={{ mb: 3 }}>
+              {availableFeatures.map((feature) => (
+                <FormControlLabel
+                  key={feature.id}
+                  control={(
+                    <Checkbox
+                      checked={(formData.allowedFeatures || []).includes(feature.id)}
+                      onChange={() => handleToggleFeature(feature.id)}
+                    />
+                  )}
+                  label={(
+                    <Box>
+                      <Typography variant="body2">{feature.label}</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {feature.description}
+                      </Typography>
+                    </Box>
+                  )}
+                />
+              ))}
+            </FormGroup>
 
             <Typography variant="h6" gutterBottom>
               Page Access

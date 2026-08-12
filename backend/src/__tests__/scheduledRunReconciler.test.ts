@@ -10,6 +10,7 @@
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => ['*']),
   getAllowedSkills: jest.fn(async () => ['*']),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({

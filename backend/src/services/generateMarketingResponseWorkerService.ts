@@ -22,6 +22,10 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-907: epoch ms at which the caller started this turn's whole-turn wall-clock
+  // cap. Passed through to the loop so its time budget uses the SAME deadline the
+  // caller enforces, rather than one that starts after the fork IPC hop.
+  turnStartMs?: number;
 }
 
 interface GenerateMarketingResponseResult {

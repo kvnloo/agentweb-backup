@@ -1121,6 +1121,20 @@ export class UserDB {
     return item;
   }
 
+  /**
+   * Returns a strongly current User record after resolving its stable primary
+   * key from the UserIdIndex. DynamoDB does not support strongly consistent
+   * reads on GSIs, so callers that must not act on recently removed OAuth
+   * credentials need this two-step lookup instead of getUserById alone.
+   */
+  async getUserByIdConsistent(userId: string) {
+    const indexed = await this.getUserById(userId);
+    if (!indexed?.email) return undefined;
+
+    const current = await this.getUserByEmailConsistent(indexed.email);
+    return current?.userId === userId ? current : undefined;
+  }
+
   async getUserById(userId: string) {
     try {
       const params = {
@@ -8985,7 +8999,8 @@ export const socialEngagementTrackingDb = {
     commentId?: string;
     engagingAccountId: string;
     actionType: string;
-  }) {
+    scheduleId: string;
+  }): Promise<boolean> {
     try {
       const dedupId = params.commentId || params.postId;
       const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
@@ -8996,8 +9011,22 @@ export const socialEngagementTrackingDb = {
       await dynamodb.delete({
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Key: { userId: params.userId, postId_engagingAccountId: key },
+        // Only remove the queued reservation that belongs to this schedule.
+        // A failed attempt can be rescheduled under a new ID before an older
+        // schedule reaches cleanup; deleting by key alone would erase that
+        // newer reservation and allow duplicate LinkedIn activity.
+        ConditionExpression: 'scheduleId = :scheduleId AND #status = :queued',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':scheduleId': params.scheduleId,
+          ':queued': 'queued',
+        },
       }).promise();
+      return true;
     } catch (error) {
+      if ((error as any)?.code === 'ConditionalCheckFailedException') {
+        return false;
+      }
       handleDynamoDbError(error, "deleteEngagement");
       throw error;
     }

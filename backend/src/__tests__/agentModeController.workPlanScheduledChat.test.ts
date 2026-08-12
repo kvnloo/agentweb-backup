@@ -10,6 +10,7 @@ jest.mock('../services/subscriptionService', () => ({
     'modify_work_plan',
     'set_work_plan_status',
   ]),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
