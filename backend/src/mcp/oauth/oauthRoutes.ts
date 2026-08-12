@@ -11,6 +11,7 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { mcpOAuthService } from './oauthService';
 import { authenticateToken, getUserFromToken } from '../../middleware/auth';
 import { getJwtSecret } from '../../config/jwt';
@@ -212,8 +213,16 @@ export function setupMcpOAuth(app: express.Express) {
     // Short-lived, signed proof for the inline signup page. The registration
     // endpoint accepts MCP attribution only with this server-minted intent,
     // so a normal public signup cannot spoof acquisition source.
+    const signupIntentId = crypto.randomBytes(24).toString('hex');
+    try {
+      await mcpOAuthService.createSignupIntent(signupIntentId, client_id);
+    } catch (error) {
+      console.error('[MCP-OAuth] Failed to store signup intent:', error);
+      return res.status(503).json({ error: 'Unable to initialize MCP signup flow' });
+    }
+
     const signupIntent = jwt.sign(
-      { purpose: 'mcp_signup', clientId: client_id },
+      { purpose: 'mcp_signup', clientId: client_id, intentId: signupIntentId },
       getJwtSecret(),
       { expiresIn: '15m' },
     );

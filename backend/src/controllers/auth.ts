@@ -16,6 +16,7 @@ import { isCompanyEmail } from "../utils/validation";
 import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
+import { mcpOAuthService } from "../mcp/oauth/oauthService";
 
 // ENG-512: domain-based org auto-join. If the new signup's email domain
 // matches an org with autoJoinEnabled, create a pending domain-join request
@@ -156,8 +157,22 @@ export const register = async (req: Request, res: Response) => {
     let signupSource = "password";
     if (requestedSignupSource === "mcp" && typeof signupIntent === "string") {
       try {
-        const intent = jwt.verify(signupIntent, getJwtSecret()) as { purpose?: string };
-        if (intent?.purpose === "mcp_signup") signupSource = "mcp";
+        const intent = jwt.verify(signupIntent, getJwtSecret()) as {
+          purpose?: string;
+          clientId?: string;
+          intentId?: string;
+        };
+        if (
+          intent?.purpose === "mcp_signup" &&
+          typeof intent.clientId === "string" &&
+          typeof intent.intentId === "string"
+        ) {
+          const canUseIntent = await mcpOAuthService.consumeSignupIntent(
+            intent.intentId,
+            intent.clientId,
+          );
+          if (canUseIntent) signupSource = "mcp";
+        }
       } catch {
         // Invalid/expired intent falls back to ordinary password attribution.
       }

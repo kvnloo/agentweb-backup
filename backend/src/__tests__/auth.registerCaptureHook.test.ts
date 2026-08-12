@@ -49,8 +49,14 @@ jest.mock('../types/attribution', () => ({
 }));
 
 const mockOnUserRegistered = jest.fn();
+const mockConsumeSignupIntent = jest.fn();
 jest.mock('../services/contactCaptureHooks', () => ({
   onUserRegistered: (...args: any[]) => mockOnUserRegistered(...args),
+}));
+jest.mock('../mcp/oauth/oauthService', () => ({
+  mcpOAuthService: {
+    consumeSignupIntent: (...args: any[]) => mockConsumeSignupIntent(...args),
+  },
 }));
 
 jest.mock('bcryptjs', () => ({
@@ -84,6 +90,7 @@ beforeEach(() => {
   });
   mockUpdateUser.mockResolvedValue({ userId: 'uuid-u1' });
   mockOnUserRegistered.mockResolvedValue(null);
+  mockConsumeSignupIntent.mockResolvedValue(true);
 });
 
 describe('register controller fires onUserRegistered', () => {

@@ -51,6 +51,15 @@ export interface OAuthAuthorizationCode {
   createdAt: string;
 }
 
+export interface OAuthSignupIntent {
+  code: string;
+  clientId: string;
+  purpose: "mcp_signup";
+  used: boolean;
+  expiresAt: number; // epoch seconds (DynamoDB TTL)
+  createdAt: string;
+}
+
 export interface OAuthTokenRecord {
   tokenHash: string;
   refreshTokenHash: string;
@@ -239,6 +248,70 @@ export class McpOAuthService {
     }).promise();
 
     return { code };
+  }
+
+  async createSignupIntent(
+    code: string,
+    clientId: string,
+  ): Promise<void> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const record: OAuthSignupIntent = {
+      code,
+      clientId,
+      purpose: "mcp_signup",
+      used: false,
+      expiresAt: nowSec + 15 * 60,
+      createdAt: new Date().toISOString(),
+    };
+
+    await dynamodb
+      .put({
+        TableName: this.codesTable,
+        Item: record,
+      })
+      .promise();
+  }
+
+  async consumeSignupIntent(
+    code: string,
+    clientId: string,
+  ): Promise<boolean> {
+    const result = await dynamodb
+      .get({
+        TableName: this.codesTable,
+        Key: { code },
+      })
+      .promise();
+
+    const record = result.Item as OAuthSignupIntent | undefined;
+    if (!record) return false;
+    if (record.clientId !== clientId) return false;
+    if (record.used) return false;
+    if (record.purpose !== "mcp_signup") return false;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (record.expiresAt <= nowSec) return false;
+
+    try {
+      await dynamodb
+        .update({
+          TableName: this.codesTable,
+          Key: { code },
+          ConditionExpression: "attribute_exists(code) AND used = :unused AND clientId = :clientId",
+          UpdateExpression: "SET used = :used",
+          ExpressionAttributeValues: {
+            ":unused": false,
+            ":clientId": clientId,
+            ":used": true,
+          },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.name === "ConditionalCheckFailedException") return false;
+      throw error;
+    }
+
+    return true;
   }
 
   async consumeAuthorizationCode(code: string): Promise<OAuthAuthorizationCode | null> {

@@ -10,6 +10,7 @@
 const mockRegisterClient = jest.fn();
 const mockGetClient = jest.fn();
 const mockCreateAuthorizationCode = jest.fn();
+const mockCreateSignupIntent = jest.fn();
 const mockConsumeAuthorizationCode = jest.fn();
 const mockCreateTokenPair = jest.fn();
 const mockValidateAccessToken = jest.fn();
@@ -25,6 +26,7 @@ jest.mock('../oauthService', () => ({
     registerClient: (...args: any[]) => mockRegisterClient(...args),
     getClient: (...args: any[]) => mockGetClient(...args),
     createAuthorizationCode: (...args: any[]) => mockCreateAuthorizationCode(...args),
+    createSignupIntent: (...args: any[]) => mockCreateSignupIntent(...args),
     consumeAuthorizationCode: (...args: any[]) => mockConsumeAuthorizationCode(...args),
     createTokenPair: (...args: any[]) => mockCreateTokenPair(...args),
     validateAccessToken: (...args: any[]) => mockValidateAccessToken(...args),
@@ -92,6 +94,7 @@ describe('MCP OAuth Routes', () => {
     mockRecordMcpOAuthStarted.mockResolvedValue(true);
     mockRecordMcpOAuthAuthorized.mockResolvedValue(true);
     mockRecordMcpOAuthTokenIssued.mockResolvedValue(true);
+    mockCreateSignupIntent.mockResolvedValue(undefined);
     mockGetUserFromToken.mockResolvedValue({ user: null });
     process.env.BACKEND_URL = 'https://api.agentweb.pro';
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
