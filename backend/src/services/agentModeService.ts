@@ -191,6 +191,13 @@ export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 
+// ENG-907: sentinel resolved by `withSynthesisRetryDeadline` when a forced-synthesis backup
+// call outlives the time left. A unique symbol so it can never collide with a real response.
+const SYNTHESIS_RETRY_TIMED_OUT = Symbol('synthesis-retry-timed-out');
+// Slack left between the bounded retry and the caller's cap, so the turn still has room to
+// persist and return its partial answer after giving up on the retry.
+const SYNTHESIS_RETRY_MARGIN_MS = 5_000;
+
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
 // generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
@@ -2828,6 +2835,39 @@ export class AgentModeService {
     return knownGoodModel;
   }
 
+  /**
+   * ENG-907: bound a permitted forced-synthesis backup call to the wall-clock time that is
+   * actually left, rather than trusting the duration estimate that admitted it.
+   *
+   * The estimate is drawn from calls this run already made, and the backup is by definition
+   * a DIFFERENT model — it can be slower than anything measured. If it overruns, the
+   * controller's cap fires and rejects the whole generation, discarding the partial answer
+   * this feature exists to deliver. So stop waiting with time still on the clock and let the
+   * caller fall back to that partial answer.
+   *
+   * Resolves to `SYNTHESIS_RETRY_TIMED_OUT` instead of rejecting, so the timeout is not
+   * mistaken for a model error and misclassified. The in-flight request is left to settle on
+   * its own — there is no abort plumbing through the provider adapters, and the turn is ending
+   * regardless — but its rejection is swallowed so it cannot surface as an unhandled one.
+   * With no deadline the call is awaited unchanged.
+   */
+  private async withSynthesisRetryDeadline(call: Promise<any>, deadlineMs?: number): Promise<any> {
+    if (deadlineMs === undefined) return call;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        call,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(SYNTHESIS_RETRY_TIMED_OUT), deadlineMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      // The loser of the race is still in flight; never let it become an unhandled rejection.
+      void Promise.resolve(call).catch(() => {});
+    }
+  }
+
   async callLLM(
     model: string,
     messages: any[],
@@ -3641,6 +3681,9 @@ export class AgentModeService {
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
+      // Hard wall-clock bound for a permitted forced-synthesis retry, so a slower-than-
+      // predicted backup model still cannot run the turn past the caller's cap.
+      let synthesisRetryDeadlineMs: number | undefined;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3978,6 +4021,13 @@ export class AgentModeService {
               );
               recordSpanError(chatSpan, callError);
               synthesisRetryUnaffordable = true;
+            } else {
+              // The estimate says a retry fits — but an estimate is not a guarantee. The
+              // backup can be a different, slower model than anything measured this run, so
+              // arm a hard bound too: whatever the retry does, this turn stops waiting on it
+              // with time still on the clock and delivers the partial answer. Without it the
+              // original ENG-907 loss stays reachable through the retry.
+              synthesisRetryDeadlineMs = Math.max(1, retryBudget.remainingMs - SYNTHESIS_RETRY_MARGIN_MS);
             }
           }
           if (synthesisRetryUnaffordable) {
@@ -3996,7 +4046,7 @@ export class AgentModeService {
               }
               llmModel = backup;
               backupModelUsed = true;
-              response = await this.callLLM(llmModel, trimmedMessages, {
+              response = await this.withSynthesisRetryDeadline(this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
@@ -4004,7 +4054,17 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
-              });
+              }), synthesisRetryDeadlineMs);
+              if (response === SYNTHESIS_RETRY_TIMED_OUT) {
+                console.warn(
+                  `AgentMode: backup model "${llmModel}" did not answer within the ${synthesisRetryDeadlineMs}ms ` +
+                  `left for the forced synthesis in session ${sessionId} — delivering the work gathered so far ` +
+                  'rather than letting the turn cap discard it'
+                );
+                recordSpanError(chatSpan, callError);
+                response = undefined;
+                synthesisRetryUnaffordable = true;
+              }
             } else {
               recordSpanError(chatSpan, callError);
               throw callError;
