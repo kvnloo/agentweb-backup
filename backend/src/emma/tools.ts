@@ -2543,7 +2543,13 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.status,
       args.author,
-      args.categories
+      args.categories,
+      // ENG-827: this registry — not the MCP one — is what a live Emma session
+      // dispatches through, so dropping the hook here left the CMS write unguarded on
+      // the path that actually runs. publishBlogArticle fetches the article HTML over
+      // the network before it writes, so the dispatcher's admission check precedes the
+      // slow part rather than the irreversible one; this is re-run at the CMS write.
+      context?.assertPublishStillAuthorized
     );
   }
 });
