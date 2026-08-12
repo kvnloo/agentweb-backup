@@ -39,6 +39,10 @@ module.exports = {
     // two suites that exercise the SDK boundary keep their own jest.mock('resend', ...),
     // which takes precedence over this. See __mocks__/resend.ts.
     '^resend$': '<rootDir>/__mocks__/resend.ts',
+    // ENG-1111: node-fetch is a separate implementation from Node's native `fetch`, so the
+    // globalThis.fetch wrapper in setup.ts does not cover it. Delegates to the real
+    // node-fetch after the same local-or-allowlisted check. See __mocks__/node-fetch.ts.
+    '^node-fetch$': '<rootDir>/__mocks__/node-fetch.ts',
   },
   collectCoverageFrom: [
     'src/utils/**/*.ts',
