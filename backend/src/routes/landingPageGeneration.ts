@@ -1600,13 +1600,23 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
     // the run's re-check from the session the tool forwarded and run it now, after all
     // the reads and immediately before the write, so no window is left after this
     // point. No session header means an interactive publish, which is not gated.
-    const withdrawn = await publishWithdrawnMidFlight(
-      publishRevalidationForForwardedRun(req, "publish_landing_page_changes")
-    );
-    if (withdrawn) {
+    // There are TWO writes that can advance main — the standard merge and the 409
+    // fallback's force-update — and the fallback reaches its one through a failed
+    // merge and another 30s branch read, so a single check up front would let that
+    // path publish on a decision taken a minute earlier. Re-read immediately before
+    // each of them instead; a third write site added later has one obvious call to
+    // make rather than a block to remember to copy.
+    const refuseIfConsentWithdrawn = async (): Promise<boolean> => {
+      const withdrawn = await publishWithdrawnMidFlight(
+        publishRevalidationForForwardedRun(req, "publish_landing_page_changes")
+      );
+      if (!withdrawn) return false;
       console.warn(`[LP GENERATION] Publish abandoned for ${page.id}: ${withdrawn.error}`);
-      return res.status(403).json({ error: withdrawn.error });
-    }
+      res.status(403).json({ error: withdrawn.error });
+      return true;
+    };
+
+    if (await refuseIfConsentWithdrawn()) return;
 
     try {
       const mergeRes = await axios.post<any>(
@@ -1631,6 +1641,11 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
       const draftSha: string = branchRes.data.object.sha;
+
+      // The branch lookup above is a second 30s window on top of the failed merge,
+      // so re-check here too: this force-update is what makes the page public on
+      // this path, and it must not run on consent read before either of them.
+      if (await refuseIfConsentWithdrawn()) return;
 
       // Force-update main to point at the draft branch tip
       await axios.patch<any>(

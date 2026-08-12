@@ -890,6 +890,20 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
   };
 
+  // jest's `clearMocks` only calls mockClear(), which does NOT drain queued
+  // `mockResolvedValueOnce` values. The refusal cases below deliberately stop before
+  // consuming theirs, so without an explicit reset those leftovers surface in a later
+  // test as a GitHub call that mysteriously returns the wrong thing. Reset on both
+  // sides so this block neither inherits nor exports axios state.
+  const resetGitHubStubs = () => {
+    mockAxios.get.mockReset();
+    mockAxios.post.mockReset();
+    mockAxios.patch.mockReset();
+    mockAxios.delete.mockReset();
+  };
+  beforeEach(resetGitHubStubs);
+  afterEach(resetGitHubStubs);
+
   const stubGitHubMergeFlow = () => {
     // GET pre-merge main ref → POST /merges → DELETE branch ref
     mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
@@ -1045,6 +1059,63 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     );
     // It really did consult live schedule state rather than trusting the admission.
     expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21");
+  });
+
+  // The 409 fallback force-advances main instead of merging. It reaches that write
+  // through a FAILED merge and a second branch-tip read, each allowed 30s, so it
+  // needs its own re-check — the one before the standard merge is by then ~a minute
+  // stale. Same public outcome, so the same rule applies.
+  const stub409Fallback = () => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip
+    mockAxios.post.mockRejectedValueOnce({ response: { status: 409 } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+  };
+
+  it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Authorized when the merge was attempted; revoked by the time the fallback
+    // has looked up the branch tip.
+    mockGetScheduleById
+      .mockResolvedValueOnce({ autopublishAuthorized: true, autopublishAuthorizedTools: [TOOL] })
+      .mockResolvedValue({ autopublishAuthorized: false, autopublishAuthorizedTools: [] });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    // The force-update is the write that would have made the page public here.
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+    // It really did re-read rather than reusing the pre-merge decision.
+    expect(mockGetScheduleById).toHaveBeenCalledTimes(2);
+  });
+
+  it("SUCCESS: consent holds through the 409 fallback → main is force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+    mockAxios.patch.mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.merge_commit_sha).toBe("draft-tip-sha");
+    expect(mockAxios.patch).toHaveBeenCalled();
   });
 
   it("BOUNDARY: an interactive publish carries no session header → not gated, no consent read", async () => {
