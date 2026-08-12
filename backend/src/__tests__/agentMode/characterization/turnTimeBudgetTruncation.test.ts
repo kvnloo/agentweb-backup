@@ -229,7 +229,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
   });
 
   it('falls back to a partial-delivery message when the synthesis turn returns nothing', async () => {
-    const { result } = await runRealLoop((call, isFinalSynthesis) =>
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop((call, isFinalSynthesis) =>
       isFinalSynthesis
         ? { content: '' }
         : {
@@ -240,6 +240,55 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
 
     expect(result.truncatedByTimeBudget).toBe(true);
     expect(result.content).toMatch(/time limit/i);
+    // The empty-synthesis retry ladder must NOT fire here. Every millisecond left is
+    // inside the reserve held back for this one call, so a retry would spend it and
+    // could let the controller's cap fire mid-call — discarding the whole turn, which
+    // is the ENG-907 failure itself. One synthesis attempt, then deliver.
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
+  it('delivers a token-truncated synthesis as-is instead of spending the reserve on a continuation', async () => {
+    // Same hazard from the other continuation ladder: a synthesis that stops on
+    // max_tokens normally gets a "keep going" round trip. Inside the reserve there is no
+    // room for one, and the clipped text is a real partial answer — ship it.
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content: 'Partial results — 6 of the 10 best posts:\n1. @wallet_dev on agentic',
+              finish_reason: 'length',
+            }
+          : {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+            },
+    );
+
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(elapsedMs).toBeLessThanOrEqual(CAP_MS);
+  });
+
+  it('still honours the max-tokens continuation when the time budget is NOT spent', async () => {
+    // The suppression above is scoped to the forced-synthesis phase only. A fast run that
+    // hits max_tokens must keep its ordinary continuation, or this fix would silently
+    // truncate every long answer in the product.
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop(
+      (call) =>
+        call === 0
+          ? { content: 'Here are the 10 best posts: 1. …', finish_reason: 'length' }
+          : { content: ' …and the reply order.' },
+      5_000,
+    );
+
+    expect(result.truncatedByTimeBudget).toBeFalsy();
+    expect(finalSynthesisPerCall.some(Boolean)).toBe(false);
+    expect(elapsedMs).toBeLessThan(CAP_MS / 2);
+    // Two calls happened: the truncated one and its continuation.
+    expect(finalSynthesisPerCall).toHaveLength(2);
+    expect(result.content).toMatch(/reply order/);
   });
 
   it("measures against the CALLER's deadline, not the moment the loop happened to start", async () => {
