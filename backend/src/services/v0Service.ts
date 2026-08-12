@@ -1032,6 +1032,15 @@ export interface GenerateLandingPageOptions {
   originatingSessionId?: string;
   /** See GeneratedLandingPage.bridgeOutUrl's own doc comment. */
   bridgeOutUrl?: string;
+  /**
+   * ENG-1141: an explicit pixel/account choice from the creation form's mandatory
+   * picker (shown only when the customer's Meta connections are genuinely ambiguous —
+   * 2+ accounts, or the chosen account has 2+ pixels). Wins outright over
+   * resolveMetaPixelForUser on the first-page path; skips that call entirely rather
+   * than calling it and discarding the result. No effect on addSubPage — a sub-page
+   * always inherits its site's root record's already-resolved metaPixelId.
+   */
+  metaPixelOverride?: { pixelId: string; accountId: string };
 }
 
 /**
@@ -1077,6 +1086,7 @@ export async function generateLandingPage(
   const originatingSessionId = opts?.originatingSessionId;
   const mode = opts?.mode ?? "unified";
   const bridgeOutUrl = opts?.bridgeOutUrl;
+  const metaPixelOverride = opts?.metaPixelOverride;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1100,7 +1110,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
       );
     }
 
@@ -1120,7 +1130,7 @@ export async function generateLandingPage(
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
     );
   }
 
@@ -1164,7 +1174,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride);
 }
 
 /**
@@ -1258,7 +1268,8 @@ async function generateFirstPage(
   templateHtml?: string,
   existingId?: string,
   originatingSessionId?: string,
-  bridgeOutUrl?: string
+  bridgeOutUrl?: string,
+  metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1275,17 +1286,25 @@ async function generateFirstPage(
   // instruction is included, same as GTM's "absent id" path.
   let metaPixelId: string | undefined;
   let metaAdAccountId: string | undefined;
-  try {
-    const user = await userDb.getUserById(userId);
-    const resolution = await metaService.resolveMetaPixelForUser(user, userId);
-    if ("pixelId" in resolution) {
-      metaPixelId = resolution.pixelId;
-      metaAdAccountId = resolution.accountId;
-    } else {
-      console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+  if (metaPixelOverride) {
+    // ENG-1141: an explicit choice from the creation form's mandatory picker always
+    // wins — skip resolveMetaPixelForUser entirely rather than calling it and
+    // discarding the result.
+    metaPixelId = metaPixelOverride.pixelId;
+    metaAdAccountId = metaPixelOverride.accountId;
+  } else {
+    try {
+      const user = await userDb.getUserById(userId);
+      const resolution = await metaService.resolveMetaPixelForUser(user, userId);
+      if ("pixelId" in resolution) {
+        metaPixelId = resolution.pixelId;
+        metaAdAccountId = resolution.accountId;
+      } else {
+        console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+      }
+    } catch (err: any) {
+      console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
     }
-  } catch (err: any) {
-    console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
   }
 
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl);

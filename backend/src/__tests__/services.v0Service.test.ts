@@ -807,6 +807,48 @@ describe("v0Service - generateLandingPage", () => {
     expect(result.id).toBe("test-uuid-1234");
   });
 
+  describe("ENG-1141: metaPixelOverride at chat-creation time", () => {
+    it("uses an explicit override directly, without ever calling resolveMetaPixelForUser", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser");
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_override" });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create page",
+        "Overridden",
+        {},
+        undefined,
+        undefined,
+        { metaPixelOverride: { pixelId: "px-override", accountId: "acc-override" } }
+      );
+
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(result.metaPixelId).toBe("px-override");
+      expect(result.metaAdAccountId).toBe("acc-override");
+      resolveSpy.mockRestore();
+    });
+
+    it("falls through to resolveMetaPixelForUser when no override is given (unchanged behavior)", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_auto" });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create page",
+        "Auto-resolved",
+        {}
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+  });
+
   it("SUCCESS: recycles a prior failed record (no v0 chat) instead of orphaning it", async () => {
     // Query #1 (findUserSiteRecord) → no site repo exists.
     // Query #2 (listLandingPages) → one prior failed first-page record with no v0ChatId.
