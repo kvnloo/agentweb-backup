@@ -329,6 +329,7 @@ import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import type { LeadImportRowOutcome } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -10490,34 +10491,102 @@ export class AgentModeService {
 
       const result = await crmDb.batchCreateLeads(listId, formattedLeads);
 
+      // ENG-1133: report the import row by row, not just in aggregate. A large
+      // import can be cut off mid-way (the whole-turn cap fires between calls),
+      // and "25 new lead(s) created" tells the next turn nothing about WHICH
+      // rows landed — so the only offer left was "retry the whole request".
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList } = await import('../utils/leadImportLedger');
+      const attempted = leads.length;
+      const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
+      const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
+      const reconciliation = {
+        created: tally('created'),
+        merged: tally('merged'),
+        alreadyPresent: tally('already_present'),
+        duplicateInRequest: tally('duplicate_in_request'),
+        anonymizedSkipped: tally('anonymized_skipped'),
+        failed: tally('failed'),
+        unprocessed: tally('unprocessed'),
+      };
+
+      // Rows can only be NAMED when the ledger is in input order. Without it the
+      // counts still reconcile, but pointing at a specific row would be a guess.
+      const importedIdentifiers: string[] = [];
+      const unimportedRows: Array<{ row: number; identifier: string; reason: LeadImportRowOutcome }> = [];
+      if (rowAligned) {
+        outcomes.forEach((outcome, index) => {
+          const identifier = describeLeadRow(leads[index], index);
+          if (outcome === 'created' || outcome === 'merged' || outcome === 'already_present') {
+            importedIdentifiers.push(identifier);
+          } else if (outcome === 'failed' || outcome === 'unprocessed') {
+            unimportedRows.push({ row: index + 1, identifier, reason: outcome });
+          }
+        });
+      }
+
+      const landed = reconciliation.created + reconciliation.merged + reconciliation.alreadyPresent;
+      const missing = reconciliation.failed + reconciliation.unprocessed;
+      const complete = attempted > 0 && missing === 0;
+
       const messageParts: string[] = [];
-      if (result.newCount > 0) {
-        messageParts.push(`${result.newCount} new lead(s) created`);
+      if (reconciliation.created > 0) {
+        messageParts.push(`${reconciliation.created} new lead(s) created`);
       }
-      if (result.mergedCount > 0) {
-        messageParts.push(`${result.mergedCount} lead(s) merged`);
+      if (reconciliation.merged > 0) {
+        messageParts.push(`${reconciliation.merged} lead(s) merged`);
       }
-      if (result.errorCount > 0) {
-        messageParts.push(`${result.errorCount} lead(s) failed`);
+      // A row already in the list, unchanged, is a completed row — saying so is
+      // what makes re-sending a partially-imported file readable as progress
+      // instead of as a failed import.
+      if (reconciliation.alreadyPresent > 0) {
+        messageParts.push(`${reconciliation.alreadyPresent} lead(s) already present and up to date`);
+      }
+      if (reconciliation.duplicateInRequest > 0) {
+        messageParts.push(`${reconciliation.duplicateInRequest} duplicate row(s) in the request skipped`);
       }
       // ENG-1002 (follow-up): say so when rows were refused as anonymized
       // placeholders, so the agent cannot report a clean import that silently
       // wrote fewer records than the caller handed over.
-      const anonymizedSkipped = result.anonymizedSkipped || 0;
-      if (anonymizedSkipped > 0) {
-        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      if (reconciliation.anonymizedSkipped > 0) {
+        messageParts.push(`${reconciliation.anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
+      if (reconciliation.failed > 0) {
+        messageParts.push(`${reconciliation.failed} lead(s) failed`);
+      }
+      if (reconciliation.unprocessed > 0) {
+        messageParts.push(`${reconciliation.unprocessed} lead(s) never processed`);
       }
 
+      const summary = messageParts.length > 0
+        ? `Successfully processed: ${messageParts.join(', ')}.`
+        : 'No leads were processed.';
+      const message = attempted === 0
+        ? 'No leads were processed.'
+        : complete
+          ? summary
+          : `Partial import: ${landed} of ${attempted} row(s) are in the list. ${summary} `
+            + `RESUME by calling add_leads_to_list again with ONLY the ${unimportedRows.length > 0 ? 'rows listed in unimportedRows' : 'rows that did not import'} — `
+            + `do not ask the user to retry the request. `
+            + `Re-sending an already-imported row is safe (it merges instead of duplicating).`;
+
       return {
-        success: result.successCount > 0,
-        message: messageParts.length > 0
-          ? `Successfully processed: ${messageParts.join(', ')}.`
-          : 'No leads were processed.',
+        success: complete,
+        complete,
+        ...(complete || attempted === 0 ? {} : { resumable: true }),
+        // Rows are in the list even though the call reports incomplete — the CRM
+        // page still has to refresh for them (see shouldEmitCrmDataChanged).
+        ...(!complete && landed > 0 ? { partial: true } : {}),
+        message,
+        attempted,
+        reconciliation,
         successCount: result.successCount,
         newCount: result.newCount || 0,
         mergedCount: result.mergedCount || 0,
+        alreadyPresentCount: reconciliation.alreadyPresent,
         errorCount: result.errorCount,
-        anonymizedSkipped,
+        anonymizedSkipped: reconciliation.anonymizedSkipped,
+        ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
+        ...(unimportedRows.length > 0 ? capLeadRowList('unimportedRows', unimportedRows) : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {

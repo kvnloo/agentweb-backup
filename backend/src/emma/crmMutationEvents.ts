@@ -37,6 +37,23 @@ export const CRM_MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'import_leads_from_search',
 ]);
 
+/**
+ * Should a CRM-mutating tool result broadcast a refresh?
+ *
+ * A result that reports `success: false` normally wrote nothing, so the page
+ * has nothing new to show. A PARTIAL import is the exception (ENG-1133): it
+ * reports the call as incomplete — so the agent resumes the missing rows
+ * instead of claiming a clean import — while the rows that did land are
+ * already in the list and have to appear without a manual reload.
+ */
+export function shouldEmitCrmDataChanged(result: unknown): boolean {
+  const r = result as { success?: unknown; partial?: unknown } | null | undefined;
+  if (r && r.success === false) {
+    return r.partial === true;
+  }
+  return true;
+}
+
 export interface CrmDataChangedPayload {
   /** The affected lead list, when the tool targets one. Absent for list-create. */
   listId?: string;
