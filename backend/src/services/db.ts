@@ -6505,7 +6505,20 @@ export const crmDb = {
      *  leak into CSV exports, email-template variables, or the
      *  lead-filter UI. */
     system?: Record<string, any>;
-  }>) {
+  }>, options: {
+    /**
+     * Dedupe rows that carry NEITHER an email NOR a LinkedIn URL against the
+     * list's existing rows on name+company (ENG-1133).
+     *
+     * Opt-in, because it is a guess: two genuinely different people with the
+     * same name at the same company collapse into one. That trade is right for
+     * a file import a user may re-send (the alternative is a duplicate of every
+     * email-less row on every retry) and wrong for a sync from a system that
+     * has its own stable record ids — HubSpot/Attio contacts must not be merged
+     * on a name collision.
+     */
+    dedupeByNameCompany?: boolean;
+  } = {}) {
     // Declared OUTSIDE the try so the catch below can still see what was
     // already classified. Refused placeholders are counted before any write
     // happens, and a later DynamoDB failure must not relabel them as database
@@ -6565,9 +6578,11 @@ export const crmDb = {
         }
         const liKey = normalizeLinkedInUrl(lead.linkedin);
         if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
-        const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
-        if (nameCompanyKey && !existingLeadsByNameCompany.has(nameCompanyKey)) {
-          existingLeadsByNameCompany.set(nameCompanyKey, lead);
+        if (options.dedupeByNameCompany) {
+          const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nameCompanyKey && !existingLeadsByNameCompany.has(nameCompanyKey)) {
+            existingLeadsByNameCompany.set(nameCompanyKey, lead);
+          }
         }
       });
 
@@ -6636,9 +6651,10 @@ export const crmDb = {
         // wrote it a second time. Fall back to the name+company key — but ONLY
         // for those rows: a row that carries its own identity keeps the
         // behaviour above, or two different people who happen to share a name
-        // at one company would be silently merged.
+        // at one company would be silently merged. Opt-in per caller, see
+        // `options.dedupeByNameCompany`.
         const nameCompanyKey =
-          !lead.email?.trim() && !liKey
+          options.dedupeByNameCompany && !lead.email?.trim() && !liKey
             ? computeNameCompanyKey(lead.firstName, lead.lastName, lead.company)
             : undefined;
         if (nameCompanyKey) {
