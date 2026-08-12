@@ -32,6 +32,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     updateSessionContextLimitReported: jest.fn().mockResolvedValue(undefined),
     createOrReuseInteractiveShare: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),

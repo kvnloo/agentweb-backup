@@ -3,8 +3,24 @@ import { Request, Response } from 'express';
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
+    getSupportedModels: jest.fn().mockResolvedValue(['gpt-5-chat-2']),
+    resolveGenerationModel: jest.fn((model: string) => ({
+      model,
+      fellBack: false,
+      requestedModel: model,
+    })),
   },
   AgentModeService: jest.fn(),
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn().mockResolvedValue({
+    billingUserId: 'test-user-123',
+    policy: null,
+    costUsedMicroUsd: 0,
+    tokenUsed: 0,
+    mode: { usageMode: 'full_choice', reason: 'no_policy' },
+  }),
 }));
 
 import { agentModeController } from '../controllers/agentModeController';
@@ -76,13 +92,23 @@ describe('AgentModeController - createSession', () => {
     );
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
       mockSession.sessionId,
-      'gpt-5-chat-2'
+      'gpt-5-chat-2',
+      expect.objectContaining({
+        requestedModel: 'gpt-5-chat-2',
+        effectiveModel: 'gpt-5-chat-2',
+        modelSelection: 'honored',
+        usageMode: 'full_choice',
+      }),
     );
     expect(mockRes.status).toHaveBeenCalledWith(201);
-    expect(mockRes.json).toHaveBeenCalledWith({
+    expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
       ...mockSession,
       llmModel: 'gpt-5-chat-2',
-    });
+      requestedModel: 'gpt-5-chat-2',
+      effectiveModel: 'gpt-5-chat-2',
+      modelSelection: 'honored',
+      usageMode: 'full_choice',
+    }));
   });
 
   it('should create session with sessionType "image-generation" when provided', async () => {
@@ -126,7 +152,8 @@ describe('AgentModeController - createSession', () => {
     );
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
       mockSessionWithImageType.sessionId,
-      'gpt-5-chat-2'
+      'gpt-5-chat-2',
+      undefined,
     );
     expect(mockRes.status).toHaveBeenCalledWith(201);
     expect(mockRes.json).toHaveBeenCalledWith({

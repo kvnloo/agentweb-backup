@@ -88,6 +88,7 @@ jest.mock('../utils/sseProgress', () => ({
 
 import { agentModeController } from '../controllers/agentModeController';
 import { scheduleDb, scheduleTemplateDb } from '../services/db';
+import { agentModeService } from '../services/agentModeService';
 
 const mockUser = { userId: 'user-1', email: 'test@example.com', isAdmin: true };
 const mockOtherUser = { userId: 'user-2', email: 'other@example.com', isAdmin: false };
@@ -112,6 +113,8 @@ function mockRes() {
 describe('Schedule Templates', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    (agentModeService.getDefaultModel as jest.Mock).mockResolvedValue('gpt-5-chat-2');
+    (agentModeService.getScheduledChatsDefaultModel as jest.Mock).mockResolvedValue('gpt-5-chat-2');
   });
 
   // ─── CREATE ───────────────────────────────────────────────────────────────

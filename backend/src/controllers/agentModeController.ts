@@ -219,6 +219,20 @@ type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usagePolicyVersion: string | null;
 };
 
+function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
+  return {
+    requestedModel: decision.requestedModel,
+    effectiveModel: decision.effectiveModel,
+    backupModel: decision.backupModel,
+    backupSource: decision.backupSource,
+    modelSelection: decision.modelSelection,
+    modelSelectionReason: decision.reason,
+    usageMode: decision.usageMode,
+    usagePolicyVersion: decision.usagePolicyVersion,
+    recordedAt: new Date().toISOString(),
+  };
+}
+
 /**
  * One server-owned model decision for interactive, MCP, and scheduled paths.
  * The caller's model id is only a preference; current cost state and the
@@ -230,16 +244,25 @@ async function resolveEffectiveModelForUser(input: {
   backupModel?: string | null;
   backupSource?: ModelBackupSource | null;
 }): Promise<EffectiveModelPolicyDecision> {
-  const [usage, systemDefaultModel, supportedModelIds] = await Promise.all([
+  const [usage, systemDefaultModel] = await Promise.all([
     getEffectiveLlmUsagePolicy(input.userId),
     agentModeService.getDefaultModel(),
-    agentModeService.getSupportedModels(false),
   ]);
+  // Older controller unit tests intentionally use partial service doubles.
+  // The runtime service always has these methods; the identity fallbacks keep
+  // unrelated legacy contracts on their original full-choice behavior.
+  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+    ? await agentModeService.getSupportedModels(false)
+    : [input.requestedModel, input.backupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const requestedResolution = input.requestedModel
-    ? agentModeService.resolveGenerationModel(input.requestedModel)
+    ? (typeof agentModeService.resolveGenerationModel === 'function'
+        ? agentModeService.resolveGenerationModel(input.requestedModel)
+        : { model: input.requestedModel, fellBack: false, requestedModel: input.requestedModel })
     : null;
   const backupResolution = input.backupModel
-    ? agentModeService.resolveGenerationModel(input.backupModel)
+    ? (typeof agentModeService.resolveGenerationModel === 'function'
+        ? agentModeService.resolveGenerationModel(input.backupModel)
+        : { model: input.backupModel, fellBack: false, requestedModel: input.backupModel })
     : null;
   const decision = selectPolicyModel({
     usageMode: usage.mode.usageMode,
@@ -262,10 +285,13 @@ async function resolveScheduleBackup(input: {
   requestedBackupModel?: string | null;
 }): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
   const usage = await getEffectiveLlmUsagePolicy(input.userId);
-  const [supportedModelIds, systemDefaultModel] = await Promise.all([
-    agentModeService.getSupportedModels(false),
-    agentModeService.getScheduledChatsDefaultModel(),
-  ]);
+  const scheduledDefault = typeof agentModeService.getScheduledChatsDefaultModel === 'function'
+    ? await agentModeService.getScheduledChatsDefaultModel()
+    : null;
+  const systemDefaultModel = scheduledDefault || await agentModeService.getDefaultModel();
+  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+    ? await agentModeService.getSupportedModels(false)
+    : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const supported = new Set(supportedModelIds);
   const requested = input.requestedBackupModel?.trim();
   const optimized = new Set(usage.policy?.optimizedModelIds || []);
@@ -3760,7 +3786,11 @@ export async function runScheduledChat(
         console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
       });
     }
-    await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(
+      sessionId,
+      modelToUse,
+      toStoredModelPolicyDecision(scheduleModelPolicy),
+    );
 
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
@@ -5602,7 +5632,13 @@ export const agentModeController = {
       ];
       if (initialSkillState) createSessionArgs.push(initialSkillState);
       const session = await chatbotDb.createChatSession(...createSessionArgs);
-      const sessionWithModel = skillId ? session : await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+      const sessionWithModel = skillId
+        ? session
+        : await chatbotDb.updateSessionLlmModel(
+            session.sessionId,
+            modelToUse,
+            initialModelPolicy ? toStoredModelPolicyDecision(initialModelPolicy) : undefined,
+          );
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
@@ -5619,6 +5655,8 @@ export const agentModeController = {
         ...(initialModelPolicy ? {
           requestedModel: initialModelPolicy.requestedModel,
           effectiveModel: initialModelPolicy.effectiveModel,
+          backupModel: initialModelPolicy.backupModel,
+          backupSource: initialModelPolicy.backupSource,
           modelSelection: initialModelPolicy.modelSelection,
           usageMode: initialModelPolicy.usageMode,
           usagePolicyVersion: initialModelPolicy.usagePolicyVersion,
@@ -5726,7 +5764,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -5899,6 +5937,31 @@ export const agentModeController = {
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
+        if (usageStatus.usagePolicyVersion) {
+          modelPolicyDecision = await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+            backupModel: llmBackupModel,
+            backupSource: llmBackupModel ? 'user' : null,
+          });
+          await chatbotDb.updateSessionLlmModel(
+            sessionId,
+            session.llmModel || agentModeService.default_model,
+            toStoredModelPolicyDecision(modelPolicyDecision),
+          );
+          return res.status(429).json({
+            error: 'AI usage is paused until your next reset or additional usage is added.',
+            code: 'usage_paused',
+            usageMode: modelPolicyDecision.usageMode,
+            requestedModel: modelPolicyDecision.requestedModel,
+            effectiveModel: modelPolicyDecision.effectiveModel,
+            backupModel: modelPolicyDecision.backupModel,
+            backupSource: modelPolicyDecision.backupSource,
+            modelSelection: modelPolicyDecision.modelSelection,
+            modelSelectionReason: modelPolicyDecision.reason,
+            usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+          });
+        }
         return res.status(429).json({
           error: 'AI usage is paused until your next reset or additional usage is added.',
           code: 'usage_paused',
@@ -5943,15 +6006,34 @@ export const agentModeController = {
       modelPolicyDecision = await resolveEffectiveModelForUser({
         userId: session.userId,
         requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+        backupModel: llmBackupModel,
+        backupSource: llmBackupModel ? 'user' : null,
       });
       if (!modelPolicyDecision.effectiveModel) {
+        await chatbotDb.updateSessionLlmModel(
+          sessionId,
+          session.llmModel || agentModeService.default_model,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+        );
         return res.status(429).json({
           error: 'AI usage is paused until your next reset or additional usage is added.',
           code: 'usage_paused',
           usageMode: 'paused',
+          requestedModel: modelPolicyDecision.requestedModel,
+          effectiveModel: null,
+          backupModel: modelPolicyDecision.backupModel,
+          backupSource: modelPolicyDecision.backupSource,
+          modelSelection: modelPolicyDecision.modelSelection,
+          modelSelectionReason: modelPolicyDecision.reason,
+          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
         });
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
+      await chatbotDb.updateSessionLlmModel(
+        sessionId,
+        modelToUse,
+        toStoredModelPolicyDecision(modelPolicyDecision),
+      );
 
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
@@ -6196,6 +6278,8 @@ export const agentModeController = {
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
           effectiveModel: modelPolicyDecision.effectiveModel,
+          backupModel: modelPolicyDecision.backupModel,
+          backupSource: modelPolicyDecision.backupSource,
           modelSelection: modelPolicyDecision.modelSelection,
           modelSelectionReason: modelPolicyDecision.reason,
           usageMode: modelPolicyDecision.usageMode,

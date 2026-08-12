@@ -62,6 +62,12 @@ describe('Scheduled Chat MCP Tools', () => {
         .toContain('emma_list_models');
     });
 
+    it('exposes preferred and backup model selection on Emma messages', () => {
+      const definition: any = mcpToolRegistry.getTool('emma_send_message')?.definition;
+      expect(definition.inputSchema.properties.llm_model).toBeDefined();
+      expect(definition.inputSchema.properties.backup_model).toBeDefined();
+    });
+
     it('should expose scheduled chat tools to external MCP clients', () => {
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
@@ -238,6 +244,37 @@ describe('Scheduled Chat MCP Tools', () => {
       });
       expect(result.content[0].text).toContain('optimized');
       expect(result.content[0].text).toContain('gemini-3.1-flash-lite');
+    });
+  });
+
+  describe('emma_send_message', () => {
+    it('passes preferred and backup models to the authoritative generate endpoint', async () => {
+      mockMcpFetch.mockResolvedValue({
+        content: 'done',
+        requestedModel: 'anthropic.claude-opus-5',
+        effectiveModel: 'gemini-3.1-flash-lite',
+        backupModel: 'gemini-3.1-flash-lite',
+        backupSource: 'user',
+      });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'session-1',
+        message: 'Do the work',
+        llm_model: 'anthropic.claude-opus-5',
+        backup_model: 'gemini-3.1-flash-lite',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+        body: {
+          sessionId: 'session-1',
+          userMessage: 'Do the work',
+          llmModel: 'anthropic.claude-opus-5',
+          llmBackupModel: 'gemini-3.1-flash-lite',
+        },
+      });
     });
   });
 
