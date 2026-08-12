@@ -265,7 +265,11 @@ export async function reverseMonthlyPurchasedLlmUsageCredit(input: {
         reversedAt: (input.now || new Date()).toISOString(),
       }],
     };
-    const condition = existing.version == null
+    const condition: {
+      expression: string;
+      names: Record<string, string>;
+      values?: Record<string, any>;
+    } = existing.version == null
       ? {
           expression: '#creditLedger.#month = :expectedMonth AND #creditLedger.#grantIds = :expectedGrantIds AND attribute_not_exists(#creditLedger.#version)',
           names: {
