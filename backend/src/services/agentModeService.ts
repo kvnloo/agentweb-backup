@@ -16105,35 +16105,72 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Three outcomes, deliberately distinct: applied (proven), NOT applied (proven wrong — the
    * silent-drop case), and unverified (the read-back itself failed, so nothing is proven
    * either way). "Unverified" must never be reported as applied.
+   *
+   * A single read would make us cry wolf on Meta's read-after-write lag: a cap that DID land
+   * but has not propagated reads back as absent, and we would tell the user their money stop
+   * is missing when it is not. So a negative result is retried before it is believed — the
+   * same shape (and reason) as the creative-swap verification's retry loop. Only reads are
+   * retried; the write is never re-sent.
    */
+  private static readonly SPEND_CAP_VERIFY_ATTEMPTS = 3;
+  private static readonly SPEND_CAP_VERIFY_BACKOFF_MS = 2000;
+
   private async verifyCampaignSpendCap(
     accountId: string,
     accessToken: string,
     campaignId: string | undefined,
     requestedSpendCap: number
-  ): Promise<{ verified: boolean; readFailed: boolean; applied?: number; detail: string }> {
+  ): Promise<{ verified: boolean; readFailed: boolean; applied?: number; detail: string; attempts: number }> {
     if (!campaignId) {
-      return { verified: false, readFailed: true, detail: 'Meta returned no campaign id to read back' };
+      return { verified: false, readFailed: true, detail: 'Meta returned no campaign id to read back', attempts: 0 };
     }
-    try {
-      const fresh: any = await metaService.getCampaign(accountId, accessToken, campaignId);
-      const raw = fresh?.spend_cap;
-      // Graph returns numeric fields as strings; an absent cap means there is no cap at all.
-      const applied = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
-      if (applied !== undefined && Number.isFinite(applied) && applied === Number(requestedSpendCap)) {
-        return { verified: true, readFailed: false, applied, detail: `spend cap is ${applied}` };
+
+    let last: { verified: boolean; readFailed: boolean; applied?: number; detail: string } = {
+      verified: false, readFailed: true, detail: 'not read',
+    };
+
+    for (let attempt = 1; attempt <= AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const fresh: any = await metaService.getCampaign(accountId, accessToken, campaignId);
+        const raw = fresh?.spend_cap;
+        // Graph returns numeric fields as strings; an absent cap means there is no cap at all.
+        const applied = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
+        if (applied !== undefined && Number.isFinite(applied) && applied === Number(requestedSpendCap)) {
+          return { verified: true, readFailed: false, applied, detail: `spend cap is ${applied}`, attempts: attempt };
+        }
+        last = {
+          verified: false,
+          readFailed: false,
+          applied,
+          detail: applied === undefined
+            ? 'the campaign has NO spend cap set'
+            : `the campaign's spend cap is ${applied}`,
+        };
+      } catch (error: any) {
+        last = { verified: false, readFailed: true, detail: error?.message || 'unknown error' };
       }
-      return {
-        verified: false,
-        readFailed: false,
-        applied,
-        detail: applied === undefined
-          ? 'the campaign has NO spend cap set'
-          : `the campaign's spend cap is ${applied}`,
-      };
-    } catch (error: any) {
-      return { verified: false, readFailed: true, detail: error?.message || 'unknown error' };
+
+      if (attempt < AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, AgentModeService.SPEND_CAP_VERIFY_BACKOFF_MS));
+      }
     }
+
+    return { ...last, attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS };
+  }
+
+  /**
+   * spend_cap is in the account currency's MINOR units, but `budget_amount` and the ad-set
+   * budgets in the SAME tool are in major units (the backend multiplies those by 100). That
+   * asymmetry is exactly how a model turns "$3,000" into a $30 cap — and our read-back would
+   * then cheerfully confirm 3000 as "verified", because the write DID land; only the meaning
+   * was wrong. Echoing the major-unit equivalent in every spend-cap message makes a 100x slip
+   * visible to the model and the user instead of hiding behind a confident number.
+   */
+  private static describeSpendCap(minorUnits: number): string {
+    const major = (Number(minorUnits) / 100).toLocaleString('en-US', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    return `${minorUnits} (= ${major} in the ad account's currency)`;
   }
 
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
@@ -16162,7 +16199,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (check.verified) {
         return {
           ...created,
-          message: `${created.message} (spend cap verified: ${check.applied})`,
+          message: `${created.message} (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
           spend_cap: check.applied,
           spend_cap_verified: true,
         };
@@ -16180,7 +16217,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         ...created,
         message: `⚠️ Campaign "${campaignName}" was created, but the requested spend cap of ` +
-          `${params.spend_cap} was NOT applied — ${check.detail}. This campaign has no hard spend stop. ` +
+          `${AgentModeService.describeSpendCap(params.spend_cap)} was NOT applied after ${check.attempts} ` +
+          `read-backs — ${check.detail}. This campaign has no hard spend stop. ` +
           `Apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, params.spend_cap=${params.spend_cap}) ` +
           `and tell the user the cap is not yet in place. Do NOT create the campaign again.`,
         spend_cap_requested: params.spend_cap,
@@ -16716,7 +16754,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (check.verified) {
         return {
           success: true,
-          message: `Campaign updated successfully (spend cap verified: ${check.applied})`,
+          message: `Campaign updated successfully (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
           spend_cap: check.applied,
           spend_cap_verified: true,
         };
@@ -16741,8 +16779,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // so the reason itself carries the detail (the code stays as its prefix so callers
       // and the tool contract can still match on it).
       const notApplied =
-        `SPEND_CAP_NOT_APPLIED: the requested spend cap of ${normalizedParams.spend_cap} was NOT applied ` +
-        `to campaign ${campaignId} — ${check.detail}. The campaign does not have the hard spend stop you ` +
+        `SPEND_CAP_NOT_APPLIED: the requested spend cap of ` +
+        `${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} was NOT applied to campaign ` +
+        `${campaignId} after ${check.attempts} read-backs — ${check.detail}. ` +
+        `The campaign does not have the hard spend stop you ` +
         `asked for. Tell the user the cap is NOT in place and never claim it is set. If they ask you to ` +
         `try again, the identical CAMPAIGN UPDATE (campaign_id=${campaignId}, ` +
         `params.spend_cap=${normalizedParams.spend_cap}) is safe to re-send — the write is idempotent.`;
