@@ -23,6 +23,24 @@
 #   EB_HEALTH_SETTLE_SECONDS     Grace for health to leave Grey/Red once Ready (default 180)
 #   EB_POLL_INTERVAL_SECONDS     Seconds between describe-environments polls (default 15)
 #   EB_UPDATE_MAX_ATTEMPTS       Retries for a concurrent-update collision (default 3)
+#   EB_ABORT_MAX_RETRIES         Re-applies when EB aborts the rollout on a subset
+#                                of instances (default 1). Set to 0 to restore the
+#                                pre-ENG-1127 behaviour of failing immediately.
+#                                Bounded by EB_TOTAL_TIMEOUT_SECONDS either way.
+#   EB_HEALTH_PROBE_DRYRUN       '1' exercises the lagging-rollup health probe on
+#                                an already-successful deploy and logs what it
+#                                saw. Observation only — it runs after the deploy
+#                                is confirmed and cannot change the exit status.
+#                                Off by default, so a normal deploy still makes
+#                                no extra AWS calls.
+#   EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS
+#                                Wall-clock bound for that dry run (default 120).
+#                                Exceeding it abandons the probe and reports it
+#                                as INERT; it never fails the deploy.
+#   EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS
+#                                Seconds of the overall budget the dry run must
+#                                leave untouched (default 30). If less than that
+#                                remains, the dry run is skipped outright.
 #
 # EB_TOTAL_TIMEOUT_SECONDS is an absolute deadline covering settling, retries and
 # verification together, so the worst case cannot exceed it no matter how many
@@ -46,7 +64,9 @@
 #   elbv2:DescribeTargetGroups
 #   elbv2:DescribeTargetHealth
 # Missing any of them degrades to today's behaviour (fail on a Red rollup) and
-# names the denied call in the failure message.
+# names the denied call in the failure message. Because that degradation is
+# silent until an incident, EB_HEALTH_PROBE_DRYRUN exists to exercise the probe
+# on a healthy deploy and prove those permissions before they are needed.
 
 set -euo pipefail
 
@@ -56,6 +76,10 @@ EB_HEALTH_SETTLE_SECONDS="${EB_HEALTH_SETTLE_SECONDS:-180}"
 EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
+EB_ABORT_MAX_RETRIES="${EB_ABORT_MAX_RETRIES:-1}"
+EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
+EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS:-120}"
+EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS="${EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS:-30}"
 
 # Absolute epoch deadline for the whole run; set in main().
 EB_RUN_DEADLINE=0
@@ -88,6 +112,38 @@ EB_TERMINAL_EVENT_PATTERNS=(
   'Failed to deploy configuration'
   'You cannot configure a load balancer'
 )
+
+# ERROR-severity EB events that mean the rollout failed on a SUBSET of instances
+# and can succeed on a re-apply (ENG-1127).
+#
+# EB requires every instance to succeed. One instance failing its app-deploy
+# aborts the whole rollout, reverts the environment's version pointer, and
+# leaves the instances that did succeed on the new version. The environment then
+# sits Ready on the old version — indistinguishable, from status alone, from the
+# ENG-837 rejection this script correctly treats as terminal.
+#
+# It is not the same thing. Nothing is wrong with the bundle or the config, so
+# re-applying it converges. On 2026-08-11 the abort came from a concurrent
+# self-startup on an ASG replacement instance that had joined 31 seconds before
+# the deploy; the next deploy to land went Green untouched.
+#
+# Kept as narrow as the terminal list, and for the same reason: these two
+# strings are EB's own wording for "some instances, not your config".
+EB_ABORT_EVENT_PATTERNS=(
+  'Unsuccessful command execution on instance id(s)'
+  'During an aborted deployment'
+)
+
+# Raw text of the ERROR events read by the most recent scan, so the stale-Ready
+# branch can tell a recoverable abort from a terminal rejection without paying
+# for a second describe-events call.
+EB_LAST_ERROR_EVENTS=''
+EB_ABORT_RETRIES_USED=0
+
+# verify_deployment's return code for "the rollout aborted on a subset of
+# instances; re-apply". Distinct from 0/1 so main() cannot confuse it with a
+# genuine failure.
+readonly EB_VERIFY_RETRYABLE_ABORT=75
 
 log() {
   echo "[eb-deploy] $*"
@@ -290,6 +346,106 @@ underlying_health_verdict() {
   EB_HEALTH_VERDICT='LAGGING'
 }
 
+# Run the lag probe on a deploy that already passed, purely to observe it.
+#
+# underlying_health_verdict is only reachable when the rollup is still Grey/Red
+# past the settle window, and that has not happened on a real deploy since this
+# fix merged. So its four extra IAM actions and its output parsing have never
+# executed in production, and an inert probe is indistinguishable from a working
+# one until the incident it exists for — at which point a denied API call
+# silently degrades back to the false failure this whole change removed.
+#
+# Setting EB_HEALTH_PROBE_DRYRUN=1 makes the probe deliberately reachable on an
+# ordinary healthy deploy. It runs the real calls, prints what it saw, and is
+# explicitly NOT part of the verdict: the deploy has already been confirmed by
+# the time this runs, and nothing here can change the exit status. A dry run
+# that could fail a deploy would be a new, untested gate rather than a
+# diagnostic — the opposite of the point.
+#
+# Off by default, so an ordinary deploy still makes zero extra AWS calls.
+#
+# The probe is four sequential AWS calls with no bound of their own. Running it
+# *after* success means a stalled or throttled call would hold the script open
+# past the step's timeout-minutes and report a failure for a deploy that had
+# already been confirmed — the exact false failure this change exists to remove,
+# reintroduced by the diagnostic. So the dry run gets its own wall-clock budget,
+# clamped to what is left of the overall run budget, and abandoning it is just
+# another INERT observation.
+run_health_probe_dryrun() {
+  [ "${EB_HEALTH_PROBE_DRYRUN}" = "1" ] || return 0
+
+  local budget="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS}"
+  local remaining
+  # Leave a margin so the script still exits cleanly on its own terms rather
+  # than being killed mid-diagnostic by the workflow.
+  remaining=$(( EB_RUN_DEADLINE - $(now_seconds) - EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS ))
+  [ "${remaining}" -lt "${budget}" ] && budget="${remaining}"
+
+  if [ "${budget}" -le 0 ]; then
+    log "probe dry run: SKIPPED — too little of the ${EB_TOTAL_TIMEOUT_SECONDS}s deploy budget is left to run the probe without risking the step timeout. This did not affect this deploy."
+    return 0
+  fi
+
+  log "Probe dry run requested; exercising the lagging-rollup health probe against ${EB_ENVIRONMENT_NAME} (bounded to ${budget}s)."
+
+  # The verdict is collected through a file rather than by waiting on the child:
+  # a finished-but-unreaped child still answers `kill -0`, so polling liveness
+  # would burn the whole budget on a probe that already returned.
+  local result="${TMPDIR:-/tmp}/eb-probe-dryrun.$$"
+  rm -f "${result}" "${result}.partial"
+  # Job control puts the child in its own process group, so abandoning the probe
+  # can signal the whole tree. Killing only the wrapper subshell would leave the
+  # stalled `aws` descendant alive holding this script's stdout/stderr, and the
+  # runner can wait on those descriptors — which is the same already-confirmed-
+  # deploy-reported-as-failed defect, one level down.
+  set -m
+  (
+    underlying_health_verdict
+    printf '%s\n%s\n' "${EB_HEALTH_VERDICT}" "${EB_UNHEALTHY_DETAIL:-}" >"${result}.partial"
+    mv "${result}.partial" "${result}"
+  ) &
+  local pid=$!
+  set +m
+
+  local waited=0
+  while [ ! -f "${result}" ] && [ "${waited}" -lt "${budget}" ]; do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+
+  if [ ! -f "${result}" ]; then
+    # Signal the group first (negative PID), so the stalled AWS call dies with
+    # its wrapper; fall back to the bare PID if the group is already gone.
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    sleep 1
+    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    rm -f "${result}.partial"
+    log "probe dry run: verdict=UNKNOWN detail=the probe did not finish within ${budget}s and was abandoned"
+    log "probe dry run: INERT — the probe could not complete, so on a real Grey/Red rollup it would fall back to failing the deploy. Fix this before relying on it. This did not affect this deploy."
+    return 0
+  fi
+
+  wait "${pid}" 2>/dev/null || true
+  EB_HEALTH_VERDICT=$(sed -n 1p "${result}")
+  EB_UNHEALTHY_DETAIL=$(sed -n 2p "${result}")
+  rm -f "${result}"
+
+  log "probe dry run: verdict=${EB_HEALTH_VERDICT} detail=${EB_UNHEALTHY_DETAIL:-none}"
+
+  case "${EB_HEALTH_VERDICT}" in
+    LAGGING)
+      log "probe dry run: the probe can read every instance and target, so it would speak for a lagging rollup. Its IAM permissions are proven. This observation did not affect this deploy."
+      ;;
+    UNHEALTHY)
+      log "probe dry run: the probe reached every signal and found something unhealthy. Its IAM permissions are proven; the finding did not affect this deploy, whose own health check already passed."
+      ;;
+    *)
+      log "probe dry run: INERT — the probe could not complete, so on a real Grey/Red rollup it would fall back to failing the deploy. Fix this before relying on it. This did not affect this deploy."
+      ;;
+  esac
+}
+
 # Fails immediately on a status the environment cannot recover from, so a dead
 # environment surfaces now instead of burning the whole timeout.
 fail_on_terminal_status() {
@@ -317,6 +473,7 @@ scan_for_terminal_events() {
   [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 0
 
   local since out pattern
+  EB_LAST_ERROR_EVENTS=''
   # EB wants an ISO-8601 timestamp; both BSD and GNU date are in play (macOS
   # locally, Linux on the runner), so try the BSD form first and fall back.
   since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -340,6 +497,8 @@ scan_for_terminal_events() {
   log "[events] EB reported ERROR-severity events since the update was accepted:"
   log "[events] ${out}"
 
+  EB_LAST_ERROR_EVENTS="${out}"
+
   for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
     if printf '%s' "${out}" | grep -qF "${pattern}"; then
       fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
@@ -347,6 +506,24 @@ scan_for_terminal_events() {
   done
 
   return 0
+}
+
+# True when the most recent event scan carries EB's wording for a rollout that
+# failed on a subset of instances rather than being rejected outright.
+#
+# Reads only what scan_for_terminal_events already fetched, so this costs no
+# extra AWS call and cannot itself fail the deploy.
+events_show_recoverable_abort() {
+  local pattern
+  if [ -z "${EB_LAST_ERROR_EVENTS}" ]; then
+    return 1
+  fi
+  for pattern in "${EB_ABORT_EVENT_PATTERNS[@]}"; do
+    if printf '%s' "${EB_LAST_ERROR_EVENTS}" | grep -qF "${pattern}"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Creates the application version. A genuine failure fails the job; the single
@@ -464,6 +641,19 @@ verify_deployment() {
         stale_ready_since=$(now_seconds)
         log "Environment is Ready but still running '${EB_CURRENT_VERSION}'; allowing ${EB_REJECTION_GRACE_SECONDS}s for the update to begin."
       elif [ "$(( $(now_seconds) - stale_ready_since ))" -ge "${EB_REJECTION_GRACE_SECONDS}" ]; then
+        # A subset-of-instances abort lands in exactly this state but is not a
+        # rejection: the bundle is fine and a re-apply converges (ENG-1127).
+        # scan_for_terminal_events has already run and would have failed the job
+        # outright on a terminal pattern, so a terminal rejection can never be
+        # retried here even when EB reports both in the same event batch.
+        if events_show_recoverable_abort; then
+          if [ "${EB_ABORT_RETRIES_USED}" -lt "${EB_ABORT_MAX_RETRIES}" ]; then
+            EB_ABORT_RETRIES_USED=$(( EB_ABORT_RETRIES_USED + 1 ))
+            log "[abort-retry] EB aborted the rollout on a subset of instances, so '${EB_VERSION_LABEL}' was not applied and '${EB_ENVIRONMENT_NAME}' is back on '${EB_CURRENT_VERSION}'. The bundle and config are fine, so re-applying (${EB_ABORT_RETRIES_USED}/${EB_ABORT_MAX_RETRIES}) within the remaining budget. EB reported: ${EB_LAST_ERROR_EVENTS}"
+            return "${EB_VERIFY_RETRYABLE_ABORT}"
+          fi
+          fail "environment '${EB_ENVIRONMENT_NAME}' aborted the rollout of version '${EB_VERSION_LABEL}' on a subset of instances and was still Ready on '${EB_CURRENT_VERSION}' after ${EB_ABORT_RETRIES_USED} re-apply attempt(s). Version '${EB_VERSION_LABEL}' was NOT applied. EB reported: ${EB_LAST_ERROR_EVENTS}"
+        fi
         fail "environment '${EB_ENVIRONMENT_NAME}' has been Ready on version '${EB_CURRENT_VERSION}' for ${EB_REJECTION_GRACE_SECONDS}s after update-environment accepted '${EB_VERSION_LABEL}'. Elastic Beanstalk took the request and then declined to apply it, so this will never converge. Check the environment's ERROR events for the rejection reason."
       fi
     else
@@ -481,6 +671,7 @@ verify_deployment() {
       # calling either one a failure. Green/Yellow are accepted immediately.
       if [ "${EB_HEALTH}" != "Grey" ] && [ "${EB_HEALTH}" != "Red" ]; then
         log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' is Ready, running version '${EB_VERSION_LABEL}', health=${EB_HEALTH}."
+        run_health_probe_dryrun
         return 0
       fi
 
@@ -532,8 +723,24 @@ main() {
   log "Deploying '${EB_VERSION_LABEL}' to application '${EB_APPLICATION_NAME}' environment '${EB_ENVIRONMENT_NAME}'."
   log "Overall budget: ${EB_TOTAL_TIMEOUT_SECONDS}s (settle cap ${EB_SETTLE_TIMEOUT_SECONDS}s per attempt, up to ${EB_UPDATE_MAX_ATTEMPTS} attempts)."
   create_application_version
-  update_environment
-  verify_deployment
+
+  # One apply/verify cycle, plus a bounded re-apply when EB aborts the rollout
+  # on a subset of instances (ENG-1127). Every other outcome still exits from
+  # inside verify_deployment via fail(), and EB_RUN_DEADLINE bounds the loop
+  # regardless of how many cycles it takes.
+  local verify_rc
+  while :; do
+    update_environment
+    verify_rc=0
+    verify_deployment || verify_rc=$?
+    if [ "${verify_rc}" -eq 0 ]; then
+      break
+    fi
+    if [ "${verify_rc}" -ne "${EB_VERIFY_RETRYABLE_ABORT}" ]; then
+      exit "${verify_rc}"
+    fi
+  done
+
   log "Deployment of '${EB_VERSION_LABEL}' to '${EB_ENVIRONMENT_NAME}' is complete and verified."
 }
 

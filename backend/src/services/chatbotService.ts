@@ -550,7 +550,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -589,6 +590,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {
@@ -3765,17 +3767,29 @@ export async function loadKnowledgeBase(): Promise<void> {
   //printKnowledgeBase();
 }
 
-// Load knowledge base on startup and refresh periodically
-loadKnowledgeBase().catch((error) => {
-  console.error("Error loading knowledge base:", error);
-});
-
-// Refresh knowledge base every hour
-setInterval(() => {
+// Load knowledge base on startup and refresh periodically.
+//
+// Skipped under test. This is module-load network I/O, so merely IMPORTING any
+// route that transitively reaches this file fires a real fetch at the docs
+// corpus — which is what trips org.test.ts's "no route here has any business
+// touching the network" assertion (ENG-1112) even though nothing in that suite
+// asks for docs. The hourly timer has the same problem in reverse: it keeps a
+// handle open after a suite finishes, which is where "Cannot log after tests are
+// done" and the non-graceful worker exits come from. Production behaviour is
+// unchanged; the one test that needs the knowledge base calls
+// loadKnowledgeBase() itself.
+if (process.env.NODE_ENV !== "test") {
   loadKnowledgeBase().catch((error) => {
-    console.error("Error refreshing knowledge base:", error);
+    console.error("Error loading knowledge base:", error);
   });
-}, 60 * 60 * 1000);
+
+  // Refresh knowledge base every hour
+  setInterval(() => {
+    loadKnowledgeBase().catch((error) => {
+      console.error("Error refreshing knowledge base:", error);
+    });
+  }, 60 * 60 * 1000);
+}
 
 const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 
@@ -3813,23 +3827,72 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
+// Org-role context for Emma, one variant per role.
+//
+// This replaces a single member-only addendum that (a) asserted "there is only 1
+// owner per organization; co-owner roles do not exist on this platform", which
+// ENG-954 made false, (b) claimed only the owner can edit Brand Guidelines and
+// Market Strategy, which the per-feature `editors[]` grant has been able to
+// delegate for months, and (c) was gated on `orgRole === "member"`, so an admin
+// received no org context at all — the role most likely to be asked permission
+// questions got the least information.
+const ORG_OWNER_ADDENDUM = `
+
+## Organization membership — the current user is an owner
+
+The current user is an **owner** of their organization. Be accurate about what that means:
+
+- An organization can have **multiple owners and multiple admins**. Owners can promote another member to admin or owner, and can demote them again.
+- **Owners** can do everything: manage members and roles, edit all org settings and shared content, manage billing, and delete the organization.
+- An organization must always keep at least one owner. The last owner cannot be removed, demoted, or leave until another owner is promoted.
+- To hand over an organization, promote someone else to owner first, then leave. There is no separate "transfer ownership" step.`;
+
+const ORG_ADMIN_ADDENDUM = `
+
+## Organization membership — the current user is an admin
+
+The current user is an **admin** of their organization, not an owner. Be accurate about what admins can and cannot do:
+
+- **Admins can** invite and remove members, change org settings, manage shared content across the organization, and promote members to admin.
+- **Admins cannot** delete the organization, and cannot grant or revoke the owner role — only an owner can do that.
+- An organization can have multiple owners and multiple admins.
+
+If the user wants to do something reserved to owners, explain which owner action is needed rather than implying the capability does not exist.`;
+
 const ORG_MEMBER_ADDENDUM = `
 
-## Organization membership — current user is a member (not the owner)
+## Organization membership — the current user is a member
 
-The current user is a **member** of an organization, not the owner. Be accurate about what members can and cannot do:
+The current user is a **member** of an organization, not an owner or admin. Be accurate about what members can and cannot do:
 
-- There is only **1 owner** per organization. Co-owner roles do not exist on this platform. Do NOT suggest that someone can be made a co-owner or share ownership.
-- Members **cannot** edit Brand Guidelines or Market Strategy — those pages are read-only for members. Only the owner can modify them.
-- Members can use all other platform features (tasks, schedules, marketing hub, social posts, SEO, CRM, etc.) within the organization.
+- Members can use all platform features for their own work — tasks, schedules, marketing hub, social posts, SEO, CRM — and can see whatever the organization has chosen to share.
+- Members **cannot** manage the organization: inviting or removing people, changing org settings, and changing anyone's role are reserved to owners and admins.
+- Brand Guidelines and Market Strategy are read-only for members **unless** an owner or admin has added them as an editor for that area. The same is true for the organization's knowledge base, templates and landing pages.
+- Organizations can have multiple owners and multiple admins. If the user needs broader access, the thing to ask an owner or admin for is to be made an editor, an admin, or an owner — whichever matches what they are trying to do.`;
 
-If a user asks about making someone a co-owner, giving ownership to another person, or assigning owner-level permissions, clearly explain that only one owner is supported per organization and that co-owner assignment is not a feature of this platform.`;
+function orgRoleAddendum(orgRole?: string): string {
+  if (orgRole === "owner") return ORG_OWNER_ADDENDUM;
+  if (orgRole === "admin") return ORG_ADMIN_ADDENDUM;
+  if (orgRole === "member") return ORG_MEMBER_ADDENDUM;
+  return "";
+}
 
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
-  const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  // main refactored the member-addendum ternary into orgRoleAddendum(); ENG-803 only
+  // added the comment below. Both sides kept.
+  const memberAddendum = orgRoleAddendum(orgRole);
+  // ENG-803: `sessionType` can be 'scheduled' here — a user may open a
+  // schedule-created session in the sidebar and keep chatting in it — but this turn
+  // is ATTENDED. getScheduledSessionOverride's publish argument is therefore left
+  // undefined ON PURPOSE, which emits the base override and the truthful-reporting
+  // rules WITHOUT the unattended publish mandate or the PUBLISH AUTHORIZATION block.
+  // Passing a resolved decision here would be wrong in both directions: `true` would
+  // order a live publish past the owner's opt-out (Greptile review #18), and `false`
+  // would assert an approval gate this session may not actually be under. A human is
+  // present, so the ordinary approval flow applies.
   return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
@@ -4012,7 +4075,11 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: cap here, at the shared source, so every consumer of
+          // this function is protected uniformly instead of relying on each
+          // one to remember to truncate independently (which is exactly how
+          // one uncapped path crashed the backend with ERR_STRING_TOO_LONG).
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'public-knowledge-base',
             ...(fileName && { fileName })
@@ -4059,7 +4126,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: same cap as the public branch above.
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'private-knowledge-base',
             taskId: taskId,

@@ -60,6 +60,10 @@ export const aiReadinessManifest: LoopManifest<NormalizedEvent, LlmAnalystPropos
     'form_submitted',
     'book_clicked',
     'signup_clicked',
+    // ENG-911: the AI-Readiness quiz popup (mounted site-wide, incl. the
+    // homepage) auto-fires this ~9s after mount — it was never added here,
+    // so every popup impression silently 400'd.
+    'roadmap_popup_viewed',
   ],
   mutationSurface: [
     { key: 'hero_heading', kind: 'copy' },

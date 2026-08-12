@@ -21,6 +21,8 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -40,11 +42,25 @@ import { MarketingActionCarrier, normalizeMarketingActions } from '../services/m
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import {
+  reconcileFalseFailureReport,
+  ledgerFromSucceededFunctions,
+  diffSucceededFunctions,
+  appendConfirmedPublishNotice,
+  collectConfirmedPublishActions,
+  collectPublishActionsSince,
+  FalseFailureLedgerEntry,
+} from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
+import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
-import { getAllowedSkills } from '../services/subscriptionService';
+import {
+  getAllowedSkills,
+  isSubscriptionFeatureEnabled,
+  type SubscriptionFeatureId,
+} from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
@@ -53,6 +69,22 @@ import { DynamoDB } from 'aws-sdk';
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
+const SCHEDULED_CHATS_FEATURE: SubscriptionFeatureId = 'scheduled_chats';
+const SCHEDULED_CHATS_NOT_INCLUDED_ERROR = {
+  error: 'Scheduled chats are not included in your current plan.',
+  code: 'subscription_feature_not_included',
+  feature: SCHEDULED_CHATS_FEATURE,
+};
+
+async function userCanUseScheduledChats(userId: string): Promise<boolean | null> {
+  return isSubscriptionFeatureEnabled(userId, SCHEDULED_CHATS_FEATURE);
+}
+
+async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): Promise<boolean> {
+  if ((await userCanUseScheduledChats(userId)) === true) return false;
+  res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+  return true;
+}
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
 // only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
@@ -106,6 +138,41 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
 // does recover on retry — so it must NOT get the system-error copy that says "retrying
 // won't help" (that copy is only true for deterministic errors). Give it its own honest
 // message: temporary, auto-retried, usually self-clearing.
+/**
+ * ENG-971: the zero-output copy above all opens with "so no results were generated"
+ * and closes with "will be retried automatically". Both are false for a run that
+ * published to production and then died before writing its summary — and the retry
+ * is worse than the wording, because it republishes. This message replaces them for
+ * that case, and the requeue is suppressed alongside it.
+ */
+function zeroAssistantPublishedMessage(actions: string[], willResume: boolean, paused = false): string {
+  // No action names means the run's ledger could not be read (Greptile P1). Say that
+  // plainly rather than inventing a list or, worse, implying nothing happened — the
+  // whole point of this branch is that something may well have gone out.
+  const landed = actions.length > 0
+    ? 'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
+      + `${actions.join('; ')}. That is live and saved. `
+    : 'This scheduled run stopped before it could report back, and I could not confirm how far it got — '
+      + 'some of its work may already have gone out. ';
+  return willResume
+    // Resuming continues the same session from its last settled step, so the rest of
+    // the task finishes without repeating what already went out.
+    ? landed
+      + 'I will pick up where this run left off shortly and finish the rest — '
+      + 'what already went out will not be repeated, so there is nothing for you to re-run.'
+    // Not safely continuable: a restart would repeat the publish, so we stop and tell
+    // the owner rather than leaving a part-finished run to look like a success.
+    : landed
+      + 'The rest of this run could not be continued safely, and re-running it from the start '
+      + 'would repeat what already went out — so it has NOT been retried automatically. '
+      + (paused
+        // Saying this only when the pause actually persisted: an email cannot stop a
+        // cron, so the schedule is what had to change, and the user must know it did.
+        ? 'I have paused this schedule so its next run cannot repeat that work — '
+          + 'review what is outstanding, then resume the schedule when you are ready.'
+        : 'Check whether anything is still outstanding.');
+}
+
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
@@ -401,24 +468,97 @@ function buildWorkPlanSummary(session: any): string | null {
 /**
  * Invoke the diagnosis agent to produce a context-aware error message.
  * Returns null if diagnosis fails — caller should fall back to the generic message.
+ *
+ * ENG-971: this is where the production false-failure report was written. The turn
+ * hit GENERATION_TIMEOUT_MS three minutes AFTER publish_landing_page_changes had
+ * landed and been verified live, so none of the truthful-reporting guards inside
+ * generateMarketingResponse (finalize guard, ENG-736 landing reconciler, ENG-971
+ * false-failure guard) ran — a thrown turn never reaches that seam. The diagnosis
+ * agent was handed only the error and `failedFunctions`, and turned "be specific
+ * about what was accomplished" into "your changes were not saved. Please try your
+ * request again", risking a re-run of a production deploy that had already landed.
+ *
+ * Two fixes, both here: the agent is now given the run's SUCCESS ledger
+ * (`calledFunctions`, which toolDispatch flushes per iteration and is therefore
+ * durable at the moment of the throw), and its output goes through the same
+ * deterministic, append-only guard the loop edge uses.
+ *
+ * The ledger comes back alongside the message because the caller needs it too: when
+ * diagnosis is unavailable the generic fallback still ends in "please try sending
+ * your message again", and that advice is just as wrong after a landed publish.
  */
+interface DiagnosisResult {
+  /** The diagnosis agent's message, already reconciled. Null when unavailable. */
+  message: string | null;
+  /** Publish/deploy calls this run is confirmed to have completed. */
+  publishLedger: FalseFailureLedgerEntry[];
+}
+
+/**
+ * The publish/deploy calls a session is confirmed to have completed. Used on the
+ * error branches that never reach the diagnosis agent — a worker shutdown replaces
+ * it with a fixed string, and that string still ends in "please send your message
+ * again", which is the wrong advice after a landed publish.
+ */
+async function loadPublishLedger(
+  sessionId: string,
+  baseline?: Record<string, number> | null,
+): Promise<FalseFailureLedgerEntry[] | null> {
+  // Retried, because UNKNOWN is no longer a soft outcome: it can stop a scheduled
+  // restart and even pause a customer's schedule. A single transient DynamoDB blip
+  // must not be enough to trigger that — "unreadable" has to mean actually
+  // unreadable, not unlucky once.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return ledgerFromSucceededFunctions(
+        diffSucceededFunctions(baseline, session?.calledFunctions || null),
+      );
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadPublishLedger: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
+  try {
+    // NULL means UNKNOWN, and that is deliberately not the same as "nothing was
+    // published" (Greptile P1). Collapsing the two let a failed read on the
+    // scheduled path restart a run from scratch and repeat a production publish.
+    // Callers that only annotate a message may treat null as empty; the caller that
+    // decides whether to RE-RUN work must not.
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
-  userMessage: string
-): Promise<string | null> {
+  userMessage: string,
+  baseline?: Record<string, number> | null
+): Promise<DiagnosisResult> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    // THIS TURN's successes, not the session's lifetime total — see
+    // diffSucceededFunctions. "What was accomplished" must mean this request.
+    const succeededFunctions = diffSucceededFunctions(baseline, session?.calledFunctions || null);
+    const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
       userMessage: userMessage || '',
       workPlanSummary: buildWorkPlanSummary(session),
       failedFunctions: session?.failedFunctions || null,
+      succeededFunctions,
     };
-    return await agentModeService.generateDiagnosticMessage(context);
+    const message = await agentModeService.generateDiagnosticMessage(context);
+    return {
+      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      publishLedger,
+    };
   } catch {
-    return null;
+    return { message: null, publishLedger: [] };
   }
 }
 
@@ -902,6 +1042,8 @@ const CADENCE_SKIP_PATTERNS: RegExp[] = [
   /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest|off)\s+day)\b/i,
   /\b(?:rest|off|skip|non-?publishing)\s+day\s+for\s+this\s+(?:schedule|cadence)\b/i,
   /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
+  // Self-contained because it names the publishing window itself (ENG-844 audit).
+  /\boutside\s+(?:the\s+|its\s+|this\s+)?(?:publish(?:ing)?|post(?:ing)?)\s+(?:window|cadence|days?|schedule)\b/i,
 ];
 
 // A bare skip declaration. On its own this is ambiguous (a failure can be worded
@@ -911,6 +1053,12 @@ const SKIP_DECLARATION_PATTERNS: RegExp[] = [
   /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule|post))\b/i,
   /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
   /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+  // Real phrasings a model reaches for that the original set missed (audited against
+  // production skip transcripts, ENG-844). Each still requires a CADENCE_RATIONALE
+  // match in the same turn, so none of these can authorize a skip on its own.
+  /\bstanding\s+down\b/i,
+  /\bno\s+action\s+(?:taken|needed|required)\b/i,
+  /\b(?:no\s+(?:content|posts?|images?)\s+(?:was|were)\s+(?:produced|created|generated|published)|nothing\s+(?:was|were)\s+(?:produced|created|generated|published))\b/i,
 ];
 
 // Evidence the skip is driven by the schedule's PUBLISHING CADENCE (a weekday
@@ -928,16 +1076,49 @@ const CADENCE_RATIONALE_PATTERNS: RegExp[] = [
 
 // A run that hit a FAILURE (missing access, auth, timeout, tool error) is NOT a
 // cadence skip — it must still retry + alert. Any of these veto the carve-out.
-const SKIP_FAILURE_SIGNAL_PATTERNS: RegExp[] = [
-  // Contractions only fire on a real apostrophe so words like "current" (…nt) do
-  // not false-veto: couldn't, wasn't, isn't, can't, don't, won't, …
-  /\b\w+n['’]t\b/i,
-  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to)\b/i,
+// HARD failure signals: unambiguous evidence something broke. These veto wherever
+// they appear (after the zero-ledger neutralisation below).
+const HARD_FAILURE_PATTERNS: RegExp[] = [
   /\b(?:failed(?:\s+to)?|failure|errored?|an?\s+error|timed?\s*out|time[\s-]?out)\b/i,
-  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|no\s+access|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
+  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
   /\bauth(?:entication|orization)?\s+(?:fail(?:ed|ure)?|error|issue|problem)\b/i,
   /\b(?:token\s+expired|invalid\s+(?:token|credential))/i,
+  /\bdid\s+not\s+work\b/i,
 ];
+
+// INABILITY / REFUSAL phrasing. This is genuinely ambiguous: on a skip day
+// "I cannot post today because the cadence forbids it" is a correct REFUSAL, while
+// "I could not access LinkedIn" is a FAILURE. The original rule vetoed on ANY
+// `\w+n't` contraction, which silently rejected the most natural ways to describe a
+// legitimate skip — "today isn't a publishing day", "I won't publish anything
+// today", "I didn't create anything" — the same phrasing-fragility class that caused
+// the 2026-08-06 production regression (ENG-844). So these veto ONLY when the
+// sentence does not justify itself by the cadence, or when it names an external
+// resource (which turns a refusal into a report of a broken dependency).
+const INABILITY_PATTERNS: RegExp[] = [
+  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to|would\s+not|refused)\b/i,
+];
+
+// An external dependency named alongside an inability means it is a failure report
+// ("LinkedIn would not accept the post"), not a cadence refusal.
+const FAILURE_RESOURCE_PATTERN =
+  /\b(?:linkedin|instagram|twitter|facebook|api|endpoint|server|network|gateway|upstream|http|token|credential|account)\b/i;
+
+// "no access" is only an auth failure when it is about an external resource
+// ("no access to the LinkedIn account"). On its own it is ordinary prose — e.g.
+// "no access to the calendar was needed" — and must not veto a legitimate skip.
+const NO_ACCESS_PATTERN = /\bno\s+access\b/i;
+
+// Expand contractions so the veto reasons about words, not apostrophes: "couldn't"
+// → "could not" (still an inability), while "isn't"/"didn't"/"won't" become plain
+// negations that no longer trip anything by themselves.
+function expandContractions(text: string): string {
+  return text
+    .replace(/\bcan['’]t\b/gi, 'cannot')
+    .replace(/\bwon['’]t\b/gi, 'will not')
+    .replace(/\bshan['’]t\b/gi, 'shall not')
+    .replace(/\b(\w+)n['’]t\b/gi, '$1 not');
+}
 
 const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 
@@ -968,11 +1149,18 @@ const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
   /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
   /\bif\b[^.]*\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post))/i,
   /\b(?:skip|publish\s+nothing|post\s+nothing|no\s+post)\b[^.]*\b(?:mon|tue|wed|thu|fri|sat|sun|weekend|weekday)/i,
+  // A negative cadence stated directly — "DO NOT create or publish anything on
+  // Tue/Thu", "doesn't publish on weekends" (contractions are expanded first). The
+  // object between the negation and the verb is why the `if …` pattern above missed
+  // these (ENG-844 audit).
+  /\b(?:do|does|will|should)\s+not\b[^.]{0,40}?\b(?:publish|post|create|generate)\b/i,
 ];
 
 function instructionAuthorizesConditionalSkip(instruction: string): boolean {
   if (!instruction || typeof instruction !== 'string') return false;
-  const text = instruction.replace(/<[^>]+>/g, ' ');
+  // Expand contractions here too, so an owner who wrote "doesn't publish on
+  // weekends" is read the same as "does not publish on weekends" (ENG-844 audit).
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
   return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
 }
 
@@ -1064,17 +1252,34 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
   const publishDays = new Set<number>();
   const skipDays = new Set<number>();
   if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
-  const text = instruction.replace(/<[^>]+>/g, ' ');
-  const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
-  const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
+  // "do not publish" must tolerate an intervening object — real instructions say
+  // "DO NOT create or publish anything" (ENG-844 audit). Contractions are already
+  // expanded above, so only the "do not" form needs matching here.
+  const skipKeyword =
+    /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b|\b(?:do|does|will|should)\s+not\b[^.;\n]{0,40}?\b(?:publish|post|create|generate)\b/i;
+  // NB the inflections: `only\s+(?:publish|post)\b` does NOT match "only publishes",
+  // which is the single most common way owners write a cadence. That omission left
+  // publishDays EMPTY for the LUCAS schedule; it only ever corroborated because its
+  // skip clause happened to quote the words "non-publishing day". Any owner who
+  // wrote just "only publishes on Mon/Wed/Fri" got no cadence at all and every skip
+  // failed closed into the retry press (ENG-844 audit).
+  const publishOnlyKeyword =
+    /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b|\bonly\s+on\b/i;
   for (const clause of text.split(/[.;\n]+/)) {
     const days = weekdaysInFragment(clause);
     if (days.length === 0) continue;
     const isSkip = skipKeyword.test(clause);
     const isPublishOnly = publishOnlyKeyword.test(clause);
     // A "publish only on <days>" clause names the PUBLISH days; a skip clause names
-    // the SKIP days. Publish-only wins a tie (its days are the positive cadence).
-    if (isPublishOnly) days.forEach((d) => publishDays.add(d));
+    // the SKIP days. A clause naming the verb ("publish only" / "only publishes") is
+    // an unambiguous positive cadence and wins. A bare "only on <days>" is a WEAK
+    // signal — "skip only on Saturday" also contains it — so when the clause also
+    // reads as a skip, the skip interpretation wins (otherwise Saturday would be
+    // recorded as a PUBLISH day and every legitimate Saturday skip rejected).
+    const strongPublishOnly =
+      /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i.test(clause);
+    if (strongPublishOnly || (isPublishOnly && !isSkip)) days.forEach((d) => publishDays.add(d));
     else if (isSkip) days.forEach((d) => skipDays.add(d));
   }
   return { publishDays, skipDays };
@@ -1213,7 +1418,12 @@ export function scheduledRunSignalsConditionalSkip(
   // weekday assertion and a "<td>Failed</td><td>0</td>" completion ledger is read
   // as prose. Verified against the real ENG-844 session (442e7880…): both
   // happened, and without this the carve-out never fired on the actual skip.
-  const text = content.replace(/<[^>]+>/g, ' ');
+  // Contractions are expanded up-front so EVERY stage reasons about words rather
+  // than apostrophes. Without this, the most natural skip phrasing of all —
+  // "today isn't a publishing day" — never even matched the cadence-skip patterns
+  // (which look for "not a publishing day"), so the run was never recognised as a
+  // skip (ENG-844 audit).
+  const text = expandContractions(content.replace(/<[^>]+>/g, ' '));
 
   // (1) Must be a cadence-anchored skip, not a bare "skip today".
   const isCadenceSkip =
@@ -1225,17 +1435,49 @@ export function scheduledRunSignalsConditionalSkip(
   // (2) A failure worded as a skip is not a cadence skip. But FIRST neutralize a
   // zero/none-valued failure ledger — a clean run routinely reports "Failed: 0" /
   // "Failed  0" (a "<td>Failed</td><td>0</td>" cell) / "failures: none", which is
-  // a SUCCESS signal, not a failure. Only the ledger's own value is dropped
-  // (label THEN count); a nonzero or asserted failure ("Failed 1", "post failed",
-  // "auth failed", "couldn't reach the API") is untouched and still vetoes. NB:
-  // matching a zero that PRECEDES the word (`0 failed`) is deliberately avoided —
-  // once tags are stripped, the prior ledger row's count ("Succeeded 0") sits
-  // right before the next row's "Failed" and would falsely neutralize it.
-  const failureScan = text.replace(
-    /\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi,
-    ' '
+  // a SUCCESS signal, not a failure. A nonzero or asserted failure ("Failed 1",
+  // "post failed", "auth failed", "couldn't reach the API") is untouched and still
+  // vetoes.
+  //
+  // BOTH orders must be neutralized (prod regression, session 25ec4670 on
+  // 2026-08-06): agents also write the count FIRST, as an inline ledger —
+  // "Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued." Only handling
+  // label-then-count let the bare word "failed" survive there and veto a perfectly
+  // legitimate cadence skip, sending the run into the full 20-attempt retry press
+  // this ticket exists to prevent.
+  //
+  // The count-then-label rule carries a negative lookahead for a FOLLOWING nonzero
+  // count, which is what makes it safe: a stripped HTML table renders as
+  // "Succeeded 0 Failed 1", where the "0" belongs to the PREVIOUS row — there,
+  // "Failed" is followed by "1", so it is left intact and still vetoes.
+  //
+  // That lookahead must tolerate PUNCTUATION between the label and its own count
+  // (Greptile P1): "Succeeded 0 Failed, 1" / "… Failed; 1" / "… Failed | 1" all bind
+  // the 1 to "Failed", but a separator class of only [:=-] failed to see it, so the
+  // "0 Failed" was neutralised and a reported failure was waived as a clean skip.
+  // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
+  // often, never less — and the real production ledger is unaffected because every
+  // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  const failureScan = expandContractions(
+    text
+      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
   );
-  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
+  // (2a) Hard failure evidence vetoes anywhere in the turn.
+  if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
+  // (2b) Inability/refusal is judged PER SENTENCE: it only vetoes when the sentence
+  // does not justify itself by the cadence, or when it names an external resource
+  // (a broken dependency rather than a deliberate refusal).
+  for (const sentence of failureScan.split(/[.;!?\n]+/)) {
+    // "no access" + a named external resource is an auth failure.
+    if (NO_ACCESS_PATTERN.test(sentence) && FAILURE_RESOURCE_PATTERN.test(sentence)) return false;
+    if (!INABILITY_PATTERNS.some((re) => re.test(sentence))) continue;
+    const cadenceJustified =
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(sentence)) ||
+      CADENCE_SKIP_PATTERNS.some((re) => re.test(sentence));
+    if (cadenceJustified && !FAILURE_RESOURCE_PATTERN.test(sentence)) continue;
+    return false;
+  }
 
   // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
   // AND no tool errors. Any tool error means this was a failure, not a skip; any
@@ -1469,16 +1711,60 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
+// ENG-803: the terminal marker a publish-withheld run is instructed to end on (see
+// the approval-required branch of getScheduledSessionOverride).
+//
+// Without this the fix would loop the very runs it protects. A withheld run
+// correctly ends by saying its drafts are saved and nothing was posted — wording
+// that the confirmation detector reads as "awaiting … approval", i.e. a run halting
+// for a human answer. It would then be nudged to continue, on a schedule whose owner
+// asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
+// avoid. The marker is emitted only on the withheld branch, so it distinguishes a
+// deliberate, complete withhold from a genuine mid-run halt.
+const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+
+// NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
+// must confirm the run was actually withheld before honouring it — see the
+// publishAuthorized parameter on the classifiers below (Greptile review #20).
+export function scheduledRunWithheldPublish(content?: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return PUBLISH_WITHHELD_MARKER.test(content);
+}
+
+/**
+ * ENG-803: may this run's publish-withheld marker be honoured?
+ *
+ * The marker is text the MODEL wrote, so trusting it alone re-opens the exact hole
+ * this ticket is about (Greptile review #20): an AUTHORIZED run that simply does not
+ * want to post can emit the sentence, suppress its own corrective continuation, and
+ * finish "successfully" having published nothing. That is the fabricated publishing
+ * constraint again, except this time the platform hands it a machine-readable way to
+ * escape the nudge.
+ *
+ * So the marker is only honoured when the schedule ACTUALLY withheld authorization —
+ * an explicit `false` resolved from the record. `undefined` (a caller with no
+ * schedule to read) deliberately does NOT exempt: the two failure modes are not
+ * symmetric. Refusing the exemption costs a genuinely-withheld run one extra
+ * continuation, bounded by completionGateMaxContinuations; granting it on an unknown
+ * lets any run talk its way out of a mandated publish.
+ */
+function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolean {
+  return publishAuthorized === false && scheduledRunWithheldPublish(content);
+}
+
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
-}): ScheduledContinuationReason | null {
+}, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
-  if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
+  // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
+  // genuinely truncated or leave other work unfinished, and those must still continue.
+  if (!withholdIsGenuine(content, publishAuthorized) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1545,6 +1831,40 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   }
 }
 
+/**
+ * ENG-803: resolve the publish authorization that is true RIGHT NOW.
+ *
+ * A scheduled run lives for minutes, and the owner can flip "Require approval before
+ * publishing" while it is in flight. The prompt builder
+ * (agentModeService.resolveScheduledPublishAuthorized) and the dispatch guard
+ * (blockedByScheduledPublishApproval) both re-read the record at the moment they act,
+ * so a snapshot taken when the worker loaded the schedule can disagree with both
+ * (Greptile review #30). The disagreement is not cosmetic: with a stale `false`, an
+ * owner who has just AUTHORIZED publishing gets a run whose model-authored
+ * `PUBLISH WITHHELD` marker is still believed, suppressing the corrective
+ * continuation — ENG-803's original "finished without posting" failure, rebuilt out
+ * of a cache. So this reads the record, exactly like the other two consumers, and
+ * feeds the same pure `resolvePublishAuthorized`.
+ *
+ * A READ FAILURE RETURNS undefined, NOT false. `false` is the one value that makes
+ * the marker believable, so inventing it from a DynamoDB blip would let an unverified
+ * model-authored sentence end the run. `undefined` withholds the exemption instead:
+ * the run spends one more bounded continuation, and any genuinely unauthorized
+ * publish it then attempts is still refused by the dispatch guard, which does its own
+ * independent read. The two layers fail in opposite directions on purpose.
+ */
+async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean | undefined> {
+  try {
+    return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId) as any);
+  } catch (error) {
+    console.error(
+      `AgentMode ENG-803: could not re-read schedule ${scheduleId} to verify a publish-withheld marker; refusing the exemption rather than trusting model-authored text:`,
+      error
+    );
+    return undefined;
+  }
+}
+
 // Async classifier used at the completion-gate decision points. Identical to the
 // sync classifier except the 'confirmation' case also consults the LLM judge when
 // the regex misses — so an unanticipated halt phrasing still triggers the
@@ -1554,11 +1874,20 @@ export async function classifyScheduledContinuationAsync(response: {
   truncatedByStepBudget?: boolean;
   truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
-}): Promise<ScheduledContinuationReason | null> {
+}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
-  if (await scheduledTurnDefersToUser(content)) return 'confirmation';
+  // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
+  // marker can be exempted, so a turn without one must not pay for a schedule read.
+  // Absent resolver (callers with no schedule) stays `undefined`, which never exempts.
+  const publishAuthorized = scheduledRunWithheldPublish(content)
+    ? await resolvePublishAuthorizedNow?.()
+    : undefined;
+  // ENG-803: same withhold exemption as the sync classifier above — and it must be
+  // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
+  // that is deliberately shaped like a deferral.
+  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1636,6 +1965,13 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-803: reads this run's publish authorization AS IT IS NOW. Used ONLY to
+    // decide whether the model's publish-withheld marker may be believed — see
+    // withholdIsGenuine. Deliberately a resolver rather than a value: the owner can
+    // change the setting mid-run, and a snapshot would disagree with the prompt
+    // builder and the dispatch guard, which both re-read it (Greptile review #30).
+    // Undefined for callers with no schedule, which never honour the marker.
+    publishAuthorized?: () => Promise<boolean | undefined>;
     // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
     // session that this run is RESUMING. Seeded into the run's accumulated tool
     // calls so keyword/required-function verification counts the whole task, not
@@ -1667,7 +2003,8 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false
+    parkNotifiable = false,
+    publishAuthorized
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -1997,7 +2334,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        });
+        }, publishAuthorized);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2252,7 +2589,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          })
+          }, publishAuthorized)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -2397,6 +2734,38 @@ function getZeroAssistantRetryCount(schedule: any): number {
   return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
 }
 
+/**
+ * Tell the schedule owner a run needs a human look. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort by
+ * design — a notification failure must never break the run.
+ */
+async function notifyScheduleOwnerOfFailure(
+  schedule: any,
+  userId: string,
+  detail: { failedAttempts: number; failureClass: any }
+): Promise<void> {
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduledRunFailedEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; owner alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send owner failure alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -2446,6 +2815,18 @@ export async function runScheduledChat(
   const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let leaseAcquired = false;
+  // ENG-971: set when this run published and we could neither resume it nor
+  // persist a pause. Holding the lease is the ONLY backstop that needs no
+  // successful write: `setRunInFlight` is conditional on
+  // `attribute_not_exists(runInFlight)`, so while the lease stands the schedule
+  // physically cannot start a fresh run and repeat the publish. The stale
+  // heartbeat then hands it to the reconciler, which re-checks the attempt and
+  // recovers it properly once the datastore is healthy again.
+  let holdLeaseToBlockRestart = false;
+  // ENG-971: successes already on the session when THIS run started — empty for a
+  // fresh session, the abandoned run's totals when resuming one. Hoisted above the
+  // try because the zero-output requeue decision reads it from the CATCH.
+  let runStartCalledFunctions: Record<string, number> | null = null;
 
   try {
     // Guard against orphaned schedules whose owning user no longer exists.
@@ -2496,6 +2877,58 @@ export async function runScheduledChat(
       }
 
       return orphanedUserResult;
+    }
+
+    // Central guard covers cron/manual/public execution and old schedules that
+    // remain stored after an admin removes this entitlement.
+    const scheduledChatAccess = await userCanUseScheduledChats(userId);
+    if (scheduledChatAccess === null) {
+      const unresolvedEntitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: 'Scheduled chat was not run because subscription features are temporarily unavailable. It will remain active and retry on the next scheduled run.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, unresolvedEntitlementResult)
+        .catch((error) => console.error('Error saving unresolved scheduled-chat entitlement result:', error));
+      return unresolvedEntitlementResult;
+    }
+
+    if (!scheduledChatAccess) {
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+      }).catch((error) => console.error(`Failed to auto-pause schedule ${schedule.scheduleId}:`, error));
+
+      const entitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: SCHEDULED_CHATS_NOT_INCLUDED_ERROR.error,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, entitlementResult)
+        .catch((error) => console.error('Error saving scheduled-chat entitlement result:', error));
+      return entitlementResult;
     }
 
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -2923,6 +3356,12 @@ export async function runScheduledChat(
       // reloads the full transcript from the DB.
       isResumeRun = true;
       sessionId = pendingResumeSessionId;
+      // ENG-971: a RESUMED session carries the abandoned run's calledFunctions. Without
+      // this baseline, that run's publish would be read as THIS run's work — and since
+      // a confirmed publish suppresses the zero-output requeue, an unrelated failure
+      // here would silently end the schedule's auto-recovery. Resume is exactly the
+      // path for runs that did real work first, so this is the common case.
+      runStartCalledFunctions = resumeSession.calledFunctions || {};
       // Credit the abandoned portion's tool calls to this run's verification,
       // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
       resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
@@ -3049,6 +3488,11 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-803: re-read at the moment the marker is evaluated, so the continuation
+      // classifier uses the SAME live decision as the prompt builder and the dispatch
+      // guard. A snapshot taken here would go stale the moment the owner toggles the
+      // setting mid-run (Greptile review #30).
+      publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -3126,7 +3570,24 @@ export async function runScheduledChat(
 
     // Generate a 2-3 word summary and update the session title
     try {
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      // ENG-803: ground the title suffix in the tools that actually ran, so a run
+      // that posted nothing cannot be titled "Replies queued".
+      //
+      // SUCCEEDED, not merely ATTEMPTED (Greptile review #19). The ledger keeps
+      // failed and preflight-rejected calls too, so passing every name through would
+      // hand the summarizer a `twitter_manage_post` entry for a call that errored —
+      // and it would faithfully title the run "Replies Posted". That is precisely
+      // ENG-803's false-success title, re-created by the fix meant to prevent it.
+      //
+      // A call counts only when it has no top-level `error` (the repo-wide failure
+      // marker — see countFailedToolCalls) and its result did not report
+      // success:false, which is how preflight rejections come back while still
+      // looking like a completed call.
+      const succeededToolNames = (result.toolCalls || [])
+        .filter(toolCallSucceeded)
+        .map((call: any) => call?.name)
+        .filter(Boolean);
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;
@@ -3321,6 +3782,53 @@ export async function runScheduledChat(
 
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput) {
+      // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
+      // can land and the process die before the summary — exactly the shape of the
+      // session this issue came from, minus the closing turn. Requeuing that run
+      // REPUBLISHES it, and unlike the interactive error paths there is no human
+      // between the failure and the retry, so correcting the transcript alone would
+      // arrive far too late. Read the ledger first; it decides both the message and
+      // whether the requeue happens at all. A read failure yields no actions and
+      // every existing behaviour is preserved.
+      const publishLedgerForRun = sessionId
+        ? await loadPublishLedger(sessionId, runStartCalledFunctions)
+        : [];
+      // A read failure is UNKNOWN, not "nothing happened" (Greptile P1). Restarting
+      // the task from scratch on an unknown can repeat a production publish, so an
+      // unknown is handled exactly like a confirmed one: never restart, prefer resume.
+      const publishLedgerUnknown = publishLedgerForRun === null;
+      const publishedActions = publishLedgerForRun
+        ? collectConfirmedPublishActions(publishLedgerForRun)
+        : [];
+      const mayHavePublished = publishedActions.length > 0 || publishLedgerUnknown;
+
+      // Work landed this run, so there are three options and only one is good.
+      // A blind requeue restarts from scratch and REPUBLISHES it. Simply not
+      // retrying avoids that, but can leave a multi-step run (publish 1 of 5, then
+      // die) permanently part-done with nothing surfaced — a quieter, harder-to-
+      // diagnose failure than the duplicate it prevents. So prefer RESUME:
+      // planScheduledRunResume says yes only when the transcript ends on a settled,
+      // balanced boundary, which by construction never re-drives a tool that already
+      // ran. The rest of the task finishes; the publish is not repeated.
+      const zeroOutputNextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      let willResumePublishedRun = false;
+      if (
+        mayHavePublished
+        && !isTest
+        && sessionId
+        && zeroOutputNextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES
+      ) {
+        try {
+          const priorMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+          willResumePublishedRun = planScheduledRunResume(priorMessages as any).resumable;
+        } catch (planError) {
+          console.error(
+            `Zero-output resume-plan check failed for session ${sessionId}; will not retry:`,
+            planError
+          );
+        }
+      }
+
       // Never leave the session silent (ENG-209). Persist a structured
       // "job incomplete" assistant message so the user sees graceful feedback
       // instead of an empty session. Done BEFORE requeue so the failed session
@@ -3332,8 +3840,15 @@ export async function runScheduledChat(
         // batches" advice that can't help — that mislabels the transcript for anyone
         // debugging it. Budget-shaped failures keep the original guidance.
         const failureClass = classifyZeroAssistantFailure(error);
-        const incompleteMessage = zeroAssistantIncompleteMessage(error);
-        try {
+        // ENG-971: the published-run message is written AFTER the requeue decision
+        // (below), because its two variants make opposite promises and only the
+        // outcome knows which is true — the resume wording would be a lie if the
+        // requeue write then failed. This is the very failure class this issue is
+        // about, so the message must never run ahead of the fact.
+        const incompleteMessage = mayHavePublished
+          ? null
+          : zeroAssistantIncompleteMessage(error);
+        if (incompleteMessage) try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
             content: incompleteMessage,
@@ -3362,8 +3877,119 @@ export async function runScheduledChat(
         timestamp: new Date().toISOString(),
       });
 
-      if (!isTest) {
-        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      let publishedRunDidResume = false;
+      let publishedRunPaused = false;
+      if (mayHavePublished) {
+        if (willResumePublishedRun) {
+          // Requeue AS A RESUME: same session, continued from its last settled step.
+          // Retried, because this single write is what stands between a recoverable
+          // blip and having to pause the customer's schedule below.
+          const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(zeroOutputNextRetryCount)).toISOString();
+          for (let attempt = 1; attempt <= 3 && !publishedRunDidResume; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'active',
+                nextRunTime: retryAt,
+                zeroAssistantRetryCount: zeroOutputNextRetryCount,
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                pendingResumeSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunDidResume = true;
+              zeroAssistantRequeuedAt = retryAt;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+                + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
+              );
+            } catch (requeueError) {
+              console.error(
+                `Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId} `
+                + `(attempt ${attempt}/3):`,
+                requeueError
+              );
+            }
+          }
+        } else {
+          // Cannot continue safely and must not restart.
+          console.error(
+            `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+            + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing.`
+          );
+        }
+
+        // The run published and is NOT being continued — either it could not be
+        // resumed, or the resume marker would not persist. Leaving the schedule
+        // ACTIVE means its next ordinary fire starts a fresh session and repeats
+        // work that already went out, and an owner email cannot stop a cron: only
+        // persisted state can. So pause the schedule. Deliberately a last resort —
+        // it stops a customer's recurring workflow — which is why the marker write
+        // above is retried first, and why nothing pauses on an ordinary failure.
+        if (!publishedRunDidResume && !isTest) {
+          zeroAssistantRequeuedAt = undefined;
+          // Retried like the marker write above: this is the last durable thing
+          // standing between a published run and a repeat, so one unlucky call must
+          // not decide it.
+          for (let attempt = 1; attempt <= 3 && !publishedRunPaused; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'paused',
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunPaused = true;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} PAUSED: it published `
+                + `(${publishedActions.join('; ') || 'outcome unreadable'}) and cannot be continued, `
+                + `so its next fire would repeat that work.`
+              );
+            } catch (pauseError) {
+              console.error(
+                `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
+                + `non-resumable run (attempt ${attempt}/3):`,
+                pauseError
+              );
+            }
+          }
+          // Every durable write failed. Fall back to the one guard that needs no
+          // write: keep the lease, so no fresh run can start until the reconciler
+          // re-examines this attempt.
+          if (!publishedRunPaused) holdLeaseToBlockRestart = true;
+        }
+
+        // Keyed on what ACTUALLY happened, not on which branch we took (Greptile P1).
+        // A resume marker that failed to persist leaves the schedule active with no
+        // marker, so its next ordinary fire starts a FRESH session and can repeat the
+        // publish. That path used to only log. Whenever the run did not actually
+        // resume — unresumable transcript OR failed marker write — the work may
+        // already have gone out and nothing will continue it, so the owner is told.
+        if (!publishedRunDidResume && !isTest) {
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: zeroOutputNextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
+        }
+        // Outcome settled — now the transcript can state it truthfully.
+        if (sessionId) {
+          try {
+            await chatbotDb.addMessageToSession(sessionId, {
+              role: 'assistant',
+              content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
+              timestamp: new Date().toISOString(),
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isErrorMessage: true,
+                jobIncomplete: true,
+                failureClass: classifyZeroAssistantFailure(error),
+              },
+            });
+          } catch (persistError) {
+            console.error('Failed to persist published-run job-incomplete message:', persistError);
+          }
+        }
+      } else if (!isTest) {
+        const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
           zeroAssistantRequeuedAt = retryAt;
@@ -3398,35 +4024,10 @@ export async function runScheduledChat(
           // atomic with the email send, so any such flag inevitably diverges from actual
           // delivery (a duplicate alert if the write fails after a send, or a missed alert
           // if the ordering is inverted). No dedup state means no divergence to get wrong.
-          try {
-            let recipients: string[] = Array.isArray(schedule.emailNotifications)
-              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-              : [];
-            if (recipients.length === 0) {
-              const owner = await userDb.getUserById(userId);
-              if (owner?.email) recipients = [owner.email];
-            }
-            if (recipients.length > 0) {
-              await emailService.sendScheduledRunFailedEmail(
-                recipients,
-                schedule.scheduleName,
-                schedule.scheduleId,
-                {
-                  failedAttempts: nextRetryCount,
-                  failureClass: classifyZeroAssistantFailure(error),
-                }
-              );
-            } else {
-              console.error(
-                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
-              );
-            }
-          } catch (notifyError) {
-            console.error(
-              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
-              notifyError
-            );
-          }
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: nextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
         }
       }
     }
@@ -3528,7 +4129,16 @@ export async function runScheduledChat(
     // if the reconciler already reaped this run (heartbeat went stale), the clear
     // no-ops and the requeue it wrote stands.
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (leaseAcquired) {
+    if (leaseAcquired && holdLeaseToBlockRestart) {
+      // Deliberately NOT clearing. Releasing here would free the schedule to fire
+      // normally and re-run work that already went out; keeping it is a decision
+      // not to act, so unlike a pause write it cannot fail.
+      console.error(
+        `Scheduled chat ${schedule.scheduleId}: HOLDING the in-flight lease — this run published `
+        + `and could not be resumed or paused, so the lease is the only thing preventing a repeat. `
+        + `The stale-run reconciler will recover it.`
+      );
+    } else if (leaseAcquired) {
       try {
         await scheduleDb.clearRunInFlight(schedule.scheduleId, leaseRunId);
       } catch (clearError) {
@@ -3554,9 +4164,9 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // failure recorded) — just not rescheduled.
   const isActive = schedule.status === 'active';
   const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
-  const willRequeue = isActive && !overCap;
-  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
-  const requeuedAt = willRequeue
+  let willRequeue = isActive && !overCap;
+  let noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
+  let requeuedAt = willRequeue
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
 
@@ -3566,6 +4176,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // killed mid-tool-execution is NOT resumed (never re-drive a half-applied side
   // effect). Best-effort: any read/plan failure falls back to a fresh restart.
   let resumeSessionId = '';
+  // Set when this run published (or may have) and cannot be continued: suppressing
+  // the requeue alone leaves the schedule ACTIVE, so its next ORDINARY fire would
+  // still restart from scratch and repeat that work. Only pausing prevents it.
+  let pauseBeforeClaim = false;
   if (willRequeue && lease.sessionId) {
     try {
       const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
@@ -3573,7 +4187,93 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
         resumeSessionId = lease.sessionId;
       }
     } catch (planError) {
-      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}, will restart fresh:`, planError);
+      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}:`, planError);
+    }
+  }
+
+  // ENG-971 (Greptile): without a resume marker this requeue RESTARTS the task from
+  // scratch, re-driving its side effects. The paths that reach here without one are
+  // exactly the dangerous cases — an unresumable transcript, or a plan check that
+  // threw — and `claimAbandonedRun` with no resumeSessionId also REMOVES any marker
+  // already stored. So restart only when the ledger can be read AND shows nothing
+  // published; a confirmed publish or an unreadable ledger stops the restart and
+  // tells the owner instead, matching the zero-output path in runScheduledChat.
+  if (willRequeue && !resumeSessionId && lease.sessionId) {
+    // Scoped to THIS attempt via lease.startedAt. calledFunctions is
+    // session-cumulative and a recovered run resumes the abandoned run's session,
+    // so reading the counters here would let an EARLIER attempt's publish pause a
+    // schedule whose latest attempt published nothing — a live workflow stopped for
+    // a run that did nothing wrong. The transcript answers precisely, using state
+    // the lease already carries.
+    let attemptPublished: string[] = [];
+    let transcriptUnreadable = true;
+    // Retried for the same reason the ledger read is: an unreadable transcript can
+    // PAUSE a live schedule, so one transient failure must not be enough to decide it.
+    for (let attempt = 1; attempt <= 3 && transcriptUnreadable; attempt++) {
+      try {
+        const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
+        attemptPublished = collectPublishActionsSince(priorMessages as any, lease.startedAt);
+        transcriptUnreadable = false;
+      } catch (readError) {
+        if (attempt === 3) {
+          console.error(
+            `recoverAbandonedScheduledRun: transcript unreadable for ${lease.sessionId} after 3 attempts:`,
+            readError
+          );
+        }
+      }
+    }
+    const mayHavePublished = transcriptUnreadable || attemptPublished.length > 0;
+    if (mayHavePublished) {
+      willRequeue = false;
+      requeuedAt = undefined;
+      noRequeueReason = transcriptUnreadable
+        ? 'transcript unreadable — a fresh restart could repeat completed work'
+        : `this attempt already ${attemptPublished.join('; ')} — a fresh restart would repeat it`;
+      console.error(
+        `recoverAbandonedScheduledRun: NOT restarting schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+      );
+      await notifyScheduleOwnerOfFailure(schedule, schedule.userId, {
+        failedAttempts: nextRetryCount,
+        failureClass: 'system',
+      });
+      pauseBeforeClaim = true;
+    }
+  }
+
+  // ENG-971: pause BEFORE claiming. claimAbandonedRun is what REMOVES the stale
+  // lease, and that lease is the only thing stopping a due schedule starting a
+  // fresh run — so a pause attempted afterwards has already given away the guard
+  // it was meant to replace. Pausing first is safe to repeat: a losing instance
+  // simply writes status='paused' twice. If the pause will not persist we do not
+  // claim at all, leaving the lease in place; a later reconciler pass retries once
+  // the datastore is healthy.
+  if (pauseBeforeClaim) {
+    let paused = false;
+    for (let attempt = 1; attempt <= 3 && !paused; attempt++) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          status: 'paused',
+          updatedAt: new Date().toISOString(),
+        });
+        paused = true;
+        console.error(
+          `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+        );
+      } catch (pauseError) {
+        console.error(
+          `CRITICAL: failed to pause schedule ${schedule.scheduleId} (attempt ${attempt}/3):`,
+          pauseError
+        );
+      }
+    }
+    if (!paused) {
+      console.error(
+        `recoverAbandonedScheduledRun: leaving the stale lease on ${schedule.scheduleId} in place — `
+        + `this run may already have published and the pause would not persist, so the lease is the `
+        + `only thing preventing a repeat. A later reconciler pass will retry.`
+      );
+      return false;
     }
   }
 
@@ -3587,6 +4287,7 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       : null
   );
   if (!won) return false;
+
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
   // When the run will RESUME, do NOT append the "job incomplete" placeholder — the
@@ -4359,7 +5060,19 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const skillId = req.params?.skillId;
+      const portalType = skillId ? 'agent' : requestedPortalType;
+      let skill;
+      if (skillId) {
+        skill = await agentModeService.getAuthorizedSkill(skillId, user.userId);
+        if (!skill) {
+          return res.status(404).json({ error: 'Skill not found' });
+        }
+        const validationError = validateWelcomeMessage(skill.welcomeMessage);
+        if (validationError) return res.status(400).json({ error: validationError });
+      }
+      const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
       // Cross-restart duplicate-submit lock, keyed by the client-provided
       // idempotencyKey scoped to this user. The conditional idem#… put means
@@ -4390,12 +5103,27 @@ export const agentModeController = {
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
       // For ad video generation from Videos page, sessionType should be 'video-generation'
-      const finalSessionType = sessionType || 'regular';
+      const finalSessionType = skillId ? 'regular' : sessionType || 'regular';
 
       // Pass delegate info if this is a delegated access session
       const delegateInfo = authReq.delegateInfo;
 
-      const session = await chatbotDb.createChatSession(
+      // Resolve all initial state before the one session Put, so a Skill
+      // session is either fully initialized or absent.
+      let modelToUse: string;
+      if (finalSessionType === 'report_generation') {
+        modelToUse = await agentModeService.getReportsModel();
+      } else if (portalType === 'emma-sidebar') {
+        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
+      } else {
+        modelToUse = await agentModeService.getDefaultModel();
+      }
+      const welcomeMessage = skill?.welcomeMessage?.trim();
+      const initialSkillState = skillId ? {
+        llmModel: modelToUse, associatedSkills: [skillId],
+        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+      } : undefined;
+      const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
         undefined, // pageContent
         portalType,
@@ -4406,19 +5134,10 @@ export const agentModeController = {
         undefined, // emailCampaignTaskId
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
         delegateInfo // Pass delegate info for admin delegation tracking
-      );
-
-      // Set default model for new sessions
-      // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
-      let modelToUse: string;
-      if (finalSessionType === 'report_generation') {
-        modelToUse = await agentModeService.getReportsModel();
-      } else if (portalType === 'emma-sidebar') {
-        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
-      } else {
-        modelToUse = await agentModeService.getDefaultModel();
-      }
-      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+      ];
+      if (initialSkillState) createSessionArgs.push(initialSkillState);
+      const session = await chatbotDb.createChatSession(...createSessionArgs);
+      const sessionWithModel = skillId ? session : await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
@@ -4427,11 +5146,12 @@ export const agentModeController = {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
       }
 
-      res.status(201).json(sessionWithModel);
+      res.status(201).json(skillId ? {
+        ...sessionWithModel,
+        redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+      } : sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
-      // Release the claim so the client's retry is accepted — a failed create
-      // must not lock the user out for the idem ttl.
       if (createIdemKeyHeld) {
         await releaseIdempotency(createIdemKeyHeld);
       }
@@ -4526,6 +5246,9 @@ export const agentModeController = {
     // the durable run record terminal after an error unwinds the inner finally.
     let runSurvivalRunId: string | undefined;
     let idemKeyHeld: string | undefined;
+    // ENG-971: calledFunctions is session-cumulative, so the error path needs to know
+    // where THIS turn started to tell its own successes from earlier turns'.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
@@ -4563,6 +5286,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
@@ -5014,21 +5738,35 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage, turnStartCalledFunctions);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: the fallback carries no outcome at all, just blanket retry
+          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
+          // the fixed string: a diagnosis message has already been judged on its own
+          // prose, and a truthful one must not collect a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
@@ -5597,6 +6335,9 @@ export const agentModeController = {
   async generateSharedResponse(req: Request, res: Response) {
     // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
     let sharedTurnStartMs = Date.now();
+    // ENG-971: see generateResponse — calledFunctions is session-cumulative, so the
+    // error path needs this turn's starting point to attribute successes correctly.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -5611,6 +6352,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
 
       // Check if conversable sharing is active and token matches
       if (!conversable) {
@@ -5765,21 +6507,33 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: see the matching comment in generateResponse — the fixed
+          // fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
@@ -6724,6 +7478,7 @@ export const agentModeController = {
   async createScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const {
         sessionId,
         scheduleName,
@@ -6743,6 +7498,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -6823,6 +7579,13 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-803: owner opt-OUT that holds this schedule's runs at the publish step.
+        // Default false = publish, which is what scheduled runs have always done, so
+        // no existing schedule changes behaviour. Kept distinct from fullAutonomy
+        // (consent to decide unaided is a different question from consent to post)
+        // and absent from the manage_scheduled_chat MCP allowlist, so only a human
+        // can set it.
+        requirePublishApproval: requirePublishApproval === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -6928,6 +7691,7 @@ export const agentModeController = {
   async updateScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const {
         scheduleName,
@@ -6948,6 +7712,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -7020,6 +7785,11 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
+        // update that omits the field must never silently set or clear it.
+        requirePublishApproval: requirePublishApproval !== undefined
+          ? (requirePublishApproval === true)
+          : ((existingSchedule as any).requirePublishApproval || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
@@ -7132,6 +7902,7 @@ export const agentModeController = {
   async submitScheduledChatVariables(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const { variableValues, triggerRun } = req.body as { variableValues?: Record<string, string>; triggerRun?: boolean };
 
@@ -7295,6 +8066,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const nowIso = new Date().toISOString();
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
@@ -7417,6 +8191,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
         ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
@@ -7460,6 +8237,7 @@ export const agentModeController = {
   async testScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
 
       // Verify schedule exists and belongs to user
@@ -7543,6 +8321,7 @@ export const agentModeController = {
       if (!status || !['active', 'paused'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
       }
+      if (status === 'active' && await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
 
       // Verify schedule exists and belongs to user
       const schedule = await scheduleDb.getScheduleById(scheduleId);
@@ -9322,6 +10101,7 @@ export const agentModeController = {
   createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { templateId } = req.params;
       const {
         scheduleName, nextRunTime, scheduleFrequency,

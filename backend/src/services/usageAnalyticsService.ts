@@ -5,6 +5,7 @@
 
 import { usageRecordDb, UsageRecordRow, isVendorEntry } from "./usageRecordDb";
 import { userDb, orgDb, User } from "./db";
+import type { OrgRole } from "./orgAuthz";
 import { getAccountById } from "./connectedAccountsDb";
 import { TWITTER_PROVIDER, isPostReadOperation } from "../utils/twitterPricing";
 
@@ -545,7 +546,7 @@ export interface OrgRollupModelRow {
 export interface OrgRollupMember {
   userId: string;
   email: string | null;
-  orgRole: "owner" | "member" | null;
+  orgRole: OrgRole | null;
   /** The user the admin actually clicked (highlighted in the UI). */
   isSelected: boolean;
   burnUsd: number;
@@ -565,7 +566,7 @@ export interface OrgUsageRollup {
   /** The OWNER's subscription tier — the org's cost cap is keyed on this, not the member's. */
   ownerSubscriptionType: string | null;
   selectedIsOwner: boolean;
-  selectedRole: "owner" | "member" | null;
+  selectedRole: OrgRole | null;
   /** Total real burn across all members (shadow table). */
   grossBurnUsd: number;
   /** Amount charged to the org quota = the OWNER's monthly counter. */
@@ -707,7 +708,7 @@ export async function getUserOrgUsageRollup(
     .sort((a, b) => b.burnUsd - a.burnUsd || a.userId.localeCompare(b.userId));
 
   const selectedIsOwner = user.userId === ownerUser.userId;
-  const selectedRole: "owner" | "member" | null =
+  const selectedRole: OrgRole | null =
     user.orgRole ?? (selectedIsOwner ? "owner" : null);
 
   return {
@@ -867,7 +868,7 @@ export async function getUserXBreakdown(
 export interface XOrgRollupMember {
   userId: string;
   email: string | null;
-  orgRole: "owner" | "member" | null;
+  orgRole: OrgRole | null;
   /** The user the admin actually clicked (highlighted in the UI). */
   isSelected: boolean;
   costUsd: number;
@@ -884,7 +885,7 @@ export interface XOrgUsageRollup {
   ownerUserId: string;
   ownerEmail: string | null;
   selectedIsOwner: boolean;
-  selectedRole: "owner" | "member" | null;
+  selectedRole: OrgRole | null;
   /** Total allocated X $ across ALL org members. */
   totalCostUsd: number;
   totalCallCount: number;
@@ -959,7 +960,7 @@ export async function getUserXOrgRollup(
     .sort((a, b) => b.costUsd - a.costUsd || a.userId.localeCompare(b.userId));
 
   const selectedIsOwner = user.userId === ownerUser.userId;
-  const selectedRole: "owner" | "member" | null =
+  const selectedRole: OrgRole | null =
     user.orgRole ?? (selectedIsOwner ? "owner" : null);
 
   return {

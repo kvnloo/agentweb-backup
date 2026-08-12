@@ -33,6 +33,12 @@ module.exports = {
     // test Slack behavior keep their own jest.mock('@slack/web-api', ...), which takes
     // precedence over this. See __mocks__/slack-web-api.ts.
     '^@slack/web-api$': '<rootDir>/__mocks__/slack-web-api.ts',
+    // Safety net for resend (ENG-1112): the SDK sends over the global `fetch` to
+    // api.resend.com, and resendService pulls a live API key from Secrets Manager, so on
+    // any host where that secret resolves an un-mocked send left the box for real. The
+    // two suites that exercise the SDK boundary keep their own jest.mock('resend', ...),
+    // which takes precedence over this. See __mocks__/resend.ts.
+    '^resend$': '<rootDir>/__mocks__/resend.ts',
   },
   collectCoverageFrom: [
     'src/utils/**/*.ts',

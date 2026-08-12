@@ -149,5 +149,17 @@ describe('SkillService - Extended Schema', () => {
       expect(result.name).toBe('Basic Skill');
       expect(mockPut).toHaveBeenCalled();
     });
+
+    it('persists the existing welcomeMessage field on create', async () => {
+      mockPromise.mockResolvedValueOnce({});
+
+      const result = await skillService.createSkill(
+        'Brief skill', 'Starts with a static brief', [], undefined, false,
+        'Bring the artifact and the context.'
+      );
+
+      expect(result.welcomeMessage).toBe('Bring the artifact and the context.');
+      expect(mockPut.mock.calls[0][0].Item.welcomeMessage).toBe('Bring the artifact and the context.');
+    });
   });
 });

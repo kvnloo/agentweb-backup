@@ -172,7 +172,7 @@ export class MetaService {
    */
   private static readonly CAMPAIGN_READ_FIELDS = [
     'id', 'name', 'status', 'objective',
-    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
   ] as const;
 
@@ -875,7 +875,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
       const result = await campaign.get(fields);
       return result._data;
@@ -1084,7 +1084,15 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
-      const fields = ['id', 'name', 'status', 'campaign_id'];
+      // ENG-838 AC4: the read-back after a create has to be able to prove the
+      // spend-shaping settings landed, so the delivery fields ride along with
+      // the write-target fields. Requesting more fields does not change the
+      // shape callers already read (id/name/status/campaign_id).
+      const fields = [
+        'id', 'name', 'status', 'campaign_id',
+        'bid_strategy', 'bid_amount', 'daily_budget', 'lifetime_budget',
+        'start_time', 'end_time'
+      ];
       this.log(`Fetching ad set: ${adSetId}`);
       const result = await adSet.get(fields);
       return result._data;
