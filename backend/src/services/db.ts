@@ -9489,6 +9489,11 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing for bounded administrative diagnostics. */
+  async listAll(): Promise<Organization[]> {
+    return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,
