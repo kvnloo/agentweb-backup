@@ -45,7 +45,7 @@ describe('admin one-time LLM usage credits', () => {
       granted: true,
       billingUserId: 'owner-1',
       ledger: {
-        month: '2026-08', totalPurchasedMicroUsd: 0, totalAdminGrantedMicroUsd: 10_000_000,
+        month: '2026-08', totalPurchasedMicroUsd: 0, totalAdminGrantedMicroUsd: 500_000_000,
         totalMigrationOffsetMicroUsd: 0, grantIds: ['admin:owner-1:grow106_123'], grants: [],
       },
     });
@@ -54,19 +54,19 @@ describe('admin one-time LLM usage credits', () => {
   it('grants provider-cost credit to the org billing root with audit metadata', async () => {
     const res = await request(app)
       .post('/api/admin/users/member-1/llm-usage-credit')
-      .send({ amountUsd: 10, reason: 'GROW-106 founder event', idempotencyKey: 'grow106_123' })
+      .send({ amountUsd: 500, reason: 'GROW-106 founder event', idempotencyKey: 'grow106_123' })
       .expect(200);
 
     expect(mockedResolveBillingUserId).toHaveBeenCalledWith('member-1');
     expect(mockedGrant).toHaveBeenCalledWith(expect.objectContaining({
       billingUserId: 'owner-1',
       source: 'admin',
-      amountMicroUsd: 10_000_000,
+      amountMicroUsd: 500_000_000,
       reason: 'GROW-106 founder event',
       grantedBy: 'admin@agentweb.pro',
       grantId: 'admin:owner-1:grow106_123',
     }));
-    expect(res.body).toMatchObject({ granted: true, billingUserId: 'owner-1', amountUsd: 10 });
+    expect(res.body).toMatchObject({ granted: true, billingUserId: 'owner-1', amountUsd: 500 });
   });
 
   it.each([
