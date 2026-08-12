@@ -20,6 +20,17 @@ describe('evaluateTurnTimeBudget', () => {
     expect(state.remainingMs).toBe(540_000);
   });
 
+  it('falls back to the real clock when nowMs is not supplied', () => {
+    // Production never passes nowMs — only the tests do. If the default were wrong the
+    // budget would misread every real turn, so pin that the live path works.
+    const now = Date.now();
+    const state = evaluateTurnTimeBudget({ startedAtMs: now - 60_000, hardCapMs: now + 540_000 });
+    expect(state.phase).toBe('normal');
+    expect(state.elapsedMs).toBeGreaterThanOrEqual(60_000);
+    expect(state.remainingMs).toBeGreaterThan(0);
+    expect(state.remainingMs).toBeLessThanOrEqual(540_000);
+  });
+
   it('enters wrap_up once the elapsed fraction crosses the threshold', () => {
     // 70% of 600s = 420s
     expect(evaluateTurnTimeBudget({ startedAtMs: START, hardCapMs: CAP, nowMs: START + 419_000 }).phase)

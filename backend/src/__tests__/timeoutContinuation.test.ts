@@ -161,6 +161,56 @@ describe('ENG-907 — salvaging a timed-out turn that did real work', () => {
       expect(collectTurnWorkSince(msgs, turnStart).narrationCount).toBe(0);
     });
 
+    it('dates a message from metadata.timestamp when the top-level one is missing', () => {
+      // Persisted rows are not uniform — some carry the timestamp only in metadata.
+      // Falling back matters: an undated message is dropped, which would silently
+      // under-count the very work this salvage exists to report.
+      const msgs = [
+        { role: 'assistant', content: 'Scanned batch 1.', metadata: { timestamp: '2026-08-04T22:47:00Z' } },
+        { role: 'tool', name: 'twitter_outreach', content: '{}', metadata: { timestamp: '2026-08-04T22:48:00Z' } },
+      ];
+      expect(collectTurnWorkSince(msgs as any, turnStart)).toEqual({
+        narrationCount: 1,
+        toolNames: ['twitter_outreach'],
+      });
+    });
+
+    it('skips a tool row with no usable name rather than listing a blank', () => {
+      const msgs = [
+        { role: 'tool', content: '{}', ...at('2026-08-04T22:48:00Z') },
+        { role: 'tool', name: 42, content: '{}', ...at('2026-08-04T22:48:01Z') },
+        tool('2026-08-04T22:48:02Z', 'twitter_outreach'),
+      ];
+      expect(collectTurnWorkSince(msgs as any, turnStart).toolNames).toEqual(['twitter_outreach']);
+    });
+
+    it("does not count the user's own message as work the assistant did", () => {
+      // The turn window starts at the user's message, so it is inside the range by
+      // definition. Only assistant narration and executed tools count as salvaged work.
+      const msgs = [
+        { role: 'user', content: 'Find the 10 best X posts…', ...at('2026-08-04T22:46:57Z') },
+        { role: 'system', content: 'context', ...at('2026-08-04T22:46:58Z') },
+      ];
+      expect(collectTurnWorkSince(msgs as any, turnStart)).toEqual({ narrationCount: 0, toolNames: [] });
+    });
+
+    it('counts a narration row that carries no metadata at all', () => {
+      // Not every persisted assistant row has a metadata object. Reading the exclusion
+      // flags off it must not throw or accidentally drop real work.
+      const msgs = [{ role: 'assistant', content: 'Scanned batch 1.', ...at('2026-08-04T22:47:00Z') }];
+      expect(collectTurnWorkSince(msgs as any, turnStart).narrationCount).toBe(1);
+    });
+
+    it('excludes a diagnostic-only closing (not just one flagged as an error)', () => {
+      // The ENG-907 closing carries both flags, but the error-path diagnosis LLM can
+      // write a diagnostic message without isErrorMessage. Counting it as salvaged work
+      // would be the same false success.
+      const msgs = [
+        assistant('2026-08-04T22:56:58Z', 'The run appears to have stalled.', { isDiagnosticMessage: true }),
+      ];
+      expect(collectTurnWorkSince(msgs, turnStart).narrationCount).toBe(0);
+    });
+
     it('ignores blank/non-string assistant content and undated messages', () => {
       const msgs = [
         assistant('2026-08-04T22:47:00Z', '   '),
