@@ -228,16 +228,29 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
     }
-    const org = await orgDb.getOrgById(orgId);
-    if (!org) {
-      return res.status(404).json({ message: "Organization not found" });
+    // Guarded read-modify-write with retry: an overlapping share-settings
+    // writer fails the conditional write and we re-apply the toggle on top of
+    // the fresh document instead of clobbering its changes.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; ; attempt++) {
+      const org = await orgDb.getOrgById(orgId);
+      if (!org) {
+        return res.status(404).json({ message: "Organization not found" });
+      }
+      const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
+      const shareSettings = {
+        ...(org.shareSettings ?? {}),
+        analytics: { enabled, editors: existing.editors ?? [] },
+      };
+      try {
+        await orgDb.updateShareSettings(orgId, shareSettings as any, org.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
+          throw writeError;
+        }
+      }
     }
-    const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
-    const shareSettings = {
-      ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors ?? [] },
-    };
-    await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
   } catch (error: any) {
     console.error("Error updating org analytics-sharing:", error.message);
@@ -680,7 +693,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
       ? await crmDb.batchCreateLeads(parsed.listId, leads)
-      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
     if (results.errorCount === 0) {
@@ -698,6 +711,16 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       );
     }
 
+    // ENG-1002: this route reports `attemptedCount` outright, so a row refused
+    // as a LinkedIn placeholder leaves attempted > success + errors with
+    // nothing to explain the difference. Report it in both the payload and the
+    // message, as the other import paths do.
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
+    const skippedNote =
+      syncAnonymizedSkipped > 0
+        ? ` ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped.`
+        : "";
+
     return res.json({
       success: true,
       source,
@@ -710,11 +733,13 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
       message:
-        results.errorCount === 0
+        (results.errorCount === 0
           ? `Synced ${results.successCount} record(s) from ${source}.`
-          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`) +
+        skippedNote,
     });
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
@@ -1249,15 +1274,24 @@ router.put("/users/:userId/email-sender", async (req, res) => {
 router.get("/slack/channel-info", async (req, res) => {
   try {
     const { channelId } = req.query;
-    if (!channelId || typeof channelId !== "string") {
+    if (typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const configuredChannelId = channelId.trim();
+    if (!configuredChannelId) {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const info = await getSlackChannelInfo(channelId.trim());
+    const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
-      return res.status(404).json({ message: "Channel not found or bot not a member" });
+      return res.json({
+        channelId: configuredChannelId,
+        displayName: configuredChannelId,
+        resolved: false,
+        message: "Channel not found or bot not a member",
+      });
     }
-    res.json(info);
+    res.json({ ...info, channelId: configuredChannelId, resolved: true });
   } catch (error: any) {
     console.error("Error fetching Slack channel info:", error);
     res.status(500).json({ message: "Error fetching channel info", details: error.message });
@@ -4661,6 +4695,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4669,6 +4704,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
+        allowedFeatures: allAvailableFeatures,
       }];
     }
 
@@ -4701,6 +4737,11 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
 
@@ -4710,6 +4751,7 @@ router.get("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
@@ -4738,6 +4780,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4749,6 +4792,9 @@ router.post("/subscription-types", async (req, res) => {
       }
       if (!Array.isArray(type.allowedSkills)) {
         throw new Error("Each subscription type must have allowedSkills array");
+      }
+      if (type.allowedFeatures !== undefined && !Array.isArray(type.allowedFeatures)) {
+        throw new Error("allowedFeatures must be an array when provided");
       }
 
       // Remove "/marketing" prefix from allowedPages if present
@@ -4778,6 +4824,11 @@ router.post("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4801,6 +4852,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
       };
@@ -4819,6 +4871,11 @@ router.post("/subscription-types", async (req, res) => {
     console.error("Error saving subscription types:", error);
     res.status(400).json({ message: error.message || "Error saving subscription types" });
   }
+});
+
+router.get("/subscription-features", async (_req, res) => {
+  const subscriptionService = await import('../services/subscriptionService');
+  res.json({ features: subscriptionService.getAllAvailableSubscriptionFeatures() });
 });
 
 // Add or remove a single skill from a subscription type

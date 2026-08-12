@@ -23,6 +23,13 @@
  * The golden reference below is a faithful copy of the algorithm as it stood
  * before the fix. DO NOT "simplify" it to match the new implementation — its
  * entire purpose is to be an independent oracle of the prior behavior.
+ *
+ * ONE deliberate divergence has been folded into the oracle since: ENG-940's
+ * follow-up changed which results the tool-content preserve window protects
+ * (the N most recent AT-RISK results, not the N most recent results outright).
+ * That is an intended behavior change, not drift, so the oracle encodes it too —
+ * it is marked at the point of use. Everything else must still match byte for
+ * byte, and the performance and splice/reorder guarantees are unaffected.
  */
 
 // ─── Golden reference: the ORIGINAL trimToolMessagesForContext algorithm ──────
@@ -54,6 +61,18 @@ function goldenTrim(
 
   const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
+  // ENG-940 follow-up: the tool-content window preserves the N most recent
+  // AT-RISK results (those over their trim limit) rather than the N most recent
+  // results outright, so a result the trimmer would never touch cannot evict one
+  // it would destroy. The recency-based `preserveSet` above still drives the
+  // assistant-argument logic, which is unchanged.
+  const atRiskIndices = toolIndices.filter(
+    (i) =>
+      typeof messages[i].content === 'string' &&
+      messages[i].content.length > (REF_LARGE_TOOL_RESULT_LIMIT[messages[i].name] || maxToolContentLength),
+  );
+  const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
+
   const oldAssistantIndices = new Set<number>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -73,7 +92,7 @@ function goldenTrim(
   }
 
   return messages.map((msg, idx) => {
-    if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string') {
+    if (msg.role === 'tool' && !atRiskPreserveSet.has(idx) && typeof msg.content === 'string') {
       const limit = REF_LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
       if (msg.content.length > limit) {
         const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
