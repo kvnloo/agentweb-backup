@@ -1263,11 +1263,13 @@ describe('AgentModeService - CRM Tools', () => {
           userId,
         );
 
-        expect(result.success).toBe(false);
+        // NOT success:false — the dispatch boundary turns a success:false result
+        // into a structured tool error, which strips `unimportedRows` before the
+        // model ever sees it and appends a "do NOT retry" verdict. Rows landed,
+        // so the call succeeded; `complete: false` carries the incompleteness.
+        expect(result.success).toBe(true);
         expect(result.complete).toBe(false);
         expect(result.resumable).toBe(true);
-        // Rows landed, so the CRM page must still refresh (shouldEmitCrmDataChanged).
-        expect(result.partial).toBe(true);
         expect(result.unimportedRows).toEqual([
           { row: 2, identifier: 'b@example.com', reason: 'failed' },
           { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
@@ -1276,6 +1278,29 @@ describe('AgentModeService - CRM Tools', () => {
         // The agent must be told to resume with the named rows, not to hand a
         // whole-request retry back to the user.
         expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('still reports failure when the import landed nothing at all', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 2,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'failed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        // Nothing is in the list, so this IS a tool failure — the dispatcher
+        // should downgrade it and the CRM page has nothing to refresh for.
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBe(true);
       });
 
       it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {

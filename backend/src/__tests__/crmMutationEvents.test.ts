@@ -2,7 +2,6 @@ import {
   CRM_DATA_CHANGED_EVENT,
   CRM_MUTATING_TOOLS,
   buildCrmDataChangedPayload,
-  shouldEmitCrmDataChanged,
 } from '../emma/crmMutationEvents';
 
 describe('crmMutationEvents', () => {
@@ -78,29 +77,6 @@ describe('crmMutationEvents', () => {
         expect(payload).not.toBeNull();
         expect(payload!.source).toBe(tool);
       }
-    });
-  });
-
-  // ENG-1133: a truncated import reports success:false so the agent resumes the
-  // missing rows instead of claiming a clean import — but the rows that DID
-  // land must still show up on the CRM page without a manual reload.
-  describe('shouldEmitCrmDataChanged', () => {
-    it('emits for an ordinary successful mutation', () => {
-      expect(shouldEmitCrmDataChanged({ success: true })).toBe(true);
-    });
-
-    it('emits for a partial import that already wrote rows', () => {
-      expect(shouldEmitCrmDataChanged({ success: false, partial: true, complete: false })).toBe(true);
-    });
-
-    it('stays silent for a failure that wrote nothing', () => {
-      expect(shouldEmitCrmDataChanged({ success: false })).toBe(false);
-      expect(shouldEmitCrmDataChanged({ success: false, partial: false })).toBe(false);
-    });
-
-    it('emits for a result that reports no success flag at all', () => {
-      expect(shouldEmitCrmDataChanged({ listId: 'L1' })).toBe(true);
-      expect(shouldEmitCrmDataChanged(undefined)).toBe(true);
     });
   });
 });
