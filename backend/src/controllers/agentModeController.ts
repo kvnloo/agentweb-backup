@@ -160,10 +160,17 @@ async function applyScheduleEditWithConsentNarrowing(
             consentUpdates.autopublishAuthorizedAt = null;
             consentUpdates.autopublishAuthorizedBy = null;
           }
-          // Bind the write to the consent it was derived FROM.
+          // Bind the write to BOTH halves of what it was derived from: the consent, and
+          // the tool list that consent was granted against. Asserting only the consent
+          // leaves a concurrent edit free to move the required tools underneath this
+          // one, so the grant would be narrowed — or dropped — against a list that is
+          // no longer the schedule's. A failure here is not fatal: the loop re-reads and
+          // re-derives against whatever actually landed. Same binding the grant endpoint
+          // uses, so the two paths cannot disagree about what they are asserting.
           expectation = {
             autopublishAuthorized: true,
             autopublishAuthorizedTools: snapshot.autopublishAuthorizedTools,
+            requiredFunctionCalls: snapshot.requiredFunctionCalls,
           };
           console.log(
             `AgentMode: ENG-827 publish consent narrowing on edit for schedule ${scheduleId}: ` +
