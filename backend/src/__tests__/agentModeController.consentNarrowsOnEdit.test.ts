@@ -216,7 +216,66 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
     expect(narrowingCondition()).toEqual({
       autopublishAuthorized: true,
       autopublishAuthorizedTools: ['post_on_connected_account'],
+      requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
     });
+  });
+
+  // ENG-827 (Greptile, seventh pass): the narrowing is derived from the required tools
+  // as well as from the consent, so asserting only the consent leaves a concurrent edit
+  // free to move those tools underneath it — the grant would then be narrowed, or
+  // dropped, against a list that is no longer the schedule's.
+  it('binds the narrowing to the required tools it was derived against', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
+      res()
+    );
+
+    expect(narrowingCondition()).toEqual(
+      expect.objectContaining({
+        requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
+      })
+    );
+  });
+
+  it('re-derives against the tools that actually landed when a concurrent edit moved them', async () => {
+    mockScheduleDb.getScheduleById
+      .mockResolvedValueOnce(existing() as any)
+      // A concurrent edit swapped which publishing tool this schedule uses, and the
+      // owner's grant now covers that one.
+      .mockResolvedValueOnce(
+        existing({
+          requiredFunctionCalls: ['read_brand_guidelines', 'publish_blog_article'],
+          autopublishAuthorizedTools: ['publish_blog_article'],
+        }) as any
+      );
+
+    const conditionFailure: any = new Error('The conditional request failed');
+    conditionFailure.name = 'ConditionalCheckFailedException';
+    mockScheduleDb.updateSchedule
+      .mockRejectedValueOnce(conditionFailure)
+      .mockResolvedValueOnce({} as any);
+
+    const r = res();
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
+      r
+    );
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+    const retry = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1];
+    // Narrowed against the grant that is actually stored now.
+    expect(retry[1].autopublishAuthorizedTools).toEqual([]);
+    expect(retry[1].autopublishAuthorized).toBe(false);
+    expect(retry[2]).toEqual({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['publish_blog_article'],
+      requiredFunctionCalls: ['read_brand_guidelines', 'publish_blog_article'],
+    });
+    expect(r.json).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Scheduled chat updated successfully' })
+    );
   });
 
   // ENG-827 (Greptile, fourth pass). Two failures were on the table and they pull in
@@ -261,6 +320,7 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
     expect(retry[2]).toEqual({
       autopublishAuthorized: true,
       autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+      requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
     });
     expect(r.json).toHaveBeenCalledWith(
       expect.objectContaining({ message: 'Scheduled chat updated successfully' })
