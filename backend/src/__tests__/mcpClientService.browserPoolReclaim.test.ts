@@ -97,6 +97,30 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
   }
 
   describe('browser-specific idle TTL', () => {
+    // The cap bounds how many browsers exist at once, so the TTL is only garbage
+    // collection and has no reason to be stricter than any other pool's. Shortening it
+    // would narrow an existing guarantee: a user who steps away mid-chat and comes back
+    // must still find the page their session left behind.
+    it('defaults to the same idle TTL as ordinary pools — no narrowing versus main', async () => {
+      buildService();
+      await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      agePool('user-1::session-a', 45 * 60 * 1000);
+
+      await (service as any).cleanupStaleSessions();
+
+      expect(poolKeys()).toContain('user-1::session-a');
+    });
+
+    it('still reaps a browser pool once it passes that TTL', async () => {
+      buildService();
+      await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      agePool('user-1::session-a', 61 * 60 * 1000);
+
+      await (service as any).cleanupStaleSessions();
+
+      expect(poolKeys()).not.toContain('user-1::session-a');
+    });
+
     it('reaps an idle browser pool well before the generic session TTL', async () => {
       buildService({ MCP_BROWSER_IDLE_TIMEOUT_MS: '600000', MCP_CLIENT_SESSION_TIMEOUT_MS: '3600000' });
       await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
@@ -169,9 +193,55 @@ describe('McpClientService browser pool reclaim (ENG-1118)', () => {
       expect(poolKeys()).not.toContain('user-1::session-b');
     });
 
+    // Preferring to wait means a cron burst costs a little latency instead of an extra
+    // Chromium per session. The wait is bounded and then we proceed, so a genuinely stuck
+    // fleet degrades to the old overshoot rather than deadlocking a run.
+    it('waits for a busy pool to free up instead of overshooting the cap', async () => {
+      buildService({
+        MCP_MAX_BROWSER_CLIENTS: '1',
+        MCP_BROWSER_EVICTION_GRACE_MS: '60000',
+        MCP_BROWSER_SLOT_WAIT_MS: '5000',
+        MCP_BROWSER_SLOT_POLL_MS: '20',
+      });
+      await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      agePool('user-1::session-a', 10 * 60 * 1000);
+      (service as any).markPoolBusy('user-1::session-a', 1);
+      agePool('user-1::session-a', 10 * 60 * 1000);
+
+      // The call in flight settles shortly after the second session asks for a browser.
+      setTimeout(() => {
+        (service as any).markPoolBusy('user-1::session-a', -1);
+        agePool('user-1::session-a', 10 * 60 * 1000);
+      }, 100);
+
+      await (service as any).getSessionClient('playwright', 'session-b', 'user-1');
+
+      expect(poolKeys()).not.toContain('user-1::session-a');
+      expect(poolKeys()).toEqual(['user-1::session-b']);
+    });
+
+    it('gives up waiting and proceeds rather than blocking a run forever', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      buildService({
+        MCP_MAX_BROWSER_CLIENTS: '1',
+        MCP_BROWSER_EVICTION_GRACE_MS: '60000',
+        MCP_BROWSER_SLOT_WAIT_MS: '100',
+        MCP_BROWSER_SLOT_POLL_MS: '20',
+      });
+      await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
+      (service as any).markPoolBusy('user-1::session-a', 1);
+
+      await (service as any).getSessionClient('playwright', 'session-b', 'user-1');
+
+      expect(poolKeys()).toContain('user-1::session-a');
+      expect(poolKeys()).toContain('user-1::session-b');
+      expect(warn.mock.calls.some(c => String(c[0]).includes('over the browser client cap'))).toBe(true);
+      warn.mockRestore();
+    });
+
     it('overshoots loudly rather than evicting a pool still inside the grace window', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-      buildService({ MCP_MAX_BROWSER_CLIENTS: '1', MCP_BROWSER_EVICTION_GRACE_MS: '60000' });
+      buildService({ MCP_MAX_BROWSER_CLIENTS: '1', MCP_BROWSER_EVICTION_GRACE_MS: '60000', MCP_BROWSER_SLOT_WAIT_MS: '0' });
       await (service as any).getSessionClient('playwright', 'session-a', 'user-1');
 
       await (service as any).getSessionClient('playwright', 'session-b', 'user-1');
