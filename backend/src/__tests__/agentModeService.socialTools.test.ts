@@ -222,6 +222,7 @@ describe('AgentModeService - Social Media Tools', () => {
     // post, so the handler re-validates at its last moment before committing.
     it('does NOT create the post when consent is withdrawn while the call is in flight', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
 
       const result = await service.postOnConnectedAccount(
@@ -246,6 +247,7 @@ describe('AgentModeService - Social Media Tools', () => {
 
     it('posts normally when the in-flight re-check still allows it', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
       mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
 
       const result = await service.postOnConnectedAccount(
