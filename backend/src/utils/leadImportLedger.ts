@@ -17,6 +17,18 @@ import { LeadImportRowOutcome } from './leadSchema';
 export const LEAD_IMPORT_ROW_LIST_CAP = 100;
 
 /**
+ * Wall-clock budget for the writes behind one `add_leads_to_list` call.
+ *
+ * Sized well inside the agent-mode whole-turn cap (600s, see
+ * AGENT_MODE_GENERATION_TIMEOUT_MS) so that when an import cannot finish — a
+ * throttled table, or a re-sent file whose every row needs its own sequential
+ * merge round-trip — the tool RETURNS a partial naming the rows it still owes,
+ * and the agent resumes them. Running to the turn cap instead kills the turn
+ * with no tool result at all, which is the failure this ticket was filed for.
+ */
+export const LEAD_IMPORT_WRITE_BUDGET_MS = 120_000;
+
+/**
  * Normalize the per-row ledger from a `crmDb.batchCreateLeads` result.
  *
  * `rowAligned` is false when the result carries no usable ledger (a legacy or

@@ -6507,6 +6507,17 @@ export const crmDb = {
     system?: Record<string, any>;
   }>, options: {
     /**
+     * Wall-clock budget for this import (ENG-1133). When it runs out, the
+     * importer stops between units of work and leaves the rows it never reached
+     * as `unprocessed`, so the caller gets a resumable partial instead of being
+     * cut off mid-import by a caller-level timeout with nothing to show for it.
+     * Omitted (the default) means no budget — every existing caller is unchanged.
+     *
+     * At least one unit of work is always attempted, so a resume can never spin
+     * without making progress.
+     */
+    deadlineMs?: number;
+    /**
      * Dedupe rows that carry NEITHER an email NOR a LinkedIn URL against the
      * list's existing rows on name+company (ENG-1133).
      *
@@ -6549,6 +6560,16 @@ export const crmDb = {
       // rather than replaying the whole file (ENG-1133).
       rowOutcomes: leads.map(() => 'unprocessed' as LeadImportRowOutcome),
     };
+
+    // ENG-1133: the import budget. `unitsDone` keeps the first unit of work
+    // unconditional — a budget already spent by the pre-read must still write
+    // something, or a resume would come back with the same rows outstanding
+    // forever.
+    const deadlineAt = options.deadlineMs && options.deadlineMs > 0
+      ? Date.now() + options.deadlineMs
+      : null;
+    let unitsDone = 0;
+    const outOfTime = () => deadlineAt !== null && unitsDone > 0 && Date.now() >= deadlineAt;
 
     try {
       // Get existing leads to check for duplicates by email
@@ -6686,6 +6707,11 @@ export const crmDb = {
       // Process new leads in batches of 25 (DynamoDB batch write limit)
       const batchSize = 25;
       for (let i = 0; i < newLeads.length; i += batchSize) {
+        // Out of budget: stop here and leave the rest `unprocessed` (ENG-1133).
+        // Their outcomes are already initialised to that, so the caller is told
+        // exactly which rows it still owes.
+        if (outOfTime()) break;
+        unitsDone++;
         const batch = newLeads.slice(i, i + batchSize);
 
         const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
@@ -6836,6 +6862,12 @@ export const crmDb = {
 
       // Process leads to update (merge existing leads with new data)
       for (const { existingLead, newData, index: sourceIndex } of leadsToUpdate) {
+        // Each merge is its own sequential round-trip, so a re-sent file whose
+        // rows are all already present is the slowest shape this function has —
+        // and the one a resume produces. Stop on the budget rather than run past
+        // the caller's timeout (ENG-1133).
+        if (outOfTime()) break;
+        unitsDone++;
         try {
           // Helper to normalize values for comparison
           const normalize = (value: any): string => {
@@ -6961,9 +6993,9 @@ export const crmDb = {
 
       // Update lead count (only for new leads, updates don't change count).
       // Counts rows actually WRITTEN, not rows selected for writing: a batch
-      // whose write failed must not inflate the list's count (ENG-1133).
-      // Best-effort for the same reason as the field names above — a
-      // denormalized counter is recoverable, the ledger is not.
+      // that failed, or one the budget stopped us reaching, must not inflate the
+      // list's count (ENG-1133). Best-effort for the same reason as the field
+      // names above — a denormalized counter is recoverable, the ledger is not.
       if (results.created.length > 0) {
         try {
           await this.incrementLeadCount(listId, results.created.length);
