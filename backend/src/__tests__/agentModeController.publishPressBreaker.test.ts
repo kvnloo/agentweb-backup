@@ -16,6 +16,10 @@ jest.mock('../services/subscriptionService', () => ({
     'modify_work_plan',
     'set_work_plan_status',
   ]),
+  // runScheduledChat gates on the 'scheduled_chats' subscription feature before
+  // it runs a turn. Without this the module mock returns undefined, the gate
+  // throws, and every assertion below fails against a run that never started.
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
