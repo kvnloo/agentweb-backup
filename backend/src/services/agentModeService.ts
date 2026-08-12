@@ -10505,7 +10505,15 @@ export class AgentModeService {
         return formatted;
       });
 
-      const result = await crmDb.batchCreateLeads(listId, formattedLeads);
+      const { LEAD_IMPORT_WRITE_BUDGET_MS } = await import('../utils/leadImportLedger');
+      const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        // A file the user may re-send after a truncated run: dedupe the rows
+        // that carry no identity of their own, or every retry duplicates them.
+        dedupeByNameCompany: true,
+        // Come back with a resumable partial rather than being guillotined by
+        // the whole-turn cap with nothing to report (ENG-1133).
+        deadlineMs: LEAD_IMPORT_WRITE_BUDGET_MS,
+      });
 
       // ENG-1133: report the import row by row, not just in aggregate. A large
       // import can be cut off mid-way (the whole-turn cap fires between calls),
@@ -10602,13 +10610,15 @@ export class AgentModeService {
         ...(complete || attempted === 0 ? {} : { resumable: true }),
         message,
         attempted,
+        // `reconciliation` is the ONLY set of counts on the wire. The legacy
+        // scalars used to sit beside it and disagree with it: the DB layer's
+        // `errorCount` tallies in-request duplicates together with genuine
+        // write failures, so a clean import of a file containing one repeated
+        // row reported `errorCount: 1` next to `failed: 0`, and a model reading
+        // the payload could truthfully say a lead had failed when none had.
+        // Two counts of the same thing is exactly the "numbers don't add up"
+        // the ticket is about, so there is now one (ENG-1133).
         reconciliation,
-        successCount: result.successCount,
-        newCount: result.newCount || 0,
-        mergedCount: result.mergedCount || 0,
-        alreadyPresentCount: reconciliation.alreadyPresent,
-        errorCount: result.errorCount,
-        anonymizedSkipped: reconciliation.anonymizedSkipped,
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
         ...(unimportedRows.length > 0 ? capLeadRowList('unimportedRows', unimportedRows) : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
