@@ -1406,6 +1406,35 @@ describe('AgentModeService - CRM Tools', () => {
         expect(result.message).not.toMatch(/FIRST/);
       });
 
+      // When the list could not be read at all, resending the same rows hits
+      // the same wall. This is the one incomplete import that must NOT be
+      // offered as a resume, or the agent loops on it for the rest of the turn.
+      it('reports an unreadable list as a blocker rather than a resume', async () => {
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: ['Could not read the existing leads in this list within 120000ms, so no rows were imported.'],
+          rowOutcomes: ['unprocessed', 'unprocessed'],
+          dedupeIncomplete: true,
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/Import not attempted/);
+        expect(result.message).toMatch(/would duplicate rows already in the list/);
+        expect(result.message).toMatch(/Do NOT retry the same call/);
+        expect(result.message).not.toMatch(/RESUME by calling/);
+      });
+
       it('reconciles attempted rows across created, merged, duplicate, skipped and failed', async () => {
         mockCrmDb.batchCreateLeads.mockResolvedValue({
           successCount: 2,

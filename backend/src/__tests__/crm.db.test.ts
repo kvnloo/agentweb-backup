@@ -2648,6 +2648,46 @@ describe('CRM Database Service', () => {
         expect(result.rowOutcomes).toEqual(['merged', 'unprocessed', 'unprocessed']);
       });
 
+      // The pre-read is O(list size) and runs before any row is written, so on
+      // a huge or throttled list it can burn the whole budget and let the
+      // caller's own timeout kill the turn with no ledger at all — the exact
+      // failure this ticket is about.
+      it('stops when the existing-lead pre-read cannot finish inside the budget', async () => {
+        // Every page reports another page behind it, so the pre-read would never
+        // end on its own. The budget has to end it.
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'next' } }),
+        });
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'preread@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        // Nothing written: the dedupe maps are missing rows, so every unmatched
+        // row would be inserted a second time.
+        expect(result.newCount).toBe(0);
+        expect(result.mergedCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
+        expect(result.errors[0]).toMatch(/Could not read the existing leads/);
+      });
+
+      it('does not flag an incomplete pre-read when the list reads cleanly', async () => {
+        primeExisting([{ leadId: 'lead_a', listId, email: 'a@example.com' }]);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'b@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(false);
+        expect(result.newCount).toBe(1);
+      });
+
       it('imports everything when no budget is given', async () => {
         const rows = Array.from({ length: 30 }, (_, i) => ({ email: `nobudget${i}@example.com` }));
 
