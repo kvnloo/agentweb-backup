@@ -939,4 +939,105 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       );
     });
   });
+
+  // ENG-1045: the retry nudge must be satisfied by the mandated publish OUTCOME,
+  // not by the literal tool name. A 2+ tweet thread can ONLY go out through
+  // twitter_manage_post/post_thread (the backend rejects a 1-item thread), so a
+  // name-keyed check on post_on_connected_account was unsatisfiable after one —
+  // and the only way to clear it was a SECOND, irreversible post to a live
+  // customer timeline. Reported on a scheduled X run that published successfully
+  // and was then nudged ten-plus consecutive times.
+  describe('publish-outcome satisfaction of the retry nudge (ENG-1045)', () => {
+    const xPostSchedule = {
+      ...baseSchedule,
+      keywords: [],
+      startingMessage: "Publish tonight's X post.",
+      requiredFunctionCalls: ['post_on_connected_account'],
+      functionCallMinCalls: {},
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    };
+
+    const threadPublishTurn = {
+      content: 'Published tonight’s two-tweet thread on eLife’s peer review data.',
+      toolCalls: [
+        {
+          name: 'twitter_manage_post',
+          arguments: { action: 'post_thread', tweets: ['first tweet', 'second tweet'] },
+          result: {},
+        },
+      ],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    };
+
+    it('accepts a successful thread publish and never re-presses for a duplicate post', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      const capturedMessages: string[] = [];
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation((params: any) => {
+        capturedMessages.push(params.messageContent || '');
+        return Promise.resolve(threadPublishTurn);
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      // One turn, no nudge: the publish outcome was already achieved.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(capturedMessages.some((m) => m.includes('Please try again. Make sure to'))).toBe(false);
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'success',
+          passed: true,
+          attempt: 1,
+          functionCallMatches: ['post_on_connected_account'],
+          functionCallMisses: [],
+          // The persisted record must agree with the verdict — a
+          // `{actual: 0, required: 1}` next to `passed: true` is the
+          // self-contradicting shape ENG-827 had to unpick.
+          functionCallDetails: { 'post_on_connected_account': { actual: 1, required: 1 } },
+        })
+      );
+    });
+
+    it('still presses when the thread publish FAILED — nothing went live to credit', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...threadPublishTurn,
+        content: 'The thread could not be posted.',
+        toolCalls: [{ ...threadPublishTurn.toolCalls[0], error: 'Twitter action failed' }],
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'failure',
+          passed: false,
+          functionCallMisses: ['post_on_connected_account'],
+          functionCallDetails: { 'post_on_connected_account': { actual: 0, required: 1 } },
+        })
+      );
+    });
+
+    it('does NOT credit a non-publishing action of the same tool', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...threadPublishTurn,
+        content: 'Pulled the metrics for last week’s tweets.',
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'get_tweet_metrics', tweet_ids: ['1'] }, result: {} },
+        ],
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          passed: false,
+          functionCallMisses: ['post_on_connected_account'],
+        })
+      );
+    });
+  });
 });
