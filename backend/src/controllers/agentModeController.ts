@@ -25,6 +25,7 @@ import { isCronEnabled } from '../utils/instanceState';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
+import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -2428,10 +2429,21 @@ export async function runVerifiedChat(
     }
   }
 
-  // Count how many times a required function was called.
-  const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    return calls.filter(c => c === functionName).length;
-  };
+  // Count how many times a required function's OUTCOME was achieved.
+  //
+  // ENG-1045: this used to compare tool NAMES only, which made the requirement
+  // unsatisfiable for any schedule whose mandated publish had to route through a
+  // different tool. A 2+ tweet thread can only go out via twitter_manage_post
+  // (post_on_connected_account is single-tweet; the backend rejects a 1-item
+  // thread), so after a successful thread the count stayed at 0 and the loop
+  // re-sent "Make sure to post_on_connected_account (1 more time needed)" on every
+  // remaining attempt — with a SECOND, irreversible post to a live timeline as the
+  // only way to clear it. countCallsSatisfyingRequirement keeps exact-name matching
+  // and additionally credits a SUCCESSFUL equivalent publish route.
+  const countCallsForRequirement = (
+    functionName: string,
+    calls: RequiredCallLedgerEntry[]
+  ): number => countCallsSatisfyingRequirement(functionName, calls);
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -2440,12 +2452,16 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts. ENG-657: on a resume, seed with the
+  // Track all tool calls across attempts. ENG-657: on a resume, seed with the
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = Array.isArray(params.priorToolCalls)
-    ? params.priorToolCalls.map((c) => c.name).filter(Boolean)
+  // ENG-1045: kept as ENTRIES rather than bare names — the outcome check needs each
+  // call's action argument and its success/error marker, which a name list discards.
+  // Resumed entries carry only name/error (that is all the transcript reconstruction
+  // preserves), so they still credit by name exactly as they did before.
+  const allActualFunctionCallsForReporting: RequiredCallLedgerEntry[] = Array.isArray(params.priorToolCalls)
+    ? params.priorToolCalls.filter((c) => c && c.name)
     : [];
 
   // Set when the completion gate asks for one more continuation turn; the next
@@ -2691,7 +2707,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
+          ...continuationToolCalls.filter((call: any) => call?.name)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2833,9 +2849,8 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
-      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+      allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -4084,12 +4099,12 @@ export async function runScheduledChat(
     // Convert result to scheduled chat format
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
-    // Calculate final function call details
+    // Calculate final function call details. ENG-1045: counted through the same
+    // outcome-aware helper the checker uses, so the persisted record cannot say
+    // `post_on_connected_account {actual: 0, required: 1}` on a run the checker
+    // passed because the mandated post went out as a thread — the same
+    // self-contradicting shape ENG-827 removed from this record below.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
-    const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    actualFunctionCalls.forEach((call: string) => {
-      actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
-    });
 
     // ENG-827: report the requirements this run was actually HELD TO, which is the
     // publish-scope-filtered list the checker used above — not the raw schedule
@@ -4109,7 +4124,7 @@ export async function runScheduledChat(
     filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
       .forEach((functionName: string) => {
         finalFunctionCallDetails[functionName] = {
-          actual: actualFunctionCallCounts[functionName] || 0,
+          actual: countCallsSatisfyingRequirement(functionName, result.toolCalls),
           required: functionCallMinCalls[functionName] || 1
         };
       });
