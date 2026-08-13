@@ -1322,19 +1322,47 @@ describe('AgentModeService - CRM Tools', () => {
         const result = await service.addLeadsToList(listId, rows, userId);
 
         expect(result.complete).toBe(false);
-        expect(result.unimportedRows).toHaveLength(100);
-        expect(result.unimportedRowsTruncated).toEqual({ shown: 100, total: 200 });
-        // The authoritative set: every missing position, not the slice that fits.
+        // 200 ledger entries are ~14KB — inside the budget, so the resume list
+        // names every missing row rather than a 100-row slice of them.
+        expect(result.unimportedRows).toHaveLength(200);
+        expect(result.unimportedRowsTruncated).toBeUndefined();
         expect(result.unimportedRowRanges).toBe('51-250');
-        expect(result.message).toMatch(/FIRST 100 of 200 missing rows/);
-        expect(result.message).toMatch(/unimportedRowRanges \(51-250\) lists EVERY missing position/);
+        expect(result.message).not.toMatch(/FIRST/);
+      });
+
+      // The budget can still be exceeded by rows carrying long identifiers. A
+      // trimmed resume list that does not say it is trimmed is silent data
+      // loss: the agent imports the slice, reads `complete: true` and stops.
+      it('says so when the resume list does not fit, and points at the untrimmed ranges', async () => {
+        const rows = Array.from({ length: 400 }, (_, i) => ({
+          email: `row${i}.${'x'.repeat(120)}@example.com`,
+        }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 1 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        expect(result.unimportedRowsTruncated).toBeDefined();
+        expect(result.unimportedRowsTruncated.total).toBe(399);
+        expect(result.unimportedRows.length).toBe(result.unimportedRowsTruncated.shown);
+        expect(result.unimportedRows.length).toBeLessThan(399);
+        // The backstop still accounts for every missing row.
+        expect(result.unimportedRowRanges).toBe('2-400');
+        expect(result.message).toMatch(/FIRST \d+ of 399 missing rows/);
+        expect(result.message).toMatch(/unimportedRowRanges \(2-400\) lists EVERY missing position/);
         expect(result.message).toMatch(/not done until a result comes back with complete: true/);
       });
 
-      // A resume that only ever sees the first 100 of 200 missing rows imports
-      // them, gets `complete: true` for that call, and stops — stranding the
-      // other 100. The ranges are what make the resume deterministic.
-      it('names every missing row position, including the ones past the detail cap', async () => {
+      // A resume that only ever sees a slice of the missing rows imports it,
+      // gets `complete: true` for that call, and stops — stranding the rest.
+      // The ranges are what make the resume deterministic regardless.
+      it('names every missing row position, including any past the detail budget', async () => {
         const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
         mockCrmDb.batchCreateLeads.mockResolvedValue({
           successCount: 50,

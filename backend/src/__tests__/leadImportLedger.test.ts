@@ -1,7 +1,9 @@
 import {
+  LEAD_IMPORT_RESUME_BYTE_BUDGET,
   LEAD_IMPORT_ROW_LIST_CAP,
   LEAD_IMPORT_WRITE_BUDGET_MS,
   buildLeadImportRowOutcomes,
+  capLeadResumeRows,
   capLeadRowList,
   describeLeadRow,
   summarizeLeadRowNumbers,
@@ -114,6 +116,45 @@ describe('leadImportLedger', () => {
         unimportedRows: rows.slice(0, LEAD_IMPORT_ROW_LIST_CAP),
         unimportedRowsTruncated: { shown: LEAD_IMPORT_ROW_LIST_CAP, total: LEAD_IMPORT_ROW_LIST_CAP + 5 },
       });
+    });
+  });
+
+  describe('capLeadResumeRows', () => {
+    const entry = (row: number) => ({ row, identifier: `row${row}@example.com`, reason: 'unprocessed' });
+
+    it('keeps a resume list that fits, however many rows that is', () => {
+      // A 200-row shortfall is the case the old flat 100-row cap truncated for
+      // no reason: it is a few KB, and truncating it is what stranded rows.
+      const rows = Array.from({ length: 200 }, (_, i) => entry(i + 1));
+      expect(capLeadResumeRows('unimportedRows', rows)).toEqual({ unimportedRows: rows });
+    });
+
+    it('trims only what will not fit, and says how much it left out', () => {
+      const rows = Array.from({ length: 400 }, (_, i) => ({
+        row: i + 1,
+        identifier: `row${i}.${'x'.repeat(120)}@example.com`,
+        reason: 'unprocessed',
+      }));
+      const result = capLeadResumeRows('unimportedRows', rows);
+      expect(result.unimportedRows.length).toBeLessThan(400);
+      expect(result.unimportedRowsTruncated).toEqual({
+        shown: result.unimportedRows.length,
+        total: 400,
+      });
+      expect(JSON.stringify(result.unimportedRows).length).toBeLessThanOrEqual(
+        LEAD_IMPORT_RESUME_BYTE_BUDGET,
+      );
+    });
+
+    it('always names at least one row, even one that alone busts the budget', () => {
+      const huge = { row: 1, identifier: 'x'.repeat(LEAD_IMPORT_RESUME_BYTE_BUDGET * 2), reason: 'failed' };
+      const result = capLeadResumeRows('unimportedRows', [huge, entry(2)]);
+      expect(result.unimportedRows).toEqual([huge]);
+      expect(result.unimportedRowsTruncated).toEqual({ shown: 1, total: 2 });
+    });
+
+    it('has nothing to trim when there is nothing missing', () => {
+      expect(capLeadResumeRows('unimportedRows', [])).toEqual({ unimportedRows: [] });
     });
   });
 
