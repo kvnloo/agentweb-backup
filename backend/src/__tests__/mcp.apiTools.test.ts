@@ -1384,7 +1384,7 @@ describe('apiTools', () => {
           onboardingStage: 'brand_submitted',
           onboardingEvents: [{ event: 'goal_selected' }, { event: 'brand_submitted' }],
         })
-        .mockResolvedValueOnce({ status: 'building' });
+        .mockResolvedValueOnce({ status: { brandBuildStatus: 'building' } });
 
       const result = await mcpToolRegistry.execute('emma_get_onboarding_status', {}, context);
       const parsed = JSON.parse((result as any).content[0].text);
