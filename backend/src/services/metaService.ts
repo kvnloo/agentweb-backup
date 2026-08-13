@@ -772,8 +772,67 @@ export class MetaService {
    * Returns `undefined` — never `[]` — when the grant could not be determined, so
    * callers can distinguish "we could not ask" from "nothing was granted". Storing
    * an empty array in the former case would later read as an authoritative refusal.
+   *
+   * Asks `/me/permissions` first and falls back to `debug_token` (ENG-1158).
+   * `debug_token` must be called with an APP token, so it answers only for tokens
+   * minted by the app whose credentials we currently hold — anything else comes
+   * back "(#100) The App_id in the input_token did not match the Viewing App" and
+   * the grant reads as undeterminable forever. Verified live: every Meta ad
+   * account on the dev test user fails debug_token exactly that way, while
+   * `/me/permissions` — which needs only the user token — returns the full grant.
+   * It also states `granted` vs `declined` outright rather than leaving a
+   * declined permission to be inferred from its absence.
    */
   public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
+    const fromPermissions = await this.getGrantedScopesFromPermissions(accessToken);
+    if (fromPermissions) return fromPermissions;
+    return this.getGrantedScopesFromDebugToken(accessToken);
+  }
+
+  /**
+   * Read the grant from `/me/permissions`, which authenticates with the user
+   * token itself and so has no app-identity precondition.
+   *
+   * Returns `undefined` on any failure or empty answer so the caller can fall
+   * back — an empty granted list is far likelier to be a failure than a real
+   * grant of nothing (Meta always includes `public_profile` on a live token).
+   */
+  private async getGrantedScopesFromPermissions(accessToken: string): Promise<string[] | undefined> {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions` +
+          `?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (body?.error) {
+        console.warn(
+          `[MetaService] getGrantedScopes: /me/permissions returned an error: ${body.error?.message ?? 'unknown'}`
+        );
+        return undefined;
+      }
+
+      if (!Array.isArray(body?.data)) return undefined;
+
+      // Only 'granted'. A declined permission is listed too, and counting it
+      // would report capability for a connection the user explicitly refused.
+      const granted = body.data
+        .filter((entry: any) => entry?.status === 'granted')
+        .map((entry: any) => entry?.permission)
+        .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+        .map((s: string) => s.trim());
+
+      if (granted.length === 0) return undefined;
+      return Array.from(new Set(granted));
+    } catch (error: any) {
+      console.warn(`[MetaService] getGrantedScopes: /me/permissions failed: ${error?.message ?? error}`);
+      return undefined;
+    }
+  }
+
+  /** The original `debug_token` route, kept as a fallback. */
+  private async getGrantedScopesFromDebugToken(accessToken: string): Promise<string[] | undefined> {
     try {
       const { getMetaCredentials } = await import('../utils/secretsManager');
       const creds = await getMetaCredentials();
