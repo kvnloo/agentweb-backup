@@ -6,7 +6,7 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
-import { injectPixelIntoLayoutFiles } from "../utils/pixelInjection";
+import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { metaService } from "./metaService";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
@@ -1032,6 +1032,21 @@ export interface GenerateLandingPageOptions {
   originatingSessionId?: string;
   /** See GeneratedLandingPage.bridgeOutUrl's own doc comment. */
   bridgeOutUrl?: string;
+  /**
+   * ENG-1141: an explicit pixel/account choice from the creation form's mandatory
+   * picker (shown only when the customer's Meta connections are genuinely ambiguous —
+   * 2+ accounts, or the chosen account has 2+ pixels). Wins outright over
+   * resolveMetaPixelForUser on the first-page path; skips that call entirely rather
+   * than calling it and discarding the result.
+   *
+   * On the addSubPage path it FILLS A GAP rather than diverging: a site that already
+   * resolved a pixel keeps it (a pixel is site-wide by construction — shared layout
+   * snippet, one PIXEL_ID constant in the capture route — and Meta's own guidance is one
+   * pixel per site). A site with NO pixel — the 2+-ad-account case this ticket exists for,
+   * where resolveMetaPixelForUser refused at generation time — gets this one installed
+   * site-wide and written onto its root record, so later pages inherit it.
+   */
+  metaPixelOverride?: { pixelId: string; accountId: string };
 }
 
 /**
@@ -1050,9 +1065,34 @@ async function addSubPage(
   leadListId?: string,
   templateHtml?: string,
   originatingSessionId?: string,
-  bridgeOutUrl?: string
+  bridgeOutUrl?: string,
+  metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
-  if (process.env.CODING_AGENT_SUBPAGES === "true") {
+  /*
+   * ENG-1141: the coding-agent engine has NO Meta tracking installation of its own — it never
+   * reads site.metaPixelId, and it cannot inject the base snippet or sync the capture route.
+   * On a site that already HAS a pixel that's fine: its task tells the agent to mirror the
+   * home page's existing form wiring, so fireLeadTracking is copied along with the rest.
+   *
+   * The case it cannot serve is the one this ticket exists for — a site with NO pixel, where
+   * an explicit choice has to be INSTALLED (layout snippet + capture route + root record).
+   * Sending that through the agent would silently discard a selection the customer was just
+   * forced to make. So route those builds down the v0 path, which does install it, and accept
+   * one v0 generation for the page that sets a site's pixel up. Every later page on that site
+   * inherits it and goes back through the agent.
+   */
+  const codingAgentEnabled = process.env.CODING_AGENT_SUBPAGES === "true";
+  const overrideNeedsInstalling = Boolean(
+    !site.metaPixelId && metaPixelOverride?.pixelId && metaPixelOverride?.accountId,
+  );
+  if (codingAgentEnabled && overrideNeedsInstalling) {
+    console.log(
+      `[V0 SERVICE] Using the v0 path for /${buildPageSlug(name)} despite CODING_AGENT_SUBPAGES: ` +
+      `this build installs the chosen Meta pixel ${metaPixelOverride!.pixelId} site-wide, which the ` +
+      `coding-agent engine cannot do. Later pages on this site inherit it and use the agent again.`,
+    );
+  }
+  if (codingAgentEnabled && !overrideNeedsInstalling) {
     const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
     return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
       leadListId,
@@ -1060,7 +1100,7 @@ async function addSubPage(
     });
   }
   return addPageToExistingRepo(
-    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
+    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
   );
 }
 
@@ -1077,6 +1117,7 @@ export async function generateLandingPage(
   const originatingSessionId = opts?.originatingSessionId;
   const mode = opts?.mode ?? "unified";
   const bridgeOutUrl = opts?.bridgeOutUrl;
+  const metaPixelOverride = opts?.metaPixelOverride;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1090,7 +1131,7 @@ export async function generateLandingPage(
           return reuse;
         }
         return addSubPage(
-          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
+          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
         );
       }
       // siteId given but not a usable site (deleted / never deployed) → fall through.
@@ -1100,7 +1141,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
       );
     }
 
@@ -1116,11 +1157,11 @@ export async function generateLandingPage(
         return reuse;
       }
       return addSubPage(
-        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
+        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl, metaPixelOverride
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
     );
   }
 
@@ -1146,7 +1187,9 @@ export async function generateLandingPage(
       return reuse;
     }
     // ── Add new page route to existing repo (no v0 call) ──
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl);
+    // Legacy (DURABLE_LANDING_GENERATION off) also adds sub-pages, so the override has to
+    // reach here too — otherwise the picker is silently ignored wherever the flag isn't on.
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl, metaPixelOverride);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1164,7 +1207,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride);
 }
 
 /**
@@ -1258,7 +1301,8 @@ async function generateFirstPage(
   templateHtml?: string,
   existingId?: string,
   originatingSessionId?: string,
-  bridgeOutUrl?: string
+  bridgeOutUrl?: string,
+  metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1275,17 +1319,29 @@ async function generateFirstPage(
   // instruction is included, same as GTM's "absent id" path.
   let metaPixelId: string | undefined;
   let metaAdAccountId: string | undefined;
-  try {
-    const user = await userDb.getUserById(userId);
-    const resolution = await metaService.resolveMetaPixelForUser(user, userId);
-    if ("pixelId" in resolution) {
-      metaPixelId = resolution.pixelId;
-      metaAdAccountId = resolution.accountId;
-    } else {
-      console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+  if (metaPixelOverride?.pixelId && metaPixelOverride?.accountId) {
+    // ENG-1141: an explicit choice from the creation form's mandatory picker always
+    // wins — skip resolveMetaPixelForUser entirely rather than calling it and
+    // discarding the result. BOTH halves are required: a pixel without the ad account
+    // it belongs to can't produce a CAPI send later (the account is where the token
+    // comes from), so a partial value falls back to auto-resolution rather than
+    // half-applying. The route validates shape before this, so this guards internal
+    // callers and future endpoints, not the picker itself.
+    metaPixelId = metaPixelOverride.pixelId;
+    metaAdAccountId = metaPixelOverride.accountId;
+  } else {
+    try {
+      const user = await userDb.getUserById(userId);
+      const resolution = await metaService.resolveMetaPixelForUser(user, userId);
+      if ("pixelId" in resolution) {
+        metaPixelId = resolution.pixelId;
+        metaAdAccountId = resolution.accountId;
+      } else {
+        console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+      }
+    } catch (err: any) {
+      console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
     }
-  } catch (err: any) {
-    console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
   }
 
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl);
@@ -1580,7 +1636,8 @@ async function addPageToExistingRepo(
   leadListId?: string,
   templateHtml?: string,
   originatingSessionId?: string,
-  bridgeOutUrl?: string
+  bridgeOutUrl?: string,
+  metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -1595,6 +1652,38 @@ async function addPageToExistingRepo(
   const repoFullName = `${owner}/${repoName}`;
 
   console.log(`[V0 SERVICE] Adding new page /${slug} to existing repo ${repoFullName} via v0 generation`);
+
+  /*
+   * ENG-1141 — a picker choice FILLS A GAP here, it never diverges from the site.
+   *
+   * A pixel is site-wide by construction in a generated repo: the base snippet lives in the
+   * shared app/layout.tsx (which remapFilesForSubPage deliberately never re-pushes), and the
+   * capture route bakes a single PIXEL_ID/META_ACCOUNT_ID constant for the whole repo — unlike
+   * LIST_BY_PATH, which really is per-page. Per-page pixels would need a PIXEL_BY_PATH map and
+   * a layout that inits several pixels, and Meta's own guidance is one pixel per site anyway
+   * (splitting fragments attribution, audiences and the optimization learning phase).
+   *
+   * So: if the site already resolved a pixel, the sub-page inherits it and an override is
+   * ignored. The override only applies when the site has NONE — which is exactly the case this
+   * ticket exists for (2+ ad accounts => resolveMetaPixelForUser refuses at generation time, so
+   * the root record was written with no pixel and every later page inherited that nothing).
+   * When it applies we also install it site-wide below (layout snippet + capture route) and
+   * persist it onto the ROOT record, so later pages inherit it instead of asking again.
+   */
+  const inheritedPixelId = existingPage.metaPixelId;
+  const applyingPixelOverride = Boolean(
+    !inheritedPixelId && metaPixelOverride?.pixelId && metaPixelOverride?.accountId,
+  );
+  const effectivePixelId = inheritedPixelId ?? (applyingPixelOverride ? metaPixelOverride!.pixelId : undefined);
+  const effectiveMetaAccountId = inheritedPixelId
+    ? existingPage.metaAdAccountId
+    : (applyingPixelOverride ? metaPixelOverride!.accountId : undefined);
+  if (applyingPixelOverride) {
+    console.log(
+      `[V0 SERVICE] Site ${existingPage.siteId ?? existingPage.id} has no Meta pixel — applying the ` +
+      `creation-form override ${effectivePixelId} (account ${effectiveMetaAccountId}) site-wide`,
+    );
+  }
 
   // Use the custom domain if available, otherwise the vercel deployed URL origin.
   // customDomainUrl takes priority because it's the public-facing address.
@@ -1650,7 +1739,7 @@ async function addPageToExistingRepo(
     // untouched, from the first page's push) — but the Lead-event prompt instruction is still
     // needed here since each page has its OWN form component. Just read whatever the site's
     // root already resolved, no fresh Meta API call.
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, existingPage.metaPixelId, bridgeOutUrl);
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, effectivePixelId, bridgeOutUrl);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -1751,7 +1840,7 @@ async function addPageToExistingRepo(
 
         // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
-        if (existingPage.metaPixelId) {
+        if (effectivePixelId) {
           // ENG-482: validate against the file set that ACTUALLY ships (post-remap), not
           // previewFiles (v0's raw, unfiltered zip). remapFilesForSubPage's skip-list drops
           // files like app/layout.tsx — v0's own scaffold layout.tsx can independently
@@ -1913,7 +2002,7 @@ async function addPageToExistingRepo(
     // build OUTRIGHT with "Module not found" if the file isn't in THIS commit — live-repro'd
     // exactly this by adding a page to a pre-existing test-env repo. Must ride in the SAME
     // commit whose build status this function actually checks, not a later async sync.
-    if (leadListId && (existingPage.metaPixelId || bridgeOutUrl)) {
+    if (leadListId && (effectivePixelId || bridgeOutUrl)) {
       filesToCommit.push({ path: "lib/agentweb-track.ts", content: Buffer.from(buildTrackingHelper()) });
     }
 
@@ -1959,6 +2048,67 @@ async function addPageToExistingRepo(
       console.warn(`[V0 SERVICE] Import repair scan failed for ${repoFullName} (continuing): ${repairErr?.message}`);
     }
 
+    /*
+     * ENG-1141: install the site's base pixel snippet when this build is the one applying an
+     * override to a site that had none. It has to happen HERE, riding the same commit as the
+     * page: remapFilesForSubPage deliberately drops app/layout.tsx from a sub-page's own file
+     * set (v0's scaffold layout would otherwise clobber the real one), so nothing else in this
+     * path ever touches it — and without the base snippet `window.fbq` never exists, leaving
+     * the form's fbq('track','Lead') call queuing forever against nothing.
+     *
+     * Best-effort by design: a layout we cannot read or whose shape defeats the insertion must
+     * not fail the page build. The server-side CAPI leg (capture route, synced below) still
+     * works in that case, so the outcome degrades to "server-side only", not "no tracking".
+     *
+     * The one case that is NOT best-effort is drift (below): when the repo already carries a
+     * different pixel, the whole override is abandoned rather than half-applied, because
+     * installing only the server half would point CAPI at our pixel while the browser fired
+     * the other one — two different pixels for one conversion, which is worse than neither.
+     */
+    let pixelOverrideAbandoned = false;
+    if (applyingPixelOverride && effectivePixelId) {
+      try {
+        const currentLayout = await readRepoFile(repoFullName, "app/layout.tsx", ghHeaders);
+        if (!currentLayout) {
+          console.warn(`[V0 SERVICE] No app/layout.tsx in ${repoFullName} — skipping base pixel install`);
+        } else if (verifyPixelInjection(currentLayout, effectivePixelId)) {
+          console.log(`[V0 SERVICE] Base pixel ${effectivePixelId} already present in ${repoFullName}'s layout`);
+        } else if (repairs.some((r) => r.path === "app/layout.tsx")) {
+          // The repair scan already owns this path in this commit — two entries for one path
+          // would be ambiguous, and the repair is the one that keeps the build green.
+          console.warn(`[V0 SERVICE] Skipping base pixel install: app/layout.tsx is already being repaired`);
+        } else if (/\{\/\* Meta Pixel Code \*\/\}/.test(currentLayout)) {
+          /*
+           * The repo already carries a DIFFERENT pixel than the one we're about to install.
+           * The record and the repo are separate sources of truth and can drift (a record that
+           * lost its pixel, or one that never had it while the repo was wired by hand — the
+           * exact drift §13 hit on Every.io). injectPixelIntoLayout always strips the existing
+           * block before inserting, so proceeding here would silently repoint a LIVE site's
+           * conversions at another pixel. Refuse and say so loudly: a missing install is
+           * recoverable and visible, a swapped pixel corrupts someone's attribution quietly.
+           */
+          pixelOverrideAbandoned = true;
+          console.error(
+            `[V0 SERVICE] Base pixel install ABORTED for ${repoFullName}: layout.tsx already has a different ` +
+            `Meta Pixel block. Not replacing it — the site record and the repo disagree, which needs a human. ` +
+            `Requested pixel: ${effectivePixelId}.`,
+          );
+        } else {
+          const updatedLayout = injectPixelIntoLayout(currentLayout, effectivePixelId);
+          if (verifyPixelInjection(updatedLayout, effectivePixelId)) {
+            filesToCommit.push({ path: "app/layout.tsx", content: Buffer.from(updatedLayout) });
+            console.log(`[V0 SERVICE] Installing base pixel ${effectivePixelId} into ${repoFullName}'s layout`);
+          } else {
+            console.warn(
+              `[V0 SERVICE] Base pixel install skipped for ${repoFullName}: layout.tsx has no <head>/<body> anchor`,
+            );
+          }
+        }
+      } catch (layoutErr: any) {
+        console.warn(`[V0 SERVICE] Base pixel install failed for ${repoFullName} (continuing): ${layoutErr?.message}`);
+      }
+    }
+
     const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
       repoFullName,
       ghHeaders,
@@ -1969,6 +2119,27 @@ async function addPageToExistingRepo(
     );
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
+
+    /*
+     * ENG-1141: record the applied override on the SITE's root record, so every later page
+     * inherits it through the normal path and the creation form stops asking. Done after the
+     * push (the code carrying this pixel is on main) but before the Vercel poll, so a build
+     * that times out doesn't lose the fact that the repo now carries this pixel.
+     *
+     * Best-effort: the pixel is already committed to the repo, so failing to write the record
+     * must not fail the page. Worst case the next page re-applies the same value.
+     */
+    if (applyingPixelOverride && effectivePixelId && !pixelOverrideAbandoned) {
+      const rootId = existingPage.siteId ?? existingPage.id;
+      try {
+        await updateLandingPageMetaPixel(rootId, userId, effectivePixelId, effectiveMetaAccountId);
+        console.log(`[V0 SERVICE] Recorded Meta pixel ${effectivePixelId} on site root ${rootId}`);
+      } catch (persistErr: any) {
+        console.warn(
+          `[V0 SERVICE] Could not record Meta pixel on site root ${rootId} (page still shipped with it): ${persistErr?.message}`,
+        );
+      }
+    }
 
     // Poll Vercel deployment to verify the build succeeds before marking as deployed.
     // Match on the exact commit we just pushed so a stale build that lacks the new
@@ -2054,8 +2225,10 @@ async function addPageToExistingRepo(
       const syncResult = await syncLeadCaptureFilesToRepo(
         repoFullName,
         buildListByPath,
-        existingPage.metaPixelId,
-        existingPage.metaAdAccountId,
+        // Drift (see the install block above): fall back to whatever the site record already
+        // had, so the capture route is never left pointing at a pixel the layout doesn't fire.
+        pixelOverrideAbandoned ? existingPage.metaPixelId : effectivePixelId,
+        pixelOverrideAbandoned ? existingPage.metaAdAccountId : effectiveMetaAccountId,
       );
       if (!syncResult.committed && syncResult.reason !== "up-to-date") {
         console.warn(
