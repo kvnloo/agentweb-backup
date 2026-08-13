@@ -195,3 +195,113 @@ export function capLeadRowList<T>(key: string, rows: T[]): Record<string, any> {
     [`${key}Truncated`]: { shown: LEAD_IMPORT_ROW_LIST_CAP, total: rows.length },
   };
 }
+
+/**
+ * ENG-1174: the row totals an import actually achieved this turn, read back off the
+ * persisted transcript.
+ *
+ * When a turn THROWS, the diagnosis agent in agentModeController's catch is handed
+ * only `calledFunctions` — a histogram of how many times each tool was CALLED. That is
+ * why ENG-1173 has to strip every quantity from its prose: reading `add_leads_to_list: 3`
+ * as "3 leads" is exactly the production defect (session 39eb5663 wrote 75 rows across
+ * three calls and told the user "the 3 leads").
+ *
+ * The real numbers do survive, though. The minimal stored result deliberately keeps
+ * `attempted` / `reconciliation` on the tool message so the NEXT turn can resume, so a
+ * thrown turn's diagnosis can read them from the same place. No new persisted state is
+ * needed — this is a read.
+ */
+export interface LeadImportTotals {
+  /** Rows confirmed to be in the list: created + merged + alreadyPresent. */
+  landed: number;
+  /** Rows this turn tried to write. */
+  attempted: number;
+  /**
+   * False when no import result this turn could be read as an ENG-1133 result —
+   * absent, unparseable, error-enveloped, or predating the contract.
+   *
+   * UNKNOWN is NOT zero, and collapsing the two would recreate the very bug this
+   * fixes with a different wrong number: telling a user that nothing was written
+   * when 75 rows are sitting in their CRM is worse than telling them nothing.
+   */
+  known: boolean;
+}
+
+/** Timestamped transcript message, as the persisted session stores it. */
+interface TranscriptMessageLike {
+  role?: string;
+  name?: string;
+  content?: unknown;
+  timestamp?: string;
+  metadata?: { timestamp?: string; [k: string]: unknown };
+}
+
+const UNKNOWN_TOTALS: LeadImportTotals = { landed: 0, attempted: 0, known: false };
+
+export function collectLeadImportTotals(
+  messages: TranscriptMessageLike[] | null | undefined,
+  sinceMs: number,
+): LeadImportTotals {
+  if (!Array.isArray(messages)) return UNKNOWN_TOTALS;
+
+  let landed = 0;
+  let attempted = 0;
+  let known = false;
+
+  for (const message of messages) {
+    if (!message || message.role !== 'tool' || message.name !== 'add_leads_to_list') continue;
+
+    const rawTs = message.timestamp || message.metadata?.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    // No usable timestamp: this batch can be neither included nor excluded with
+    // confidence. SKIPPING it is the dangerous choice — the surviving batches still
+    // report `known: true`, so a 75-row import silently becomes an authoritative
+    // "50". An unattributable batch therefore poisons the whole sum.
+    if (!Number.isFinite(ts)) return UNKNOWN_TOTALS;
+    // A batch that provably predates this turn is a different matter: it is excluded
+    // on evidence, not on ignorance, so the remaining sum stays trustworthy.
+    if (ts < sinceMs) continue;
+
+    const text = typeof message.content === 'string' ? message.content : '';
+    // A tool result wearing the error envelope is a FAILED call, never a total.
+    if (!text || text.includes('⚠️ Tool Error')) return UNKNOWN_TOTALS;
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // One unreadable batch makes the SUM unreliable, not just that batch — so the
+      // whole answer degrades to UNKNOWN rather than silently under-reporting.
+      return UNKNOWN_TOTALS;
+    }
+
+    const rec = parsed?.reconciliation;
+    if (!rec || typeof rec !== 'object' || typeof parsed?.attempted !== 'number') {
+      // Pre-ENG-1133 shape (successCount/newCount) or something else entirely.
+      return UNKNOWN_TOTALS;
+    }
+
+    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    // ENG-1133's own definition, reused rather than reinvented: a merged or
+    // already-present row IS in the list, so it counts as landed.
+    landed += num(rec.created) + num(rec.merged) + num(rec.alreadyPresent);
+    attempted += parsed.attempted;
+    known = true;
+  }
+
+  return known ? { landed, attempted, known: true } : UNKNOWN_TOTALS;
+}
+
+/**
+ * ENG-1174: one factual line for the diagnosis prompt, or null when there is nothing
+ * trustworthy to say. Phrased in ROWS so it cannot be mistaken for the run-count
+ * ledger that sits beside it in the same prompt.
+ */
+export function describeLeadImportTotals(totals: LeadImportTotals | null | undefined): string | null {
+  if (!totals || !totals.known || totals.attempted <= 0) return null;
+
+  return totals.landed >= totals.attempted
+    ? `Lead import rows written this run: ${totals.landed} row(s), all of the ${totals.attempted} attempted.`
+    : `Lead import rows written this run: ${totals.landed} of ${totals.attempted} row(s) attempted — `
+      + `${totals.attempted - totals.landed} row(s) did not land. These are ROW counts, not run counts.`;
+}

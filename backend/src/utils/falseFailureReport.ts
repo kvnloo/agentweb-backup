@@ -514,6 +514,17 @@ const UNFOUNDED_COUNT_RE = new RegExp(
 );
 
 /**
+ * ENG-1174: the nouns a founded count may legitimately attach to.
+ *
+ * Every founded figure this module is given comes from a lead import, so it is a count
+ * of ROWS. Allowing it on any noun at all would let "I sent 75 emails" stand because 75
+ * happened to be the row total — a number that is true about one thing asserted about
+ * another. If a second source of founded counts is ever added, it must arrive with its
+ * own noun set rather than widening this one.
+ */
+const FOUNDED_COUNT_NOUNS_RE = /^(?:leads?|rows?|records?|contacts?|prospects?)$/i;
+
+/**
  * ENG-1173 kill switch — ON by default; set AGENT_DIAGNOSIS_COUNT_GUARD=false to stand
  * the count strip and the data-write notices down.
  *
@@ -549,9 +560,18 @@ function countGuardEnabled(): boolean {
  * real tool results and its counts ARE founded; stripping them there would destroy
  * true information.
  */
-export function stripUnfoundedEntityCounts(content: string): string {
+export function stripUnfoundedEntityCounts(content: string, foundedCounts?: number[] | null): string {
   if (typeof content !== 'string' || content.length === 0) return content;
   if (!countGuardEnabled()) return content;
+
+  // ENG-1174: figures this run can actually prove — read off its own tool results
+  // (see collectLeadImportTotals). A quantity matching one of them is FOUNDED and may
+  // stand; everything else is still removed. Empty/absent keeps the ENG-1173 behaviour
+  // of stripping every count, which is the correct default whenever nothing is provable.
+  const founded = new Set<number>(
+    Array.isArray(foundedCounts) ? foundedCounts.filter((n) => typeof n === 'number' && Number.isFinite(n)) : [],
+  );
+
   return content.replace(
     UNFOUNDED_COUNT_RE,
     (match: string, determiner: string | undefined, noun: string, offset: number, whole: string) => {
@@ -560,6 +580,17 @@ export function stripUnfoundedEntityCounts(content: string): string {
       // claim about the whole set, which is worse than the number this guard exists
       // to remove. An N-of-M construction is left alone entirely.
       if (/\bof\s+$/i.test(whole.slice(0, offset))) return match;
+
+      // A founded figure is founded FOR A PARTICULAR THING. The only source of these
+      // today is a lead import (collectLeadImportTotals), so 75 is 75 rows — it says
+      // nothing about emails, posts or campaigns. Without this check the guard let
+      // "I sent 75 emails" through purely because 75 happened to be the row total,
+      // which is the same confident-wrong-number defect this module exists to remove.
+      if (founded.size > 0 && FOUNDED_COUNT_NOUNS_RE.test(noun)) {
+        const digits = match.match(/\d[\d,]*/);
+        const value = digits ? Number(digits[0].replace(/,/g, '')) : NaN;
+        if (Number.isFinite(value) && founded.has(value)) return match;
+      }
       return `${determiner || 'the'} ${noun}`;
     },
   );
