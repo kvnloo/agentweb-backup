@@ -118,7 +118,7 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
-import { callSatisfiesRequirement } from '../utils/requiredCallSatisfaction';
+import { callSatisfiesRequirement, countCallsSatisfyingRequirement } from '../utils/requiredCallSatisfaction';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -635,6 +635,67 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
       metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' }] },
     }]);
     expect(callSatisfiesRequirement('post_on_connected_account', failed)).toBe(false);
+  });
+
+  // ENG-1045: the real persisted shape — the executed ledger is CUMULATIVE and lands
+  // on the message that CLOSES the turn, while each intermediate assistant message
+  // keeps its own request-only tool_calls. Verified against prod session 555bb0a4,
+  // where 26 real calls reconstructed as 52 entries. Because these entries seed the
+  // required-call counts, the doubling let ONE real publish satisfy a minCount of 2.
+  it('counts a call once when the request list and the closing turn ledger both carry it', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'you_search_web', arguments: '{"q":"x"}' } }] },
+      { tool_calls: [{ id: 'call_2', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      {
+        metadata: {
+          toolCalls: [
+            { id: 'call_1', name: 'you_search_web', arguments: { q: 'x' }, result: {} },
+            { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          ],
+        },
+      },
+    ];
+
+    const entries = reconstructPriorToolCalls(messages);
+    expect(entries).toHaveLength(2);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', entries)).toBe(1);
+  });
+
+  it('upgrades a request-list entry to the ledger entry so a later-recorded failure still vetoes', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      { metadata: { toolCalls: [{ id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' }] } },
+    ];
+
+    // One entry, and it is the one carrying the error — so the publish stays owed.
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' },
+    ]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', reconstructPriorToolCalls(messages))).toBe(0);
+  });
+
+  it('never collapses distinct calls, and keeps un-identified entries separate', () => {
+    // Two genuine publishes with distinct ids must both count.
+    const distinct = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', distinct)).toBe(2);
+
+    // No id means unknown identity, which is not evidence of sameness — keep both.
+    const noIds = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(noIds).toHaveLength(2);
   });
 });
 
