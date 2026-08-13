@@ -1418,10 +1418,61 @@ describe('Connected Accounts Routes', () => {
                 attributionPixelId: 'px-1',
                 attributionAccountId: 'act-1',
             }));
+            // attributionDisabled: false rides along — choosing a real pair also clears any
+            // previous "don't track" opt-out, so the two controls can't disagree.
             expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
                 'test_user_id', 'calendly', 'cal-1',
-                { attributionPixelId: 'px-1', attributionAccountId: 'act-1' }
+                { attributionPixelId: 'px-1', attributionAccountId: 'act-1', attributionDisabled: false }
             );
+        });
+
+        // ENG-1141 opt-out: leaving the pair unset means "auto-resolve to my first
+        // account/pixel", so a customer who connected Calendly purely for scheduling had no
+        // way to say "no Meta attribution at all" — they'd silently get CAPI Schedule events
+        // fired against whichever ad account happened to come first.
+        it('accepts disabled:true as an explicit opt-out, clearing any stored pair', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ disabled: true });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({ success: true, attributionDisabled: true }));
+            // No ownership check to run — there is no pixel being claimed.
+            expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: undefined, attributionAccountId: undefined, attributionDisabled: true }
+            );
+        });
+
+        it('clears the opt-out when a real pair is set afterwards', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+            mockAssertOwnedMetaPixel.mockResolvedValue({ accountId: 'act-1' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ pixelId: 'px-1', accountId: 'act-1' });
+
+            expect(response.status).toBe(200);
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1',
+                { attributionPixelId: 'px-1', attributionAccountId: 'act-1', attributionDisabled: false }
+            );
+        });
+
+        it('still rejects a request that is neither a valid pair nor an opt-out', async () => {
+            (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/attribution')
+                .send({ disabled: false });
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
         });
 
         it('returns 404 when the calendly account is not connected to the user', async () => {

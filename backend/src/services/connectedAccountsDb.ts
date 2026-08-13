@@ -319,6 +319,13 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // falls back to the caller's first connected account/first pixel when unset.
   attributionPixelId?: string;
   attributionAccountId?: string;
+  // ENG-1141: an explicit "don't wire Meta up at all" choice. Distinct from simply leaving
+  // the pair unset, which means "auto-resolve to my first account/pixel" — a customer who
+  // connected Calendly purely for scheduling has no way to express "no Meta attribution"
+  // otherwise, and would silently get CAPI Schedule events fired against whichever ad
+  // account happened to be first. When true, the booking is still created and CRM-forwarded
+  // exactly as before; only the CAPI leg is skipped.
+  attributionDisabled?: boolean;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;

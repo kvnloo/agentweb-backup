@@ -300,6 +300,49 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       );
     });
 
+    // ENG-1141 opt-out: a Calendly-only customer must be able to say "no Meta attribution"
+    // and still get the booking + CRM-forward. Unset means "auto-resolve", so this needs its
+    // own explicit flag — otherwise CAPI fires against whichever ad account came first.
+    it('skips the CAPI leg entirely when attribution is explicitly disabled', async () => {
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{
+        userId: USER_ID,
+        account: { ...mockAccount, config: { ...mockAccount.config, attributionDisabled: true } },
+      }]);
+
+      const res = await postSigned(makePayload({ email: 'lead@example.com' }));
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+      // The booking itself is unaffected — this opts out of Meta, not out of the CRM.
+      expect(mockCreateLead).toHaveBeenCalled();
+    });
+
+    it('ignores a stale stored pair when attribution is disabled', async () => {
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{
+        userId: USER_ID,
+        account: {
+          ...mockAccount,
+          config: {
+            ...mockAccount.config,
+            attributionPixelId: 'configured-pixel',
+            attributionAccountId: 'configured-acct',
+            attributionDisabled: true,
+          },
+        },
+      }]);
+
+      const res = await postSigned(makePayload({ email: 'lead@example.com' }));
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+    });
+
     it('passes undefined (letting it default to the first account/pixel) when nothing is configured on the connection', async () => {
       const body = makePayload();
       const res = await postSigned(body);
