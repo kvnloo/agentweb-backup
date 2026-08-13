@@ -10530,7 +10530,7 @@ export class AgentModeService {
       // import can be cut off mid-way (the whole-turn cap fires between calls),
       // and "25 new lead(s) created" tells the next turn nothing about WHICH
       // rows landed — so the only offer left was "retry the whole request".
-      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, summarizeLeadRowNumbers, LEAD_IMPORT_ROW_LIST_CAP } = await import('../utils/leadImportLedger');
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, capLeadResumeRows, summarizeLeadRowNumbers } = await import('../utils/leadImportLedger');
       const attempted = leads.length;
       const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
       const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
@@ -10595,16 +10595,20 @@ export class AgentModeService {
       const summary = messageParts.length > 0
         ? `Successfully processed: ${messageParts.join(', ')}.`
         : 'No leads were processed.';
-      // `unimportedRows` is capped, so on a big partial it names only the first
-      // slice of what is missing. Naming a slice is not a resume: the agent
-      // imports it, gets a clean `complete: true` for that call and reports the
-      // import finished, stranding the rest. `unimportedRowRanges` is the
-      // authoritative set — every missing position in the rows just sent, run
-      // length encoded and never truncated — so a truncated detail list costs
-      // readability, not resumability.
+      // The resume list is budgeted by size, so every realistic partial names
+      // every missing row. If a pathological one is still trimmed, saying so is
+      // not optional: naming a slice is not a resume — the agent imports it,
+      // gets a clean `complete: true` for that call and reports the import
+      // finished, stranding the rest. `unimportedRowRanges` is the backstop that
+      // is never trimmed: every missing position in the rows just sent, run
+      // length encoded.
       const unimportedRowRanges = summarizeLeadRowNumbers(unimportedRows.map(r => r.row));
-      const resumeTruncated = unimportedRows.length > LEAD_IMPORT_ROW_LIST_CAP
-        ? `unimportedRows details only the FIRST ${LEAD_IMPORT_ROW_LIST_CAP} of ${unimportedRows.length} missing rows, `
+      const resume = unimportedRows.length > 0
+        ? capLeadResumeRows('unimportedRows', unimportedRows)
+        : {};
+      const resumeShown = (resume.unimportedRows || []).length;
+      const resumeTruncated = resumeShown > 0 && resumeShown < unimportedRows.length
+        ? `unimportedRows details only the FIRST ${resumeShown} of ${unimportedRows.length} missing rows, `
           + `but unimportedRowRanges (${unimportedRowRanges}) lists EVERY missing position in the rows you just sent — resend all of them. `
           + `The import is not done until a result comes back with complete: true. `
         : '';
@@ -10645,7 +10649,7 @@ export class AgentModeService {
         reconciliation,
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
         ...(unimportedRows.length > 0
-          ? { ...capLeadRowList('unimportedRows', unimportedRows), unimportedRowRanges }
+          ? { ...resume, unimportedRowRanges }
           : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
       };

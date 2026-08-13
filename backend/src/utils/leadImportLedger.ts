@@ -13,8 +13,23 @@ import { LeadImportRowOutcome } from './leadSchema';
 
 /** Longest row list echoed back in a tool result before it is truncated.
  *  Keeps a large import's result well clear of the size at which the agent
- *  layer replaces a tool response with a preview. */
+ *  layer replaces a tool response with a preview. Applies to the INFORMATIONAL
+ *  lists only — see `capLeadResumeRows` for why the resume list is budgeted by
+ *  size instead. */
 export const LEAD_IMPORT_ROW_LIST_CAP = 100;
+
+/**
+ * Size budget for the resume list, in bytes of serialized JSON.
+ *
+ * Counting rows was the wrong unit here. A resume list is bounded by the
+ * request that produced it — one ~70-byte ledger entry per row the caller just
+ * sent as a ~200-byte object — so echoing ALL of it back costs a fraction of
+ * the arguments the model already emitted, and a flat 100-row cap truncated
+ * lists that were never a size problem (a 200-row shortfall is ~14KB). What the
+ * cap protects against is only the pathological tail, so budget it in the unit
+ * that actually matters and let every realistic partial through whole.
+ */
+export const LEAD_IMPORT_RESUME_BYTE_BUDGET = 32_768;
 
 /**
  * Wall-clock budget for the writes behind one `add_leads_to_list` call.
@@ -81,15 +96,15 @@ export function describeLeadRow(lead: any, index: number): string {
  * Compact, COMPLETE description of which input positions did not land, as a
  * run-length encoded range string ("7,19,101-220").
  *
- * The detailed `unimportedRows` list is capped for size, so on a big partial it
- * names only the first slice. Saying so in prose is not enough: the agent
- * imports that slice, gets a clean `complete: true` for it, and reports the
- * import finished — silently stranding the rest, which is the exact failure
- * this ticket exists to remove. Row positions are the resume key (the caller
- * still holds the rows it just sent), and encoding them by run is complete in
- * space proportional to the number of RUNS rather than rows: the dominant
- * partial — a write budget or turn cap cutting the file at some position —
- * is one run. So this summary is never truncated.
+ * `capLeadResumeRows` lets every realistic partial through whole, but a
+ * pathological one can still be trimmed, and a trimmed resume list left to
+ * speak for itself is silent data loss: the agent imports the slice it was
+ * shown, gets a clean `complete: true` for it, and reports the import finished
+ * while the rest are still missing. This summary is the backstop that cannot be
+ * trimmed — row positions are the resume key (the caller still holds the rows
+ * it just sent), and encoding them by run costs space per RUN rather than per
+ * row, so the dominant partial — a write budget or turn cap cutting the file at
+ * some position — is a single range however many rows it covers.
  */
 export function summarizeLeadRowNumbers(rowNumbers: number[]): string {
   const sorted = [...rowNumbers].sort((a, b) => a - b);
@@ -115,9 +130,31 @@ export function summarizeLeadRowNumbers(rowNumbers: number[]): string {
 }
 
 /**
- * Echo a row list back under `key`, truncated at the cap. A truncated list
- * always says so — a silently shortened resume list reads as "that is all of
- * them" and would strand the rest.
+ * Echo the resume list back under `key`, keeping every row that fits inside
+ * `LEAD_IMPORT_RESUME_BYTE_BUDGET`. A trimmed list always says so, and at least
+ * one row is always named so a resume is never left with nothing to act on.
+ */
+export function capLeadResumeRows<T>(key: string, rows: T[]): Record<string, any> {
+  let budget = LEAD_IMPORT_RESUME_BYTE_BUDGET;
+  let kept = 0;
+  for (const row of rows) {
+    budget -= JSON.stringify(row).length + 1;
+    if (budget < 0 && kept > 0) break;
+    kept++;
+  }
+  if (kept >= rows.length) {
+    return { [key]: rows };
+  }
+  return {
+    [key]: rows.slice(0, kept),
+    [`${key}Truncated`]: { shown: kept, total: rows.length },
+  };
+}
+
+/**
+ * Echo an informational row list back under `key`, truncated at the cap. A
+ * truncated list always says so — a silently shortened list reads as "that is
+ * all of them".
  */
 export function capLeadRowList<T>(key: string, rows: T[]): Record<string, any> {
   if (rows.length <= LEAD_IMPORT_ROW_LIST_CAP) {
