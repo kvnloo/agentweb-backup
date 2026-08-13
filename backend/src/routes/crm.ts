@@ -2981,17 +2981,26 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     }
 
     const csvAnonymizedSkipped = results.anonymizedSkipped || 0;
+    // ENG-1133: a row already in the list, unchanged, increments neither
+    // successCount nor mergedCount. Re-uploading a file that is already
+    // imported therefore reported "Imported 0 leads" — the CSV wizard's version
+    // of the "No leads were processed" this ticket fixed for Emma. It is a
+    // completed row and has to be named as one.
+    const csvAlreadyPresent = results.alreadyPresentCount || 0;
     res.json({
       success: true,
       successCount: results.successCount,
       mergedCount: results.mergedCount,
+      alreadyPresentCount: csvAlreadyPresent,
       errorCount: results.errorCount,
       // ENG-1002: placeholder rows are refused before the write, so say so —
       // otherwise the row count the user uploaded silently exceeds every
       // number reported back.
       anonymizedSkipped: csvAnonymizedSkipped,
       errors: results.errors,
-      message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`
+      message: `Imported ${results.successCount} leads`
+        + (csvAlreadyPresent > 0 ? `, ${csvAlreadyPresent} already present and up to date` : '')
+        + (results.errorCount > 0 ? `, ${results.errorCount} errors` : '')
         + (csvAnonymizedSkipped > 0 ? `, ${csvAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
     });
   } catch (error: any) {

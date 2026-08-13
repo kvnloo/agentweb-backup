@@ -297,6 +297,14 @@ export interface ExecutePreparedToolsInput {
    */
   generationHardCapMs?: number;
   /**
+   * The turn's REAL wall-clock cap (epoch ms) — the ENG-907 budget, set only when the
+   * caller actually armed `withGenerationTimeout`. Unlike the two media deadlines above
+   * this is not an invented ceiling: callers that impose no cap (scheduled, Slack, GTM,
+   * email) leave it undefined. Tools that must return a result before the turn is
+   * guillotined bound their own work with it (ENG-1133's lead import).
+   */
+  turnHardCapMs?: number;
+  /**
    * Longest media-call wall-clock duration (ms) observed so far this run, across prior
    * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
    * latency rather than a guess. The dispatcher returns an updated value each iteration.
@@ -433,6 +441,7 @@ export async function executePreparedTools(
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
     generationHardCapMs,
+    turnHardCapMs,
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
     approvedRevisionImageSources,
@@ -712,6 +721,11 @@ export async function executePreparedTools(
           // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
           // killed mid-wait by the generation timeout (ENG-124).
           runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+          // The turn's real cap, for tools that must hand a result back before the turn
+          // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
+          // a soft media-only budget, so it both under-budgets the work and, once it has
+          // passed, would report no time left while the turn still has minutes.
+          turnHardCapMs,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
