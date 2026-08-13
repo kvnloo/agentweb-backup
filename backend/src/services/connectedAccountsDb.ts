@@ -494,9 +494,12 @@ export const getAccountsWithOwnerIncludingOrgShared = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  // platform + account_id, not account_id alone — see the note above.
+  // platform + account_id, not account_id alone — see the note above. The
+  // separator is written as an escape and never as a literal control character:
+  // a raw NUL in the source makes git and grep treat this entire file as
+  // binary, which silently costs every diff and review of it.
   const identity = (account: { platform: string; account_id: string }) =>
-    `${account.platform} ${account.account_id}`;
+    `${account.platform}\u0000${account.account_id}`;
   const seen = new Set(ownAccounts.map(identity));
   const sharedAccounts: ConnectedAccountWithUser[] = [];
 
