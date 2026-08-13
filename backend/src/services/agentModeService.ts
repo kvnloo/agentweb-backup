@@ -14892,7 +14892,12 @@ TRUTHFULNESS RULES (these override tone):
 - The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
-- Do not attribute a failure to an operation that appears in the succeeded list.`;
+- Do not attribute a failure to an operation that appears in the succeeded list.
+
+COUNTING RULES (ENG-1173 — a real session reported "successfully added the 3 leads" when 75 leads had been written across 3 batched calls):
+- The numbers beside each operation are TOOL-CALL counts: how many times that tool was called. They are NOT counts of leads, records, rows, emails, posts, or anything else the tool wrote.
+- Never state a number of leads, records, rows, contacts, emails, or posts. You do not have that information — one call can write one row or a thousand.
+- Name what ran without any quantity ("added leads to your list"), never "added the 3 leads".`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14905,7 +14910,11 @@ TRUTHFULNESS RULES (these override tone):
         parts.push('No work plan.');
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
-        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+        // ENG-1173: the unit has to travel WITH the data. Sent as a bare histogram
+        // under an unqualified label, {"add_leads_to_list":3} reads as "3 leads" —
+        // which is exactly what production session 39eb5663 told the user after
+        // writing 75 across 3 batches.
+        parts.push(`Succeeded operations — TOOL-CALL COUNTS, i.e. how many times each tool was called this run, NOT how many records it wrote (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);

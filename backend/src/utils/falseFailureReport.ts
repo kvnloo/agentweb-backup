@@ -98,6 +98,32 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
  * excluded rather than guessed.
  */
 
+/**
+ * ENG-1173: data writes that are duplicate-unsafe but are NOT publishes.
+ *
+ * Kept in its own set, and consumed ONLY by `reconcileFalseDataWriteFailure`, because
+ * `CONFIRMED_PUBLISH_TOOLS` decides more than wording. Through
+ * `collectConfirmedPublishActions` it drives `mayHavePublished` in agentModeController,
+ * which decides whether a failed SCHEDULED run may be requeued at all. Adding CRM
+ * writes there would silently disable a schedule's auto-recovery for any task that
+ * touches the CRM — exactly the over-reach the note above about
+ * `generate_landing_page` describes. This set changes a MESSAGE and nothing else.
+ *
+ * Narrow on purpose. `import_leads_from_search` is deliberately absent: ENG-1002 and
+ * ENG-1068 both record its written-vs-reported counts disagreeing, so "it wrote
+ * something" is not yet a claim this module can stand behind by name alone.
+ */
+const CONFIRMED_DATA_WRITE_TOOLS: ReadonlySet<string> = new Set<string>([
+  'add_leads_to_list',
+  'create_lead_list',
+]);
+
+/** Plain-language labels for the data-write set. Deliberately carry no quantities. */
+const DATA_WRITE_ACTION_LABELS: Record<string, string> = {
+  add_leads_to_list: 'added leads to your list',
+  create_lead_list: 'created your lead list',
+};
+
 /** Plain-language label per tool, so the correction reads as prose, not tool names. */
 const PUBLISH_ACTION_LABELS: Record<string, string> = {
   publish_landing_page_changes: 'published your landing-page changes',
@@ -127,6 +153,10 @@ const INTERRUPTION_CLAIM_RE = new RegExp([
   String.raw`\bended\s+unexpectedly\b`,
   String.raw`\bpartway\s+through\b`,
   String.raw`\bdid\s*n[o']?t\s+finish\b`,
+  // ENG-1173: the diagnosis agent's OWN phrasing for the same claim. Production
+  // session 98b90503 closed with "the process took longer than expected" and matched
+  // none of the patterns above, so the guard never even reached the ledger check.
+  String.raw`\btook\s+longer\s+than\s+expected\b`,
   String.raw`\b(?:session|connection|request|run)\b[^.!?\n]{0,40}\b(?:was )?(?:interrupted|dropped|lost)\b`,
 ].join('|'), 'i');
 
@@ -155,6 +185,14 @@ const DENIED_SUCCESS_RE = new RegExp([
   // Scoped to the WORK, so a truthful "I could not complete the competitor
   // comparison" or "…could not complete the memory note" stays silent.
   String.raw`\bcould\s*n[o']?t\s+(?:complete|finish)\s+(?:the\s+|your\s+)?(?:deployment|deploy|publish\w*|update|changes?|fix(?:es)?|edits?|post|send)\b`,
+  // ENG-1173: "Emma was unable to finish adding your prospects to the … list" — the
+  // production denial in session 98b90503, where five add_leads_to_list batches had
+  // all returned success. Left unscoped on purpose: the object is a GERUND phrase
+  // ("finish adding your prospects"), which no noun list can enumerate. Over-firing
+  // is cheap here because the guard only ever APPENDS what the ledger confirms — it
+  // cannot assert an outcome the run did not produce.
+  String.raw`\b(?:was|were|is|are)?\s*unable\s+to\s+(?:finish|complete)\b`,
+  String.raw`\bcould\s+not\s+be\s+completed\b`,
   String.raw`\bmay\s+n[o']?t\s+have\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|sent|gone\s+through)\b`,
   String.raw`\bnothing\s+(?:was\s+)?(?:saved|persisted|applied|published|deployed|posted|sent)\b`,
   String.raw`\bnone\s+of\s+(?:the|your|these|those)\s+[^.!?\n]{0,30}?\b(?:made\s+it|went\s+through|(?:was|were)\s+(?:saved|applied|published|deployed|sent|posted))\b`,
@@ -410,6 +448,133 @@ export function appendConfirmedPublishNotice(
   if (actions.length === 0) return content;
 
   return `${content.replace(/\s+$/, '')}\n\n${buildConfirmedWorkNotice(actions)}`;
+}
+
+/**
+ * ENG-1173: entity nouns whose QUANTITY the diagnosis agent can never know.
+ *
+ * The agent is handed `calledFunctions` — a histogram of tool-call counts — and
+ * nothing else numeric. It has no `successCount`, no row count, no record count. So
+ * every quantity of a record-like thing in its output is unfounded by construction,
+ * whatever number it happens to be.
+ */
+const UNFOUNDED_COUNT_NOUNS = [
+  'leads?', 'contacts?', 'prospects?', 'subscribers?',
+  'records?', 'rows?', 'entries', 'items?',
+  'posts?', 'emails?', 'messages?', 'campaigns?',
+  'lists?', 'articles?', 'pages?', 'images?', 'files?',
+].join('|');
+
+const UNFOUNDED_COUNT_RE = new RegExp(
+  String.raw`\b(?:(the|your|all|these|those)\s+)?\d[\d,]*\s+(${UNFOUNDED_COUNT_NOUNS})\b`,
+  'gi',
+);
+
+/**
+ * Remove entity quantities from diagnosis-agent prose.
+ *
+ * Production session 39eb5663 wrote 75 leads across three `add_leads_to_list` batches
+ * and closed with "I have successfully added the 3 leads to your CRM list". The `3` is
+ * `calledFunctions["add_leads_to_list"]` — the call count — and reading it as a lead
+ * count is the only reasonable reading of what the prompt actually sent.
+ *
+ * This STRIPS rather than corrects, and that is the whole design: there is no
+ * authoritative record count on this path to reconcile against, so the only honest
+ * options are "no number" and "a number that might be wrong". A user told "added the
+ * leads" goes and looks; a user told "added the 3 leads" believes it.
+ *
+ * Digits only. Spelled-out quantities ("three leads") are left alone deliberately —
+ * the observed failure is numeric because the ledger is JSON, and word-matching would
+ * mangle ordinary prose for no measured benefit.
+ *
+ * Point this ONLY at diagnosis-agent output. The main agent composes its closing from
+ * real tool results and its counts ARE founded; stripping them there would destroy
+ * true information.
+ */
+export function stripUnfoundedEntityCounts(content: string): string {
+  if (typeof content !== 'string' || content.length === 0) return content;
+  return content.replace(
+    UNFOUNDED_COUNT_RE,
+    (_match, determiner: string | undefined, noun: string) => `${determiner || 'the'} ${noun}`,
+  );
+}
+
+/** Plain-language labels of every duplicate-unsafe data write confirmed this run. */
+export function collectConfirmedDataWriteActions(
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string[] {
+  if (!Array.isArray(toolCalls)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of toolCalls) {
+    // A name in this ledger is itself the confirmation that the call succeeded
+    // (see ledgerFromSucceededFunctions); an entry carrying an error never counts.
+    if (!entry || entry.error !== undefined) continue;
+    if (!entry.name || !CONFIRMED_DATA_WRITE_TOOLS.has(entry.name)) continue;
+    const label = DATA_WRITE_ACTION_LABELS[entry.name];
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out;
+}
+
+/** The visible correction appended after a confirmed, duplicate-unsafe data write. */
+function buildDataWriteNotice(actions: string[]): string {
+  return (
+    `${CORRECTION_MARKER}, successfully: ${actions.join('; ')}. `
+    + 'That data is written and saved, so please do NOT re-run it — a repeat import can '
+    + 'create duplicate records. Check the list before retrying.'
+  );
+}
+
+/**
+ * ENG-1173: the data-write twin of `appendConfirmedPublishNotice`, for text the CALLER
+ * already knows is generic.
+ *
+ * The fixed fallbacks ("I encountered an error … Please try sending your message
+ * again", "The server restarted … Please send your message again") carry no outcome to
+ * judge, just blanket retry advice — and that advice after a landed CRM import is the
+ * same duplicate-record instruction this ticket is about. These strings are reached
+ * whenever the diagnosis agent is unavailable, including its own 10s timeout, so the
+ * path is not rare. Never point this at model-written prose: truthful text would
+ * collect a "Correction" banner it does not deserve.
+ */
+export function appendConfirmedDataWriteNotice(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(CORRECTION_MARKER)) return content;
+
+  const actions = collectConfirmedDataWriteActions(toolCalls);
+  if (actions.length === 0) return content;
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildDataWriteNotice(actions)}`;
+}
+
+/**
+ * ENG-1173: the ENG-971 inversion, one seam over — a message denying work that a
+ * confirmed CRM write actually completed.
+ *
+ * Same contract as `reconcileFalseFailureReport`: fires only when the text asserts
+ * BOTH an interruption AND that the work was not saved, appends only what the ledger
+ * confirms, and never rewrites the model's own words. Run this AFTER the publish
+ * reconciler — the shared `CORRECTION_MARKER` makes whichever fires first win, and a
+ * landed publish is the more expensive thing to re-run.
+ */
+export function reconcileFalseDataWriteFailure(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(CORRECTION_MARKER)) return content;
+  if (!assertsUnsavedInterruption(content)) return content;
+
+  const actions = collectConfirmedDataWriteActions(toolCalls);
+  if (actions.length === 0) return content;
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildDataWriteNotice(actions)}`;
 }
 
 /**
