@@ -752,7 +752,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should load metrics for company page account', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.getAccountMetrics.mockResolvedValue({
         followers: [{ followerCount: 1000, timeRange: { start: 1234567890 } }],
@@ -764,7 +766,13 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:organization:123456'
       );
 
-      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(mockLinkedInAccount, 'user-123', undefined, undefined);
+      // The resolved account carries the owner tag added by the org-shared lookup.
+      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(
+        { ...mockLinkedInAccount, userId: 'user-123' },
+        'user-123',
+        undefined,
+        undefined
+      );
       expect(result.success).toBe(true);
       expect(result.metrics).toBeDefined();
       expect(result.metrics.followers).toBeDefined();
@@ -772,7 +780,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return error when account not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([] as any);
 
       const result = await service.loadConnectedAccountMetrics(
         'user-123',
@@ -784,7 +792,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle token refresh through adapter when token is expired', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       // The adapter will handle token refresh, so we test successful metrics fetch
       mockAdapter.getAccountMetrics.mockResolvedValue({
         followers: [{ followerCount: 2000 }],
@@ -802,7 +812,9 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle adapter errors gracefully', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.getAccountMetrics.mockRejectedValue(new Error('LinkedIn API error'));
 
