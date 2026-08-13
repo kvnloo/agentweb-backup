@@ -2273,13 +2273,17 @@ export async function runVerifiedChat(
     // Already resolved by the cost policy. Optimized scheduled runs pass string|null
     // so a transient retry remains inside the approved optimized catalog.
     transientFallbackModel?: string | null;
+    // ENG-936: approval-bound source URLs for `generate_image` revisions in
+    // this run. Passed through to the tool dispatcher so confirm=true edits of
+    // the wrong source are rejected before execution.
+    approvedRevisionImageSources?: string[];
     // Admission decision snapshot used only for post-dispatch audit correction.
     // Passing it explicitly avoids consulting the session object loaded before the
     // caller's admission write (legacy sessions may not have a prior stamp).
     modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision;
   }
 ): Promise<RunVerifiedChatResult> {
-  const {
+    const {
     sessionId,
     userId,
     startingMessage,
@@ -2292,7 +2296,8 @@ export async function runVerifiedChat(
     parkNotifiable = false,
     publishAuthorization,
     refreshPublishAuthorization,
-    publishAuthorized
+    publishAuthorized,
+    approvedRevisionImageSources,
   } = params;
 
   // ENG-827: both of these NARROW mid-run when the owner revokes consent, and are
@@ -2677,7 +2682,8 @@ export async function runVerifiedChat(
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization,
           params.transientFallbackModel,
-          params.modelPolicyDecisionForAudit
+          params.modelPolicyDecisionForAudit,
+          approvedRevisionImageSources
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2809,7 +2815,8 @@ export async function runVerifiedChat(
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization,
         params.transientFallbackModel,
-        params.modelPolicyDecisionForAudit
+        params.modelPolicyDecisionForAudit,
+        approvedRevisionImageSources
       );
 
       if (!hasAssistantOutput(response)) {
@@ -5100,6 +5107,9 @@ export async function generateSessionResponse(
   // to the worker; it only makes the post-fallback durable audit independent of a
   // stale pre-admission session read.
   modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
+  // ENG-936: approved image-source URLs for this run (currently used by
+  // image-revision confirmation preflights). Passed into the worker only.
+  approvedRevisionImageSources?: string[],
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -5374,6 +5384,7 @@ export async function generateSessionResponse(
       // enforces no cap), so the loop wraps itself up against the real deadline.
       turnStartMs,
       transientFallbackModel,
+      approvedRevisionImageSources,
     },
     (progress) => {
       // Emit progress updates via SSE
