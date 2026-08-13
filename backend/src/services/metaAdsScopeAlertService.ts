@@ -33,6 +33,19 @@ export const notifyMetaAdsScopeLost = async (params: {
 }): Promise<boolean> => {
   const { ownerUserId, accountId, accountName } = params;
 
+  // Production only. The dev and preview databases are clones of production, so
+  // they carry real customer addresses, and this alert now fires from a cron
+  // that runs on boot — meaning any preview environment would mail real people
+  // about an account they cannot see. `sendOncallAlert` guards itself the same
+  // way for the same reason. Callers still record the marker, so a real
+  // production sweep is unaffected by whatever a preview did.
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(
+      `[MetaAdsScopeAlert] [DEV] Suppressed ads-scope alert to owner ${ownerUserId} for account ${accountId ?? 'unknown'}`
+    );
+    return false;
+  }
+
   try {
     const owner = await userDb.getUserById(ownerUserId);
     const email = owner?.email;

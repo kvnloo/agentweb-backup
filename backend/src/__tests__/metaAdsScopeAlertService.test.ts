@@ -31,10 +31,45 @@ const sendEmail = emailService.sendEmail as jest.Mock;
 const getUserById = userDb.getUserById as jest.Mock;
 
 describe('notifyMetaAdsScopeLost (ENG-1158)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
   beforeEach(() => {
     jest.clearAllMocks();
     sendEmail.mockResolvedValue(undefined);
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
+    // This alert only sends in production (see below). The behaviour under test
+    // in every other case is what production does.
+    process.env.NODE_ENV = 'production';
+  });
+
+  afterAll(() => {
+    process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  /**
+   * The dev and preview databases are clones of production and carry real
+   * customer addresses, and this alert now fires from a cron that runs on boot.
+   * Without this guard, spinning up a preview environment mails real people
+   * about an account they cannot see.
+   */
+  describe('outside production', () => {
+    it.each(['development', 'staging', 'test'])('sends nothing in %s', async (env) => {
+      process.env.NODE_ENV = env;
+      getUserById.mockResolvedValue({ userId: 'owner1', email: 'owner@example.com' });
+
+      const sent = await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '1' });
+
+      expect(sent).toBe(false);
+      expect(sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('does not even look the owner up', async () => {
+      process.env.NODE_ENV = 'development';
+
+      await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '1' });
+
+      expect(getUserById).not.toHaveBeenCalled();
+    });
   });
 
   it('emails the connection owner with the reconnect destination', async () => {
