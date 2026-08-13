@@ -213,3 +213,66 @@ describe('AgentModeService — org-shared accounts on social read paths (ENG-943
     });
   });
 });
+
+/**
+ * account_id does not identify an account on its own — the same id can appear on
+ * two platforms (one Google account connected for Gmail and Drive is the common
+ * case, and the accessible set now returns both rather than silently dropping
+ * one). A LinkedIn-specific entry point matching on the id alone can therefore
+ * pick a row of some other platform and hand it to the LinkedIn adapter.
+ *
+ * The mail resolver already prefers the row whose platform the caller is asking
+ * about; these do the same.
+ */
+describe('AgentModeService — id collisions across platforms on the LinkedIn paths (ENG-943)', () => {
+  let service: AgentModeService;
+  const adapter: any = {
+    getComments: jest.fn(),
+    createReaction: jest.fn(),
+  };
+
+  /** Same account_id as the LinkedIn page below, different platform. */
+  const collidingOther = {
+    account_id: 'shared@example.com',
+    account_name: 'Drive',
+    platform: 'google_drive',
+    userId: CALLER,
+    config: { account_type: 'google_drive', access_token: 't', token_expires_at: Date.now() + 3600000 },
+  };
+
+  const linkedInAtSameId = {
+    account_id: 'shared@example.com',
+    account_name: 'Shared Page',
+    platform: 'linkedin',
+    sharedWithOrg: true,
+    userId: OWNER,
+    config: { account_type: 'company_page', access_token: 't', token_expires_at: Date.now() + 3600000 },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSocial.getAdapter.mockReturnValue(adapter);
+    // Non-LinkedIn row first, so an id-only match picks the wrong one.
+    mockAccessible.mockResolvedValue([collidingOther, linkedInAtSameId] as any);
+    service = new AgentModeService();
+  });
+
+  it('picks the LinkedIn row when reading comments, not the same-id account on another platform', async () => {
+    adapter.getComments.mockResolvedValue([]);
+
+    const result = await service.listLinkedInComments(CALLER, 'shared@example.com', 'urn:li:share:1');
+
+    expect(result.success).toBe(true);
+    expect(adapter.getComments).toHaveBeenCalledWith(linkedInAtSameId, 'urn:li:share:1', OWNER);
+  });
+
+  it('picks the LinkedIn row when reacting', async () => {
+    mockConsistent.mockResolvedValue({ ...linkedInAtSameId } as any);
+    adapter.createReaction.mockResolvedValue({ success: true });
+
+    const result = await service.reactToLinkedInPost(CALLER, 'shared@example.com', 'urn:li:share:1', 'LIKE');
+
+    expect(result.success).toBe(true);
+    expect(mockConsistent).toHaveBeenCalledWith('shared@example.com', OWNER, 'linkedin');
+  });
+});

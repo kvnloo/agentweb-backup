@@ -440,7 +440,19 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
  *
  * Own accounts are always returned (ownerUserId === callerUserId). Other
  * members' accounts are included only when sharedWithOrg === true.
- * Deduplication is by account_id — the caller's own account wins on conflict.
+ * Deduplication is by platform + account_id — the caller's own account wins on
+ * conflict.
+ *
+ * Platform is part of the key because account_id alone does not identify an
+ * account: one Google account connected for both Gmail and Drive carries the
+ * same address on both rows. Keying on the id alone dropped whichever of the
+ * two came second, and dropped a teammate's shared account entirely if the
+ * caller happened to hold any account at the same id on any platform. For a
+ * mailbox that is not cosmetic — losing the Gmail row makes it unresolvable
+ * again, which is ENG-943's symptom reached by another route, and one the
+ * resolver's own "prefer the email platform" guard cannot catch because the row
+ * never arrives. Own accounts were never deduped at all, so consumers already
+ * handle one address appearing on two platforms.
  */
 export const getAccountsWithOwnerIncludingOrgShared = async (
   callerUserId: string
@@ -461,15 +473,18 @@ export const getAccountsWithOwnerIncludingOrgShared = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  const seen = new Set(ownAccounts.map(a => a.account_id));
+  // platform + account_id, not account_id alone — see the note above.
+  const identity = (account: { platform: string; account_id: string }) =>
+    `${account.platform} ${account.account_id}`;
+  const seen = new Set(ownAccounts.map(identity));
   const sharedAccounts: ConnectedAccountWithUser[] = [];
 
   for (const member of members) {
     if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
     for (const account of memberAccounts) {
-      if (account.sharedWithOrg && !seen.has(account.account_id)) {
-        seen.add(account.account_id);
+      if (account.sharedWithOrg && !seen.has(identity(account))) {
+        seen.add(identity(account));
         sharedAccounts.push({ ...account, userId: member.userId });
       }
     }

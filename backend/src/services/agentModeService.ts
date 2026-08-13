@@ -30764,11 +30764,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    */
   private async resolveAccessibleAccount(
     callerUserId: string,
-    accountId: string
+    accountId: string,
+    preferPlatform?: string
   ): Promise<{ account: any; ownerUserId: string } | null> {
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
     const accounts = (await getAccountsWithOwnerIncludingOrgShared(callerUserId)) || [];
-    const account = accounts.find((a: any) => a.account_id === accountId);
+    const sameId = accounts.filter((a: any) => a.account_id === accountId);
+    // account_id alone does not identify an account — the same id can sit on two
+    // platforms (one Google account connected for Gmail and Drive is the common
+    // case). A platform-specific caller must not be handed some other platform's
+    // row just because it matched the id first; the mail resolver disambiguates
+    // the same way.
+    const account = (preferPlatform && sameId.find((a: any) => a.platform === preferPlatform)) || sameId[0];
     if (!account) return null;
     return { account, ownerUserId: (account as any).userId || callerUserId };
   }
@@ -30779,7 +30786,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     try {
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      const resolved = await this.resolveAccessibleAccount(userId, accountId, 'linkedin');
       if (!resolved) {
         return { success: false, message: 'Account not found or access denied' };
       }
@@ -30835,7 +30842,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const resolved = await this.resolveAccessibleAccount(userId, accountId);
+        const resolved = await this.resolveAccessibleAccount(userId, accountId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', resolved ? {
           found: true,
           platform: resolved.account.platform,
