@@ -54,4 +54,26 @@ describe('findOrphanedOrgJoinRequests', () => {
       audit,
     })).resolves.toMatchObject({ truncated: true });
   });
+
+  it('stops lookups after the missing-reference cap is reached', async () => {
+    const findUser = jest.fn(async () => null);
+    const orgRequestCount = 120;
+    const requests = Array.from({ length: orgRequestCount }, (_, index) => ({ userId: `missing-${index}` }));
+    const result = await findOrphanedOrgJoinRequests({
+      listOrganizations: async () => [org('org-1', requests)],
+      findUser,
+      audit: jest.fn(),
+    });
+
+    expect(result).toMatchObject({
+      organizationsScanned: 1,
+      pendingRequestsScanned: orgRequestCount,
+      truncated: true,
+      missingUserReferences: new Array(100).fill(0).map((_, index) => ({
+        orgId: 'org-1',
+        userId: `missing-${index}`,
+      })),
+    });
+    expect(findUser).toHaveBeenCalledTimes(100);
+  });
 });
