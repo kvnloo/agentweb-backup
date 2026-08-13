@@ -336,10 +336,20 @@ export async function reverseMonthlyPurchasedLlmUsageCredit(input: {
 
 /**
  * Record an append-only debit against the AgentWeb Credits wallet (ENG-1138
- * AC5a). Idempotent by `workId` — the same work unit debited twice returns
- * `{debited: false}` on the second call, so a fire-and-forget caller on the
- * metering chokepoint can be retried after a transient DynamoDB failure
- * without double-charging the customer.
+ * AC5a). Idempotent by `workId` **within the current usage month** — the
+ * same work unit debited twice in the same month returns `{debited: false}`
+ * on the second call, so a fire-and-forget caller on the metering chokepoint
+ * can be retried after a transient DynamoDB failure without double-charging
+ * the customer.
+ *
+ * Idempotency deliberately does NOT span month rollover. A workId that
+ * appears in two months is either:
+ *   1. a long-running unit (session, task) that legitimately produced cost
+ *      in both months → each month debits its own spend (correct), or
+ *   2. an id reused across unrelated work → the shape is a caller bug, and
+ *      cross-month dedup would silently mask it.
+ * Consumers that need strict cross-month idempotency must scope their own
+ * workId (e.g., embed the month in it before calling).
  *
  * NOT wired into `meterUserUsage` in this PR — that's a follow-up. This
  * function ships the data-plane API; the chokepoint call site + guard-test
