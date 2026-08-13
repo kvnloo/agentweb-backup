@@ -3449,7 +3449,10 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
-      runBudgetDeadlineMs: context?.runBudgetDeadlineMs,
+      // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
+      // soft deadline, which is neither a bound on the turn nor still meaningful once it
+      // has passed (ENG-1133).
+      turnDeadlineMs: context?.turnHardCapMs,
     });
   }
 });

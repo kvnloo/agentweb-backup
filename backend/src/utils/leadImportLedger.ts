@@ -59,10 +59,17 @@ export const LEAD_IMPORT_LEDGER_RESERVE_MS = 5_000;
  * Never returns 0: the DB layer reads a non-positive budget as "unbounded",
  * and a positive floor still lets the first unit of work through (its first
  * unit is unconditional), so a resume always makes some progress.
+ *
+ * `turnDeadlineMs` must be the turn's real wall-clock cap and nothing else. The
+ * media-generation soft deadline is NOT a bound on the turn: it sits 3 minutes
+ * inside the cap, so clamping to it under-budgets the import, and once it has
+ * passed the run still has minutes left while this would floor to 1ms and
+ * starve every write. Absent a real cap (scheduled/Slack/email runs impose
+ * none) the flat budget stands — there is no turn for the import to outlive.
  */
-export function leadImportWriteBudgetMs(now: number, runBudgetDeadlineMs?: number): number {
-  if (!Number.isFinite(runBudgetDeadlineMs as number)) return LEAD_IMPORT_WRITE_BUDGET_MS;
-  const remaining = (runBudgetDeadlineMs as number) - now - LEAD_IMPORT_LEDGER_RESERVE_MS;
+export function leadImportWriteBudgetMs(now: number, turnDeadlineMs?: number): number {
+  if (!Number.isFinite(turnDeadlineMs as number)) return LEAD_IMPORT_WRITE_BUDGET_MS;
+  const remaining = (turnDeadlineMs as number) - now - LEAD_IMPORT_LEDGER_RESERVE_MS;
   return Math.max(1, Math.min(LEAD_IMPORT_WRITE_BUDGET_MS, remaining));
 }
 

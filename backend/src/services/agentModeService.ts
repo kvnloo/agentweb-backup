@@ -4509,6 +4509,7 @@ export class AgentModeService {
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
           generationHardCapMs,
+          turnHardCapMs,
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
@@ -7582,6 +7583,7 @@ export class AgentModeService {
     isDelegatedAccess?: boolean;
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
+    turnHardCapMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
@@ -7596,6 +7598,9 @@ export class AgentModeService {
     // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
     // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
     if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
+    // The turn's real wall-clock cap (ENG-907), for tools that must return their result
+    // before the turn is killed rather than be guillotined mid-write (ENG-1133).
+    if (input.turnHardCapMs != null) toolOptions.turnHardCapMs = input.turnHardCapMs;
 
     return this.executeTool(
       input.llmModel,
@@ -10829,10 +10834,11 @@ export class AgentModeService {
     listId: string,
     leads: any[],
     userId: string,
-    // The run's wall-clock deadline (epoch ms), threaded in by the dispatcher.
+    // The turn's real wall-clock cap (epoch ms), threaded in by the dispatcher.
     // The import budget is clamped to it so the write loop cannot outlive the
-    // turn and lose the ledger (ENG-1133).
-    options: { runBudgetDeadlineMs?: number } = {},
+    // turn and lose the ledger (ENG-1133). Undefined when the caller imposes no
+    // cap at all, in which case the flat budget stands.
+    options: { turnDeadlineMs?: number } = {},
   ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -10894,7 +10900,7 @@ export class AgentModeService {
         // the whole-turn cap with nothing to report (ENG-1133). Clamped to the
         // run's remaining budget: a full-length budget started late in a turn
         // would outlive the turn and lose the ledger it exists to produce.
-        deadlineMs: leadImportWriteBudgetMs(Date.now(), options.runBudgetDeadlineMs),
+        deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
       });
 
       // ENG-1133: report the import row by row, not just in aggregate. A large
