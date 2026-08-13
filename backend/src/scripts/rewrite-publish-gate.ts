@@ -91,9 +91,22 @@ async function main(): Promise<void> {
         skipped++;
         continue;
       }
-      const backup = backupSkill(skill, BACKUP_DIR, s);
+      // Everything below is derived from `current`, the row we just re-read, and
+      // never from `skill`, the row the scan saw. The updatedAt guard above is
+      // necessary but not sufficient: a writer that mutates a field without
+      // bumping the timestamp would be silently reverted by spreading the stale
+      // scan row, and — worse — the backup would hold that same stale copy, so it
+      // could not restore what the write destroyed. Re-deriving costs one pure
+      // function call and removes the whole class of problem.
+      const fresh = rewritePublishGate(current.systemPrompt);
+      if (!fresh.applied.length) {
+        console.log("    ! prose no longer matches on re-read — skipping rather than writing a guess");
+        skipped++;
+        continue;
+      }
+      const backup = backupSkill(current, BACKUP_DIR, s);
       console.log(`    backup: ${path.relative(process.cwd(), backup)}`);
-      await skillService.updateSkill({ ...skill, systemPrompt: plan.systemPrompt });
+      await skillService.updateSkill({ ...current, systemPrompt: fresh.systemPrompt });
       console.log("    applied ✅");
     }
     changed++;
