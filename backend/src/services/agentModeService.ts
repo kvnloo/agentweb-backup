@@ -11905,7 +11905,14 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion to identify leads to delete' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
+      // Must stay in step with the searchLeads resolver — this path is the
+      // destructive one, so a field it fails to resolve does not merely return a
+      // wrong answer, it selects the wrong rows for deletion. `clickIds` falling
+      // through to `customFields.clickIds` (undefined on essentially every lead)
+      // made `is_empty` match EVERYTHING, so "delete the leads with no click ID"
+      // selected the attributed leads too. The two-phase confirm gate was the
+      // only thing between that and data loss, and its preview looked correct.
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt', 'clickIds'];
 
       // Helper function to check if a lead matches all filters
       const leadMatchesFilters = (lead: any): boolean => {
