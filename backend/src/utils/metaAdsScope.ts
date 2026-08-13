@@ -53,6 +53,22 @@ export interface MetaAdsScopeConfigLike {
    * the same impossible read.
    */
   ads_scope_revoked_at?: unknown;
+  /**
+   * Set once the owner has been emailed about the current outage (ENG-1158).
+   *
+   * Deliberately a separate marker from `ads_scope_revoked_at` rather than
+   * inferring "already told them" from the revocation being recorded. Detection
+   * and notification are not the same event: an account latched before the alert
+   * existed — or one whose alert failed to send — has a revocation on file and
+   * has never been told anything. Keying the email off the revocation leaves
+   * exactly those accounts silent forever, since the pre-flight gate means the
+   * detection path never runs again.
+   *
+   * Not read by `getMetaAdsScopeState`: this records what we told the owner, not
+   * what the connection can do. A reconnect replaces the config wholesale and so
+   * clears it, which is what lets a genuinely new outage alert again.
+   */
+  ads_scope_alerted_at?: unknown;
 }
 
 /**

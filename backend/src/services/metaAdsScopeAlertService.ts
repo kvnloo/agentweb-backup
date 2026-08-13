@@ -14,9 +14,13 @@ import { META_ADS_RECONSENT_MESSAGE } from '../utils/metaAdsScope';
  * The reconnect is owner-only work, so the detection is worthless unless it
  * travels to a human.
  *
- * Fired at the transition (the first refusal we record), not on every blocked
- * run — after detection the pre-flight gate short-circuits, and the marker is
- * cleared by a successful reconnect, so one episode produces one email.
+ * Fired from both the detection path and the pre-flight gate, deduped by the
+ * caller on the `ads_scope_alerted_at` marker, so one outage produces one email
+ * however it is noticed. Notably NOT keyed off the detection transition: the
+ * account this was written for was already latched when the alert shipped, and
+ * the gate means its detection path will never run again — a transition-only
+ * alert would leave exactly the reported outage silent. A successful reconnect
+ * replaces the config, clearing the marker, so a later outage alerts afresh.
  *
  * Best-effort by construction: this never throws and never rejects. It rides
  * alongside a user-facing error that must reach the caller intact, so a mail
