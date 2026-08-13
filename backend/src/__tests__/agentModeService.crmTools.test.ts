@@ -46,6 +46,7 @@ import { AgentModeService } from '../services/agentModeService';
 import { crmDb, userDb, orgDb } from '../services/db';
 import { resendService } from '../services/resendService';
 import { gmailService } from '../services/gmailService';
+import { LEAD_IMPORT_WRITE_BUDGET_MS } from '../utils/leadImportLedger';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -1339,7 +1340,7 @@ describe('AgentModeService - CRM Tools', () => {
         expect(result.message).toMatch(/add_leads_to_list/);
       });
 
-      it('clamps the write budget to the run budget it was handed', async () => {
+      it('clamps the write budget to the turn deadline it was handed', async () => {
         // A full-length write budget started late in a turn outlives the turn,
         // and the ledger it exists to produce never comes back.
         mockCrmDb.batchCreateLeads.mockResolvedValue({
@@ -1352,12 +1353,31 @@ describe('AgentModeService - CRM Tools', () => {
         } as any);
 
         await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {
-          runBudgetDeadlineMs: Date.now() + 30_000,
+          turnDeadlineMs: Date.now() + 30_000,
         });
 
         const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
         expect(options.deadlineMs).toBeGreaterThan(0);
         expect(options.deadlineMs).toBeLessThanOrEqual(25_000);
+      });
+
+      it('keeps the full write budget when the caller imposes no turn cap', async () => {
+        // Scheduled/Slack/email runs have no wall-clock cap, so there is no turn
+        // for the import to outlive — clamping them would truncate work that
+        // completes today.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {});
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
       });
 
       // The resume list is capped so a huge partial cannot blow the tool result

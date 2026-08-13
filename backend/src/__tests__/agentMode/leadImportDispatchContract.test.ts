@@ -190,4 +190,68 @@ describe('ENG-1133 — a partial lead import survives the dispatch boundary', ()
       expect.anything(),
     );
   });
+
+  // The import bounds its writes by the turn's cap so the ledger comes back
+  // before the turn is killed. That only works if the REAL cap reaches the tool:
+  // the context's `runBudgetDeadlineMs` carries the media-gen soft deadline,
+  // which sits minutes inside the cap and goes stale once it passes.
+  it('hands the tool the turn cap, not the media-generation deadline', async () => {
+    const executeTool = jest.spyOn(service as any, 'executeTool').mockResolvedValue(PARTIAL_LEDGER);
+    const callLLM = jest.spyOn(service as any, 'callLLM');
+    callLLM.mockResolvedValueOnce(
+      buildLLMResponse({
+        tool_calls: [{
+          id: 't1',
+          name: 'add_leads_to_list',
+          arguments: JSON.stringify({ list_id: 'L1', leads: ROWS }),
+        }],
+      }),
+    );
+    callLLM.mockResolvedValue(buildLLMResponse({ content: 'Import handled.' }));
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    const turnStartMs = Date.now();
+    await service.generateMarketingResponse(
+      'Import this CSV into list L1.',
+      [] as any,
+      'test-user',
+      service.default_model,
+      'test-session',
+      false,
+      undefined,
+      socketEmit,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      false,
+      turnStartMs,
+    );
+
+    const toolOptions = executeTool.mock.calls[0][6] as any;
+    expect(toolOptions.turnHardCapMs).toBeGreaterThan(turnStartMs);
+    // The media budget defaults to 7 minutes; the turn cap is 10. Anything at or
+    // below the media deadline means the soft budget leaked in as the cap.
+    expect(toolOptions.turnHardCapMs).toBeGreaterThan(toolOptions.runBudgetDeadlineMs);
+  });
+
+  it('spends the turn cap as the import write budget', async () => {
+    const { emmaToolRegistry } = await import('../../emma/registry');
+    await import('../../emma/tools');
+    const { agentModeService } = await import('../../services/agentModeService');
+    const addLeadsToList = jest
+      .spyOn(agentModeService, 'addLeadsToList')
+      .mockResolvedValue({ success: true } as any);
+    const turnHardCapMs = Date.now() + 30_000;
+
+    await emmaToolRegistry.getTool('add_leads_to_list')!.execute(
+      { list_id: 'L1', leads: ROWS },
+      // A context carrying BOTH deadlines: the tool has to spend the turn cap.
+      { userId: 'test-user', runBudgetDeadlineMs: Date.now() + 1_000, turnHardCapMs },
+    );
+
+    expect(addLeadsToList).toHaveBeenCalledWith('L1', ROWS, 'test-user', { turnDeadlineMs: turnHardCapMs });
+    addLeadsToList.mockRestore();
+  });
 });
