@@ -1069,6 +1069,22 @@ async function addSubPage(
   metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
   if (process.env.CODING_AGENT_SUBPAGES === "true") {
+    /*
+     * ENG-1141: the coding-agent engine has NO Meta tracking of any kind — it never reads
+     * site.metaPixelId either, so a page built here ships untracked whether or not a pixel
+     * was chosen. That is pre-existing and wider than this ticket, but it must not be
+     * silent: a customer who was just forced through a mandatory picker would otherwise get
+     * an untracked page with nothing anywhere saying why. Wiring tracking into that engine
+     * (agent-authored fireLeadTracking + the layout/capture sync this file does for the v0
+     * path) is real work and needs its own ticket; this flag is off by default today.
+     */
+    if (metaPixelOverride?.pixelId) {
+      console.warn(
+        `[V0 SERVICE] CODING_AGENT_SUBPAGES is on: the chosen Meta pixel ${metaPixelOverride.pixelId} ` +
+        `CANNOT be applied to /${buildPageSlug(name)} — that engine has no Meta tracking support at all. ` +
+        `The page will ship untracked.`,
+      );
+    }
     const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
     return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
       leadListId,
