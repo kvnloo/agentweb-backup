@@ -234,6 +234,23 @@ describe('admin-grant audit trail (AC7)', () => {
     expect(mockGetUserById).toHaveBeenCalledTimes(2);
   });
 
+  it('never audits a sub-cent grant as $0 — floors displayed cents at 1 and keeps exact microUsd in metadata', async () => {
+    await grantMonthlyLlmUsageCredit({
+      billingUserId: 'u1',
+      grantId: 'admin:sub-cent',
+      source: 'admin',
+      // 5_000 microUsd = $0.005 = half a cent
+      amountMicroUsd: 5_000,
+      grantedBy: 'ops@agentweb.pro',
+      now: NOW,
+    });
+
+    const params = mockTransactWrite.mock.calls[0]![0] as any;
+    const auditItem = params.TransactItems[1].Put.Item;
+    expect(auditItem.amount).toBe(1);
+    expect(auditItem.metadata.amountMicroUsd).toBe(5_000);
+  });
+
   it('propagates non-conditional transaction errors instead of retrying', async () => {
     const throttleErr: any = new Error('Rate exceeded');
     throttleErr.code = 'ProvisionedThroughputExceededException';

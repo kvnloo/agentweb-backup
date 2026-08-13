@@ -287,7 +287,10 @@ export async function grantMonthlyLlmUsageCredit(input: {
                   eventType: 'admin_credit_grant',
                   // Payment-history amount is stored in cents everywhere else;
                   // keep the exact micro-USD value in metadata for precision.
-                  amount: Math.round(amountMicroUsd / 10_000),
+                  // Round up any sub-cent partial (via ceil) and floor the
+                  // displayed cents at 1 so grants under 1c can't silently
+                  // audit as $0 — metadata still carries the exact microUsd.
+                  amount: Math.max(1, Math.ceil(amountMicroUsd / 10_000)),
                   currency: 'usd',
                   status: 'granted',
                   metadata: {
