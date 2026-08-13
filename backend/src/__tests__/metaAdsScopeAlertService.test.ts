@@ -26,6 +26,7 @@ jest.mock('../services/emailService', () => ({
 import { notifyMetaAdsScopeLost } from '../services/metaAdsScopeAlertService';
 import { userDb } from '../services/db';
 import { emailService } from '../services/emailService';
+import { __resetMetaAdsScopeAlertGuard } from '../services/metaAdsScopeAlertService';
 
 const sendEmail = emailService.sendEmail as jest.Mock;
 const getUserById = userDb.getUserById as jest.Mock;
@@ -40,6 +41,35 @@ describe('notifyMetaAdsScopeLost (ENG-1158)', () => {
     // This alert only sends in production (see below). The behaviour under test
     // in every other case is what production does.
     process.env.NODE_ENV = 'production';
+    __resetMetaAdsScopeAlertGuard();
+  });
+
+  /**
+   * `ads_scope_alerted_at` is written by a read-modify-write with no condition,
+   * so two runs racing on the same account can both read "not yet alerted" and
+   * both send. The durable marker cannot close that window; this guard can.
+   */
+  describe('concurrent sends for the same account', () => {
+    it('sends once when two callers race', async () => {
+      getUserById.mockResolvedValue({ userId: 'owner1', email: 'owner@example.com' });
+
+      const [first, second] = await Promise.all([
+        notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '922903076601160' }),
+        notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '922903076601160' }),
+      ]);
+
+      expect(sendEmail).toHaveBeenCalledTimes(1);
+      expect([first, second].filter(Boolean)).toHaveLength(1);
+    });
+
+    it('does not suppress a different account for the same owner', async () => {
+      getUserById.mockResolvedValue({ userId: 'owner1', email: 'owner@example.com' });
+
+      await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: 'acct-a' });
+      await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: 'acct-b' });
+
+      expect(sendEmail).toHaveBeenCalledTimes(2);
+    });
   });
 
   afterAll(() => {

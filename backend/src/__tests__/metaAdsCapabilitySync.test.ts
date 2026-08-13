@@ -126,12 +126,115 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
     });
   });
 
+  /**
+   * A single denied probe is weak evidence. Meta returns the ads refusal for
+   * transient reasons too — Business Manager permission changes take time to
+   * propagate — and acting on one observation means stripping a working
+   * customer's grant and emailing them about an outage that already ended.
+   *
+   * Two consecutive denials, a sweep apart, is strong evidence. The cost of
+   * waiting is 12 more hours on a problem that had already run for 13 days
+   * unnoticed; the cost of being wrong is a broken connection and a false alarm.
+   */
+  describe('a first denial is suspected, not acted on', () => {
+    it('records the suspicion without stripping the grant or alerting', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('suspected');
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(typeof updates.ads_scope_denied_seen_at).toBe('string');
+      expect(updates.granted_scopes).toBeUndefined();
+      expect(updates.ads_scope_revoked_at).toBeUndefined();
+      // The connection keeps working in the meantime.
+      expect(getMetaAdsScopeState(account.config)).not.toBe('missing');
+    });
+
+    it('acts on the second consecutive denial', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('revoked');
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+      expect(getMetaAdsScopeState(account.config)).toBe('missing');
+    });
+
+    it('forgets the suspicion as soon as one probe succeeds', async () => {
+      // Otherwise a denial today and an unrelated one next month would combine
+      // into a "confirmed" outage that never actually persisted.
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
+      expect(options.unset).toContain('ads_scope_denied_seen_at');
+      expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
+    });
+
+    it('acts immediately when the refusal is already on record', async () => {
+      // An account the agent path already caught does not need re-confirming.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('revoked');
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('alert budget', () => {
+    it('still records the revocation when the alert budget is spent', async () => {
+      // Protection must not depend on there being room to send mail.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = latchedAccount();
+
+      const result = await syncMetaAdsCapability(account, 'user1', { allowAlert: false });
+
+      expect(result.outcome).toBe('revoked');
+      expect(result.alerted).toBe(false);
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(getMetaAdsScopeState(account.config)).toBe('missing');
+    });
+
+    it('leaves the notice unrecorded so a later sweep can still send it', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = latchedAccount();
+
+      await syncMetaAdsCapability(account, 'user1', { allowAlert: false });
+
+      expect(account.config.ads_scope_alerted_at).toBeUndefined();
+    });
+
+    it('reports that it alerted when the budget allows', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1', { allowAlert: true });
+
+      expect(result.alerted).toBe(true);
+    });
+  });
+
   describe('proactive detection — scope lost with no run to notice it', () => {
     it('records the revocation and alerts the owner', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
 
       const result = await syncMetaAdsCapability(
-        metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] }),
+        metaAccount({
+          granted_scopes: ['ads_read', 'pages_show_list'],
+          ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+        }),
         'user1'
       );
 
@@ -157,7 +260,10 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
      */
     it('makes the revocation actually take effect, not merely record it', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      const account = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+      const account = metaAccount({
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
 
       await syncMetaAdsCapability(account, 'user1');
 
