@@ -945,9 +945,11 @@ describe('AgentModeService - Social Media Tools', () => {
     it('does not react when the account disconnects after eligibility is checked', async () => {
       const mockAdapter = { createReaction: jest.fn() };
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter as any);
-      mockGetAccountById
-        .mockResolvedValueOnce(mockLinkedInAccount as any)
-        .mockResolvedValueOnce(null);
+      // Eligible at listing time, gone by the pre-write re-read.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { ...mockLinkedInAccount, userId: 'user-123' },
+      ] as any);
+      mockGetAccountById.mockResolvedValueOnce(null);
 
       const result = await service.reactToLinkedInPost(
         'user-123', 'urn:li:organization:123456', 'urn:li:share:123', 'LIKE'

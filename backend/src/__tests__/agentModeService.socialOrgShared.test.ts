@@ -32,11 +32,17 @@ jest.mock('../services/socialPlatformService', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
+import {
+  getAccountsWithOwnerIncludingOrgShared,
+  getAccountByIdConsistent,
+} from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
 const mockAccessible = getAccountsWithOwnerIncludingOrgShared as jest.MockedFunction<
   typeof getAccountsWithOwnerIncludingOrgShared
+>;
+const mockConsistent = getAccountByIdConsistent as jest.MockedFunction<
+  typeof getAccountByIdConsistent
 >;
 const mockSocial = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
 
@@ -68,6 +74,7 @@ describe('AgentModeService — org-shared accounts on social read paths (ENG-943
     getComments: jest.fn(),
     getAccountMetrics: jest.fn(),
     getPostAnalytics: jest.fn(),
+    createReaction: jest.fn(),
   };
 
   beforeEach(() => {
@@ -124,6 +131,66 @@ describe('AgentModeService — org-shared accounts on social read paths (ENG-943
       expect(result.success).toBe(false);
       expect(result.message).toBe('Account not found or access denied');
       expect(adapter.getAccountMetrics).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * A reaction is a write, so it keeps the last-moment re-read postOnConnectedAccount
+   * uses: the listing that made the account reachable is not a standing grant, and the
+   * owner can disconnect or un-share it while the call is in flight. It does NOT carry
+   * ENG-827's assertStillAuthorized — createReaction has no such parameter, because a
+   * like is not a publish.
+   */
+  describe('reactToLinkedInPost', () => {
+    beforeEach(() => {
+      // By default the re-read agrees with the listing.
+      mockConsistent.mockImplementation(async (accountId: string) =>
+        [ownLinkedIn, sharedLinkedIn].find(a => a.account_id === accountId) as any
+      );
+      adapter.createReaction.mockResolvedValue({ message: 'ok', postId: 'r1', postUrl: 'u' });
+    });
+
+    it('reacts on a teammate’s org-shared account as its OWNER', async () => {
+      const result = await service.reactToLinkedInPost(CALLER, sharedLinkedIn.account_id, 'urn:li:share:1');
+
+      expect(result.success).toBe(true);
+      expect(mockConsistent).toHaveBeenCalledWith(sharedLinkedIn.account_id, OWNER, 'linkedin');
+      expect(adapter.createReaction).toHaveBeenCalledWith(sharedLinkedIn, 'urn:li:share:1', 'LIKE', OWNER);
+    });
+
+    it('still uses the caller’s own id for the caller’s own account', async () => {
+      const result = await service.reactToLinkedInPost(CALLER, ownLinkedIn.account_id, 'urn:li:share:1');
+
+      expect(result.success).toBe(true);
+      expect(adapter.createReaction).toHaveBeenCalledWith(ownLinkedIn, 'urn:li:share:1', 'LIKE', CALLER);
+    });
+
+    it('rejects an account the caller cannot reach', async () => {
+      const result = await service.reactToLinkedInPost(CALLER, 'urn:li:organization:nope', 'urn:li:share:1');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
+      expect(adapter.createReaction).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the owner un-shared the account after it was listed', async () => {
+      mockConsistent.mockResolvedValue({ ...sharedLinkedIn, sharedWithOrg: false } as any);
+
+      const result = await service.reactToLinkedInPost(CALLER, sharedLinkedIn.account_id, 'urn:li:share:1');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
+      expect(adapter.createReaction).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the account was disconnected after it was listed', async () => {
+      mockConsistent.mockResolvedValue(null as any);
+
+      const result = await service.reactToLinkedInPost(CALLER, sharedLinkedIn.account_id, 'urn:li:share:1');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('LinkedIn account is no longer connected');
+      expect(adapter.createReaction).not.toHaveBeenCalled();
     });
   });
 
