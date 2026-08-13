@@ -9489,6 +9489,26 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing, optionally capped for administrative diagnostics. */
+  async listAll(maxItems?: number): Promise<Organization[]> {
+    if (!maxItems || maxItems < 1) {
+      return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+    }
+
+    const organizations: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        Limit: maxItems - organizations.length,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      organizations.push(...((result.Items || []) as Organization[]));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && organizations.length < maxItems);
+    return organizations;
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,
