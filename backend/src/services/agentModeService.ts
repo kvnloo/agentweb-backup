@@ -15435,10 +15435,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * a revocation recorded before this alert shipped reads as "already notified"
    * when nobody was notified at all.
    *
-   * Records the notice BEFORE sending it. This runs on every blocked read, which
-   * for a scheduled report is daily and forever, so an unwritable marker must
-   * fail towards silence: a notice that never arrives is recoverable by the
-   * Settings row, whereas a mail loop aimed at a customer is not.
+   * Records the notice AFTER a confirmed send. The reverse — claim then retract
+   * on failure — leaves a permanent false acknowledgement whenever the retraction
+   * also fails, and a permanently silenced owner is the very failure this ticket
+   * exists to fix. The repetition risk that ordering guarded against is handled
+   * instead by the alert service's post-delivery guard.
    *
    * Best-effort throughout — the caller is on its way to throwing the actionable
    * re-consent error, and nothing here may displace it.
@@ -15452,14 +15453,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (connection.config?.ads_scope_alerted_at) return;
 
     try {
-      const alertedAt = new Date().toISOString();
-      const { updateAccountConfig } = await import('./connectedAccountsDb');
-      await updateAccountConfig(ownerUserId, connection.platform as any, connection.account_id, {
-        ads_scope_alerted_at: alertedAt,
-      });
-      // Keep the in-memory record in step so a single run cannot alert twice.
-      if (connection.config) connection.config.ads_scope_alerted_at = alertedAt;
-
       const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
       const delivered = await notifyMetaAdsScopeLost({
         ownerUserId,
@@ -15467,16 +15460,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         accountName: connection.account_name,
       });
 
-      // Retract the claim if nothing was delivered. Keeping it would record the
-      // owner as notified when they were never told — no address on file, a mail
-      // failure, a non-production environment — and every later run trusts this
-      // marker and stays silent (Greptile P1).
-      if (!delivered) {
-        await updateAccountConfig(ownerUserId, connection.platform as any, connection.account_id, {}, {
-          unset: ['ads_scope_alerted_at'],
-        });
-        if (connection.config) delete connection.config.ads_scope_alerted_at;
-      }
+      // Send first, record second. Claiming the notice up front and retracting
+      // it on failure left a permanent false acknowledgement whenever the
+      // retraction ALSO failed, and a silenced owner is this ticket's own bug
+      // (Greptile P1). Nothing delivered means nothing recorded, so a later run
+      // simply tries again; the alert service's own post-delivery guard is what
+      // stops a failed marker write turning into an email per blocked call.
+      if (!delivered) return;
+
+      const alertedAt = new Date().toISOString();
+      const { updateAccountConfig } = await import('./connectedAccountsDb');
+      await updateAccountConfig(ownerUserId, connection.platform as any, connection.account_id, {
+        ads_scope_alerted_at: alertedAt,
+      });
+      // Keep the in-memory record in step so a single run cannot alert twice.
+      if (connection.config) connection.config.ads_scope_alerted_at = alertedAt;
     } catch (alertError: any) {
       console.warn(
         `[AgentMode] ENG-1158: could not alert owner ${ownerUserId} about the missing Meta ads scope: ${alertError?.message ?? alertError}`

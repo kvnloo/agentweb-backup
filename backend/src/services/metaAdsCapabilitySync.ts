@@ -218,20 +218,18 @@ export const syncMetaAdsCapability = async (
       .filter((s: unknown): s is string => typeof s === 'string')
       .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
 
-    // Protection is unconditional; only the notice is budgeted. When the budget
-    // is spent we still strip the grant and stamp the refusal, but leave
-    // `ads_scope_alerted_at` unwritten so a later sweep can still deliver it.
+    // Protection is unconditional; only the notice is budgeted. The refusal is
+    // recorded on its own, WITHOUT `ads_scope_alerted_at` — that marker is
+    // written afterwards and only if the notice actually goes out.
     const allowAlert = options?.allowAlert !== false;
 
     await updateAccountConfig(userId, platform as any, account.account_id, {
       granted_scopes: retained,
       ads_scope_revoked_at: config.ads_scope_revoked_at || now,
-      ...(allowAlert ? { ads_scope_alerted_at: now } : {}),
     }, { unset: ['ads_scope_denied_seen_at'] });
     config.granted_scopes = retained;
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     delete config.ads_scope_denied_seen_at;
-    if (allowAlert) config.ads_scope_alerted_at = now;
 
     if (!allowAlert) {
       console.warn(
@@ -247,27 +245,28 @@ export const syncMetaAdsCapability = async (
       accountName: account.account_name,
     });
 
-    // The marker is claimed before sending so a mail failure cannot become a
-    // twice-daily mail loop. But keeping it when nothing was delivered — no
-    // address on file, a send failure, a non-production environment — would
-    // permanently record the owner as told when they were never told at all,
-    // and every later run trusts that marker. So retract it: the claim only
-    // stands if the notice actually went out (Greptile P1).
     if (!delivered) {
-      try {
-        await updateAccountConfig(userId, platform as any, account.account_id, {}, {
-          unset: ['ads_scope_alerted_at'],
-        });
-        delete config.ads_scope_alerted_at;
-      } catch (retractError: any) {
-        console.warn(
-          `[MetaAdsCapabilitySync] Could not retract the unsent alert marker for user ${userId} account ${account.account_id}: ${retractError?.message ?? retractError}`
-        );
-      }
       console.warn(
         `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded, but the owner was NOT notified; a later run will retry`
       );
       return { outcome: 'revoked', alerted: false };
+    }
+
+    // Record the notice only now that it demonstrably went out. Claiming it
+    // beforehand and retracting on failure left a permanent false
+    // acknowledgement whenever the retraction ALSO failed, and silence is this
+    // ticket's own bug (Greptile P1). If this write fails the owner is simply
+    // told again on a later sweep — bounded repetition, never silence.
+    try {
+      const alertedAt = new Date().toISOString();
+      await updateAccountConfig(userId, platform as any, account.account_id, {
+        ads_scope_alerted_at: alertedAt,
+      });
+      config.ads_scope_alerted_at = alertedAt;
+    } catch (markError: any) {
+      console.warn(
+        `[MetaAdsCapabilitySync] Notified owner ${userId} about account ${account.account_id} but could not record it; a later run may notify again: ${markError?.message ?? markError}`
+      );
     }
 
     console.log(

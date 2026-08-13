@@ -550,18 +550,32 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
 
-    it('does not email when the notice could not be recorded — better silent than daily spam', async () => {
-      // Without a durable marker there is nothing to stop the next run, and the
-      // next, from emailing again. An unsent notice is recoverable; a mail loop
-      // aimed at a customer is not.
+    it('still emails when the notice cannot be recorded — bounded repetition beats silence', async () => {
+      // The reverse ordering (claim the marker, retract on failure) left a
+      // permanent false acknowledgement whenever the retraction also failed, and
+      // a silenced owner is this ticket's own bug. Sending first means the worst
+      // case is that a later run tells them again.
       (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
       mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
 
       const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
 
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
       // ...and the caller still gets the actionable error.
       expect(err.isMetaAdsScopeError).toBe(true);
+    });
+
+    it('records the notice only after the send is confirmed', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      // Nothing delivered, so nothing claimed — a later run simply retries.
+      const marked = mockUpdateAccountConfig.mock.calls.filter(
+        (c: any[]) => c[3]?.ads_scope_alerted_at !== undefined
+      );
+      expect(marked).toHaveLength(0);
     });
 
     it('still refuses with the actionable error when the alert itself throws', async () => {

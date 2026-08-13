@@ -34,21 +34,39 @@ import { META_ADS_RECONSENT_MESSAGE } from '../utils/metaAdsScope';
  * a read-modify-write with no condition, so two runs can both read "not yet
  * alerted" and both send.
  *
- * Deliberately an in-flight promise rather than a "recently sent" timestamp.
- * A timestamp recorded before the attempt turns a FAILED send into a reported
- * success for anyone arriving later, so the callers keep a notice marker for an
- * email that never went out and the owner is silenced permanently (Greptile P1
- * on the first version of this guard). Sharing the promise instead means every
- * joiner gets the real outcome: all true, or all false and all retract.
- *
  * Entries live only for the duration of the send, so the map cannot grow.
  * Covers one process, like the token-refresh singleflight it mirrors.
  */
 const inFlightAlerts = new Map<string, Promise<boolean>>();
 
-/** Test seam: forget every in-flight send. */
+/** How long after a CONFIRMED send the same notice is not worth repeating. */
+const RESEND_GUARD_MS = 15 * 60 * 1000;
+
+/**
+ * owner+account -> when we last actually delivered this notice.
+ *
+ * Recorded ONLY after a successful send, which is the whole difference from the
+ * first version of this guard: that one recorded the attempt up front, so a
+ * failed send reported success to everyone arriving later and the owner was
+ * silenced permanently (Greptile P1). Recording success is a true statement, so
+ * reporting it as "already told" is safe.
+ *
+ * Needed because the durable marker is now only written after delivery: without
+ * this, a run whose marker write failed would re-send on every subsequent
+ * blocked agent call, not just once per sweep.
+ */
+const sentRecently = new Map<string, number>();
+
+const pruneSentRecently = (now: number): void => {
+  for (const [key, at] of sentRecently) {
+    if (now - at >= RESEND_GUARD_MS) sentRecently.delete(key);
+  }
+};
+
+/** Test seam: forget every in-flight and recently-delivered send. */
 export const __resetMetaAdsScopeAlertGuard = (): void => {
   inFlightAlerts.clear();
+  sentRecently.clear();
 };
 
 export const notifyMetaAdsScopeLost = async (params: {
@@ -82,9 +100,19 @@ export const notifyMetaAdsScopeLost = async (params: {
   // second one. Every joiner gets the real outcome, so a failure is never
   // reported to anyone as a success.
   const key = `${ownerUserId}:${accountId ?? 'unknown'}`;
+
+  const lastDelivered = sentRecently.get(key);
+  if (lastDelivered !== undefined && Date.now() - lastDelivered < RESEND_GUARD_MS) {
+    // True because it IS true: this process delivered it moments ago.
+    console.warn(
+      `[MetaAdsScopeAlert] Not repeating the ads-scope alert for ${key} — delivered ${Math.round((Date.now() - lastDelivered) / 1000)}s ago`
+    );
+    return true;
+  }
+
   let inFlight = inFlightAlerts.get(key);
   if (!inFlight) {
-    inFlight = deliverMetaAdsScopeAlert({ ownerUserId, accountId, accountName });
+    inFlight = deliverMetaAdsScopeAlert({ ownerUserId, accountId, accountName }, key);
     inFlightAlerts.set(key, inFlight);
     void inFlight.finally(() => inFlightAlerts.delete(key));
   } else {
@@ -105,7 +133,7 @@ const deliverMetaAdsScopeAlert = async (params: {
   ownerUserId: string;
   accountId?: string;
   accountName?: string;
-}): Promise<boolean> => {
+}, key: string): Promise<boolean> => {
   const { ownerUserId, accountId, accountName } = params;
 
   try {
@@ -152,6 +180,11 @@ const deliverMetaAdsScopeAlert = async (params: {
     `;
 
     await emailService.sendEmail(email, subject, text, html);
+
+    // Only now, with the send confirmed, is it true that the owner was told.
+    const now = Date.now();
+    sentRecently.set(key, now);
+    pruneSentRecently(now);
     return true;
   } catch (error: any) {
     console.warn(

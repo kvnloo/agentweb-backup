@@ -260,6 +260,7 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(result.alerted).toBe(false);
       expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
+      expect(account.config.ads_scope_alerted_at).toBeUndefined();
     });
 
     it('leaves the notice unrecorded so a later sweep can still send it', async () => {
@@ -358,7 +359,7 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
      * the owner as told when they never were, and every later run trusts it —
      * so the claim only stands if the notice actually went out (Greptile P1).
      */
-    it('retracts the notice when nothing was delivered, so a later run retries', async () => {
+    it('records no notice when nothing was delivered, so a later run retries', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
       mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
       const account = latchedAccount();
@@ -367,10 +368,40 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.alerted).toBe(false);
       expect(account.config.ads_scope_alerted_at).toBeUndefined();
-      const retraction = mockUpdateAccountConfig.mock.calls.at(-1);
-      expect(retraction[4].unset).toContain('ads_scope_alerted_at');
+      // No write ever carries the marker — there is nothing to retract, so no
+      // second failure can leave a permanent false acknowledgement.
+      for (const call of mockUpdateAccountConfig.mock.calls) {
+        expect(call[3]?.ads_scope_alerted_at).toBeUndefined();
+      }
       // The revocation itself stands — protection is not undone by a mail failure.
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
+    });
+
+    it('never records the notice in the same write as the revocation', async () => {
+      // The revocation must land whatever happens to the mail; coupling them is
+      // what created the acknowledge-then-retract problem.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
+
+      await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      const revocationWrite = mockUpdateAccountConfig.mock.calls[0][3];
+      expect(typeof revocationWrite.ads_scope_revoked_at).toBe('string');
+      expect(revocationWrite.ads_scope_alerted_at).toBeUndefined();
+    });
+
+    it('still reports success when the notice went out but could not be recorded', async () => {
+      // Bounded repetition (a later sweep tells them again) beats silence.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
+      mockUpdateAccountConfig
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('dynamo unavailable'));
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('revoked');
+      expect(result.alerted).toBe(true);
     });
 
     it('keeps the notice when it was delivered', async () => {
@@ -382,19 +413,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.alerted).toBe(true);
       expect(typeof account.config.ads_scope_alerted_at).toBe('string');
-    });
-
-    it('still reports the revocation when the retraction write itself fails', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
-      mockUpdateAccountConfig
-        .mockResolvedValueOnce(undefined)
-        .mockRejectedValueOnce(new Error('dynamo unavailable'));
-
-      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
-
-      expect(result.outcome).toBe('revoked');
-      expect(result.alerted).toBe(false);
     });
 
     it('does not email when the notice could not be recorded', async () => {
