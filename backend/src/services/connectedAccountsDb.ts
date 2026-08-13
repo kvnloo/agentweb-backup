@@ -625,41 +625,71 @@ export const updateAccountConfig = async (
     unset?: string[];
   }
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error('User not found');
+  // Compare-and-swap, mirroring updateAccountTokens. The User model forces a
+  // whole-list write, so a plain read-modify-write silently discards anything
+  // another writer changed in between — a token the refresh cron had just
+  // renewed, or a capability marker a concurrent sweep had just set. Conditioning
+  // the write on the list we actually read turns that clobber into a retry.
+  //
+  // Unlike the token path this re-applies the merge rather than failing closed:
+  // this function's contract is "merge these fields into whatever is current",
+  // so a fresh read followed by the same merge is exactly the right answer.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accounts.findIndex(
+      acc => acc.platform === platform && acc.account_id === accountId
+    );
+
+    if (accountIndex < 0) {
+      throw new Error(`No ${platform} account with id "${accountId}" connected`);
+    }
+
+    const existingAccount = accounts[accountIndex];
+    const mergedConfig: Record<string, any> = {
+      ...existingAccount.config,
+      ...configUpdates,
+    };
+    for (const key of options?.unset || []) {
+      delete mergedConfig[key];
+    }
+
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: mergedConfig as ConnectedAccountConfig['config'],
+      updated_at: new Date().toISOString(),
+    };
+
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      if (attempt === 2) {
+        throw Object.assign(
+          new Error(`Connected account "${accountId}" changed while updating its config; retry`),
+          { code: 'ConnectedAccountChanged' },
+        );
+      }
+      // Loop: re-read and re-apply the merge onto whatever is now current.
+    }
   }
-
-  const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accounts.findIndex(
-    acc => acc.platform === platform && acc.account_id === accountId
-  );
-
-  if (accountIndex < 0) {
-    throw new Error(`No ${platform} account with id "${accountId}" connected`);
-  }
-
-  const existingAccount = accounts[accountIndex];
-  const mergedConfig: Record<string, any> = {
-    ...existingAccount.config,
-    ...configUpdates,
-  };
-  for (const key of options?.unset || []) {
-    delete mergedConfig[key];
-  }
-
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: mergedConfig as ConnectedAccountConfig['config'],
-    updated_at: new Date().toISOString(),
-  };
-
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
-
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
 };
 
 /**

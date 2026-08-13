@@ -10,7 +10,7 @@
 
 jest.mock('../services/db', () => ({
   userDb: {
-    getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -42,7 +42,7 @@ const persistedConfig = () =>
 describe('updateAccountConfig', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (userDb.getUserById as jest.Mock).mockResolvedValue({
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({
       userId: 'user-1',
       email: 'founders@agentweb.pro',
       connected_accounts: [metaAccount()],
@@ -101,6 +101,52 @@ describe('updateAccountConfig', () => {
     const config = persistedConfig();
     expect(config.ads_scope_revoked_at).toBe('2026-07-31T07:00:21.688Z');
     expect(config.ads_scope_alerted_at).toBe('2026-08-13T07:00:00.000Z');
+  });
+
+  /**
+   * The User model forces a whole-list write, so a plain read-modify-write
+   * discards whatever another writer changed in between — a freshly refreshed
+   * token, or a capability marker from a concurrent sweep (Greptile P1).
+   */
+  describe('concurrent writers', () => {
+    it('conditions the write on the list it actually read', async () => {
+      await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] });
+
+      const [, , options] = (userDb.updateUser as jest.Mock).mock.calls[0];
+      expect(Object.values(options.condition.names)).toContain('connected_accounts');
+      // The guard is the list as read, so any concurrent write fails the check.
+      expect(options.condition.values[':expectedConnectedAccounts']).toEqual([metaAccount()]);
+    });
+
+    it('re-reads and re-applies the merge when the record changed under it', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce(conflict).mockResolvedValueOnce(undefined);
+
+      await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: ['ads_read'] });
+
+      // Read again rather than reusing the stale snapshot.
+      expect((userDb.getUserByIdConsistent as jest.Mock).mock.calls).toHaveLength(2);
+      expect((userDb.updateUser as jest.Mock).mock.calls).toHaveLength(2);
+      const config = (userDb.updateUser as jest.Mock).mock.calls[1][1].connected_accounts[0].config;
+      expect(config.granted_scopes).toEqual(['ads_read']);
+    });
+
+    it('gives up with a typed error rather than clobbering after repeated conflicts', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValue(conflict);
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] })
+      ).rejects.toMatchObject({ code: 'ConnectedAccountChanged' });
+    });
+
+    it('propagates a non-conflict failure untouched', async () => {
+      (userDb.updateUser as jest.Mock).mockRejectedValue(new Error('dynamo exploded'));
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', {})
+      ).rejects.toThrow(/dynamo exploded/);
+    });
   });
 
   it('throws when the account is not connected', async () => {
