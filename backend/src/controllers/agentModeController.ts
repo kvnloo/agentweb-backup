@@ -1611,8 +1611,32 @@ function isWriteToolCall(toolCall: any): boolean {
 // drop a FAILED abandoned call's error, which the conditional-skip error-veto needs
 // to reject a failed run (Greptile P1, ENG-844). Falls back to the request list
 // only for a message that has no executed ledger. Each returned entry keeps the
-// name and, when the call failed, its error.
-export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; error?: any }> {
+// name, the call's arguments, and — when the call failed — its error.
+//
+// ENG-1045: the arguments matter as much as the name. The publish-outcome check
+// reads `arguments.action` to recognise that a `twitter_manage_post` /
+// `post_thread` satisfied a mandated `post_on_connected_account`. Dropping the
+// arguments here made that route unreachable on the ENG-657 resume path, so a run
+// that published a thread and was then abandoned came back to the nudge loop —
+// and its pressure to publish a duplicate — all over again.
+function reconstructedToolCallArguments(tc: any): any {
+  // Executed-ledger entries carry parsed `arguments`; a request-list entry carries
+  // `function.arguments` as a JSON string (and the ledger falls back to that raw
+  // string when parsing failed at dispatch time).
+  const raw = tc?.arguments ?? tc?.function?.arguments;
+  if (raw == null) return undefined;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    // Unparseable arguments are simply unknown — the entry still counts by name.
+    return undefined;
+  }
+}
+
+export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; arguments?: any; error?: any }> {
   if (!Array.isArray(messages)) return [];
   return messages.flatMap((m: any) => {
     const executed = Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : [];
@@ -1622,10 +1646,15 @@ export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string
       .map((tc: any) => {
         const name = tc?.function?.name || tc?.name;
         if (!name) return null;
-        return (tc && typeof tc === 'object' && tc.error != null) ? { name, error: tc.error } : { name };
+        const args = reconstructedToolCallArguments(tc);
+        return {
+          name,
+          ...(args !== undefined ? { arguments: args } : {}),
+          ...(tc && typeof tc === 'object' && tc.error != null ? { error: tc.error } : {}),
+        };
       })
       .filter(Boolean);
-  }) as Array<{ name: string; error?: any }>;
+  }) as Array<{ name: string; arguments?: any; error?: any }>;
 }
 
 export function scheduledRunSignalsConditionalSkip(
@@ -2243,7 +2272,7 @@ export async function runVerifiedChat(
     // `error` is preserved (ENG-844) so the conditional-skip error-veto can reject a
     // resumed run whose ABANDONED portion had a failed tool call — reconstructing only
     // names would hide that failure and let it be recorded as a clean skip.
-    priorToolCalls?: Array<{ name: string; error?: any }>;
+    priorToolCalls?: Array<{ name: string; arguments?: any; error?: any }>;
     // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
     // Production leaves it undefined (the detector uses `new Date()`); tests pin it
     // so the cadence-vs-today check is deterministic regardless of the day CI runs.
@@ -2458,8 +2487,9 @@ export async function runVerifiedChat(
   // verify loop could re-prompt the model into re-running a completed side effect.
   // ENG-1045: kept as ENTRIES rather than bare names — the outcome check needs each
   // call's action argument and its success/error marker, which a name list discards.
-  // Resumed entries carry only name/error (that is all the transcript reconstruction
-  // preserves), so they still credit by name exactly as they did before.
+  // Resumed entries carry name/arguments/error (see reconstructPriorToolCalls), so a
+  // thread published before the abandonment credits the mandated publish on resume
+  // instead of restarting the nudge loop.
   const allActualFunctionCallsForReporting: RequiredCallLedgerEntry[] = Array.isArray(params.priorToolCalls)
     ? params.priorToolCalls.filter((c) => c && c.name)
     : [];
@@ -3604,7 +3634,7 @@ export async function runScheduledChat(
     let isResumeRun = false;
     // ENG-657: tool calls the abandoned portion already made, seeded into the
     // resumed run's verification so requiredFunctionCalls counts the whole task.
-    let resumePriorToolCalls: Array<{ name: string; error?: any }> = [];
+    let resumePriorToolCalls: Array<{ name: string; arguments?: any; error?: any }> = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
