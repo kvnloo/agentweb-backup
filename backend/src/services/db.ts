@@ -3333,10 +3333,12 @@ export const scheduleDb = {
      * first and then failing the edit would delete history for a save that never
      * happened. `expectedLength` binds the removal to the history the count was
      * measured against, so a run recording at the same moment cannot leave this write
-     * taking a second prefix off an already-shortened list. Capped at
-     * MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     * taking a second prefix off an already-shortened list. `expectedLast` pins the
+     * tail with it: an overflow recovery that drops one entry and appends its own
+     * leaves the length unchanged, and length alone would wave the stale count
+     * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
      */
-    shedRunResults?: { count: number; expectedLength: number }
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3380,6 +3382,12 @@ export const scheduleDb = {
         ).join(", ")}`;
         conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
         expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
+        if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
+          conditionExpressions.push(
+            `#runResults[${shedRunResults.expectedLength - 1}] = :expectedRunResultsLast`
+          );
+          expressionAttributeValues[':expectedRunResultsLast'] = shedRunResults.expectedLast;
+        }
       }
 
       const params: any = {

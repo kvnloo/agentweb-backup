@@ -152,7 +152,7 @@ async function applyScheduleEditWithConsentNarrowing(
   // history is never deleted for an edit that then fails, and bound to the history the
   // count was measured against so it cannot take a second prefix off a list another
   // writer already shortened.
-  shedRunResults?: { count: number; expectedLength: number }
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
 ): Promise<void> {
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
@@ -8753,6 +8753,9 @@ export const agentModeController = {
       // history, so even a length-trimmed prompt still failed). Budget the projected
       // item and shed the oldest history rather than failing the save.
       const projectedItem: Record<string, any> = { ...existingSchedule, ...updates };
+      const observedRunResults: any[] = Array.isArray((existingSchedule as any).runResults)
+        ? (existingSchedule as any).runResults
+        : [];
       let runResultsToShed = 0;
       const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
         if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
@@ -8804,9 +8807,8 @@ export const agentModeController = {
         runResultsToShed > 0
           ? {
               count: runResultsToShed,
-              expectedLength: Array.isArray((existingSchedule as any).runResults)
-                ? (existingSchedule as any).runResults.length
-                : 0,
+              expectedLength: observedRunResults.length,
+              expectedLast: observedRunResults[observedRunResults.length - 1],
             }
           : undefined
       );
