@@ -537,6 +537,9 @@ describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
 
   it('reads an auto-resolved org-shared mailbox as its owner', async () => {
     mockResolveDefaultEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    // A shared mailbox is re-checked before each read round, on both the named
+    // and the auto-resolved path, so sharing revoked mid-wait takes effect.
+    mockResolveEmailAccount.mockResolvedValue(SHARED_MAILBOX);
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
 
@@ -561,5 +564,67 @@ describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
     expect(result.success).toBe(true);
     expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-123', 'teammate@agentweb.pro');
     expect(mockGetEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', ['msg-1']);
+  });
+
+  /**
+   * The mailbox is resolved once, then polled for up to MAX_WAIT_SECONDS. On a
+   * teammate's shared mailbox that leaves a window — up to 180s across ~36 poll
+   * rounds — in which the owner can stop sharing while the loop keeps reading
+   * with the captured owner identity, handing over a code that arrived after
+   * access was withdrawn. The disclosure dialog promises an admin can "stop
+   * sharing at any time", so revocation has to take effect within the call, not
+   * only at the next one. Re-check before each round; the caller's OWN mailbox
+   * needs no check and pays nothing.
+   */
+  it('stops reading a shared mailbox once the owner withdraws sharing', async () => {
+    mockResolveEmailAccount.mockResolvedValueOnce(SHARED_MAILBOX);
+    // Sharing is withdrawn between resolution and the read.
+    mockResolveEmailAccount.mockRejectedValue(
+      new Error('Connected account "teammate@agentweb.pro" not found. Use list_connected_accounts to get valid account IDs.')
+    );
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(result.code).toBeUndefined();
+    // The point of the guard: no read is attempted after access is gone.
+    expect(mockListEmails).not.toHaveBeenCalled();
+    expect(mockGetEmails).not.toHaveBeenCalled();
+  });
+
+  it('stops when the mailbox is still reachable but has changed owner', async () => {
+    mockResolveEmailAccount.mockResolvedValueOnce(SHARED_MAILBOX);
+    mockResolveEmailAccount.mockResolvedValue({ ...SHARED_MAILBOX, ownerUserId: 'someone-else' });
+    mockListEmails.mockResolvedValue([summary()]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
+  it('does not re-check the caller’s own mailbox', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...GMAIL_ACCOUNT, accountId: 'me@agentweb.pro' });
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'me@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    // Resolved once, never re-resolved: an own mailbox cannot be un-shared.
+    expect(mockResolveEmailAccount).toHaveBeenCalledTimes(1);
   });
 });

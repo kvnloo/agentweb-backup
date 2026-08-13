@@ -311,6 +311,26 @@ emmaToolRegistry.register({
       mailboxUserId = resolved.ownerUserId;
     }
 
+    // Sharing is checked once, above, but the loop below reads the mailbox for
+    // up to MAX_WAIT_SECONDS across ~36 rounds, always authenticating as the
+    // owner captured at resolution. On a teammate's shared mailbox that leaves a
+    // window in which the owner stops sharing and the caller still receives a
+    // code that arrived afterwards. The share dialog tells an admin they can
+    // "stop sharing at any time", so revocation has to bite inside the call.
+    //
+    // The caller's OWN mailbox cannot be un-shared from under them, so it is
+    // never re-checked and pays nothing — which is every caller outside an org.
+    const stillAccessible = async (): Promise<boolean> => {
+      if (mailboxUserId === userId) return true;
+      try {
+        const recheck = await resolveEmailAccount(userId, accountId);
+        // Owner changed ⇒ this is no longer the mailbox we were authorised for.
+        return recheck.ownerUserId === mailboxUserId;
+      } catch {
+        return false;
+      }
+    };
+
     // ── Poll for a fresh matching message ──────────────────────────────────
     const deadline = Date.now() + waitSeconds * 1000;
     let sawStaleMatch = false;
@@ -318,6 +338,16 @@ emmaToolRegistry.register({
     let sawFreshMatchWithoutCode = false;
 
     for (;;) {
+      if (!(await stillAccessible())) {
+        return {
+          success: false,
+          reason: 'mailbox_error',
+          message:
+            `Access to mailbox "${accountId}" ended while waiting for the code — its owner stopped sharing it ` +
+            `with your organization. ${NO_FABRICATION_NOTE}`,
+        };
+      }
+
       // Two sources, unioned: a provider search (sees archived/filtered mail and
       // is not bounded by the scan size) and the INBOX scan (needs no query
       // support and is the only source for non-Gmail providers). A search
