@@ -69,6 +69,19 @@ export interface MetaAdsScopeConfigLike {
    * clears it, which is what lets a genuinely new outage alert again.
    */
   ads_scope_alerted_at?: unknown;
+  /**
+   * When the reconciler first saw Meta refuse this ad account, pending
+   * confirmation by a second sweep (ENG-1158).
+   *
+   * Deliberately NOT read by `getMetaAdsScopeState`: a suspicion must change
+   * nothing a user can feel. One denied probe is weak evidence — Meta returns
+   * the ads refusal transiently too, e.g. while a Business Manager permission
+   * change propagates — and acting on it would strip a working customer's grant
+   * and mail them about an outage that had already ended. Cleared by any
+   * successful probe, so two unrelated denials a month apart can never add up to
+   * a confirmation.
+   */
+  ads_scope_denied_seen_at?: unknown;
 }
 
 /**
