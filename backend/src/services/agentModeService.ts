@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
-import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, createHmac, randomUUID } from 'crypto';
@@ -12,9 +12,18 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
+import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import {
+  evaluateTurnTimeBudget,
+  buildTurnTimeBudgetNudge,
+  TURN_TIME_BUDGET_FALLBACK_CONTENT,
+} from '../utils/turnTimeBudget';
+import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -28,8 +37,13 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+// ENG-1002: the anonymized-hit rule lives in one place so the import tool and
+// the outreach-onboarding prospect preview cannot drift apart.
+import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -49,7 +63,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
+import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -91,16 +106,30 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 
+// Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
+// 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
+export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
+
 // Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
-// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed the context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+//
+// ENG-940: this MUST stay at (or below) the context-trim floor. It used to be 10_000 while the
+// trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
+// to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
+// payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
+// get_pr_digest payload (~8,981 chars) that way. Note the actual harm, since the ticket reports
+// it backwards: the model had ALREADY summarized the payload correctly while it was readable, then
+// saw only the preview a few turns later, concluded its own accurate summary must have been
+// invented, deleted the correct memory and reported the digest as unproducible. Losing the key
+// does not just hide data — it makes a run repudiate correct work it has already done.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
@@ -108,6 +137,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
+import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -151,7 +181,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 // re-exported so any importer of the old path keeps working.
 export { normalizeMetaCampaignIds };
 
-const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
 // single big tool-call argument (e.g. create_html_file's content_draft, which
@@ -163,6 +193,13 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 // output ceiling. Models only emit what they need, so raising the cap does not
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// ENG-907: sentinel resolved by `withSynthesisRetryDeadline` when a forced-synthesis backup
+// call outlives the time left. A unique symbol so it can never collide with a real response.
+const SYNTHESIS_RETRY_TIMED_OUT = Symbol('synthesis-retry-timed-out');
+// Slack left between the bounded retry and the caller's cap, so the turn still has room to
+// persist and return its partial answer after giving up on the retry.
+const SYNTHESIS_RETRY_MARGIN_MS = 5_000;
 
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
@@ -307,6 +344,7 @@ import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import type { LeadImportRowOutcome } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -840,6 +878,22 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-1174: a factual ROW total for this run's lead import, read off the persisted
+   * tool results (ENG-1133's `attempted` + `reconciliation`). Null when nothing
+   * trustworthy could be read — never a zero, because "unreadable" and "nothing
+   * landed" must not look the same to the model. This is the ONLY quantity the
+   * diagnosis agent is allowed to restate; everything else it invents is stripped.
+   */
+  importTotalsSummary?: string | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -891,6 +945,7 @@ function buildFindReason(filters: {
   const joined = parts.join('; ');
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
+
 
 /**
  * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
@@ -1103,6 +1158,16 @@ export class AgentModeService {
     } catch (error) {
       console.error('AgentMode: Error during shutdown:', error);
     }
+  }
+
+  /**
+   * ENG-1118: release the MCP clients a finished chat session owns.
+   * Browser servers pool per chat session, so this hands back that session's browser
+   * process at run end. A no-op for a session that never opened one.
+   */
+  async releaseSessionMcpClients(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    await this.mcpClientService.releaseSessionClients(sessionId);
   }
 
   /**
@@ -1668,7 +1733,21 @@ export class AgentModeService {
     );
   }
 
-  async getBackupModel(primaryModel: string): Promise<string | null> {
+  async getBackupModel(
+    primaryModel: string,
+    // undefined = preserve the admin-managed global fallback. A string or null is
+    // an explicit dispatch policy: use only that model, or do not retry at all.
+    // This distinction prevents optimized-mode requests from escaping to a premium
+    // global backup after the admission policy selected a cheaper model.
+    transientFallbackModel?: string | null,
+  ): Promise<string | null> {
+    if (transientFallbackModel !== undefined) {
+      return transientFallbackModel &&
+        transientFallbackModel !== primaryModel &&
+        Boolean(this.llmModels[transientFallbackModel])
+        ? transientFallbackModel
+        : null;
+    }
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
       const configured = setting?.settingValue?.trim();
@@ -2792,6 +2871,39 @@ export class AgentModeService {
     return knownGoodModel;
   }
 
+  /**
+   * ENG-907: bound a permitted forced-synthesis backup call to the wall-clock time that is
+   * actually left, rather than trusting the duration estimate that admitted it.
+   *
+   * The estimate is drawn from calls this run already made, and the backup is by definition
+   * a DIFFERENT model — it can be slower than anything measured. If it overruns, the
+   * controller's cap fires and rejects the whole generation, discarding the partial answer
+   * this feature exists to deliver. So stop waiting with time still on the clock and let the
+   * caller fall back to that partial answer.
+   *
+   * Resolves to `SYNTHESIS_RETRY_TIMED_OUT` instead of rejecting, so the timeout is not
+   * mistaken for a model error and misclassified. The in-flight request is left to settle on
+   * its own — there is no abort plumbing through the provider adapters, and the turn is ending
+   * regardless — but its rejection is swallowed so it cannot surface as an unhandled one.
+   * With no deadline the call is awaited unchanged.
+   */
+  private async withSynthesisRetryDeadline(call: Promise<any>, deadlineMs?: number): Promise<any> {
+    if (deadlineMs === undefined) return call;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        call,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(SYNTHESIS_RETRY_TIMED_OUT), deadlineMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      // The loser of the race is still in flight; never let it become an unhandled rejection.
+      void Promise.resolve(call).catch(() => {});
+    }
+  }
+
   async callLLM(
     model: string,
     messages: any[],
@@ -3109,23 +3221,41 @@ export class AgentModeService {
    * sessionType and emits nothing for them.
    */
   private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+    return (await this.resolveScheduledPublishAuthorization(currentSession)).authorized;
+  }
+
+  /**
+   * ENG-827: the authorization THIS TURN operates under, as a tool-scoped object.
+   *
+   * Resolved exactly like the dispatch guard — the run's admission stamp intersected
+   * with the live schedule — so the directive the model reads and the refusal it would
+   * hit at dispatch cannot disagree. Deriving them separately is what produced the
+   * prompt-orders-publish / guard-refuses-publish churn this ticket is about.
+   *
+   * An absent stamp reads as NOT authorized, matching the guard exactly: that is the
+   * ordinary state of every draft-only run, and also the state of a run whose stamp
+   * could not be written (which the runner downgrades to draft-only for this reason).
+   */
+  private async resolveScheduledPublishAuthorization(currentSession: any): Promise<SchedulePublishAuthorization> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true, tools: [] };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) {
       console.warn(
         `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
     try {
-      // resolvePublishAuthorized returns false for a null/deleted schedule too.
-      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+      // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
+      // schedule too, so a vanished record withholds rather than publishes.
+      const live = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleId));
+      return narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
         error
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
   }
 
@@ -3173,8 +3303,24 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false,
-    persistIncrementally: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
+    persistIncrementally: boolean = false,
+    // ENG-907: epoch ms at which the CALLER started this turn's wall-clock cap
+    // (the controller stamps it right before it hands the promise to
+    // withGenerationTimeout). Optional — callers without a cap omit it.
+    turnStartMs?: number,
+    // ENG-827 (Greptile): publish authorization the caller already resolved. Supplied
+    // by the scheduled path so the system prompt is built from the SAME value the
+    // required-function checker holds; absent on the interactive path, which resolves
+    // per turn below.
+    publishAuthorizationOverride?: SchedulePublishAuthorization,
+    // Cost-policy-owned retry target. undefined preserves the global admin backup;
+    // null explicitly disables retry. Optimized callers always send string|null.
+    transientFallbackModel?: string | null,
+    // ENG-936: approved source URLs for image revisions. When provided, the
+    // preflight gate rejects confirm=true `generate_image` calls that attempt to
+    // edit an unapproved source URL.
+    approvedRevisionImageSources?: string[],
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3276,7 +3422,19 @@ export class AgentModeService {
       // text. This is the UNATTENDED run path, so it always passes a resolved
       // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
       // deliberately passes nothing (see the tri-state note on the override).
-      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
+      // and the publish directive appended after the conversation, so a single read
+      // backs every statement the model sees about publishing.
+      // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
+      // can straddle a revocation, and the disagreement that bites is a prompt saying
+      // "draft only" while the checker still requires a publishing tool — the agent is
+      // then told not to publish and marked incomplete for not publishing, which is the
+      // retry loop this ticket is about. Using one value makes that unrepresentable.
+      // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
+      // turn message, and the publish sinks re-read live consent at the write itself.
+      const publishAuthorization =
+        publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
+      const publishAuthorized = publishAuthorization.authorized;
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
@@ -3389,6 +3547,27 @@ export class AgentModeService {
       }
 
       messages.push(...marketingMessages);
+
+      // ENG-827: the unattended publish directive goes LAST, after the conversation.
+      //
+      // It used to be appended to the system prompt the controller stores as the
+      // session's first message — which `buildMarketingContext` slices off (startIdx=1),
+      // so the model never read it at all. Position then turned out to matter on its own:
+      // on the preview, an authorized run whose base system prompt already carried an
+      // equivalent block still opened with "Should I post this?" and only published after
+      // three checker nudges. Buried ~70k characters up, the instruction lost to the
+      // publishing tools' own "get explicit approval first" text. Placed here it is the
+      // last thing before the model answers, and it is the same authorization object the
+      // dispatch guard enforces.
+      if (currentSession?.sessionType === 'scheduled') {
+        const publishDirective = getUnattendedExecutionDirective(
+          'scheduled',
+          isAdmin,
+          publishAuthorization.authorized ? 'authorized' : 'withheld',
+          publishAuthorization.tools
+        );
+        if (publishDirective) messages.push({ role: 'system', content: publishDirective });
+      }
 
       // Cross-message loop detection: when the user repeats the same message multiple times
       // without providing requested information, stop asking and use available context tools.
@@ -3554,6 +3733,57 @@ export class AgentModeService {
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
       const mediaCallKeysThisRun = new Map<string, string>();
 
+      // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
+      // A broad research turn can stay far under `maxIterations` and still burn the whole
+      // 10-minute controller cap issuing discovery calls; when the cap fires the run is
+      // force-rejected and every bit of text it produced is discarded (the user gets a bare
+      // "please try again" after real spend). We track the same deadline here so the loop
+      // can wrap itself up: nudge to stop new discovery at 70% of the budget, then stop
+      // honouring tool calls and force one final synthesis turn while there is still time
+      // to deliver.
+      // Unlike `generationHardCapMs` above this is NOT tied to the media switch — but it is
+      // strictly scoped to callers that actually impose a deadline. Set
+      // AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable it everywhere.
+      //
+      // The deadline belongs to the CALLER, and `turnStartMs` is the ONLY evidence that one
+      // exists. `withGenerationTimeout` wraps exactly two call sites — the interactive
+      // generate endpoint and the ishare endpoint — and both stamp `turnStartMs` right
+      // before arming it. Every other caller (scheduled runs, Slack, GTM plan, admin
+      // replay, email, benchmarks) invokes this loop with NO wall-clock cap whatsoever.
+      // Defaulting those to `Date.now() + generationTimeoutMs` would invent a 10-minute
+      // ceiling that production does not have and truncate work that completes today:
+      // session bd733cb4 (the 5/5/5 LinkedIn queue run ENG-907's own report holds up as
+      // the pattern to copy) spent 683s on a single scheduled turn and would have been
+      // forced into synthesis at ~520s, losing the knowledge-base write that WAS the
+      // deliverable. So: no caller stamp, no budget — behave exactly as before.
+      //
+      // When we do have a stamp, anchor on it rather than on a local Date.now(): the
+      // session and message reads, the title LLM call, the fork IPC hop and the memory
+      // embedding backfill all run before control reaches here, and anchoring locally
+      // would put our cap later than the one actually enforced and silently spend that
+      // setup latency out of the synthesis reserve. Clamped, so a skewed/future stamp
+      // cannot extend the budget past now.
+      const callerDeadlineStamped =
+        Number.isFinite(turnStartMs as number) && (turnStartMs as number) > 0;
+      const turnStartedAtMs = callerDeadlineStamped
+        ? Math.min(turnStartMs as number, Date.now())
+        : Date.now();
+      const turnHardCapMs =
+        callerDeadlineStamped && generationTimeoutMs > 0
+          ? turnStartedAtMs + generationTimeoutMs
+          : undefined;
+      let longestLlmCallMsThisRun = 0;
+      let timeBudgetWrapUpWarned = false;
+      // Sticky: once the loop switches to synthesis it never offers tools again this turn.
+      let forceFinalSynthesis = false;
+      let truncatedByTimeBudget = false;
+      // Set when the forced synthesis call failed with no room left to retry it — the loop
+      // then stops instead of starting a second full call it cannot afford (see below).
+      let synthesisRetryUnaffordable = false;
+      // Hard wall-clock bound for a permitted forced-synthesis retry, so a slower-than-
+      // predicted backup model still cannot run the turn past the caller's cap.
+      let synthesisRetryDeadlineMs: number | undefined;
+
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
@@ -3579,6 +3809,23 @@ export class AgentModeService {
       // after tool calls when the context is large; a single nudge is enough to recover)
       let emptySynthesisRetries = 0;
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
+
+      // ENG-1054: set true once a turn's whole answer was discarded as serialization
+      // residue (e.g. "}]"). It survives the retry so that, if the retry ALSO fails to
+      // synthesize, the loop reports the executed-action ledger instead of ending on a
+      // blank reply — turning one silent-output bug into another would be no fix.
+      let synthesisResidueDropped = false;
+
+      // ENG-1054 kill switch — ON by default; set AGENT_SYNTHESIS_RESIDUE_GUARD=false
+      // to disable the guard and its recap.
+      //
+      // This guard DISCARDS model output it judges unusable, and its failure mode is
+      // silent: a false positive costs the user their answer and only shows up as a
+      // log line, never as an error. Merging here deploys straight to production, so
+      // there needs to be a way to stand it down from config rather than waiting on a
+      // revert — matching how AGENT_FINALIZE_GUARD gates the other output-rewriting
+      // seam. Off restores the exact pre-ENG-1054 behaviour.
+      const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
 
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
@@ -3609,6 +3856,36 @@ export class AgentModeService {
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
           (messages as any[]).push({ role: 'user', content: urgency });
+        }
+
+        // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
+        // exempt from the synthesis switch — with no work done yet there is nothing to
+        // synthesize, and the run should fail loudly rather than emit an empty "partial".
+        if (turnHardCapMs !== undefined && !forceFinalSynthesis) {
+          const timeBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: longestLlmCallMsThisRun,
+          });
+          if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: whole-turn time budget nearly exhausted for session ${sessionId} ` +
+              `(${Math.round(timeBudget.elapsedMs / 1000)}s used, ${Math.round(timeBudget.remainingMs / 1000)}s left) — ` +
+              'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
+            });
+          } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
+            timeBudgetWrapUpWarned = true;
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
+            });
+          }
         }
 
         // 4. Refresh Context if Skills Changed
@@ -3782,6 +4059,17 @@ export class AgentModeService {
         });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
+            // ENG-907: the forced synthesis turn keeps offering the SAME tool list. It is
+            // tempting to withhold it so the model physically cannot start more work, but
+            // that breaks the request: by this point the history is full of tool_use /
+            // tool_result blocks, and both providers we run Claude on reject a request that
+            // replays them with no tool list — Bedrock Converse fails the whole call with
+            // "The toolConfig field must be defined when using toolUse and toolResult
+            // content blocks". That would turn the partial delivery this feature exists to
+            // produce into a hard error, on exactly the model ENG-907 was reported against
+            // (anthropic.claude-opus-5). Tools stay on the wire; the loop instead DISCARDS
+            // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
+            // no further work can start either way and the model is told as much.
             tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
@@ -3791,8 +4079,60 @@ export class AgentModeService {
             humanPaced: humanPacedTurn
           });
         } catch (callError) {
-          if (isTransientLLMError(callError) && !backupModelUsed) {
-            const backup = await this.getBackupModel(llmModel);
+          // ENG-907: the backup-model retry below issues a SECOND full call of the same
+          // size. During the forced synthesis the only time left is the reserve held for
+          // that one call, so starting a retry it cannot afford runs the turn past the
+          // controller's cap — and the cap discards the answer, which is the failure this
+          // whole change exists to prevent. The attempt that just failed is the best
+          // available estimate of what the retry would cost, so require at least that much
+          // still on the clock. When there is not enough, end the turn here and deliver
+          // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
+          // one) rather than throwing the turn away.
+          //
+          // Scoped tightly to the retry that would otherwise have run: the SAME
+          // `isTransientLLMError(...) && !backupModelUsed` condition guards it. A
+          // non-transient failure (context limit, content policy, malformed request) has no
+          // retry to skip, and reporting one as "I hit the time limit — reply continue"
+          // would be a lie that walks the user straight back into the same error. Those
+          // keep propagating through their existing classification path untouched, as does
+          // any transient failure outside the forced synthesis.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError) && !backupModelUsed) {
+            const retryBudget = evaluateTurnTimeBudget({
+              startedAtMs: turnStartedAtMs,
+              hardCapMs: turnHardCapMs,
+              longestLlmCallMs: longestLlmCallMsThisRun,
+            });
+            // What the retry will cost is a FULL call, so size it against the slowest full
+            // call this run actually made — not against the attempt that just failed. A
+            // primary that fails fast (an immediate 429, a dropped socket) burns almost no
+            // clock, so comparing to it alone waves through a backup that is slower than the
+            // time left and crosses the cap anyway, discarding the very partial answer this
+            // guard protects. Take whichever estimate is larger.
+            const failedCallMs = Date.now() - llmStart;
+            const estimatedRetryMs = Math.max(failedCallMs, longestLlmCallMsThisRun);
+            if (retryBudget.remainingMs <= estimatedRetryMs) {
+              console.warn(
+                `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
+                `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
+                `${Math.round(failedCallMs / 1000)}s; a full call has taken up to ` +
+                `${Math.round(longestLlmCallMsThisRun / 1000)}s this run) — not starting a retry that ` +
+                'would run past the turn cap; delivering the work gathered so far'
+              );
+              recordSpanError(chatSpan, callError);
+              synthesisRetryUnaffordable = true;
+            } else {
+              // The estimate says a retry fits — but an estimate is not a guarantee. The
+              // backup can be a different, slower model than anything measured this run, so
+              // arm a hard bound too: whatever the retry does, this turn stops waiting on it
+              // with time still on the clock and delivers the partial answer. Without it the
+              // original ENG-907 loss stays reachable through the retry.
+              synthesisRetryDeadlineMs = Math.max(1, retryBudget.remainingMs - SYNTHESIS_RETRY_MARGIN_MS);
+            }
+          }
+          if (synthesisRetryUnaffordable) {
+            // handled above — fall through to the break after the span is closed
+          } else if (isTransientLLMError(callError) && !backupModelUsed) {
+            const backup = await this.getBackupModel(llmModel, transientFallbackModel);
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
               if (onProgress) {
@@ -3805,7 +4145,7 @@ export class AgentModeService {
               }
               llmModel = backup;
               backupModelUsed = true;
-              response = await this.callLLM(llmModel, trimmedMessages, {
+              response = await this.withSynthesisRetryDeadline(this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
@@ -3813,7 +4153,17 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
-              });
+              }), synthesisRetryDeadlineMs);
+              if (response === SYNTHESIS_RETRY_TIMED_OUT) {
+                console.warn(
+                  `AgentMode: backup model "${llmModel}" did not answer within the ${synthesisRetryDeadlineMs}ms ` +
+                  `left for the forced synthesis in session ${sessionId} — delivering the work gathered so far ` +
+                  'rather than letting the turn cap discard it'
+                );
+                recordSpanError(chatSpan, callError);
+                response = undefined;
+                synthesisRetryUnaffordable = true;
+              }
             } else {
               recordSpanError(chatSpan, callError);
               throw callError;
@@ -3825,7 +4175,21 @@ export class AgentModeService {
         } finally {
           endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
+        // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
+        // loop instead of raising — the caller is milliseconds from its cap, and an
+        // exception here loses everything. `content` at this point can only hold an earlier
+        // tool-calling turn's progress narration ("Scanned batch 9."), never an answer, so
+        // returning it would hand the user stale narration as the deliverable (the ENG-1054
+        // hazard). Say plainly that the time ran out and point at the work in the steps
+        // above, which is what the user can actually act on.
+        if (synthesisRetryUnaffordable) {
+          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          break;
+        }
         const llmDurationMs = Date.now() - llmStart;
+        // ENG-907: size the synthesis reserve off the slowest call actually observed —
+        // a fixed 90s is not enough headroom on a model that takes minutes per turn.
+        if (llmDurationMs > longestLlmCallMsThisRun) longestLlmCallMsThisRun = llmDurationMs;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
@@ -3869,6 +4233,30 @@ export class AgentModeService {
         } else if (responseMessage.content && typeof responseMessage.content === 'object') {
           responseContent = (responseMessage.content as any).text || '';
         }
+
+        // ENG-1054: a turn whose entire text is serialization residue (observed in
+        // production as a closing message of literally "}]") is a FAILED synthesis,
+        // not an answer. Left alone it is non-empty, so the termination ladder below
+        // accepts it as the final response and the turn's deliverables are lost.
+        // Treat it as no text at all: the bounded empty-synthesis nudge then re-asks
+        // for the summary. Blanking responseMessage.content too keeps the debris out
+        // of the persisted transcript AND out of the history sent on the retry (this
+        // runs before the message is appended to `messages` below).
+        const residueDroppedThisTurn = synthesisResidueGuardEnabled && isUnusableSynthesis(responseContent);
+        if (residueDroppedThisTurn) {
+          console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
+          synthesisResidueDropped = true;
+          responseContent = '';
+          responseMessage.content = '';
+        }
+
+        // ENG-1054: did THIS turn produce usable text? `content` below is a sticky
+        // cross-turn accumulator — any earlier turn that narrated alongside its tool
+        // calls (the common case, and the shape of the production session) leaves it
+        // non-empty for the rest of the run. So it cannot answer "did the turn we are
+        // about to terminate on actually answer?", and gating the ENG-1054 remedies on
+        // it would silently disarm both. They gate on this per-turn flag instead.
+        const turnHadUsableText = responseContent.trim().length > 0;
 
         // Update content with LLM's response
         if (responseContent) {
@@ -3925,6 +4313,21 @@ export class AgentModeService {
           delete responseMessage.tool_calls;
         }
 
+        // ENG-907: the wall-clock budget is exhausted, so this turn is the last one that
+        // can still deliver anything. Tools had to stay on the wire (see the callLLM call
+        // above), so enforce the "no more work" half here: drop any calls the model made
+        // instead of executing them, and let the turn fall through to the terminal path
+        // with whatever text it wrote. Same reference-delete as the truncation drop above —
+        // responseMessage is already in `messages`, so this also clears the dangling
+        // tool_use that an empty-synthesis retry would otherwise replay unanswered.
+        if (forceFinalSynthesis && responseMessage.tool_calls?.length) {
+          console.warn(
+            `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
+            `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
+          );
+          delete responseMessage.tool_calls;
+        }
+
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
@@ -3937,7 +4340,17 @@ export class AgentModeService {
           const termination = computeTermination({
             finishReason,
             stopReason,
-            content,
+            // ENG-1054: present THIS turn's (already-blanked) text when the turn's
+            // whole answer was residue. Passing the sticky accumulator would make a
+            // residue-only final turn look answered — the ladder would return
+            // final_response and the bounded synthesis retry would never fire.
+            content: residueDroppedThisTurn ? '' : content,
+            // ENG-946: the empty-synthesis decision keys off THIS turn's text, not the
+            // accumulator — `content` is replace-on-nonempty, so a mid-run narration
+            // survived into an empty final turn and suppressed the nudge. This
+            // generalises the ENG-1054 line above, which only unsticks `content` for the
+            // residue case; a terminating turn that comes back plain-empty needs it too.
+            currentTurnText: responseContent,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
@@ -3950,7 +4363,24 @@ export class AgentModeService {
             content = termination.contentIfEmpty;
           }
 
-          if (termination.reason === 'max_tokens_continuation') {
+          // ENG-907: once the forced synthesis has run, every millisecond left is inside the
+          // reserve held back for it — there is no room for another round trip. Both
+          // continuation ladders below would spend it, and if the hard cap fires mid-call the
+          // controller discards the whole turn: the exact all-or-nothing loss this change
+          // exists to remove. So end here instead and deliver what the synthesis produced. A
+          // max-tokens stop still leaves real (if clipped) text; an empty one falls through to
+          // TURN_TIME_BUDGET_FALLBACK_CONTENT below. Both beat risking a bare timeout.
+          const timeBudgetBlocksContinuation =
+            forceFinalSynthesis &&
+            (termination.reason === 'max_tokens_continuation' || termination.reason === 'empty_synthesis_retry');
+          if (timeBudgetBlocksContinuation) {
+            console.warn(
+              `AgentMode: suppressing ${termination.reason} in session ${sessionId} — the turn's time budget ` +
+              'is spent; delivering the forced synthesis output as-is rather than risking the hard cap'
+            );
+          }
+
+          if (termination.reason === 'max_tokens_continuation' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
@@ -3960,10 +4390,37 @@ export class AgentModeService {
             console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
           }
 
-          if (termination.reason === 'empty_synthesis_retry') {
+          if (termination.reason === 'empty_synthesis_retry' && !timeBudgetBlocksContinuation) {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
+          }
+
+          // ENG-1054: the loop is terminating after a synthesis that was discarded as
+          // residue, and this final turn produced no usable text either. Ending here
+          // would hand the user stale narration from an earlier turn (or a blank reply)
+          // and erase the record of the (already-applied) actions the run executed.
+          // Report that ledger instead — tool names and outcome counts only, so it can
+          // never claim a false success. Gated on the per-turn flag, not on `content`:
+          // `content` still holds any earlier turn's text and would suppress this.
+          if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            if (!turnHadUsableText) {
+              console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+              content = buildExecutedActionsFallback(toolCalls);
+            } else {
+              // The retry DID produce text. Keep it — but do not let "the model
+              // emitted characters" stand in for "the model answered". A retry that
+              // returns a fragment or drifts also satisfies that check, and the
+              // record of what executed would be lost with it. Judging the prose
+              // instead is unbounded and would risk discarding a real answer, so
+              // append the ledger rather than choosing between them.
+              const footer = buildExecutedActionsFooter(toolCalls);
+              if (footer) {
+                console.warn(`AgentMode: Synthesis recovered after residue in session ${sessionId} — appending the executed-action ledger (${toolCalls.length} tool call(s))`);
+                content = `${content}\n\n${footer}`;
+              }
+            }
+            if (responseMessage) responseMessage.content = content;
           }
 
           // Log the stop reason for debugging
@@ -4060,8 +4517,10 @@ export class AgentModeService {
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
           generationHardCapMs,
+          turnHardCapMs,
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
+          approvedRevisionImageSources,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -4234,6 +4693,13 @@ export class AgentModeService {
         }
       }
 
+      // ENG-907: same contract for the wall-clock budget. The forced synthesis turn
+      // normally writes the partial deliverable itself; if it came back empty, say the
+      // time limit was hit rather than returning nothing at all.
+      if (truncatedByTimeBudget && !content) {
+        content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+      }
+
       // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
       // the loop edge, AFTER the final message and BEFORE emit/persist.
       // Two independent flags, most-enforcing wins:
@@ -4341,8 +4807,17 @@ export class AgentModeService {
       // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
       // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
       // patch so the persisted transcript matches what the user sees.
+      // ENG-971: the INVERSION of the above — a false FAILURE report. Same shape of
+      // guard (deterministic, always-on, append-only, applied at the same seam): when
+      // the closing narrative claims the session timed out AND that the user's changes
+      // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
+      // append the true outcome so the user does not re-run a production deploy that
+      // already landed. Runs after the landing reconciler so both corrections compose.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        const reconciledContent = reconcileFalseFailureReport(
+          reconcileLandingDeploymentReport(content, toolCalls),
+          toolCalls,
+        );
         if (reconciledContent !== content) {
           content = reconciledContent;
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -4417,6 +4892,9 @@ export class AgentModeService {
         persistedResponseCount,
         ...(wasCancelled ? { cancelled: true } : {}),
         ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
+        // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
+        // because it ran out of time, so a scheduled run must continue it.
+        ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -5039,58 +5517,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
-      // is effectively enabled for this caller (plain members need
-      // enabled=true; editors and the org owner always get fanout). Any
-      // lookup failure degrades to non-org behavior.
-      let sessionUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb, orgDb } = await import('./db');
-        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
-        const sessionUser = await uDb.getUserById(userId);
-        const candidateOrgId = sessionUser?.orgId;
-        if (candidateOrgId) {
-          const org = await orgDb.getOrgById(candidateOrgId);
-          const effectivelyEnabled = isFeatureEffectivelyEnabled(
-            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
-            org,
-            'skills',
-          );
-          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
-        }
-      } catch { /* skip — org-sharing is best-effort */ }
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
-
-      if (!publishedSkills.length)
-        return { message: "No skills available in the library." };
-
       const session = await chatbotDb.getChatSession(sessionId);
-      const currentAssociated = session?.associatedSkills || [];
-      const associatedSkillIds = new Set(currentAssociated);
-
-      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
-
-      // Add admin skill for admin users (if not already installed)
-      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          if (user?.isAdmin) {
-            availableSkills.push({
-              skillId: ADMIN_SKILL_VIRTUAL_ID,
-              name: 'Admin Tools',
-              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-              toolNames: ADMIN_SKILL_TOOL_NAMES,
-              isPublished: true,
-            } as any);
-          }
-        } catch (e) {
-          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      if (!availableSkills.length)
+      const skills = await this.getSkillsForDisplay(session?.associatedSkills || [], userId);
+      if (!skills.length) return { message: "No skills available in the library." };
+      const availableSkills = skills.filter(skill => !skill.installed);
+      if (!availableSkills.length) {
         return { message: "All available skills are already installed." };
+      }
 
       return {
         message: `Found ${availableSkills.length} available skill(s).`,
@@ -5211,7 +5644,8 @@ export class AgentModeService {
     'send_email_from_sender',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
-    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // responses that were offloaded to S3 by the TOOL_RESPONSE_S3_THRESHOLD
+    // overflow mechanism (pinned to CONTEXT_TRIM_TOOL_CONTENT_LIMIT).
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
     // header but has no tool to retrieve the full content.
     'search_tool_response',
@@ -5463,25 +5897,28 @@ export class AgentModeService {
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
-    let userOrgId: string | undefined;
-    if (userId) {
-      try {
-        const { userDb: uDb } = await import('./db');
-        const u = await uDb.getUserById(userId);
-        userOrgId = u?.orgId;
-      } catch { /* skip */ }
-    }
+  private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
+    const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+    return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
+  }
+
+  public async getAuthorizedSkill(skillId: string, userId: string): Promise<Skill | undefined> {
+    return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
+  }
+
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -5533,40 +5970,10 @@ export class AgentModeService {
         return { message: "skillIds must be a non-empty array of skill IDs." };
       }
 
-      let installUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb } = await import('./db');
-        const installUser = await uDb.getUserById(userId);
-        installUserOrgId = installUser?.orgId;
-      } catch { /* skip — org-sharing is best-effort */ }
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
-        getAllowedSkills(userId)
-      ]);
-
-      const isWildcard = userAllowedSkillIds.includes("*");
-      const allowedSkillSet = new Set(userAllowedSkillIds);
-
-      // Check admin status for admin skill gating
-      let isAdmin = false;
-      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          isAdmin = user?.isAdmin === true;
-        } catch (e) {
-          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
+      const availableSkills = await this.getSkillsForDisplay([], userId);
+      const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
       const validSkillIds = skillIds.filter(id => {
-        const skill = publishedSkills.find(s => s.skillId === id);
-        const isOwnSkill = skill && skill.ownerId === userId;
-        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
+        return availableById.has(id) || (id === ADMIN_SKILL_VIRTUAL_ID && isDelegatedAccess);
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -5583,7 +5990,7 @@ export class AgentModeService {
           } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
             installedNames.push('Admin Tools');
           } else {
-            const skill = publishedSkills.find(s => s.skillId === id);
+            const skill = availableById.get(id);
             if (skill) installedNames.push(skill.name);
           }
         });
@@ -5829,6 +6236,22 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1133: keep the import ledger out of the default "store {}" fallback.
+    // The turn that truncates is the turn that cannot report — the resume has to
+    // happen on the NEXT turn, which reads this stored result. Reduced to {} it
+    // had nothing to resume from, which is how a 97-row import that stopped at
+    // 75 ended in "please retry the request". The bulky `importedIdentifiers`
+    // echo is dropped (the model already saw it in the tool message); only the
+    // counts and the rows still owed are kept.
+    if (toolName === 'add_leads_to_list') {
+      const keep = ['success', 'complete', 'resumable', 'attempted', 'reconciliation', 'unimportedRows', 'unimportedRowsTruncated', 'unimportedRowRanges'];
+      const minimal: Record<string, any> = {};
+      for (const field of keep) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
@@ -5872,7 +6295,12 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         imageUrl: actualResult.imageUrl,
-        filename: actualResult.filename
+        filename: actualResult.filename,
+        // ENG-936: an image EDIT parks on the human-in-the-loop confirmation gate and
+        // returns success:true with no imageUrl. Dropping this flag made that state
+        // indistinguishable from a broken generation downstream (the auto-revision
+        // path reported it as "failed to extract asset URL").
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
       };
     }
 
@@ -6514,16 +6942,27 @@ export class AgentModeService {
           }
         };
       case 'add_leads_to_list':
-        const mockNewCount = Math.floor((args.leads?.length || 0) * 0.7);
-        const mockMergedCount = (args.leads?.length || 0) - mockNewCount;
+        // Mirrors the real result contract (ENG-1133): `attempted` +
+        // `reconciliation`, no legacy scalars beside them. A mock that answers
+        // in a shape the tool no longer returns teaches mockMode callers to read
+        // fields that will be missing in production.
+        const mockAttempted = args.leads?.length || 0;
+        const mockNewCount = Math.floor(mockAttempted * 0.7);
+        const mockMergedCount = mockAttempted - mockNewCount;
         return {
           success: true,
+          complete: true,
           message: `Successfully processed: ${mockNewCount} new lead(s) created, ${mockMergedCount} lead(s) merged.`,
-          successCount: args.leads?.length || 0,
-          newCount: mockNewCount,
-          mergedCount: mockMergedCount,
-          errorCount: 0,
-          errors: []
+          attempted: mockAttempted,
+          reconciliation: {
+            created: mockNewCount,
+            merged: mockMergedCount,
+            alreadyPresent: 0,
+            duplicateInRequest: 0,
+            anonymizedSkipped: 0,
+            failed: 0,
+            unprocessed: 0,
+          },
         };
       case 'create_gtm_plan':
         const mockPhases = args.phases || [
@@ -7152,6 +7591,7 @@ export class AgentModeService {
     isDelegatedAccess?: boolean;
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
+    turnHardCapMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
@@ -7166,6 +7606,9 @@ export class AgentModeService {
     // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
     // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
     if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
+    // The turn's real wall-clock cap (ENG-907), for tools that must return their result
+    // before the turn is killed rather than be guillotined mid-write (ENG-1133).
+    if (input.turnHardCapMs != null) toolOptions.turnHardCapMs = input.turnHardCapMs;
 
     return this.executeTool(
       input.llmModel,
@@ -8837,12 +9280,15 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // If user belongs to an org, read from org data instead — falling back to
+      // the org owner's record when the org was created without copying the
+      // profile over, so Emma sees the same brand the settings page shows a
+      // member of an un-copied org (ENG-927).
       let brand = user.brandGuidelines;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.brandGuidelines) {
-          brand = org.brandGuidelines;
+        if (org) {
+          brand = await resolveOrgProfileField(user, org, 'brandGuidelines');
         }
       }
       if (!brand) {
@@ -8993,12 +9439,13 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // Same owner-record fallback as the brand read: an un-copied org must not
+      // hide the owner's strategy from a member (ENG-927).
       let marketStrategy = user.marketStrategy;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.marketStrategy) {
-          marketStrategy = org.marketStrategy;
+        if (org) {
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
         }
       }
       if (!marketStrategy) {
@@ -9128,7 +9575,9 @@ export class AgentModeService {
             error: 'Permission denied'
           };
         }
-        existingMarketStrategy = org?.marketStrategy;
+        // Same owner-record fallback as the brand path — merging onto an
+        // unpopulated org record would drop the owner's competitors/ICPs.
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy', { forWrite: true });
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -10389,7 +10838,16 @@ export class AgentModeService {
     }
   }
 
-  public async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+  public async addLeadsToList(
+    listId: string,
+    leads: any[],
+    userId: string,
+    // The turn's real wall-clock cap (epoch ms), threaded in by the dispatcher.
+    // The import budget is clamped to it so the write loop cannot outlive the
+    // turn and lose the ledger (ENG-1133). Undefined when the caller imposes no
+    // cap at all, in which case the flat budget stands.
+    options: { turnDeadlineMs?: number } = {},
+  ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
 
@@ -10403,12 +10861,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessAddLeads = await canDestructiveCrmList(userId, list);
       if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to add leads to this list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -10440,28 +10899,166 @@ export class AgentModeService {
         return formatted;
       });
 
-      const result = await crmDb.batchCreateLeads(listId, formattedLeads);
+      const { leadImportWriteBudgetMs } = await import('../utils/leadImportLedger');
+      const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        // A file the user may re-send after a truncated run: dedupe the rows
+        // that carry no identity of their own, or every retry duplicates them.
+        dedupeByNameCompany: true,
+        // Come back with a resumable partial rather than being guillotined by
+        // the whole-turn cap with nothing to report (ENG-1133). Clamped to the
+        // run's remaining budget: a full-length budget started late in a turn
+        // would outlive the turn and lose the ledger it exists to produce.
+        deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
+      });
+
+      // ENG-1133: report the import row by row, not just in aggregate. A large
+      // import can be cut off mid-way (the whole-turn cap fires between calls),
+      // and "25 new lead(s) created" tells the next turn nothing about WHICH
+      // rows landed — so the only offer left was "retry the whole request".
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, capLeadResumeRows, summarizeLeadRowNumbers } = await import('../utils/leadImportLedger');
+      const attempted = leads.length;
+      const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
+      const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
+      const reconciliation = {
+        created: tally('created'),
+        merged: tally('merged'),
+        alreadyPresent: tally('already_present'),
+        duplicateInRequest: tally('duplicate_in_request'),
+        anonymizedSkipped: tally('anonymized_skipped'),
+        failed: tally('failed'),
+        unprocessed: tally('unprocessed'),
+      };
+
+      // Rows can only be NAMED when the ledger is in input order. Without it the
+      // counts still reconcile, but pointing at a specific row would be a guess.
+      const importedIdentifiers: string[] = [];
+      const unimportedRows: Array<{ row: number; identifier: string; reason: LeadImportRowOutcome }> = [];
+      if (rowAligned) {
+        outcomes.forEach((outcome, index) => {
+          const identifier = describeLeadRow(leads[index], index);
+          if (outcome === 'created' || outcome === 'merged' || outcome === 'already_present') {
+            importedIdentifiers.push(identifier);
+          } else if (outcome === 'failed' || outcome === 'unprocessed') {
+            unimportedRows.push({ row: index + 1, identifier, reason: outcome });
+          }
+        });
+      }
+
+      const landed = reconciliation.created + reconciliation.merged + reconciliation.alreadyPresent;
+      const missing = reconciliation.failed + reconciliation.unprocessed;
+      const complete = attempted > 0 && missing === 0;
 
       const messageParts: string[] = [];
-      if (result.newCount > 0) {
-        messageParts.push(`${result.newCount} new lead(s) created`);
+      if (reconciliation.created > 0) {
+        messageParts.push(`${reconciliation.created} new lead(s) created`);
       }
-      if (result.mergedCount > 0) {
-        messageParts.push(`${result.mergedCount} lead(s) merged`);
+      if (reconciliation.merged > 0) {
+        messageParts.push(`${reconciliation.merged} lead(s) merged`);
       }
-      if (result.errorCount > 0) {
-        messageParts.push(`${result.errorCount} lead(s) failed`);
+      // A row already in the list, unchanged, is a completed row — saying so is
+      // what makes re-sending a partially-imported file readable as progress
+      // instead of as a failed import.
+      if (reconciliation.alreadyPresent > 0) {
+        messageParts.push(`${reconciliation.alreadyPresent} lead(s) already present and up to date`);
+      }
+      if (reconciliation.duplicateInRequest > 0) {
+        messageParts.push(`${reconciliation.duplicateInRequest} duplicate row(s) in the request skipped`);
+      }
+      // ENG-1002 (follow-up): say so when rows were refused as anonymized
+      // placeholders, so the agent cannot report a clean import that silently
+      // wrote fewer records than the caller handed over.
+      if (reconciliation.anonymizedSkipped > 0) {
+        messageParts.push(`${reconciliation.anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
+      if (reconciliation.failed > 0) {
+        messageParts.push(`${reconciliation.failed} lead(s) failed`);
+      }
+      if (reconciliation.unprocessed > 0) {
+        messageParts.push(`${reconciliation.unprocessed} lead(s) never processed`);
       }
 
+      const summary = messageParts.length > 0
+        ? `Successfully processed: ${messageParts.join(', ')}.`
+        : 'No leads were processed.';
+      // The resume list is budgeted by size, so every realistic partial names
+      // every missing row. If a pathological one is still trimmed, saying so is
+      // not optional: naming a slice is not a resume — the agent imports it,
+      // gets a clean `complete: true` for that call and reports the import
+      // finished, stranding the rest. `unimportedRowRanges` is the backstop that
+      // is never trimmed: every missing position in the rows just sent, run
+      // length encoded.
+      const unimportedRowRanges = summarizeLeadRowNumbers(unimportedRows.map(r => r.row));
+      const resume = unimportedRows.length > 0
+        ? capLeadResumeRows('unimportedRows', unimportedRows)
+        : {};
+      const resumeShown = (resume.unimportedRows || []).length;
+      const resumeTruncated = resumeShown > 0 && resumeShown < unimportedRows.length
+        ? `unimportedRows details only the FIRST ${resumeShown} of ${unimportedRows.length} missing rows, `
+          + `but unimportedRowRanges (${unimportedRowRanges}) lists EVERY missing position in the rows you just sent — resend all of them. `
+          + `The import is not done until a result comes back with complete: true. `
+        : '';
+      // The list itself could not be read inside the budget, so nothing was
+      // attempted. Resending the same rows would hit the same wall, so this is
+      // a blocker to report — not the resume path every other partial takes.
+      const dedupeIncomplete = (result as any).dedupeIncomplete === true;
+      // A partial is worth resuming only while rows remain that were never
+      // attempted: re-sending those makes progress. If nothing landed and every
+      // row was attempted, they all failed on write — resending the same rows
+      // would fail the same way, so that is a plain failure with no resume
+      // offer, not a resume the agent will loop on.
+      const resumable = !complete && attempted > 0 && !dedupeIncomplete
+        && (landed > 0 || reconciliation.unprocessed > 0);
+      const message = dedupeIncomplete
+        ? `Import not attempted: this list has more existing leads than can be read within the import budget, `
+          + `and importing without reading them first would duplicate rows already in the list. `
+          + `No rows were written. Do NOT retry the same call — tell the user the list is too large to import into and needs splitting or a smaller list.`
+        : attempted === 0
+        ? 'No leads were processed.'
+        : complete
+          ? summary
+          : !resumable
+          ? `Import failed: none of the ${attempted} row(s) could be written. ${summary} `
+            + `Every row was attempted, so re-sending them would fail the same way — `
+            + `report the errors to the user instead of retrying.`
+          : `Partial import: ${landed} of ${attempted} row(s) are in the list. ${summary} `
+            + `RESUME by calling add_leads_to_list again with ONLY the ${unimportedRows.length > 0 ? 'rows listed in unimportedRows' : 'rows that did not import'} — `
+            + `do not ask the user to retry the request. ${resumeTruncated}`
+            + `Re-sending an already-imported row is safe (it merges instead of duplicating).`;
+
       return {
-        success: result.successCount > 0,
-        message: messageParts.length > 0
-          ? `Successfully processed: ${messageParts.join(', ')}.`
-          : 'No leads were processed.',
-        successCount: result.successCount,
-        newCount: result.newCount || 0,
-        mergedCount: result.mergedCount || 0,
-        errorCount: result.errorCount,
+        // An incomplete import is NOT a tool failure, and must not be reported
+        // as one. `success: false` is read at the dispatch boundary
+        // (toolResultError → executePreparedTools) and downgrades the whole call
+        // to a structured tool error: the model is then handed the message
+        // string ALONE — `unimportedRows` and `reconciliation` never reach it —
+        // the call is billed to failedFunctions, the CRM refresh is skipped, and
+        // the appended retryability verdict tells the agent "do NOT retry […]
+        // report the blocker to the user". That is precisely the whole-request
+        // hand-off this ticket exists to remove. So failure is reserved for a
+        // call that landed NOTHING AND has nothing left to resume; an import
+        // that wrote rows, or still owes rows it never reached, succeeds while
+        // carrying `complete: false` and its resume list. Success has to follow
+        // the resume offer exactly — `success: false` beside `resumable: true`
+        // would strip the resume list and tell the agent to stop, which is the
+        // contradiction this ticket removes.
+        success: complete || landed > 0 || resumable,
+        complete,
+        ...(resumable ? { resumable: true } : {}),
+        message,
+        attempted,
+        // `reconciliation` is the ONLY set of counts on the wire. The legacy
+        // scalars used to sit beside it and disagree with it: the DB layer's
+        // `errorCount` tallies in-request duplicates together with genuine
+        // write failures, so a clean import of a file containing one repeated
+        // row reported `errorCount: 1` next to `failed: 0`, and a model reading
+        // the payload could truthfully say a lead had failed when none had.
+        // Two counts of the same thing is exactly the "numbers don't add up"
+        // the ticket is about, so there is now one (ENG-1133).
+        reconciliation,
+        ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
+        ...(unimportedRows.length > 0
+          ? { ...resume, unimportedRowRanges }
+          : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {
@@ -10757,21 +11354,25 @@ export class AgentModeService {
       }
 
       // Resolve and access-check each list. In single-list mode an inaccessible
-      // list_id is a hard error; in multi-list mode we silently skip so the
-      // caller still gets results from the lists they CAN see.
+      // list_id is a hard error; in multi-list mode we skip and record the list ID
+      // in skipped_list_ids so callers can distinguish a permission skip from an
+      // empty result.
       type ListEntry = { listId: string; list: any } | null;
       const lists: ListEntry[] = [];
+      const skippedListIds: string[] = [];
       for (let i = 0; i < cursorListIds.length; i++) {
         const id = cursorListIds[i];
         const list = await crmDb.getLeadListById(id);
         if (!list) {
           if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
         const access = await crmDb.canOrgMemberAccessList(userId, list);
         if (!access) {
           if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
@@ -10875,6 +11476,7 @@ export class AgentModeService {
         ...(isMultiList ? {
           listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
             .map((e) => ({ listId: e.listId, listName: e.list.name })),
+          skipped_list_ids: skippedListIds,
         } : {}),
         has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
@@ -11239,9 +11841,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11347,9 +11950,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const now = new Date().toISOString();
@@ -11410,9 +12014,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!leadIds || leadIds.length === 0) {
@@ -11460,9 +12065,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!filters || filters.length === 0) {
@@ -11633,9 +12239,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Filter out undefined values
@@ -11693,9 +12300,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessUpdateStatus = await canDestructiveCrmList(userId, list);
       if (!hasAccessUpdateStatus) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Fetch current lead
@@ -11788,9 +12396,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Validate statusConfig entries
@@ -11832,9 +12441,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const listName = list.name;
@@ -11923,9 +12533,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11960,9 +12571,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessSend = await canDestructiveCrmList(userId, list);
       if (!hasAccessSend) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -12446,12 +13058,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to access this lead list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -12874,7 +13487,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             error: 'Permission denied'
           };
         }
-        existingBrand = org?.brandGuidelines;
+        // Fall back to the org owner's record when the org record was never
+        // populated, so a tweak merges onto the existing brand instead of
+        // building a fresh empty structure over it (ENG-927).
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines', { forWrite: true });
       } else {
         existingBrand = user.brandGuidelines;
       }
@@ -13111,7 +13727,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     if (user?.orgId) {
       const { orgDb } = await import('./db');
       const org = await orgDb.getOrgById(user.orgId);
-      if (org && org.marketStrategy) return org.marketStrategy;
+      // Owner-record fallback for an org that was never populated (ENG-927), so
+      // the re-setup offer and the regenerate flow count what the user actually
+      // has rather than offering to build a strategy that already exists.
+      if (org) return resolveOrgProfileField(user, org, 'marketStrategy');
     }
     return user?.marketStrategy;
   }
@@ -14442,7 +15061,25 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      //
+      // ENG-1133: the ledger's numbers are INVOCATION counts, and unlabelled they
+      // read as a quantity of things. Handed {"add_leads_to_list":3} for a run that
+      // wrote 75 leads over three calls, this agent told the customer "I have
+      // successfully added the 3 leads to your CRM list" — the tool ran 3 times.
+      // The unit has to be on the wire, because the agent never sees tool RESULTS.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.
+- The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14454,8 +15091,20 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       } else {
         parts.push('No work plan.');
       }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+      }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
-        parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
+        parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
+      }
+      // ENG-1174: the one place a real quantity is available. Read from this run's own
+      // tool results, so unlike the run-count ledgers above it may be quoted verbatim.
+      if (context.importTotalsSummary) {
+        parts.push(
+          `${context.importTotalsSummary}\n`
+          + 'These row numbers are measured, not inferred — you MAY state them exactly as given. '
+          + 'Do not round them, add to them, or derive any other quantity from them.',
+        );
       }
 
       const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
@@ -15739,15 +16388,133 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Write-then-verify read-back for the campaign spend cap (ENG-1018) — the same shape of
+   * check AD UPDATE already does after a creative swap. spend_cap is the campaign's hard
+   * money stop, so the write response is never trusted on its own: the campaign is re-read
+   * and the applied value compared against what was requested.
+   *
+   * TWO outcomes, because that is all a read-back can honestly support: CONFIRMED (a read
+   * came back equal to what we asked for — proof the cap is on the campaign) and UNCONFIRMED
+   * (everything else). A read-back can prove a cap IS set; it cannot prove one is NOT.
+   *
+   * That asymmetry is not theoretical. Live against the test ad account, an UPDATE to 300000
+   * returned success and then read back with NO spend_cap AT ALL for more than six seconds —
+   * through three retries and an independent raw Graph GET — before settling on the correct
+   * 300000. Timed separately, the same write converged in under a second. So Meta can serve a
+   * transiently field-less view of a campaign it has already updated, and code that treats an
+   * absent read as "the cap was NOT applied" will tell users their money stop is missing when
+   * it is not, and send them to re-apply a cap they already have.
+   *
+   * Retrying narrows that window (the write is never re-sent, only the read), but cannot
+   * close it — so a persistent negative is reported as "could not confirm", never as "not
+   * applied". Unconfirmed is still loud: the caller is told not to claim the cap is in place.
+   */
+  private static readonly SPEND_CAP_VERIFY_ATTEMPTS = 4;
+  private static readonly SPEND_CAP_VERIFY_BACKOFF_MS = 3000;
+
+  private async verifyCampaignSpendCap(
+    accountId: string,
+    accessToken: string,
+    campaignId: string | undefined,
+    requestedSpendCap: number
+  ): Promise<{ verified: boolean; readFailed: boolean; applied?: number; detail: string; attempts: number }> {
+    if (!campaignId) {
+      return { verified: false, readFailed: true, detail: 'Meta returned no campaign id to read back', attempts: 0 };
+    }
+
+    let last: { verified: boolean; readFailed: boolean; applied?: number; detail: string } = {
+      verified: false, readFailed: true, detail: 'not read',
+    };
+
+    for (let attempt = 1; attempt <= AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const fresh: any = await metaService.getCampaign(accountId, accessToken, campaignId);
+        const raw = fresh?.spend_cap;
+        // Graph returns numeric fields as strings; an absent cap means there is no cap at all.
+        const applied = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
+        if (applied !== undefined && Number.isFinite(applied) && applied === Number(requestedSpendCap)) {
+          return { verified: true, readFailed: false, applied, detail: `spend cap is ${applied}`, attempts: attempt };
+        }
+        last = {
+          verified: false,
+          readFailed: false,
+          applied,
+          detail: applied === undefined
+            ? 'the campaign has NO spend cap set'
+            : `the campaign's spend cap is ${applied}`,
+        };
+      } catch (error: any) {
+        last = { verified: false, readFailed: true, detail: error?.message || 'unknown error' };
+      }
+
+      if (attempt < AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS) {
+        await new Promise(resolve => setTimeout(resolve, AgentModeService.SPEND_CAP_VERIFY_BACKOFF_MS));
+      }
+    }
+
+    return { ...last, attempts: AgentModeService.SPEND_CAP_VERIFY_ATTEMPTS };
+  }
+
+  /**
+   * spend_cap is in the account currency's MINOR units, but `budget_amount` and the ad-set
+   * budgets in the SAME tool are in major units (the backend multiplies those by 100). That
+   * asymmetry is exactly how a model turns "$3,000" into a $30 cap — and our read-back would
+   * then cheerfully confirm 3000 as "verified", because the write DID land; only the meaning
+   * was wrong. Echoing the major-unit equivalent in every spend-cap message makes a 100x slip
+   * visible to the model and the user instead of hiding behind a confident number.
+   */
+  private static describeSpendCap(minorUnits: number): string {
+    const major = (Number(minorUnits) / 100).toLocaleString('en-US', {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+    return `${minorUnits} (= ${major} in the ad account's currency)`;
+  }
+
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const campaign = await metaService.createCampaign(accountId, accessToken, params);
 
-      return {
+      // metaService.createCampaign requests only `id` back from the Graph API, so the
+      // created object carries no `name` — in production this printed
+      // `Campaign "undefined" created successfully` (prod session
+      // 5ac8aeef-db88-4ccc-85ca-347b13c99542), which the agent then had to explain away
+      // to the user mid-verification. Fall back to the name that was requested.
+      const campaignName = campaign?.name || params.name;
+      const created = {
         success: true,
-        message: `Campaign "${campaign.name}" created successfully`,
+        message: `Campaign "${campaignName}" created successfully`,
         campaign: campaign
+      };
+
+      if (params.spend_cap === undefined || params.spend_cap === null) return created;
+
+      // A requested spend cap is verified independently — a create used to drop it silently
+      // and still report success, leaving the operator believing there was a money backstop
+      // when there was none (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaign?.id, params.spend_cap);
+      if (check.verified) {
+        return {
+          ...created,
+          message: `${created.message} (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      return {
+        ...created,
+        message: `⚠️ Campaign "${campaignName}" was created, but its spend cap of ` +
+          `${AgentModeService.describeSpendCap(params.spend_cap)} could NOT be confirmed after ` +
+          `${check.attempts} read-back(s) — ${check.detail}. Do NOT tell the user a spend cap is in ` +
+          `place. Meta sometimes needs a moment to reflect this field, so re-read it with CAMPAIGN ` +
+          `LIST (campaign_id=${campaign?.id} + params.fields="id,name,spend_cap"); if it is still ` +
+          `missing, apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, ` +
+          `params.spend_cap=${params.spend_cap}). Do NOT create the campaign again.`,
+        spend_cap_requested: params.spend_cap,
+        spend_cap_read: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -16023,13 +16790,76 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // The user-facing message is deliberately unchanged: that string is
       // customer-visible copy and is not this issue's to rewrite. The structured
       // fields below are what make the choice detectable.
-      return {
+      //
+      // ENG-838 AC4: `strategy` above is what this process *resolved*, never
+      // what Meta stored. Read the entity back and compare, so a write Meta
+      // reinterpreted (the Open Future Forum shape: specified parameters,
+      // platform defaults applied, run reports success) is visible instead of
+      // silent.
+      const base = {
         success: true,
         message: `Ad set "${adSet.name}" created successfully`,
         adSet: adSet,
         appliedBidStrategy: strategy,
         bidStrategyWasDefaulted: args.bid_strategy === undefined
       };
+
+      let readBack: any;
+      try {
+        readBack = await metaService.getAdSet(accessToken, adSet.id);
+      } catch (readBackError: any) {
+        // The ad set exists; reporting failure would be a different lie. But
+        // the result must not imply the settings were confirmed.
+        return {
+          ...base,
+          readBackVerified: false,
+          readBackError: readBackError?.message || String(readBackError)
+        };
+      }
+
+      const expected: Array<[string, any]> = [
+        ['bid_strategy', strategy],
+        ['bid_amount', normalizedParams.bid_amount],
+        ['daily_budget', normalizedParams.daily_budget],
+        ['lifetime_budget', normalizedParams.lifetime_budget],
+        ['start_time', normalizedParams.start_time],
+        ['end_time', normalizedParams.end_time]
+      ];
+      // Meta returns monetary fields as strings; compare stringified so
+      // 1000 and "1000" are the same value and not a fake mismatch.
+      const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      const readBackMismatches = expected
+        .filter(([, requested]) => requested !== undefined)
+        .map(([parameter, requested]) => ({
+          parameter,
+          requested: asComparable(requested),
+          applied: asComparable(readBack?.[parameter])
+        }))
+        .filter(m => m.requested !== m.applied);
+
+      if (readBackMismatches.length > 0) {
+        const detail = readBackMismatches
+          .map(m => `${m.parameter}: requested ${m.requested}, Meta applied ${m.applied}`)
+          .join('; ');
+        return {
+          ...base,
+          // The create already committed a live entity. Keep the operation
+          // successful so generic tool retry handling cannot create a
+          // duplicate ad set, while the message remains an explicit loud
+          // failure of the requested settings.
+          success: true,
+          readBackMismatch: true,
+          message:
+            `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
+            `(${detail}). It is live with settings nobody chose — review or pause it in Ads Manager.`,
+          error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
+          readBack,
+          readBackVerified: true,
+          readBackMismatches
+        };
+      }
+
+      return { ...base, readBack, readBackVerified: true, readBackMismatches };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad set:', error);
@@ -16192,16 +17022,52 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const normalizedParams = { ...params };
       if (normalizedParams.budget_amount !== undefined) {
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+
+      if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
+        return {
+          success: true,
+          message: `Campaign updated successfully`
+        };
+      }
+
+      // "Campaign updated successfully" with no way to check was the exact reported failure
+      // mode for this money-affecting field — verify the applied cap by re-reading the
+      // campaign before claiming the change took effect (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaignId, normalizedParams.spend_cap);
+      if (check.verified) {
+        return {
+          success: true,
+          message: `Campaign updated successfully (spend cap verified: ${AgentModeService.describeSpendCap(check.applied!)})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      // Deliberately NOT success:false. An unconfirmed read is not a failed write — live,
+      // this exact path fired on an update that HAD landed (see verifyCampaignSpendCap), and
+      // success:false would have downgraded the whole result at the dispatch boundary to a
+      // bare error string, counted a healthy call as a failure, and told the user to re-apply
+      // a cap they already had. success:true with a loud, unmissable message keeps every
+      // structured field in front of the model and still forbids claiming the cap is set.
       return {
         success: true,
-        message: `Campaign updated successfully`
+        message: `⚠️ The spend cap of ${AgentModeService.describeSpendCap(normalizedParams.spend_cap)} ` +
+          `on campaign ${campaignId} could NOT be confirmed after ${check.attempts} read-back(s) — ` +
+          `${check.detail}. The update was accepted by Meta, but do NOT tell the user the cap is in ` +
+          `place and never claim it is set. Meta sometimes needs a moment to reflect this field: ` +
+          `re-read it with CAMPAIGN LIST (campaign_id=${campaignId} + ` +
+          `params.fields="id,name,spend_cap") before reporting anything. If it is still missing, ` +
+          `re-send the identical CAMPAIGN UPDATE — the write is idempotent.`,
+        spend_cap_requested: normalizedParams.spend_cap,
+        spend_cap_read: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_UNCONFIRMED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -17146,6 +18012,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           MetaService.validateCampaignParams('CREATE', params);
         } else if (action === 'UPDATE' && !campaign_id) {
           throw new Error('CAMPAIGN UPDATE requires "campaign_id".');
+        } else if (action === 'UPDATE') {
+          // UPDATE passes params through verbatim, so the spend-cap shape has to be checked
+          // here or a fractional/negative cap reaches Meta as an opaque "Invalid parameter".
+          MetaService.assertValidSpendCap(params?.spend_cap);
         } else if (action === 'DELETE' && !campaign_id) {
           throw new Error('CAMPAIGN DELETE requires "campaign_id".');
         }
@@ -17724,7 +18594,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return {
           success: false,
           message: validationError.message,
-          error: 'PARAM_VALIDATION_ERROR',
+          // The code alone is useless to the model: a success:false result is rewritten at
+          // the dispatch boundary into ONE reason string taken from `error` before `message`
+          // (utils/toolResultError), so the explanation of WHICH param is wrong and where it
+          // belongs — the entire value of rejecting instead of silently dropping — was being
+          // dropped on the floor. Keep the code as the prefix so callers still match on it.
+          error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
           hint: 'Fix the listed parameters and retry.'
         } as any;
       }
@@ -17750,7 +18625,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: validationError.message,
-        error: 'PARAM_VALIDATION_ERROR',
+        // Same reason as the pre-gate site above: `error` is what the model actually reads.
+        error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
         hint: 'Fix the listed parameters and retry.'
       } as any;
     }
@@ -19834,17 +20710,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // Helper function to format web search results for AI analysis
   private formatWebSearchResults(searchResult: any): string {
-    const { query, results, totalResults } = searchResult;
+    const { query, results, totalResults, resultSource, freshness } = searchResult;
+    // ENG-1050: news searches mix news articles with recent web pages from the
+    // same freshness window, so label each entry and make an empty result read as
+    // "no coverage found" rather than an ambiguous failure.
+    const isNewsSearch = resultSource === 'news';
+    const heading = isNewsSearch ? '📰 News Search Results' : '🔍 Web Search Results';
 
     if (!results || results.length === 0) {
-      return `<strong>🔍 Web Search Results for "${query}"</strong><br>No results found for your search query.`;
+      const emptyNote = isNewsSearch
+        ? `No news articles or recent web pages were found for this query within the ${freshness || 'week'} freshness window. `
+          + `The search itself succeeded — treat this as "no coverage found", not as a search failure.`
+        : 'No results found for your search query.';
+      return `<strong>${heading} for "${query}"</strong><br>${emptyNote}`;
     }
 
-    let summary = `<strong>🔍 Web Search Results for "${query}"</strong><br>`;
+    let summary = `<strong>${heading} for "${query}"</strong><br>`;
     summary += `I found ${totalResults} relevant search results:<br><br>`;
 
     results.forEach((result: any, index: number) => {
-      summary += `<strong>${index + 1}. ${result.title}</strong><br>`;
+      const sourceLabel = isNewsSearch
+        ? (result.sourceType === 'news' ? '📰 News article — ' : '🌐 Recent web page — ')
+        : '';
+      summary += `<strong>${index + 1}. ${sourceLabel}${result.title}</strong><br>`;
       summary += `🔗 <a href="${result.url}" target="_blank">${result.url}</a><br>`;
       summary += `<em>${result.snippet}</em><br>`;
       if (result.publishedDate) {
@@ -19934,6 +20822,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+    }
+    // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
+    // record a note ABOUT the work — they are not the work. A trailing save_memory
+    // schema rejection got the generic "adjust the plan" guidance below, read like a
+    // failure of the primary task, and was generalized into "the system timed out and
+    // your changes were not saved. Please try again." — after a landing-page publish
+    // that had already gone live in production. Give the criticality verdict
+    // explicitly, and keep it accurate even when the memory note WAS what the user
+    // asked for: the failure is real and must be reported, it is just SCOPED to the note.
+    if (isBookkeepingTool(toolName)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
@@ -20026,7 +20925,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
       const results: Array<{ content: string; source: string; fileName?: string }> = (searchResults || []).map(result => ({
-        content: result.content,
+        // ENG-1057: unlike the Drive/ClickUp sources below, Vertex results were
+        // never capped, so a single oversized entry could exceed Node's max
+        // string length once merged/serialized downstream and crash the process.
+        content: result.content && result.content.length > 5000
+          ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+          : result.content,
         source: result.metadata?.source || 'unknown',
         ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
       }));
@@ -22513,12 +23417,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const formattedContent = this.formatWebSearchResults({
         query,
         results: normalizedResults,
-        totalResults: normalizedResults.length
+        totalResults: normalizedResults.length,
+        resultSource,
+        freshness,
       });
+
+      // ENG-1050: a news search can be answered by news articles, by recent web
+      // pages from the same freshness window, or by neither. Say which, so a
+      // digest can tell "no coverage this week" from "the search returned
+      // nothing", and never presents a web page as a news article.
+      const newsArticleCount = normalizedResults.filter((result: any) => result.sourceType === 'news').length;
+      const recentPageCount = normalizedResults.length - newsArticleCount;
+      const isEmptyNewsSearch = resultSource === 'news' && normalizedResults.length === 0;
+      const message = isEmptyNewsSearch
+        // "Found 0 results" reads as a broken search, which is the ambiguity this
+        // ticket is about. Say the same thing the LLM-facing content says.
+        ? `No coverage found for "${query}" within the ${freshness || 'week'} window — `
+          + `the search itself succeeded, there is simply nothing published`
+        : resultSource === 'news'
+          ? `Found ${normalizedResults.length} results for "${query}" within the ${freshness || 'week'} window `
+            + `(${newsArticleCount} news article${newsArticleCount === 1 ? '' : 's'}, `
+            + `${recentPageCount} recent web page${recentPageCount === 1 ? '' : 's'})`
+          : `Found ${normalizedResults.length} web search results for "${query}"`;
 
       return {
         success: true,
-        message: `Found ${normalizedResults.length} ${resultSource === 'news' ? 'news' : 'web search'} results for "${query}"`,
+        message,
         query,
         results: normalizedResults,
         totalResults: normalizedResults.length,
@@ -22596,7 +23520,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = CONTEXT_TRIM_TOOL_CONTENT_LIMIT): any[] {
     // Single linear scan: collect tool-role indices and map each tool_call_id to
     // the index of its (first) resolving tool message. This map replaces the
     // original per-assistant nested forward scan (O(n^2) per call) with O(1)
@@ -22616,8 +23540,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
-    // Most recent N tool results: keep at full size
+    // Most recent N tool results by pure recency. This drives the "old assistant
+    // message" test below ONLY — an assistant whose call was just answered must
+    // keep its arguments intact, and that is a question about recency, not size.
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Size at which THIS tool's result would be compressed (per-tool allowances
+    // may raise the default floor, never lower it).
+    const trimLimitFor = (msg: any): number =>
+      AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+
+    // ENG-940: which results the preserve window actually protects. A result at
+    // or below its trim limit is passed through untouched whether or not it is
+    // preserved, so spending a slot on it protects nothing while evicting a
+    // result that the trimmer really would destroy. The reported run died on
+    // exactly that: three 488-char save_memory schema rejections landed after an
+    // 8,981-char get_pr_digest payload and pushed it out of a 3-slot window
+    // inside one logical turn. So the window keeps the N most recent AT-RISK
+    // results. The worst-case context cost is unchanged — it was always up to N
+    // full-size results — this only stops the window being wasted on results
+    // that were never in danger.
+    const atRiskIndices = toolIndices.filter(
+      (i) => typeof messages[i].content === 'string' && messages[i].content.length > trimLimitFor(messages[i]),
+    );
+    const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
 
     // Track which assistant messages are "old" (none of their tool_calls resolve
     // to a preserved tool result after them). We trim large argument fields on these.
@@ -22647,14 +23593,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
-        !preserveSet.has(idx) &&
+        !atRiskPreserveSet.has(idx) &&
         typeof msg.content === 'string'
       ) {
-        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        const limit = trimLimitFor(msg);
         if (msg.content.length > limit) {
+          // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
+          // header at the very front — or, when the offload failed, the "could NOT be stored"
+          // notice. Preview the payload separately from that header, otherwise the 200-char
+          // slice spends its whole budget on (and can cut in half) the only thing telling the
+          // model how much of this result it is still allowed to trust.
+          const s3Ref = extractToolResponseHeader(msg.content);
+          const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
-          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+          const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
+          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
 
@@ -25056,7 +26010,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     status: string = 'draft',
     author?: string,
-    categories: string[] = []
+    categories: string[] = [],
+    // ENG-827 (Greptile): the dispatcher checks consent before this method is entered,
+    // but the very first thing it does is fetch the article HTML over the network with
+    // a 30s budget. The check therefore precedes the slow part rather than the
+    // irreversible one, exactly like the YouTube upload did. Callers that publish on a
+    // schedule pass the hook so the decision is re-made against live consent at the
+    // last reachable point instead.
+    assertStillAuthorized?: () => Promise<{ error: string } | null>
   ): Promise<any> {
     try {
       console.log('AgentMode: Publishing blog article - Title:', title, 'Status:', status);
@@ -25117,6 +26078,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
       }
 
+      // A draft is reversible and invisible, so it is not gated — only going live is.
+      if (status === 'published') {
+        const withdrawnBeforeCms = await assertStillAuthorized?.();
+        if (withdrawnBeforeCms) {
+          console.warn('AgentMode: ENG-827 abandoning blog publish — consent was withdrawn while the article HTML was being fetched.');
+          return { success: false, message: withdrawnBeforeCms.error };
+        }
+      }
+
       const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
       return await publishWithResolvedBlogPublisher(
         {
@@ -25130,9 +26100,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           status: status === 'published' ? 'published' : 'draft',
           publishedAt: new Date().toISOString(),
         },
-        { userId, sessionId }
+        // ENG-827: the check above guards entry to the publisher; this rides all the
+        // way down to the CMS write itself, past the Payload probe, the user lookup
+        // and each publisher's secrets fetch.
+        { userId, sessionId, assertStillAuthorized: status === 'published' ? assertStillAuthorized : undefined }
       );
     } catch (error: any) {
+      // ENG-827: a deliberate stop is not a CMS failure; reporting it as one would
+      // send the run down the retry path.
+      if (isPublishConsentWithdrawn(error)) {
+        return { success: false, message: error.message };
+      }
       console.error('AgentMode: Error publishing blog article:', error);
 
       // Extract detailed error information for better user feedback
@@ -29429,7 +30407,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
@@ -29439,7 +30417,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -29492,11 +30470,54 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // the org member's userId for org-shared accounts).
       const ownerUserId: string = (account as any).userId || userId;
 
+      // A listing is not an authorization grant for an irreversible LinkedIn
+      // write. Re-read the owner record immediately before posting so a
+      // concurrent disconnect cannot leave this request with a usable token.
+      if (account.platform === 'linkedin') {
+        const currentAccount = await getAccountByIdConsistent(account.account_id, ownerUserId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+        if (ownerUserId !== userId && currentAccount.sharedWithOrg !== true) {
+          return { success: false, message: 'Account not found or access denied' };
+        }
+        account = currentAccount;
+      }
+
       // The adapter handles token refresh internally before making API calls.
       console.log('[AgentMode] Getting adapter for platform:', account.platform);
       const adapter = socialPlatformService.getAdapter(account.platform);
+
+      // ENG-827: LAST MOMENT before the post becomes real and un-makeable. Everything
+      // above — resolving accounts across the org, and inside createPost the media
+      // download and (for YouTube) the video upload — can take minutes, all of it on a
+      // decision taken before that work began. Re-read the owner's consent here, so a
+      // revocation that lands while this call is in flight still stops the post rather
+      // than being noticed only after it is public. Absent hook (interactive session,
+      // direct service call) → nothing changes.
+      const withdrawnMidFlight = await toolContext?.assertPublishStillAuthorized?.();
+      if (withdrawnMidFlight) {
+        console.warn(`[AgentMode] ENG-827: abandoning post on ${account.platform} — publish consent was withdrawn while this call was in flight.`);
+        return { success: false, message: withdrawnMidFlight.error };
+      }
+
       console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+      // ENG-827 (Greptile): the check above is the last moment before ENTERING the
+      // adapter, not before the post becomes real. LinkedIn uploads images and YouTube
+      // downloads then uploads an entire video INSIDE createPost — minutes, on a
+      // decision taken before that work began. Hand the same re-check down so those
+      // adapters can run it immediately before their irreversible request; adapters
+      // that commit straight away (X) need nothing and ignore it.
+      const result = await adapter.createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized
+      );
+
+      // An adapter that abandoned the post on a withdrawn consent reports it as a
+      // refusal, not a platform failure — the run was stopped deliberately.
+      if (result.success === false) {
+        return { success: false, message: result.message };
+      }
 
       return {
         success: true,
@@ -29526,9 +30547,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     parent_comment_urn?: string;
     reaction_type?: string;
     post_ids?: string[];
-  }): Promise<any> {
+  }, toolContext?: any): Promise<any> {
     const { action, account_id } = args;
     console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+    // ENG-827: last-moment publish-consent re-check. A repost or comment is a public
+    // write under the owner's name, so a consent withdrawn after dispatch admitted
+    // this call must still stop it. Self-scoping: the dispatcher attaches the hook
+    // only for a call it classified as publishing, so an analytics or comment-list
+    // read reaches this line with nothing to run.
+    const withdrawn = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawn) return withdrawn;
 
     const requirePostUrn = (a: string) =>
       !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
@@ -29538,10 +30567,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
 
     switch (action) {
+      // ENG-827 (Greptile): the check above still leaves an account lookup and a token
+      // refresh in front of the write, so the hook is handed down and re-run
+      // immediately before the irreversible call. Reads below get nothing to run.
       case 'repost':
-        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary);
+        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary, toolContext);
       case 'comment':
-        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn);
+        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn, toolContext);
       case 'list_comments':
         return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
       case 'react':
@@ -29553,14 +30585,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string): Promise<any> {
+  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const account = await getAccountById(accountId, userId);
+      const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
       if (!account) {
         return { success: false, message: 'Account not found or access denied' };
       }
@@ -29574,7 +30606,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Repost is not supported for this platform' };
       }
 
-      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+      // A prior lookup is only an eligibility check. Re-read immediately before
+      // the provider write so a concurrent disconnect cannot leave a usable token
+      // in memory for the remainder of this request.
+      const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+      if (!currentAccount) {
+        return { success: false, message: 'LinkedIn account is no longer connected' };
+      }
+
+      // ENG-827: last point before the repost is public — after the account re-read
+      // above and with the adapter's token refresh still to come inside the call.
+      // Consent is checked LAST so nothing but the write itself follows it.
+      const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+      if (withdrawnNow) return withdrawnNow;
+
+      const result = await adapter.createRepost(
+        currentAccount, postUrn, commentary, userId,
+        toolContext?.assertPublishStillAuthorized
+      );
 
       return {
         success: true,
@@ -29591,7 +30640,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
       accountId,
@@ -29600,12 +30649,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
+        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', account ? {
           found: true,
           platform: account.platform,
@@ -29666,8 +30715,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
         }
 
+        // The duplicate check above can be slow. Re-read the account immediately
+        // before the irreversible write so disconnect wins over an in-flight run.
+        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+
+        // ENG-827 (Greptile): the duplicate-comment lookup and the account re-read above
+        // are both network calls, and the adapter refreshes the token inside
+        // createComment. Re-check consent here, the last point before the comment is
+        // public under the owner's name.
+        const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+        if (withdrawnNow) return withdrawnNow;
+
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
+        const result = await adapter.createComment(
+          currentAccount, postUrn, commentText, userId, parentCommentUrn,
+          toolContext?.assertPublishStillAuthorized
+        );
 
         return {
           success: true,
@@ -29698,17 +30764,50 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  /**
+   * Resolve a connected account the caller can actually reach — their own, or one a
+   * teammate explicitly shared with the org — together with the id of the member who
+   * OWNS it.
+   *
+   * list_connected_accounts reports that own+org-shared set, so resolving against the
+   * caller's own record alone made a listed account come back "not found or access
+   * denied" from the very tools the list points at (ENG-943, first found on the mail
+   * tools). The owner id is load-bearing downstream too: adapters persist a refreshed
+   * token with updateAccountTokens(userId, …), so passing the caller would write a
+   * teammate's rotated token onto the caller's record and leave the owner's stale.
+   *
+   * Read paths only. An irreversible write additionally re-reads the owner record at
+   * the last moment to catch a mid-flight disconnect — see postOnConnectedAccount.
+   */
+  private async resolveAccessibleAccount(
+    callerUserId: string,
+    accountId: string,
+    preferPlatform?: string
+  ): Promise<{ account: any; ownerUserId: string } | null> {
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const accounts = (await getAccountsWithOwnerIncludingOrgShared(callerUserId)) || [];
+    const sameId = accounts.filter((a: any) => a.account_id === accountId);
+    // account_id alone does not identify an account — the same id can sit on two
+    // platforms (one Google account connected for Gmail and Drive is the common
+    // case). A platform-specific caller must not be handed some other platform's
+    // row just because it matched the id first; the mail resolver disambiguates
+    // the same way.
+    const account = (preferPlatform && sameId.find((a: any) => a.platform === preferPlatform)) || sameId[0];
+    if (!account) return null;
+    return { account, ownerUserId: (account as any).userId || callerUserId };
+  }
+
   async listLinkedInComments(userId: string, accountId: string, postUrn: string): Promise<any> {
     console.log('[AgentMode] listLinkedInComments called:', { userId, accountId, postUrn });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const account = await getAccountById(accountId, userId);
-      if (!account) {
+      const resolved = await this.resolveAccessibleAccount(userId, accountId, 'linkedin');
+      if (!resolved) {
         return { success: false, message: 'Account not found or access denied' };
       }
+      const { account, ownerUserId } = resolved;
 
       if (account.platform !== 'linkedin') {
         return { success: false, message: 'Listing comments is currently only supported for LinkedIn accounts' };
@@ -29719,7 +30818,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Listing comments is not supported for this platform' };
       }
 
-      const comments = await adapter.getComments(account, postUrn, userId);
+      const comments = await adapter.getComments(account, postUrn, ownerUserId);
 
       return {
         success: true,
@@ -29732,7 +30831,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }))
       };
     } catch (error: any) {
-      let message = error.message;
+      // Coerce before matching: the account lookup can now throw (the old
+      // getAccountById swallowed its DynamoDB errors and returned null), and a
+      // thrown non-Error would make .includes blow up inside this catch.
+      let message = error?.message || String(error);
       if (message.includes('access token expired')) {
         message = 'Account token expired. Please reconnect the account in Settings.';
       }
@@ -29752,26 +30854,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
+        const resolved = await this.resolveAccessibleAccount(userId, accountId, 'linkedin');
+        console.log('[AgentMode] Account lookup result:', resolved ? {
           found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
+          platform: resolved.account.platform,
+          accountType: resolved.account.config?.account_type,
+          accountName: resolved.account.account_name
         } : { found: false });
 
-        if (!account) {
+        if (!resolved) {
           console.log('[AgentMode] Account not found, returning error');
           return {
             success: false,
             message: 'Account not found or access denied'
           };
         }
+        const { account, ownerUserId } = resolved;
 
         // Only LinkedIn is supported for reactions
         if (account.platform !== 'linkedin') {
@@ -29792,8 +30895,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        // A listing is not a standing grant for a write: re-read the OWNER's record
+        // immediately before reacting so a disconnect — or an un-share — that lands
+        // while this call is in flight still stops it (mirrors postOnConnectedAccount).
+        const currentAccount = await getAccountByIdConsistent(accountId, ownerUserId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+        if (ownerUserId !== userId && currentAccount.sharedWithOrg !== true) {
+          return { success: false, message: 'Account not found or access denied' };
+        }
+
         console.log('[AgentMode] Calling adapter.createReaction (adapter will handle token refresh if needed)...');
-        const result = await adapter.createReaction(account, postUrn, reactionType, userId);
+        const result = await adapter.createReaction(currentAccount, postUrn, reactionType, ownerUserId);
 
         return {
           success: true,
@@ -29915,22 +31029,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // Load metrics for connected account helper
   async loadConnectedAccountMetrics(userId: string, accountId: string, startDate?: Date, endDate?: Date): Promise<any> {
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
-        const account = await getAccountById(accountId, userId);
+        const resolved = await this.resolveAccessibleAccount(userId, accountId);
 
-        if (!account) {
+        if (!resolved) {
           return {
             success: false,
             message: 'Account not found or access denied'
           };
         }
+        const { account, ownerUserId } = resolved;
 
         const adapter = socialPlatformService.getAdapter(account.platform);
 
-        const metrics = await adapter.getAccountMetrics(account, userId, startDate, endDate);
+        const metrics = await adapter.getAccountMetrics(account, ownerUserId, startDate, endDate);
 
         return {
           success: true,
@@ -29977,20 +31091,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      // Verify account ownership
-      const account = await getAccountById(accountId, userId);
-      if (!account) {
+      // Verify the caller can reach this account (own or org-shared)
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
       const adapter = socialPlatformService.getAdapter(account.platform);
-      const analytics = await adapter.getPostAnalytics(account, postIds, userId);
+      const analytics = await adapter.getPostAnalytics(account, postIds, ownerUserId);
 
       // Check for any errors in the results
       const failedCount = analytics.filter((a: any) => a.error).length;
@@ -30378,7 +31492,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
               const { crmDb } = await import('./db');
               const mirrorList = await crmDb.getLeadListById(mirrorListId);
-              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+              const { canDestructiveCrmList } = await import('./crmAccessControl');
+              if (!mirrorList || !(await canDestructiveCrmList(userId, mirrorList))) {
                 console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
                 return;
               }
@@ -30801,11 +31916,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // Public entry: bind the acting user into the X metering context so every X
   // call this dispatch makes attributes the shadow ledger to the ACTING user and
   // bills the account owner (ENG-664 Option B, matching the LLM rail).
-  async twitterManagePost(userId: string, args: any): Promise<any> {
-    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  async twitterManagePost(userId: string, args: any, toolContext?: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args, toolContext));
   }
 
-  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
+  private async _twitterManagePostImpl(userId: string, args: any, toolContext?: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -30840,6 +31955,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const ownerUserId = account.userId;
     account_id = account.account_id;
 
+    // ENG-827: last-moment publish-consent re-check, after the account resolution
+    // above (which scans every account shared with the owner's org) and immediately
+    // before the switch — every publishing branch writes on its first statement, so
+    // there is no window left after this point. Self-scoping: the dispatcher attaches
+    // the hook only for a call it classified as publishing, so a metrics or list read
+    // reaches this line with nothing to run and pays nothing.
+    const withdrawnBeforeTweet = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawnBeforeTweet) return withdrawnBeforeTweet;
+
     // Best-effort CRM logging — never fails the action.
     const logCrm = async (
       eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
@@ -30869,9 +31993,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'reply': {
           if (!text) throw new Error('text is required for reply');
           if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          // ENG-827: the hook goes down so the check also covers the client resolution
+          // and any token refresh inside the call — the last work before the write.
           const result = await twitterService.postTweet(ownerUserId, account_id, text, {
             inReplyToTweetId: in_reply_to_tweet_id,
-          });
+          }, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -30883,15 +32009,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (tweets.length < 2) {
             throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
           }
-          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          // ENG-827 (Greptile): a thread is N separate public writes. The check above
+          // covers the first tweet only, so consent is re-read before each subsequent
+          // one and the thread stops the moment it is withdrawn.
+          const result = await twitterService.postThread(
+            ownerUserId, account_id, tweets,
+            toolContext?.assertPublishStillAuthorized
+          );
           if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          if (result.length < tweets.length) {
+            // Report the truncation rather than a clean success: those tweets are
+            // public and cannot be un-made, and the owner needs to know the thread is
+            // a fragment so they can finish or delete it.
+            return {
+              success: false,
+              message:
+                `Publishing consent was withdrawn part-way through the thread. ${result.length} of ` +
+                `${tweets.length} tweets were already posted and cannot be un-posted; the rest were ` +
+                `not sent. Do NOT retry — tell the owner the thread is incomplete so they can finish ` +
+                `or remove it.`,
+              data: result,
+            };
+          }
           return { success: true, data: result };
         }
 
         case 'quote-tweet': {
           if (!text) throw new Error('text is required for quote_tweet');
           if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
-          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -30916,7 +32062,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'retweet': {
           if (!tweet_id) throw new Error('tweet_id is required for retweet');
-          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id, toolContext?.assertPublishStillAuthorized);
           return { success: true, data: result };
         }
 
@@ -30968,6 +32114,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
+      // ENG-827: a write abandoned because the owner withdrew consent is a deliberate
+      // stop, not an X failure. Reporting it as "Twitter action failed" would invite a
+      // retry of the very thing the owner just said no to.
+      if (isPublishConsentWithdrawn(error)) {
+        console.warn('[AgentMode] ENG-827: twitter_manage_post stopped — publish consent was withdrawn before the write.');
+        return { success: false, error: error.message };
+      }
       // Surface X's real ApiResponseError payload (title/detail/errors) instead of
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);
@@ -31661,6 +32814,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
+    // Access check (ENG-1049): this function creates leads (batchCreateLeads
+    // below), and is called directly by the import_leads_from_search Emma tool
+    // — bypassing the canDestructiveCrmList check that crm.ts's POST
+    // /lists/:listId/leads/find route applies before calling this same method.
+    // Without this, any same-org member could import leads into another
+    // member's list via Emma chat.
+    try {
+      const { crmDb: accessCrmDb } = await import('./db');
+      const accessList = await accessCrmDb.getLeadListById(listId);
+      if (!accessList) {
+        return { success: false, error: 'The specified lead list does not exist' };
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      if (!(await canDestructiveCrmList(userId, accessList))) {
+        return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+    } catch (err) {
+      // Fail closed — an access-check failure must never silently allow the
+      // write. Distinct from the cosmetic, fail-soft list lookups below.
+      return { success: false, error: 'Failed to verify list access' };
+    }
+
     // Resolve account: user's own or platform-wide fallback
     const accountId = await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
@@ -31717,8 +32892,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let searchError: string | null = null;
     let searchUnavailable = false;
     const allErrors: string[] = [];
-    const allCreated: Array<{ leadId: string; email?: string }> = [];
-    const allMappedLeadsPreview: any[] = []; // first-5 preview only
+    // `lead` is the mapped payload the record was written from — the response
+    // preview is derived from this so it can only ever describe real writes.
+    const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
+    // Out-of-network "LinkedIn Member" hits dropped before the write.
+    let anonymizedSkipped = 0;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -31825,14 +33003,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return lead;
       });
 
+      // Phase 1b (ENG-1002): drop anonymized / identity-less hits BEFORE any
+      // further work. LinkedIn returns out-of-network profiles as the
+      // placeholder "LinkedIn Member" with no public identifier; persisting
+      // one produces a nameless, emailless, un-linkable record that can never
+      // be dedup'd — so every subsequent run of the same search creates
+      // another copy. Skipping them also means the top-up loop keeps
+      // paginating until it finds `limit` genuinely usable leads.
+      const candidates: Array<{ lead: any; item: any }> = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (isAnonymizedSearchLead(leads[i])) {
+          anonymizedSkipped++;
+          continue;
+        }
+        candidates.push({ lead: leads[i], item: items[i] });
+      }
+      const importable: any[] = candidates.map((c) => c.lead);
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
+
       // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
       // missing a company. Skipped entirely when no candidates remain.
       const llmIndices: number[] = [];
       const llmTitles: string[] = [];
-      for (let i = 0; i < leads.length; i++) {
-        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+      for (let i = 0; i < importable.length; i++) {
+        if (!importable[i].company && typeof importable[i].title === 'string' && importable[i].title) {
           llmIndices.push(i);
-          llmTitles.push(leads[i].title);
+          llmTitles.push(importable[i].title);
         }
       }
       if (llmTitles.length > 0) {
@@ -31841,7 +33040,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
-            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+            if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
           }
         } catch (e: any) {
           console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
@@ -31849,8 +33048,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
-      await Promise.all(items.map(async (item: any, idx: number) => {
-        const lead = leads[idx];
+      await Promise.all(candidates.map(async ({ lead, item }) => {
         if (lead.company || !item.public_identifier || !accountId) return;
         try {
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
@@ -31866,18 +33064,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }));
 
-      const result = await crmDb.batchCreateLeads(listId, leads);
+      const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
       cumulativeMerged += result.mergedCount ?? 0;
       if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
       const created = Array.isArray((result as any).created) ? (result as any).created : [];
-      if (created.length) allCreated.push(...created);
-
-      if (allMappedLeadsPreview.length < 5) {
-        for (const lead of leads) {
-          if (allMappedLeadsPreview.length >= 5) break;
-          allMappedLeadsPreview.push(lead);
-        }
+      // Carry the source row alongside each created id so the response preview
+      // is built from the records that were actually written — not from every
+      // candidate we looked at (ENG-1002). Rows that dedup'd into an existing
+      // lead, or that were unchanged no-ops, never appear in `created`.
+      for (const entry of created) {
+        const source = typeof entry?.sourceIndex === 'number' ? importable[entry.sourceIndex] : undefined;
+        allCreated.push({ ...entry, lead: source });
       }
 
       if (cumulativeNew >= limit) break;
@@ -31944,14 +33142,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       cursor: resumeCursor,
       iterations: iterationCount,
       trimmed: trimmedCount,
+      anonymizedSkipped,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
+      response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
     }
-    response.importedLeads = allMappedLeadsPreview;
+    // Preview strictly the records that were written and survived trimming.
+    response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
 
     if (auto_enrich && cumulativeNew > 0) {
       const newLeadIds: string[] = allCreated.map((c) => c.leadId);

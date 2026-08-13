@@ -2438,3 +2438,78 @@ describe('agentToolGatewayService', () => {
     }
   });
 });
+
+/**
+ * ENG-1048: a `maxLength` rejection told the model the limit but not what it had
+ * actually sent, so correcting the call was guess-and-check. In the reported run
+ * (prod session d11fc6b7…, 2026-08-11) Emma burned four consecutive turns walking
+ * `save_memory` content down 2926 → 2306 → 2128 → 1817 against a 2000 limit, and
+ * two more in the 2026-08-10 run. Those rejections are not free: each is a full
+ * model turn, and ENG-940 records them evicting a large tool result from the
+ * context window. Stating the received length and the exact overflow turns the
+ * loop into a single deterministic correction.
+ */
+describe('ENG-1048: maxLength rejections say how far over the argument is', () => {
+  const saveMemorySchema = {
+    type: 'object',
+    properties: {
+      content: { type: 'string', maxLength: 2000 },
+      category: { type: 'string' },
+    },
+    required: ['content', 'category'],
+  };
+
+  const reject = (length: number) => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'save_memory',
+      args: { content: 'x'.repeat(length), category: 'insight' },
+      inputSchema: saveMemorySchema,
+    });
+    if (result.status !== 'invalid') throw new Error(`expected ${length} chars to be rejected`);
+    return result;
+  };
+
+  // FAIL: the first overflow of the reported run — 2926 against a 2000 limit
+  it('reports the limit, the received length and the overflow', () => {
+    const message = reject(2926).issues[0].message;
+
+    expect(message).toContain('at most 2000 character(s)');
+    expect(message).toContain('2926');
+    expect(message).toContain('926');
+  });
+
+  // FAIL: the model reads the retry instruction, not the raw issue — it must carry the numbers too
+  it('carries the numbers into the message the model actually sees', () => {
+    const result = reject(2010);
+
+    expect(result.modelMessage).toContain('2010');
+    expect(result.modelMessage).toContain('10');
+  });
+
+  // FAIL: measured in code points, so a 1001-emoji argument reports its true length
+  it('counts code points, not UTF-16 units', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'save_memory',
+      args: { content: '😀'.repeat(2001), category: 'insight' },
+      inputSchema: saveMemorySchema,
+    });
+
+    expect(result.status).toBe('invalid');
+    if (result.status === 'invalid') {
+      // 2001 code points (4002 UTF-16 units) — the message must say 2001, over by 1.
+      expect(result.issues[0].message).toContain('2001');
+      expect(result.issues[0].message).not.toContain('4002');
+    }
+  });
+
+  // SUCCESS: an argument at exactly the limit is still accepted
+  it('accepts an argument of exactly maxLength', () => {
+    const result = validateAndRepairToolArgs({
+      toolName: 'save_memory',
+      args: { content: 'x'.repeat(2000), category: 'insight' },
+      inputSchema: saveMemorySchema,
+    });
+
+    expect(result.status).toBe('valid');
+  });
+});

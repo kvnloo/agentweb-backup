@@ -4,14 +4,17 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
+import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
+import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -29,10 +32,20 @@ const CLAIM_STALE_MS = 5 * 60 * 1000;
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts.
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -396,6 +409,15 @@ export interface User {
     }>;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Opaque identity of the write that produced this value, stamped only by
+     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * granular and every other brand writer mints its own, so two writes can
+     * share a stamp; pairing it with a revision lets a conditional write
+     * identify the exact value it read. Absent on anything written by another
+     * path, which those conditions match explicitly.
+     */
+    rev?: string;
   };
   marketStrategy?: {
     businessOverview: string;
@@ -468,6 +490,8 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
+  llmUsageCredits?: MonthlyLlmUsageCredits;
   extraCostUsage?: {
     month: string;      // "YYYY-MM" format for current tracking month
     totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
@@ -749,6 +773,7 @@ export interface OrgShareSettings {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm?: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -1108,6 +1133,20 @@ export class UserDB {
     const item = result.Item;
     if (item?.userId?.startsWith("deleted_")) return undefined;
     return item;
+  }
+
+  /**
+   * Returns a strongly current User record after resolving its stable primary
+   * key from the UserIdIndex. DynamoDB does not support strongly consistent
+   * reads on GSIs, so callers that must not act on recently removed OAuth
+   * credentials need this two-step lookup instead of getUserById alone.
+   */
+  async getUserByIdConsistent(userId: string) {
+    const indexed = await this.getUserById(userId);
+    if (!indexed?.email) return undefined;
+
+    const current = await this.getUserByEmailConsistent(indexed.email);
+    return current?.userId === userId ? current : undefined;
   }
 
   async getUserById(userId: string) {
@@ -1630,6 +1669,75 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Roll the monthly usage counter over to a new month, archiving the previous
+   * month into history — but ONLY if nobody has rolled it over already.
+   *
+   * The caller reads the stored month, sees it is stale, and decides to reset.
+   * Between that read and this write, another charge for the same user can do
+   * exactly the same thing. Without the condition below both writes land and the
+   * second discards the first call's tokens and cost entirely — a whole charge
+   * lost, on the one day of the month when every active user rolls over at once.
+   *
+   * Returns false when the condition fails, i.e. somebody else already rolled the
+   * month. The caller then applies its charge as a normal increment onto the
+   * counter the winner created, so no spend is dropped either way.
+   */
+  async resetTokenUsageForMonth(args: {
+    userId: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    history: Array<{ month: string; totalTokens: number; totalCost: number }>;
+  }): Promise<boolean> {
+    const user = await this.getUserById(args.userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${args.userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+      // Succeed only while the stored month is still NOT the new one. A row with
+      // no tokenUsage at all is a first-ever charge and also qualifies.
+      ConditionExpression:
+        "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#history": "tokenUsageHistory",
+        "#bonus": "tokenAllowanceBonus",
+      },
+      ExpressionAttributeValues: {
+        ":userId": args.userId,
+        ":month": args.month,
+        ":usage": {
+          month: args.month,
+          totalTokens: args.tokens,
+          totalCost: args.cost,
+          resetDate: args.resetDate,
+        },
+        ":history": args.history,
+        ":zero": 0,
+      },
+    };
+
+    try {
+      await this.docClient.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return false;
+      }
+      handleDynamoDbError(error, "resetTokenUsageForMonth");
       throw error;
     }
   }
@@ -2965,6 +3073,87 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+// A write that loses its race is recomputed, not replayed — replaying a list built
+// against different history would clobber whatever landed in between.
+const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
+
+/**
+ * ENG-1048: the run history this row can hold WITH one more result on the end, and
+ * the history that was derived from. Returns null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
+ */
+const planRunResultShed = async (scheduleId: string, runResult: any) => {
+  const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+  const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
+  if (!existing) return null;
+
+  const history = Array.isArray(existing.runResults) ? existing.runResults : [];
+  const appended = [...history, runResult];
+  const { kept, dropped } = trimListToItemBudget(
+    { ...existing, runResults: appended },
+    'runResults',
+    appended,
+  );
+  if (kept.length === 0) return null;
+  if (dropped > 0) {
+    console.warn(
+      `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
+    );
+  }
+  return { kept, observed: history };
+};
+
+/**
+ * ENG-1048: shed the oldest runs AND record the incoming one in a single write, bound
+ * to the exact history the new list was built from.
+ *
+ * The two halves cannot be separated. Trim in one write and append in another, and a
+ * failure in between deletes history without recording the run it made room for. So:
+ * one `SET`, conditioned on the stored history still being what was read — length AND
+ * tail entry, because a concurrent recovery that drops one and appends one leaves the
+ * length untouched. On mismatch the caller recomputes; nothing is written from a read
+ * that has been overtaken.
+ */
+const writeShedRunResults = async (
+  scheduleId: string,
+  kept: any[],
+  observed: any[]
+): Promise<{ raced: true } | { raced: false; attributes: any }> => {
+  const values: Record<string, any> = {
+    ':runResults': kept,
+    ':updatedAt': new Date().toISOString(),
+    ':expectedLength': observed.length,
+  };
+  let condition = 'size(#runResults) = :expectedLength';
+  if (observed.length === 0) {
+    condition = `(attribute_not_exists(#runResults) OR ${condition})`;
+  } else {
+    condition += ` AND #runResults[${observed.length - 1}] = :expectedLast`;
+    values[':expectedLast'] = observed[observed.length - 1];
+  }
+
+  try {
+    const result = await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: { scheduleId },
+      UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: condition,
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+    return { raced: false, attributes: result.Attributes };
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `DynamoDB addRunResult: schedule ${scheduleId} run history moved under the shed — recomputing.`
+      );
+      return { raced: true };
+    }
+    throw error;
+  }
+};
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -2990,6 +3179,10 @@ export const scheduleDb = {
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
+    llmModel?: string;
+    llmBackupModel?: string;
+    llmBackupSource?: 'user' | 'system';
+    llmBackupNeedsConfirmation?: boolean;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
     variables?: Array<{ name: string; description?: string }>;
     variableValues?: { [variableName: string]: string };
@@ -3046,6 +3239,23 @@ export const scheduleDb = {
     }
   },
 
+  /**
+   * Every schedule in the table, paginated. A full scan, so this is for one-off
+   * operator work (the ENG-827 consent migration) — never a request path. The
+   * prefixed table name stays inside this module, which is the only reason a
+   * script can enumerate schedules without knowing about TABLE_PREFIX.
+   */
+  async getAllSchedules(): Promise<any[]> {
+    try {
+      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+    } catch (error) {
+      // Rethrows. A scan that dies halfway must not read as "no schedules" — that
+      // would turn a transient failure into a migration that silently grants nothing.
+      handleDynamoDbError(error, "getAllSchedules");
+      return [];
+    }
+  },
+
   async updateSchedule(
     scheduleId: string,
     updates: Partial<{
@@ -3074,11 +3284,28 @@ export const scheduleDb = {
       // my behalf". Settable ONLY by the owner — deliberately absent from the
       // manage_scheduled_chat MCP allowlist so the model can neither grant itself
       // publishing authority nor silence its own publishing. Default off (= publish).
+      // ENG-803: owner's explicit hold. Outranks any grant below — an owner who asked
+      // to review stays reviewing.
       requirePublishApproval?: boolean;
+      // ENG-827: AFFIRMATIVE consent to publish unattended to a live connected account
+      // without the owner seeing the content first. Absence is NOT consent. Settable
+      // only by the owner (portal checkbox / owner-only endpoint); the MCP surface can
+      // REVOKE it but never grant it.
+      autopublishAuthorized?: boolean;
+      // ENG-827: the publish tools the owner approved when consenting. Consent is bound
+      // to THIS list, so a later edit to requiredFunctionCalls cannot re-scope it onto a
+      // tool they never saw. An empty list authorizes nothing.
+      autopublishAuthorizedTools?: string[];
+      autopublishAuthorizedAt?: string | null;
+      autopublishAuthorizedBy?: string | null;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
       runCount: number;
+      llmModel: string;
+      llmBackupModel: string;
+      llmBackupSource: 'user' | 'system';
+      llmBackupNeedsConfirmation: boolean;
       variables: Array<{ name: string; description?: string }>;
       variableValues: { [variableName: string]: string };
       variableRequestStatus: 'idle' | 'pending' | 'provided';
@@ -3088,9 +3315,30 @@ export const scheduleDb = {
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
       zeroAssistantRetryCount: number;
+      // ENG-971: marks the requeued zero-output run to CONTINUE the abandoned
+      // session rather than restart it, so work that already published is not
+      // repeated. Consumed (at most once) by the next dispatch.
+      pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-    }>
+    }>,
+    /**
+     * ENG-827: attributes that must STILL hold for this write to land, as read a
+     * moment ago. `undefined` means the attribute must still be absent.
+     */
+    expect?: Record<string, any>,
+    /**
+     * ENG-1048: shed `count` of the OLDEST run results as part of THIS write. The trim
+     * exists to make room for the edit, so the two have to land together — shedding
+     * first and then failing the edit would delete history for a save that never
+     * happened. `expectedLength` binds the removal to the history the count was
+     * measured against, so a run recording at the same moment cannot leave this write
+     * taking a second prefix off an already-shortened list. `expectedLast` pins the
+     * tail with it: an overflow recovery that drops one entry and appends its own
+     * leaves the length unchanged, and length alone would wave the stale count
+     * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     */
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3103,16 +3351,58 @@ export const scheduleDb = {
         expressionAttributeValues[`:${key}`] = value;
       });
 
-      const params = {
+      // ENG-827: an optional "only if this is still true" clause. A caller that
+      // DERIVES what it writes from what it read cannot write unconditionally — a
+      // concurrent edit between the two turns the write into a decision nobody made.
+      // Expressed as expected attribute values so the check and the write are one
+      // operation; on mismatch DynamoDB throws ConditionalCheckFailedException and
+      // the caller decides what to tell the user.
+      const conditionExpressions: string[] = [];
+      Object.entries(expect || {}).forEach(([key, value], index) => {
+        const alias = `expected${index}`;
+        expressionAttributeNames[`#${alias}`] = key;
+        if (value === undefined) {
+          conditionExpressions.push(`attribute_not_exists(#${alias})`);
+          return;
+        }
+        conditionExpressions.push(`#${alias} = :${alias}`);
+        expressionAttributeValues[`:${alias}`] = value;
+      });
+
+      // ENG-1048: removing by index (rather than SETting a list built from a read)
+      // is what makes this safe against a run finishing mid-edit: appends land at the
+      // tail, so index 0 still names the oldest entry. `runResults` is never also SET
+      // here — overlapping document paths in one expression are rejected.
+      let removeExpression = '';
+      if (shedRunResults && shedRunResults.count > 0) {
+        expressionAttributeNames['#runResults'] = 'runResults';
+        removeExpression = ` REMOVE ${Array.from(
+          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          (_, index) => `#runResults[${index}]`
+        ).join(", ")}`;
+        conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
+        expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
+        if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
+          conditionExpressions.push(
+            `#runResults[${shedRunResults.expectedLength - 1}] = :expectedRunResultsLast`
+          );
+          expressionAttributeValues[':expectedRunResultsLast'] = shedRunResults.expectedLast;
+        }
+      }
+
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      if (conditionExpressions.length > 0) {
+        params.ConditionExpression = conditionExpressions.join(" AND ");
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
@@ -3122,32 +3412,48 @@ export const scheduleDb = {
   },
 
   async addRunResult(scheduleId: string, runResult: any) {
-    try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
-        },
-        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-        ExpressionAttributeNames: {
-          '#runResults': 'runResults',
-          '#updatedAt': 'updatedAt',
-        },
-        ExpressionAttributeValues: {
-          ':runResult': [runResult],
-          ':emptyList': [],
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: {
+        scheduleId,
+      },
+      UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#runResults': 'runResults',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':runResult': [runResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
 
+    try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
+      // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
+      if (isDynamoItemSizeError(error)) {
+        try {
+          for (let attempt = 1; attempt <= MAX_RUN_RESULT_SHED_ATTEMPTS; attempt++) {
+            const plan = await planRunResultShed(scheduleId, runResult);
+            if (plan === null) break;
+            const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
+            if (written.raced) continue;
+            return written.attributes;
+          }
+        } catch (recoveryError) {
+          // Recovery failed too — report the condition that actually stopped the write.
+          console.error(`DynamoDB addRunResult: could not make room on schedule ${scheduleId}:`, recoveryError);
+        }
+      }
       handleDynamoDbError(error, "addRunResult");
       throw error;
     }
   },
+
 
   async getRunResults(scheduleId: string) {
     try {
@@ -4650,21 +4956,37 @@ export const crmDb = {
     return items;
   },
 
-  // Returns true if userId owns the list OR is an org member of the same org as the list owner.
+  // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
+  // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
+  // and listed crm.editors retain cross-member read access.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
     const [user, owner] = await Promise.all([
       userDb.getUserById(userId),
       userDb.getUserById(list.userId),
     ]);
-    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+    if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    if (crmEnabled) return true;
+    if (org?.ownerUserId === userId) return true;
+    return !!(crmCfg?.editors && crmCfg.editors.includes(userId));
   },
 
   // Org-aware version: returns the user's own lists plus all org members' lists.
+  // When shareSettings.crm.enabled is false the fan-out is suppressed for plain
+  // members; org owners and crm.editors still receive the full org list.
   async getLeadListsForUser(userId: string) {
     const ownLists = await this.getLeadListsByUserId(userId);
     const user = await userDb.getUserById(userId);
     if (!user?.orgId) return ownLists;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    const isPrivileged =
+      org?.ownerUserId === userId || !!(crmCfg?.editors && crmCfg.editors.includes(userId));
+    if (!crmEnabled && !isPrivileged) return ownLists;
     const members = await orgDb.getOrgMembers(user.orgId);
     const memberListArrays = await Promise.all(
       members
@@ -5077,6 +5399,19 @@ export const crmDb = {
       handleDynamoDbError(error, 'setLeadListSearchCursor');
       throw error;
     }
+  },
+
+  async transferLeadListOwner(listId: string, newUserId: string): Promise<void> {
+    const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-LeadLists`,
+      Key: { listId },
+      UpdateExpression: "SET userId = :uid, updatedAt = :ts",
+      ExpressionAttributeValues: {
+        ":uid": newUserId,
+        ":ts": new Date().toISOString(),
+      },
+    }).promise();
   },
 
   async deleteLeadList(listId: string) {
@@ -6447,29 +6782,131 @@ export const crmDb = {
      *  leak into CSV exports, email-template variables, or the
      *  lead-filter UI. */
     system?: Record<string, any>;
-  }>) {
-    try {
-      const results = {
-        successCount: 0,
-        newCount: 0,
-        mergedCount: 0,
-        errorCount: 0,
-        errors: [] as string[],
-        // IDs of newly created leads (excludes merged updates). Used by callers
-        // that need to act on freshly-imported leads — e.g., the CSV importer
-        // queues these for enrich.so email validation when the user opts in.
-        created: [] as Array<{ leadId: string; email?: string }>,
-      };
+  }>, options: {
+    /**
+     * Wall-clock budget for this import (ENG-1133). When it runs out, the
+     * importer stops between units of work and leaves the rows it never reached
+     * as `unprocessed`, so the caller gets a resumable partial instead of being
+     * cut off mid-import by a caller-level timeout with nothing to show for it.
+     * Omitted (the default) means no budget — every existing caller is unchanged.
+     *
+     * At least one unit of work is always attempted, so a resume can never spin
+     * without making progress.
+     */
+    deadlineMs?: number;
+    /**
+     * Dedupe rows that carry NEITHER an email NOR a LinkedIn URL against the
+     * list's existing rows on name+company (ENG-1133).
+     *
+     * Opt-in, because it is a guess: two genuinely different people with the
+     * same name at the same company collapse into one. That trade is right for
+     * a file import a user may re-send (the alternative is a duplicate of every
+     * email-less row on every retry) and wrong for a sync from a system that
+     * has its own stable record ids — HubSpot/Attio contacts must not be merged
+     * on a name collision.
+     */
+    dedupeByNameCompany?: boolean;
+  } = {}) {
+    // Declared OUTSIDE the try so the catch below can still see what was
+    // already classified. Refused placeholders are counted before any write
+    // happens, and a later DynamoDB failure must not relabel them as database
+    // errors (ENG-1002 follow-up).
+    const results = {
+      successCount: 0,
+      newCount: 0,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [] as string[],
+      // IDs of newly created leads (excludes merged updates). Used by callers
+      // that need to act on freshly-imported leads — e.g., the CSV importer
+      // queues these for enrich.so email validation when the user opts in.
+      // `sourceIndex` is the position in the input `leads` array the record
+      // was written from, so callers can join a created leadId back to the
+      // row it came from even when the row carries no email (ENG-1002).
+      created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+      // Rows refused because they are LinkedIn's anonymized placeholder
+      // rather than a person (ENG-1002). Reported, never dropped silently.
+      anonymizedSkipped: 0,
+      // Rows that matched a lead already in the list and needed no change.
+      // They used to fall out of every counter, so an import re-sent after a
+      // partial run reported "No leads were processed" even though every row
+      // was safely in place (ENG-1133).
+      alreadyPresentCount: 0,
+      // What happened to each input row, aligned to the input array. Lets a
+      // caller resume a truncated import from the rows that never landed
+      // rather than replaying the whole file (ENG-1133).
+      rowOutcomes: leads.map(() => 'unprocessed' as LeadImportRowOutcome),
+      // Set when the existing-lead pre-read ran out of budget before it had
+      // read the whole list, so nothing was written (ENG-1133). Distinct from
+      // an ordinary partial: those rows are not merely unreached, they are
+      // unsafe to attempt until the list can be scanned.
+      dedupeIncomplete: false,
+    };
 
+    // ENG-1133: the import budget. `unitsDone` keeps the first unit of work
+    // unconditional — a budget already spent by the pre-read must still write
+    // something, or a resume would come back with the same rows outstanding
+    // forever.
+    const deadlineAt = options.deadlineMs && options.deadlineMs > 0
+      ? Date.now() + options.deadlineMs
+      : null;
+    let unitsDone = 0;
+    const outOfTime = () => deadlineAt !== null && unitsDone > 0 && Date.now() >= deadlineAt;
+
+    try {
       // Get existing leads to check for duplicates by email
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
       let lastKey = undefined;
+      // ENG-1133: checking the clock BETWEEN pages is not enough — a single
+      // page that stalls holds the await open past the budget and the check
+      // below is never reached, so the turn dies with no ledger anyway. Bound
+      // each page by whatever budget is left. A rejection still propagates: a
+      // query that fails is a real error, and nothing has been written yet.
+      const readExistingPage = async (startKey: any) => {
+        const read = this.getLeadsByListId(listId, 100, startKey);
+        if (deadlineAt === null) return read;
+        read.catch(() => undefined); // handled by the race; keeps Node quiet if we bail first
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) return null;
+        let timer: NodeJS.Timeout | undefined;
+        const expired = new Promise<null>(resolve => {
+          timer = setTimeout(() => resolve(null), remaining);
+        });
+        try {
+          return await Promise.race([read, expired]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
       do {
-        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        const result = await readExistingPage(lastKey);
+        if (result === null) {
+          results.dedupeIncomplete = true;
+          break;
+        }
         allExistingLeads.push(...result.items);
         lastKey = result.lastEvaluatedKey;
+        // ENG-1133: the pre-read is O(list size) and runs before any row is
+        // written, so on a very large or throttled list it can burn the whole
+        // budget — and then the caller's own timeout kills the turn with no
+        // ledger at all, which is the failure this ticket exists to remove.
+        // Stop and report instead. Writing on a half-read list is not the
+        // alternative: the dedupe maps below would be missing rows and every
+        // unmatched row would be inserted a second time.
+        if (lastKey && deadlineAt !== null && Date.now() >= deadlineAt) {
+          results.dedupeIncomplete = true;
+          break;
+        }
       } while (lastKey);
+
+      if (results.dedupeIncomplete) {
+        results.errors.push(
+          `Could not read the existing leads in this list within ${options.deadlineMs}ms, so no rows were imported. `
+          + 'Importing without the full list would duplicate rows that are already in it.',
+        );
+        return results;
+      }
 
       // Build dedup maps keyed by both email AND normalized LinkedIn URL.
       // Same person can appear with no email but a LinkedIn URL (typical for
@@ -6477,22 +6914,46 @@ export const crmDb = {
       // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
       const existingLeadsByLinkedIn = new Map<string, any>();
+      // ENG-1133: last-resort identity for rows that carry neither an email nor
+      // a LinkedIn URL. Computed from the stored fields rather than read from
+      // the persisted `nameCompanyKey` attribute so legacy rows written before
+      // that attribute existed still dedupe.
+      const existingLeadsByNameCompany = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
         const liKey = normalizeLinkedInUrl(lead.linkedin);
         if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
+        if (options.dedupeByNameCompany) {
+          const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nameCompanyKey && !existingLeadsByNameCompany.has(nameCompanyKey)) {
+            existingLeadsByNameCompany.set(nameCompanyKey, lead);
+          }
+        }
       });
 
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
-      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
+      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0]; index: number }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
-      const uniqueLeads = new Map<string, typeof leads[0]>();
+      // The map value carries the row's original index so `results.created` can
+      // report which input row each written lead came from (ENG-1002).
+      const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
+      const seenNameCompany = new Set<string>();
       leads.forEach((lead, index) => {
+        // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
+        // one point every write path converges, so no caller can reintroduce
+        // the nameless, un-dedupable rows by routing around the import tool.
+        // `return` (not a re-indexed filter) keeps every surviving row's
+        // sourceIndex pointing at its ORIGINAL position for callers joining on it.
+        if (isLinkedInPlaceholderName(lead)) {
+          results.anonymizedSkipped++;
+          results.rowOutcomes[index] = 'anonymized_skipped';
+          return;
+        }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
         const liKey = normalizeLinkedInUrl(lead.linkedin);
 
@@ -6500,13 +6961,14 @@ export const crmDb = {
           if (uniqueLeads.has(emailKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate email "${lead.email}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
 
           // Check against existing leads — if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
-            leadsToUpdate.push({ existingLead, newData: lead });
+            leadsToUpdate.push({ existingLead, newData: lead, index });
             return;
           }
         }
@@ -6518,36 +6980,71 @@ export const crmDb = {
           if (seenLinkedIn.has(liKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate LinkedIn URL "${lead.linkedin}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
           // Existing-list dedup: same URL → merge into existing lead.
           const existingByLi = existingLeadsByLinkedIn.get(liKey);
           if (existingByLi) {
-            leadsToUpdate.push({ existingLead: existingByLi, newData: lead });
+            leadsToUpdate.push({ existingLead: existingByLi, newData: lead, index });
             seenLinkedIn.add(liKey);
             return;
           }
           seenLinkedIn.add(liKey);
         }
 
-        uniqueLeads.set(emailKey, lead);
+        // ENG-1133: a row with neither an email nor a LinkedIn URL has no
+        // identity to dedupe on, so re-sending a file after a truncated import
+        // wrote it a second time. Fall back to the name+company key — but ONLY
+        // for those rows: a row that carries its own identity keeps the
+        // behaviour above, or two different people who happen to share a name
+        // at one company would be silently merged. Opt-in per caller, see
+        // `options.dedupeByNameCompany`.
+        const nameCompanyKey =
+          options.dedupeByNameCompany && !lead.email?.trim() && !liKey
+            ? computeNameCompanyKey(lead.firstName, lead.lastName, lead.company)
+            : undefined;
+        if (nameCompanyKey) {
+          if (seenNameCompany.has(nameCompanyKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate name/company "${lead.firstName} ${lead.lastName} @ ${lead.company}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
+            return;
+          }
+          const existingByName = existingLeadsByNameCompany.get(nameCompanyKey);
+          if (existingByName) {
+            leadsToUpdate.push({ existingLead: existingByName, newData: lead, index });
+            seenNameCompany.add(nameCompanyKey);
+            return;
+          }
+          seenNameCompany.add(nameCompanyKey);
+        }
+
+        uniqueLeads.set(emailKey, { lead, index });
       });
 
-      // Add unique new leads
-      uniqueLeads.forEach((lead) => {
+      // Add unique new leads (keeping each one's input-array position aligned).
+      const newLeadSourceIndices: number[] = [];
+      uniqueLeads.forEach(({ lead, index }) => {
         newLeads.push(lead);
+        newLeadSourceIndices.push(index);
       });
 
       // Process new leads in batches of 25 (DynamoDB batch write limit)
       const batchSize = 25;
       for (let i = 0; i < newLeads.length; i += batchSize) {
+        // Out of budget: stop here and leave the rest `unprocessed` (ENG-1133).
+        // Their outcomes are already initialised to that, so the caller is told
+        // exactly which rows it still owes.
+        if (outOfTime()) break;
+        unitsDone++;
         const batch = newLeads.slice(i, i + batchSize);
 
-        const batchCreated: Array<{ leadId: string; email?: string }> = [];
-        const writeRequests = batch.map(lead => {
+        const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
+        const writeRequests = batch.map((lead, batchIndex) => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
-          batchCreated.push({ leadId, email: emailValue });
+          batchCreated.push({ leadId, email: emailValue, sourceIndex: newLeadSourceIndices[i + batchIndex] });
 
           const item: any = {
             listId,
@@ -6615,10 +7112,18 @@ export const crmDb = {
           // Promote batch IDs into the global created list only after the write
           // succeeds — keeps results.created in sync with what's actually persisted.
           results.created.push(...batchCreated);
+          batchCreated.forEach(({ sourceIndex }) => {
+            results.rowOutcomes[sourceIndex] = 'created';
+          });
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
-            results.errors.push(`Row ${i + index + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            // Report the row's position in the CALLER's array, not in the
+            // filtered new-lead array — otherwise the row a resume is told to
+            // retry is not the row that failed (ENG-1133).
+            const sourceIndex = newLeadSourceIndices[i + index];
+            results.errors.push(`Row ${sourceIndex + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            results.rowOutcomes[sourceIndex] = 'failed';
           });
         }
       }
@@ -6665,16 +7170,30 @@ export const crmDb = {
         }
       });
 
-      // Update field names in list
+      // Update field names in list. Best-effort: this is display bookkeeping,
+      // and letting it throw would unwind into the catch below and discard the
+      // per-row ledger for an import whose rows are already written — the
+      // caller would be told the whole import failed and would re-send rows
+      // that are in the list (ENG-1133).
       if (allFieldNames.length > 0) {
-        const list = await this.getLeadListById(listId);
-        const existingFieldNames = (list?.fieldNames as string[]) || [];
-        const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
-        await this.updateFieldNames(listId, combinedFieldNames);
+        try {
+          const list = await this.getLeadListById(listId);
+          const existingFieldNames = (list?.fieldNames as string[]) || [];
+          const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
+          await this.updateFieldNames(listId, combinedFieldNames);
+        } catch (fieldNameError: any) {
+          console.error(`batchCreateLeads: failed to update field names for ${listId}:`, fieldNameError?.message || fieldNameError);
+        }
       }
 
       // Process leads to update (merge existing leads with new data)
-      for (const { existingLead, newData } of leadsToUpdate) {
+      for (const { existingLead, newData, index: sourceIndex } of leadsToUpdate) {
+        // Each merge is its own sequential round-trip, so a re-sent file whose
+        // rows are all already present is the slowest shape this function has —
+        // and the one a resume produces. Stop on the budget rather than run past
+        // the caller's timeout (ENG-1133).
+        if (outOfTime()) break;
+        unitsDone++;
         try {
           // Helper to normalize values for comparison
           const normalize = (value: any): string => {
@@ -6783,29 +7302,63 @@ export const crmDb = {
             await this.updateLead(listId, existingLead.leadId, updates);
             results.successCount++;
             results.mergedCount++;
+            results.rowOutcomes[sourceIndex] = 'merged';
+          } else {
+            // No changes needed — the row is already in the list exactly as
+            // supplied. Still an accounted-for outcome, not a silent drop
+            // (ENG-1133): a resume re-sending completed rows lands here.
+            results.alreadyPresentCount++;
+            results.rowOutcomes[sourceIndex] = 'already_present';
           }
-          // If no changes, skip the update (don't count as merged)
         } catch (updateError: any) {
           results.errorCount++;
-          results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.errors.push(`Row ${sourceIndex + 1}: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.rowOutcomes[sourceIndex] = 'failed';
         }
       }
 
-      // Update lead count (only for new leads, updates don't change count)
-      if (newLeads.length > 0) {
-        await this.incrementLeadCount(listId, newLeads.length);
+      // Update lead count (only for new leads, updates don't change count).
+      // Counts rows actually WRITTEN, not rows selected for writing: a batch
+      // that failed, or one the budget stopped us reaching, must not inflate the
+      // list's count (ENG-1133). Best-effort for the same reason as the field
+      // names above — a denormalized counter is recoverable, the ledger is not.
+      if (results.created.length > 0) {
+        try {
+          await this.incrementLeadCount(listId, results.created.length);
+        } catch (countError: any) {
+          console.error(`batchCreateLeads: failed to increment lead count for ${listId}:`, countError?.message || countError);
+        }
       }
 
       return results;
     } catch (error: any) {
       handleDynamoDbError(error, "batchCreateLeads");
+      // NOTE: handleDynamoDbError above always rethrows, so this return is not
+      // reached today — callers see the exception, not this object. It is kept
+      // consistent anyway: the placeholder refusals happened before the failure
+      // and are still true, so they are carried through and the failure is
+      // billed only to the rows actually attempted. Zeroing them would report a
+      // refused placeholder as a database error — the same misreporting
+      // ENG-1002 is about — while still summing to `leads.length` and so
+      // slipping past the accounting invariant unnoticed.
       return {
         successCount: 0,
         newCount: 0,
         mergedCount: 0,
-        errorCount: leads.length,
+        errorCount: leads.length - results.anonymizedSkipped,
         errors: [`Batch upload failed: ${error.message}`],
-        created: [] as Array<{ leadId: string; email?: string }>,
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+        anonymizedSkipped: results.anonymizedSkipped,
+        alreadyPresentCount: 0,
+        // Nothing survived the failure, so every row that was not refused
+        // outright is reported as failed rather than left `unprocessed` —
+        // a resume must retry them, not assume they were never reached.
+        rowOutcomes: results.rowOutcomes.map((outcome) =>
+          outcome === 'anonymized_skipped' ? outcome : ('failed' as LeadImportRowOutcome),
+        ),
+        // A hard failure, not an unreadable list — the caller should report the
+        // error, not the "this list is too large to import into" blocker.
+        dedupeIncomplete: false,
       };
     }
   },
@@ -8909,7 +9462,8 @@ export const socialEngagementTrackingDb = {
     commentId?: string;
     engagingAccountId: string;
     actionType: string;
-  }) {
+    scheduleId: string;
+  }): Promise<boolean> {
     try {
       const dedupId = params.commentId || params.postId;
       const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
@@ -8920,8 +9474,22 @@ export const socialEngagementTrackingDb = {
       await dynamodb.delete({
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Key: { userId: params.userId, postId_engagingAccountId: key },
+        // Only remove the queued reservation that belongs to this schedule.
+        // A failed attempt can be rescheduled under a new ID before an older
+        // schedule reaches cleanup; deleting by key alone would erase that
+        // newer reservation and allow duplicate LinkedIn activity.
+        ConditionExpression: 'scheduleId = :scheduleId AND #status = :queued',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':scheduleId': params.scheduleId,
+          ':queued': 'queued',
+        },
       }).promise();
+      return true;
     } catch (error) {
+      if ((error as any)?.code === 'ConditionalCheckFailedException') {
+        return false;
+      }
       handleDynamoDbError(error, "deleteEngagement");
       throw error;
     }
@@ -9052,6 +9620,26 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing, optionally capped for administrative diagnostics. */
+  async listAll(maxItems?: number): Promise<Organization[]> {
+    if (!maxItems || maxItems < 1) {
+      return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+    }
+
+    const organizations: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        Limit: maxItems - organizations.length,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      organizations.push(...((result.Items || []) as Organization[]));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && organizations.length < maxItems);
+    return organizations;
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,
@@ -9110,7 +9698,23 @@ export const orgDb = {
     }
   },
 
-  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+  /**
+   * `options.condition` mirrors `userDb.updateUser`'s: an optional guard so a
+   * caller doing read-modify-write on an org can refuse to clobber a value that
+   * moved underneath it. Unmet conditions are rethrown verbatim so the caller
+   * can tell "my guard fired" apart from a real DynamoDB fault.
+   */
+  async updateOrg(
+    orgId: string,
+    updates: Partial<Organization>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ): Promise<Organization> {
     const { orgId: _, createdAt: __, ...updatableFields } = updates;
 
     if (Object.keys(updatableFields).length === 0) {
@@ -9153,7 +9757,7 @@ export const orgDb = {
     updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
     if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
-    const params = {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: updateExpressionParts.join(" "),
@@ -9161,6 +9765,11 @@ export const orgDb = {
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes as Organization;
@@ -9378,6 +9987,7 @@ export const orgDb = {
         workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
         skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
         analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
+        crm:               { ...(ss.crm ?? { enabled: true, editors: [] }), editors: strip((ss.crm?.editors) ?? []) },
         brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
         marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
       };

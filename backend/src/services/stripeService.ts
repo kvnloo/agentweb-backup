@@ -408,6 +408,35 @@ export async function syncSubscriptionFromStripe(
 
 // ─── Webhook Event Handlers ────────────────────────────────────────────
 
+export async function handleLlmUsageTopUpCheckoutCompleted(session: any): Promise<void> {
+  const metadata = session?.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') throw new Error('Invalid usage top-up checkout metadata');
+  if (session.payment_status !== 'paid') {
+    // Async payment methods are granted by checkout.session.async_payment_succeeded.
+    return;
+  }
+  const billingUserId = String(metadata.billingUserId || '');
+  const amountMicroUsd = Number(metadata.usageCreditMicroUsd);
+  const minimumMarkupBps = Number(metadata.minimumMarkupBps);
+  const paidCents = Number(session.amount_total);
+  const topUpGrantId = String(metadata.topUpGrantId || session.id || '');
+  if (!billingUserId) throw new Error('billingUserId is required');
+  if (!topUpGrantId) throw new Error('topUpGrantId is required');
+  if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) throw new Error('Invalid usage credit amount');
+  if (!Number.isInteger(minimumMarkupBps) || minimumMarkupBps < 10_000) throw new Error('Invalid usage top-up markup');
+  if (!Number.isInteger(paidCents) || paidCents <= 0) throw new Error('Invalid usage top-up payment amount');
+  if (paidCents * 10_000 * 10_000 < amountMicroUsd * minimumMarkupBps) {
+    throw new Error('Usage top-up payment is below the configured minimum markup');
+  }
+  const { grantMonthlyLlmUsageCredit } = await import('./llmUsageCreditService');
+  await grantMonthlyLlmUsageCredit({
+    billingUserId,
+    grantId: `stripe:${topUpGrantId}`,
+    source: 'purchase',
+    amountMicroUsd,
+  });
+}
+
 /**
  * Handle checkout.session.completed — link Stripe customer/subscription to user.
  */
@@ -865,6 +894,7 @@ export async function handleInvoicePaymentFailed(invoice: any): Promise<void> {
  * Handle charge.refunded — record the refund in payment history.
  */
 export async function handleChargeRefunded(charge: any): Promise<void> {
+  const metadata = charge.metadata || {};
   const customerId = typeof charge.customer === 'string'
     ? charge.customer
     : charge.customer?.id;
@@ -874,10 +904,42 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
     return;
   }
 
-  const user = await findUserByStripeCustomerId(customerId);
+  const metadataBillingUserId = String(metadata.billingUserId || '');
+  const user = metadata.purchaseType === 'llm_usage_top_up' && metadataBillingUserId
+    ? await userDb.getUserById(metadataBillingUserId)
+    : await findUserByStripeCustomerId(customerId);
   if (!user) {
     console.warn(`[STRIPE] No user found for charge.refunded. customer=${customerId}`);
     return;
+  }
+
+  if (metadata.purchaseType === 'llm_usage_top_up') {
+    const amountPaidCents = Number(charge.amount);
+    const amountRefundedCents = Number(charge.amount_refunded);
+    const purchasedMicroUsd = Number(metadata.usageCreditMicroUsd);
+    const topUpGrantId = String(metadata.topUpGrantId || '');
+    const billingUserId = user.userId;
+    if (
+      !topUpGrantId ||
+      !Number.isInteger(amountPaidCents) || amountPaidCents <= 0 ||
+      !Number.isInteger(amountRefundedCents) || amountRefundedCents < 0 ||
+      !Number.isInteger(purchasedMicroUsd) || purchasedMicroUsd <= 0
+    ) {
+      throw new Error(`Invalid usage top-up refund metadata for charge ${charge.id}`);
+    }
+    const targetReversedMicroUsd = charge.refunded
+      ? purchasedMicroUsd
+      : Math.min(
+          purchasedMicroUsd,
+          Math.round((purchasedMicroUsd * amountRefundedCents) / amountPaidCents),
+        );
+    const { reverseMonthlyPurchasedLlmUsageCredit } = await import('./llmUsageCreditService');
+    await reverseMonthlyPurchasedLlmUsageCredit({
+      billingUserId,
+      grantId: `stripe:${topUpGrantId}`,
+      reversalId: `charge:${charge.id}:refunded:${amountRefundedCents}`,
+      targetReversedMicroUsd,
+    });
   }
 
   // Record in payment history

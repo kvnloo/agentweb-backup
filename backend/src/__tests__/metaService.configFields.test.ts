@@ -149,3 +149,87 @@ describe('MetaService config-field reads (ENG-398)', () => {
     expect(getAdSets).not.toHaveBeenCalled();
   });
 });
+
+// ENG-785 — spend_cap was missed in the ENG-398 widening: same defect class, same
+// file, same fix shape. CAMPAIGN LIST must surface spend_cap by default, honor it in
+// an explicit selection, and keep rejecting unknown fields loudly.
+describe('MetaService CAMPAIGN spend_cap read (ENG-785)', () => {
+  let service: MetaService;
+  const token = 'mock_token';
+  const accountId = '1234567890';
+
+  beforeEach(() => {
+    service = MetaService.getInstance();
+    jest.clearAllMocks();
+  });
+
+  it('CAMPAIGN LIST default: requests spend_cap (and budget_remaining) from Graph', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([{ _data: { id: 'c1' } }]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token);
+
+    const requestedFields = getCampaigns.mock.calls[0][0] as string[];
+    expect(requestedFields).toEqual(expect.arrayContaining(['spend_cap', 'budget_remaining']));
+  });
+
+  it('CAMPAIGN LIST honors an explicit fields selection including spend_cap', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token, { fields: 'spend_cap,budget_remaining' });
+
+    expect(getCampaigns).toHaveBeenCalledWith(['spend_cap', 'budget_remaining']);
+  });
+
+  it('CAMPAIGN LIST passes spend_cap through from the Graph response unmodified', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([
+      { _data: { id: 'c1', spend_cap: '92200', budget_remaining: '150' } },
+    ]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    const result = await service.listCampaigns(accountId, token);
+
+    expect(result).toEqual([{ id: 'c1', spend_cap: '92200', budget_remaining: '150' }]);
+  });
+
+  it('CAMPAIGN LIST single-campaign read (campaign_id) includes spend_cap in the requested fields', async () => {
+    const get = jest.fn().mockResolvedValue({ _data: { id: 'camp_9', spend_cap: '5000' } });
+    (Campaign as unknown as jest.Mock).mockImplementation(() => ({ get }));
+
+    const result = await service.listCampaigns(accountId, token, { campaignId: 'camp_9' });
+
+    expect(get.mock.calls[0][0]).toEqual(expect.arrayContaining(['spend_cap']));
+    expect(result).toEqual([{ id: 'camp_9', spend_cap: '5000' }]);
+  });
+
+  it('CAMPAIGN LIST still rejects unknown fields LOUDLY after the widening (ENG-398 regression pin)', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await expect(
+      service.listCampaigns(accountId, token, { fields: 'spend_cap,not_a_real_field' })
+    ).rejects.toThrow(/Unsupported campaign field\(s\): not_a_real_field/);
+    expect(getCampaigns).not.toHaveBeenCalled();
+  });
+
+  it('CAMPAIGN LIST treats an empty fields selection as the default boundary', async () => {
+    const getCampaigns = jest.fn().mockResolvedValue([]);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await service.listCampaigns(accountId, token, { fields: ' , ' });
+
+    expect(getCampaigns).toHaveBeenCalledWith(expect.arrayContaining(['spend_cap', 'budget_remaining']));
+  });
+
+  it('CAMPAIGN LIST propagates Graph errors with structured context', async () => {
+    const graphError = Object.assign(new Error('Graph unavailable'), { code: 2 });
+    const getCampaigns = jest.fn().mockRejectedValue(graphError);
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ getCampaigns }));
+
+    await expect(service.listCampaigns(accountId, token)).rejects.toMatchObject({
+      message: 'Graph unavailable',
+      structuredError: expect.objectContaining({ classification: 'RETRYABLE_ERROR', code: 2 }),
+    });
+  });
+});

@@ -22,6 +22,24 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-827 (Greptile): the publish authorization the CALLER already resolved, carried
+  // across the worker boundary so the system prompt is built from the same value the
+  // required-function checker uses. Two independent reads can land either side of a
+  // revocation and disagree — and the disagreement that matters is a prompt saying
+  // "draft only" while the checker still demands a publishing tool, which is the retry
+  // loop this ticket exists to fix. Plain data, so it survives serialization.
+  publishAuthorizationOverride?: { authorized: boolean; tools: string[] };
+  // ENG-907: epoch ms at which the caller started this turn's whole-turn wall-clock
+  // cap. Passed through to the loop so its time budget uses the SAME deadline the
+  // caller enforces, rather than one that starts after the fork IPC hop.
+  turnStartMs?: number;
+  // Explicit cost-policy fallback. `null` survives IPC and means no retry;
+  // omission preserves the global admin fallback for unrestricted requests.
+  transientFallbackModel?: string | null;
+  // ENG-936: approved source URLs for confirmed image revisions. When supplied,
+  // the tool dispatcher rejects confirm=true generate_image calls that reference
+  // any unapproved source image for this run.
+  approvedRevisionImageSources?: string[];
 }
 
 interface GenerateMarketingResponseResult {
@@ -297,6 +315,25 @@ export class GenerateMarketingResponseWorkerService {
     const requestId = this.sessionToRequestId.get(sessionId);
     if (requestId && this.worker && !this.worker.killed) {
       this.worker.send({ type: 'cancel', requestId });
+    }
+  }
+
+  /**
+   * ENG-1118: tell the worker to release a finished chat session's MCP clients.
+   *
+   * Browser MCP servers pool per chat session and those pools live in the worker process,
+   * so a caller in this process cannot reclaim them directly — a scheduled run's Chromium
+   * would sit idle until the pool sweep. Fire-and-forget, like cancelSession: never starts
+   * a worker (with no worker there is nothing to release) and never throws into the
+   * caller's `finally`.
+   */
+  releaseSessionClients(sessionId: string): void {
+    if (!sessionId) return;
+    if (!this.worker || this.worker.killed) return;
+    try {
+      this.worker.send({ type: 'releaseSessionClients', sessionId });
+    } catch (error) {
+      console.warn(`[Worker] Could not signal MCP client release for session ${sessionId}:`, (error as Error).message);
     }
   }
 

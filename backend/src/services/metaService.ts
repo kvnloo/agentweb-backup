@@ -11,6 +11,11 @@ export interface MetaAdsCampaignParams {
   objective: string;
   status?: string;
   special_ad_categories?: string[];
+  // Lifetime hard-stop spend cap for the campaign, in the ad account currency's MINOR units
+  // (cents) — e.g. 300000 = $3,000. Kept in minor units to match Meta's own field and the
+  // long-standing CAMPAIGN UPDATE pass-through, which already applies this value verbatim;
+  // converting only here would silently reinterpret every existing caller's number by 100x.
+  spend_cap?: number;
 }
 
 export interface MetaAdsAdSetParams {
@@ -172,7 +177,7 @@ export class MetaService {
    */
   private static readonly CAMPAIGN_READ_FIELDS = [
     'id', 'name', 'status', 'objective',
-    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
   ] as const;
 
@@ -300,6 +305,84 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+    MetaService.assertValidSpendCap(params.spend_cap);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
+  }
+
+  /**
+   * `spend_cap` is a whole number of minor currency units, so anything else is a caller
+   * mistake we should catch rather than forward: a fraction (1000.5), a negative, a NaN from
+   * a bad parse, or a string. Meta would reject most of these, but as an opaque "Invalid
+   * parameter" — and on CREATE that rejection arrives AFTER the campaign question is settled,
+   * where a clear pre-flight message costs nothing. 0 is rejected here too, matching Meta,
+   * which refuses it explicitly ("Spend Cap Can't Be Zero", subcode 1885099): removing a cap
+   * is a different operation, not a cap of nothing.
+   */
+  public static assertValidSpendCap(value: unknown): void {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+      throw new Error(
+        `Campaign "spend_cap" must be a positive whole number of cents (e.g. 300000 = $3,000) — got ${JSON.stringify(value)}. ` +
+        `It is NOT in dollars: multiply the amount the user asked for by 100. ` +
+        `To remove an existing cap, do not send 0 — Meta rejects that.`
+      );
+    }
+  }
+
+  /**
+   * Params `createCampaign` actually forwards to Meta, plus the ones this layer legitimately
+   * consumes before the call (the objective gate's `objective_quote`, the write-confirmation
+   * gate's `confirm`, and the wrapper-injected `account_id`). Anything else a caller sends on
+   * CAMPAIGN CREATE is dropped by createCampaign's literal-key allow-list.
+   */
+  private static readonly CAMPAIGN_CREATE_APPLIED_PARAMS = [
+    'name', 'objective', 'status', 'special_ad_categories', 'spend_cap',
+    'advantage_campaign_budget', 'budget_amount',
+  ] as const;
+
+  private static readonly CAMPAIGN_CREATE_CONSUMED_PARAMS = [
+    'account_id', 'objective_quote', 'confirm', 'fields',
+  ] as const;
+
+  /**
+   * Reject a CAMPAIGN CREATE param that would not be applied, BEFORE anything is created.
+   * A silently-dropped param plus a success message is how a campaign was created with no
+   * spend cap while the operator was told the cap was in place (ENG-1018) — money-affecting
+   * fields must fail loudly. Rejecting pre-flight means nothing is created, so the caller
+   * fixes the params and retries with no orphaned campaign to clean up.
+   *
+   * This deliberately refuses ANY param outside the mapped set, including genuine Meta
+   * campaign fields. Forwarding those was tried and reverted: a live create with
+   * `start_time` on the test ad account was accepted by Meta with no error and then
+   * IGNORED (the campaign read back the 1969 epoch placeholder — campaign scheduling comes
+   * from the ad sets), while `buying_type` in the same call applied. Passing a field through
+   * therefore does not mean it takes effect, and we cannot tell which is which without
+   * per-field knowledge — so forwarding would have rebuilt this very bug one layer up:
+   * accepted, reported successful, never applied. A loud refusal that names the field is
+   * worse UX and better behaviour.
+   */
+  private static assertNoUnappliedCampaignCreateParams(params: Partial<MetaAdsCampaignParams>): void {
+    const handled = new Set<string>([
+      ...MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS,
+      ...MetaService.CAMPAIGN_CREATE_CONSUMED_PARAMS,
+    ]);
+    const unapplied = Object.keys(params || {}).filter(
+      key => !handled.has(key) && (params as any)[key] !== undefined
+    );
+    if (unapplied.length === 0) return;
+
+    throw new Error(
+      `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
+      `to the campaign, so this create was rejected instead of silently ignoring them. ` +
+      `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
+      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars) — ` +
+      `do NOT pass daily_budget/lifetime_budget here. ` +
+      `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Scheduling (start_time/stop_time) comes from the campaign's AD SETS — Meta accepts those ` +
+      `on a campaign create and then ignores them, so set them on AD_SET CREATE. ` +
+      `Ad-set fields (bid_strategy, bid_amount, targeting, ` +
+      `optimization_goal, billing_event, end_time) belong on AD_SET CREATE too.`
+    );
   }
 
   /**
@@ -331,6 +414,9 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+
+    MetaService.assertValidSpendCap(params.spend_cap);
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
   /**
@@ -875,7 +961,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
       const result = await campaign.get(fields);
       return result._data;
@@ -944,6 +1030,15 @@ export class MetaService {
       // Handle Advantage Campaign Budget (CBO)
       if ((params as any).advantage_campaign_budget && (params as any).budget_amount) {
         finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
+      }
+
+      // Campaign hard-stop spend cap, in minor units (cents), forwarded verbatim — the same
+      // way CAMPAIGN UPDATE has always sent it. This allow-list used to omit spend_cap
+      // entirely, so a create that asked for a cap produced an UNCAPPED campaign and still
+      // reported success (ENG-1018). The caller verifies the applied value with a read-back;
+      // this only guarantees the request reaches Meta.
+      if (params.spend_cap !== undefined && params.spend_cap !== null) {
+        finalParams.spend_cap = params.spend_cap;
       }
 
       this.log(`Attempting createCampaign with literal keys:`, finalParams);
@@ -1084,7 +1179,15 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const adSet = new AdSet(adSetId);
-      const fields = ['id', 'name', 'status', 'campaign_id'];
+      // ENG-838 AC4: the read-back after a create has to be able to prove the
+      // spend-shaping settings landed, so the delivery fields ride along with
+      // the write-target fields. Requesting more fields does not change the
+      // shape callers already read (id/name/status/campaign_id).
+      const fields = [
+        'id', 'name', 'status', 'campaign_id',
+        'bid_strategy', 'bid_amount', 'daily_budget', 'lifetime_budget',
+        'start_time', 'end_time'
+      ];
       this.log(`Fetching ad set: ${adSetId}`);
       const result = await adSet.get(fields);
       return result._data;
@@ -2284,6 +2387,161 @@ export class MetaService {
       }
 
       return { pixelId: pixels[0].id, accountId };
+    } catch (error: any) {
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
+   * Calendly's resolution (ENG-1141) — deliberately NOT resolveMetaPixelForUser, because
+   * a booking webhook is unattended (no human to prompt when ambiguous), so this defaults
+   * to the caller's first connected account and its first pixel instead of refusing. An
+   * explicit `stored` choice (the Calendly card's own account/pixel dropdowns) always wins
+   * when both fields are present. Never throws, same AC3 guarantee as resolveMetaPixelForUser.
+   */
+  /**
+   * Does the stored pixel still exist on its (still-connected) account?
+   *
+   * Cache-first by design: `/pixels` already caches the customer's full pixel set per user and
+   * invalidates it on connect/disconnect, so a warm entry answers this for free. Only a cold
+   * cache costs one Graph call, scoped to the single stored account rather than a full fan-out.
+   *
+   * FAILS OPEN. If the check itself cannot run — expired token, Graph outage, malformed record —
+   * the answer is "keep the customer's explicit choice". Falling back to auto-resolution on an
+   * outage would silently repoint a working configuration at a different pixel, which is worse
+   * than briefly honoring one that may have been deleted (that case degrades visibly: the CAPI
+   * send fails and is recorded in the job's `failures`).
+   *
+   * The partial result is deliberately NOT written back into the /pixels cache: it covers one
+   * account, and storing it would make a later full read believe the customer has no others.
+   */
+  private async storedPixelStillExists(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string },
+  ): Promise<boolean> {
+    try {
+      const { getCachedPixels } = await import('./metaPixelsCache');
+      const cached = getCachedPixels(userId);
+      if (cached) {
+        return cached.some((p) => p.pixelId === stored.pixelId && p.accountId === stored.accountId);
+      }
+
+      const { getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // Two failures that must NOT be treated alike (Greptile round 5 on #2384).
+      //
+      // Credentials failing is evidence about the stored pair itself: that account's token is
+      // gone or unusable, so keeping the selection would send every later booking down a path
+      // whose credentials cannot resolve — retried to exhaustion while a healthy pixel on
+      // another connected account sits unused. That is the exact failure the connectivity
+      // check exists to prevent, so treat it as "not usable" and let the search continue.
+      let credentials: { accountId: string; accessToken: string };
+      try {
+        credentials = await getMetaAccountCredentials(user, userId, stored.accountId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} has no usable credentials ` +
+          `(${error?.message}) — falling back to auto-resolution`,
+        );
+        return false;
+      }
+
+      // A Graph failure is evidence about Meta, not about the choice. Keep it: repointing a
+      // working configuration because of a transient outage is worse than briefly honoring a
+      // pixel that may have been deleted, which degrades visibly as a recorded CAPI failure.
+      try {
+        const pixels = await this.listPixels(credentials.accountId, credentials.accessToken);
+        return (pixels || []).some((p: any) => p.id === stored.pixelId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Could not reach Meta to verify stored pixel ${stored.pixelId} ` +
+          `(keeping the customer's choice): ${error?.message}`,
+        );
+        return true;
+      }
+    } catch (error: any) {
+      // The cache lookup or module import failed — nothing learned about the pair either way.
+      console.warn(
+        `[Meta] Could not verify stored pixel ${stored.pixelId} (keeping the customer's choice): ${error?.message}`,
+      );
+      return true;
+    }
+  }
+
+  public async resolveMetaPixelWithDefault(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string } | undefined,
+  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // The stored pair is a snapshot of a choice made earlier, so it can outlive the
+      // connection it names — the customer disconnects that Meta account, or a reconnect
+      // issues a different account id. Honoring it blindly sends every later booking down
+      // a path whose credentials no longer resolve: the CAPI leg throws, the job is marked
+      // failed and retried to exhaustion, and a healthy pixel on another connected account
+      // is never tried (Greptile P1 on #2384; Pass 1 of this feature had this check and the
+      // Pass-2 rework dropped it). The check is LOCAL — it reads the already-loaded user
+      // record — deliberately not a Graph round-trip on every booking just to confirm a
+      // stored choice. A pixel deleted from a still-connected account therefore still gets
+      // honored here and surfaces as a CAPI failure instead; catching that would cost a
+      // per-booking API call, which this resolver exists to avoid.
+      if (stored?.pixelId && stored?.accountId) {
+        let storedAccountStillConnected = true;
+        try {
+          storedAccountStillConnected = getConnectedMetaAccountsList(user)
+            .some((account: { accountId: string }) => account.accountId === stored.accountId);
+        } catch {
+          // Unreadable/malformed user record: keep the customer's explicit choice rather
+          // than silently downgrading it to "whatever account comes first".
+          storedAccountStillConnected = true;
+        }
+        if (storedAccountStillConnected) {
+          // The account surviving is only half of staleness — the pixel itself can be deleted
+          // from an account that is still connected (Greptile round 4 on #2384). Verified via
+          // the shared /pixels cache, so the common case (a customer who just looked at the
+          // picker, or any second booking inside the TTL) costs no Graph traffic at all.
+          if (await this.storedPixelStillExists(user, userId, stored)) {
+            return { pixelId: stored.pixelId, accountId: stored.accountId };
+          }
+          console.warn(
+            `[Meta] Stored Calendly attribution pixel ${stored.pixelId} no longer exists on account ` +
+            `${stored.accountId} — falling back to auto-resolution`,
+          );
+        }
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} is no longer connected — falling back to auto-resolution`,
+        );
+      }
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+
+      // Search every connected account in order for the first one that actually has
+      // a pixel — the whole point of this resolver is "always resolvable once ANY
+      // connected account has a pixel," so it can't stop at accounts[0] just because
+      // that particular account happens to have none (a real regression caught live:
+      // a customer's first-listed account had 0 pixels while a later one had 1, and
+      // the naive accounts[0]-only version reproduced the exact silent-skip bug this
+      // resolver exists to fix). One account's failure (expired token, Graph error)
+      // is skipped, not fatal — the next account still gets a fair try.
+      let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      for (const account of accounts) {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
+          const pixels = await this.listPixels(accountId, accessToken);
+          if (pixels && pixels.length > 0) {
+            return { pixelId: pixels[0].id, accountId };
+          }
+        } catch (error: any) {
+          lastReason = error?.message || lastReason;
+        }
+      }
+      return { unresolved: true, reason: lastReason };
     } catch (error: any) {
       return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
     }

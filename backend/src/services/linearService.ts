@@ -240,6 +240,13 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
  * Optional triage fields (ENG-187): `priority` (Linear enum 1=Urgent 2=High 3=Medium 4=Low),
  * `stateName` (workflow state by name, e.g. "Todo"; falls back to the backlog state when omitted
  * or unknown), `assigneeId` (Linear user uuid).
+ *
+ * Returns `null` — filing nothing — outside production (ENG-1099). This rail files real rows on the
+ * production board, so a test-env/local/preview backend filing through it manufactures issues
+ * indistinguishable from genuine production incidents, and inflates the ENG-240 dedupe clusters that
+ * assume a filed cluster reflects production reality. `sendOncallAlert` sits on the same failure
+ * paths and has always been guarded this way; this uses that same NODE_ENV mechanism deliberately
+ * rather than introducing a second environment convention. Callers must handle `null`.
  */
 export async function createInternalLinearIssue(params: {
   title: string;
@@ -248,7 +255,14 @@ export async function createInternalLinearIssue(params: {
   priority?: number;
   stateName?: string;
   assigneeId?: string;
-}): Promise<LinearIssueResult> {
+}): Promise<LinearIssueResult | null> {
+  if (process.env.NODE_ENV !== 'production') {
+    // Loud, not silent: a developer debugging locally still sees the intake decision it would have made.
+    console.log(
+      `[DEV] Suppressed Linear issue creation: ${params.title} [${params.labelNames.join(', ')}]\n${params.description}`,
+    );
+    return null;
+  }
   const meta = await getTeamMeta();
   const labelIds = resolveLabelIdsLoud(meta, params.labelNames);
   const input: Record<string, any> = {

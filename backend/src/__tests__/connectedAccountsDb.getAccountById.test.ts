@@ -19,10 +19,12 @@ let mockUsers: Record<string, any> = {};
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn((id: string) => Promise.resolve(mockUsers[id] ?? null)),
+    getUserByIdConsistent: jest.fn((id: string) => Promise.resolve(mockUsers[id] ?? null)),
   },
 }));
 
-import { getAccountById } from '../services/connectedAccountsDb';
+import { getAccountById, getAccountByIdConsistent } from '../services/connectedAccountsDb';
+import { userDb } from '../services/db';
 
 const makeAccount = (platform: string, accountId: string) => ({
   platform,
@@ -97,5 +99,22 @@ describe('getAccountById', () => {
     const result = await getAccountById('shared-acct', 'user-a');
     expect(result).not.toBeNull();
     expect(result!.platform).toBe('google_drive');
+  });
+
+  it('uses the strongly current user record so a recently disconnected account cannot be returned', async () => {
+    const staleUser = {
+      userId: 'user-a',
+      connected_accounts: [makeAccount('linkedin', 'linkedin-account')],
+    };
+    (userDb.getUserById as jest.Mock).mockResolvedValue(staleUser);
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({
+      userId: 'user-a',
+      connected_accounts: [],
+    });
+
+    const result = await getAccountByIdConsistent('linkedin-account', 'user-a', 'linkedin');
+
+    expect(result).toBeNull();
+    expect(userDb.getUserByIdConsistent).toHaveBeenCalledWith('user-a');
   });
 });
