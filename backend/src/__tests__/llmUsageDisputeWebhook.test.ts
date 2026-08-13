@@ -46,20 +46,7 @@ const topUpCharge = {
   },
 };
 
-const DISPUTE_CREATED_SEC = 1_800_000_000; // deterministic sample; Stripe-shape unix seconds
-// Kept in sync with disputeIdOffsetMs() in stripeService.ts. Recompute here
-// so the assertions catch any drift in the offset formula.
-function idOffsetFor(id: string): number {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = ((h << 5) - h + id.charCodeAt(i)) | 0;
-  return Math.abs(h) % 500;
-}
-const DISPUTE_OPENED_TS = new Date(
-  DISPUTE_CREATED_SEC * 1000 + idOffsetFor('dp_1'),
-).toISOString();
-const DISPUTE_CLOSED_TS = new Date(
-  DISPUTE_CREATED_SEC * 1000 + idOffsetFor('dp_1') + 500,
-).toISOString();
+const DISPUTE_CREATED_SEC = 1_800_000_000; // Stripe-shape unix seconds (still passed through, not used for keying)
 
 const fullDispute = {
   id: 'dp_1',
@@ -74,6 +61,7 @@ const fullDispute = {
 describe('AgentWeb Credits chargeback handling', () => {
   let getUser: jest.SpyInstance;
   let record: jest.SpyInstance;
+  let getByUserId: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -81,11 +69,14 @@ describe('AgentWeb Credits chargeback handling', () => {
     mockStripe.charges.retrieve.mockResolvedValue(topUpCharge);
     getUser = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'u1' } as any);
     record = jest.spyOn(paymentHistoryDb, 'record').mockResolvedValue(undefined as any);
+    // Default: no prior history for the user, so dedup lets the write through.
+    getByUserId = jest.spyOn(paymentHistoryDb, 'getByUserId').mockResolvedValue([]);
   });
 
   afterEach(() => {
     getUser.mockRestore();
     record.mockRestore();
+    getByUserId.mockRestore();
   });
 
   describe('dispute opened', () => {
@@ -154,32 +145,41 @@ describe('AgentWeb Credits chargeback handling', () => {
       expect(first[0].reversalId).toBe(second[0].reversalId);
     });
 
-    it('uses a deterministic timestamp derived from dispute.created so webhook redelivery replaces the same history row', async () => {
+    it('skips a duplicate dispute_opened history row when the same disputeId is already recorded', async () => {
+      // Simulate a prior dispute_opened row for this dispute in history.
+      getByUserId.mockResolvedValueOnce([
+        {
+          userId: 'u1',
+          timestamp: '2026-08-13T10:00:00.000Z',
+          eventType: 'dispute_opened',
+          amount: 2500,
+          currency: 'usd',
+          status: 'disputed',
+          metadata: { disputeId: 'dp_1' },
+        },
+      ]);
+
+      await handleChargeDisputeCreated(fullDispute);
+
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('does not treat an unrelated dispute_opened row as a duplicate', async () => {
+      getByUserId.mockResolvedValueOnce([
+        {
+          userId: 'u1',
+          timestamp: '2026-08-13T10:00:00.000Z',
+          eventType: 'dispute_opened',
+          amount: 4200,
+          currency: 'usd',
+          status: 'disputed',
+          metadata: { disputeId: 'dp_OTHER' },
+        },
+      ]);
+
       await handleChargeDisputeCreated(fullDispute);
 
       expect(record).toHaveBeenCalledTimes(1);
-      const arg = (record.mock.calls[0]![0] as any);
-      expect(arg.timestamp).toBe(DISPUTE_OPENED_TS);
-    });
-
-    it('separates two disputes that share the same dispute.created second by hashing the dispute id into the timestamp offset', async () => {
-      await handleChargeDisputeCreated(fullDispute);
-      const firstTs = (record.mock.calls[0]![0] as any).timestamp;
-
-      // Same createdSec, different dispute id → must produce a different sort
-      // key so the second dispute's audit row is not silently overwritten by
-      // the first one's Put.
-      await handleChargeDisputeCreated({ ...fullDispute, id: 'dp_2' });
-      const secondTs = (record.mock.calls[1]![0] as any).timestamp;
-
-      expect(firstTs).not.toBe(secondTs);
-      // Both must still be inside the same wall-clock second (baseMs ..
-      // baseMs+999) — the offset stays under 1000ms.
-      const baseMs = DISPUTE_CREATED_SEC * 1000;
-      expect(new Date(firstTs).getTime()).toBeGreaterThanOrEqual(baseMs);
-      expect(new Date(firstTs).getTime()).toBeLessThan(baseMs + 1000);
-      expect(new Date(secondTs).getTime()).toBeGreaterThanOrEqual(baseMs);
-      expect(new Date(secondTs).getTime()).toBeLessThan(baseMs + 1000);
     });
 
     it('records the true reversal outcome when no current-month grant exists to revoke', async () => {
@@ -222,12 +222,40 @@ describe('AgentWeb Credits chargeback handling', () => {
       expect(mockReverse).not.toHaveBeenCalled();
     });
 
-    it('uses a deterministic timestamp 1ms after the opened row, so redelivery collapses and opened/closed stay distinct', async () => {
+    it('skips a duplicate dispute_closed row when the same disputeId is already recorded', async () => {
+      getByUserId.mockResolvedValueOnce([
+        {
+          userId: 'u1',
+          timestamp: '2026-08-13T10:00:00.000Z',
+          eventType: 'dispute_closed',
+          amount: 2500,
+          currency: 'usd',
+          status: 'won',
+          metadata: { disputeId: 'dp_1' },
+        },
+      ]);
+
+      await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
+
+      expect(record).not.toHaveBeenCalled();
+    });
+
+    it('records dispute_closed even when a prior dispute_opened row for the same id exists — different event types are not duplicates', async () => {
+      getByUserId.mockResolvedValueOnce([
+        {
+          userId: 'u1',
+          timestamp: '2026-08-13T10:00:00.000Z',
+          eventType: 'dispute_opened',
+          amount: 2500,
+          currency: 'usd',
+          status: 'disputed',
+          metadata: { disputeId: 'dp_1' },
+        },
+      ]);
+
       await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
 
       expect(record).toHaveBeenCalledTimes(1);
-      const arg = (record.mock.calls[0]![0] as any);
-      expect(arg.timestamp).toBe(DISPUTE_CLOSED_TS);
     });
   });
 });

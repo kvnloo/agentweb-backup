@@ -1045,12 +1045,20 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
     ? 'revoked'
     : 'no_current_month_grant';
 
-  // Deterministic timestamp so Stripe webhook redelivery replaces the same
-  // (userId, timestamp) item instead of appending a duplicate history row.
-  // dispute.created is unix-seconds and unchanged across redeliveries.
+  // Idempotency via query-before-put on disputeId in metadata (the earlier
+  // "deterministic timestamp derived from dispute.created + id-hash offset"
+  // scheme still collided on the ~500 slots per second and let two disputes
+  // for the same billing user in the same second silently overwrite each
+  // other's audit rows). Wall-clock timestamp lets each dispute keep its
+  // own row, and the query check keeps webhook retries from appending a
+  // duplicate. Reversal is already idempotent via its own reversalId key.
+  if (await disputeHistoryAlreadyRecorded(user.userId, 'dispute_opened', dispute.id)) {
+    console.log(`[STRIPE] dispute_opened for ${dispute.id} already recorded — skipping duplicate history`);
+    return;
+  }
   await paymentHistoryDb.record({
     userId: user.userId,
-    timestamp: disputeEventTimestamp(dispute, 'opened'),
+    timestamp: new Date().toISOString(),
     eventType: 'dispute_opened',
     amount: amountDisputedCents,
     currency: dispute.currency || charge.currency || 'usd',
@@ -1070,42 +1078,32 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
 }
 
 /**
- * Deterministic ISO timestamp for a dispute-driven payment-history row.
+ * Idempotency check for dispute-driven payment-history rows: scans the user's
+ * recent history for a row with the same event type AND matching disputeId
+ * in metadata. Returns true if one is already recorded, so the caller can
+ * skip a duplicate Put on webhook redelivery.
  *
- * Stripe sends `dispute.created` (unix seconds) unchanged on every redelivery,
- * so keying the row's sort key off it collapses retries into a same-key Put
- * (DynamoDB replaces, no duplicate). The `+1ms` offset for the closed event
- * keeps the opened/closed rows on distinct sort keys for the same dispute.
+ * Replaces an earlier deterministic-timestamp scheme (dispute.created +
+ * id-hash offset) that collided at scale: distinct disputes for the same
+ * billing user with hash-colliding ids in the same second overwrote each
+ * other's audit rows. Query-before-put has bounded cost (100-row lookup)
+ * and no collision risk.
+ *
+ * Lookback of 100 covers realistic redelivery windows (minutes-to-hours).
+ * If a user ever accumulates more than 100 payment events between an
+ * original dispute event and its redelivery, the dedup window slips and a
+ * duplicate could land — the fix at that scale is a GSI on disputeId.
  */
-function disputeEventTimestamp(dispute: any, kind: 'opened' | 'closed'): string {
-  const createdSec = Number(dispute?.created);
-  if (!Number.isFinite(createdSec) || createdSec <= 0) {
-    // Fall back to wall-clock only when Stripe omits `created` entirely —
-    // shouldn't happen for real dispute payloads.
-    return new Date().toISOString();
-  }
-  const baseMs = Math.round(createdSec * 1000);
-  // Fold dispute.id into a stable 0-499ms offset so two DIFFERENT disputes
-  // that share the same dispute.created second don't collide on the same
-  // (userId, timestamp) key. Same dispute across retries → same offset →
-  // same key → Put replaces (idempotent). ~500 slots per second → birthday
-  // collision needs ~26 same-second disputes for one billing user before
-  // hitting 50% probability, which the traffic shape does not sustain. The
-  // opened event uses the base offset; the closed event adds 500 so
-  // opened/closed for the same dispute stay on distinct sort keys without
-  // overlapping any other dispute's opened slot.
-  const idOffset = disputeIdOffsetMs(String(dispute?.id || ''));
-  const kindOffset = kind === 'closed' ? 500 : 0;
-  return new Date(baseMs + idOffset + kindOffset).toISOString();
-}
-
-function disputeIdOffsetMs(id: string): number {
-  // Simple deterministic 32-bit hash mapped into 0..499. Idempotent per id.
-  let h = 0;
-  for (let i = 0; i < id.length; i++) {
-    h = ((h << 5) - h + id.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h) % 500;
+const DISPUTE_HISTORY_DEDUP_LOOKBACK = 100;
+async function disputeHistoryAlreadyRecorded(
+  userId: string,
+  eventType: 'dispute_opened' | 'dispute_closed',
+  disputeId: string,
+): Promise<boolean> {
+  const recent = await paymentHistoryDb.getByUserId(userId, DISPUTE_HISTORY_DEDUP_LOOKBACK);
+  return recent.some(
+    (r) => r.eventType === eventType && (r.metadata as any)?.disputeId === disputeId,
+  );
 }
 
 /**
@@ -1135,13 +1133,16 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
     return;
   }
 
-  // Deterministic timestamp derived from dispute.created (+1ms offset from
-  // the opened row so both events for the same dispute stay on distinct sort
-  // keys) — Stripe redelivery lands at the same (userId, timestamp) key so
-  // the Put replaces rather than duplicates.
+  // Idempotency via query-before-put on disputeId in metadata (see
+  // handleChargeDisputeCreated for the rationale — the deterministic-
+  // timestamp scheme it replaced collided at scale).
+  if (await disputeHistoryAlreadyRecorded(user.userId, 'dispute_closed', dispute.id)) {
+    console.log(`[STRIPE] dispute_closed for ${dispute.id} already recorded — skipping duplicate history`);
+    return;
+  }
   await paymentHistoryDb.record({
     userId: user.userId,
-    timestamp: disputeEventTimestamp(dispute, 'closed'),
+    timestamp: new Date().toISOString(),
     eventType: 'dispute_closed',
     amount: Number(dispute.amount) || 0,
     currency: dispute.currency || charge.currency || 'usd',
