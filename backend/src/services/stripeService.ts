@@ -1027,30 +1027,65 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
     Math.round((purchasedMicroUsd * amountDisputedCents) / amountPaidCents),
   );
   const { reverseMonthlyPurchasedLlmUsageCredit } = await import('./llmUsageCreditService');
-  await reverseMonthlyPurchasedLlmUsageCredit({
+  const reversalResult = await reverseMonthlyPurchasedLlmUsageCredit({
     billingUserId: user.userId,
     grantId: `stripe:${topUpGrantId}`,
     reversalId: `dispute:${dispute.id}:${amountDisputedCents}`,
     targetReversedMicroUsd,
   });
 
+  // Reversal can no-op when the original grant is not on the current-month
+  // ledger (credits are month-scoped and expire at reset, so a past-month
+  // grant has nothing left to revoke). Retrying does not help — the semantic
+  // condition will persist — so record the *true* outcome in the audit trail
+  // and return success. A later run of the reaper picks these up if we ever
+  // want to compensate customers whose disputed spend crossed months.
+  const revokedMicroUsd = reversalResult.reversed ? targetReversedMicroUsd : 0;
+  const reversalOutcome = reversalResult.reversed
+    ? 'revoked'
+    : 'no_current_month_grant';
+
+  // Deterministic timestamp so Stripe webhook redelivery replaces the same
+  // (userId, timestamp) item instead of appending a duplicate history row.
+  // dispute.created is unix-seconds and unchanged across redeliveries.
   await paymentHistoryDb.record({
     userId: user.userId,
-    timestamp: new Date().toISOString(),
+    timestamp: disputeEventTimestamp(dispute, 'opened'),
     eventType: 'dispute_opened',
     amount: amountDisputedCents,
     currency: dispute.currency || charge.currency || 'usd',
-    status: 'disputed',
+    status: reversalOutcome === 'revoked' ? 'disputed' : 'disputed_no_action',
     metadata: {
       chargeId: charge.id,
       disputeId: dispute.id,
       disputeReason: dispute.reason,
+      revokedMicroUsd,
+      reversalOutcome,
     },
   });
 
   console.log(
-    `[STRIPE] Credit purchase disputed: user ${user.userId}, dispute=${dispute.id}, revoked=${targetReversedMicroUsd} microUSD`
+    `[STRIPE] Credit purchase disputed: user ${user.userId}, dispute=${dispute.id}, revoked=${revokedMicroUsd} microUSD (${reversalOutcome})`
   );
+}
+
+/**
+ * Deterministic ISO timestamp for a dispute-driven payment-history row.
+ *
+ * Stripe sends `dispute.created` (unix seconds) unchanged on every redelivery,
+ * so keying the row's sort key off it collapses retries into a same-key Put
+ * (DynamoDB replaces, no duplicate). The `+1ms` offset for the closed event
+ * keeps the opened/closed rows on distinct sort keys for the same dispute.
+ */
+function disputeEventTimestamp(dispute: any, kind: 'opened' | 'closed'): string {
+  const createdSec = Number(dispute?.created);
+  if (!Number.isFinite(createdSec) || createdSec <= 0) {
+    // Fall back to wall-clock only when Stripe omits `created` entirely —
+    // shouldn't happen for real dispute payloads.
+    return new Date().toISOString();
+  }
+  const baseMs = Math.round(createdSec * 1000);
+  return new Date(baseMs + (kind === 'closed' ? 1 : 0)).toISOString();
 }
 
 /**
@@ -1080,9 +1115,13 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
     return;
   }
 
+  // Deterministic timestamp derived from dispute.created (+1ms offset from
+  // the opened row so both events for the same dispute stay on distinct sort
+  // keys) — Stripe redelivery lands at the same (userId, timestamp) key so
+  // the Put replaces rather than duplicates.
   await paymentHistoryDb.record({
     userId: user.userId,
-    timestamp: new Date().toISOString(),
+    timestamp: disputeEventTimestamp(dispute, 'closed'),
     eventType: 'dispute_closed',
     amount: Number(dispute.amount) || 0,
     currency: dispute.currency || charge.currency || 'usd',

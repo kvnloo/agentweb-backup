@@ -17,7 +17,7 @@ const mockStripe = {
 
 jest.mock('stripe', () => jest.fn().mockImplementation(() => mockStripe));
 
-const mockReverse = jest.fn(async () => ({ reversed: true }));
+const mockReverse = jest.fn(async () => ({ reversed: true, billingUserId: 'u1', ledger: {} as any }));
 const mockGrant = jest.fn(async () => ({ granted: true }));
 
 // Blanket-mocking this module would strip the other exports stripeService's
@@ -46,6 +46,10 @@ const topUpCharge = {
   },
 };
 
+const DISPUTE_CREATED_SEC = 1_800_000_000; // deterministic sample; Stripe-shape unix seconds
+const DISPUTE_OPENED_TS = new Date(DISPUTE_CREATED_SEC * 1000).toISOString();
+const DISPUTE_CLOSED_TS = new Date(DISPUTE_CREATED_SEC * 1000 + 1).toISOString();
+
 const fullDispute = {
   id: 'dp_1',
   charge: 'ch_topup_1',
@@ -53,6 +57,7 @@ const fullDispute = {
   currency: 'usd',
   reason: 'fraudulent',
   status: 'needs_response',
+  created: DISPUTE_CREATED_SEC,
 };
 
 describe('AgentWeb Credits chargeback handling', () => {
@@ -137,6 +142,39 @@ describe('AgentWeb Credits chargeback handling', () => {
       const [first, second] = mockReverse.mock.calls as any[];
       expect(first[0].reversalId).toBe(second[0].reversalId);
     });
+
+    it('uses a deterministic timestamp derived from dispute.created so webhook redelivery replaces the same history row', async () => {
+      await handleChargeDisputeCreated(fullDispute);
+
+      expect(record).toHaveBeenCalledTimes(1);
+      const arg = (record.mock.calls[0]![0] as any);
+      expect(arg.timestamp).toBe(DISPUTE_OPENED_TS);
+    });
+
+    it('records the true reversal outcome when no current-month grant exists to revoke', async () => {
+      mockReverse.mockResolvedValueOnce({ reversed: false, billingUserId: 'u1', ledger: {} as any });
+
+      await handleChargeDisputeCreated(fullDispute);
+
+      expect(record).toHaveBeenCalledTimes(1);
+      const arg = (record.mock.calls[0]![0] as any);
+      expect(arg.status).toBe('disputed_no_action');
+      expect(arg.metadata).toMatchObject({
+        revokedMicroUsd: 0,
+        reversalOutcome: 'no_current_month_grant',
+      });
+    });
+
+    it('records the revoked amount when the reversal succeeds', async () => {
+      await handleChargeDisputeCreated(fullDispute);
+
+      const arg = (record.mock.calls[0]![0] as any);
+      expect(arg.status).toBe('disputed');
+      expect(arg.metadata).toMatchObject({
+        revokedMicroUsd: 10_000_000,
+        reversalOutcome: 'revoked',
+      });
+    });
   });
 
   describe('dispute closed', () => {
@@ -151,6 +189,14 @@ describe('AgentWeb Credits chargeback handling', () => {
 
       expect(mockGrant).not.toHaveBeenCalled();
       expect(mockReverse).not.toHaveBeenCalled();
+    });
+
+    it('uses a deterministic timestamp 1ms after the opened row, so redelivery collapses and opened/closed stay distinct', async () => {
+      await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
+
+      expect(record).toHaveBeenCalledTimes(1);
+      const arg = (record.mock.calls[0]![0] as any);
+      expect(arg.timestamp).toBe(DISPUTE_CLOSED_TS);
     });
   });
 });
