@@ -49,23 +49,21 @@ export interface MonthlyLlmUsageCredits {
   debits?: LlmUsageDebit[];
   debitIds?: string[];
   totalDebitedMicroUsd?: number;
-  /**
-   * True once `debits[]` has been pruned to stay under DynamoDB's 400KB item
-   * limit. The granular tail is incomplete when set, but `totalDebitedMicroUsd`
-   * remains authoritative — it never decrements on prune. Consumers that need
-   * full granular audit should page to a dedicated table once this ever flips.
-   */
-  debitsTruncated?: boolean;
 }
 
 /**
- * Cap on debit entries kept in-line on the user row before pruning starts.
- * Each entry is ~150 bytes so 2000 entries ≈ 300KB, safely under DynamoDB's
- * 400KB item-size limit while leaving headroom for the rest of the ledger
- * (grants, reversals, admin fields). Realistic worst-case (top 1% of Pro
- * users going many multiples over hard cap for a full month) sits an order
- * of magnitude below this, so a single-item ledger is sustainable until we
- * outgrow it and decide to move to a dedicated `AW-UsageDebits` table.
+ * Cap on debit entries per monthly ledger. Each entry is ~150 bytes so 2000
+ * entries ≈ 300KB, safely under DynamoDB's 400KB item-size limit while
+ * leaving headroom for the rest of the ledger (grants, reversals, admin
+ * fields). Realistic worst-case (top 1% of Pro users going many multiples
+ * over hard cap for a full month) sits an order of magnitude below this.
+ *
+ * When the cap is reached, further debits **throw** rather than prune —
+ * pruning the oldest entry silently breaks retry idempotency (a workId
+ * whose id row falls off then retries would be treated as new and
+ * double-count). Throwing loud lets the fire-and-forget caller log the
+ * ledger-full state so we know to page to a dedicated `AW-UsageDebits`
+ * table if this ever fires in practice.
  */
 const MAX_DEBITS_PER_LEDGER = 2000;
 
@@ -405,6 +403,20 @@ export async function recordLlmUsageDebit(input: {
       return { debited: false, billingUserId, ledger: current };
     }
 
+    // Item-size guard: throw when the in-line debits array is full instead of
+    // pruning the oldest entry. Pruning would silently break retry
+    // idempotency — a workId whose id row falls off could re-debit as
+    // "new" and double-count. Throwing loud lets the fire-and-forget caller
+    // log the ledger-full state so we know to page to a secondary table if
+    // this ever fires in practice. Cap chosen to stay under DynamoDB's
+    // 400KB item ceiling (see MAX_DEBITS_PER_LEDGER doc).
+    const existingDebits = current.debits || [];
+    if (existingDebits.length >= MAX_DEBITS_PER_LEDGER) {
+      throw new Error(
+        `LLM usage debit ledger full for ${billingUserId} (${month}): ${existingDebits.length} entries; migrate to a dedicated table`
+      );
+    }
+
     const debit: LlmUsageDebit = {
       id: debitId,
       workId,
@@ -412,34 +424,13 @@ export async function recordLlmUsageDebit(input: {
       debitedAt,
     };
 
-    // Item-size guard: keep in-line debits below the DynamoDB 400KB ceiling
-    // by dropping the oldest entry when the array hits MAX_DEBITS_PER_LEDGER.
-    // `totalDebitedMicroUsd` deliberately does NOT decrement — audit totals
-    // stay authoritative even after granular tail rows fall off; the
-    // debitsTruncated flag records that they did.
-    const existingDebits = current.debits || [];
-    const existingDebitIds = current.debitIds || [];
-    const willTruncate = existingDebits.length >= MAX_DEBITS_PER_LEDGER;
-    const keptDebits = willTruncate
-      ? existingDebits.slice(existingDebits.length - (MAX_DEBITS_PER_LEDGER - 1))
-      : existingDebits;
-    const keptDebitIds = willTruncate
-      ? existingDebitIds.slice(existingDebitIds.length - (MAX_DEBITS_PER_LEDGER - 1))
-      : existingDebitIds;
-    if (willTruncate) {
-      console.warn(
-        `[llmUsageCreditService] Pruning oldest debits for ${billingUserId} (${month}) — ledger reached ${existingDebits.length} entries. Migrate to a dedicated table if this fires often.`
-      );
-    }
-
     const next: MonthlyLlmUsageCredits = {
       ...current,
       month,
       version: (existing?.version || 0) + 1,
-      debits: [...keptDebits, debit],
-      debitIds: [...keptDebitIds, debitId],
+      debits: [...existingDebits, debit],
+      debitIds: [...(current.debitIds || []), debitId],
       totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
-      ...(willTruncate || current.debitsTruncated ? { debitsTruncated: true } : {}),
     };
 
     const condition: {

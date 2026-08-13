@@ -227,11 +227,9 @@ describe('recordLlmUsageDebit', () => {
     expect(mockUpdateUser.mock.calls[0]![1].llmUsageCredits.version).toBe(1);
   });
 
-  it('prunes the oldest debit entries when the ledger reaches the item-size cap, without decrementing the running total', async () => {
-    // Simulate a ledger that's already at MAX_DEBITS_PER_LEDGER entries. Uses
-    // 2000 to match the constant declared in llmUsageCreditService.ts — if
-    // that constant changes, this needs to change too (deliberate coupling so
-    // the item-size guard cannot be silently loosened).
+  it('throws when the ledger has reached the item-size cap, so a full ledger fails loud instead of silently pruning and breaking idempotency', async () => {
+    // MAX matches the const in llmUsageCreditService.ts. Coupled so a silent
+    // loosening of the cap is caught by a failing test.
     const MAX = 2000;
     const fullDebits = Array.from({ length: MAX }, (_, i) => ({
       id: `meter:old-${i}`,
@@ -245,42 +243,41 @@ describe('recordLlmUsageDebit', () => {
     ledger.totalDebitedMicroUsd = MAX * 100_000;
     mockGetUserById.mockResolvedValue({ userId: 'u1', email: 'u1@example.com', llmUsageCredits: ledger });
 
-    await recordLlmUsageDebit({
-      billingUserId: 'u1',
-      workId: 'task-newest',
-      amountMicroUsd: 250_000,
-      now: NOW,
-    });
+    await expect(
+      recordLlmUsageDebit({
+        billingUserId: 'u1',
+        workId: 'task-newest',
+        amountMicroUsd: 250_000,
+        now: NOW,
+      }),
+    ).rejects.toThrow(/debit ledger full/);
 
-    const [, updates] = mockUpdateUser.mock.calls[0]!;
-    const next = updates.llmUsageCredits;
-    // Array stays at the cap — one dropped, one added.
-    expect(next.debits).toHaveLength(MAX);
-    // Oldest is gone, newest is on the tail.
-    expect(next.debits[0].id).not.toBe('meter:old-0');
-    expect(next.debits[next.debits.length - 1].id).toBe('meter:task-newest');
-    // Running total never decrements on prune — audit total stays authoritative.
-    expect(next.totalDebitedMicroUsd).toBe(MAX * 100_000 + 250_000);
-    // Truncation is flagged so consumers know granular tail is incomplete.
-    expect(next.debitsTruncated).toBe(true);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
-  it('keeps debitsTruncated set once flipped, even on later debits that do not themselves prune', async () => {
+  it('still honors idempotency on a full ledger — a retry of an already-recorded workId returns debited:false without touching state', async () => {
+    const MAX = 2000;
+    const fullDebits = Array.from({ length: MAX }, (_, i) => ({
+      id: `meter:old-${i}`,
+      workId: `old-${i}`,
+      amountMicroUsd: 100_000,
+      debitedAt: '2026-08-01T00:00:00.000Z',
+    }));
     const ledger = baseLedger();
-    ledger.debitsTruncated = true;
-    ledger.debits = [];
-    ledger.debitIds = [];
-    ledger.totalDebitedMicroUsd = 12_345;
+    ledger.debits = fullDebits;
+    ledger.debitIds = fullDebits.map(d => d.id);
+    ledger.totalDebitedMicroUsd = MAX * 100_000;
     mockGetUserById.mockResolvedValue({ userId: 'u1', email: 'u1@example.com', llmUsageCredits: ledger });
 
-    await recordLlmUsageDebit({
+    const result = await recordLlmUsageDebit({
       billingUserId: 'u1',
-      workId: 'task-after-truncation',
-      amountMicroUsd: 100,
+      // Retry a workId that's already in the ledger — no throw, no update.
+      workId: 'old-0',
+      amountMicroUsd: 100_000,
       now: NOW,
     });
 
-    const [, updates] = mockUpdateUser.mock.calls[0]!;
-    expect(updates.llmUsageCredits.debitsTruncated).toBe(true);
+    expect(result.debited).toBe(false);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 });
