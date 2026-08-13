@@ -2035,7 +2035,13 @@ async function addPageToExistingRepo(
      * Best-effort by design: a layout we cannot read or whose shape defeats the insertion must
      * not fail the page build. The server-side CAPI leg (capture route, synced below) still
      * works in that case, so the outcome degrades to "server-side only", not "no tracking".
+     *
+     * The one case that is NOT best-effort is drift (below): when the repo already carries a
+     * different pixel, the whole override is abandoned rather than half-applied, because
+     * installing only the server half would point CAPI at our pixel while the browser fired
+     * the other one — two different pixels for one conversion, which is worse than neither.
      */
+    let pixelOverrideAbandoned = false;
     if (applyingPixelOverride && effectivePixelId) {
       try {
         const currentLayout = await readRepoFile(repoFullName, "app/layout.tsx", ghHeaders);
@@ -2047,6 +2053,22 @@ async function addPageToExistingRepo(
           // The repair scan already owns this path in this commit — two entries for one path
           // would be ambiguous, and the repair is the one that keeps the build green.
           console.warn(`[V0 SERVICE] Skipping base pixel install: app/layout.tsx is already being repaired`);
+        } else if (/\{\/\* Meta Pixel Code \*\/\}/.test(currentLayout)) {
+          /*
+           * The repo already carries a DIFFERENT pixel than the one we're about to install.
+           * The record and the repo are separate sources of truth and can drift (a record that
+           * lost its pixel, or one that never had it while the repo was wired by hand — the
+           * exact drift §13 hit on Every.io). injectPixelIntoLayout always strips the existing
+           * block before inserting, so proceeding here would silently repoint a LIVE site's
+           * conversions at another pixel. Refuse and say so loudly: a missing install is
+           * recoverable and visible, a swapped pixel corrupts someone's attribution quietly.
+           */
+          pixelOverrideAbandoned = true;
+          console.error(
+            `[V0 SERVICE] Base pixel install ABORTED for ${repoFullName}: layout.tsx already has a different ` +
+            `Meta Pixel block. Not replacing it — the site record and the repo disagree, which needs a human. ` +
+            `Requested pixel: ${effectivePixelId}.`,
+          );
         } else {
           const updatedLayout = injectPixelIntoLayout(currentLayout, effectivePixelId);
           if (verifyPixelInjection(updatedLayout, effectivePixelId)) {
@@ -2083,7 +2105,7 @@ async function addPageToExistingRepo(
      * Best-effort: the pixel is already committed to the repo, so failing to write the record
      * must not fail the page. Worst case the next page re-applies the same value.
      */
-    if (applyingPixelOverride && effectivePixelId) {
+    if (applyingPixelOverride && effectivePixelId && !pixelOverrideAbandoned) {
       const rootId = existingPage.siteId ?? existingPage.id;
       try {
         await updateLandingPageMetaPixel(rootId, userId, effectivePixelId, effectiveMetaAccountId);
@@ -2179,8 +2201,10 @@ async function addPageToExistingRepo(
       const syncResult = await syncLeadCaptureFilesToRepo(
         repoFullName,
         buildListByPath,
-        effectivePixelId,
-        effectiveMetaAccountId,
+        // Drift (see the install block above): fall back to whatever the site record already
+        // had, so the capture route is never left pointing at a pixel the layout doesn't fire.
+        pixelOverrideAbandoned ? existingPage.metaPixelId : effectivePixelId,
+        pixelOverrideAbandoned ? existingPage.metaAdAccountId : effectiveMetaAccountId,
       );
       if (!syncResult.committed && syncResult.reason !== "up-to-date") {
         console.warn(

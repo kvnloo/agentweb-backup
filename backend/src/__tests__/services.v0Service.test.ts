@@ -5056,6 +5056,58 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       );
     });
 
+    // The record and the repo are separate sources of truth and can drift (a record that lost
+    // its pixel while the repo was wired by hand — the drift §13 hit on Every.io).
+    // injectPixelIntoLayout always strips the existing block first, so proceeding would
+    // silently repoint a LIVE site's conversions at a different pixel.
+    it("refuses to replace a different pixel already in the layout, and abandons the override entirely", async () => {
+      setupSiteRecordMock();
+      await setupTrackedV0Mocks();
+
+      mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } }); // repair scan
+      mockAxiosGet.mockResolvedValueOnce({                        // layout ALREADY has another pixel
+        data: {
+          content: Buffer.from(
+            "<html><head>{/* Meta Pixel Code */}fbq('init', '999999999999999');{/* End Meta Pixel Code */}</head><body>{children}</body></html>"
+          ).toString("base64"),
+        },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_page" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_track" } });
+      // Exactly two blobs are expected (page + tracking helper). Without the guard a third —
+      // the rewritten layout — rides along, which both trips the assertions below and shifts
+      // this sequential mock queue; either way the test goes red, and the assertions say why.
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+
+      setupVercelDeploySuccessMock();
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+        { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+      );
+
+      // The page still ships — this is a tracking decision, not a build failure.
+      expect(result.status).toBe("deployed");
+      // The foreign pixel is untouched: no layout blob committed at all.
+      expect(committedBlobs().some((c) => c.includes("Meta Pixel Code"))).toBe(false);
+      // And the override is abandoned wholesale rather than half-applied: the capture route
+      // must not point CAPI at our pixel while the browser fires theirs.
+      const captureRoute = committedBlobs().find((c) => c.includes("LIST_BY_PATH"));
+      expect(captureRoute).not.toContain("override-pixel");
+      // The root record is not rewritten either.
+      expect(mockUpdate).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({ ":px": "override-pixel" }),
+        })
+      );
+    });
+
     it("installs the chosen pixel site-wide when the site has none, and records it on the root", async () => {
       // The ENG-1141 case: 2+ ad accounts, so resolveMetaPixelForUser refused at generation
       // time and the root record carries no pixel — every later page inherited that nothing.

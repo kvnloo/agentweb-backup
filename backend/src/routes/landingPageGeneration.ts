@@ -433,7 +433,19 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         );
         metaPixelOverride = { pixelId: meta_pixel_override.pixelId, accountId: resolvedAccountId };
       } catch (err: any) {
-        return res.status(400).json({ error: err?.message || "Invalid meta_pixel_override" });
+        if (err?.ownershipViolation) {
+          // The customer picked something that isn't theirs — a real rejection.
+          return res.status(400).json({ error: err?.message || "Invalid meta_pixel_override" });
+        }
+        // Anything else means we couldn't REACH Meta to verify (Graph down, expired token,
+        // network). Failing here would block page generation entirely on Meta's uptime — a
+        // much worse outcome than shipping the page and resolving tracking normally, which is
+        // exactly what happened before this option existed. Degrade, don't block.
+        console.warn(
+          `[LP GENERATION] Could not verify meta_pixel_override for user ${userId} ` +
+          `(continuing without it): ${err?.message}`,
+        );
+        metaPixelOverride = undefined;
       }
     }
 

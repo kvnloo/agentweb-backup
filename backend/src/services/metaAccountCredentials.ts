@@ -124,14 +124,25 @@ export async function assertOwnedMetaPixel(
   const cleaned = cleanAccountId(accountId);
   const accounts = getConnectedMetaAccountsList(user);
   if (!accounts.some((acc: any) => acc.accountId === cleaned)) {
-    throw new Error(`Meta ad account "${accountId}" is not one of your connected accounts.`);
+    // `ownershipViolation` marks "the customer asked for something that isn't theirs" as
+    // distinct from "we couldn't reach Meta to check". Callers must be able to tell those
+    // apart: the first is a real rejection, the second must not become one — see the
+    // generate route, which degrades to no-override rather than failing a page build on
+    // Meta's uptime. A tagged property rather than message-matching, which drifts.
+    throw Object.assign(
+      new Error(`Meta ad account "${accountId}" is not one of your connected accounts.`),
+      { ownershipViolation: true },
+    );
   }
 
   const { metaService } = await import('./metaService');
   const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, cleaned);
   const pixels = await metaService.listPixels(resolvedAccountId, accessToken);
   if (!(pixels || []).some((p: any) => p.id === pixelId)) {
-    throw new Error(`Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.`);
+    throw Object.assign(
+      new Error(`Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.`),
+      { ownershipViolation: true },
+    );
   }
   return { accountId: resolvedAccountId };
 }

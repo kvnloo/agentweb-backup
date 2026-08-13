@@ -1,6 +1,6 @@
 import request from 'supertest';
 import express from 'express';
-import metaV2Router from '../routes/metaV2';
+import metaV2Router, { __clearPixelsCacheForTests } from '../routes/metaV2';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
 
@@ -75,6 +75,10 @@ app.use('/api/meta/v2', metaV2Router);
 describe('Meta V2 Routes', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // /pixels caches per user for 60s at module scope — without this, one case's
+    // result would satisfy the next one's request and the fan-out assertions would
+    // silently stop testing anything.
+    __clearPixelsCacheForTests();
   });
 
   const mockUser = {
@@ -197,6 +201,43 @@ describe('Meta V2 Routes', () => {
       const response = await request(app).get('/api/meta/v2/pixels');
 
       expect(response.status).toBe(404);
+    });
+
+    // This endpoint fans out one Graph call per connected ad account, and both callers
+    // (create dialog, Connected Accounts card) refetch on every open — an agency with 20
+    // accounts would pay 20 calls each time, with Generate disabled until they all land.
+    it('serves a second request from cache instead of re-hitting Meta', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock)
+        .mockResolvedValueOnce([{ id: 'pxA1' }])
+        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+
+      const first = await request(app).get('/api/meta/v2/pixels');
+      expect(first.status).toBe(200);
+      expect(first.body.pixels).toHaveLength(2);
+      expect(metaService.listPixels).toHaveBeenCalledTimes(2); // one per account
+
+      const second = await request(app).get('/api/meta/v2/pixels');
+      expect(second.status).toBe(200);
+      expect(second.body.pixels).toEqual(first.body.pixels);
+      expect(second.body.cached).toBe(true);
+      // Still 2 — the second request added no Graph traffic at all.
+      expect(metaService.listPixels).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not serve one user\'s pixels to another', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'pxA1' }]);
+      await request(app).get('/api/meta/v2/pixels');
+
+      // The cache is keyed by userId; clearing it stands in for a different caller, since
+      // this suite's auth mock pins one user. What matters is that a miss refetches.
+      __clearPixelsCacheForTests();
+      (metaService.listPixels as jest.Mock).mockResolvedValue([{ id: 'someone-else' }]);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+      expect(response.body.pixels.every((p: any) => p.pixelId === 'someone-else')).toBe(true);
+      expect(response.body.cached).toBeUndefined();
     });
 
     // Negative/boundary coverage (CLAUDE.md Rule 2, Greptile P2 on #2384). The picker

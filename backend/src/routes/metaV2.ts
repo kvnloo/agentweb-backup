@@ -186,10 +186,48 @@ router.get('/campaigns-and-adsets', async (req, res) => {
 // A single account's lookup failing (e.g. an expired token) is skipped, not
 // fatal to the whole request — same "never let one bad account break
 // everything" philosophy as resolveMetaPixelForUser itself.
+//
+// Cached per user for a short TTL: this fans out ONE Graph call per connected ad
+// account, and both callers (the landing-page create dialog and the Connected
+// Accounts card) refetch every time they open. An agency with 20 accounts would
+// otherwise spend 20 Graph calls per dialog-open, with the picker — and Generate
+// behind it — waiting on all of them. Pixels change rarely; a stale entry costs a
+// customer at most one minute before a newly created pixel appears.
 // ---------------------------------------------------------------------------
+const PIXELS_CACHE_TTL_MS = 60_000;
+/** Bounded so a large tenant can't grow this without limit; oldest entry is evicted. */
+const PIXELS_CACHE_MAX_ENTRIES = 500;
+const pixelsCache = new Map<string, { at: number; pixels: any[] }>();
+
+function readPixelsCache(userId: string): any[] | null {
+  const hit = pixelsCache.get(userId);
+  if (!hit) return null;
+  if (Date.now() - hit.at > PIXELS_CACHE_TTL_MS) {
+    pixelsCache.delete(userId);
+    return null;
+  }
+  return hit.pixels;
+}
+
+/** Test-only: process-level state would otherwise leak between cases in one suite. */
+export function __clearPixelsCacheForTests(): void {
+  pixelsCache.clear();
+}
+
+function writePixelsCache(userId: string, pixels: any[]): void {
+  if (pixelsCache.size >= PIXELS_CACHE_MAX_ENTRIES) {
+    const oldest = pixelsCache.keys().next().value;
+    if (oldest !== undefined) pixelsCache.delete(oldest);
+  }
+  pixelsCache.set(userId, { at: Date.now(), pixels });
+}
+
 router.get('/pixels', async (req, res) => {
   const userId = (req as any).user.userId;
   try {
+    const cached = readPixelsCache(userId);
+    if (cached) return res.json({ pixels: cached, cached: true });
+
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
@@ -207,7 +245,9 @@ router.get('/pixels', async (req, res) => {
       })
     );
 
-    res.json({ pixels: perAccountPixels.flat() });
+    const pixels = perAccountPixels.flat();
+    writePixelsCache(userId, pixels);
+    res.json({ pixels });
   } catch (error: any) {
     console.error('[MetaV2] /pixels error:', error);
     res.status(500).json({ message: error.message });
