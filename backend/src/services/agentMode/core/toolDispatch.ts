@@ -314,6 +314,12 @@ export interface ExecutePreparedToolsInput {
    * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
    */
   priorMediaCallKeys?: Map<string, string>;
+  /**
+   * ENG-936: optional approved image source URLs that must be used for image
+   * revisions. When supplied, a confirm=true `generate_image` call is rejected
+   * unless every requested input image is in this allow-list.
+   */
+  approvedRevisionImageSources?: string[];
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -343,6 +349,53 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+}
+
+/**
+ * ENG-936: normalize image input fields into a single string array for source checks.
+ */
+function getInputImages(toolCallArgs: any): string[] {
+  const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
+  if (typeof rawInputImages === 'string') return [rawInputImages];
+  if (!Array.isArray(rawInputImages)) return [];
+  return rawInputImages.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * ENG-936: ensure a revision-style image edit binds to an explicitly approved
+ * source URL before execution. A false pass here means `confirm=true` was issued
+ * for the wrong source and must be stopped before gateway execution.
+ */
+function isApprovedImageSourceForRevision(
+  args: any,
+  approvedSources: string[] | undefined,
+): { approved: boolean; errorMessage?: string } {
+  if (!approvedSources || approvedSources.length === 0) {
+    return { approved: true };
+  }
+
+  const inputImages = getInputImages(args);
+  if (!Array.isArray(inputImages) || inputImages.length === 0) {
+    return {
+      approved: false,
+      errorMessage:
+        `generate_image confirmation requires explicit approved source inputImages. ` +
+        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
+    };
+  }
+
+  const mismatch = inputImages.find((url) => !approvedSources.includes(url));
+  if (!mismatch) {
+    return { approved: true };
+  }
+
+  return {
+    approved: false,
+    errorMessage:
+      `generate_image source mismatch under confirmation gate. ` +
+      `Expected one of: ${approvedSources.join(', ')}. ` +
+      `Received: ${mismatch}`,
+  };
 }
 
 /**
@@ -382,6 +435,7 @@ export async function executePreparedTools(
     generationHardCapMs,
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
+    approvedRevisionImageSources,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -549,6 +603,32 @@ export async function executePreparedTools(
         const errorMsg = `Tool "${toolCall.function.name}" was blocked by Agent Tool Gateway policy: ${policyDecision.flags.map((flag) => flag.message).join(' ')}`;
         appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
         continue;
+      }
+
+      if (
+        toolCall.function.name === 'generate_image'
+        && Array.isArray(approvedRevisionImageSources)
+        && approvedRevisionImageSources.length > 0
+      ) {
+        const sourceCheck = isApprovedImageSourceForRevision(
+          preparedFunctionArgs,
+          approvedRevisionImageSources,
+        );
+        if (!sourceCheck.approved) {
+          const errorMsg = sourceCheck.errorMessage || 'generate_image rejected: unapproved source image.';
+          const guidance = appendRetryabilityGuidance(
+            ports.formatToolError(toolCall.function.name, errorMsg),
+            'invalid_args',
+          );
+          appendPreflightToolFailure(
+            toolCall,
+            preparedFunctionArgs,
+            errorMsg,
+            guidance,
+            policyDecision,
+          );
+          continue;
+        }
       }
 
       // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
