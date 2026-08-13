@@ -230,11 +230,24 @@ export async function resolveEmailAccount(
  * Pick a mailbox for a caller who didn't name one, in EMAIL_PLATFORMS order and
  * preferring the caller's own account over a teammate's shared one. Null when
  * the caller can reach no mailbox at all.
+ *
+ * Takes the same operation as resolveEmailAccount, and for the same reason: a
+ * teammate's org-shared mailbox is readable but not send-from. Only
+ * read_verification_code auto-resolves today, so nothing currently reaches this
+ * with 'send' — but leaving the restriction in the named path alone would hand
+ * the first future send caller exactly what the named path refuses, silently.
+ * A send with no own mailbox returns null rather than throwing, because callers
+ * of this path already have to handle "no mailbox" and a shared one is, for a
+ * send, no mailbox.
  */
 export async function resolveDefaultEmailAccount(
-  userId: string
+  userId: string,
+  operation: EmailOperation = 'read'
 ): Promise<ResolvedEmailAccount | null> {
-  const accounts = await accessibleEmailAccounts(userId);
+  const accessible = await accessibleEmailAccounts(userId);
+  const accounts = operation === 'send'
+    ? accessible.filter(acc => acc.userId === userId)
+    : accessible;
 
   for (const platform of EMAIL_PLATFORMS) {
     const onPlatform = accounts.filter(acc => acc.platform === platform);

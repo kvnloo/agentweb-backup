@@ -258,3 +258,55 @@ describe('resolveDefaultEmailAccount (ENG-943)', () => {
     await expect(resolveDefaultEmailAccount(CALLER)).resolves.toBeNull();
   });
 });
+
+/**
+ * The auto-resolve path has to honour the same read/send split as the named one.
+ * Only read_verification_code calls it today, so no caller can currently reach a
+ * teammate's mailbox for a send — but the restriction living in resolveEmailAccount
+ * alone means the first future send caller silently gets what the named path
+ * refuses. Take the operation here too, so the rule holds wherever a mailbox is
+ * picked rather than wherever it happens to be named.
+ */
+describe('resolveDefaultEmailAccount — send is own-mailbox only (ENG-943)', () => {
+  it('will not auto-pick a teammate’s org-shared mailbox to send from', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      account('gmail', 'teammate@example.com', TEAMMATE),
+    ]);
+
+    await expect(resolveDefaultEmailAccount(CALLER, 'send')).resolves.toBeNull();
+  });
+
+  it('picks the caller’s own mailbox for a send even on a later platform', async () => {
+    // gmail comes first in EMAIL_PLATFORMS, so a platform-ordered pick that
+    // ignored the operation would hand back the teammate's gmail here.
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      account('gmail', 'teammate@example.com', TEAMMATE),
+      account('outlook', 'mine@example.com', CALLER),
+    ]);
+
+    const resolved = await resolveDefaultEmailAccount(CALLER, 'send');
+
+    expect(resolved?.accountId).toBe('mine@example.com');
+    expect(resolved?.ownerUserId).toBe(CALLER);
+  });
+
+  it('still auto-picks a teammate’s shared mailbox for a read', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      account('gmail', 'teammate@example.com', TEAMMATE),
+    ]);
+
+    const resolved = await resolveDefaultEmailAccount(CALLER, 'read');
+
+    expect(resolved?.ownerUserId).toBe(TEAMMATE);
+  });
+
+  it('defaults to read when no operation is given — read_verification_code’s path', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      account('gmail', 'teammate@example.com', TEAMMATE),
+    ]);
+
+    const resolved = await resolveDefaultEmailAccount(CALLER);
+
+    expect(resolved?.ownerUserId).toBe(TEAMMATE);
+  });
+});
