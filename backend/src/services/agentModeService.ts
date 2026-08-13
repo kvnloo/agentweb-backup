@@ -5879,7 +5879,7 @@ export class AgentModeService {
     // echo is dropped (the model already saw it in the tool message); only the
     // counts and the rows still owed are kept.
     if (toolName === 'add_leads_to_list') {
-      const keep = ['success', 'complete', 'resumable', 'attempted', 'reconciliation', 'unimportedRows', 'unimportedRowsTruncated'];
+      const keep = ['success', 'complete', 'resumable', 'attempted', 'reconciliation', 'unimportedRows', 'unimportedRowsTruncated', 'unimportedRowRanges'];
       const minimal: Record<string, any> = {};
       for (const field of keep) {
         if (result?.[field] !== undefined) minimal[field] = result[field];
@@ -10530,7 +10530,7 @@ export class AgentModeService {
       // import can be cut off mid-way (the whole-turn cap fires between calls),
       // and "25 new lead(s) created" tells the next turn nothing about WHICH
       // rows landed — so the only offer left was "retry the whole request".
-      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, LEAD_IMPORT_ROW_LIST_CAP } = await import('../utils/leadImportLedger');
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, summarizeLeadRowNumbers, LEAD_IMPORT_ROW_LIST_CAP } = await import('../utils/leadImportLedger');
       const attempted = leads.length;
       const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
       const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
@@ -10596,13 +10596,16 @@ export class AgentModeService {
         ? `Successfully processed: ${messageParts.join(', ')}.`
         : 'No leads were processed.';
       // `unimportedRows` is capped, so on a big partial it names only the first
-      // slice of what is missing. Left unsaid, the agent imports that slice, gets
-      // a clean `complete: true` back and reports the import finished — silently
-      // stranding the rest. A truncated resume list has to say it is truncated
-      // and that finishing it is not the same as finishing the import.
+      // slice of what is missing. Naming a slice is not a resume: the agent
+      // imports it, gets a clean `complete: true` for that call and reports the
+      // import finished, stranding the rest. `unimportedRowRanges` is the
+      // authoritative set — every missing position in the rows just sent, run
+      // length encoded and never truncated — so a truncated detail list costs
+      // readability, not resumability.
+      const unimportedRowRanges = summarizeLeadRowNumbers(unimportedRows.map(r => r.row));
       const resumeTruncated = unimportedRows.length > LEAD_IMPORT_ROW_LIST_CAP
-        ? `unimportedRows names only the FIRST ${LEAD_IMPORT_ROW_LIST_CAP} of ${unimportedRows.length} missing rows — `
-          + `after those land, call add_leads_to_list again for the remainder. `
+        ? `unimportedRows details only the FIRST ${LEAD_IMPORT_ROW_LIST_CAP} of ${unimportedRows.length} missing rows, `
+          + `but unimportedRowRanges (${unimportedRowRanges}) lists EVERY missing position in the rows you just sent — resend all of them. `
           + `The import is not done until a result comes back with complete: true. `
         : '';
       const message = attempted === 0
@@ -10641,7 +10644,9 @@ export class AgentModeService {
         // the ticket is about, so there is now one (ENG-1133).
         reconciliation,
         ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
-        ...(unimportedRows.length > 0 ? capLeadRowList('unimportedRows', unimportedRows) : {}),
+        ...(unimportedRows.length > 0
+          ? { ...capLeadRowList('unimportedRows', unimportedRows), unimportedRowRanges }
+          : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {

@@ -78,6 +78,43 @@ export function describeLeadRow(lead: any, index: number): string {
 }
 
 /**
+ * Compact, COMPLETE description of which input positions did not land, as a
+ * run-length encoded range string ("7,19,101-220").
+ *
+ * The detailed `unimportedRows` list is capped for size, so on a big partial it
+ * names only the first slice. Saying so in prose is not enough: the agent
+ * imports that slice, gets a clean `complete: true` for it, and reports the
+ * import finished — silently stranding the rest, which is the exact failure
+ * this ticket exists to remove. Row positions are the resume key (the caller
+ * still holds the rows it just sent), and encoding them by run is complete in
+ * space proportional to the number of RUNS rather than rows: the dominant
+ * partial — a write budget or turn cap cutting the file at some position —
+ * is one run. So this summary is never truncated.
+ */
+export function summarizeLeadRowNumbers(rowNumbers: number[]): string {
+  const sorted = [...rowNumbers].sort((a, b) => a - b);
+  const parts: string[] = [];
+  let start: number | null = null;
+  let previous: number | null = null;
+  const flush = () => {
+    if (start === null || previous === null) return;
+    parts.push(start === previous ? `${start}` : `${start}-${previous}`);
+  };
+  for (const rowNumber of sorted) {
+    if (previous !== null && rowNumber === previous) continue;
+    if (previous !== null && rowNumber === previous + 1) {
+      previous = rowNumber;
+      continue;
+    }
+    flush();
+    start = rowNumber;
+    previous = rowNumber;
+  }
+  flush();
+  return parts.join(',');
+}
+
+/**
  * Echo a row list back under `key`, truncated at the cap. A truncated list
  * always says so — a silently shortened resume list reads as "that is all of
  * them" and would strand the rest.
