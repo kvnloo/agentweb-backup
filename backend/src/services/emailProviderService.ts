@@ -141,9 +141,31 @@ export interface ResolvedEmailAccount {
  * and then rejected as "not found" by the very tools the list points at, and a
  * scheduled run needing a login code from it had nowhere to go (ENG-943).
  */
+/**
+ * The lookup itself, with its failures made honest.
+ *
+ * The lookup this replaced (getAccountById) caught its own DynamoDB errors and
+ * returned null, so a transient failure arrived as "not found" — a lie that
+ * sends the caller hunting for a bad account id, which is the exact confusion
+ * ENG-943 was filed about. This one lets the failure through, but as an
+ * EmailProviderError: the tool layer only converts that type (and two message
+ * substrings) into a clean tool error, so an unwrapped DynamoDB error would
+ * escape as a raw exception instead.
+ */
+async function listAccessibleAccounts(userId: string) {
+  try {
+    return (await getAccountsWithOwnerIncludingOrgShared(userId)) || [];
+  } catch (error: any) {
+    throw new EmailProviderError(
+      `Could not read your connected accounts just now (${error?.message || 'unknown error'}). ` +
+        `This is a temporary lookup failure, not a missing account — please retry.`
+    );
+  }
+}
+
 async function accessibleEmailAccounts(userId: string) {
-  const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
-  return (accounts || []).filter(acc => EMAIL_PLATFORMS.includes(acc.platform as EmailPlatform));
+  const accounts = await listAccessibleAccounts(userId);
+  return accounts.filter(acc => EMAIL_PLATFORMS.includes(acc.platform as EmailPlatform));
 }
 
 /**
@@ -170,7 +192,7 @@ export async function resolveEmailAccount(
   accountId: string,
   operation: EmailOperation = 'read'
 ): Promise<ResolvedEmailAccount> {
-  const accounts = (await getAccountsWithOwnerIncludingOrgShared(userId)) || [];
+  const accounts = await listAccessibleAccounts(userId);
   const sameId = accounts.filter(acc => acc.account_id === accountId);
 
   // Prefer an email platform rather than taking the first id match: one Google

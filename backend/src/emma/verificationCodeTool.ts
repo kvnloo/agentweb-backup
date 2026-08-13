@@ -282,7 +282,20 @@ emmaToolRegistry.register({
         };
       }
     } else {
-      const resolved = await resolveDefaultEmailAccount(userId);
+      // A lookup failure here is not "no mailbox connected" — saying so would
+      // send an unattended run off to report a missing account when the account
+      // is fine and the read simply failed. Report it as a mailbox error, the
+      // same reason the provider read failures below use.
+      let resolved: Awaited<ReturnType<typeof resolveDefaultEmailAccount>>;
+      try {
+        resolved = await resolveDefaultEmailAccount(userId);
+      } catch (error: any) {
+        return {
+          success: false,
+          reason: 'mailbox_error',
+          message: `Could not resolve a mailbox to read the code from: ${error?.message || error}. ${NO_FABRICATION_NOTE}`,
+        };
+      }
       if (!resolved) {
         return {
           success: false,

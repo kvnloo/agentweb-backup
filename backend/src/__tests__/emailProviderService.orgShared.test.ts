@@ -35,6 +35,7 @@ import {
   registerEmailProvider,
   resolveEmailAccount,
   resolveDefaultEmailAccount,
+  EmailProviderError,
   type IEmailService,
 } from '../services/emailProviderService';
 
@@ -136,6 +137,37 @@ describe('resolveEmailAccount — org-shared mailboxes (ENG-943)', () => {
  * sending as a teammate was never granted. Fixing the read bug must not quietly
  * hand it over — the ticket reports only reads.
  */
+/**
+ * The old lookup (getAccountById) caught its own DynamoDB errors and returned
+ * null, so a transient failure surfaced as "not found". The org-shared lookup
+ * does not, so an unwrapped throw would escape the email tool's catch — it only
+ * recognises EmailProviderError and two message substrings — and reach the
+ * caller as a raw exception. Fail honestly, but as a typed provider error.
+ */
+describe('resolveEmailAccount — connected-account lookup failures (ENG-943)', () => {
+  it('reports a lookup failure as a provider error rather than a raw throw', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockRejectedValue(
+      new Error('ProvisionedThroughputExceededException')
+    );
+
+    await expect(resolveEmailAccount(CALLER, 'me@example.com')).rejects.toThrow(
+      EmailProviderError
+    );
+  });
+
+  it('does not disguise a lookup failure as a missing account', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockRejectedValue(new Error('boom'));
+
+    await expect(resolveEmailAccount(CALLER, 'me@example.com')).rejects.not.toThrow(/not found/i);
+  });
+
+  it('reports a lookup failure on the auto-resolve path too', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockRejectedValue(new Error('boom'));
+
+    await expect(resolveDefaultEmailAccount(CALLER)).rejects.toThrow(EmailProviderError);
+  });
+});
+
 describe('resolveEmailAccount — send is own-mailbox only (ENG-943)', () => {
   const shared = account('gmail', 'teammate@example.com', TEAMMATE);
   const own = account('gmail', 'me@example.com', CALLER);
