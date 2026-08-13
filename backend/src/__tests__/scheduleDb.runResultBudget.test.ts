@@ -52,6 +52,9 @@ const rejected = (error: any) => ({ promise: jest.fn().mockRejectedValue(error) 
 describe('scheduleDb.addRunResult item budget', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks keeps implementations, and these tests queue different ones.
+    mockDocumentClientMethods.update.mockReset();
+    mockDocumentClientMethods.get.mockReset();
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     jest.spyOn(console, 'error').mockImplementation(() => {});
   });
@@ -109,6 +112,48 @@ describe('scheduleDb.addRunResult item budget', () => {
     mockDocumentClientMethods.update.mock.calls.forEach(([params]: any[]) => {
       expect(Array.isArray(params.ExpressionAttributeValues?.[':runResults'])).toBe(false);
     });
+  });
+
+  // FAIL: another writer shedding at the same moment must not make this one delete a
+  // second prefix off an already-shortened list — recount against what is stored now
+  it('recounts instead of over-deleting when the history moved under it', async () => {
+    const runResults = Array.from({ length: 20 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) }));
+    const raced = Object.assign(new Error('stale'), { code: 'ConditionalCheckFailedException' });
+    mockDocumentClientMethods.update
+      .mockReturnValueOnce(rejected(itemSizeError()))
+      .mockReturnValueOnce(rejected(raced))
+      .mockReturnValueOnce(resolved({}))
+      .mockReturnValueOnce(resolved({ Attributes: { scheduleId: 'sched-1' } }));
+    mockDocumentClientMethods.get
+      .mockReturnValueOnce(resolved({ Item: { scheduleId: 'sched-1', startingMessage: 'p'.repeat(35000), runResults } }))
+      .mockReturnValueOnce(resolved({
+        Item: { scheduleId: 'sched-1', startingMessage: 'p'.repeat(35000), runResults: runResults.slice(3) },
+      }));
+
+    const result = await scheduleDb.addRunResult('sched-1', { runId: 'run-new', summary: 'r'.repeat(30000) });
+
+    expect(result).toEqual({ scheduleId: 'sched-1' });
+    // Two reads: the racing removal is recomputed, not replayed.
+    expect(mockDocumentClientMethods.get).toHaveBeenCalledTimes(2);
+    const first = mockDocumentClientMethods.update.mock.calls[1][0];
+    const second = mockDocumentClientMethods.update.mock.calls[2][0];
+    expect(first.ConditionExpression).toContain('size(#runResults)');
+    expect(second.ExpressionAttributeValues[':expectedLength']).toBe(runResults.length - 3);
+  });
+
+  // FAIL: a shed that keeps losing the race must not fall through to an unguarded write
+  it('surfaces the original error when the history keeps moving', async () => {
+    const runResults = Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) }));
+    const raced = Object.assign(new Error('stale'), { code: 'ConditionalCheckFailedException' });
+    mockDocumentClientMethods.update
+      .mockReturnValueOnce(rejected(itemSizeError()))
+      .mockReturnValue(rejected(raced));
+    mockDocumentClientMethods.get.mockReturnValue(resolved({
+      Item: { scheduleId: 'sched-1', startingMessage: 'p'.repeat(35000), runResults },
+    }));
+
+    await expect(scheduleDb.addRunResult('sched-1', { runId: 'run-new', summary: 'r'.repeat(30000) }))
+      .rejects.toThrow('Item size has exceeded the maximum allowed size');
   });
 
   // FAIL: an unrelated failure must not trigger the read-modify-write path
