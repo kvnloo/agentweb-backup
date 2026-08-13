@@ -27,6 +27,14 @@
 #                                of instances (default 1). Set to 0 to restore the
 #                                pre-ENG-1127 behaviour of failing immediately.
 #                                Bounded by EB_TOTAL_TIMEOUT_SECONDS either way.
+#   EB_READY_ON_DEPLOYMENT_SUCCEEDED
+#                                '1' lets an immutable deploy finish as soon as
+#                                EB announces the new fleet is in and it has
+#                                started draining the old one, instead of waiting
+#                                for Status=Ready (ENG-1183). Off by default, so
+#                                production is unaffected and keeps demanding the
+#                                full Ready. See drain_phase_reached below for
+#                                what it costs and what guards it.
 #   EB_HEALTH_PROBE_DRYRUN       '1' exercises the lagging-rollup health probe on
 #                                an already-successful deploy and logs what it
 #                                saw. Observation only — it runs after the deploy
@@ -77,6 +85,7 @@ EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
 EB_ABORT_MAX_RETRIES="${EB_ABORT_MAX_RETRIES:-1}"
+EB_READY_ON_DEPLOYMENT_SUCCEEDED="${EB_READY_ON_DEPLOYMENT_SUCCEEDED:-0}"
 EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
 EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS:-120}"
 EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS="${EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS:-30}"
@@ -652,6 +661,85 @@ update_environment() {
   fail "update-environment could not be applied to '${EB_ENVIRONMENT_NAME}' after ${EB_UPDATE_MAX_ATTEMPTS} attempts because the environment kept reporting a concurrent update in progress. Version '${EB_VERSION_LABEL}' was NOT applied."
 }
 
+# EB's wording for "the new fleet is in and healthy; I am now tearing the old one
+# down". Under the immutable policy this is the moment the deploy is materially
+# done — everything after it is the old instances draining.
+readonly EB_DRAIN_PHASE_EVENT='Deployment succeeded. Terminating old instances and temporary Auto Scaling group.'
+
+# True when EB has announced the drain phase SINCE THIS UPDATE was accepted.
+#
+# Why waiting past this point is not free (ENG-1183): the drain is deliberate.
+# asgLifecycleGuard.ts parks each dying instance in Terminating:Wait for up to
+# DRAIN_CEILING_MS (10 min) so in-flight scheduled runs finish rather than being
+# killed and requeued by the ENG-324 reconciler. EB withholds Status=Ready until
+# the last one is reaped, so a deploy that materially succeeded keeps the job
+# pinned for another 10-20 minutes. On 2026-08-13 that failed run 31680773689
+# outright: EB logged this event at 08:46:19 and CI gave up at 08:58:32,
+# reporting Health=Green the whole way down.
+#
+# Anchored to EB_UPDATE_ACCEPTED_AT for the same reason the ERROR scan is: an
+# event from an earlier deploy must never satisfy this one.
+drain_phase_reached() {
+  [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 1
+
+  local since out
+  since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -z "${since}" ] && return 1
+
+  # A read failure here must never fail the deploy: this is an early-exit
+  # opportunity, and missing it simply falls back to waiting for Ready.
+  if ! out=$(aws elasticbeanstalk describe-events \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --severity INFO \
+    --start-time "${since}" \
+    --max-items 50 \
+    --query 'Events[].Message' \
+    --output text 2>&1); then
+    return 1
+  fi
+
+  printf '%s' "${out}" | grep -qF "${EB_DRAIN_PHASE_EVENT}"
+}
+
+EB_FLEET_DETAIL=''
+
+# True when at least one instance is BOTH healthy AND already running the exact
+# version this run is deploying.
+#
+# This is the guard that makes the early exit safe, not a nicety. Staging takes
+# concurrent deploys from different PRs, so the drain-phase event alone is
+# ambiguous — it could belong to somebody else's version that finished while we
+# were polling. Requiring an instance that is Ok on OUR version is what ties the
+# announcement to this deploy. Per-instance Deployment.VersionLabel is reported
+# immediately, unlike the environment's VersionLabel, which EB holds back until
+# the teardown completes.
+fleet_serving_target_version() {
+  local out id version health
+  EB_FLEET_DETAIL=''
+
+  if ! out=$(aws elasticbeanstalk describe-instances-health \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --attribute-names Deployment HealthStatus \
+    --query 'InstanceHealthList[*].[InstanceId,Deployment.VersionLabel,HealthStatus]' \
+    --output text 2>&1); then
+    EB_FLEET_DETAIL="describe-instances-health failed: ${out}"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r id version health; do
+    [ -z "${id}" ] && continue
+    [ "${id}" = "None" ] && continue
+    if [ "${version}" = "${EB_VERSION_LABEL}" ] && [ "${health}" = "Ok" ]; then
+      EB_FLEET_DETAIL="instance ${id} is Ok and running '${version}'"
+      return 0
+    fi
+  done <<<"${out}"
+
+  EB_FLEET_DETAIL="no instance is yet both Ok and running '${EB_VERSION_LABEL}'"
+  return 1
+}
+
 # The gate that makes a green check mean something: poll until the environment
 # is Ready AND reports this exact version, then assert health is not Red.
 verify_deployment() {
@@ -742,8 +830,26 @@ verify_deployment() {
       fi
     fi
 
+    # Opt-in early exit for environments whose teardown is a deliberate drain
+    # rather than work still to do (ENG-1183). Deliberately last in the loop
+    # body: every rejection, abort and terminal-event check above has already
+    # run and can still fail this deploy, so this can only ever shorten a
+    # deploy that was going to pass, never rescue one that was going to fail.
+    #
+    # Status is checked first so this stays cheap — the two probes only run once
+    # EB has left Ready, i.e. while a rollout is genuinely in flight. Ready is
+    # handled by the branches above either way.
+    if [ "${EB_READY_ON_DEPLOYMENT_SUCCEEDED}" = "1" ] && [ "${EB_STATUS}" != "Ready" ] \
+      && [ "${EB_UPDATE_ACCEPTED_AT}" -ne 0 ]; then
+      if drain_phase_reached && fleet_serving_target_version; then
+        log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' has taken version '${EB_VERSION_LABEL}' — EB announced the new fleet is in and is now draining the old one, and ${EB_FLEET_DETAIL}. Not waiting for Status=Ready: what remains is the graceful drain of the OLD instances (ENG-657/ENG-764), which finishes old work and cannot change this version's outcome."
+        run_health_probe_dryrun
+        return 0
+      fi
+    fi
+
     if run_budget_exhausted; then
-      fail "environment '${EB_ENVIRONMENT_NAME}' did not come up Ready on version '${EB_VERSION_LABEL}' within the overall deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s. Last observed Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION}."
+      fail "environment '${EB_ENVIRONMENT_NAME}' did not come up Ready on version '${EB_VERSION_LABEL}' within the overall deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s. Last observed Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION}.${EB_FLEET_DETAIL:+ Fleet probe last reported: ${EB_FLEET_DETAIL}.}"
     fi
 
     sleep "${EB_POLL_INTERVAL_SECONDS}"

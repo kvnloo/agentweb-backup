@@ -45,9 +45,13 @@ all_args="$*"
 printf '%s\n' "$operation" >>"${MOCK_DIR}/operations"
 
 query=''
+severity=''
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--query" ]; then
     query="${2:-}"
+  fi
+  if [ "$1" = "--severity" ]; then
+    severity="${2:-}"
   fi
   shift
 done
@@ -115,6 +119,25 @@ case "$operation" in
     # ENG-837: ERROR-severity events are how an ASYNCHRONOUS EB rejection
     # becomes visible. Fixtures: `events` (message text, one per line),
     # `events_exit` (simulate an API/IAM failure).
+    #
+    # ENG-1183 reads the INFO stream for the drain-phase announcement, so the
+    # two severities are served from separate fixtures (`events_info`,
+    # `events_info_exit`). Keeping them apart is what lets a test prove the
+    # early exit does not fire on an ERROR-stream coincidence, and vice versa.
+    if [ "$severity" = "INFO" ]; then
+      code=0
+      [ -f "${MOCK_DIR}/events_info_exit" ] && code=$(cat "${MOCK_DIR}/events_info_exit")
+      if [ "$code" != "0" ]; then
+        printf 'mock aws: simulated describe-events (INFO) failure\n' >&2
+        exit "$code"
+      fi
+      if [ -f "${MOCK_DIR}/events_info" ]; then
+        cat "${MOCK_DIR}/events_info"
+      else
+        printf 'None\n'
+      fi
+      exit 0
+    fi
     code=0
     [ -f "${MOCK_DIR}/events_exit" ] && code=$(cat "${MOCK_DIR}/events_exit")
     if [ "$code" != "0" ]; then
@@ -130,6 +153,28 @@ case "$operation" in
     ;;
 
   describe-instances-health)
+    # ENG-1183 asks the same API a different question: which version is each
+    # instance actually running? Fixture `instances_deployment` holds
+    # "<instance-id><TAB><VersionLabel><TAB><HealthStatus>" lines, NONE, or
+    # "ERROR|<message>". Routed on the query so the ENG-878 health fixtures
+    # above stay untouched.
+    if printf '%s' "$query" | grep -qF 'Deployment.VersionLabel'; then
+      if [ -f "${MOCK_DIR}/instances_deployment" ]; then
+        first=$(head -n 1 "${MOCK_DIR}/instances_deployment")
+        if [ "${first%%|*}" = "ERROR" ]; then
+          printf '%s\n' "${first#*|}" >&2
+          exit 255
+        fi
+        if [ "$first" = "NONE" ]; then
+          printf 'None\n'
+          exit 0
+        fi
+        cat "${MOCK_DIR}/instances_deployment"
+      else
+        printf 'None\n'
+      fi
+      exit 0
+    fi
     # ENG-878: the non-lagging per-instance signal. Fixture `instances_health`
     # holds "<instance-id><TAB><HealthStatus>" lines, the literal token NONE for
     # an empty environment, or "ERROR|<message>" to simulate an API/IAM failure.
@@ -993,6 +1038,130 @@ printf 'None\n' >"$M/asg_name"
 run_deploy "$M"
 check 'ENG-764: an environment with no ASG fails loudly' 1 \
   'returned no Auto Scaling group'
+
+# ---------------------------------------------------------------------------
+# ENG-1183: finish on the drain-phase announcement instead of Status=Ready.
+#
+# Under the immutable policy EB withholds Status=Ready until the last old
+# instance is reaped, and that teardown is a deliberate 10-min graceful drain
+# (ENG-657/ENG-764). Waiting it out pinned CI past its budget on deploys that
+# had already succeeded. These cases pin both halves: that the early exit works
+# when it should, and — more important — that it stays shut otherwise.
+# ---------------------------------------------------------------------------
+
+DRAIN_EVENT='Deployment succeeded. Terminating old instances and temporary Auto Scaling group.'
+OUR_VERSION='backend-20260729-pr2216'
+
+# The state the bug produced: Updating forever, healthy, still reporting the
+# PREVIOUS version because EB has not finished the teardown.
+DRAINING_STATE="Updating|Green|old-version"
+
+# Default OFF is the whole safety story for production, so prove it first: every
+# signal the early exit needs is present, and without the flag it still waits.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS=5
+check 'ENG-1183: the early exit is OFF by default, so production still demands Ready' 1 \
+  'did not come up Ready'
+
+# The fix itself.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1
+check 'ENG-1183: enabled, the deploy finishes on the drain announcement' 0 \
+  'has taken version'
+
+# The message has to explain itself, or the next person reads "success while
+# Updating" as the script going soft.
+check 'ENG-1183: success names the instance that proves it' 0 \
+  "instance i-0abc is Ok and running '${OUR_VERSION}'"
+check 'ENG-1183: success says what is still outstanding and why it does not matter' 0 \
+  'graceful drain of the OLD instances'
+
+# THE safety case. Staging takes concurrent deploys from different PRs, so the
+# drain event on its own is ambiguous — it can belong to somebody else's version
+# that finished while we were polling. Without the per-instance version check
+# this test is what would go green on a deploy that never landed.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'i-0abc\tbackend-SOMEONE-ELSES-pr9999\tOk\n' >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1 EB_TOTAL_TIMEOUT_SECONDS=5
+check "ENG-1183: another PR's drain announcement cannot finish this deploy" 1 \
+  'did not come up Ready'
+check 'ENG-1183: the timeout reports what the fleet probe actually saw' 1 \
+  "no instance is yet both Ok and running '${OUR_VERSION}'"
+
+# Right version, not healthy yet: the announcement is not enough on its own.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'i-0abc\t%s\tSevere\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1 EB_TOTAL_TIMEOUT_SECONDS=5
+check 'ENG-1183: an unhealthy instance on the right version does not finish the deploy' 1 \
+  'did not come up Ready'
+
+# Fleet is ready but EB has not announced the drain phase — the rollout may still
+# be mid-flight, so there is nothing to shortcut.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1 EB_TOTAL_TIMEOUT_SECONDS=5
+check 'ENG-1183: without the drain announcement the deploy keeps waiting' 1 \
+  'did not come up Ready'
+
+# A terminal rejection must still win, even when EB reports both in the same
+# window. The early exit is last in the loop body precisely so this holds.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'Configuration validation exception: Invalid option value\n' >"$M/events"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1
+check 'ENG-1183: a terminal rejection still beats the drain announcement' 1 \
+  'REJECTED this update'
+
+# An IAM gap on the INFO stream degrades to the old behaviour, never to a false
+# green: the deploy simply waits for Ready and succeeds when it arrives.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}" "Ready|Green|${OUR_VERSION}"
+printf '255\n' >"$M/events_info_exit"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1
+check 'ENG-1183: an unreadable INFO event stream falls back to waiting for Ready' 0 \
+  'SUCCESS: environment'
+
+# Same for the fleet probe: a denied describe-instances-health must not shortcut.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' "${DRAINING_STATE}"
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'ERROR|AccessDenied: describe-instances-health\n' >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1 EB_TOTAL_TIMEOUT_SECONDS=5
+check 'ENG-1183: a denied fleet probe does not shortcut the deploy' 1 \
+  'did not come up Ready'
+
+# Ready-on-the-old-version is a rejection (ENG-837) and stays one. The early exit
+# is gated on having LEFT Ready, so it cannot paper over that.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${DRAIN_EVENT}" >"$M/events_info"
+printf 'i-0abc\t%s\tOk\n' "${OUR_VERSION}" >"$M/instances_deployment"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1 EB_REJECTION_GRACE_SECONDS=1 \
+  EB_ABORT_MAX_RETRIES=0
+check 'ENG-1183: a stale-Ready rejection is still a rejection with the flag on' 1 \
+  'declined to apply it'
+
+# The normal Ready path must be untouched when the flag is on and the drain
+# announcement never appears — this is the control for the whole block.
+M=$(new_mock_dir)
+set_describe_states "$M" "Updating|Grey|old-version" "Ready|Green|${OUR_VERSION}"
+run_deploy "$M" EB_READY_ON_DEPLOYMENT_SUCCEEDED=1
+check 'ENG-1183 control: the ordinary Ready path still succeeds with the flag on' 0 \
+  'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
 

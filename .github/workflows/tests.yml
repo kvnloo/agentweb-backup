@@ -668,6 +668,13 @@ jobs:
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
           EB_TOTAL_TIMEOUT_SECONDS: '2700'
           EB_SETTLE_TIMEOUT_SECONDS: '1200'
+          # Staging only, and deliberately not a default in the script: finish
+          # once EB says the new fleet is in and it has started draining the old
+          # one, rather than sitting through a 10-min-per-instance drain that
+          # only affects instances this version is replacing (ENG-1183). The
+          # production job in deploy.yml does not set this and still demands the
+          # full Status=Ready.
+          EB_READY_ON_DEPLOYMENT_SUCCEEDED: '1'
         run: bash .github/scripts/eb-deploy.sh
 
       # Only reachable when the step above proved the environment is Ready on
