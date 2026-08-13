@@ -1,5 +1,11 @@
+import AWS from 'aws-sdk';
 import { userDb, type User } from './db';
 import { paymentHistoryDb } from './paymentHistoryDb';
+
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
+const PAYMENT_HISTORY_TABLE = `${TABLE_PREFIX}AW-PaymentHistory`;
+const docClient = new AWS.DynamoDB.DocumentClient();
 
 export type LlmUsageCreditSource = 'purchase' | 'migration' | 'admin';
 
@@ -241,38 +247,84 @@ export async function grantMonthlyLlmUsageCredit(input: {
         };
 
     try {
-      await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
       if (input.source === 'admin') {
-        // AC7 audit: admin credits are an out-of-band judgment call, so record
-        // an immutable payment-history event with actor, reason, and the
-        // before/after allowance figures. Stripe purchases and rollout
-        // migrations already have their own audit trails (Stripe events,
-        // rollout script log) and don't route through this path.
+        // AC7 audit: admin credits are an out-of-band judgment call and must
+        // carry an immutable audit record with actor/reason/before-after
+        // balance. Ledger commit and audit write go through DynamoDB
+        // TransactWriteItems so a partial success is impossible — either both
+        // land or neither does. Doing the audit as a follow-up call would
+        // permanently orphan grants whenever the audit write fails (retry
+        // short-circuits on the persisted grantId and never re-attempts the
+        // audit). Stripe purchases and rollout migrations don't need this
+        // treatment: they carry their own audit trails (Stripe events, the
+        // rollout script log).
         const beforeAllowance = allowanceBalanceFromLedger(current);
         const afterAllowance = allowanceBalanceFromLedger(next);
-        await paymentHistoryDb.record({
-          userId: billingUserId,
-          timestamp: grantedAt,
-          eventType: 'admin_credit_grant',
-          amount: amountMicroUsd,
-          currency: 'usd',
-          status: 'granted',
-          metadata: {
-            grantId: input.grantId,
-            ...(input.grantedBy?.trim() ? { grantedBy: input.grantedBy.trim() } : {}),
-            ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
-            beforeAllowanceMicroUsd: beforeAllowance,
-            afterAllowanceMicroUsd: afterAllowance,
-          },
-        });
+        await docClient.transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: USERS_TABLE,
+                Key: { email: user.email },
+                UpdateExpression: 'SET #creditLedger = :next',
+                ConditionExpression: condition.expression,
+                ExpressionAttributeNames: {
+                  '#creditLedger': 'llmUsageCredits',
+                  ...(condition.names || {}),
+                },
+                ExpressionAttributeValues: {
+                  ':next': next,
+                  ...(condition.values || {}),
+                },
+              },
+            },
+            {
+              Put: {
+                TableName: PAYMENT_HISTORY_TABLE,
+                Item: {
+                  userId: billingUserId,
+                  timestamp: grantedAt,
+                  eventType: 'admin_credit_grant',
+                  // Payment-history amount is stored in cents everywhere else;
+                  // keep the exact micro-USD value in metadata for precision.
+                  amount: Math.round(amountMicroUsd / 10_000),
+                  currency: 'usd',
+                  status: 'granted',
+                  metadata: {
+                    grantId: input.grantId,
+                    ...(input.grantedBy?.trim() ? { grantedBy: input.grantedBy.trim() } : {}),
+                    ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+                    amountMicroUsd,
+                    beforeAllowanceMicroUsd: beforeAllowance,
+                    afterAllowanceMicroUsd: afterAllowance,
+                  },
+                },
+              },
+            },
+          ],
+        }).promise();
+      } else {
+        await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
       }
       return { granted: true, billingUserId, ledger: next };
     } catch (error) {
-      if (isConditionalFailure(error)) continue;
+      if (isTransactionalConditionalFailure(error) || isConditionalFailure(error)) continue;
       throw error;
     }
   }
   throw new Error(`Concurrent usage-credit updates did not settle for ${billingUserId}`);
+}
+
+/**
+ * A TransactWriteItems that fails because ONE of its condition checks did not
+ * hold surfaces as `TransactionCanceledException` with `CancellationReasons[i]
+ * .Code === 'ConditionalCheckFailed'`. Retry treats this identically to a
+ * plain conditional failure — the loop rebuilds from the fresh ledger.
+ */
+function isTransactionalConditionalFailure(error: any): boolean {
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
 }
 
 /**
