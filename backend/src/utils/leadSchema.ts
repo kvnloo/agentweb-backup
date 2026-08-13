@@ -138,6 +138,23 @@ const FREE_EMAIL_DOMAINS = new Set([
 ]);
 
 /**
+ * What a bulk import did with one input row. Reported per row, aligned to the
+ * caller's input array, so a partially-completed import can be resumed from
+ * exactly the rows that never landed instead of being restarted (ENG-1133).
+ *
+ * `unprocessed` is the initial state: a row the importer never reached — the
+ * only outcome that is neither a write nor a decision.
+ */
+export type LeadImportRowOutcome =
+  | 'created'
+  | 'merged'
+  | 'already_present'
+  | 'duplicate_in_request'
+  | 'anonymized_skipped'
+  | 'failed'
+  | 'unprocessed';
+
+/**
  * Synthesized lookup key for the cross-tenant NameCompanyLookupIndex GSI.
  * Only returned when all three components are non-empty strings — otherwise
  * the attribute is omitted from the lead item and the lead never appears in
