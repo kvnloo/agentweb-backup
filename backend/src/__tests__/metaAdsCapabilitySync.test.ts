@@ -1,0 +1,222 @@
+/**
+ * ENG-1158 — reconcile recorded Meta Ads capability against Meta's own answer.
+ *
+ * Two gaps this closes, both found by reading the live record for account
+ * 922903076601160 rather than the code:
+ *
+ *  - RECOVERY. `ads_scope_revoked_at` was only ever cleared by our own OAuth
+ *    reconnect (which replaces the config wholesale). An owner who re-granted
+ *    the Ads permission out of band — on Meta's Business Integrations page,
+ *    which is a normal thing to do — stayed locked out indefinitely: the
+ *    pre-flight gate refuses locally in ~100ms and nothing re-reads the grant.
+ *
+ *  - PROACTIVE DETECTION. Scope loss was only noticed when a run happened to
+ *    attempt a Meta read. A paused schedule, or none at all, meant silence.
+ *
+ * The asymmetry that governs every case below: Meta's answer is authoritative
+ * only when we actually get one. `getGrantedScopes` returns undefined for a
+ * failed debug_token, and acting on that would revoke working connections
+ * during a Meta outage.
+ */
+
+const mockGetGrantedScopes = jest.fn();
+jest.mock('../services/metaService', () => ({
+  metaService: {
+    getGrantedScopes: (...args: any[]) => mockGetGrantedScopes(...args),
+  },
+}));
+
+const mockUpdateAccountConfig = jest.fn().mockResolvedValue(undefined);
+jest.mock('../services/connectedAccountsDb', () => {
+  const actual = jest.requireActual('../services/connectedAccountsDb');
+  return {
+    ...actual,
+    updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
+  };
+});
+
+const mockNotifyMetaAdsScopeLost = jest.fn().mockResolvedValue(true);
+jest.mock('../services/metaAdsScopeAlertService', () => ({
+  notifyMetaAdsScopeLost: (...args: any[]) => mockNotifyMetaAdsScopeLost(...args),
+}));
+
+import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
+import { getMetaAdsScopeState } from '../utils/metaAdsScope';
+
+const AD_ACCOUNT_ID = '922903076601160';
+
+const metaAccount = (config: Record<string, any>) =>
+  ({
+    platform: 'meta',
+    account_id: AD_ACCOUNT_ID,
+    account_name: 'AgentWeb',
+    config: {
+      account_type: 'ad_account',
+      ad_account_id: AD_ACCOUNT_ID,
+      access_token: 'EAA-token',
+      token_expires_at: Date.now() + 86_400_000,
+      ...config,
+    },
+  }) as any;
+
+/** The exact production state this ticket was filed about. */
+const latchedAccount = () =>
+  metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' });
+
+describe('syncMetaAdsCapability (ENG-1158)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockUpdateAccountConfig.mockResolvedValue(undefined);
+    mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
+  });
+
+  describe('recovery — the owner re-granted the permission outside our OAuth flow', () => {
+    it('clears the revocation when Meta now reports an ads scope', async () => {
+      mockGetGrantedScopes.mockResolvedValue(['ads_read', 'pages_show_list']);
+      const account = latchedAccount();
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('recovered');
+      const [, , , updates, options] = mockUpdateAccountConfig.mock.calls[0];
+      expect(updates.granted_scopes).toEqual(['ads_read', 'pages_show_list']);
+      expect(options.unset).toEqual(
+        expect.arrayContaining(['ads_scope_revoked_at', 'ads_scope_alerted_at'])
+      );
+    });
+
+    it('leaves the account genuinely usable again, not merely re-labelled', async () => {
+      // The end state is what matters: the pre-flight gate must stop refusing.
+      mockGetGrantedScopes.mockResolvedValue(['ads_management']);
+      const account = latchedAccount();
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(getMetaAdsScopeState(account.config)).toBe('granted');
+    });
+
+    it('does not write when a capable account is already recorded as capable', async () => {
+      // The overwhelmingly common case every 12 hours. It must be a no-op.
+      mockGetGrantedScopes.mockResolvedValue(['ads_read']);
+
+      const result = await syncMetaAdsCapability(metaAccount({ granted_scopes: ['ads_read'] }), 'user1');
+
+      expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('proactive detection — scope lost with no run to notice it', () => {
+    it('records the revocation and alerts the owner', async () => {
+      mockGetGrantedScopes.mockResolvedValue(['pages_show_list']);
+
+      const result = await syncMetaAdsCapability(
+        metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] }),
+        'user1'
+      );
+
+      expect(result.outcome).toBe('revoked');
+      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(userId).toBe('user1');
+      expect(platform).toBe('meta');
+      expect(accountId).toBe(AD_ACCOUNT_ID);
+      expect(updates.granted_scopes).toEqual(['pages_show_list']);
+      expect(typeof updates.ads_scope_revoked_at).toBe('string');
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
+      );
+    });
+
+    it('alerts the owner of an account latched before any alert existed', async () => {
+      // Already revoked, never told. The sweep is the only thing that reaches
+      // this owner if their schedule is paused.
+      mockGetGrantedScopes.mockResolvedValue([]);
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('revoked');
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not alert twice for the same outage', async () => {
+      mockGetGrantedScopes.mockResolvedValue([]);
+
+      const result = await syncMetaAdsCapability(
+        metaAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
+        }),
+        'user1'
+      );
+
+      expect(result.outcome).toBe('unchanged');
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('does not email when the notice could not be recorded', async () => {
+      // Without a durable marker nothing stops the next sweep emailing again —
+      // and this one runs every 12 hours, forever.
+      mockGetGrantedScopes.mockResolvedValue([]);
+      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('error');
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('never acts on absence of proof', () => {
+    it('does nothing when Meta could not tell us (debug_token failed)', async () => {
+      // A Meta outage must not revoke every connection we have.
+      mockGetGrantedScopes.mockResolvedValue(undefined);
+
+      const result = await syncMetaAdsCapability(metaAccount({ granted_scopes: ['ads_read'] }), 'user1');
+
+      expect(result.outcome).toBe('undetermined');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+    });
+
+    it('does not clear a revocation when the grant cannot be determined', async () => {
+      mockGetGrantedScopes.mockResolvedValue(undefined);
+      const account = latchedAccount();
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(getMetaAdsScopeState(account.config)).toBe('missing');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('never throws when Meta itself throws', async () => {
+      mockGetGrantedScopes.mockRejectedValue(new Error('ECONNRESET'));
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('error');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('skips accounts that are not Meta ad accounts', async () => {
+      const page = metaAccount({ account_type: 'page', granted_scopes: [] });
+
+      const result = await syncMetaAdsCapability(page, 'user1');
+
+      expect(result.outcome).toBe('skipped');
+      expect(mockGetGrantedScopes).not.toHaveBeenCalled();
+    });
+
+    it('skips an account with no access token to ask with', async () => {
+      const tokenless = metaAccount({ granted_scopes: [] });
+      delete tokenless.config.access_token;
+
+      const result = await syncMetaAdsCapability(tokenless, 'user1');
+
+      expect(result.outcome).toBe('skipped');
+      expect(mockGetGrantedScopes).not.toHaveBeenCalled();
+    });
+  });
+});
