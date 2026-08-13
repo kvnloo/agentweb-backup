@@ -879,6 +879,14 @@ export interface DiagnosisContext {
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
   /**
+   * ENG-1174: a factual ROW total for this run's lead import, read off the persisted
+   * tool results (ENG-1133's `attempted` + `reconciliation`). Null when nothing
+   * trustworthy could be read — never a zero, because "unreadable" and "nothing
+   * landed" must not look the same to the model. This is the ONLY quantity the
+   * diagnosis agent is allowed to restate; everything else it invents is stripped.
+   */
+  importTotalsSummary?: string | null;
+  /**
    * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
    * Without it the diagnosis agent sees a failure-only view of the run and answers
    * "be specific about what was accomplished" by asserting nothing was — which is how
@@ -15088,6 +15096,15 @@ TRUTHFULNESS RULES (these override tone):
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
+      }
+      // ENG-1174: the one place a real quantity is available. Read from this run's own
+      // tool results, so unlike the run-count ledgers above it may be quoted verbatim.
+      if (context.importTotalsSummary) {
+        parts.push(
+          `${context.importTotalsSummary}\n`
+          + 'These row numbers are measured, not inferred — you MAY state them exactly as given. '
+          + 'Do not round them, add to them, or derive any other quantity from them.',
+        );
       }
 
       const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [

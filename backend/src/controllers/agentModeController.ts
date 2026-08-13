@@ -62,6 +62,7 @@ import {
   appendConfirmedDataWriteNotice,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
+import { collectLeadImportTotals, describeLeadImportTotals } from '../utils/leadImportLedger';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -844,7 +845,11 @@ async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
   userMessage: string,
-  baseline?: Record<string, number> | null
+  baseline?: Record<string, number> | null,
+  // ENG-1174: start of THIS turn, so import totals read off the transcript belong to
+  // this request. Omitted means "cannot attribute" — the totals stay UNKNOWN rather
+  // than borrowing an earlier turn's rows.
+  turnStartMs?: number,
 ): Promise<DiagnosisResult> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
@@ -852,6 +857,12 @@ async function getDiagnosticErrorMessage(
     // diffSucceededFunctions. "What was accomplished" must mean this request.
     const succeededFunctions = diffSucceededFunctions(baseline, session?.calledFunctions || null);
     const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
+    // ENG-1174: the run's own tool results are the only authority for a ROW count.
+    // ENG-1133 keeps them on the persisted tool message precisely so a turn that died
+    // can still be resumed from them, which is what makes them readable here.
+    const importTotals = typeof turnStartMs === 'number'
+      ? collectLeadImportTotals(session?.messages as any, turnStartMs)
+      : null;
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -859,20 +870,36 @@ async function getDiagnosticErrorMessage(
       workPlanSummary: buildWorkPlanSummary(session),
       failedFunctions: session?.failedFunctions || null,
       succeededFunctions,
+      importTotalsSummary: describeLeadImportTotals(importTotals),
     };
+    // Only figures the transcript proves may survive the ENG-1173 strip — and only
+    // `landed`, deliberately.
+    //
+    // Admitting `attempted` and the shortfall alongside it looks harmless (all three
+    // are measured) but the guard can only test numeric membership, not what the
+    // sentence claims about the number. With 75 of 97 landed, a founded set of
+    // {75, 97, 22} lets "I added 97 leads" and "I added 22 leads" through as
+    // successful-write claims — a false success, which is the exact harm this work
+    // exists to prevent (Greptile P1 on this PR).
+    //
+    // `landed` is the only figure that is true under the claim the model is most
+    // likely to make ("I added N"). The useful partial phrasing survives anyway:
+    // "75 of 97 leads" is left whole by the N-of-M rule above, which never rewrites
+    // an N-of-M construction.
+    const foundedCounts = importTotals?.known ? [importTotals.landed] : [];
     const message = await agentModeService.generateDiagnosticMessage(context);
     return {
       // ENG-1173: three passes, in this order and for this reason.
-      //   1. strip — the agent's only numeric input is a tool-call histogram, so any
-      //      entity quantity it emits is unfounded. Remove it before anything reads
-      //      the prose, so a correction can never be appended under a wrong count.
+      //   1. strip — every entity quantity goes, EXCEPT one the run's own tool
+      //      results prove (ENG-1174's foundedCounts). Runs before anything reads the
+      //      prose, so a correction can never be appended under a wrong count.
       //   2. publish reconcile — the ENG-971 guard, unchanged.
       //   3. data-write reconcile — the same inversion after a confirmed CRM write.
       //      Last because both share CORRECTION_MARKER and first-writer wins; a
       //      landed publish is the more expensive thing to have re-run.
       message: message
         ? reconcileFalseDataWriteFailure(
-            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message), publishLedger),
+            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message, foundedCounts), publishLedger),
             publishLedger,
           )
         : null,
@@ -6052,6 +6079,10 @@ export const agentModeController = {
     // ENG-971: calledFunctions is session-cumulative, so the error path needs to know
     // where THIS turn started to tell its own successes from earlier turns'.
     let turnStartCalledFunctions: Record<string, number> | null = null;
+    // ENG-1174: same reason, for time rather than counters — the catch needs this
+    // turn's start to attribute persisted import results to THIS request. The inner
+    // `turnStartMs` is block-scoped to the try, so it cannot serve the error path.
+    let turnStartMsForDiagnosis: number | null = null;
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
@@ -6369,6 +6400,7 @@ export const agentModeController = {
       // in the same tick, just below), so it is threaded into the run as the anchor for
       // the loop's own wall-clock budget.
       const turnStartMs = Date.now();
+      turnStartMsForDiagnosis = turnStartMs;
 
       // Capture the generation promise so the durable path can reattach to it if the
       // run times out while the work is still going (it keeps running detached).
@@ -6658,7 +6690,9 @@ export const agentModeController = {
             );
           } else {
             const userMessage = req.body?.userMessage || '';
-            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage, turnStartCalledFunctions);
+            const diagnosis = await getDiagnosticErrorMessage(
+              error, sessionId, userMessage, turnStartCalledFunctions, turnStartMsForDiagnosis ?? undefined,
+            );
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
           }
@@ -7519,7 +7553,7 @@ export const agentModeController = {
             );
           } else {
             const userMessage = req.body?.userMessage || '';
-            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions);
+            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions, sharedTurnStartMs);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
           }
