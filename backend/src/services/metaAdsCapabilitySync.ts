@@ -129,24 +129,40 @@ export const syncMetaAdsCapability = async (
       // A stale suspicion still has to be cleared, or two unrelated denials a
       // month apart would combine into a "confirmation" that never happened.
       const hasSuspicion = !!config.ads_scope_denied_seen_at;
-      if (recordedState !== 'missing' && !hasSuspicion) return { outcome: 'unchanged' };
+      const wasRefusing = recordedState === 'missing';
+      if (!wasRefusing && !hasSuspicion) return { outcome: 'unchanged' };
 
-      // Ads data reads. Retract the refusal AND the notice — the notice must go
-      // too, or a future outage would be deduped against an episode that is
-      // already over and the owner would never hear about it.
+      // Retract the refusal AND the notice — the notice must go too, or a future
+      // outage would be deduped against an episode that is already over and the
+      // owner would never hear about it.
       //
-      // `granted_scopes` is deliberately left alone. It records what Meta said
-      // the USER granted; synthesising an ads scope into it to force a 'granted'
-      // reading would fabricate provenance. Dropping the marker moves the record
-      // to 'unknown', which is the honest state — we have not proven a grant, we
-      // have proven the read works — and 'unknown' is what stops the gate
-      // refusing.
-      await updateAccountConfig(userId, platform as any, account.account_id, {}, {
-        unset: ['ads_scope_revoked_at', 'ads_scope_alerted_at', 'ads_scope_denied_seen_at'],
-      });
-      delete config.ads_scope_revoked_at;
-      delete config.ads_scope_alerted_at;
-      delete config.ads_scope_denied_seen_at;
+      // `granted_scopes` goes with them, and that is load-bearing rather than
+      // tidiness. A revocation NARROWS the stored grant instead of emptying it,
+      // so a recovering account is left holding e.g. ['pages_show_list'] — and
+      // getMetaAdsScopeState reads a non-empty grant carrying no ads scope as a
+      // proven 'missing' (its final fallthrough). Clearing only the markers would
+      // therefore leave the gate still refusing and the row still disconnected:
+      // recovery that does not recover, for every account that ever needed it.
+      //
+      // Dropping it is also the honest record. What remains there after a
+      // revocation is our own subtraction, not anything Meta reported, so it
+      // cannot stand as a grant. Absent reads as 'unknown', which says exactly
+      // what we know: the read works; what was granted, we would have to re-ask.
+      const unset = ['ads_scope_denied_seen_at'];
+      if (wasRefusing) unset.push('ads_scope_revoked_at', 'ads_scope_alerted_at', 'granted_scopes');
+
+      await updateAccountConfig(userId, platform as any, account.account_id, {}, { unset });
+      for (const key of unset) delete config[key];
+
+      // A cleared suspicion is not a recovery: nothing user-visible was ever
+      // wrong. Counting it as one would make a transient blip read in monitoring
+      // as a customer outage that resolved.
+      if (!wasRefusing) {
+        console.log(
+          `[MetaAdsCapabilitySync] Ads access confirmed for user ${userId} account ${account.account_id} — cleared an unconfirmed refusal`
+        );
+        return { outcome: 'unchanged' };
+      }
 
       console.log(
         `[MetaAdsCapabilitySync] Ads access restored for user ${userId} account ${account.account_id} — cleared the recorded refusal`

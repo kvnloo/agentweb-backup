@@ -114,6 +114,60 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(getMetaAdsScopeState(account.config)).not.toBe('missing');
     });
 
+    /**
+     * The realistic post-revocation shape, and the one the fixtures missed. A
+     * revocation NARROWS granted_scopes rather than emptying it, so a recovered
+     * account is left holding e.g. ['pages_show_list'] — and getMetaAdsScopeState
+     * reads a non-empty grant with no ads scope as a proven 'missing', its final
+     * fallthrough. Clearing only the markers therefore leaves the gate refusing
+     * and the row disconnected: recovery that does not recover.
+     */
+    it('recovers an account whose grant was narrowed by an earlier revocation', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = metaAccount({
+        granted_scopes: ['pages_show_list', 'pages_read_engagement', 'public_profile'],
+        ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+        ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
+      });
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('recovered');
+      expect(getMetaAdsScopeState(account.config)).not.toBe('missing');
+    });
+
+    it('drops the narrowed grant rather than leaving a value we derived', async () => {
+      // What remains is our own subtraction, not anything Meta reported, so it
+      // cannot be trusted as a grant record. Absent reads as 'unknown', which is
+      // the honest answer: we proved the read works, not what was granted.
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = metaAccount({
+        granted_scopes: ['pages_show_list'],
+        ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
+      expect(options.unset).toContain('granted_scopes');
+      expect(account.config.granted_scopes).toBeUndefined();
+    });
+
+    it('reports a cleared suspicion as unchanged, not as a recovery', async () => {
+      // Nothing user-visible was ever wrong, so counting it as a recovery would
+      // make a transient blip read in monitoring as a customer outage resolved.
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('unchanged');
+      expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
+    });
+
     it('does not write when a capable account is already recorded as capable', async () => {
       // The overwhelmingly common case every 12 hours. It must be a no-op.
       mockProbeAdsAccountAccess.mockResolvedValue('accessible');
