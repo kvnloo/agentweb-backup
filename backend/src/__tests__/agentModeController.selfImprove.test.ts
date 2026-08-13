@@ -61,6 +61,7 @@ jest.mock('../services/db', () => ({
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
     updateSchedule: jest.fn(),
+    dropOldestRunResults: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
   userDb: {
@@ -422,10 +423,8 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
   // FAIL: run history is the other unbounded attribute — shed it once revisions are gone
   it('sheds the oldest run results when trimming revisions is not enough', async () => {
-    const schedule = nearLimitSchedule({
-      promptRevisions: [],
-      runResults: Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) })),
-    });
+    const runResults = Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) }));
+    const schedule = nearLimitSchedule({ promptRevisions: [], runResults });
     mockScheduleDb.getScheduleById.mockResolvedValue(schedule as any);
 
     const res = makeRes();
@@ -437,11 +436,54 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
     await agentModeController.updateScheduledChat(req, res);
 
-    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
-    expect(updates.runResults.length).toBeLessThan(12);
+    const [scheduleId, dropped] = mockScheduleDb.dropOldestRunResults.mock.calls[0] as any;
+    expect(scheduleId).toBe('sched-big');
+    expect(dropped).toBeGreaterThan(0);
+    const kept = runResults.slice(dropped);
     // Newest runs survive; the oldest are the ones dropped.
-    expect(updates.runResults[updates.runResults.length - 1].runId).toBe('run-11');
-    expect(estimateDynamoItemBytes({ ...schedule, ...updates })).toBeLessThanOrEqual(SCHEDULE_ITEM_BUDGET_BYTES);
+    expect(kept[kept.length - 1].runId).toBe('run-11');
+    expect(estimateDynamoItemBytes({ ...schedule, runResults: kept, ...(mockScheduleDb.updateSchedule.mock.calls[0][1] as any) }))
+      .toBeLessThanOrEqual(SCHEDULE_ITEM_BUDGET_BYTES);
+  });
+
+  // FAIL: the trimmed history must NEVER be written back from this handler's own read.
+  // A run finishing while the owner saves an edit appends to the tail, and a full-list
+  // write derived from the earlier read would erase that completed run's result.
+  it('sheds run history by index instead of rewriting the list it read', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
+      promptRevisions: [],
+      runResults: Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) })),
+    }) as any);
+
+    const res = makeRes();
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-big' },
+      body: { startingMessage: 'q'.repeat(36000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(mockScheduleDb.dropOldestRunResults).toHaveBeenCalled();
+    const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
+    expect(updates.runResults).toBeUndefined();
+  });
+
+  // FAIL: a save that is rejected must not have already dropped the owner's run history
+  it('does not shed run history when the edit is rejected as too large', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule() as any);
+
+    const res = makeRes();
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-big' },
+      body: { startingMessage: 'q'.repeat(420000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
   });
 
   // FAIL: a prompt that cannot fit at all is a client error with a reason, not a 500
@@ -517,6 +559,7 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
     expect(updates.promptRevisions).toHaveLength(2);
     expect(updates.runResults).toBeUndefined();
+    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
     expect(res.status).not.toHaveBeenCalledWith(400);
   });
 });

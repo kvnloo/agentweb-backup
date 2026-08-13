@@ -191,6 +191,48 @@ describe('every AW-ChatMessages write path is size-bounded', () => {
     expect(fits(request.message)).toBe(true);
   });
 
+  // The guard is a ceiling, so the interesting inputs are the two messages either
+  // side of it: exactly at budget must survive intact, one byte over must be shrunk.
+  const atExactly = (bytes: number) => {
+    const overhead = Buffer.byteLength(JSON.stringify({ role: 'assistant', content: '' }), 'utf8');
+    return { role: 'assistant', content: 'z'.repeat(bytes - overhead) };
+  };
+
+  // BOUNDARY: a message sized exactly to the budget is not oversized — leave it whole
+  it('writes a message that is exactly at the budget through untouched', async () => {
+    const exact = atExactly(350_000);
+    expect(Buffer.byteLength(JSON.stringify(exact), 'utf8')).toBe(350_000);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).migrateMessagesToMessagesTable('sess-exact', [exact]);
+
+    expect(lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message).toBe(exact);
+  });
+
+  // BOUNDARY: one byte past the budget is oversized, on the repair path too
+  it('shrinks a message that is one byte over the budget', async () => {
+    const over = atExactly(350_001);
+
+    batchWriteMock.mockResolvedValueOnce({ UnprocessedItems: {} });
+    await (chatbotDb as any).updateMessagesInDatabase('sess-over', [{ messageIndex: 2, message: over }]);
+
+    const written = lastBatchWriteParams.RequestItems[tableName][0].PutRequest.Item.message;
+    expect(written).not.toBe(over);
+    expect(fits(written)).toBe(true);
+  });
+
+  // ERROR PATH: the guard runs before the write, so a rejected batch still surfaces
+  it('surfaces a write failure rather than reporting an oversized message as stored', async () => {
+    batchWriteMock.mockRejectedValueOnce(Object.assign(new Error('throttled'), {
+      code: 'ProvisionedThroughputExceededException',
+    }));
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(
+      (chatbotDb as any).migrateMessagesToMessagesTable('sess-fail', [huge()]),
+    ).rejects.toThrow('throttled');
+  });
+
   // SUCCESS: a message that already fits is written through untouched
   it('leaves a normal message alone on both paths', async () => {
     const small = { role: 'assistant', content: 'short answer' };

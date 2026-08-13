@@ -75,6 +75,7 @@ describe('scheduleDb.addRunResult item budget', () => {
     const runResults = Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) }));
     mockDocumentClientMethods.update
       .mockReturnValueOnce(rejected(itemSizeError()))
+      .mockReturnValueOnce(resolved({}))
       .mockReturnValueOnce(resolved({ Attributes: { scheduleId: 'sched-1' } }));
     mockDocumentClientMethods.get.mockReturnValue(resolved({
       Item: { scheduleId: 'sched-1', startingMessage: 'p'.repeat(35000), runResults },
@@ -84,13 +85,30 @@ describe('scheduleDb.addRunResult item budget', () => {
 
     expect(result).toEqual({ scheduleId: 'sched-1' });
     expect(mockDocumentClientMethods.get).toHaveBeenCalledTimes(1);
-    const retry = mockDocumentClientMethods.update.mock.calls[1][0];
-    expect(retry.UpdateExpression).not.toContain('list_append');
-    const written = retry.ExpressionAttributeValues[':runResults'];
-    expect(written.length).toBeLessThan(runResults.length + 1);
-    // The incoming run is kept; the oldest are the ones dropped.
-    expect(written[written.length - 1].runId).toBe('run-new');
-    expect(written[0].runId).not.toBe('run-0');
+    // The oldest entries go out by index, and the incoming run is appended by the
+    // retry of the original list_append — so nothing is written from the stale read.
+    const trim = mockDocumentClientMethods.update.mock.calls[1][0];
+    expect(trim.UpdateExpression).toMatch(/REMOVE #runResults\[0\]/);
+    expect(mockDocumentClientMethods.update.mock.calls[2][0].UpdateExpression).toContain('list_append');
+  });
+
+  // FAIL: a run finishing concurrently appends to the tail — a full-list write derived
+  // from the read above would erase it, so the trim must never send one
+  it('never writes back the run-result list it read', async () => {
+    const runResults = Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) }));
+    mockDocumentClientMethods.update
+      .mockReturnValueOnce(rejected(itemSizeError()))
+      .mockReturnValueOnce(resolved({}))
+      .mockReturnValueOnce(resolved({ Attributes: { scheduleId: 'sched-1' } }));
+    mockDocumentClientMethods.get.mockReturnValue(resolved({
+      Item: { scheduleId: 'sched-1', startingMessage: 'p'.repeat(35000), runResults },
+    }));
+
+    await scheduleDb.addRunResult('sched-1', { runId: 'run-new', summary: 'r'.repeat(30000) });
+
+    mockDocumentClientMethods.update.mock.calls.forEach(([params]: any[]) => {
+      expect(Array.isArray(params.ExpressionAttributeValues?.[':runResults'])).toBe(false);
+    });
   });
 
   // FAIL: an unrelated failure must not trigger the read-modify-write path
