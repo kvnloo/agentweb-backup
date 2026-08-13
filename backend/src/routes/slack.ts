@@ -1367,7 +1367,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                 }
                 
                 // ENG-936: one shared prompt for every revision entry point (see revisionService).
-                const { buildAgentModeRevisionMessage } = await import('../services/revisionService');
+                const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                  '../services/revisionService'
+                );
                 const revisionMessage = buildAgentModeRevisionMessage(
                   originalApproval.assetType,
                   originalApproval.assetUrl,
@@ -1417,6 +1419,12 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                         // Only extract if the tool call succeeded
                         if (toolResult.success) {
+                          if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                            toolCallFailed = true;
+                            toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                            continue;
+                          }
+
                           const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                           if (imageUrl) {
                             newAssetUrl = imageUrl;
@@ -1585,7 +1593,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                     
                     // ENG-936: one shared prompt for every revision entry point (see revisionService).
-                    const { buildAgentModeRevisionMessage } = await import('../services/revisionService');
+                    const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                      '../services/revisionService'
+                    );
                     const revisionMessage = buildAgentModeRevisionMessage(
                       originalApproval.assetType,
                       originalApproval.assetUrl,
@@ -1635,6 +1645,12 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                             // Only extract if the tool call succeeded
                             if (toolResult.success) {
+                              if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                                toolCallFailed = true;
+                                toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                                continue;
+                              }
+
                               const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                               if (imageUrl) {
                                 newAssetUrl = imageUrl;
