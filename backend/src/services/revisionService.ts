@@ -29,6 +29,25 @@ export function buildAgentModeRevisionMessage(
   throw new Error(`Unsupported asset type for Agent Mode revision: ${assetType}`);
 }
 
+function normalizeInputImages(toolCall: any): string[] {
+  const rawInputImages =
+    toolCall?.arguments?.inputImages ??
+    toolCall?.arguments?.input_images ??
+    toolCall?.result?.inputImages ??
+    toolCall?.result?.input_images ??
+    [];
+
+  if (typeof rawInputImages === 'string') return [rawInputImages];
+  if (!Array.isArray(rawInputImages)) return [];
+  return rawInputImages.filter((value): value is string => typeof value === 'string');
+}
+
+export function isApprovedRevisionSource(toolCall: any, approvedAssetUrl: string): boolean {
+  const inputImages = normalizeInputImages(toolCall);
+  if (inputImages.length === 0) return true;
+  return inputImages.includes(approvedAssetUrl);
+}
+
 /**
  * ENG-936: classify why a revision produced no asset, so the oncall alert names the
  * real cause. "Could not extract new asset URL" is the last resort, not the default —
@@ -154,6 +173,12 @@ async function runAgentModeRevision(
         }
 
         if (approval.assetType === 'image') {
+          if (!isApprovedRevisionSource(toolCall, approval.assetUrl)) {
+            toolCallFailed = true;
+            toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${approval.assetUrl}".`;
+            continue;
+          }
+
           if (toolResult.success) {
             const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
             if (imageUrl) {

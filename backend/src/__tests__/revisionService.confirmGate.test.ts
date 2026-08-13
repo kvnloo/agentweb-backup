@@ -16,6 +16,7 @@
 import {
   buildAgentModeRevisionMessage,
   describeRevisionFailure,
+  isApprovedRevisionSource,
 } from '../services/revisionService';
 
 const IMAGE_URL = 'https://example.com/users/u1/files/original.png';
@@ -41,6 +42,38 @@ describe('ENG-936: Agent Mode revision carries the user approval past the image-
     expect(() => buildAgentModeRevisionMessage('video' as any, IMAGE_URL, 'x')).toThrow(
       /Unsupported asset type/
     );
+  });
+});
+
+describe('ENG-936: image revisions must use the approved source URL', () => {
+  const approvedUrl = 'https://example.com/users/u1/files/original.png';
+
+  it('accepts generate_image calls that include the approved source image', () => {
+    expect(
+      isApprovedRevisionSource(
+        {
+          name: 'generate_image',
+          arguments: { inputImages: [approvedUrl, 'https://example.com/other.png'] },
+        },
+        approvedUrl
+      )
+    ).toBe(true);
+  });
+
+  it('rejects generate_image calls that use only unapproved source images', () => {
+    expect(
+      isApprovedRevisionSource(
+        {
+          name: 'generate_image',
+          arguments: { inputImages: ['https://example.com/other.png'] },
+        },
+        approvedUrl
+      )
+    ).toBe(false);
+  });
+
+  it('does not block non-generate_image calls', () => {
+    expect(isApprovedRevisionSource({ name: 'update_html_file' }, approvedUrl)).toBe(true);
   });
 });
 
