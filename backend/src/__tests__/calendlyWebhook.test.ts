@@ -46,11 +46,11 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-const mockResolveMetaPixelForUser = jest.fn();
+const mockResolveMetaPixelWithDefault = jest.fn();
 const mockSendCapiLeadEvent = jest.fn();
 jest.mock('../services/metaService', () => ({
   metaService: {
-    resolveMetaPixelForUser: (...a: any[]) => mockResolveMetaPixelForUser(...a),
+    resolveMetaPixelWithDefault: (...a: any[]) => mockResolveMetaPixelWithDefault(...a),
     sendCapiLeadEvent: (...a: any[]) => mockSendCapiLeadEvent(...a),
   },
 }));
@@ -196,7 +196,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     jest.clearAllMocks();
     mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: mockAccount }]);
     mockGetUserById.mockResolvedValue(mockOwner);
-    mockResolveMetaPixelForUser.mockResolvedValue({ pixelId: 'pixel-1', accountId: 'act-1' });
+    mockResolveMetaPixelWithDefault.mockResolvedValue({ pixelId: 'pixel-1', accountId: 'act-1' });
     mockGetMetaAccountCredentials.mockResolvedValue({ accountId: 'act-1', accessToken: 'meta-token', accountName: 'Ad Account' });
     mockSendCapiLeadEvent.mockResolvedValue({ success: true, fbtraceId: 'trace-1' });
     mockGetLeadByEmail.mockResolvedValue(null);
@@ -254,7 +254,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
   });
 
   it('does not call CAPI (and does not throw) when the Meta pixel cannot be resolved', async () => {
-    mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
+    mockResolveMetaPixelWithDefault.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
     const body = makePayload();
     const res = await postSigned(body);
 
@@ -276,6 +276,82 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     expect(accessToken).toBe('meta-token');
     expect(event.eventId).toBe('https://api.calendly.com/scheduled_events/evt-2/invitees/inv-2');
     expect(event.email).toBe('lead@example.com');
+  });
+
+  describe('ENG-1141 — Calendly-scoped attribution choice', () => {
+    it('passes the connection\'s own configured pixel/account to resolveMetaPixelWithDefault when set', async () => {
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{
+        userId: USER_ID,
+        account: {
+          ...mockAccount,
+          config: { ...mockAccount.config, attributionPixelId: 'configured-pixel', attributionAccountId: 'configured-acct' },
+        },
+      }]);
+      const body = makePayload();
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).toHaveBeenCalledWith(
+        mockOwner,
+        USER_ID,
+        { pixelId: 'configured-pixel', accountId: 'configured-acct' },
+      );
+    });
+
+    // ENG-1141 opt-out: a Calendly-only customer must be able to say "no Meta attribution"
+    // and still get the booking + CRM-forward. Unset means "auto-resolve", so this needs its
+    // own explicit flag — otherwise CAPI fires against whichever ad account came first.
+    it('skips the CAPI leg entirely when attribution is explicitly disabled', async () => {
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{
+        userId: USER_ID,
+        account: { ...mockAccount, config: { ...mockAccount.config, attributionDisabled: true } },
+      }]);
+
+      const res = await postSigned(makePayload({ email: 'lead@example.com' }));
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+      // The booking itself is unaffected — this opts out of Meta, not out of the CRM.
+      expect(mockCreateLead).toHaveBeenCalled();
+    });
+
+    it('ignores a stale stored pair when attribution is disabled', async () => {
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{
+        userId: USER_ID,
+        account: {
+          ...mockAccount,
+          config: {
+            ...mockAccount.config,
+            attributionPixelId: 'configured-pixel',
+            attributionAccountId: 'configured-acct',
+            attributionDisabled: true,
+          },
+        },
+      }]);
+
+      const res = await postSigned(makePayload({ email: 'lead@example.com' }));
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+    });
+
+    it('passes undefined (letting it default to the first account/pixel) when nothing is configured on the connection', async () => {
+      const body = makePayload();
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockResolveMetaPixelWithDefault).toHaveBeenCalledWith(mockOwner, USER_ID, undefined);
+    });
   });
 
   describe('async job queue integration (ENG-524 fast-follow, Greptile P1)', () => {
@@ -517,7 +593,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       });
 
       it('marks the job complete (not failed) when Meta pixel is unresolved — an expected skip, not a failure', async () => {
-        mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
+        mockResolveMetaPixelWithDefault.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
         const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-24/invitees/inv-24' });
 
         const res = await postSigned(body);
@@ -998,7 +1074,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     });
 
     it('still runs CRM-forward when the Meta pixel cannot be resolved', async () => {
-      mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
+      mockResolveMetaPixelWithDefault.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
       mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 

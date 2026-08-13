@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
+import { invalidateCachedPixels } from './metaPixelsCache';
 
 // ============================================
 // Type Definitions
@@ -312,6 +313,20 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // persisted here so every later delivery reuses it directly — see
   // resolveOrCreateBookingList in calendlyWebhook.ts.
   booking_lead_list_id?: string;
+  // ENG-1141: which Meta pixel/ad account CAPI attribution uses for this connection's
+  // bookings. Unlike landing pages (per-generation choice, no stored default — a human
+  // is present at creation time), a booking webhook is unattended, so this has to be
+  // settable once and reused — see resolveMetaPixelWithDefault in metaService.ts, which
+  // falls back to the caller's first connected account/first pixel when unset.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  // ENG-1141: an explicit "don't wire Meta up at all" choice. Distinct from simply leaving
+  // the pair unset, which means "auto-resolve to my first account/pixel" — a customer who
+  // connected Calendly purely for scheduling has no way to express "no Meta attribution"
+  // otherwise, and would silently get CAPI Schedule events fired against whichever ad
+  // account happened to be first. When true, the booking is still created and CRM-forwarded
+  // exactly as before; only the CAPI leg is skipped.
+  attributionDisabled?: boolean;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
@@ -413,6 +428,12 @@ export const createAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: updatedAccounts,
   } as Partial<User>);
+
+  // ENG-1141: which pixels exist for this user just changed. Without this, connecting a
+  // Meta account and immediately opening the create dialog would read a cached "no pixels"
+  // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
+  // page. See services/metaPixelsCache.ts.
+  invalidateCachedPixels(userId);
 
   return accountConfig;
 };
@@ -668,6 +689,9 @@ export const deleteAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: a disconnect must not leave that account's pixels listed in the picker.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -697,6 +721,10 @@ export const deleteAccountById = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: same as deleteAccount — a disconnected account's pixels must stop being
+  // offered immediately, not a TTL later.
+  invalidateCachedPixels(userId);
 };
 
 /**
