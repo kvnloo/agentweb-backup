@@ -167,6 +167,17 @@ export async function grantMonthlyLlmUsageCredit(input: {
   if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) {
     throw new Error('amountMicroUsd must be a positive integer');
   }
+  // Admin grants must be whole-cent multiples so the payment-history `amount`
+  // (which is denominated in cents everywhere else in the codebase) can
+  // represent them faithfully. Sub-cent admin credits have no product use
+  // case today — the admin dialog defaults to a whole-dollar prefill — and
+  // allowing them would force the audit row to either round to $0 (loses
+  // audit) or up to 1c (overstates). Migration and purchase sources
+  // legitimately carry sub-cent amounts (raw provider spend, fractional
+  // cents) and are unaffected.
+  if (input.source === 'admin' && amountMicroUsd % 10_000 !== 0) {
+    throw new Error('admin grants must be whole-cent multiples (amountMicroUsd divisible by 10_000)');
+  }
 
   const billingUserId = input.billingUserId;
   const month = getCurrentUsageMonth(input.now);
@@ -285,12 +296,11 @@ export async function grantMonthlyLlmUsageCredit(input: {
                   userId: billingUserId,
                   timestamp: grantedAt,
                   eventType: 'admin_credit_grant',
-                  // Payment-history amount is stored in cents everywhere else;
-                  // keep the exact micro-USD value in metadata for precision.
-                  // Round up any sub-cent partial (via ceil) and floor the
-                  // displayed cents at 1 so grants under 1c can't silently
-                  // audit as $0 — metadata still carries the exact microUsd.
-                  amount: Math.max(1, Math.ceil(amountMicroUsd / 10_000)),
+                  // Payment-history amount is stored in cents everywhere else.
+                  // Admin grants are validated as whole-cent multiples above,
+                  // so this division is exact — no rounding tradeoff. Exact
+                  // micro-USD stays in metadata for downstream precision.
+                  amount: amountMicroUsd / 10_000,
                   currency: 'usd',
                   status: 'granted',
                   metadata: {

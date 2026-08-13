@@ -234,21 +234,36 @@ describe('admin-grant audit trail (AC7)', () => {
     expect(mockGetUserById).toHaveBeenCalledTimes(2);
   });
 
-  it('never audits a sub-cent grant as $0 — floors displayed cents at 1 and keeps exact microUsd in metadata', async () => {
+  it('rejects sub-cent admin grants so the payment-history amount (in cents) can represent them exactly', async () => {
+    await expect(
+      grantMonthlyLlmUsageCredit({
+        billingUserId: 'u1',
+        grantId: 'admin:sub-cent',
+        source: 'admin',
+        // 5_000 microUsd = $0.005 = half a cent → not representable in cents.
+        amountMicroUsd: 5_000,
+        grantedBy: 'ops@agentweb.pro',
+        now: NOW,
+      }),
+    ).rejects.toThrow(/whole-cent multiples/);
+    expect(mockTransactWrite).not.toHaveBeenCalled();
+  });
+
+  it('allows sub-cent grants for purchase/migration sources — only the admin path is whole-cent-constrained', async () => {
+    // Purchase and migration sources legitimately carry fractional-cent
+    // amounts (raw provider spend); the whole-cent constraint applies only
+    // to admin because only admin writes a cents-denominated audit row.
     await grantMonthlyLlmUsageCredit({
       billingUserId: 'u1',
-      grantId: 'admin:sub-cent',
-      source: 'admin',
-      // 5_000 microUsd = $0.005 = half a cent
-      amountMicroUsd: 5_000,
-      grantedBy: 'ops@agentweb.pro',
+      grantId: 'stripe:cs_fractional',
+      source: 'purchase',
+      amountMicroUsd: 3_500,
       now: NOW,
     });
-
-    const params = mockTransactWrite.mock.calls[0]![0] as any;
-    const auditItem = params.TransactItems[1].Put.Item;
-    expect(auditItem.amount).toBe(1);
-    expect(auditItem.metadata.amountMicroUsd).toBe(5_000);
+    // Purchase source doesn't route through the transaction (no audit row),
+    // so it lands on the plain updateUser path — no throw is proof enough.
+    expect(mockTransactWrite).not.toHaveBeenCalled();
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
   });
 
   it('propagates non-conditional transaction errors instead of retrying', async () => {
