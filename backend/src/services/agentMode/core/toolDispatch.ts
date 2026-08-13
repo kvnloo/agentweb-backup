@@ -607,7 +607,8 @@ export async function executePreparedTools(
 
       if (
         toolCall.function.name === 'generate_image'
-        && preparedFunctionArgs?.confirm === true
+        && Array.isArray(approvedRevisionImageSources)
+        && approvedRevisionImageSources.length > 0
       ) {
         const sourceCheck = isApprovedImageSourceForRevision(
           preparedFunctionArgs,

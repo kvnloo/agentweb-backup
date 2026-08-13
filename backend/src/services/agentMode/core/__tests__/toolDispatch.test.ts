@@ -1023,6 +1023,36 @@ describe('executePreparedTools', () => {
       });
       expect(input.messages[0].content).toContain('explicit approved source inputImages');
     });
+
+    it('requires revision source inputImages even without explicit confirm=true', async () => {
+      const execOrder: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          execOrder.push(i.toolName);
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+      });
+
+      const input = makeInput(
+        [toolCall('a', 'generate_image', JSON.stringify({ prompt: 'edit' }))],
+        ports,
+        {
+          approvedRevisionImageSources: ['https://assets.example.com/approved.png'],
+        },
+      );
+
+      const result = await executePreparedTools(input);
+
+      expect(execOrder).toEqual([]);
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({});
+      expect(input.toolCallsLedger[0]).toMatchObject({
+        name: 'generate_image',
+        error: expect.stringContaining('explicit approved source inputImages'),
+      });
+      expect(input.messages[0].content).toContain('explicit approved source inputImages');
+    });
   });
 
   // ── ENG-105: the REAL validateToolOutput port, end-to-end through dispatch ──────
