@@ -5,6 +5,7 @@ import {
   appendConfirmedDataWriteNotice,
   collectConfirmedPublishActions,
   reconcileFalseFailureReport,
+  assertsUnsavedInterruption,
 } from '../utils/falseFailureReport';
 
 /**
@@ -63,6 +64,17 @@ describe('stripUnfoundedEntityCounts (ENG-1173)', () => {
     expect(stripUnfoundedEntityCounts(keep)).toBe(keep);
   });
 
+  /**
+   * "2 of 5 files" -> "2 of the files" would drop the denominator and keep the
+   * numerator, turning a partial into a claim about "the files" — worse than the bug
+   * being fixed. A count that is part of an N-of-M construction is left intact.
+   */
+  it('does not mangle an N-of-M partial', () => {
+    const partial = 'I processed 2 of 5 files before stopping.';
+    expect(stripUnfoundedEntityCounts(partial)).toBe(partial);
+    expect(stripUnfoundedEntityCounts('Imported 75 of 97 leads.')).toBe('Imported 75 of 97 leads.');
+  });
+
   it('leaves a message with no counts untouched', () => {
     const clean = 'The run ended before I could write the summary. Reply "continue" to resume.';
     expect(stripUnfoundedEntityCounts(clean)).toBe(clean);
@@ -72,6 +84,84 @@ describe('stripUnfoundedEntityCounts (ENG-1173)', () => {
     expect(stripUnfoundedEntityCounts('')).toBe('');
     expect(stripUnfoundedEntityCounts(null as any)).toBe(null);
     expect(stripUnfoundedEntityCounts(undefined as any)).toBe(undefined);
+  });
+});
+
+/**
+ * ENG-1173 regression guard. The widened interruption/loss vocabulary is SHARED with
+ * `reconcileFalseFailureReport`, which runs at the loop edge (agentModeService, "if
+ * (content && !wasCancelled)") on the MAIN AGENT's own closing prose — always-on, every
+ * provider, every turn. An unscoped "unable to finish|complete" therefore reached far
+ * beyond the diagnosis path and put a red correction banner on truthful messages.
+ */
+describe('widened vocabulary must not fire on truthful main-agent prose (ENG-1173)', () => {
+  const publishLedger = [{ name: 'publish_landing_page_changes' }];
+
+  it('leaves a truthful "published, but one sub-task did not finish" close alone', () => {
+    const truthful =
+      'I published your landing page. The research took longer than expected, so I was '
+      + 'unable to complete the competitor analysis.';
+
+    expect(assertsUnsavedInterruption(truthful)).toBe(false);
+    expect(reconcileFalseFailureReport(truthful, publishLedger)).toBe(truthful);
+  });
+
+  it.each([
+    'I was unable to complete the competitor analysis before time ran out.',
+    'The run timed out and I could not finish the market research.',
+    'This took longer than expected, so the summary is missing.',
+  ])('no banner on truthful partial: %s', (text) => {
+    expect(reconcileFalseFailureReport(text, publishLedger)).toBe(text);
+  });
+
+  it('still catches the production denial, which names a WRITE', () => {
+    const prod =
+      'Emma was unable to finish adding your prospects to the "POS IncentivPay Motion" '
+      + 'list because the process took longer than expected.';
+
+    expect(assertsUnsavedInterruption(prod)).toBe(true);
+  });
+
+  it('still catches the original ENG-971 shape', () => {
+    const eng971 = 'The system timed out, so your changes were not saved. Please try again.';
+
+    expect(assertsUnsavedInterruption(eng971)).toBe(true);
+    expect(reconcileFalseFailureReport(eng971, publishLedger)).not.toBe(eng971);
+  });
+});
+
+describe('ENG-1173 kill switch', () => {
+  const ORIGINAL = process.env.AGENT_DIAGNOSIS_COUNT_GUARD;
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.AGENT_DIAGNOSIS_COUNT_GUARD;
+    else process.env.AGENT_DIAGNOSIS_COUNT_GUARD = ORIGINAL;
+  });
+
+  /**
+   * These guards rewrite/annotate user-visible text and fail SILENTLY — a false
+   * positive costs the user information and surfaces only as a log line. Merging
+   * deploys straight to production, so there has to be a way to stand them down from
+   * config instead of waiting on a revert. Mirrors AGENT_SYNTHESIS_RESIDUE_GUARD.
+   */
+  it('restores exact pre-ENG-1173 behaviour when disabled', () => {
+    process.env.AGENT_DIAGNOSIS_COUNT_GUARD = 'false';
+
+    const withCount = 'I have successfully added the 3 leads to your CRM list.';
+    expect(stripUnfoundedEntityCounts(withCount)).toBe(withCount);
+
+    const falseFailure = 'The run timed out and your leads were not saved. Please try again.';
+    expect(reconcileFalseDataWriteFailure(falseFailure, [{ name: 'add_leads_to_list' }]))
+      .toBe(falseFailure);
+    expect(appendConfirmedDataWriteNotice('Some error text.', [{ name: 'add_leads_to_list' }]))
+      .toBe('Some error text.');
+  });
+
+  it('is on by default and on any value other than the literal "false"', () => {
+    delete process.env.AGENT_DIAGNOSIS_COUNT_GUARD;
+    expect(stripUnfoundedEntityCounts('Added 3 leads.')).toBe('Added the leads.');
+
+    process.env.AGENT_DIAGNOSIS_COUNT_GUARD = 'true';
+    expect(stripUnfoundedEntityCounts('Added 3 leads.')).toBe('Added the leads.');
   });
 });
 

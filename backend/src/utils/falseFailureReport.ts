@@ -224,12 +224,18 @@ const DENIED_SUCCESS_RE = new RegExp([
   String.raw`\bcould\s*n[o']?t\s+(?:complete|finish)\s+(?:the\s+|your\s+)?(?:deployment|deploy|publish\w*|update|changes?|fix(?:es)?|edits?|post|send)\b`,
   // ENG-1173: "Emma was unable to finish adding your prospects to the … list" — the
   // production denial in session 98b90503, where five add_leads_to_list batches had
-  // all returned success. Left unscoped on purpose: the object is a GERUND phrase
-  // ("finish adding your prospects"), which no noun list can enumerate. Over-firing
-  // is cheap here because the guard only ever APPENDS what the ledger confirms — it
-  // cannot assert an outcome the run did not produce.
-  String.raw`\b(?:was|were|is|are)?\s*unable\s+to\s+(?:finish|complete)\b`,
-  String.raw`\bcould\s+not\s+be\s+completed\b`,
+  // all returned success.
+  //
+  // SCOPED TO THE WRITE, and the scoping is the whole point. These patterns are shared
+  // with reconcileFalseFailureReport, which runs at the loop edge on the MAIN AGENT's
+  // own closing prose — always-on, every provider, every turn. An unscoped
+  // "unable to finish|complete" also matched truthful copy like "I published your page,
+  // but I was unable to complete the competitor analysis", stamping a red correction
+  // banner on a message that was entirely accurate. Matching the GERUND of a write verb
+  // keeps the production denial and drops the false positives.
+  String.raw`\bunable\s+to\s+(?:finish|complete)\s+(?:the\s+|your\s+)?(?:adding|importing|creating|saving|publishing|sending|posting|uploading|deploying|writing|updating)\b`,
+  // Same reasoning: anchored to the noun that names the write, never bare.
+  String.raw`\b(?:import|upload|sync|deployment|publish)\b[^.!?\n]{0,20}\bcould\s+not\s+be\s+completed\b`,
   String.raw`\bmay\s+n[o']?t\s+have\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|sent|gone\s+through)\b`,
   String.raw`\bnothing\s+(?:was\s+)?(?:saved|persisted|applied|published|deployed|posted|sent)\b`,
   String.raw`\bnone\s+of\s+(?:the|your|these|those)\s+[^.!?\n]{0,30}?\b(?:made\s+it|went\s+through|(?:was|were)\s+(?:saved|applied|published|deployed|sent|posted))\b`,
@@ -508,6 +514,21 @@ const UNFOUNDED_COUNT_RE = new RegExp(
 );
 
 /**
+ * ENG-1173 kill switch — ON by default; set AGENT_DIAGNOSIS_COUNT_GUARD=false to stand
+ * the count strip and the data-write notices down.
+ *
+ * Same reasoning as AGENT_SYNTHESIS_RESIDUE_GUARD (ENG-1054): these guards alter
+ * user-visible text and fail SILENTLY — a false positive costs the user information
+ * and surfaces only as a log line, never as an error. A merge here deploys straight to
+ * production, so there has to be a way to disable it from config rather than waiting on
+ * a revert. Read per call, not at module load, so it can be flipped without a restart.
+ * Off restores the exact pre-ENG-1173 behaviour.
+ */
+function countGuardEnabled(): boolean {
+  return process.env.AGENT_DIAGNOSIS_COUNT_GUARD !== 'false';
+}
+
+/**
  * Remove entity quantities from diagnosis-agent prose.
  *
  * Production session 39eb5663 wrote 75 leads across three `add_leads_to_list` batches
@@ -530,9 +551,17 @@ const UNFOUNDED_COUNT_RE = new RegExp(
  */
 export function stripUnfoundedEntityCounts(content: string): string {
   if (typeof content !== 'string' || content.length === 0) return content;
+  if (!countGuardEnabled()) return content;
   return content.replace(
     UNFOUNDED_COUNT_RE,
-    (_match, determiner: string | undefined, noun: string) => `${determiner || 'the'} ${noun}`,
+    (match: string, determiner: string | undefined, noun: string, offset: number, whole: string) => {
+      // "2 of 5 files" must stay intact. Rewriting only the "5 files" half yields
+      // "2 of the files" — the denominator is gone and the numerator now reads as a
+      // claim about the whole set, which is worse than the number this guard exists
+      // to remove. An N-of-M construction is left alone entirely.
+      if (/\bof\s+$/i.test(whole.slice(0, offset))) return match;
+      return `${determiner || 'the'} ${noun}`;
+    },
   );
 }
 
@@ -606,6 +635,7 @@ export function appendConfirmedDataWriteNotice(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!countGuardEnabled()) return content;
   if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
 
   const actions = collectConfirmedDataWriteActions(toolCalls);
@@ -629,6 +659,7 @@ export function reconcileFalseDataWriteFailure(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!countGuardEnabled()) return content;
   // A publish correction is already here — extend it rather than drop the warning.
   if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
   if (!assertsUnsavedInterruption(content)) return content;
