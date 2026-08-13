@@ -100,8 +100,15 @@ describe('AgentModeController — import row counts in the diagnosis message (EN
     },
   });
 
-  /** Must be inside this turn, which starts at Date.now() in the handler. */
-  const inThisTurn = () => new Date(Date.now() + 1_000).toISOString();
+  /**
+   * Must sort AFTER the turn start, which the handler captures as its own `Date.now()`
+   * some time after this fixture is built. A small relative offset (`Date.now() + 1s`)
+   * is a flake waiting to happen: one CI scheduling pause longer than the offset puts
+   * these rows before the turn start, they are filtered out as an earlier turn's, and
+   * the assertions fail for a reason that has nothing to do with the code under test.
+   * A fixed far-future stamp is unconditionally inside the window.
+   */
+  const inThisTurn = () => '2099-01-01T00:00:00.000Z';
 
   const sessionWithImport = (messages?: any[]) => ({
     sessionId,
