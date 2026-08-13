@@ -73,6 +73,9 @@ describe('admin one-time LLM usage credits', () => {
     [{ amountUsd: 0, reason: 'x', idempotencyKey: 'valid_key' }, 'amountUsd'],
     [{ amountUsd: 10, reason: '', idempotencyKey: 'valid_key' }, 'reason'],
     [{ amountUsd: 10, reason: 'x', idempotencyKey: 'short' }, 'idempotencyKey'],
+    // Sub-cent amounts fail with a clean 400 instead of a generic 500 from
+    // the whole-cent check in grantMonthlyLlmUsageCredit. 0.005 = half a cent.
+    [{ amountUsd: 0.005, reason: 'x', idempotencyKey: 'valid_key' }, 'whole cents'],
   ])('rejects an invalid grant before writing: %p', async (payload, message) => {
     const res = await request(app)
       .post('/api/admin/users/member-1/llm-usage-credit')

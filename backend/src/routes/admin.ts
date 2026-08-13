@@ -5153,6 +5153,15 @@ router.post("/users/:userId/llm-usage-credit", async (req, res) => {
     if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
       return res.status(400).json({ message: "amountUsd must be a positive number" });
     }
+    // Admin grants are audited in cents on payment-history — sub-cent grants
+    // cannot be represented faithfully there, so reject them here with a 400
+    // instead of letting the service layer throw and surface as a generic 500.
+    const amountMicroUsd = Math.round(amountUsd * 1_000_000);
+    if (amountMicroUsd % 10_000 !== 0) {
+      return res.status(400).json({
+        message: "amountUsd must be in whole cents (2 decimal places max)",
+      });
+    }
     if (typeof reason !== "string" || !reason.trim()) {
       return res.status(400).json({ message: "reason is required" });
     }
@@ -5163,7 +5172,6 @@ router.post("/users/:userId/llm-usage-credit", async (req, res) => {
     if (!targetUser) return res.status(404).json({ message: "User not found" });
 
     const billingUserId = await resolveBillingUserId(userId);
-    const amountMicroUsd = Math.round(amountUsd * 1_000_000);
     const admin = (req as any).user;
     const result = await grantMonthlyLlmUsageCredit({
       billingUserId,
