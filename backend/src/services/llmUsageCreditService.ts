@@ -1,4 +1,5 @@
 import { userDb, type User } from './db';
+import { paymentHistoryDb } from './paymentHistoryDb';
 
 export type LlmUsageCreditSource = 'purchase' | 'migration' | 'admin';
 
@@ -241,6 +242,30 @@ export async function grantMonthlyLlmUsageCredit(input: {
 
     try {
       await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      if (input.source === 'admin') {
+        // AC7 audit: admin credits are an out-of-band judgment call, so record
+        // an immutable payment-history event with actor, reason, and the
+        // before/after allowance figures. Stripe purchases and rollout
+        // migrations already have their own audit trails (Stripe events,
+        // rollout script log) and don't route through this path.
+        const beforeAllowance = allowanceBalanceFromLedger(current);
+        const afterAllowance = allowanceBalanceFromLedger(next);
+        await paymentHistoryDb.record({
+          userId: billingUserId,
+          timestamp: grantedAt,
+          eventType: 'admin_credit_grant',
+          amount: amountMicroUsd,
+          currency: 'usd',
+          status: 'granted',
+          metadata: {
+            grantId: input.grantId,
+            ...(input.grantedBy?.trim() ? { grantedBy: input.grantedBy.trim() } : {}),
+            ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+            beforeAllowanceMicroUsd: beforeAllowance,
+            afterAllowanceMicroUsd: afterAllowance,
+          },
+        });
+      }
       return { granted: true, billingUserId, ledger: next };
     } catch (error) {
       if (isConditionalFailure(error)) continue;
@@ -248,6 +273,21 @@ export async function grantMonthlyLlmUsageCredit(input: {
     }
   }
   throw new Error(`Concurrent usage-credit updates did not settle for ${billingUserId}`);
+}
+
+/**
+ * Sum of extra allowance carried by a ledger — purchased net of reversals,
+ * plus admin grants. Excludes migration offset, which reduces raw usage rather
+ * than extending the ceiling and would double-count if added here.
+ */
+function allowanceBalanceFromLedger(ledger: MonthlyLlmUsageCredits): number {
+  const purchasedNet = Math.max(
+    0,
+    Math.round(ledger.totalPurchasedMicroUsd || 0) -
+      Math.round(ledger.totalPurchasedReversedMicroUsd || 0),
+  );
+  const admin = Math.max(0, Math.round(ledger.totalAdminGrantedMicroUsd || 0));
+  return purchasedNet + admin;
 }
 
 /**
