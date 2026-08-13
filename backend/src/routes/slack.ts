@@ -1392,7 +1392,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   requiredFunctions,
                   keywords: [],
                   attachments: [],
-                  maxAttempts: 5
+                  maxAttempts: 5,
+                  approvedRevisionImageSources:
+                    originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                 }).then(async (result) => {
                   console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1618,7 +1620,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       requiredFunctions,
                       keywords: [],
                       attachments: [],
-                      maxAttempts: 5
+                      maxAttempts: 5,
+                      approvedRevisionImageSources:
+                        originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                     }).then(async (result) => {
                       console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 

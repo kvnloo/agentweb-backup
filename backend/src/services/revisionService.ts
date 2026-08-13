@@ -151,6 +151,8 @@ async function runAgentModeRevision(
       keywords: [],
       attachments: [],
       maxAttempts: 5,
+      approvedRevisionImageSources:
+        approval.assetType === 'image' ? [approval.assetUrl] : undefined,
     });
 
     console.log(`Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
