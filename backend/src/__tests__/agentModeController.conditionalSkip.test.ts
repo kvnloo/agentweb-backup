@@ -118,6 +118,7 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
+import { callSatisfiesRequirement } from '../utils/requiredCallSatisfaction';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -595,6 +596,45 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
   it('drops nameless calls and tolerates non-array input', () => {
     expect(reconstructPriorToolCalls(undefined as any)).toEqual([]);
     expect(reconstructPriorToolCalls([{ metadata: { toolCalls: [{}, { name: 'get_leads' }] } }])).toEqual([{ name: 'get_leads' }]);
+  });
+
+  // ENG-1045: the publish-outcome check reads arguments.action, so the reconstruction
+  // must carry the arguments through — otherwise a resumed run that already published
+  // a thread falls back into the "post_on_connected_account (1 more time needed)" loop.
+  it('carries the action argument from the executed ledger', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } },
+    ]);
+  });
+
+  it('parses the JSON-string arguments of a request-list fallback', () => {
+    const messages = [{ tool_calls: [{ function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
+    ]);
+  });
+
+  it('omits unparseable arguments but keeps the entry and its error', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: '{not json', error: 'boom' }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'twitter_manage_post', error: 'boom' }]);
+  });
+
+  it('lets a resumed post_thread entry satisfy a post_on_connected_account requirement', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: { success: true } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(true);
+
+    // A resumed thread that FAILED still leaves the publish owed.
+    const [failed] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', failed)).toBe(false);
   });
 });
 
