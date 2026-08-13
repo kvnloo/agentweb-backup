@@ -11200,7 +11200,17 @@ export class AgentModeService {
       }
 
       const searchQuery = (options?.search || '').trim().toLowerCase();
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
+      // `clickIds` is the denormalized top-level attribution field (ENG-1176).
+      // It has to be listed here or the resolver falls through to
+      // `lead.customFields.clickIds` and answers "0% of your leads carry a click
+      // ID" — indistinguishable from a broken tag, and wrong. The dot form
+      // (`clickIds.gclid`) resolves on its own and never had this problem.
+      //
+      // NOTE: `utmSource` / `utmMedium` have the same latent bug and are
+      // deliberately NOT fixed here — promoting them changes how an existing
+      // filter behaves for anyone with a same-named custom field, which is a
+      // separate seam. Tracked on ENG-1175.
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt', 'clickIds'];
       const matchingLeads: Array<{ lead: any; listId: string; listName: string }> = [];
 
       let stopIdx = -1;
