@@ -14,6 +14,7 @@ import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3072,6 +3073,87 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+// A write that loses its race is recomputed, not replayed — replaying a list built
+// against different history would clobber whatever landed in between.
+const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
+
+/**
+ * ENG-1048: the run history this row can hold WITH one more result on the end, and
+ * the history that was derived from. Returns null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
+ */
+const planRunResultShed = async (scheduleId: string, runResult: any) => {
+  const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+  const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
+  if (!existing) return null;
+
+  const history = Array.isArray(existing.runResults) ? existing.runResults : [];
+  const appended = [...history, runResult];
+  const { kept, dropped } = trimListToItemBudget(
+    { ...existing, runResults: appended },
+    'runResults',
+    appended,
+  );
+  if (kept.length === 0) return null;
+  if (dropped > 0) {
+    console.warn(
+      `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
+    );
+  }
+  return { kept, observed: history };
+};
+
+/**
+ * ENG-1048: shed the oldest runs AND record the incoming one in a single write, bound
+ * to the exact history the new list was built from.
+ *
+ * The two halves cannot be separated. Trim in one write and append in another, and a
+ * failure in between deletes history without recording the run it made room for. So:
+ * one `SET`, conditioned on the stored history still being what was read — length AND
+ * tail entry, because a concurrent recovery that drops one and appends one leaves the
+ * length untouched. On mismatch the caller recomputes; nothing is written from a read
+ * that has been overtaken.
+ */
+const writeShedRunResults = async (
+  scheduleId: string,
+  kept: any[],
+  observed: any[]
+): Promise<{ raced: true } | { raced: false; attributes: any }> => {
+  const values: Record<string, any> = {
+    ':runResults': kept,
+    ':updatedAt': new Date().toISOString(),
+    ':expectedLength': observed.length,
+  };
+  let condition = 'size(#runResults) = :expectedLength';
+  if (observed.length === 0) {
+    condition = `(attribute_not_exists(#runResults) OR ${condition})`;
+  } else {
+    condition += ` AND #runResults[${observed.length - 1}] = :expectedLast`;
+    values[':expectedLast'] = observed[observed.length - 1];
+  }
+
+  try {
+    const result = await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: { scheduleId },
+      UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: condition,
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+    return { raced: false, attributes: result.Attributes };
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `DynamoDB addRunResult: schedule ${scheduleId} run history moved under the shed — recomputing.`
+      );
+      return { raced: true };
+    }
+    throw error;
+  }
+};
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3244,7 +3326,19 @@ export const scheduleDb = {
      * ENG-827: attributes that must STILL hold for this write to land, as read a
      * moment ago. `undefined` means the attribute must still be absent.
      */
-    expect?: Record<string, any>
+    expect?: Record<string, any>,
+    /**
+     * ENG-1048: shed `count` of the OLDEST run results as part of THIS write. The trim
+     * exists to make room for the edit, so the two have to land together — shedding
+     * first and then failing the edit would delete history for a save that never
+     * happened. `expectedLength` binds the removal to the history the count was
+     * measured against, so a run recording at the same moment cannot leave this write
+     * taking a second prefix off an already-shortened list. `expectedLast` pins the
+     * tail with it: an overflow recovery that drops one entry and appends its own
+     * leaves the length unchanged, and length alone would wave the stale count
+     * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     */
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3275,12 +3369,33 @@ export const scheduleDb = {
         expressionAttributeValues[`:${alias}`] = value;
       });
 
+      // ENG-1048: removing by index (rather than SETting a list built from a read)
+      // is what makes this safe against a run finishing mid-edit: appends land at the
+      // tail, so index 0 still names the oldest entry. `runResults` is never also SET
+      // here — overlapping document paths in one expression are rejected.
+      let removeExpression = '';
+      if (shedRunResults && shedRunResults.count > 0) {
+        expressionAttributeNames['#runResults'] = 'runResults';
+        removeExpression = ` REMOVE ${Array.from(
+          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          (_, index) => `#runResults[${index}]`
+        ).join(", ")}`;
+        conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
+        expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
+        if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
+          conditionExpressions.push(
+            `#runResults[${shedRunResults.expectedLength - 1}] = :expectedRunResultsLast`
+          );
+          expressionAttributeValues[':expectedRunResultsLast'] = shedRunResults.expectedLast;
+        }
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
@@ -3297,32 +3412,48 @@ export const scheduleDb = {
   },
 
   async addRunResult(scheduleId: string, runResult: any) {
-    try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
-        },
-        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-        ExpressionAttributeNames: {
-          '#runResults': 'runResults',
-          '#updatedAt': 'updatedAt',
-        },
-        ExpressionAttributeValues: {
-          ':runResult': [runResult],
-          ':emptyList': [],
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: {
+        scheduleId,
+      },
+      UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#runResults': 'runResults',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':runResult': [runResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
 
+    try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
+      // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
+      if (isDynamoItemSizeError(error)) {
+        try {
+          for (let attempt = 1; attempt <= MAX_RUN_RESULT_SHED_ATTEMPTS; attempt++) {
+            const plan = await planRunResultShed(scheduleId, runResult);
+            if (plan === null) break;
+            const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
+            if (written.raced) continue;
+            return written.attributes;
+          }
+        } catch (recoveryError) {
+          // Recovery failed too — report the condition that actually stopped the write.
+          console.error(`DynamoDB addRunResult: could not make room on schedule ${scheduleId}:`, recoveryError);
+        }
+      }
       handleDynamoDbError(error, "addRunResult");
       throw error;
     }
   },
+
 
   async getRunResults(scheduleId: string) {
     try {
@@ -9489,6 +9620,26 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing, optionally capped for administrative diagnostics. */
+  async listAll(maxItems?: number): Promise<Organization[]> {
+    if (!maxItems || maxItems < 1) {
+      return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+    }
+
+    const organizations: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        Limit: maxItems - organizations.length,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      organizations.push(...((result.Items || []) as Organization[]));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && organizations.length < maxItems);
+    return organizations;
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,

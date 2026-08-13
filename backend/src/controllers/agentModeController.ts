@@ -22,9 +22,10 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
-import { toolCallSucceeded } from '../utils/toolCallOutcome';
+import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -67,6 +68,13 @@ import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
 import {
+  MAX_ATOMIC_RUN_RESULT_REMOVALS,
+  SCHEDULE_ITEM_BUDGET_BYTES,
+  estimateDynamoItemBytes,
+  isDynamoItemSizeError,
+  trimListToItemBudget,
+} from '../utils/dynamoItemBudget';
+import {
   getAllowedSkills,
   isSubscriptionFeatureEnabled,
   type SubscriptionFeatureId,
@@ -105,6 +113,9 @@ async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): 
 /** Raised when a schedule edit could not be committed together with its consent narrowing. */
 class ScheduleConsentRaceError extends Error {}
 
+/** ENG-1048: raised when run history moved out from under an edit's history shed. */
+class ScheduleHistoryRaceError extends Error {}
+
 const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 
 /**
@@ -140,11 +151,44 @@ const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 async function applyScheduleEditWithConsentNarrowing(
   scheduleId: string,
   updates: any,
-  firstRead: any
+  firstRead: any,
+  // ENG-1048: run results this edit has to shed to fit, carried by the SAME write so
+  // history is never deleted for an edit that then fails, and bound to the history the
+  // count was measured against so it cannot take a second prefix off a list another
+  // writer already shortened.
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
 ): Promise<void> {
+  // Pass only the arguments this write actually needs, so an ordinary edit stays an
+  // ordinary two-argument update.
+  const write = async (payload: any, expectation?: Record<string, any>) => {
+    if (shedRunResults && shedRunResults.count > 0) {
+      try {
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+      } catch (writeError: any) {
+        // The shed count belongs to the history it was measured against; it cannot be
+        // replayed against a different one. Hand back a conflict instead of retrying.
+        if (
+          writeError?.code === 'ConditionalCheckFailedException' ||
+          writeError?.name === 'ConditionalCheckFailedException'
+        ) {
+          throw new ScheduleHistoryRaceError(
+            `Run history for schedule ${scheduleId} moved while this edit was saving.`
+          );
+        }
+        throw writeError;
+      }
+      return;
+    }
+    if (expectation) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+      return;
+    }
+    await scheduleDb.updateSchedule(scheduleId, payload);
+  };
+
   // An edit that does not move the required tools cannot move the scope: plain write.
   if (updates.requiredFunctionCalls === undefined) {
-    await scheduleDb.updateSchedule(scheduleId, updates);
+    await write(updates);
     return;
   }
 
@@ -192,11 +236,11 @@ async function applyScheduleEditWithConsentNarrowing(
 
     try {
       if (expectation) {
-        await scheduleDb.updateSchedule(scheduleId, { ...updates, ...consentUpdates }, expectation);
+        await write({ ...updates, ...consentUpdates }, expectation);
       } else {
         // Nothing to narrow — no condition to assert, and no reason to make an ordinary
         // edit fail because somebody touched consent at the same moment.
-        await scheduleDb.updateSchedule(scheduleId, updates);
+        await write(updates);
       }
       return;
     } catch (writeError: any) {
@@ -2207,6 +2251,14 @@ type RunVerifiedChatResult = {
   // produced zero write calls. The run is a SUCCESSFUL skip — required write-call
   // minimums are waived instead of retry-pressed toward irreversible publishing.
   conditionalSkip?: boolean;
+  // ENG-947: set when the run spent its publish-press budget with an irreversible
+  // publish requirement still unmet, and stopped instead of re-pressing to
+  // maxAttempts. The run still FAILED (nothing was published) — this only records
+  // WHY it ended early, so the outcome is distinguishable from a run that
+  // exhausted all 20 attempts for some other reason.
+  publishHeldForApproval?: boolean;
+  publishRequirementMismatch?: boolean;
+  publishToolFailing?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -2360,6 +2412,13 @@ export async function runVerifiedChat(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
+  // ENG-947: attempts spent specifically on the publish requirement — the first
+  // attempt that ended with a publish tool as the ONLY outstanding requirement,
+  // plus every press sent afterwards. Deliberately separate from `attempt`, which
+  // work-plan reminders, zero-output/transient-LLM retries and AskUserQuestion
+  // auto-take continuations also consume: counting those would trip the breaker
+  // on a run that was never actually asked to publish.
+  let publishPressAttempts = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -2460,9 +2519,7 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = Array.isArray(params.priorToolCalls)
-    ? params.priorToolCalls.map((c) => c.name).filter(Boolean)
-    : [];
+  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2707,7 +2764,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
+          ...requirementEvidenceNames(continuationToolCalls)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2849,9 +2906,7 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
-
-      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -2965,6 +3020,112 @@ export async function runVerifiedChat(
           ).map(reqFunc => reqFunc.functionName),
           functionCallMisses: [],
           functionStatus: skipFunctionStatus,
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
+      // ENG-947: publish-press circuit breaker. The unmet-requirement retry above
+      // re-sends "Please try again. Make sure to <tool> (N more time(s) needed)."
+      // and runs another attempt, up to 20. When the ONLY thing still missing is an
+      // irreversible publish to a live account, that press has a very short useful
+      // life: the model either makes the call within a turn or two, or it has
+      // decided not to (its skill prompts carry an absolute publish gate telling it
+      // to draft-and-notify in unattended runs) and re-asking cannot move it. In
+      // production the reported schedules published on attempt 2 while they worked,
+      // and have run to attempt 20 with nothing published every day since — 55-69
+      // messages at ~$6 a run, nearly all of it prompt-cache WRITE cost from
+      // re-sending the prefix another 17 times. Stop once the budget is spent.
+      //
+      // This can only ever end a run EARLIER; it never publishes anything, and it
+      // never converts a would-be success into a failure — the run is already
+      // failing its requirements at this point and the remaining presses are what
+      // it would have spent to fail anyway. Scoped to scheduled runs
+      // (completionGate) and only when the run is otherwise done: a pending work
+      // plan or an unmet keyword still has genuinely useful work left to press for.
+      //
+      // The budget is counted in PRESSES, not raw attempts. `attempt` is shared
+      // with the work-plan reminder, the zero-output and transient-LLM retries and
+      // the AskUserQuestion auto-take continuation — none of which name the publish
+      // tool. A run whose model opens with a work plan would otherwise burn its
+      // whole budget on "Please perform the work on pending steps." and be cut off
+      // having never been asked to publish once. So increment only on the attempts
+      // that actually reached the publish-only-unmet state, which is exactly the
+      // state whose next retry message carries the publish ask.
+      const publishIsTheOnlyThingLeft =
+        completionGate &&
+        !allFunctionCallsMet &&
+        allKeywordsMet &&
+        (!workPlan || workPlanCompleted) &&
+        isPublishOnlyUnmet(functionCallMisses);
+      if (publishIsTheOnlyThingLeft) {
+        publishPressAttempts++;
+      }
+      // A stalled publish requirement has three causes and they need different
+      // things from the owner, so the marker must not conflate them. Only
+      // SUCCEEDED external writes count as evidence the run published — a failed
+      // publish wrote nothing. But a failed publish is not silence either: it
+      // means the model DID reach for the tool and the integration is broken, so
+      // the attempted-but-unsuccessful names are reported separately.
+      const externalWritesSucceeded = publishIsTheOnlyThingLeft
+        ? allToolCalls
+            .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
+            .map((tc: any) => tc.name as string)
+        : [];
+      const publishToolsAttempted = publishIsTheOnlyThingLeft
+        ? allToolCalls
+            .filter((tc: any) => tc && typeof tc.name === 'string' && !toolCallSucceeded(tc))
+            .map((tc: any) => tc.name as string)
+        : [];
+      const publishStall = publishIsTheOnlyThingLeft
+        ? classifyPublishStall({
+            pressAttempt: publishPressAttempts,
+            unmetRequiredFunctions: functionCallMisses,
+            externalWritesSucceeded,
+            publishToolsAttempted,
+          })
+        : null;
+      if (publishStall) {
+        const heldForApproval = publishStall === 'held-for-approval';
+        const toolFailing = publishStall === 'publish-tool-failing';
+        console.warn(
+          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
+          `with [${functionCallMisses.join(', ')}] still unmet. ` +
+          `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
+          (heldForApproval
+            ? `the tool was never called and the content is held for approval, and repeating an ` +
+              `identical press for an irreversible publish only burns prompt-cache writes`
+            : toolFailing
+            ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
+              `integration is broken and pressing an erroring tool again cannot succeed`
+            : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
+              `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
+              `succeed`) +
+          ` (ENG-947).`
+        );
+        return {
+          success: false,
+          ...(heldForApproval
+            ? { publishHeldForApproval: true }
+            : toolFailing
+            ? { publishToolFailing: true }
+            : { publishRequirementMismatch: true }),
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches,
+          functionCallMisses,
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return {
+              functionName: reqFunc.functionName,
+              requiredCount: reqFunc.minCount,
+              actualCount,
+              met: actualCount >= reqFunc.minCount,
+            };
+          }),
           attempts: attempt,
           workPlanCompleted: workPlanCompleted || !workPlan,
         };
@@ -3213,6 +3374,11 @@ export async function runScheduledChat(
   summary?: string;
   // Present only on a parked run — links the pending question for the UI.
   pendingQuestionId?: string;
+  // ENG-947: present only when the run stopped early on the publish-press budget
+  // with the publish tool still uncalled (content drafted and held, not published).
+  publishHeldForApproval?: boolean;
+  publishRequirementMismatch?: boolean;
+  publishToolFailing?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -4097,13 +4263,19 @@ export async function runScheduledChat(
       console.error('AgentMode: Failed to update session title with summary:', err);
     }
 
-    // Convert result to scheduled chat format
+    // Convert result to scheduled chat format. This list is the AUDIT record of what
+    // the model called, so it deliberately keeps failed attempts — "it tried and the
+    // tool errored" is exactly what someone reading run history needs to see.
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
-    // Calculate final function call details
+    // Calculate final function call details. Counted off the requirement evidence,
+    // NOT the audit list above (ENG-947): a failed publish must not report
+    // `actual: 1, required: 1` next to a functionCallMisses entry naming the same
+    // tool. The two fields would contradict each other in run history and in the
+    // result email, and the reassuring one is the one that is wrong.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    actualFunctionCalls.forEach((call: string) => {
+    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
 
@@ -4159,6 +4331,26 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-947: the run ended early because its publish-press budget ran out with
+      // the publish tool still uncalled — the content was drafted and held, not
+      // published. Still a `failure` (nothing shipped, so the streak/oncall
+      // escalation must keep firing), but marked so a held run is distinguishable
+      // from a run that exhausted all 20 attempts for some other reason.
+      ...(result.publishHeldForApproval ? { publishHeldForApproval: true } : {}),
+      // ENG-947: same early exit, opposite cause — the run DID write externally,
+      // just not through the tool requiredFunctionCalls names (a thread goes out
+      // via twitter_manage_post, not post_on_connected_account). Also a `failure`,
+      // because the requirement really is unmet, but it must never be reported as
+      // held-for-approval: nothing is waiting on the owner, and telling them to
+      // approve a post already live on X is the false report this ticket is about.
+      // What they need to fix is the schedule's required function.
+      ...(result.publishRequirementMismatch ? { publishRequirementMismatch: true } : {}),
+      // ENG-947: the third cause, found on preview session 42004fa0 — the model
+      // DID call the named publish tool on every press and each call errored
+      // ("No twitter account connected"). Nothing is waiting on the owner here
+      // either: reporting it as held-for-approval sends them to an approval queue
+      // that is empty, when what they need is to reconnect the account.
+      ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
@@ -8733,10 +8925,73 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
+      // ENG-1048: DynamoDB caps an item at 400KB, and a schedule row grows without
+      // bound along two axes — promptRevisions (a full prompt snapshot per edit) and
+      // runResults. A schedule with a ~35k-character prompt drifts into the ceiling,
+      // after which EVERY write is rejected and the prompt can never be updated
+      // again (the reported row sat 1KB under the limit with 334KB of revision
+      // history, so even a length-trimmed prompt still failed). Budget the projected
+      // item and shed the oldest history rather than failing the save.
+      const projectedItem: Record<string, any> = { ...existingSchedule, ...updates };
+      const observedRunResults: any[] = Array.isArray((existingSchedule as any).runResults)
+        ? (existingSchedule as any).runResults
+        : [];
+      let runResultsToShed = 0;
+      const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
+        if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+        const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
+        if (list.length === 0) return;
+        const { kept, dropped } = trimListToItemBudget(projectedItem, listKey, list);
+        if (dropped === 0) return;
+        console.warn(
+          `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
+        );
+        if (listKey === 'runResults') {
+          // Never write run history back from the read above: a run finishing while
+          // this edit is in flight appends to the tail, and a full-list write derived
+          // from that earlier read would erase its result. Shed by index instead,
+          // inside the edit's own write.
+          runResultsToShed = dropped;
+        } else {
+          updates[listKey] = kept;
+        }
+        projectedItem[listKey] = kept;
+      };
+      // Revision history first: it is pure undo state. Run history is only shed once
+      // revisions are exhausted, because it feeds the run-health summary.
+      shedOldest('promptRevisions');
+      shedOldest('runResults');
+      if (estimateDynamoItemBytes(projectedItem) > SCHEDULE_ITEM_BUDGET_BYTES) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save (about ${Math.round(estimateDynamoItemBytes(projectedItem) / 1024)}KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
+      }
+      // Refuse rather than shed more history than the edit's own write can carry: the
+      // alternative is deleting history in a separate write and then possibly failing
+      // the edit, which costs the owner run history for a save that never happened.
+      if (runResultsToShed > MAX_ATOMIC_RUN_RESULT_REMOVALS) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit would mean dropping ${runResultsToShed} saved runs from this schedule's history at once. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
+      }
+
       // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
       // neither can be acknowledged without the other. See
-      // applyScheduleEditWithConsentNarrowing.
-      await applyScheduleEditWithConsentNarrowing(scheduleId, updates, existingSchedule);
+      // applyScheduleEditWithConsentNarrowing. The consent fields it may add are a
+      // handful of scalars, comfortably inside the budget's headroom. ENG-1048's run
+      // history shed rides the same write for the same reason.
+      await applyScheduleEditWithConsentNarrowing(
+        scheduleId,
+        updates,
+        existingSchedule,
+        runResultsToShed > 0
+          ? {
+              count: runResultsToShed,
+              expectedLength: observedRunResults.length,
+              expectedLast: observedRunResults[observedRunResults.length - 1],
+            }
+          : undefined
+      );
 
       res.json({
         message: 'Scheduled chat updated successfully',
@@ -8756,10 +9011,28 @@ export const agentModeController = {
             'saved. Reopen the schedule to see its current settings, then apply your change again.',
         });
       }
+      // ENG-1048: the shed was bound to the run history it was measured against, and
+      // that history moved, so nothing was written. Ask for a retry rather than
+      // replaying a removal count that would now take a prefix too many.
+      if (error instanceof ScheduleHistoryRaceError) {
+        console.warn(`AgentMode: ENG-1048 schedule update abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule recorded a run while you were saving, so nothing was saved. ' +
+            'Try again — its run history has changed.',
+        });
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
       console.error('AgentMode: Update scheduled chat error:', error);
+      // ENG-1048: an item-size rejection is a client-fixable condition, not a
+      // server fault — say so instead of returning an opaque, non-retryable 500.
+      if (isDynamoItemSizeError(error)) {
+        return res.status(400).json({
+          error: "Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. Shorten the starting message and try again.",
+        });
+      }
       res.status(500).json({ error: 'Failed to update scheduled chat' });
     }
   },
