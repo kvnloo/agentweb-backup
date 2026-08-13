@@ -3307,6 +3307,10 @@ export class AgentModeService {
     // Cost-policy-owned retry target. undefined preserves the global admin backup;
     // null explicitly disables retry. Optimized callers always send string|null.
     transientFallbackModel?: string | null,
+    // ENG-936: approved source URLs for image revisions. When provided, the
+    // preflight gate rejects confirm=true `generate_image` calls that attempt to
+    // edit an unapproved source URL.
+    approvedRevisionImageSources?: string[],
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -4506,6 +4510,7 @@ export class AgentModeService {
           generationHardCapMs,
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
+          approvedRevisionImageSources,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
