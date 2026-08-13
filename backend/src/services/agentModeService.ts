@@ -30653,21 +30653,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
-        console.log('[AgentMode] Account lookup result:', account ? {
+        const resolved = await this.resolveAccessibleAccount(userId, accountId);
+        console.log('[AgentMode] Account lookup result:', resolved ? {
           found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
+          platform: resolved.account.platform,
+          accountType: resolved.account.config?.account_type,
+          accountName: resolved.account.account_name
         } : { found: false });
 
-        if (!account) {
+        if (!resolved) {
           console.log('[AgentMode] Account not found, returning error');
           return {
             success: false,
             message: 'Account not found or access denied'
           };
         }
+        const { account, ownerUserId } = resolved;
 
         // Only LinkedIn is supported for reactions
         if (account.platform !== 'linkedin') {
@@ -30688,13 +30689,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
-        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        // A listing is not a standing grant for a write: re-read the OWNER's record
+        // immediately before reacting so a disconnect — or an un-share — that lands
+        // while this call is in flight still stops it (mirrors postOnConnectedAccount).
+        const currentAccount = await getAccountByIdConsistent(accountId, ownerUserId, 'linkedin');
         if (!currentAccount) {
           return { success: false, message: 'LinkedIn account is no longer connected' };
         }
+        if (ownerUserId !== userId && currentAccount.sharedWithOrg !== true) {
+          return { success: false, message: 'Account not found or access denied' };
+        }
 
         console.log('[AgentMode] Calling adapter.createReaction (adapter will handle token refresh if needed)...');
-        const result = await adapter.createReaction(currentAccount, postUrn, reactionType, userId);
+        const result = await adapter.createReaction(currentAccount, postUrn, reactionType, ownerUserId);
 
         return {
           success: true,
