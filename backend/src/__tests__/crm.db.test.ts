@@ -2602,8 +2602,10 @@ describe('CRM Database Service', () => {
         let calls = 0;
         jest.spyOn(Date, 'now').mockImplementation(() => {
           calls++;
-          // Call 1 sets the deadline; everything after it reads as expired.
-          return calls <= 1 ? start : start + budgetMs + 1;
+          // Two reads happen before any row is written and must see budget
+          // left: the one that sets the deadline, and the one that bounds the
+          // first existing-lead page. Everything after them reads as expired.
+          return calls <= 2 ? start : start + budgetMs + 1;
         });
       };
 
@@ -2673,6 +2675,24 @@ describe('CRM Database Service', () => {
         expect(result.mergedCount).toBe(0);
         expect(result.rowOutcomes).toEqual(['unprocessed']);
         expect(result.errors[0]).toMatch(/Could not read the existing leads/);
+      });
+
+      // Checking the clock between pages does not help if one page never comes
+      // back: the await holds and the check is never reached.
+      it('stops when a single existing-lead page stalls past the budget', async () => {
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockReturnValue(new Promise(() => {})),
+        });
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'stall@example.com' }],
+          { deadlineMs: 50 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        expect(result.newCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
       });
 
       it('does not flag an incomplete pre-read when the list reads cleanly', async () => {
