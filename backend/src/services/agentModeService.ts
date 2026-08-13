@@ -15410,76 +15410,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * connections that actually work. Those are caught after the fact by
    * normalizeMetaAdsReadError. (ENG-629)
    */
-  private async assertMetaAdsScope(selected: any, userId?: string): Promise<void> {
+  private async assertMetaAdsScope(selected: any): Promise<void> {
     const { getMetaAdsScopeState, buildMetaAdsScopeError } = await import('../utils/metaAdsScope');
     if (getMetaAdsScopeState(selected?.config) !== 'missing') return;
 
-    // Notify from here too, not only from the detection path (ENG-1158). Once a
-    // revocation is on file this gate is the ONLY code that runs — the account in
-    // ENG-1158 was latched on 2026-07-31, before any alert existed, so keying the
-    // email off the detection transition left its owner permanently unreachable
-    // while every scheduled report returned nothing.
-    await this.alertOwnerOfMissingAdsScope(userId, selected);
-
     const label = selected?.account_id || selected?.config?.ad_account_id;
     throw buildMetaAdsScopeError({ accountLabel: label ? `act_${String(label).replace('act_', '')}` : undefined });
-  }
-
-  /**
-   * Email the connection owner, at most once per outage, that Meta Ads reporting
-   * is blocked and only they can fix it (ENG-1158).
-   *
-   * Dedup lives on `ads_scope_alerted_at` — what we told the owner — rather than
-   * on `ads_scope_revoked_at` — what we know about the connection. The two are
-   * different events, and conflating them is what silenced the original report:
-   * a revocation recorded before this alert shipped reads as "already notified"
-   * when nobody was notified at all.
-   *
-   * Records the notice AFTER a confirmed send. The reverse — claim then retract
-   * on failure — leaves a permanent false acknowledgement whenever the retraction
-   * also fails, and a permanently silenced owner is the very failure this ticket
-   * exists to fix. The repetition risk that ordering guarded against is handled
-   * instead by the alert service's post-delivery guard.
-   *
-   * Best-effort throughout — the caller is on its way to throwing the actionable
-   * re-consent error, and nothing here may displace it.
-   */
-  private async alertOwnerOfMissingAdsScope(
-    userId: string | undefined,
-    connection: { platform?: string; account_id?: string; account_name?: string; config?: any } | undefined
-  ): Promise<void> {
-    const ownerUserId = userId || connection?.config?.userId;
-    if (!ownerUserId || !connection?.platform || !connection?.account_id) return;
-    if (connection.config?.ads_scope_alerted_at) return;
-
-    try {
-      const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
-      const delivered = await notifyMetaAdsScopeLost({
-        ownerUserId,
-        accountId: connection.account_id,
-        accountName: connection.account_name,
-      });
-
-      // Send first, record second. Claiming the notice up front and retracting
-      // it on failure left a permanent false acknowledgement whenever the
-      // retraction ALSO failed, and a silenced owner is this ticket's own bug
-      // (Greptile P1). Nothing delivered means nothing recorded, so a later run
-      // simply tries again; the alert service's own post-delivery guard is what
-      // stops a failed marker write turning into an email per blocked call.
-      if (!delivered) return;
-
-      const alertedAt = new Date().toISOString();
-      const { updateAccountConfig } = await import('./connectedAccountsDb');
-      await updateAccountConfig(ownerUserId, connection.platform as any, connection.account_id, {
-        ads_scope_alerted_at: alertedAt,
-      });
-      // Keep the in-memory record in step so a single run cannot alert twice.
-      if (connection.config) connection.config.ads_scope_alerted_at = alertedAt;
-    } catch (alertError: any) {
-      console.warn(
-        `[AgentMode] ENG-1158: could not alert owner ${ownerUserId} about the missing Meta ads scope: ${alertError?.message ?? alertError}`
-      );
-    }
   }
 
   /**
@@ -15513,8 +15449,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (!isMetaAdsScopeRefusal(error)) return;
 
     if (connection?.account_id && connection?.platform) {
-      let persisted = false;
-
       try {
         const previous: unknown = connection.config?.granted_scopes;
         const retained = (Array.isArray(previous) ? previous : [])
@@ -15528,22 +15462,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           granted_scopes: retained,
           ads_scope_revoked_at: new Date().toISOString(),
         });
-        persisted = true;
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
         );
       }
 
-      // Tell the owner. Reconnecting is work only they can do, and this detection
-      // happens inside an unattended run — without this, a scheduled report just
-      // keeps returning nothing and nobody is told why (ENG-1158). Gated on the
-      // persist succeeding so a failed write leaves the next run free to alert
-      // instead of the notice being spent on an episode we never recorded;
-      // once-per-outage dedup is the helper's own `ads_scope_alerted_at` marker.
-      if (persisted) {
-        await this.alertOwnerOfMissingAdsScope(userId, connection);
-      }
+      // Deliberately does NOT notify the owner. The 12-hourly capability sweep
+      // is the single notifier (ENG-1158): it probes every Meta ad account and
+      // alerts on exactly the accounts this path records, so notifying here too
+      // would only buy latency — at the price of two processes racing to email
+      // the same owner for one episode, which no in-process guard can dedupe.
+      // One sender, one process, no cross-process coordination to get wrong.
     }
 
     throw buildMetaAdsScopeError({
@@ -15623,7 +15553,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       await this.ensureUsableMetaToken(selected, selected.userId || userId);
-      await this.assertMetaAdsScope(selected, selected.userId || userId);
+      await this.assertMetaAdsScope(selected);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -15647,7 +15577,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const selected = fbAccounts[0];
 
     await this.ensureUsableMetaToken(selected, selected.userId || userId);
-    await this.assertMetaAdsScope(selected, selected.userId || userId);
+    await this.assertMetaAdsScope(selected);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 

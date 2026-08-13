@@ -455,14 +455,15 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     });
   });
   /**
-   * ENG-1158 — detection only helps if it reaches a human.
+   * ENG-1158 — the agent paths deliberately do NOT email the owner.
    *
-   * The reconnect is owner-only work, and the detection happens inside an
-   * unattended scheduled run. Without this, the owner of account
-   * 922903076601160 learned about a four-day zero-data reporting outage by
-   * reading a run's output.
+   * The 12-hourly capability sweep is the single notifier: it probes every Meta
+   * ad account and alerts on exactly the accounts these paths record, so
+   * notifying here as well would only buy latency — at the price of two
+   * processes racing to email the same owner for one episode, which no
+   * in-process guard can dedupe (Greptile). One sender, one process.
    */
-  describe('owner notification on first detection (ENG-1158)', () => {
+  describe('notification is left to the capability sweep (ENG-1158)', () => {
     const legacyUser = {
       id: 'user1',
       connected_accounts: [
@@ -470,177 +471,48 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       ],
     };
 
-    it('alerts the connection owner the first time Meta refuses for lack of an Ads scope', async () => {
+    it('does not email when Meta refuses during a real run', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
 
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
-        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
-      );
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
     });
 
-    /**
-     * The production state of account 922903076601160, read from the live record:
-     * `granted_scopes: []` + `ads_scope_revoked_at: 2026-07-31T07:00:21.688Z`.
-     *
-     * This is the account ENG-1158 was filed about, and it is the case the
-     * transition-only alert could never serve. Detection fired on 2026-07-31 —
-     * before any notification existed — so the revocation is on file while the
-     * owner has been told nothing. Every run since refuses at the pre-flight gate
-     * without calling Meta, so the post-flight detection path never runs again.
-     * Keyed off the transition, this owner would stay silent forever.
-     */
-    // A factory, not a shared constant: the alert marks the in-memory record so a
-    // single run cannot email twice, and a shared fixture would carry that mark
-    // between tests. A real run re-reads the account from DynamoDB each time.
-    const latchedBeforeAnyAlert = () => ({
-      id: 'user1',
-      connected_accounts: [
-        metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
-      ],
-    });
-
-    it('alerts the owner of an account latched before the alert existed', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+    it('still records the revocation, which is what the sweep alerts on', async () => {
+      // The handoff only works because this path persists the state the sweep
+      // reads: detection here, notification there.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
 
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
-        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
-      );
-      // Still gated off Meta — notifying must not cost the impossible read.
-      expect(metaService.listCampaigns).not.toHaveBeenCalled();
+      expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(typeof updates.ads_scope_revoked_at).toBe('string');
+      expect(updates.granted_scopes).not.toContain('ads_read');
     });
 
-    it('records that it told them, so the next blocked run stays quiet', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
-
-      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
-
-      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
-      expect(userId).toBe('user1');
-      expect(platform).toBe('meta');
-      expect(accountId).toBe(AD_ACCOUNT_ID);
-      expect(typeof updates.ads_scope_alerted_at).toBe('string');
-      // Capability state is not touched — this write only records the notice.
-      expect(updates.granted_scopes).toBeUndefined();
-    });
-
-    it('does not alert twice for the same outage — one email per episode', async () => {
-      // Feed back exactly what the previous run persisted, as the next daily
-      // scheduled run would read it.
+    it('does not email when the pre-flight gate refuses a latched account', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         id: 'user1',
         connected_accounts: [
-          metaAccount({
-            granted_scopes: [],
-            ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
-            ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
-          }),
+          metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
         ],
       });
 
-      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
 
       expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-    });
-
-    it('still emails when the notice cannot be recorded — bounded repetition beats silence', async () => {
-      // The reverse ordering (claim the marker, retract on failure) left a
-      // permanent false acknowledgement whenever the retraction also failed, and
-      // a silenced owner is this ticket's own bug. Sending first means the worst
-      // case is that a later run tells them again.
-      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
-      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
-
-      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
-
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
       // ...and the caller still gets the actionable error.
       expect(err.isMetaAdsScopeError).toBe(true);
     });
 
-    it('records the notice only after the send is confirmed', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
-
-      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
-
-      // Nothing delivered, so nothing claimed — a later run simply retries.
-      const marked = mockUpdateAccountConfig.mock.calls.filter(
-        (c: any[]) => c[3]?.ads_scope_alerted_at !== undefined
-      );
-      expect(marked).toHaveLength(0);
-    });
-
-    it('still refuses with the actionable error when the alert itself throws', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
-      mockNotifyMetaAdsScopeLost.mockRejectedValue(new Error('Resend down'));
-
-      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
-
-      expect(err.isMetaAdsScopeError).toBe(true);
-      expect(err.message).toContain(META_ADS_RECONSENT_MESSAGE);
-    });
-
-    it('treats a reconnect that Meta still refuses as a new episode worth alerting', async () => {
-      // An affirmative `ads_read` grant beats the revocation marker in
-      // getMetaAdsScopeState, so pre-flight lets this through and Meta itself
-      // refuses. A grant recorded after the revocation means the owner has
-      // reconnected since — this is a fresh outage, not the one they were
-      // already told about, and the cleared marker is what makes it alertable.
-      (userDb.getUserById as jest.Mock).mockResolvedValue({
-        id: 'user1',
-        connected_accounts: [
-          metaAccount({
-            granted_scopes: ['ads_read'],
-            ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
-          }),
-        ],
-      });
-      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
-
-      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
-
-      // Meta was reached — this really did travel the post-flight path.
-      expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
-      // The caller still gets the actionable error.
-      expect(err.isMetaAdsScopeError).toBe(true);
-    });
-
-    it('does not alert when the persist failed — the next run re-detects and alerts then', async () => {
+    it('surfaces the re-consent error unchanged by the removal of alerting', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
-      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
-
-      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
-
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
-      // ...and the user-facing error still surfaces intact.
-      expect(err.isMetaAdsScopeError).toBe(true);
-    });
-
-    it('does not alert on a generic Meta permission error that never names an Ads scope', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
-      const genericError: any = new Error('(#200) Requires business_management permission');
-      genericError.code = 200;
-      (metaService.listCampaigns as jest.Mock).mockRejectedValue(genericError);
-
-      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
-
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
-    });
-
-    it('surfaces the re-consent error even when the alert itself fails', async () => {
-      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
-      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
-      mockNotifyMetaAdsScopeLost.mockRejectedValue(new Error('Resend down'));
 
       const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
 
