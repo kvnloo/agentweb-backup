@@ -3448,7 +3448,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId);
+    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+      runBudgetDeadlineMs: context?.runBudgetDeadlineMs,
+    });
   }
 });
 

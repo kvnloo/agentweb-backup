@@ -10825,7 +10825,15 @@ export class AgentModeService {
     }
   }
 
-  public async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+  public async addLeadsToList(
+    listId: string,
+    leads: any[],
+    userId: string,
+    // The run's wall-clock deadline (epoch ms), threaded in by the dispatcher.
+    // The import budget is clamped to it so the write loop cannot outlive the
+    // turn and lose the ledger (ENG-1133).
+    options: { runBudgetDeadlineMs?: number } = {},
+  ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
 
@@ -10877,14 +10885,16 @@ export class AgentModeService {
         return formatted;
       });
 
-      const { LEAD_IMPORT_WRITE_BUDGET_MS } = await import('../utils/leadImportLedger');
+      const { leadImportWriteBudgetMs } = await import('../utils/leadImportLedger');
       const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
         // A file the user may re-send after a truncated run: dedupe the rows
         // that carry no identity of their own, or every retry duplicates them.
         dedupeByNameCompany: true,
         // Come back with a resumable partial rather than being guillotined by
-        // the whole-turn cap with nothing to report (ENG-1133).
-        deadlineMs: LEAD_IMPORT_WRITE_BUDGET_MS,
+        // the whole-turn cap with nothing to report (ENG-1133). Clamped to the
+        // run's remaining budget: a full-length budget started late in a turn
+        // would outlive the turn and lose the ledger it exists to produce.
+        deadlineMs: leadImportWriteBudgetMs(Date.now(), options.runBudgetDeadlineMs),
       });
 
       // ENG-1133: report the import row by row, not just in aggregate. A large
@@ -10977,6 +10987,13 @@ export class AgentModeService {
       // attempted. Resending the same rows would hit the same wall, so this is
       // a blocker to report — not the resume path every other partial takes.
       const dedupeIncomplete = (result as any).dedupeIncomplete === true;
+      // A partial is worth resuming only while rows remain that were never
+      // attempted: re-sending those makes progress. If nothing landed and every
+      // row was attempted, they all failed on write — resending the same rows
+      // would fail the same way, so that is a plain failure with no resume
+      // offer, not a resume the agent will loop on.
+      const resumable = !complete && attempted > 0 && !dedupeIncomplete
+        && (landed > 0 || reconciliation.unprocessed > 0);
       const message = dedupeIncomplete
         ? `Import not attempted: this list has more existing leads than can be read within the import budget, `
           + `and importing without reading them first would duplicate rows already in the list. `
@@ -10985,6 +11002,10 @@ export class AgentModeService {
         ? 'No leads were processed.'
         : complete
           ? summary
+          : !resumable
+          ? `Import failed: none of the ${attempted} row(s) could be written. ${summary} `
+            + `Every row was attempted, so re-sending them would fail the same way — `
+            + `report the errors to the user instead of retrying.`
           : `Partial import: ${landed} of ${attempted} row(s) are in the list. ${summary} `
             + `RESUME by calling add_leads_to_list again with ONLY the ${unimportedRows.length > 0 ? 'rows listed in unimportedRows' : 'rows that did not import'} — `
             + `do not ask the user to retry the request. ${resumeTruncated}`
@@ -11000,11 +11021,15 @@ export class AgentModeService {
         // the appended retryability verdict tells the agent "do NOT retry […]
         // report the blocker to the user". That is precisely the whole-request
         // hand-off this ticket exists to remove. So failure is reserved for a
-        // call that landed NOTHING; an import that wrote rows but did not finish
-        // succeeds while carrying `complete: false` and its resume list.
-        success: complete || landed > 0,
+        // call that landed NOTHING AND has nothing left to resume; an import
+        // that wrote rows, or still owes rows it never reached, succeeds while
+        // carrying `complete: false` and its resume list. Success has to follow
+        // the resume offer exactly — `success: false` beside `resumable: true`
+        // would strip the resume list and tell the agent to stop, which is the
+        // contradiction this ticket removes.
+        success: complete || landed > 0 || resumable,
         complete,
-        ...(complete || attempted === 0 || dedupeIncomplete ? {} : { resumable: true }),
+        ...(resumable ? { resumable: true } : {}),
         message,
         attempted,
         // `reconciliation` is the ONLY set of counts on the wire. The legacy

@@ -43,6 +43,29 @@ export const LEAD_IMPORT_RESUME_BYTE_BUDGET = 32_768;
  */
 export const LEAD_IMPORT_WRITE_BUDGET_MS = 120_000;
 
+/** Head-room left inside the run's budget for building and returning the
+ *  ledger once the import stops writing. */
+export const LEAD_IMPORT_LEDGER_RESERVE_MS = 5_000;
+
+/**
+ * The write budget for THIS call, clamped to what the run has left.
+ *
+ * The flat budget above is only safe when the turn itself has that long to
+ * give. A call that starts with 30s of run budget remaining and then takes the
+ * full 120s is guillotined by the generation timeout mid-write, and the ledger
+ * never comes back — the exact failure the budget exists to prevent. So bound
+ * it by the run's remaining wall-clock, less enough to hand the ledger back.
+ *
+ * Never returns 0: the DB layer reads a non-positive budget as "unbounded",
+ * and a positive floor still lets the first unit of work through (its first
+ * unit is unconditional), so a resume always makes some progress.
+ */
+export function leadImportWriteBudgetMs(now: number, runBudgetDeadlineMs?: number): number {
+  if (!Number.isFinite(runBudgetDeadlineMs as number)) return LEAD_IMPORT_WRITE_BUDGET_MS;
+  const remaining = (runBudgetDeadlineMs as number) - now - LEAD_IMPORT_LEDGER_RESERVE_MS;
+  return Math.max(1, Math.min(LEAD_IMPORT_WRITE_BUDGET_MS, remaining));
+}
+
 /**
  * Normalize the per-row ledger from a `crmDb.batchCreateLeads` result.
  *
