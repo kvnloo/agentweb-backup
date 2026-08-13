@@ -549,9 +549,18 @@ function countGuardEnabled(): boolean {
  * real tool results and its counts ARE founded; stripping them there would destroy
  * true information.
  */
-export function stripUnfoundedEntityCounts(content: string): string {
+export function stripUnfoundedEntityCounts(content: string, foundedCounts?: number[] | null): string {
   if (typeof content !== 'string' || content.length === 0) return content;
   if (!countGuardEnabled()) return content;
+
+  // ENG-1174: figures this run can actually prove — read off its own tool results
+  // (see collectLeadImportTotals). A quantity matching one of them is FOUNDED and may
+  // stand; everything else is still removed. Empty/absent keeps the ENG-1173 behaviour
+  // of stripping every count, which is the correct default whenever nothing is provable.
+  const founded = new Set<number>(
+    Array.isArray(foundedCounts) ? foundedCounts.filter((n) => typeof n === 'number' && Number.isFinite(n)) : [],
+  );
+
   return content.replace(
     UNFOUNDED_COUNT_RE,
     (match: string, determiner: string | undefined, noun: string, offset: number, whole: string) => {
@@ -560,6 +569,12 @@ export function stripUnfoundedEntityCounts(content: string): string {
       // claim about the whole set, which is worse than the number this guard exists
       // to remove. An N-of-M construction is left alone entirely.
       if (/\bof\s+$/i.test(whole.slice(0, offset))) return match;
+
+      if (founded.size > 0) {
+        const digits = match.match(/\d[\d,]*/);
+        const value = digits ? Number(digits[0].replace(/,/g, '')) : NaN;
+        if (Number.isFinite(value) && founded.has(value)) return match;
+      }
       return `${determiner || 'the'} ${noun}`;
     },
   );
