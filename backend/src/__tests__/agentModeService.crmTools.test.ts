@@ -1296,11 +1296,68 @@ describe('AgentModeService - CRM Tools', () => {
           userId,
         );
 
-        // Nothing is in the list, so this IS a tool failure — the dispatcher
-        // should downgrade it and the CRM page has nothing to refresh for.
+        // Nothing is in the list and every row was attempted, so this IS a tool
+        // failure — the dispatcher should downgrade it and the CRM page has
+        // nothing to refresh for. No resume is offered with it: the dispatcher
+        // strips the payload and appends "do NOT retry", so a `resumable: true`
+        // beside it would be an instruction the agent is simultaneously told to
+        // ignore, and resending rows that all failed on write repeats the
+        // failure anyway.
         expect(result.success).toBe(false);
         expect(result.complete).toBe(false);
+        expect(result.resumable).toBeUndefined();
+        expect(result.message).toMatch(/none of the 2 row\(s\) could be written/);
+      });
+
+      it('stays resumable when the budget expired before any row was reached', async () => {
+        // Zero rows landed, but two were never attempted — resending THOSE makes
+        // progress, so the call has to succeed or the dispatcher strips the
+        // resume list and stops the agent on an import that is merely unstarted.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 0,
+          newCount: 0,
+          mergedCount: 0,
+          errorCount: 1,
+          errors: ['Row 1: a@example.com - ProvisionedThroughputExceeded'],
+          rowOutcomes: ['failed', 'unprocessed', 'unprocessed'],
+        } as any);
+
+        const result = await service.addLeadsToList(
+          listId,
+          [{ email: 'a@example.com' }, { email: 'b@example.com' }, { email: 'c@example.com' }],
+          userId,
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.complete).toBe(false);
         expect(result.resumable).toBe(true);
+        expect(result.unimportedRows).toEqual([
+          { row: 1, identifier: 'a@example.com', reason: 'failed' },
+          { row: 2, identifier: 'b@example.com', reason: 'unprocessed' },
+          { row: 3, identifier: 'c@example.com', reason: 'unprocessed' },
+        ]);
+        expect(result.message).toMatch(/add_leads_to_list/);
+      });
+
+      it('clamps the write budget to the run budget it was handed', async () => {
+        // A full-length write budget started late in a turn outlives the turn,
+        // and the ledger it exists to produce never comes back.
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 1,
+          newCount: 1,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: ['created'],
+        } as any);
+
+        await service.addLeadsToList(listId, [{ email: 'a@example.com' }], userId, {
+          runBudgetDeadlineMs: Date.now() + 30_000,
+        });
+
+        const options = mockCrmDb.batchCreateLeads.mock.calls[0][2] as any;
+        expect(options.deadlineMs).toBeGreaterThan(0);
+        expect(options.deadlineMs).toBeLessThanOrEqual(25_000);
       });
 
       // The resume list is capped so a huge partial cannot blow the tool result

@@ -1,8 +1,10 @@
 import {
   LEAD_IMPORT_RESUME_BYTE_BUDGET,
   LEAD_IMPORT_ROW_LIST_CAP,
+  LEAD_IMPORT_LEDGER_RESERVE_MS,
   LEAD_IMPORT_WRITE_BUDGET_MS,
   buildLeadImportRowOutcomes,
+  leadImportWriteBudgetMs,
   capLeadResumeRows,
   capLeadRowList,
   describeLeadRow,
@@ -160,5 +162,32 @@ describe('leadImportLedger', () => {
 
   it('budgets the writes well inside the agent-mode whole-turn cap', () => {
     expect(LEAD_IMPORT_WRITE_BUDGET_MS).toBeLessThan(600_000);
+  });
+
+  describe('leadImportWriteBudgetMs', () => {
+    it('spends the full budget when the run has no deadline', () => {
+      expect(leadImportWriteBudgetMs(1_000)).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+      expect(leadImportWriteBudgetMs(1_000, undefined)).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+      expect(leadImportWriteBudgetMs(1_000, NaN)).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+    });
+
+    it('spends the full budget when the run has more time than it needs', () => {
+      const now = 1_000;
+      const deadline = now + LEAD_IMPORT_WRITE_BUDGET_MS + LEAD_IMPORT_LEDGER_RESERVE_MS + 1;
+      expect(leadImportWriteBudgetMs(now, deadline)).toBe(LEAD_IMPORT_WRITE_BUDGET_MS);
+    });
+
+    it('clamps to the run budget, keeping head-room to return the ledger', () => {
+      // Starting a full-length write budget with 30s of turn left is what kills
+      // the turn before it can report which rows landed.
+      const now = 1_000;
+      expect(leadImportWriteBudgetMs(now, now + 30_000)).toBe(30_000 - LEAD_IMPORT_LEDGER_RESERVE_MS);
+    });
+
+    it('never returns a non-positive budget, which would read as unbounded', () => {
+      const now = 1_000;
+      expect(leadImportWriteBudgetMs(now, now + LEAD_IMPORT_LEDGER_RESERVE_MS)).toBe(1);
+      expect(leadImportWriteBudgetMs(now, now - 60_000)).toBe(1);
+    });
   });
 });
