@@ -12,6 +12,7 @@ jest.mock('../services/db', () => ({
   socialEngagementTrackingDb: {
     hasEngaged: jest.fn(),
     recordEngagement: jest.fn(),
+    deleteEngagement: jest.fn(),
     getCommentEngagementCountsForPost: jest.fn(),
   },
 }));
@@ -100,6 +101,7 @@ describe('SocialEngagementScanner', () => {
 
     mockScheduleDb.createSchedule.mockResolvedValue(undefined as any);
     mockTrackingDb.recordEngagement.mockResolvedValue(true);
+    mockTrackingDb.deleteEngagement.mockResolvedValue(true);
     mockTrackingDb.hasEngaged.mockResolvedValue(false);
     mockTrackingDb.getCommentEngagementCountsForPost.mockResolvedValue({
       likedCount: 0,
@@ -951,6 +953,34 @@ describe('SocialEngagementScanner', () => {
       // recordEngagement must be called BEFORE createSchedule (Bug 3 fix)
       expect(callOrder[0]).toBe('record');
       expect(callOrder[1]).toBe('schedule');
+    });
+  });
+
+  describe('schedule creation rollback', () => {
+    it('releases only its own queued tracking reservation when schedule creation fails', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 1,
+        },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
+      ]);
+      mockScheduleDb.createSchedule.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      await scanner.runScanner();
+
+      expect(mockTrackingDb.deleteEngagement).toHaveBeenCalledWith(expect.objectContaining({
+        scheduleId: 'test-uuid',
+        actionType: 'like',
+      }));
     });
   });
 

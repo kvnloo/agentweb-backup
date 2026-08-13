@@ -9,9 +9,11 @@ import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGu
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
+import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
+import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -29,10 +31,20 @@ const CLAIM_STALE_MS = 5 * 60 * 1000;
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts.
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -477,6 +489,8 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
+  llmUsageCredits?: MonthlyLlmUsageCredits;
   extraCostUsage?: {
     month: string;      // "YYYY-MM" format for current tracking month
     totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
@@ -1120,6 +1134,20 @@ export class UserDB {
     return item;
   }
 
+  /**
+   * Returns a strongly current User record after resolving its stable primary
+   * key from the UserIdIndex. DynamoDB does not support strongly consistent
+   * reads on GSIs, so callers that must not act on recently removed OAuth
+   * credentials need this two-step lookup instead of getUserById alone.
+   */
+  async getUserByIdConsistent(userId: string) {
+    const indexed = await this.getUserById(userId);
+    if (!indexed?.email) return undefined;
+
+    const current = await this.getUserByEmailConsistent(indexed.email);
+    return current?.userId === userId ? current : undefined;
+  }
+
   async getUserById(userId: string) {
     try {
       const params = {
@@ -1640,6 +1668,75 @@ export class UserDB {
       return (result.Attributes as { sessionVersion: number }).sessionVersion;
     } catch (error) {
       handleDynamoDbError(error, "incrementSessionVersion");
+      throw error;
+    }
+  }
+
+  /**
+   * Roll the monthly usage counter over to a new month, archiving the previous
+   * month into history — but ONLY if nobody has rolled it over already.
+   *
+   * The caller reads the stored month, sees it is stale, and decides to reset.
+   * Between that read and this write, another charge for the same user can do
+   * exactly the same thing. Without the condition below both writes land and the
+   * second discards the first call's tokens and cost entirely — a whole charge
+   * lost, on the one day of the month when every active user rolls over at once.
+   *
+   * Returns false when the condition fails, i.e. somebody else already rolled the
+   * month. The caller then applies its charge as a normal increment onto the
+   * counter the winner created, so no spend is dropped either way.
+   */
+  async resetTokenUsageForMonth(args: {
+    userId: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    history: Array<{ month: string; totalTokens: number; totalCost: number }>;
+  }): Promise<boolean> {
+    const user = await this.getUserById(args.userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${args.userId}' not found or has no email.`);
+    }
+
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
+      TableName: this.tableName,
+      Key: { email: user.email },
+      UpdateExpression:
+        "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+      // Succeed only while the stored month is still NOT the new one. A row with
+      // no tokenUsage at all is a first-ever charge and also qualifies.
+      ConditionExpression:
+        "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+      ExpressionAttributeNames: {
+        "#userId": "userId",
+        "#tokenUsage": "tokenUsage",
+        "#month": "month",
+        "#history": "tokenUsageHistory",
+        "#bonus": "tokenAllowanceBonus",
+      },
+      ExpressionAttributeValues: {
+        ":userId": args.userId,
+        ":month": args.month,
+        ":usage": {
+          month: args.month,
+          totalTokens: args.tokens,
+          totalCost: args.cost,
+          resetDate: args.resetDate,
+        },
+        ":history": args.history,
+        ":zero": 0,
+      },
+    };
+
+    try {
+      await this.docClient.update(params).promise();
+      return true;
+    } catch (error: any) {
+      if (error?.code === "ConditionalCheckFailedException") {
+        return false;
+      }
+      handleDynamoDbError(error, "resetTokenUsageForMonth");
       throw error;
     }
   }
@@ -3000,6 +3097,10 @@ export const scheduleDb = {
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
+    llmModel?: string;
+    llmBackupModel?: string;
+    llmBackupSource?: 'user' | 'system';
+    llmBackupNeedsConfirmation?: boolean;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
     variables?: Array<{ name: string; description?: string }>;
     variableValues?: { [variableName: string]: string };
@@ -3056,6 +3157,23 @@ export const scheduleDb = {
     }
   },
 
+  /**
+   * Every schedule in the table, paginated. A full scan, so this is for one-off
+   * operator work (the ENG-827 consent migration) — never a request path. The
+   * prefixed table name stays inside this module, which is the only reason a
+   * script can enumerate schedules without knowing about TABLE_PREFIX.
+   */
+  async getAllSchedules(): Promise<any[]> {
+    try {
+      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+    } catch (error) {
+      // Rethrows. A scan that dies halfway must not read as "no schedules" — that
+      // would turn a transient failure into a migration that silently grants nothing.
+      handleDynamoDbError(error, "getAllSchedules");
+      return [];
+    }
+  },
+
   async updateSchedule(
     scheduleId: string,
     updates: Partial<{
@@ -3084,11 +3202,28 @@ export const scheduleDb = {
       // my behalf". Settable ONLY by the owner — deliberately absent from the
       // manage_scheduled_chat MCP allowlist so the model can neither grant itself
       // publishing authority nor silence its own publishing. Default off (= publish).
+      // ENG-803: owner's explicit hold. Outranks any grant below — an owner who asked
+      // to review stays reviewing.
       requirePublishApproval?: boolean;
+      // ENG-827: AFFIRMATIVE consent to publish unattended to a live connected account
+      // without the owner seeing the content first. Absence is NOT consent. Settable
+      // only by the owner (portal checkbox / owner-only endpoint); the MCP surface can
+      // REVOKE it but never grant it.
+      autopublishAuthorized?: boolean;
+      // ENG-827: the publish tools the owner approved when consenting. Consent is bound
+      // to THIS list, so a later edit to requiredFunctionCalls cannot re-scope it onto a
+      // tool they never saw. An empty list authorizes nothing.
+      autopublishAuthorizedTools?: string[];
+      autopublishAuthorizedAt?: string | null;
+      autopublishAuthorizedBy?: string | null;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
       runCount: number;
+      llmModel: string;
+      llmBackupModel: string;
+      llmBackupSource: 'user' | 'system';
+      llmBackupNeedsConfirmation: boolean;
       variables: Array<{ name: string; description?: string }>;
       variableValues: { [variableName: string]: string };
       variableRequestStatus: 'idle' | 'pending' | 'provided';
@@ -3098,9 +3233,18 @@ export const scheduleDb = {
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
       zeroAssistantRetryCount: number;
+      // ENG-971: marks the requeued zero-output run to CONTINUE the abandoned
+      // session rather than restart it, so work that already published is not
+      // repeated. Consumed (at most once) by the next dispatch.
+      pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-    }>
+    }>,
+    /**
+     * ENG-827: attributes that must STILL hold for this write to land, as read a
+     * moment ago. `undefined` means the attribute must still be absent.
+     */
+    expect?: Record<string, any>
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3113,7 +3257,25 @@ export const scheduleDb = {
         expressionAttributeValues[`:${key}`] = value;
       });
 
-      const params = {
+      // ENG-827: an optional "only if this is still true" clause. A caller that
+      // DERIVES what it writes from what it read cannot write unconditionally — a
+      // concurrent edit between the two turns the write into a decision nobody made.
+      // Expressed as expected attribute values so the check and the write are one
+      // operation; on mismatch DynamoDB throws ConditionalCheckFailedException and
+      // the caller decides what to tell the user.
+      const conditionExpressions: string[] = [];
+      Object.entries(expect || {}).forEach(([key, value], index) => {
+        const alias = `expected${index}`;
+        expressionAttributeNames[`#${alias}`] = key;
+        if (value === undefined) {
+          conditionExpressions.push(`attribute_not_exists(#${alias})`);
+          return;
+        }
+        conditionExpressions.push(`#${alias} = :${alias}`);
+        expressionAttributeValues[`:${alias}`] = value;
+      });
+
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
@@ -3123,6 +3285,9 @@ export const scheduleDb = {
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      if (conditionExpressions.length > 0) {
+        params.ConditionExpression = conditionExpressions.join(" AND ");
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
@@ -6487,22 +6652,29 @@ export const crmDb = {
      *  lead-filter UI. */
     system?: Record<string, any>;
   }>) {
-    try {
-      const results = {
-        successCount: 0,
-        newCount: 0,
-        mergedCount: 0,
-        errorCount: 0,
-        errors: [] as string[],
-        // IDs of newly created leads (excludes merged updates). Used by callers
-        // that need to act on freshly-imported leads — e.g., the CSV importer
-        // queues these for enrich.so email validation when the user opts in.
-        // `sourceIndex` is the position in the input `leads` array the record
-        // was written from, so callers can join a created leadId back to the
-        // row it came from even when the row carries no email (ENG-1002).
-        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
-      };
+    // Declared OUTSIDE the try so the catch below can still see what was
+    // already classified. Refused placeholders are counted before any write
+    // happens, and a later DynamoDB failure must not relabel them as database
+    // errors (ENG-1002 follow-up).
+    const results = {
+      successCount: 0,
+      newCount: 0,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [] as string[],
+      // IDs of newly created leads (excludes merged updates). Used by callers
+      // that need to act on freshly-imported leads — e.g., the CSV importer
+      // queues these for enrich.so email validation when the user opts in.
+      // `sourceIndex` is the position in the input `leads` array the record
+      // was written from, so callers can join a created leadId back to the
+      // row it came from even when the row carries no email (ENG-1002).
+      created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+      // Rows refused because they are LinkedIn's anonymized placeholder
+      // rather than a person (ENG-1002). Reported, never dropped silently.
+      anonymizedSkipped: 0,
+    };
 
+    try {
       // Get existing leads to check for duplicates by email
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
@@ -6537,6 +6709,15 @@ export const crmDb = {
       const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
+        // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
+        // one point every write path converges, so no caller can reintroduce
+        // the nameless, un-dedupable rows by routing around the import tool.
+        // `return` (not a re-indexed filter) keeps every surviving row's
+        // sourceIndex pointing at its ORIGINAL position for callers joining on it.
+        if (isLinkedInPlaceholderName(lead)) {
+          results.anonymizedSkipped++;
+          return;
+        }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
         const liKey = normalizeLinkedInUrl(lead.linkedin);
 
@@ -6845,13 +7026,22 @@ export const crmDb = {
       return results;
     } catch (error: any) {
       handleDynamoDbError(error, "batchCreateLeads");
+      // NOTE: handleDynamoDbError above always rethrows, so this return is not
+      // reached today — callers see the exception, not this object. It is kept
+      // consistent anyway: the placeholder refusals happened before the failure
+      // and are still true, so they are carried through and the failure is
+      // billed only to the rows actually attempted. Zeroing them would report a
+      // refused placeholder as a database error — the same misreporting
+      // ENG-1002 is about — while still summing to `leads.length` and so
+      // slipping past the accounting invariant unnoticed.
       return {
         successCount: 0,
         newCount: 0,
         mergedCount: 0,
-        errorCount: leads.length,
+        errorCount: leads.length - results.anonymizedSkipped,
         errors: [`Batch upload failed: ${error.message}`],
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+        anonymizedSkipped: results.anonymizedSkipped,
       };
     }
   },
@@ -8955,7 +9145,8 @@ export const socialEngagementTrackingDb = {
     commentId?: string;
     engagingAccountId: string;
     actionType: string;
-  }) {
+    scheduleId: string;
+  }): Promise<boolean> {
     try {
       const dedupId = params.commentId || params.postId;
       const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
@@ -8966,8 +9157,22 @@ export const socialEngagementTrackingDb = {
       await dynamodb.delete({
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Key: { userId: params.userId, postId_engagingAccountId: key },
+        // Only remove the queued reservation that belongs to this schedule.
+        // A failed attempt can be rescheduled under a new ID before an older
+        // schedule reaches cleanup; deleting by key alone would erase that
+        // newer reservation and allow duplicate LinkedIn activity.
+        ConditionExpression: 'scheduleId = :scheduleId AND #status = :queued',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':scheduleId': params.scheduleId,
+          ':queued': 'queued',
+        },
       }).promise();
+      return true;
     } catch (error) {
+      if ((error as any)?.code === 'ConditionalCheckFailedException') {
+        return false;
+      }
       handleDynamoDbError(error, "deleteEngagement");
       throw error;
     }

@@ -15,13 +15,15 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
+import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
-import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
@@ -41,20 +43,309 @@ import { stripImageDataForPersistence } from '../services/agentMode/incrementalP
 import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import {
+  collectMediaGeneratedSince,
+  buildTimeoutContinuationMessage,
+  collectTurnWorkSince,
+  buildTimeoutPartialWorkMessage,
+} from '../utils/timeoutContinuation';
+import {
+  reconcileFalseFailureReport,
+  ledgerFromSucceededFunctions,
+  diffSucceededFunctions,
+  appendConfirmedPublishNotice,
+  collectConfirmedPublishActions,
+  collectPublishActionsSince,
+  FalseFailureLedgerEntry,
+} from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
+import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
-import { getAllowedSkills } from '../services/subscriptionService';
+import {
+  getAllowedSkills,
+  isSubscriptionFeatureEnabled,
+  type SubscriptionFeatureId,
+} from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import {
+  selectPolicyModel,
+  type ModelBackupSource,
+  type PolicyModelDecision,
+} from '../services/llmUsagePolicyService';
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
+const SCHEDULED_CHATS_FEATURE: SubscriptionFeatureId = 'scheduled_chats';
+const SCHEDULED_CHATS_NOT_INCLUDED_ERROR = {
+  error: 'Scheduled chats are not included in your current plan.',
+  code: 'subscription_feature_not_included',
+  feature: SCHEDULED_CHATS_FEATURE,
+};
+
+async function userCanUseScheduledChats(userId: string): Promise<boolean | null> {
+  return isSubscriptionFeatureEnabled(userId, SCHEDULED_CHATS_FEATURE);
+}
+
+async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): Promise<boolean> {
+  if ((await userCanUseScheduledChats(userId)) === true) return false;
+  res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+  return true;
+}
+
+/** Raised when a schedule edit could not be committed together with its consent narrowing. */
+class ScheduleConsentRaceError extends Error {}
+
+const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
+
+/**
+ * ENG-827 — commit a schedule edit and the consent narrowing it implies as ONE write.
+ *
+ * Consent is recorded against a SPECIFIC set of publishing tools, which is the whole
+ * reason a grant carries a scope. An edit that drops one of those tools must not leave
+ * publishing authority attached to a tool the owner has removed.
+ *
+ * The two cannot be separated, in either direction, and both failure modes are real:
+ *
+ *   - Fold them into one UNCONDITIONAL write and a grant the owner made in between is
+ *     silently clobbered by a decision derived from a stale read — they got their 200
+ *     and lost their consent.
+ *   - Split them and acknowledge the edit first, and any failure of the follow-up
+ *     leaves the acknowledged edit sitting next to a grant scoped to the tool it just
+ *     removed.
+ *
+ * So: one write, carrying the edit AND the narrowing, conditioned on the consent it was
+ * derived from. If that condition fails, consent moved under us — re-read, re-derive
+ * against what is actually stored now, and try again. The retry is what makes this
+ * converge instead of having to choose which of the two failures to accept.
+ *
+ * Nothing partial is ever acknowledged. If the attempts are exhausted the caller reports
+ * a conflict and the owner retries; the schedule is left exactly as it was.
+ *
+ * Narrowing only, and only for a grant that is actually STORED. A legacy row carries no
+ * consent field, so its scope is re-derived from the required tools on every read and
+ * follows the edit by itself; stamping `false` on one would record a refusal the owner
+ * never gave. `true` is never written from here — granting is the consent endpoint's job
+ * and nobody else's, so a rename racing a revocation can never put a grant back.
+ */
+async function applyScheduleEditWithConsentNarrowing(
+  scheduleId: string,
+  updates: any,
+  firstRead: any
+): Promise<void> {
+  // An edit that does not move the required tools cannot move the scope: plain write.
+  if (updates.requiredFunctionCalls === undefined) {
+    await scheduleDb.updateSchedule(scheduleId, updates);
+    return;
+  }
+
+  let snapshot = firstRead;
+
+  for (let attempt = 1; attempt <= MAX_CONSENT_NARROWING_ATTEMPTS; attempt++) {
+    const consentUpdates: any = {};
+    let expectation: Record<string, any> | undefined;
+
+    if (snapshot?.autopublishAuthorized === true) {
+      const stored = resolveSchedulePublishAuthorization(snapshot);
+      if (stored.authorized) {
+        const stillRequired = getRequiredPublishTools(updates.requiredFunctionCalls);
+        const narrowed = narrowPublishAuthorization(stored, {
+          authorized: stillRequired.length > 0,
+          tools: stillRequired,
+        });
+        if (!narrowed.authorized || narrowed.tools.length !== stored.tools.length) {
+          consentUpdates.autopublishAuthorizedTools = narrowed.tools;
+          if (!narrowed.authorized) {
+            consentUpdates.autopublishAuthorized = false;
+            consentUpdates.autopublishAuthorizedAt = null;
+            consentUpdates.autopublishAuthorizedBy = null;
+          }
+          // Bind the write to BOTH halves of what it was derived from: the consent, and
+          // the tool list that consent was granted against. Asserting only the consent
+          // leaves a concurrent edit free to move the required tools underneath this
+          // one, so the grant would be narrowed — or dropped — against a list that is
+          // no longer the schedule's. A failure here is not fatal: the loop re-reads and
+          // re-derives against whatever actually landed. Same binding the grant endpoint
+          // uses, so the two paths cannot disagree about what they are asserting.
+          expectation = {
+            autopublishAuthorized: true,
+            autopublishAuthorizedTools: snapshot.autopublishAuthorizedTools,
+            requiredFunctionCalls: snapshot.requiredFunctionCalls,
+          };
+          console.log(
+            `AgentMode: ENG-827 publish consent narrowing on edit for schedule ${scheduleId}: ` +
+            `[${stored.tools.join(', ')}] -> [${narrowed.tools.join(', ')}]` +
+            `${narrowed.authorized ? '' : ' (revoked — no approved publishing tool remains)'}.`
+          );
+        }
+      }
+    }
+
+    try {
+      if (expectation) {
+        await scheduleDb.updateSchedule(scheduleId, { ...updates, ...consentUpdates }, expectation);
+      } else {
+        // Nothing to narrow — no condition to assert, and no reason to make an ordinary
+        // edit fail because somebody touched consent at the same moment.
+        await scheduleDb.updateSchedule(scheduleId, updates);
+      }
+      return;
+    } catch (writeError: any) {
+      const conditionFailed =
+        writeError?.code === 'ConditionalCheckFailedException' ||
+        writeError?.name === 'ConditionalCheckFailedException';
+      if (!conditionFailed) throw writeError;
+
+      console.warn(
+        `AgentMode: ENG-827 schedule ${scheduleId} edit lost its consent condition ` +
+        `(attempt ${attempt}/${MAX_CONSENT_NARROWING_ATTEMPTS}); re-reading consent and retrying.`
+      );
+      snapshot = await scheduleDb.getScheduleById(scheduleId);
+      if (!snapshot) throw new ScheduleConsentRaceError('The schedule no longer exists.');
+    }
+  }
+
+  throw new ScheduleConsentRaceError(
+    `Publish consent for schedule ${scheduleId} changed on every attempt to apply this edit.`
+  );
+}
+
+type EffectiveModelPolicyDecision = PolicyModelDecision & {
+  usageMode: 'full_choice' | 'optimized' | 'paused';
+  usagePolicyVersion: string | null;
+  // undefined keeps unrestricted requests on the global backup behavior; optimized
+  // requests always carry string|null so provider retries cannot escape the catalog.
+  transientFallbackModel?: string | null;
+  transientFallbackSource?: ModelBackupSource | null;
+};
+
+function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
+  return {
+    requestedModel: decision.requestedModel,
+    effectiveModel: decision.effectiveModel,
+    backupModel: decision.backupModel,
+    backupSource: decision.backupSource,
+    modelSelection: decision.modelSelection,
+    modelSelectionReason: decision.reason,
+    usageMode: decision.usageMode,
+    usagePolicyVersion: decision.usagePolicyVersion,
+    recordedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * One server-owned model decision for interactive, MCP, and scheduled paths.
+ * The caller's model id is only a preference; current cost state and the
+ * admin-managed policy decide what can actually reach the provider.
+ */
+async function resolveEffectiveModelForUser(input: {
+  userId: string;
+  requestedModel?: string | null;
+  backupModel?: string | null;
+  backupSource?: ModelBackupSource | null;
+}): Promise<EffectiveModelPolicyDecision> {
+  const [usage, systemDefaultModel] = await Promise.all([
+    getEffectiveLlmUsagePolicy(input.userId),
+    agentModeService.getDefaultModel(),
+  ]);
+  // Older controller unit tests intentionally use partial service doubles.
+  // The runtime service always has these methods; the identity fallbacks keep
+  // unrelated legacy contracts on their original full-choice behavior.
+  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+    ? await agentModeService.getSupportedModels(false)
+    : [input.requestedModel, input.backupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
+  const requestedResolution = input.requestedModel
+    ? (typeof agentModeService.resolveGenerationModel === 'function'
+        ? agentModeService.resolveGenerationModel(input.requestedModel)
+        : { model: input.requestedModel, fellBack: false, requestedModel: input.requestedModel })
+    : null;
+  const backupResolution = input.backupModel
+    ? (typeof agentModeService.resolveGenerationModel === 'function'
+        ? agentModeService.resolveGenerationModel(input.backupModel)
+        : { model: input.backupModel, fellBack: false, requestedModel: input.backupModel })
+    : null;
+  const decision = selectPolicyModel({
+    usageMode: usage.mode.usageMode,
+    requestedModel: requestedResolution?.model || input.requestedModel,
+    backupModel: backupResolution?.fellBack ? null : (backupResolution?.model || input.backupModel),
+    backupSource: input.backupSource,
+    systemDefaultModel,
+    supportedModelIds,
+    policy: usage.policy,
+  });
+  let transientFallbackModel: string | null | undefined;
+  let transientFallbackSource: ModelBackupSource | null | undefined;
+  if (usage.mode.usageMode === 'optimized') {
+    const optimizedModels = new Set(usage.policy?.optimizedModelIds || []);
+    const fallback = [
+      decision.backupModel
+        ? { model: decision.backupModel, source: (decision.backupSource || 'system') as ModelBackupSource }
+        : null,
+      usage.policy?.optimizedDefaultModel
+        ? { model: usage.policy.optimizedDefaultModel, source: 'system' as ModelBackupSource }
+        : null,
+      ...[...optimizedModels].map((model) => ({ model, source: 'system' as ModelBackupSource })),
+    ].find((candidate): candidate is { model: string; source: ModelBackupSource } => Boolean(
+      candidate &&
+      candidate.model !== decision.effectiveModel &&
+      optimizedModels.has(candidate.model) &&
+      supportedModelIds.includes(candidate.model)
+    ));
+    transientFallbackModel = fallback?.model || null;
+    transientFallbackSource = fallback?.source || null;
+  }
+  return {
+    ...decision,
+    usageMode: usage.mode.usageMode,
+    usagePolicyVersion: usage.policy?.version || null,
+    transientFallbackModel,
+    transientFallbackSource,
+  };
+}
+
+async function resolveScheduleBackup(input: {
+  userId: string;
+  requestedBackupModel?: string | null;
+}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
+  const usage = await getEffectiveLlmUsagePolicy(input.userId);
+  const scheduledDefault = typeof agentModeService.getScheduledChatsDefaultModel === 'function'
+    ? await agentModeService.getScheduledChatsDefaultModel()
+    : null;
+  const systemDefaultModel = scheduledDefault || await agentModeService.getDefaultModel();
+  const supportedModelIds = typeof agentModeService.getSupportedModels === 'function'
+    ? await agentModeService.getSupportedModels(false)
+    : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
+  const supported = new Set(supportedModelIds);
+  const requested = input.requestedBackupModel?.trim();
+  const optimized = new Set(usage.policy?.optimizedModelIds || []);
+  if (requested && supported.has(requested) && (!usage.policy || optimized.has(requested))) {
+    return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
+  }
+  if (requested) {
+    const error = new Error('Backup model is not available for optimized usage');
+    error.name = 'InvalidScheduledBackupModelError';
+    throw error;
+  }
+  const configuredDefault = usage.policy?.optimizedDefaultModel || systemDefaultModel;
+  if (
+    !configuredDefault ||
+    !supported.has(configuredDefault) ||
+    (usage.policy && !optimized.has(configuredDefault))
+  ) {
+    throw new Error('No valid optimized backup model is configured for this account');
+  }
+  return {
+    llmBackupModel: configuredDefault,
+    llmBackupSource: 'system',
+    llmBackupNeedsConfirmation: true,
+  };
+}
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
 // only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
@@ -108,6 +399,41 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
 // does recover on retry — so it must NOT get the system-error copy that says "retrying
 // won't help" (that copy is only true for deterministic errors). Give it its own honest
 // message: temporary, auto-retried, usually self-clearing.
+/**
+ * ENG-971: the zero-output copy above all opens with "so no results were generated"
+ * and closes with "will be retried automatically". Both are false for a run that
+ * published to production and then died before writing its summary — and the retry
+ * is worse than the wording, because it republishes. This message replaces them for
+ * that case, and the requeue is suppressed alongside it.
+ */
+function zeroAssistantPublishedMessage(actions: string[], willResume: boolean, paused = false): string {
+  // No action names means the run's ledger could not be read (Greptile P1). Say that
+  // plainly rather than inventing a list or, worse, implying nothing happened — the
+  // whole point of this branch is that something may well have gone out.
+  const landed = actions.length > 0
+    ? 'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
+      + `${actions.join('; ')}. That is live and saved. `
+    : 'This scheduled run stopped before it could report back, and I could not confirm how far it got — '
+      + 'some of its work may already have gone out. ';
+  return willResume
+    // Resuming continues the same session from its last settled step, so the rest of
+    // the task finishes without repeating what already went out.
+    ? landed
+      + 'I will pick up where this run left off shortly and finish the rest — '
+      + 'what already went out will not be repeated, so there is nothing for you to re-run.'
+    // Not safely continuable: a restart would repeat the publish, so we stop and tell
+    // the owner rather than leaving a part-finished run to look like a success.
+    : landed
+      + 'The rest of this run could not be continued safely, and re-running it from the start '
+      + 'would repeat what already went out — so it has NOT been retried automatically. '
+      + (paused
+        // Saying this only when the pause actually persisted: an email cannot stop a
+        // cron, so the schedule is what had to change, and the user must know it did.
+        ? 'I have paused this schedule so its next run cannot repeat that work — '
+          + 'review what is outstanding, then resume the schedule when you are ready.'
+        : 'Check whether anything is still outstanding.');
+}
+
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
@@ -403,24 +729,97 @@ function buildWorkPlanSummary(session: any): string | null {
 /**
  * Invoke the diagnosis agent to produce a context-aware error message.
  * Returns null if diagnosis fails — caller should fall back to the generic message.
+ *
+ * ENG-971: this is where the production false-failure report was written. The turn
+ * hit GENERATION_TIMEOUT_MS three minutes AFTER publish_landing_page_changes had
+ * landed and been verified live, so none of the truthful-reporting guards inside
+ * generateMarketingResponse (finalize guard, ENG-736 landing reconciler, ENG-971
+ * false-failure guard) ran — a thrown turn never reaches that seam. The diagnosis
+ * agent was handed only the error and `failedFunctions`, and turned "be specific
+ * about what was accomplished" into "your changes were not saved. Please try your
+ * request again", risking a re-run of a production deploy that had already landed.
+ *
+ * Two fixes, both here: the agent is now given the run's SUCCESS ledger
+ * (`calledFunctions`, which toolDispatch flushes per iteration and is therefore
+ * durable at the moment of the throw), and its output goes through the same
+ * deterministic, append-only guard the loop edge uses.
+ *
+ * The ledger comes back alongside the message because the caller needs it too: when
+ * diagnosis is unavailable the generic fallback still ends in "please try sending
+ * your message again", and that advice is just as wrong after a landed publish.
  */
+interface DiagnosisResult {
+  /** The diagnosis agent's message, already reconciled. Null when unavailable. */
+  message: string | null;
+  /** Publish/deploy calls this run is confirmed to have completed. */
+  publishLedger: FalseFailureLedgerEntry[];
+}
+
+/**
+ * The publish/deploy calls a session is confirmed to have completed. Used on the
+ * error branches that never reach the diagnosis agent — a worker shutdown replaces
+ * it with a fixed string, and that string still ends in "please send your message
+ * again", which is the wrong advice after a landed publish.
+ */
+async function loadPublishLedger(
+  sessionId: string,
+  baseline?: Record<string, number> | null,
+): Promise<FalseFailureLedgerEntry[] | null> {
+  // Retried, because UNKNOWN is no longer a soft outcome: it can stop a scheduled
+  // restart and even pause a customer's schedule. A single transient DynamoDB blip
+  // must not be enough to trigger that — "unreadable" has to mean actually
+  // unreadable, not unlucky once.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return ledgerFromSucceededFunctions(
+        diffSucceededFunctions(baseline, session?.calledFunctions || null),
+      );
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadPublishLedger: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
+  try {
+    // NULL means UNKNOWN, and that is deliberately not the same as "nothing was
+    // published" (Greptile P1). Collapsing the two let a failed read on the
+    // scheduled path restart a run from scratch and repeat a production publish.
+    // Callers that only annotate a message may treat null as empty; the caller that
+    // decides whether to RE-RUN work must not.
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
-  userMessage: string
-): Promise<string | null> {
+  userMessage: string,
+  baseline?: Record<string, number> | null
+): Promise<DiagnosisResult> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    // THIS TURN's successes, not the session's lifetime total — see
+    // diffSucceededFunctions. "What was accomplished" must mean this request.
+    const succeededFunctions = diffSucceededFunctions(baseline, session?.calledFunctions || null);
+    const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
       userMessage: userMessage || '',
       workPlanSummary: buildWorkPlanSummary(session),
       failedFunctions: session?.failedFunctions || null,
+      succeededFunctions,
     };
-    return await agentModeService.generateDiagnosticMessage(context);
+    const message = await agentModeService.generateDiagnosticMessage(context);
+    return {
+      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      publishLedger,
+    };
   } catch {
-    return null;
+    return { message: null, publishLedger: [] };
   }
 }
 
@@ -1558,7 +1957,10 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 //       tool loop hits maxIterations, so it fires whether the final content is
 //       the canned "reached the maximum steps" apology OR the model's own
 //       partial text (the model usually complies with the "wrap up" nudge and
-//       writes non-report text, so text-pattern matching alone misses it);
+//       writes non-report text, so text-pattern matching alone misses it).
+//       ENG-907 adds the wall-clock twin, `truncatedByTimeBudget`: the run hit
+//       the whole-turn time cap and delivered a forced partial synthesis. Same
+//       meaning for the gate — real partial work that needs one more turn;
 //   (b) 'confirmation' — the turn halted to ask a human to confirm/approve
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
@@ -1614,10 +2016,11 @@ function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolea
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
   // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
@@ -1632,6 +2035,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
@@ -1729,10 +2133,11 @@ async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
   // marker can be exempted, so a turn without one must not pay for a schedule read.
@@ -1846,6 +2251,32 @@ export async function runVerifiedChat(
     // this zone so a run near a midnight boundary is judged on the owner's calendar
     // day, not UTC. Undefined falls back to UTC.
     scheduleTimezone?: string;
+    // ENG-827: the publish authorization this run was ADMITTED under, resolved ONCE
+    // by the caller from the SAME schedule snapshot it used to build
+    // `requiredFunctions`. Threaded into every turn's system prompt so the prompt
+    // states the identical decision the required-function checker is enforcing,
+    // instead of independently re-reading the schedule per attempt and risking a
+    // split verdict (Greptile P1). Undefined for callers with no schedule, which
+    // fall back to the per-turn lookup inside generateSessionResponse.
+    publishAuthorization?: SchedulePublishAuthorization;
+    /**
+     * ENG-827: re-reads the schedule's CURRENT publish authorization. Called at the
+     * top of each attempt and combined with the admitted value via
+     * narrowPublishAuthorization, which can only ever remove authorization. This is
+     * what makes revoking consent take effect on a run that is already in flight —
+     * without it the owner's kill switch does nothing until the next run, which for
+     * a multi-minute publishing run is exactly when they need it. Resolution stays
+     * single-source: one refreshed value narrows the prompt directive and the
+     * required-function list together, so they still cannot disagree.
+     */
+    refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
+    // Already resolved by the cost policy. Optimized scheduled runs pass string|null
+    // so a transient retry remains inside the approved optimized catalog.
+    transientFallbackModel?: string | null;
+    // Admission decision snapshot used only for post-dispatch audit correction.
+    // Passing it explicitly avoids consulting the session object loaded before the
+    // caller's admission write (legacy sessions may not have a prior stamp).
+    modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1853,15 +2284,45 @@ export async function runVerifiedChat(
     userId,
     startingMessage,
     keywords = [],
-    requiredFunctions = [],
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
     parkNotifiable = false,
+    publishAuthorization,
+    refreshPublishAuthorization,
     publishAuthorized
   } = params;
+
+  // ENG-827: both of these NARROW mid-run when the owner revokes consent, and are
+  // always narrowed together from one value so the checker can never demand a tool
+  // the prompt forbids. Not `const`, because revocation must bite during a live run
+  // — a snapshot taken at admission would publish minutes after the owner said stop.
+  let livePublishAuthorization = publishAuthorization;
+  let requiredFunctions = params.requiredFunctions ?? [];
+  /** Set when consent narrows mid-run; prepended to every subsequent turn message. */
+  let publishRevocationNotice: string | null = null;
+  /**
+   * ENG-827: the system prompt — and with it the PUBLISH AUTHORIZATION directive — is
+   * assembled and persisted ONCE, on the session's first message. Narrowing
+   * `livePublishAuthorization` therefore reaches the required-function checker but NOT
+   * the model, which would keep reading its admission-time "you are authorized to
+   * publish" instruction for the rest of the run: revocation would stop the nudging
+   * without stopping the publishing. Carry the withdrawal in the turn message instead,
+   * where it lands in context immediately and persists in the transcript for every
+   * later turn. The prohibition wording is single-sourced from the same directive
+   * builder the system prompt uses.
+   *
+   * This helper is the ONLY way a turn message reaches the model in this loop — both
+   * `generateSessionResponse` call sites below go through it. That is deliberate: the
+   * completion-gate CONTINUATION turn built its own message and called the model
+   * directly, so a revocation that landed while a run was mid-continuation narrowed
+   * the checker but left the model still reading "you are authorized to publish" —
+   * i.e. it could publish after the owner had already said stop.
+   */
+  const withPublishRevocationNotice = (message: string): string =>
+    publishRevocationNotice ? `${publishRevocationNotice}\n\n${message}` : message;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -2109,6 +2570,56 @@ export async function runVerifiedChat(
   while (attempt < maxAttempts) {
     attempt++;
 
+    // ENG-827: re-check consent before every turn so a revocation lands mid-run
+    // instead of a run publishing from an admission-time snapshot minutes after the
+    // owner switched it off. narrowPublishAuthorization only ever REMOVES rights, so
+    // this can neither re-authorize a run nor widen its scope. The prompt directive
+    // and the checker's required list are narrowed from that one value in the same
+    // step — the invariant that stops the checker nudging for a tool the prompt
+    // forbids (the ~21-turn loop this ticket is about) holds turn by turn, not just
+    // at admission. A failed re-read keeps the admitted value rather than downgrading
+    // an authorized run on a throttled query.
+    if (refreshPublishAuthorization && livePublishAuthorization) {
+      try {
+        // The CALLER applies narrowPublishAuthorization and owns the running value,
+        // so the rule lives in exactly one place and the caller still holds the final
+        // effective authorization to report the run against. Here we only consume it.
+        const narrowed = (await refreshPublishAuthorization()) ?? livePublishAuthorization;
+        if (narrowed.tools.length !== livePublishAuthorization.tools.length) {
+          // Sticky: once consent is withdrawn it must stay withdrawn for the rest of
+          // the run, and narrowing is monotonic so this can never be un-set.
+          publishRevocationNotice =
+            '[PUBLISH AUTHORIZATION WITHDRAWN] The owner has revoked this schedule\'s ' +
+            'permission to publish without review while this run was in progress. Any ' +
+            'authorization to publish stated earlier in this conversation is now VOID' +
+            (narrowed.tools.length > 0
+              ? ` except for: ${narrowed.tools.join(', ')}.`
+              : ' — you are no longer authorized to publish with any tool.') +
+            '\n' +
+            getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
+          console.log(
+            `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
+            `authorized tools [${livePublishAuthorization.tools.join(', ') || 'none'}] -> ` +
+            `[${narrowed.tools.join(', ') || 'none'}]`
+          );
+          requiredFunctions = requiredFunctions.filter(rf =>
+            filterRequiredFunctionsToAuthorizedScope([rf.functionName], narrowed).length > 0
+          );
+        }
+        livePublishAuthorization = narrowed;
+      } catch (err) {
+        // The supplied refresher absorbs its own read failures and fails closed, so
+        // reaching here means the callback itself is broken. Withhold rather than
+        // publish while blind — consistent with every other ambiguous case.
+        console.error('AgentMode: publish-consent refresher threw; withholding publish authorization:', err);
+        const withheld = narrowPublishAuthorization(livePublishAuthorization, null);
+        livePublishAuthorization = withheld;
+        requiredFunctions = requiredFunctions.filter(rf =>
+          filterRequiredFunctionsToAuthorizedScope([rf.functionName], withheld).length > 0
+        );
+      }
+    }
+
     try {
       // Prepare user message for this attempt
       let userMessage = startingMessage;
@@ -2158,10 +2669,15 @@ export async function runVerifiedChat(
         completionGateReason = 'unfinished';
         const continuationResponse = await generateSessionResponse(
           sessionId,
-          userMessage,
+          withPublishRevocationNotice(userMessage),
           userId,
           defaultModel,
-          []
+          [],
+          undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
+          livePublishAuthorization,
+          params.transientFallbackModel,
+          params.modelPolicyDecisionForAudit
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2285,10 +2801,15 @@ export async function runVerifiedChat(
       console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
       const response = await generateSessionResponse(
         sessionId,
-        userMessage,
+        withPublishRevocationNotice(userMessage),
         userId,
         defaultModel,
-        attachmentsForThisAttempt
+        attachmentsForThisAttempt,
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
+        livePublishAuthorization,
+        params.transientFallbackModel,
+        params.modelPolicyDecisionForAudit
       );
 
       if (!hasAssistantOutput(response)) {
@@ -2574,11 +3095,20 @@ async function waitForVerifiedChatRetry(attempt: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, delayMs));
 }
 
+/**
+ * Did this session actually answer? (ENG-946)
+ *
+ * Deliberately stricter than "has an assistant message": an assistant tool-call turn
+ * is not an answer, and the agent narrates one line alongside its tool calls, so the
+ * old check passed for runs that gathered data for minutes and then died before
+ * synthesising anything — recorded `success`, never requeued, transcript ending on
+ * tool results. Requires a real final answer instead (see core/finalAnswer).
+ */
 async function sessionHasAssistantMessage(sessionId: string): Promise<boolean | undefined> {
   try {
     const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
     if (!Array.isArray(messages)) return undefined;
-    return messages.some((message: any) => message?.role === 'assistant');
+    return transcriptHasFinalAssistantAnswer(messages);
   } catch (error) {
     console.error(`Scheduled chat zero-output check failed for session ${sessionId}:`, error);
     return undefined;
@@ -2588,6 +3118,38 @@ async function sessionHasAssistantMessage(sessionId: string): Promise<boolean | 
 function getZeroAssistantRetryCount(schedule: any): number {
   const rawCount = Number(schedule?.zeroAssistantRetryCount || 0);
   return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
+}
+
+/**
+ * Tell the schedule owner a run needs a human look. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort by
+ * design — a notification failure must never break the run.
+ */
+async function notifyScheduleOwnerOfFailure(
+  schedule: any,
+  userId: string,
+  detail: { failedAttempts: number; failureClass: any }
+): Promise<void> {
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduledRunFailedEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; owner alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send owner failure alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
 }
 
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
@@ -2631,6 +3193,9 @@ export async function runScheduledChat(
 }> {
   const now = new Date();
   let sessionId: string = '';
+  // ENG-1118: set when the run parks on a user question. A park resumes into the SAME
+  // session, so its browser is kept rather than released in `finally`.
+  let parkedOnUserQuestion = false;
   let generatedSummary: string | undefined;
 
   // ENG-324: durable in-flight lease. Set once the session exists (below), kept
@@ -2639,6 +3204,18 @@ export async function runScheduledChat(
   const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let leaseAcquired = false;
+  // ENG-971: set when this run published and we could neither resume it nor
+  // persist a pause. Holding the lease is the ONLY backstop that needs no
+  // successful write: `setRunInFlight` is conditional on
+  // `attribute_not_exists(runInFlight)`, so while the lease stands the schedule
+  // physically cannot start a fresh run and repeat the publish. The stale
+  // heartbeat then hands it to the reconciler, which re-checks the attempt and
+  // recovers it properly once the datastore is healthy again.
+  let holdLeaseToBlockRestart = false;
+  // ENG-971: successes already on the session when THIS run started — empty for a
+  // fresh session, the abandoned run's totals when resuming one. Hoisted above the
+  // try because the zero-output requeue decision reads it from the CATCH.
+  let runStartCalledFunctions: Record<string, number> | null = null;
 
   try {
     // Guard against orphaned schedules whose owning user no longer exists.
@@ -2689,6 +3266,58 @@ export async function runScheduledChat(
       }
 
       return orphanedUserResult;
+    }
+
+    // Central guard covers cron/manual/public execution and old schedules that
+    // remain stored after an admin removes this entitlement.
+    const scheduledChatAccess = await userCanUseScheduledChats(userId);
+    if (scheduledChatAccess === null) {
+      const unresolvedEntitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: 'Scheduled chat was not run because subscription features are temporarily unavailable. It will remain active and retry on the next scheduled run.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, unresolvedEntitlementResult)
+        .catch((error) => console.error('Error saving unresolved scheduled-chat entitlement result:', error));
+      return unresolvedEntitlementResult;
+    }
+
+    if (!scheduledChatAccess) {
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+      }).catch((error) => console.error(`Failed to auto-pause schedule ${schedule.scheduleId}:`, error));
+
+      const entitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: SCHEDULED_CHATS_NOT_INCLUDED_ERROR.error,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, entitlementResult)
+        .catch((error) => console.error('Error saving scheduled-chat entitlement result:', error));
+      return entitlementResult;
     }
 
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -2802,7 +3431,9 @@ export async function runScheduledChat(
       // a user with an unlimited token allowance can be blocked — render a
       // cost-based message so it doesn't misleadingly read "0 tokens used".
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
-      const blockMessage = blockedByCost
+      const blockMessage = usageStatus.usageMode === 'paused'
+        ? 'Scheduled chat cannot run: AI usage is paused until the next reset or additional usage is added.'
+        : blockedByCost
         ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
         : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
 
@@ -3116,6 +3747,12 @@ export async function runScheduledChat(
       // reloads the full transcript from the DB.
       isResumeRun = true;
       sessionId = pendingResumeSessionId;
+      // ENG-971: a RESUMED session carries the abandoned run's calledFunctions. Without
+      // this baseline, that run's publish would be read as THIS run's work — and since
+      // a confirmed publish suppresses the zero-output requeue, an unrelated failure
+      // here would silently end the schedule's auto-recovery. Resume is exactly the
+      // path for runs that did real work first, so this is the common case.
+      runStartCalledFunctions = resumeSession.calledFunctions || {};
       // Credit the abandoned portion's tool calls to this run's verification,
       // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
       resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
@@ -3153,52 +3790,109 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Update the session with the selected model from the schedule.
-    // ENG-892: schedule.llmModel is written straight from an admin request body
-    // with no allow-list check, and this is an internal db call, so it bypasses
-    // the validation on the picker endpoints. Stamping it raw recorded a model
-    // that never ran whenever generation fell back — on exactly the scheduled
-    // sessions the daily reports analyse. Resolve first so the stored value is
-    // what generation will resolve to.
+    // Resolve the stored preference at execution time. A schedule can outlive a
+    // policy/model change by months, so neither its preferred nor backup model is
+    // trusted merely because it was valid when saved.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const requestedModel = schedule.llmModel || defaultModel;
-    const scheduleModelResolution = agentModeService.resolveGenerationModel(requestedModel);
-    const modelToUse = scheduleModelResolution.model;
-    if (scheduleModelResolution.fellBack) {
-      // Fail loud, not partial. The run still completes on the fallback, but the
-      // admin's pin is dead and the UI keeps showing the model they chose — the
-      // ENG-806 failure mode, where an alias-valued setting sat inert for two
-      // months. resolveConfiguredModel alerts for AW-Settings; schedules only
-      // console.warn'd. Fire-and-forget so the run never blocks on it.
+    const rawRequestedModel = schedule.llmModel || defaultModel;
+    const requestedModelResolution = agentModeService.resolveGenerationModel(rawRequestedModel);
+    const requestedModel = requestedModelResolution.model;
+    const scheduleModelPolicy = await resolveEffectiveModelForUser({
+      userId,
+      requestedModel,
+      backupModel: schedule.llmBackupModel,
+      backupSource: schedule.llmBackupSource,
+    });
+    if (!scheduleModelPolicy.effectiveModel) {
+      const pausedError: any = new Error('usage_paused');
+      pausedError.code = 'usage_paused';
+      throw pausedError;
+    }
+    const modelToUse = scheduleModelPolicy.effectiveModel;
+    if (requestedModelResolution.fellBack) {
       void sendAgentModeOncallAlert({
         subject: 'AgentMode: unsupported model pinned on a scheduled chat',
         message:
-          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${requestedModel}", which is ` +
-          `not a served model even after legacy-alias resolution. The run fell back to "${modelToUse}", so the ` +
-          `pin is inert and every run of this schedule is using a model nobody chose.`,
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${rawRequestedModel}", which is ` +
+          `not a served model even after legacy-alias resolution. The policy resolver selected "${modelToUse}".`,
         context: {
           Schedule: schedule.scheduleId,
-          'Pinned Model': requestedModel,
+          'Pinned Model': rawRequestedModel,
           'Actually Used': modelToUse,
         },
-        // One alert per (schedule, bad value) per hour: a daily schedule with a
-        // permanently bad pin must not flood oncall.
-        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${requestedModel}`,
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${rawRequestedModel}`,
         dedupeWindowMs: 60 * 60 * 1000,
       }).catch((alertError) => {
         console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
       });
     }
-    await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
+    await chatbotDb.updateSessionLlmModel(
+      sessionId,
+      modelToUse,
+      toStoredModelPolicyDecision(scheduleModelPolicy),
+    );
 
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
-    const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
-      functionName: funcName,
-      minCount: functionCallMinCalls[funcName] || 1
-    }));
+    // ENG-827: resolve this run's publish authorization exactly ONCE, here, from the
+    // schedule snapshot this run was admitted under. The SAME object drives both
+    // consumers — the deterministic required-function checker below, and (threaded
+    // through runVerifiedChat) the PUBLISH AUTHORIZATION directive in every turn's
+    // system prompt. Deriving them from one value is what makes the invariant
+    // structural: the checker can never nudge for a publish tool the prompt told the
+    // model not to call, which is the contradiction that looped the reported runs ~21
+    // times. Two independent reads could disagree — that was Greptile's P1.
+    //
+    // Filter on the authorized TOOL SET, not the boolean. Consent is bound to the
+    // scope the owner approved, so a run can be authorized for one publish tool
+    // while the schedule also requires another that is outside that scope. Keying
+    // the filter on `authorized` alone would keep BOTH — and the prompt names only
+    // the approved one and forbids the rest, so the checker would nudge for a tool
+    // the prompt prohibits: the original contradiction, reintroduced by partial
+    // scope. `tools` is empty when unauthorized, so this still drops every publish
+    // requirement in that case.
+    let publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    // ENG-827: stamp the admitted authorization on the session before the first turn.
+    //
+    // The dispatch-time guard re-reads the schedule so a revocation stops an in-flight
+    // publish, but a re-read on its own would also let a grant made DURING the run
+    // widen it — publishing content a draft-only run had already generated under a
+    // prompt telling it not to. The guard intersects live state with this stamp
+    // instead, so a run keeps the permissions it began with and consent can only ever
+    // narrow. Only an authorized run is stamped: the guard reads an absent stamp as
+    // not authorized, which is exactly right for every draft-only run and costs a
+    // schedule that publishes nothing no extra write at all. A legacy schedule that
+    // resolves authorized by the shipped opt-out default IS stamped, so the write-time
+    // guard has a scope to intersect against rather than refusing it for want of one.
+    //
+    // If the stamp cannot be written we downgrade THIS value rather than carry on,
+    // because it is the one the prompt and the required-function filter below are both
+    // derived from. Proceeding would tell the model to publish and demand the call
+    // while the guard refused it — the exact prompt-versus-checker contradiction that
+    // produced the reported nudge loop. Downgrading costs a draft; the alternative
+    // costs a burned run.
+    if (publishAuthorization.authorized) {
+      try {
+        await chatbotDb.updateSessionPublishAdmission(sessionId, publishAuthorization);
+      } catch (admissionWriteError) {
+        console.error(
+          `AgentMode: could not record the publish admission for session ${sessionId} on schedule ` +
+          `${schedule.scheduleId}; running draft-only (fail-closed):`, admissionWriteError
+        );
+        publishAuthorization = narrowPublishAuthorization(publishAuthorization, null);
+      }
+    }
+    // ENG-827: the authorization this run is CURRENTLY operating under. Starts at the
+    // admitted value and is narrowed — never widened — by each mid-run re-check, so it
+    // also ends up holding the final state the run's record must be reported against.
+    let effectivePublishAuthorization = publishAuthorization;
+    const requiredFunctions = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization)
+      .map((funcName: string) => ({
+        functionName: funcName,
+        minCount: functionCallMinCalls[funcName] || 1
+      }));
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
@@ -3231,7 +3925,9 @@ export async function runScheduledChat(
       requiredFunctions,
       maxAttempts: 20,
       attachments: fileAttachments,
-      llmModel: schedule.llmModel || defaultModel,
+      llmModel: modelToUse,
+      transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
+      modelPolicyDecisionForAudit: scheduleModelPolicy,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
       priorToolCalls: resumePriorToolCalls,
@@ -3242,6 +3938,31 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-827: same object that filtered `requiredFunctions` above, so the prompt
+      // and the checker state one decision rather than two independent reads.
+      publishAuthorization,
+      // ENG-827: consent can be withdrawn while this run is still executing, and a
+      // run lasts minutes. Re-read it each turn so revoking actually stops an
+      // in-flight publish instead of taking effect only on the NEXT run. Narrowing
+      // is monotonic, so this can never grant rights the admission snapshot lacked.
+      refreshPublishAuthorization: async () => {
+        // Never throws: a failed read resolves to null, which narrows to UNAUTHORIZED.
+        // Absorbing the failure HERE rather than in runVerifiedChat's catch is what
+        // keeps the two values in step — if this threw, the loop would withhold while
+        // `effectivePublishAuthorization` stayed authorized, and the run record would
+        // once again report requirements the run was never held to.
+        let latest: SchedulePublishAuthorization | null = null;
+        try {
+          latest = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId));
+        } catch (err) {
+          console.error(
+            `AgentMode: publish-consent re-check failed for schedule ${schedule.scheduleId}; ` +
+            'withholding publish authorization for the rest of this run (fail-closed):', err
+          );
+        }
+        effectivePublishAuthorization = narrowPublishAuthorization(effectivePublishAuthorization, latest);
+        return effectivePublishAuthorization;
+      },
       // ENG-803: re-read at the moment the marker is evaluated, so the continuation
       // classifier uses the SAME live decision as the prompt builder and the dispatch
       // guard. A snapshot taken here would go stale the moment the owner toggles the
@@ -3285,6 +4006,8 @@ export async function runScheduledChat(
         );
       }
 
+      parkedOnUserQuestion = true;
+
       const parkedResult = {
         scheduleId: schedule.scheduleId,
         runId: preGeneratedRunId || require('uuid').v4(),
@@ -3317,7 +4040,7 @@ export async function runScheduledChat(
       const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
       if (hasAssistantMessage === false) {
         throw new ZeroAssistantOutputError(
-          `Scheduled chat produced zero persisted assistant messages for session ${sessionId}`
+          `Scheduled chat produced no persisted assistant answer for session ${sessionId}`
         );
       }
     }
@@ -3361,14 +4084,28 @@ export async function runScheduledChat(
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
 
-    expectedFunctionCalls.forEach((funcCall: string) => {
-      const actualCount = actualFunctionCallCounts[funcCall] || 0;
-      const requiredCount = functionCallMinCalls[funcCall] || 1;
-      finalFunctionCallDetails[funcCall] = {
-        actual: actualCount,
-        required: requiredCount
-      };
-    });
+    // ENG-827: report the requirements this run was actually HELD TO, which is the
+    // publish-scope-filtered list the checker used above — not the raw schedule
+    // config. Reading the unfiltered config here persisted a self-contradicting
+    // record on an unauthorized run: `post_on_connected_account {required: 1,
+    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
+    // Nothing downstream can tell that apart from a genuine silent miss, which is
+    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt and this record.
+    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
+    // run FINISHED under, which differs from the admitted one when the owner revoked
+    // consent mid-run. Reading the raw schedule config here instead persisted a
+    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
+    // next to an empty functionCallMisses on a passing run. Nothing downstream can
+    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
+    // ENG-764 had to unpick.
+    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
+      .forEach((functionName: string) => {
+        finalFunctionCallDetails[functionName] = {
+          actual: actualFunctionCallCounts[functionName] || 0,
+          required: functionCallMinCalls[functionName] || 1
+        };
+      });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
@@ -3536,6 +4273,53 @@ export async function runScheduledChat(
 
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput) {
+      // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
+      // can land and the process die before the summary — exactly the shape of the
+      // session this issue came from, minus the closing turn. Requeuing that run
+      // REPUBLISHES it, and unlike the interactive error paths there is no human
+      // between the failure and the retry, so correcting the transcript alone would
+      // arrive far too late. Read the ledger first; it decides both the message and
+      // whether the requeue happens at all. A read failure yields no actions and
+      // every existing behaviour is preserved.
+      const publishLedgerForRun = sessionId
+        ? await loadPublishLedger(sessionId, runStartCalledFunctions)
+        : [];
+      // A read failure is UNKNOWN, not "nothing happened" (Greptile P1). Restarting
+      // the task from scratch on an unknown can repeat a production publish, so an
+      // unknown is handled exactly like a confirmed one: never restart, prefer resume.
+      const publishLedgerUnknown = publishLedgerForRun === null;
+      const publishedActions = publishLedgerForRun
+        ? collectConfirmedPublishActions(publishLedgerForRun)
+        : [];
+      const mayHavePublished = publishedActions.length > 0 || publishLedgerUnknown;
+
+      // Work landed this run, so there are three options and only one is good.
+      // A blind requeue restarts from scratch and REPUBLISHES it. Simply not
+      // retrying avoids that, but can leave a multi-step run (publish 1 of 5, then
+      // die) permanently part-done with nothing surfaced — a quieter, harder-to-
+      // diagnose failure than the duplicate it prevents. So prefer RESUME:
+      // planScheduledRunResume says yes only when the transcript ends on a settled,
+      // balanced boundary, which by construction never re-drives a tool that already
+      // ran. The rest of the task finishes; the publish is not repeated.
+      const zeroOutputNextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      let willResumePublishedRun = false;
+      if (
+        mayHavePublished
+        && !isTest
+        && sessionId
+        && zeroOutputNextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES
+      ) {
+        try {
+          const priorMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+          willResumePublishedRun = planScheduledRunResume(priorMessages as any).resumable;
+        } catch (planError) {
+          console.error(
+            `Zero-output resume-plan check failed for session ${sessionId}; will not retry:`,
+            planError
+          );
+        }
+      }
+
       // Never leave the session silent (ENG-209). Persist a structured
       // "job incomplete" assistant message so the user sees graceful feedback
       // instead of an empty session. Done BEFORE requeue so the failed session
@@ -3547,8 +4331,15 @@ export async function runScheduledChat(
         // batches" advice that can't help — that mislabels the transcript for anyone
         // debugging it. Budget-shaped failures keep the original guidance.
         const failureClass = classifyZeroAssistantFailure(error);
-        const incompleteMessage = zeroAssistantIncompleteMessage(error);
-        try {
+        // ENG-971: the published-run message is written AFTER the requeue decision
+        // (below), because its two variants make opposite promises and only the
+        // outcome knows which is true — the resume wording would be a lie if the
+        // requeue write then failed. This is the very failure class this issue is
+        // about, so the message must never run ahead of the fact.
+        const incompleteMessage = mayHavePublished
+          ? null
+          : zeroAssistantIncompleteMessage(error);
+        if (incompleteMessage) try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
             content: incompleteMessage,
@@ -3577,8 +4368,119 @@ export async function runScheduledChat(
         timestamp: new Date().toISOString(),
       });
 
-      if (!isTest) {
-        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      let publishedRunDidResume = false;
+      let publishedRunPaused = false;
+      if (mayHavePublished) {
+        if (willResumePublishedRun) {
+          // Requeue AS A RESUME: same session, continued from its last settled step.
+          // Retried, because this single write is what stands between a recoverable
+          // blip and having to pause the customer's schedule below.
+          const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(zeroOutputNextRetryCount)).toISOString();
+          for (let attempt = 1; attempt <= 3 && !publishedRunDidResume; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'active',
+                nextRunTime: retryAt,
+                zeroAssistantRetryCount: zeroOutputNextRetryCount,
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                pendingResumeSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunDidResume = true;
+              zeroAssistantRequeuedAt = retryAt;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+                + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
+              );
+            } catch (requeueError) {
+              console.error(
+                `Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId} `
+                + `(attempt ${attempt}/3):`,
+                requeueError
+              );
+            }
+          }
+        } else {
+          // Cannot continue safely and must not restart.
+          console.error(
+            `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+            + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing.`
+          );
+        }
+
+        // The run published and is NOT being continued — either it could not be
+        // resumed, or the resume marker would not persist. Leaving the schedule
+        // ACTIVE means its next ordinary fire starts a fresh session and repeats
+        // work that already went out, and an owner email cannot stop a cron: only
+        // persisted state can. So pause the schedule. Deliberately a last resort —
+        // it stops a customer's recurring workflow — which is why the marker write
+        // above is retried first, and why nothing pauses on an ordinary failure.
+        if (!publishedRunDidResume && !isTest) {
+          zeroAssistantRequeuedAt = undefined;
+          // Retried like the marker write above: this is the last durable thing
+          // standing between a published run and a repeat, so one unlucky call must
+          // not decide it.
+          for (let attempt = 1; attempt <= 3 && !publishedRunPaused; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'paused',
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunPaused = true;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} PAUSED: it published `
+                + `(${publishedActions.join('; ') || 'outcome unreadable'}) and cannot be continued, `
+                + `so its next fire would repeat that work.`
+              );
+            } catch (pauseError) {
+              console.error(
+                `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
+                + `non-resumable run (attempt ${attempt}/3):`,
+                pauseError
+              );
+            }
+          }
+          // Every durable write failed. Fall back to the one guard that needs no
+          // write: keep the lease, so no fresh run can start until the reconciler
+          // re-examines this attempt.
+          if (!publishedRunPaused) holdLeaseToBlockRestart = true;
+        }
+
+        // Keyed on what ACTUALLY happened, not on which branch we took (Greptile P1).
+        // A resume marker that failed to persist leaves the schedule active with no
+        // marker, so its next ordinary fire starts a FRESH session and can repeat the
+        // publish. That path used to only log. Whenever the run did not actually
+        // resume — unresumable transcript OR failed marker write — the work may
+        // already have gone out and nothing will continue it, so the owner is told.
+        if (!publishedRunDidResume && !isTest) {
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: zeroOutputNextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
+        }
+        // Outcome settled — now the transcript can state it truthfully.
+        if (sessionId) {
+          try {
+            await chatbotDb.addMessageToSession(sessionId, {
+              role: 'assistant',
+              content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
+              timestamp: new Date().toISOString(),
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isErrorMessage: true,
+                jobIncomplete: true,
+                failureClass: classifyZeroAssistantFailure(error),
+              },
+            });
+          } catch (persistError) {
+            console.error('Failed to persist published-run job-incomplete message:', persistError);
+          }
+        }
+      } else if (!isTest) {
+        const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
           zeroAssistantRequeuedAt = retryAt;
@@ -3613,35 +4515,10 @@ export async function runScheduledChat(
           // atomic with the email send, so any such flag inevitably diverges from actual
           // delivery (a duplicate alert if the write fails after a send, or a missed alert
           // if the ordering is inverted). No dedup state means no divergence to get wrong.
-          try {
-            let recipients: string[] = Array.isArray(schedule.emailNotifications)
-              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-              : [];
-            if (recipients.length === 0) {
-              const owner = await userDb.getUserById(userId);
-              if (owner?.email) recipients = [owner.email];
-            }
-            if (recipients.length > 0) {
-              await emailService.sendScheduledRunFailedEmail(
-                recipients,
-                schedule.scheduleName,
-                schedule.scheduleId,
-                {
-                  failedAttempts: nextRetryCount,
-                  failureClass: classifyZeroAssistantFailure(error),
-                }
-              );
-            } else {
-              console.error(
-                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
-              );
-            }
-          } catch (notifyError) {
-            console.error(
-              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
-              notifyError
-            );
-          }
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: nextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
         }
       }
     }
@@ -3739,11 +4616,34 @@ export async function runScheduledChat(
     // Return error result for error reporting
     return errorResult;
   } finally {
+    // ENG-1118: the run is over — hand its browser back now rather than leaving a
+    // Chromium idle until the pool sweep. Browser MCP clients pool per chat session and
+    // live in the generate worker, so this has to be signalled across the process
+    // boundary. A parked run is the exception: it resumes into this same session, so
+    // releasing here would hand the resume a blank page. The idle sweep still reclaims
+    // it if the human never answers.
+    if (sessionId && !parkedOnUserQuestion) {
+      try {
+        generateMarketingResponseWorkerService.releaseSessionClients(sessionId);
+      } catch (releaseError) {
+        console.warn(`Failed to release MCP clients for session ${sessionId}:`, releaseError);
+      }
+    }
+
     // ENG-324: stop heartbeating and release the lease. Conditional on runId, so
     // if the reconciler already reaped this run (heartbeat went stale), the clear
     // no-ops and the requeue it wrote stands.
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (leaseAcquired) {
+    if (leaseAcquired && holdLeaseToBlockRestart) {
+      // Deliberately NOT clearing. Releasing here would free the schedule to fire
+      // normally and re-run work that already went out; keeping it is a decision
+      // not to act, so unlike a pause write it cannot fail.
+      console.error(
+        `Scheduled chat ${schedule.scheduleId}: HOLDING the in-flight lease — this run published `
+        + `and could not be resumed or paused, so the lease is the only thing preventing a repeat. `
+        + `The stale-run reconciler will recover it.`
+      );
+    } else if (leaseAcquired) {
       try {
         await scheduleDb.clearRunInFlight(schedule.scheduleId, leaseRunId);
       } catch (clearError) {
@@ -3769,9 +4669,9 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // failure recorded) — just not rescheduled.
   const isActive = schedule.status === 'active';
   const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
-  const willRequeue = isActive && !overCap;
-  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
-  const requeuedAt = willRequeue
+  let willRequeue = isActive && !overCap;
+  let noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
+  let requeuedAt = willRequeue
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
 
@@ -3781,6 +4681,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // killed mid-tool-execution is NOT resumed (never re-drive a half-applied side
   // effect). Best-effort: any read/plan failure falls back to a fresh restart.
   let resumeSessionId = '';
+  // Set when this run published (or may have) and cannot be continued: suppressing
+  // the requeue alone leaves the schedule ACTIVE, so its next ORDINARY fire would
+  // still restart from scratch and repeat that work. Only pausing prevents it.
+  let pauseBeforeClaim = false;
   if (willRequeue && lease.sessionId) {
     try {
       const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
@@ -3788,7 +4692,93 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
         resumeSessionId = lease.sessionId;
       }
     } catch (planError) {
-      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}, will restart fresh:`, planError);
+      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}:`, planError);
+    }
+  }
+
+  // ENG-971 (Greptile): without a resume marker this requeue RESTARTS the task from
+  // scratch, re-driving its side effects. The paths that reach here without one are
+  // exactly the dangerous cases — an unresumable transcript, or a plan check that
+  // threw — and `claimAbandonedRun` with no resumeSessionId also REMOVES any marker
+  // already stored. So restart only when the ledger can be read AND shows nothing
+  // published; a confirmed publish or an unreadable ledger stops the restart and
+  // tells the owner instead, matching the zero-output path in runScheduledChat.
+  if (willRequeue && !resumeSessionId && lease.sessionId) {
+    // Scoped to THIS attempt via lease.startedAt. calledFunctions is
+    // session-cumulative and a recovered run resumes the abandoned run's session,
+    // so reading the counters here would let an EARLIER attempt's publish pause a
+    // schedule whose latest attempt published nothing — a live workflow stopped for
+    // a run that did nothing wrong. The transcript answers precisely, using state
+    // the lease already carries.
+    let attemptPublished: string[] = [];
+    let transcriptUnreadable = true;
+    // Retried for the same reason the ledger read is: an unreadable transcript can
+    // PAUSE a live schedule, so one transient failure must not be enough to decide it.
+    for (let attempt = 1; attempt <= 3 && transcriptUnreadable; attempt++) {
+      try {
+        const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
+        attemptPublished = collectPublishActionsSince(priorMessages as any, lease.startedAt);
+        transcriptUnreadable = false;
+      } catch (readError) {
+        if (attempt === 3) {
+          console.error(
+            `recoverAbandonedScheduledRun: transcript unreadable for ${lease.sessionId} after 3 attempts:`,
+            readError
+          );
+        }
+      }
+    }
+    const mayHavePublished = transcriptUnreadable || attemptPublished.length > 0;
+    if (mayHavePublished) {
+      willRequeue = false;
+      requeuedAt = undefined;
+      noRequeueReason = transcriptUnreadable
+        ? 'transcript unreadable — a fresh restart could repeat completed work'
+        : `this attempt already ${attemptPublished.join('; ')} — a fresh restart would repeat it`;
+      console.error(
+        `recoverAbandonedScheduledRun: NOT restarting schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+      );
+      await notifyScheduleOwnerOfFailure(schedule, schedule.userId, {
+        failedAttempts: nextRetryCount,
+        failureClass: 'system',
+      });
+      pauseBeforeClaim = true;
+    }
+  }
+
+  // ENG-971: pause BEFORE claiming. claimAbandonedRun is what REMOVES the stale
+  // lease, and that lease is the only thing stopping a due schedule starting a
+  // fresh run — so a pause attempted afterwards has already given away the guard
+  // it was meant to replace. Pausing first is safe to repeat: a losing instance
+  // simply writes status='paused' twice. If the pause will not persist we do not
+  // claim at all, leaving the lease in place; a later reconciler pass retries once
+  // the datastore is healthy.
+  if (pauseBeforeClaim) {
+    let paused = false;
+    for (let attempt = 1; attempt <= 3 && !paused; attempt++) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          status: 'paused',
+          updatedAt: new Date().toISOString(),
+        });
+        paused = true;
+        console.error(
+          `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+        );
+      } catch (pauseError) {
+        console.error(
+          `CRITICAL: failed to pause schedule ${schedule.scheduleId} (attempt ${attempt}/3):`,
+          pauseError
+        );
+      }
+    }
+    if (!paused) {
+      console.error(
+        `recoverAbandonedScheduledRun: leaving the stale lease on ${schedule.scheduleId} in place — `
+        + `this run may already have published and the pause would not persist, so the lease is the `
+        + `only thing preventing a repeat. A later reconciler pass will retry.`
+      );
+      return false;
     }
   }
 
@@ -3802,6 +4792,7 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       : null
   );
   if (!won) return false;
+
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
   // When the run will RESUME, do NOT append the "job incomplete" placeholder — the
@@ -4088,7 +5079,27 @@ export async function generateSessionResponse(
   answerAck?: string,
   // ENG-396: the structured selection stamped on this reply's metadata, so a card can
   // show which option was CLICKED (never inferred from the message text).
-  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean },
+  // ENG-907: epoch ms stamped by the caller immediately before it wraps this promise in
+  // withGenerationTimeout. Threaded down to the tool loop so its wall-clock budget is
+  // measured against the deadline that is actually enforced — everything this function
+  // does first (session/message reads, the title LLM call, the fork IPC hop, the memory
+  // embedding backfill) would otherwise be silently subtracted from the synthesis
+  // reserve. Omitted by callers that run without a whole-turn cap.
+  turnStartMs?: number,
+  // ENG-827: publish authorization already resolved by the caller (runVerifiedChat,
+  // from runScheduledChat's single schedule snapshot). When supplied it is used
+  // verbatim, so the prompt and the required-function checker can never disagree.
+  // When absent — the interactive route, or a resumed run entered directly — fall
+  // back to reading the schedule for this turn.
+  publishAuthorizationOverride?: SchedulePublishAuthorization,
+  // Cost-policy-owned transient retry target. Optimized callers always pass a
+  // string or null; omission preserves the unrestricted global backup behavior.
+  transientFallbackModel?: string | null,
+  // The caller's just-resolved admission decision. This is intentionally not sent
+  // to the worker; it only makes the post-fallback durable audit independent of a
+  // stale pre-admission session read.
+  modelPolicyDecisionForAudit?: EffectiveModelPolicyDecision,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -4104,6 +5115,9 @@ export async function generateSessionResponse(
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
   truncatedByStepBudget?: boolean;
+  // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
+  // partial answer from a forced synthesis turn instead of the full deliverable.
+  truncatedByTimeBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -4204,9 +5218,14 @@ export async function generateSessionResponse(
 
         // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
         if (session.sessionType === 'scheduled' && session.pageIdentifier) {
-          const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+          // ANCHORED parser (ENG-803's shared helper): the schedule NAME precedes the
+          // authoritative id in `"<name>|scheduleId:<id>"`, so an unanchored match lets
+          // a schedule named `Evil scheduleId:deadbeef` select a DIFFERENT schedule's
+          // record — which this same value then uses to resolve publish authorization
+          // below. One parser for both gates.
+          const scheduleIdMatch = extractScheduleId(session.pageIdentifier);
           if (scheduleIdMatch) {
-            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
           // Resolve the schedule owner's admin status so the directive only
           // injects its admin-only (get_chat_history / list_all_clients) identity
@@ -4220,7 +5239,14 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
+          // ENG-827: the unattended directive WITHOUT its publish block. This system
+          // prompt is stored as the session's first message, and buildMarketingContext
+          // slices that message off before the model ever sees it — so a publish
+          // decision stated here would be a decision nobody reads. The publish block is
+          // emitted by AgentModeService instead, appended after the conversation where
+          // it is both delivered and salient. Verified on the preview: the copy written
+          // here had no effect on the run's behaviour.
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, 'unknown', []);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -4339,13 +5365,43 @@ export async function generateSessionResponse(
       // ENG-473: persist each settled turn as it completes so a hard process kill
       // (OOM/SIGKILL/force-exit past drain) leaves a visible partial transcript
       // instead of a silent zero-output session.
-      persistIncrementally: true
+      persistIncrementally: true,
+      // ENG-827: forward the caller's resolved authorization so the prompt and the
+      // checker are built from one value. Absent on the interactive path, where the
+      // service resolves it per turn instead.
+      publishAuthorizationOverride,
+      // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
+      // enforces no cap), so the loop wraps itself up against the real deadline.
+      turnStartMs,
+      transientFallbackModel,
     },
     (progress) => {
       // Emit progress updates via SSE
       emitProgress(sessionId, progress);
     }
   );
+
+  // The admission decision is stamped before dispatch. If the provider then fails
+  // transiently and the approved optimized fallback actually answers, update the
+  // session to the model that incurred cost so audits never report the failed primary
+  // as the effective model. This is scoped to policy-owned fallbacks; unrestricted
+  // legacy retries retain their existing persistence behavior.
+  if (
+    response.backupModelUsed &&
+    response.backupModel &&
+    transientFallbackModel !== undefined &&
+    modelPolicyDecisionForAudit?.usageMode === 'optimized'
+  ) {
+    await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
+      ...toStoredModelPolicyDecision(modelPolicyDecisionForAudit),
+      effectiveModel: response.backupModel,
+      backupModel: response.backupModel,
+      backupSource: modelPolicyDecisionForAudit.transientFallbackSource || 'system',
+      modelSelection: 'corrected',
+      modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
+      recordedAt: new Date().toISOString(),
+    });
+  }
 
   // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
   // below, so a page reload shows no ghost final response from the cancelled turn. Any
@@ -4561,7 +5617,19 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: requestedLlmModel } = req.body;
+      const skillId = req.params?.skillId;
+      const portalType = skillId ? 'agent' : requestedPortalType;
+      let skill;
+      if (skillId) {
+        skill = await agentModeService.getAuthorizedSkill(skillId, user.userId);
+        if (!skill) {
+          return res.status(404).json({ error: 'Skill not found' });
+        }
+        const validationError = validateWelcomeMessage(skill.welcomeMessage);
+        if (validationError) return res.status(400).json({ error: validationError });
+      }
+      const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
       // Cross-restart duplicate-submit lock, keyed by the client-provided
       // idempotencyKey scoped to this user. The conditional idem#… put means
@@ -4592,12 +5660,37 @@ export const agentModeController = {
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
       // For ad video generation from Videos page, sessionType should be 'video-generation'
-      const finalSessionType = sessionType || 'regular';
+      const finalSessionType = skillId ? 'regular' : sessionType || 'regular';
 
       // Pass delegate info if this is a delegated access session
       const delegateInfo = authReq.delegateInfo;
 
-      const session = await chatbotDb.createChatSession(
+      // Resolve all initial state before the one session Put, so a Skill
+      // session is either fully initialized or absent.
+      let modelToUse: string;
+      if (finalSessionType === 'report_generation') {
+        modelToUse = await agentModeService.getReportsModel();
+      } else if (portalType === 'emma-sidebar') {
+        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
+      } else {
+        modelToUse = await agentModeService.getDefaultModel();
+      }
+      let initialModelPolicy: EffectiveModelPolicyDecision | undefined;
+      if (!skillId && finalSessionType === 'regular' && portalType !== 'emma-sidebar') {
+        initialModelPolicy = await resolveEffectiveModelForUser({
+          userId: user.userId,
+          requestedModel: requestedLlmModel || modelToUse,
+        });
+        // Creating a session itself spends nothing. A paused account can still
+        // open/read the session; provider admission remains blocked on send.
+        if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
+      }
+      const welcomeMessage = skill?.welcomeMessage?.trim();
+      const initialSkillState = skillId ? {
+        llmModel: modelToUse, associatedSkills: [skillId],
+        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+      } : undefined;
+      const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
         undefined, // pageContent
         portalType,
@@ -4608,19 +5701,16 @@ export const agentModeController = {
         undefined, // emailCampaignTaskId
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
         delegateInfo // Pass delegate info for admin delegation tracking
-      );
-
-      // Set default model for new sessions
-      // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
-      let modelToUse: string;
-      if (finalSessionType === 'report_generation') {
-        modelToUse = await agentModeService.getReportsModel();
-      } else if (portalType === 'emma-sidebar') {
-        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
-      } else {
-        modelToUse = await agentModeService.getDefaultModel();
-      }
-      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+      ];
+      if (initialSkillState) createSessionArgs.push(initialSkillState);
+      const session = await chatbotDb.createChatSession(...createSessionArgs);
+      const sessionWithModel = skillId
+        ? session
+        : await chatbotDb.updateSessionLlmModel(
+            session.sessionId,
+            modelToUse,
+            initialModelPolicy ? toStoredModelPolicyDecision(initialModelPolicy) : undefined,
+          );
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
@@ -4629,11 +5719,23 @@ export const agentModeController = {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
       }
 
-      res.status(201).json(sessionWithModel);
+      res.status(201).json(skillId ? {
+        ...sessionWithModel,
+        redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+      } : {
+        ...sessionWithModel,
+        ...(initialModelPolicy ? {
+          requestedModel: initialModelPolicy.requestedModel,
+          effectiveModel: initialModelPolicy.effectiveModel,
+          backupModel: initialModelPolicy.backupModel,
+          backupSource: initialModelPolicy.backupSource,
+          modelSelection: initialModelPolicy.modelSelection,
+          usageMode: initialModelPolicy.usageMode,
+          usagePolicyVersion: initialModelPolicy.usagePolicyVersion,
+        } : {}),
+      });
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
-      // Release the claim so the client's retry is accepted — a failed create
-      // must not lock the user out for the idem ttl.
       if (createIdemKeyHeld) {
         await releaseIdempotency(createIdemKeyHeld);
       }
@@ -4728,9 +5830,13 @@ export const agentModeController = {
     // the durable run record terminal after an error unwinds the inner finally.
     let runSurvivalRunId: string | undefined;
     let idemKeyHeld: string | undefined;
+    // ENG-971: calledFunctions is session-cumulative, so the error path needs to know
+    // where THIS turn started to tell its own successes from earlier turns'.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
+    let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -4765,6 +5871,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
@@ -4902,9 +6009,35 @@ export const agentModeController = {
       // Check token usage limits
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
+        if (usageStatus.usagePolicyVersion) {
+          modelPolicyDecision = await resolveEffectiveModelForUser({
+            userId: session.userId,
+            requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+            backupModel: llmBackupModel,
+            backupSource: llmBackupModel ? 'user' : null,
+          });
+          await chatbotDb.updateSessionLlmModel(
+            sessionId,
+            session.llmModel || agentModeService.default_model,
+            toStoredModelPolicyDecision(modelPolicyDecision),
+          );
+          return res.status(429).json({
+            error: 'AI usage is paused until your next reset or additional usage is added.',
+            code: 'usage_paused',
+            usageMode: modelPolicyDecision.usageMode,
+            requestedModel: modelPolicyDecision.requestedModel,
+            effectiveModel: modelPolicyDecision.effectiveModel,
+            backupModel: modelPolicyDecision.backupModel,
+            backupSource: modelPolicyDecision.backupSource,
+            modelSelection: modelPolicyDecision.modelSelection,
+            modelSelectionReason: modelPolicyDecision.reason,
+            usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+          });
+        }
         return res.status(429).json({
-          error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          tokenUsage: usageStatus,
+          error: 'AI usage is paused until your next reset or additional usage is added.',
+          code: 'usage_paused',
+          usageMode: 'paused',
         });
       }
 
@@ -4939,8 +6072,40 @@ export const agentModeController = {
         }
       });
 
-      // Use llmModel from request, session, or default
-      const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
+      // A request/session model is a preference, not authority. Resolve it
+      // against the current cost state immediately before dispatch so an old
+      // MCP client or stored session cannot bypass optimized mode.
+      modelPolicyDecision = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+        backupModel: llmBackupModel,
+        backupSource: llmBackupModel ? 'user' : null,
+      });
+      if (!modelPolicyDecision.effectiveModel) {
+        await chatbotDb.updateSessionLlmModel(
+          sessionId,
+          session.llmModel || agentModeService.default_model,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+        );
+        return res.status(429).json({
+          error: 'AI usage is paused until your next reset or additional usage is added.',
+          code: 'usage_paused',
+          usageMode: 'paused',
+          requestedModel: modelPolicyDecision.requestedModel,
+          effectiveModel: null,
+          backupModel: modelPolicyDecision.backupModel,
+          backupSource: modelPolicyDecision.backupSource,
+          modelSelection: modelPolicyDecision.modelSelection,
+          modelSelectionReason: modelPolicyDecision.reason,
+          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+        });
+      }
+      const modelToUse = modelPolicyDecision.effectiveModel;
+      await chatbotDb.updateSessionLlmModel(
+        sessionId,
+        modelToUse,
+        toStoredModelPolicyDecision(modelPolicyDecision),
+      );
 
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
@@ -4981,6 +6146,9 @@ export const agentModeController = {
 
       // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
       // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      // ENG-907: this is also the base of the cap itself (withGenerationTimeout starts
+      // in the same tick, just below), so it is threaded into the run as the anchor for
+      // the loop's own wall-clock budget.
       const turnStartMs = Date.now();
 
       // Capture the generation promise so the durable path can reattach to it if the
@@ -4996,7 +6164,11 @@ export const agentModeController = {
         isDelegatedAccessForMessage,
         undefined, // ishareSenderInfo
         answerAck, // ENG-396: make Emma name the chosen option in her reply
-        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
+        answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
+        turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
+        undefined, // publishAuthorizationOverride — interactive path resolves per turn
+        modelPolicyDecision.transientFallbackModel,
+        modelPolicyDecision
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -5088,6 +6260,33 @@ export const agentModeController = {
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
               return;
             }
+
+            // ENG-907: no images, but the turn may still have done real research before the
+            // cap fired — ENG-473 has already persisted it. The loop's own time budget tries
+            // to wrap up first, but it can only re-check between iterations, so a long tool
+            // call can leave too little time for the forced synthesis (measured live: budget
+            // fired with 27s left, synthesis still guillotined). This is the backstop that
+            // makes the outcome deterministic: acknowledge the saved work and invite
+            // "continue" instead of putting a red error on top of it. Still returns null —
+            // and so still 504s — when the turn genuinely produced nothing.
+            const salvagedWork = collectTurnWorkSince(timedOutSession?.messages, turnStartMs);
+            const partialWorkMsg = buildTimeoutPartialWorkMessage(salvagedWork);
+            if (partialWorkMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: partialWorkMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout partial-work message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_work' });
+              }
+              res.json({ content: partialWorkMsg, partialWorkDelivery: true });
+              return;
+            }
           } catch (continuationErr) {
             console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
           }
@@ -5150,7 +6349,17 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
+        ...(modelPolicyDecision ? {
+          requestedModel: modelPolicyDecision.requestedModel,
+          effectiveModel: modelPolicyDecision.effectiveModel,
+          backupModel: modelPolicyDecision.backupModel,
+          backupSource: modelPolicyDecision.backupSource,
+          modelSelection: modelPolicyDecision.modelSelection,
+          modelSelectionReason: modelPolicyDecision.reason,
+          usageMode: modelPolicyDecision.usageMode,
+          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+        } : {}),
       });
 
       // Terminal update is best-effort BY DESIGN: markRunTerminal retries once,
@@ -5212,21 +6421,35 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage, turnStartCalledFunctions);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: the fallback carries no outcome at all, just blanket retry
+          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
+          // the fixed string: a diagnosis message has already been judged on its own
+          // prose, and a truthful one must not collect a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
@@ -5413,6 +6636,37 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
       res.status(500).json({ error: 'Failed to get supported models' });
+    }
+  },
+
+  async getModelOptions(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const [usage, supportedModels] = await Promise.all([
+        getEffectiveLlmUsagePolicy(user.userId),
+        agentModeService.getSupportedModels(user.isAdmin === true),
+      ]);
+      const supported = new Set(supportedModels);
+      const optimizedModels = usage.policy
+        ? usage.policy.optimizedModelIds.filter((model) => supported.has(model))
+        : supportedModels;
+      const selectableModels = usage.mode.usageMode === 'optimized'
+        ? optimizedModels
+        : usage.mode.usageMode === 'paused'
+          ? []
+          : supportedModels;
+      res.json({
+        usageMode: usage.mode.usageMode,
+        canGenerate: usage.mode.admissionAllowed,
+        allModels: supportedModels,
+        selectableModels,
+        scheduleBackupModels: optimizedModels,
+        optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
+        usagePolicyVersion: usage.policy?.version || null,
+      });
+    } catch (error) {
+      console.error('AgentMode: Get model options error:', error);
+      res.status(500).json({ error: 'Failed to get model options' });
     }
   },
 
@@ -5795,6 +7049,9 @@ export const agentModeController = {
   async generateSharedResponse(req: Request, res: Response) {
     // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
     let sharedTurnStartMs = Date.now();
+    // ENG-971: see generateResponse — calledFunctions is session-cumulative, so the
+    // error path needs this turn's starting point to attribute successes correctly.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -5809,6 +7066,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
 
       // Check if conversable sharing is active and token matches
       if (!conversable) {
@@ -5865,10 +7123,36 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
-      // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
-      // This ensures anonymous users get the correct model from the session
+      // The anonymous caller cannot choose the model, but the owner's stored
+      // preference is still subject to the same current cost policy as every
+      // authenticated, scheduled, and MCP dispatch.
       const defaultModel = await agentModeService.getDefaultModel();
-      const modelToUse = session.llmModel || defaultModel;
+      const modelPolicyDecision = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: session.llmModel || defaultModel,
+      });
+      if (!modelPolicyDecision.effectiveModel) {
+        // Runtime always exposes this method. The guard preserves older
+        // controller test doubles that intentionally mock only their subject.
+        if (typeof chatbotDb.updateSessionLlmModel === 'function') {
+          await chatbotDb.updateSessionLlmModel(
+            session.sessionId,
+            session.llmModel || defaultModel,
+            toStoredModelPolicyDecision(modelPolicyDecision),
+          );
+        }
+        return res.status(429).json({
+          error: 'AI usage is paused for this shared session. Please contact the owner of this link.',
+        });
+      }
+      const modelToUse = modelPolicyDecision.effectiveModel;
+      if (typeof chatbotDb.updateSessionLlmModel === 'function') {
+        await chatbotDb.updateSessionLlmModel(
+          session.sessionId,
+          modelToUse,
+          toStoredModelPolicyDecision(modelPolicyDecision),
+        );
+      }
 
       // Use the same generateSessionResponse logic as the regular generateResponse,
       // wrapped in wall-clock timeout to guarantee lock release on hung generation.
@@ -5889,7 +7173,17 @@ export const agentModeController = {
           true, // isInteractiveShare - block admin tools for security
           undefined, // pageContext
           undefined, // isDelegatedAccess
-          ishareSenderInfo
+          ishareSenderInfo,
+          undefined, // answerAck
+          undefined, // answeredQuestionMeta
+          // ENG-907: this endpoint enforces the same whole-turn cap as the interactive
+          // one (withGenerationTimeout is armed on the next line), so hand the loop the
+          // deadline too — otherwise an ishare turn is guillotined with nothing to show
+          // for it, exactly as ENG-907 described.
+          sharedTurnStartMs,
+          undefined, // publishAuthorizationOverride — shared path has no schedule consent
+          modelPolicyDecision.transientFallbackModel,
+          modelPolicyDecision
         ),
         session.sessionId
       );
@@ -5954,6 +7248,24 @@ export const agentModeController = {
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
             return;
           }
+
+          // ENG-907: same backstop as the regular /generate path — a timed-out ishare turn
+          // that did real work reports it and invites "continue" rather than surfacing a
+          // bare timeout over research that is already saved in the thread.
+          const partialWorkMsg = buildTimeoutPartialWorkMessage(
+            collectTurnWorkSince(timedOutSession?.messages, sharedTurnStartMs),
+          );
+          if (partialWorkMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: partialWorkMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            res.json({ content: partialWorkMsg, partialWorkDelivery: true });
+            return;
+          }
         } catch (persistErr) {
           console.error('AgentMode: shared partial-media timeout continuation failed (falling back to error message):', persistErr);
         }
@@ -5963,21 +7275,33 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: see the matching comment in generateResponse — the fixed
+          // fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
@@ -6922,6 +8246,7 @@ export const agentModeController = {
   async createScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const {
         sessionId,
         scheduleName,
@@ -6935,6 +8260,7 @@ export const agentModeController = {
         emailNotifications,
         emailCampaignTaskId,
         llmModel,
+        llmBackupModel,
         runCount,
         variables,
         variableValues,
@@ -6987,6 +8313,10 @@ export const agentModeController = {
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
+      const scheduleBackup = await resolveScheduleBackup({
+        userId: user.userId,
+        requestedBackupModel: llmBackupModel,
+      });
 
       // Use provided nextRunTime or calculate default
       let scheduledNextRunTime: string;
@@ -7040,6 +8370,7 @@ export const agentModeController = {
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
         llmModel: llmModel || '', // Empty means "use default at runtime"
+        ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
         variableValues: {} as Record<string, string>,
@@ -7088,9 +8419,14 @@ export const agentModeController = {
       res.status(201).json({
         scheduleId,
         message: 'Scheduled chat created successfully',
-        nextRunTime: scheduledNextRunTime
+        nextRunTime: scheduledNextRunTime,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
+      }
       console.error('AgentMode: Create scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to create scheduled chat' });
     }
@@ -7120,6 +8456,14 @@ export const agentModeController = {
       // flag consecutive failures on the card without fetching full history.
       const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
         ...rest,
+        // Whether an EXPLICIT grant exists — not whether this schedule will publish.
+        // The two differ, and conflating them is the trap here: a legacy schedule
+        // reports false and still publishes, because the resolver treats a never-asked
+        // row as authorized under ENG-803's opt-out. Read `requirePublishApproval` for
+        // "will it publish"; read this only to decide whether there is a grant to
+        // revoke. Emitted as a present boolean rather than an absent key so a consumer
+        // never has to guess what "missing" meant.
+        autopublishAuthorized: rest.autopublishAuthorized === true,
         runHealth: computeScheduleRunHealth(runResults),
       }));
 
@@ -7134,6 +8478,7 @@ export const agentModeController = {
   async updateScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const {
         scheduleName,
@@ -7148,6 +8493,7 @@ export const agentModeController = {
         dailyDigest,
         emailCampaignTaskId,
         llmModel,
+        llmBackupModel,
         runCount,
         variables,
         variableValues,
@@ -7199,6 +8545,14 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      const requestedBackupWasProvided = llmBackupModel !== undefined;
+      const scheduleBackup = requestedBackupWasProvided
+        ? await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: llmBackupModel })
+        : {
+            llmBackupModel: (existingSchedule as any).llmBackupModel || '',
+            llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
+            llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
+          };
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
@@ -7227,14 +8581,23 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
-        // update that omits the field must never silently set or clear it.
-        requirePublishApproval: requirePublishApproval !== undefined
-          ? (requirePublishApproval === true)
-          : ((existingSchedule as any).requirePublishApproval || false),
+        // ENG-803/ENG-827 (Greptile): the publish opt-out is written ONLY when this
+        // request actually carries it. Copying it forward from `existingSchedule` is a
+        // read-modify-write, and this field decides whether an unattended run may post
+        // publicly: an owner who switches the hold ON between this handler's read and
+        // its write would have it silently overwritten back to OFF by an unrelated
+        // update — a rename or a cadence change re-enabling publishing they had just
+        // stopped. `updateSchedule` builds a PARTIAL SET expression, so omitting the
+        // key leaves the stored value untouched, which is the only race-free way to
+        // preserve it. Every other field here is last-writer-wins and recoverable;
+        // this one authorizes an irreversible public post, so it is not.
+        ...(requirePublishApproval !== undefined
+          ? { requirePublishApproval: requirePublishApproval === true }
+          : {}),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
         ...(isValidIanaTimeZone(timezone)
@@ -7328,13 +8691,32 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
-      await scheduleDb.updateSchedule(scheduleId, updates);
+      // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
+      // neither can be acknowledged without the other. See
+      // applyScheduleEditWithConsentNarrowing.
+      await applyScheduleEditWithConsentNarrowing(scheduleId, updates, existingSchedule);
 
       res.json({
         message: 'Scheduled chat updated successfully',
-        nextRunTime: scheduledNextRunTime
+        nextRunTime: scheduledNextRunTime,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      // ENG-827: consent moved on every attempt, so nothing was written. Say so instead
+      // of reporting a save that did not happen — the alternative is acknowledging an
+      // edit whose consent narrowing never landed.
+      if (error instanceof ScheduleConsentRaceError) {
+        console.warn(`AgentMode: ENG-827 schedule update abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule\'s publishing permission changed while you were saving, so nothing was ' +
+            'saved. Reopen the schedule to see its current settings, then apply your change again.',
+        });
+      }
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
+      }
       console.error('AgentMode: Update scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to update scheduled chat' });
     }
@@ -7344,6 +8726,7 @@ export const agentModeController = {
   async submitScheduledChatVariables(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const { variableValues, triggerRun } = req.body as { variableValues?: Record<string, string>; triggerRun?: boolean };
 
@@ -7507,6 +8890,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const nowIso = new Date().toISOString();
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
@@ -7629,6 +9015,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
         ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
@@ -7672,6 +9061,7 @@ export const agentModeController = {
   async testScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
 
       // Verify schedule exists and belongs to user
@@ -7746,6 +9136,138 @@ export const agentModeController = {
     }
   },
 
+
+  /**
+   * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+   *
+   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   *
+   * The setting itself is not writable from the generic update body or the MCP
+   * allowlist, because a model that could GRANT it would be manufacturing standing
+   * consent to post under the owner's name. Revoking is the opposite: it can only ever
+   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
+   * instruction — "stop auto-posting on this one") stop future unattended publishing
+   * without hunting through the schedule form.
+   *
+   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
+   * is REJECTED outright. There is no request shape that turns publishing on.
+   *
+   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
+   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
+   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
+   * visible, durable and reversible by the owner — a stray grant would be an
+   * irreversible public post — so the two directions do not deserve the same treatment.
+   */
+  async revokeScheduledChatPublishConsent(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { authorized } = req.body || {};
+
+      if (typeof authorized !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // GRANTING is the owner's decision and nobody else's. A delegated admin session
+      // acts as the customer everywhere else in this API, but it must not be able to
+      // hand out this one — the whole point is that a specific human accepted that
+      // posts go out unseen under their name. Revoking stays open to delegation: it
+      // only ever makes a schedule safer.
+      if (authorized && (req as any).delegateInfo?.isDelegated) {
+        return res.status(403).json({
+          error:
+            'Unattended publishing can only be enabled by the account owner themselves, not from a ' +
+            'delegated session. Ask them to turn on "Publish without my review" on the schedule.',
+        });
+      }
+
+      // Consent is bound to the tools the owner could see when they gave it, so a grant
+      // needs a designated publishing tool. Without one the scope is unknown, and an
+      // unknown scope would either authorize nothing (a silent no-op that looks like it
+      // worked) or everything (a mandate they never gave).
+      const approvedTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
+      if (authorized && approvedTools.length === 0) {
+        return res.status(400).json({
+          error:
+            'This schedule does not require a publishing tool, so there is nothing to authorize. ' +
+            'Add the publishing tool this schedule should use (e.g. post_on_connected_account) to its ' +
+            'required functions first — consent is recorded against the specific tool it covers.',
+        });
+      }
+
+      try {
+        await scheduleDb.updateSchedule(
+          scheduleId,
+          {
+            autopublishAuthorized: authorized,
+            autopublishAuthorizedTools: authorized ? approvedTools : [],
+            autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
+            autopublishAuthorizedBy: authorized ? user.userId : null,
+            updatedAt: new Date().toISOString(),
+          } as any,
+          // ENG-827 (Greptile): a GRANT writes a scope DERIVED from the required tools
+          // read a few lines up. If a concurrent edit changes those tools in between,
+          // an unconditional write records consent for a tool set the owner never saw.
+          // Bind the write to the read: same tools, or no grant.
+          //
+          // The consent field itself is part of that read and is bound too. Without it a
+          // grant that lost the race still lands: the owner revokes, the revoke completes,
+          // and this older grant then overwrites it — permission they withdrew, restored
+          // by a request that predates the withdrawal. `undefined` compiles to
+          // `attribute_not_exists`, so a grant derived from a never-asked row lands only
+          // while that row is still never-asked.
+          //
+          // A REVOKE is not conditioned. It narrows permission no matter what else
+          // changed, and making it fail on a concurrent edit would be a refusal to
+          // take away a permission — the one direction that must always be available.
+          authorized
+            ? {
+                requiredFunctionCalls: schedule.requiredFunctionCalls,
+                autopublishAuthorized: schedule.autopublishAuthorized,
+              }
+            : undefined
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
+          console.warn(
+            `AgentMode: ENG-827 publish consent grant for schedule ${scheduleId} refused — its required ` +
+            'tools or its consent state changed during the request.'
+          );
+          return res.status(409).json({
+            error:
+              'This schedule changed while you were authorizing it, so nothing was saved — either its ' +
+              'required functions moved, so the authorization would have covered a different set of tools ' +
+              'than the one you approved, or its publishing permission was changed from somewhere else. ' +
+              'Reopen the schedule to see where it stands, then turn on "Publish without my review" again ' +
+              'if it still looks right.',
+          });
+        }
+        throw writeError;
+      }
+
+      console.log(
+        `AgentMode: ENG-827 publish consent ${authorized ? 'GRANTED' : 'REVOKED'} for schedule ` +
+        `${scheduleId} by user ${user.userId}${authorized ? ` (tools: ${approvedTools.join(', ')})` : ''}.`
+      );
+
+      res.json({
+        autopublishAuthorized: authorized,
+        autopublishAuthorizedTools: authorized ? approvedTools : [],
+        message: authorized
+          ? 'This schedule will now publish to your connected accounts without showing you the content first.'
+          : 'This schedule will now draft content and tell you what is waiting, instead of publishing.',
+      });
+    } catch (error) {
+      console.error('AgentMode: Set scheduled chat publish consent error:', error);
+      res.status(500).json({ error: 'Failed to update publish consent' });
+    }
+  },
+
   async toggleScheduledChatStatus(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -7755,6 +9277,7 @@ export const agentModeController = {
       if (!status || !['active', 'paused'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
       }
+      if (status === 'active' && await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
 
       // Verify schedule exists and belongs to user
       const schedule = await scheduleDb.getScheduleById(scheduleId);
@@ -9534,12 +11057,13 @@ export const agentModeController = {
   createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { templateId } = req.params;
       const {
         scheduleName, nextRunTime, scheduleFrequency,
         frequencyIntervalDays: overrideInterval,
         emailNotifications: overrideEmails,
-        variableValues, runCount, llmModel: overrideModel,
+        variableValues, runCount, llmModel: overrideModel, llmBackupModel: overrideBackupModel,
       } = req.body;
 
       const template = await scheduleTemplateDb.getTemplateById(templateId);
@@ -9593,6 +11117,10 @@ export const agentModeController = {
         : baseEmails;
 
       const scheduleId = uuidv4();
+      const scheduleBackup = await resolveScheduleBackup({
+        userId: user.userId,
+        requestedBackupModel: overrideBackupModel,
+      });
       const scheduledChat: any = {
         scheduleId,
         taskId: 'global',
@@ -9614,6 +11142,7 @@ export const agentModeController = {
         sessionId: null,
         type: 'scheduled_chat',
         llmModel: overrideModel || template.llmModel || '',
+        ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,
         variableValues: normalizedVariableValues,
@@ -9630,8 +11159,13 @@ export const agentModeController = {
         message: 'Scheduled chat created from template successfully',
         nextRunTime: scheduledNextRunTime,
         templateId,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
+      }
       console.error('AgentMode: Create schedule from template error:', error);
       res.status(500).json({ error: 'Failed to create schedule from template' });
     }

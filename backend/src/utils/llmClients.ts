@@ -57,7 +57,23 @@ export function normalizeOpenAIUsage(usage: any): NormalizedUsage {
   return {
     inputTokens: usage?.prompt_tokens || 0,
     outputTokens: usage?.completion_tokens || 0,
-    cacheReadTokens: usage?.prompt_tokens_details?.cached_tokens || 0,
+    // ENG-1134: the Anthropic-style fields are read as a fallback because the
+    // Bedrock Converse wrapper answers in OpenAI shape while carrying Anthropic's
+    // cache counters — so it dispatches HERE, not to normalizeAnthropicUsage.
+    // Reading only `prompt_tokens_details.cached_tokens` recorded its cache as
+    // zero, and cache is the bulk of Bedrock traffic. Real OpenAI responses do
+    // not carry these keys, so the fallback is inert for them.
+    cacheReadTokens:
+      usage?.prompt_tokens_details?.cached_tokens || usage?.cache_read_input_tokens || 0,
+    // Emitted only when actually present, so a genuine OpenAI response yields the
+    // exact same object it always did — the fallback adds nothing for callers
+    // that never had cache writes to begin with.
+    ...(usage?.cache_creation_input_tokens
+      ? { cacheWriteTokens: usage.cache_creation_input_tokens }
+      : {}),
+    ...(normalizeAnthropicCacheCreation(usage?.cache_creation)
+      ? { cacheWriteByTtl: normalizeAnthropicCacheCreation(usage?.cache_creation) }
+      : {}),
   };
 }
 

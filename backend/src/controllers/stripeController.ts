@@ -4,6 +4,7 @@ import { userDb } from '../services/db';
 import {
   stripeService,
   handleCheckoutSessionCompleted,
+  handleLlmUsageTopUpCheckoutCompleted,
   handleSubscriptionUpdated,
   handleSubscriptionDeleted,
   findUserByStripeCustomerId,
@@ -86,8 +87,17 @@ export async function handleWebhook(req: Request, res: Response) {
   try {
     switch (event.type) {
       case 'checkout.session.completed':
-        await handleCheckoutSessionCompleted(event.data.object);
-        await recordSubscriptionEvent(event.data.object, 'subscription_created');
+        if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
+          await handleLlmUsageTopUpCheckoutCompleted(event.data.object);
+        } else {
+          await handleCheckoutSessionCompleted(event.data.object);
+          await recordSubscriptionEvent(event.data.object, 'subscription_created');
+        }
+        break;
+      case 'checkout.session.async_payment_succeeded':
+        if (event.data.object?.metadata?.purchaseType === 'llm_usage_top_up') {
+          await handleLlmUsageTopUpCheckoutCompleted(event.data.object);
+        }
         break;
       // Handle subs created OUTSIDE Checkout (admin provisioning, API,
       // reconciliation). Pass { isNew: true } so the stale-webhook guard
