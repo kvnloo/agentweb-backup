@@ -693,7 +693,41 @@ PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRI
 // Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean): string {
+// ENG-827: `publishAuthorized` is the machine-readable per-schedule signal that
+// resolves the publish-gate ambiguity. Social tools (post_on_connected_account,
+// etc.) carry a hard "get explicit approval before publishing" instruction; in an
+// unattended run there is no human to approve, so without a concrete authorization
+// signal the model cannot tell an owner-authorized autopublish from an
+// unauthorized one and defaults to refusing — burning the run while the
+// required-tool checker nudges it in a loop (sessions 1b28ae36 / a924892d, ~21
+// refusal cycles and $5.86 for one unpublished draft).
+//
+// The caller derives this via resolveSchedulePublishAuthorization(): from the owner's
+// explicit, tool-scoped grant where they have given one, and otherwise from the
+// opt-out ENG-803 shipped — authorized unless they set `requirePublishApproval`,
+// scoped to the publish tools listed in `requiredFunctionCalls`. See that helper for
+// why absence of the grant field is deferral rather than refusal, and why
+// `fullAutonomy` is not a publish-consent signal in either mode.
+// `authorizedPublishTools` names those exact tools so the directive authorizes
+// precisely what the owner asked for and nothing more.
+//
+// The signal is deliberately TRI-STATE, not a boolean:
+//   'authorized' → publish; the owner's standing configuration is the approval.
+//   'withheld'   → do not publish; draft and notify once. The safe default.
+//   'unknown'    → we could not read the schedule, so emit NO publish block at all.
+// 'unknown' exists because the prompt is re-assembled on every verification attempt
+// and re-reads the schedule each time, while the required-function checker decides
+// once from its own start-of-run snapshot. A single transient read failure must not
+// make the prompt FORBID a tool the checker still requires — that manufactures
+// exactly the contradiction this ticket is about (Greptile P1). Staying silent on an
+// unreadable schedule leaves the model's own cautious default in charge, which is
+// safe, instead of asserting a prohibition we cannot actually justify.
+export function getUnattendedExecutionDirective(
+  sessionType?: string,
+  isAdmin?: boolean,
+  publishAuthorization?: 'authorized' | 'withheld' | 'unknown',
+  authorizedPublishTools?: string[]
+): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -738,7 +772,22 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.`;
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
+  ? ''
+  : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
+  ? `
+
+PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
+- The owner explicitly authorized unattended publishing for this schedule and approved ${authorizedPublishTools.join(' and ')} for it. That standing consent IS the human approval — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- The authorization covers ONLY ${authorizedPublishTools.join(' and ')}. Any OTHER publishing tool is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
+- Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
+  : `
+
+PUBLISH AUTHORIZATION — this schedule is NOT pre-authorized to publish (CRITICAL):
+- No standing approval exists to publish to a live connected account in this unattended run, and no human is present to give one. Do NOT call a live-publishing tool (e.g. post_on_connected_account) — publishing is irreversible and the owner has not turned on "Publish without my review" for this schedule.
+- Instead, fully draft the content, save it to the knowledge base, and state ONCE — clearly — that it is drafted and awaiting the owner's approval. That draft-and-notify outcome is the correct, COMPLETE terminal state for a non-authorized publishing run; it is NOT unfinished work and must not be treated as a failure.
+- Do NOT repeatedly re-attempt or re-explain the withheld publish across turns — one clear "drafted, pending approval" statement ends the run.`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

@@ -55,6 +55,20 @@ export interface AccountMetrics {
   [key: string]: any;
 }
 
+/**
+ * ENG-827: a last-moment consent re-check, handed down from the tool dispatcher.
+ *
+ * Returns a refusal to abandon the publish, or null to proceed. Adapters must call it
+ * IMMEDIATELY BEFORE the irreversible request — after any media upload, not before.
+ * The dispatcher's own check happens before `createPost` is entered, and the work
+ * inside it takes minutes for a YouTube video, so a revocation landing during the
+ * upload would otherwise be noticed only once the post is already public.
+ *
+ * Optional throughout: an interactive session or a direct service call passes nothing
+ * and every adapter proceeds exactly as before.
+ */
+export type AssertStillAuthorized = () => Promise<{ success: false; error: string } | null>;
+
 export interface SocialPlatformAdapter {
   /**
    * Post content to the social platform
@@ -62,8 +76,9 @@ export interface SocialPlatformAdapter {
    * @param content - The content to post
    * @param mediaUrls - Optional media URLs to attach
    * @param userId - Optional user ID for token refresh capability
+   * @param assertStillAuthorized - ENG-827 re-check, called just before the post is committed
    */
-  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult>;
+  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**
    * Create a comment on a post
@@ -72,7 +87,7 @@ export interface SocialPlatformAdapter {
    * @param commentText - The comment text
    * @param userId - Optional user ID for token refresh capability
    */
-  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult>;
+  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**
    * Repost (reshare) an existing post
@@ -81,7 +96,7 @@ export interface SocialPlatformAdapter {
    * @param commentary - Optional text to add alongside the repost
    * @param userId - Optional user ID for token refresh capability
    */
-  createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult>;
+  createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**
    * React to a post (like, praise, etc.)

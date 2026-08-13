@@ -3,6 +3,8 @@ import { userDb, orgDb } from "./db";
 import { CUSTOMER_PORTAL_PAGES } from "./customerPortalPages";
 import { skillService } from "./skillService";
 import { hasOwnLiveSubscription } from "./orgAuthz";
+import type { LlmUsagePolicy } from "./llmUsagePolicyService";
+import type { LlmUsageTopUpConfig } from './llmUsageTopUpService';
 
 export interface SubscriptionType {
   name: string;
@@ -15,6 +17,8 @@ export interface SubscriptionType {
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
+  llmUsagePolicy?: LlmUsagePolicy; // Versioned admin-managed full-choice/optimized/paused policy
+  llmUsageTopUp?: LlmUsageTopUpConfig; // Admin-priced packages that extend this month's hard ceiling
 }
 
 // Default pages that are always available regardless of subscription type

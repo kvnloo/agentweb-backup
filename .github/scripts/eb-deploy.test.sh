@@ -38,6 +38,11 @@ install_mock_aws() {
 MOCK_DIR="${EB_MOCK_DIR:?EB_MOCK_DIR must be set}"
 
 operation="${2:-}"
+all_args="$*"
+
+# Preserve the exact AWS operation order so lifecycle-hook tests can prove the
+# hook is installed before update-environment starts terminating old instances.
+printf '%s\n' "$operation" >>"${MOCK_DIR}/operations"
 
 query=''
 while [ "$#" -gt 0 ]; do
@@ -155,6 +160,10 @@ case "$operation" in
     ;;
 
   describe-environment-resources)
+    if printf '%s' "$query" | grep -qF 'AutoScalingGroups'; then
+      cat "${MOCK_DIR}/asg_name" 2>/dev/null || printf 'awseb-e-test-stack-AWSEBAutoScalingGroup-test\n'
+      exit 0
+    fi
     # Fixture `lb_arns`: tab/newline separated ALB ARNs, NONE, or "ERROR|<msg>".
     if [ -f "${MOCK_DIR}/lb_arns" ]; then
       first=$(head -n 1 "${MOCK_DIR}/lb_arns")
@@ -170,6 +179,18 @@ case "$operation" in
     else
       printf 'None\n'
     fi
+    exit 0
+    ;;
+
+  put-lifecycle-hook)
+    code=0
+    [ -f "${MOCK_DIR}/put_lifecycle_hook_exit" ] && code=$(cat "${MOCK_DIR}/put_lifecycle_hook_exit")
+    if [ "$code" != "0" ]; then
+      cat "${MOCK_DIR}/put_lifecycle_hook_error" 2>/dev/null >&2 || \
+        printf 'mock aws: simulated put-lifecycle-hook failure\n' >&2
+      exit "$code"
+    fi
+    printf '%s\n' "$all_args" >"${MOCK_DIR}/put_lifecycle_hook_args"
     exit 0
     ;;
 
@@ -907,6 +928,71 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
   EB_POLL_INTERVAL_SECONDS='1'
 check 'ENG-1127: a terminal pattern still wins over a co-occurring abort' 1 \
   'Elastic Beanstalk REJECTED this update'
+
+# ---------------------------------------------------------------------------
+
+# ENG-764 — every deploy must recreate the termination lifecycle hook before
+# update-environment can retire an old instance. A one-time console hook is
+# lost when EB replaces its ASG, silently reviving deploy-killed scheduled runs.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(grep -c '^put-lifecycle-hook$' "$M/operations" 2>/dev/null || true)" = 1 ]; then
+  pass 'ENG-764: the deploy installs exactly one termination lifecycle hook'
+else
+  printf '  FAIL ENG-764: the deploy installs exactly one termination lifecycle hook\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+hook_line=$(grep -n '^put-lifecycle-hook$' "$M/operations" | cut -d: -f1 || true)
+update_line=$(grep -n '^update-environment$' "$M/operations" | head -1 | cut -d: -f1 || true)
+if [ -n "$hook_line" ] && [ -n "$update_line" ] && [ "$hook_line" -lt "$update_line" ]; then
+  pass 'ENG-764: the lifecycle hook is installed before update-environment'
+else
+  printf '  FAIL ENG-764: lifecycle hook must precede update-environment (hook=%s update=%s)\n' \
+    "${hook_line:-missing}" "${update_line:-missing}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if grep -q -- '--lifecycle-hook-name agentweb-drain-before-terminate' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--heartbeat-timeout 900' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--default-result CONTINUE' "$M/put_lifecycle_hook_args" 2>/dev/null; then
+  pass 'ENG-764: the installed hook keeps the reviewed name and bounded fail-open settings'
+else
+  printf '  FAIL ENG-764: hook arguments do not match the reviewed safety contract\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# Passing control in the red phase: the existing deploy behavior is unchanged
+# until the new hook assertions above are implemented.
+check 'ENG-764 control: the underlying deploy still reaches success' 0 'SUCCESS: environment'
+
+M=$(new_mock_dir)
+printf '255\n' >"$M/put_lifecycle_hook_exit"
+printf 'AccessDenied: not authorized to perform autoscaling:PutLifecycleHook\n' \
+  >"$M/put_lifecycle_hook_error"
+run_deploy "$M"
+check 'ENG-764: a denied lifecycle-hook install fails the deploy closed' 1 \
+  'refusing to start a deploy that could cut off scheduled work'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if ! grep -q '^update-environment$' "$M/operations"; then
+  pass 'ENG-764: hook failure happens before update-environment can terminate an instance'
+else
+  printf '  FAIL ENG-764: update-environment ran after the hook failed\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+M=$(new_mock_dir)
+printf 'None\n' >"$M/asg_name"
+run_deploy "$M"
+check 'ENG-764: an environment with no ASG fails loudly' 1 \
+  'returned no Auto Scaling group'
 
 # ---------------------------------------------------------------------------
 
