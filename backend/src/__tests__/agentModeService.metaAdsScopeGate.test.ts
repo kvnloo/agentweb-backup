@@ -50,11 +50,6 @@ jest.mock('../services/connectedAccountsDb', () => {
   };
 });
 
-const mockNotifyMetaAdsScopeLost = jest.fn().mockResolvedValue(true);
-jest.mock('../services/metaAdsScopeAlertService', () => ({
-  notifyMetaAdsScopeLost: (...args: any[]) => mockNotifyMetaAdsScopeLost(...args),
-}));
-
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
@@ -93,7 +88,6 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
     mockIsTokenValid.mockResolvedValue(true);
-    mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
   });
 
   // ── AC2 + AC3: fail closed BEFORE calling Meta when we know scopes are missing ──
@@ -455,15 +449,13 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     });
   });
   /**
-   * ENG-1158 — the agent paths deliberately do NOT email the owner.
+   * ENG-1158 — these paths detect and RECORD; they do not notify.
    *
-   * The 12-hourly capability sweep is the single notifier: it probes every Meta
-   * ad account and alerts on exactly the accounts these paths record, so
-   * notifying here as well would only buy latency — at the price of two
-   * processes racing to email the same owner for one episode, which no
-   * in-process guard can dedupe (Greptile). One sender, one process.
+   * Owner email is out of scope for this PR and tracked separately. What these
+   * paths persist is what the Settings row and the agent tool read, so the
+   * detection still reaches the owner — through the UI rather than the inbox.
    */
-  describe('notification is left to the capability sweep (ENG-1158)', () => {
+  describe('detection is recorded for the surfaces to report (ENG-1158)', () => {
     const legacyUser = {
       id: 'user1',
       connected_accounts: [
@@ -471,18 +463,18 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       ],
     };
 
-    it('does not email when Meta refuses during a real run', async () => {
+    it('records rather than notifies when Meta refuses during a real run', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
 
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
     });
 
-    it('still records the revocation, which is what the sweep alerts on', async () => {
-      // The handoff only works because this path persists the state the sweep
-      // reads: detection here, notification there.
+    it('records the revocation, which is what the surfaces read', async () => {
+      // The handoff only works because this path persists the state the
+      // Settings row and the agent tool read.
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
 
@@ -494,7 +486,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(updates.granted_scopes).not.toContain('ads_read');
     });
 
-    it('does not email when the pre-flight gate refuses a latched account', async () => {
+    it('writes nothing when the pre-flight gate refuses a latched account', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         id: 'user1',
         connected_accounts: [
@@ -504,13 +496,12 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
 
       const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
 
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
       // ...and the caller still gets the actionable error.
       expect(err.isMetaAdsScopeError).toBe(true);
     });
 
-    it('surfaces the re-consent error unchanged by the removal of alerting', async () => {
+    it('surfaces the re-consent error unchanged', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
 

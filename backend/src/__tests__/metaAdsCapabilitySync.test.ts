@@ -43,11 +43,6 @@ jest.mock('../services/connectedAccountsDb', () => {
   };
 });
 
-const mockNotifyMetaAdsScopeLost = jest.fn().mockResolvedValue(true);
-jest.mock('../services/metaAdsScopeAlertService', () => ({
-  notifyMetaAdsScopeLost: (...args: any[]) => mockNotifyMetaAdsScopeLost(...args),
-}));
-
 import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
 import { getMetaAdsScopeState } from '../utils/metaAdsScope';
 
@@ -75,7 +70,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
-    mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
   });
 
   describe('recovery — the owner re-granted the permission outside our OAuth flow', () => {
@@ -88,7 +82,7 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(result.outcome).toBe('recovered');
       const [, , , updates, options] = mockUpdateAccountConfig.mock.calls[0];
       expect(options.unset).toEqual(
-        expect.arrayContaining(['ads_scope_revoked_at', 'ads_scope_alerted_at'])
+        expect.arrayContaining(['ads_scope_revoked_at', 'granted_scopes'])
       );
       // Nothing is asserted about the grant itself: we proved the read works,
       // not what the user granted. Writing an ads scope here would fabricate
@@ -127,7 +121,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       const account = metaAccount({
         granted_scopes: ['pages_show_list', 'pages_read_engagement', 'public_profile'],
         ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
-        ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
       });
 
       const result = await syncMetaAdsCapability(account, 'user1');
@@ -176,7 +169,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.outcome).toBe('unchanged');
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
     });
   });
 
@@ -198,7 +190,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('suspected');
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
       const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
       expect(typeof updates.ads_scope_denied_seen_at).toBe('string');
       expect(updates.granted_scopes).toBeUndefined();
@@ -217,7 +208,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('revoked');
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
     });
 
@@ -237,49 +227,18 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
     });
 
-    it('acts immediately when the refusal is already on record', async () => {
-      // An account the agent path already caught does not need re-confirming.
+    it('is a no-op when the refusal is already on record', async () => {
+      // An account the agent path already caught is already reported as
+      // degraded by every surface; there is nothing left to record.
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
 
       const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
 
-      expect(result.outcome).toBe('revoked');
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+      expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
   });
 
-  describe('alert budget', () => {
-    it('still records the revocation when the alert budget is spent', async () => {
-      // Protection must not depend on there being room to send mail.
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      const account = latchedAccount();
-
-      const result = await syncMetaAdsCapability(account, 'user1', { allowAlert: false });
-
-      expect(result.outcome).toBe('revoked');
-      expect(result.alerted).toBe(false);
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
-      expect(getMetaAdsScopeState(account.config)).toBe('missing');
-      expect(account.config.ads_scope_alerted_at).toBeUndefined();
-    });
-
-    it('leaves the notice unrecorded so a later sweep can still send it', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      const account = latchedAccount();
-
-      await syncMetaAdsCapability(account, 'user1', { allowAlert: false });
-
-      expect(account.config.ads_scope_alerted_at).toBeUndefined();
-    });
-
-    it('reports that it alerted when the budget allows', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-
-      const result = await syncMetaAdsCapability(latchedAccount(), 'user1', { allowAlert: true });
-
-      expect(result.alerted).toBe(true);
-    });
-  });
 
   describe('proactive detection — scope lost with no run to notice it', () => {
     it('records the revocation and alerts the owner', async () => {
@@ -301,9 +260,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(typeof updates.ads_scope_revoked_at).toBe('string');
       // The grant must be narrowed too, or the revocation is inert — see below.
       expect(updates.granted_scopes).toEqual(['pages_show_list']);
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
-        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
-      );
     });
 
     /**
@@ -325,107 +281,9 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
     });
 
-    it('alerts the owner of an account latched before any alert existed', async () => {
-      // Already revoked, never told. The sweep is the only thing that reaches
-      // this owner if their schedule is paused.
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
 
-      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
 
-      expect(result.outcome).toBe('revoked');
-      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
-    });
 
-    it('does not alert twice for the same outage', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-
-      const result = await syncMetaAdsCapability(
-        metaAccount({
-          granted_scopes: [],
-          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
-          ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
-        }),
-        'user1'
-      );
-
-      expect(result.outcome).toBe('unchanged');
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
-      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-    });
-
-    /**
-     * The marker is claimed before sending so a mail failure cannot become a
-     * twice-daily loop. But keeping it when nothing was delivered would record
-     * the owner as told when they never were, and every later run trusts it —
-     * so the claim only stands if the notice actually went out (Greptile P1).
-     */
-    it('records no notice when nothing was delivered, so a later run retries', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
-      const account = latchedAccount();
-
-      const result = await syncMetaAdsCapability(account, 'user1');
-
-      expect(result.alerted).toBe(false);
-      expect(account.config.ads_scope_alerted_at).toBeUndefined();
-      // No write ever carries the marker — there is nothing to retract, so no
-      // second failure can leave a permanent false acknowledgement.
-      for (const call of mockUpdateAccountConfig.mock.calls) {
-        expect(call[3]?.ads_scope_alerted_at).toBeUndefined();
-      }
-      // The revocation itself stands — protection is not undone by a mail failure.
-      expect(getMetaAdsScopeState(account.config)).toBe('missing');
-    });
-
-    it('never records the notice in the same write as the revocation', async () => {
-      // The revocation must land whatever happens to the mail; coupling them is
-      // what created the acknowledge-then-retract problem.
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
-
-      await syncMetaAdsCapability(latchedAccount(), 'user1');
-
-      const revocationWrite = mockUpdateAccountConfig.mock.calls[0][3];
-      expect(typeof revocationWrite.ads_scope_revoked_at).toBe('string');
-      expect(revocationWrite.ads_scope_alerted_at).toBeUndefined();
-    });
-
-    it('still reports success when the notice went out but could not be recorded', async () => {
-      // Bounded repetition (a later sweep tells them again) beats silence.
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
-      mockUpdateAccountConfig
-        .mockResolvedValueOnce(undefined)
-        .mockRejectedValueOnce(new Error('dynamo unavailable'));
-
-      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
-
-      expect(result.outcome).toBe('revoked');
-      expect(result.alerted).toBe(true);
-    });
-
-    it('keeps the notice when it was delivered', async () => {
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
-      const account = latchedAccount();
-
-      const result = await syncMetaAdsCapability(account, 'user1');
-
-      expect(result.alerted).toBe(true);
-      expect(typeof account.config.ads_scope_alerted_at).toBe('string');
-    });
-
-    it('does not email when the notice could not be recorded', async () => {
-      // Without a durable marker nothing stops the next sweep emailing again —
-      // and this one runs every 12 hours, forever.
-      mockProbeAdsAccountAccess.mockResolvedValue('denied');
-      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
-
-      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
-
-      expect(result.outcome).toBe('error');
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
-    });
   });
 
   describe('never acts on absence of proof', () => {
@@ -437,7 +295,6 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.outcome).toBe('undetermined');
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
     });
 
     it('does not clear a revocation when access cannot be determined', async () => {

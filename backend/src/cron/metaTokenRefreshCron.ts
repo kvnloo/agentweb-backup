@@ -18,7 +18,9 @@
  * settings page, and reporting silently returns nothing. This is the only place
  * that both notices it without waiting for a run to trip over it, and — just as
  * importantly — notices when the permission comes BACK, retracting a refusal
- * that would otherwise outlive the problem it described.
+ * that would otherwise outlive the problem it described. What it records is what
+ * the Settings row and the agent tool report; emailing the owner is deliberately
+ * out of scope here and tracked separately.
  *
  * Registered in server.ts to run every 12 hours.
  */
@@ -30,27 +32,16 @@ import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
 
 const TAG = '[metaTokenRefreshCron]';
 
-/**
- * Most emails one sweep may send about lost Ads permissions.
- *
- * A ceiling, not a target: in the observed population only a single account is
- * in this state, so this should never bind. It exists so that a Meta-side change
- * in refusal behaviour cannot turn one sweep into a mass mailing.
- */
-export const MAX_ADS_SCOPE_ALERTS_PER_SWEEP = 5;
-
 export interface MetaTokenRefreshCronSummary {
   scannedUsers: number;
   metaAccounts: number;
   dueForRefresh: number;
   refreshed: number;
   failed: number;
-  /** Accounts found to have lost their Ads permission this sweep (owner notified). */
+  /** Accounts confirmed to have lost their Ads permission this sweep. */
   adsScopeRevoked: number;
   /** Accounts refused once, recorded as suspected and awaiting confirmation next sweep. */
   adsScopeSuspected: number;
-  /** Revocations recorded without an email because this sweep's alert budget was spent. */
-  adsScopeAlertsSuppressed: number;
   /** Accounts whose Ads permission came back, un-refusing them. */
   adsScopeRecovered: number;
 }
@@ -70,15 +61,7 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
     adsScopeRevoked: 0,
     adsScopeRecovered: 0,
     adsScopeSuspected: 0,
-    adsScopeAlertsSuppressed: 0,
   };
-
-  // Bounds the blast radius of a Meta-side change that made many accounts look
-  // denied at once: a bug in one sweep can cost at most this many emails, not
-  // one per customer. Revocations are still recorded past the cap — only the
-  // mail is withheld, and the owners are told on a later run. Not silent: the
-  // count is logged and returned.
-  let alertsSent = 0;
 
   let users: any[];
   try {
@@ -109,14 +92,8 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
       // just as long. Runs before the refresh so a recovery is visible even if
       // the token exchange then fails.
       try {
-        const capability = await syncMetaAdsCapability(account, user.userId, {
-          allowAlert: alertsSent < MAX_ADS_SCOPE_ALERTS_PER_SWEEP,
-        });
-        if (capability.outcome === 'revoked') {
-          summary.adsScopeRevoked++;
-          if (capability.alerted) alertsSent++;
-          else summary.adsScopeAlertsSuppressed++;
-        }
+        const capability = await syncMetaAdsCapability(account, user.userId);
+        if (capability.outcome === 'revoked') summary.adsScopeRevoked++;
         if (capability.outcome === 'recovered') summary.adsScopeRecovered++;
         if (capability.outcome === 'suspected') summary.adsScopeSuspected++;
       } catch (error) {
@@ -147,7 +124,7 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
     `${TAG} Run complete — users=${summary.scannedUsers} metaAccounts=${summary.metaAccounts} ` +
       `due=${summary.dueForRefresh} refreshed=${summary.refreshed} failed=${summary.failed} ` +
       `adsScopeRevoked=${summary.adsScopeRevoked} adsScopeRecovered=${summary.adsScopeRecovered} ` +
-      `adsScopeSuspected=${summary.adsScopeSuspected} adsScopeAlertsSuppressed=${summary.adsScopeAlertsSuppressed}`
+      `adsScopeSuspected=${summary.adsScopeSuspected}`
   );
   return summary;
 }

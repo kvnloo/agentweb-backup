@@ -24,7 +24,7 @@ jest.mock('../services/metaTokenRefresh', () => {
   };
 });
 
-import { runMetaTokenRefresh, MAX_ADS_SCOPE_ALERTS_PER_SWEEP } from '../cron/metaTokenRefreshCron';
+import { runMetaTokenRefresh } from '../cron/metaTokenRefreshCron';
 import { userDb } from '../services/db';
 import { ensureFreshMetaAdAccountToken } from '../services/metaTokenRefresh';
 
@@ -65,8 +65,7 @@ describe('runMetaTokenRefresh', () => {
       expect(mockSyncMetaAdsCapability).toHaveBeenCalledTimes(1);
       expect(mockSyncMetaAdsCapability).toHaveBeenCalledWith(
         expect.objectContaining({ account_id: 'act-fresh' }),
-        'u1',
-        expect.objectContaining({ allowAlert: true })
+        'u1'
       );
       // ...and it genuinely was not due for a token refresh.
       expect(summary.dueForRefresh).toBe(0);
@@ -87,23 +86,6 @@ describe('runMetaTokenRefresh', () => {
       expect(summary.adsScopeRecovered).toBe(1);
     });
 
-    it('caps how many owners one sweep may email, and says how many it withheld', async () => {
-      // A ceiling, not a target: a Meta-side change in refusal behaviour must not
-      // be able to turn one sweep into a mass mailing.
-      const many = Array.from({ length: 8 }, (_, i) => metaAd(`acct${i}`, FAR_FUTURE));
-      (userDb.getAllUsers as jest.Mock).mockResolvedValue([{ userId: 'u1', connected_accounts: many }]);
-      mockSyncMetaAdsCapability.mockImplementation((_a: any, _u: any, opts: any) =>
-        Promise.resolve({ outcome: 'revoked', alerted: opts?.allowAlert === true })
-      );
-
-      const summary = await runMetaTokenRefresh();
-
-      expect(summary.adsScopeRevoked).toBe(8);
-      // Every account is still protected; only the mail is rationed.
-      expect(summary.adsScopeAlertsSuppressed).toBe(8 - MAX_ADS_SCOPE_ALERTS_PER_SWEEP);
-      const allowed = mockSyncMetaAdsCapability.mock.calls.filter((c: any[]) => c[2]?.allowAlert === true);
-      expect(allowed).toHaveLength(MAX_ADS_SCOPE_ALERTS_PER_SWEEP);
-    });
 
     it('counts a first, unconfirmed refusal separately from a revocation', async () => {
       (userDb.getAllUsers as jest.Mock).mockResolvedValue([

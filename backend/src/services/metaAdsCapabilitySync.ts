@@ -55,7 +55,7 @@ export type MetaAdsCapabilitySyncOutcome =
   | 'unchanged'
   /** First refusal seen. Recorded as a suspicion only — nothing user-visible changed. */
   | 'suspected'
-  /** Meta confirms the ads scope is gone; recorded, and the owner told once. */
+  /** Meta confirms the ads scope is gone; recorded so every surface reports it. */
   | 'revoked'
   /** Meta confirms the ads scope is back; the stale refusal has been retracted. */
   | 'recovered'
@@ -64,29 +64,7 @@ export type MetaAdsCapabilitySyncOutcome =
 
 export interface MetaAdsCapabilitySyncResult {
   outcome: MetaAdsCapabilitySyncOutcome;
-  /**
-   * Whether this pass was permitted to notify the owner, and attempted it.
-   *
-   * Not the same as "an email arrived": the alert service can still decline
-   * (non-production, no address on file, a duplicate within its guard window).
-   * False here means specifically that the sweep's alert budget was spent, which
-   * is what the caller needs in order to count and report withheld notices.
-   */
-  alerted?: boolean;
   error?: string;
-}
-
-export interface MetaAdsCapabilitySyncOptions {
-  /**
-   * May this account's owner be emailed on this pass? Defaults to true.
-   *
-   * The sweep passes false once it has spent its per-run alert budget, which
-   * bounds the blast radius if a Meta-side change ever made many accounts look
-   * denied at once. Recording the revocation is NOT gated on this — protection
-   * must never depend on there being room to send mail — and the notice is left
-   * unrecorded so a later sweep can still deliver it.
-   */
-  allowAlert?: boolean;
 }
 
 /**
@@ -100,8 +78,7 @@ export interface MetaAdsCapabilitySyncOptions {
  */
 export const syncMetaAdsCapability = async (
   account: ConnectedAccount,
-  userId: string,
-  options?: MetaAdsCapabilitySyncOptions
+  userId: string
 ): Promise<MetaAdsCapabilitySyncResult> => {
   const platform = account?.platform as string;
   const config = account?.config as Record<string, any> | undefined;
@@ -132,9 +109,7 @@ export const syncMetaAdsCapability = async (
       const wasRefusing = recordedState === 'missing';
       if (!wasRefusing && !hasSuspicion) return { outcome: 'unchanged' };
 
-      // Retract the refusal AND the notice — the notice must go too, or a future
-      // outage would be deduped against an episode that is already over and the
-      // owner would never hear about it.
+      // Retract the refusal.
       //
       // `granted_scopes` goes with them, and that is load-bearing rather than
       // tidiness. A revocation NARROWS the stored grant instead of emptying it,
@@ -149,7 +124,7 @@ export const syncMetaAdsCapability = async (
       // cannot stand as a grant. Absent reads as 'unknown', which says exactly
       // what we know: the read works; what was granted, we would have to re-ask.
       const unset = ['ads_scope_denied_seen_at'];
-      if (wasRefusing) unset.push('ads_scope_revoked_at', 'ads_scope_alerted_at', 'granted_scopes');
+      if (wasRefusing) unset.push('ads_scope_revoked_at', 'granted_scopes');
 
       await updateAccountConfig(userId, platform as any, account.account_id, {}, { unset });
       for (const key of unset) delete config[key];
@@ -170,24 +145,22 @@ export const syncMetaAdsCapability = async (
       return { outcome: 'recovered' };
     }
 
-    // Denied. Nothing to do if that is already recorded AND the owner has
-    // already been told about this same outage.
-    const alreadyAlerted = !!config.ads_scope_alerted_at;
-    if (recordedState === 'missing' && alreadyAlerted) return { outcome: 'unchanged' };
+    // Denied, and already recorded as such: nothing left to do.
+    if (recordedState === 'missing') return { outcome: 'unchanged' };
 
-    // First refusal we have seen for a connection not already known to be
-    // broken: record the suspicion and stop. Confirmation comes from the next
-    // sweep, 12 hours later. One denied probe is weak evidence — Meta returns
-    // this refusal transiently, e.g. while a Business Manager permission change
-    // propagates — and the two costs are wildly asymmetric. Waiting adds 12
-    // hours to a problem that had already run 13 days unnoticed; acting on a
-    // false positive strips a working customer's grant, turns their Settings row
-    // red and mails them about an outage that is already over.
+    // First refusal we have seen for this connection: record the suspicion and
+    // stop. Confirmation comes from the next sweep, 12 hours later. One denied
+    // probe is weak evidence — Meta returns this refusal transiently, e.g. while
+    // a Business Manager permission change propagates — and the two costs are
+    // wildly asymmetric. Waiting adds 12 hours to a problem that had already run
+    // 13 days unnoticed; acting on a false positive strips a working customer's
+    // grant and turns their Settings row red for an outage that is already over.
     //
-    // An account already recorded as 'missing' skips this: the agent path caught
-    // it against a read we actually wanted, which is confirmation enough.
+    // An account already recorded as 'missing' never reaches here — it returned
+    // 'unchanged' above, since the agent path already caught it against a read we
+    // actually wanted and every surface already reports it.
     const now = new Date().toISOString();
-    if (recordedState !== 'missing' && !config.ads_scope_denied_seen_at) {
+    if (!config.ads_scope_denied_seen_at) {
       await updateAccountConfig(userId, platform as any, account.account_id, {
         ads_scope_denied_seen_at: now,
       });
@@ -198,10 +171,6 @@ export const syncMetaAdsCapability = async (
       return { outcome: 'suspected' };
     }
 
-    // Record the notice in the same write that records the refusal, and do it
-    // BEFORE sending. This sweep repeats every 12 hours forever, so an
-    // unwritable marker has to fail towards silence rather than towards a mail
-    // loop aimed at a customer.
     // Narrow the recorded grant as well as stamping the refusal, exactly as the
     // post-flight path does. Without this the revocation is inert: an affirmative
     // ads scope in `granted_scopes` outranks `ads_scope_revoked_at` in
@@ -218,11 +187,6 @@ export const syncMetaAdsCapability = async (
       .filter((s: unknown): s is string => typeof s === 'string')
       .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
 
-    // Protection is unconditional; only the notice is budgeted. The refusal is
-    // recorded on its own, WITHOUT `ads_scope_alerted_at` — that marker is
-    // written afterwards and only if the notice actually goes out.
-    const allowAlert = options?.allowAlert !== false;
-
     await updateAccountConfig(userId, platform as any, account.account_id, {
       granted_scopes: retained,
       ads_scope_revoked_at: config.ads_scope_revoked_at || now,
@@ -231,48 +195,10 @@ export const syncMetaAdsCapability = async (
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     delete config.ads_scope_denied_seen_at;
 
-    if (!allowAlert) {
-      console.warn(
-        `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded, but the alert budget for this sweep is spent; the owner will be told on a later run`
-      );
-      return { outcome: 'revoked', alerted: false };
-    }
-
-    const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
-    const delivered = await notifyMetaAdsScopeLost({
-      ownerUserId: userId,
-      accountId: account.account_id,
-      accountName: account.account_name,
-    });
-
-    if (!delivered) {
-      console.warn(
-        `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded, but the owner was NOT notified; a later run will retry`
-      );
-      return { outcome: 'revoked', alerted: false };
-    }
-
-    // Record the notice only now that it demonstrably went out. Claiming it
-    // beforehand and retracting on failure left a permanent false
-    // acknowledgement whenever the retraction ALSO failed, and silence is this
-    // ticket's own bug (Greptile P1). If this write fails the owner is simply
-    // told again on a later sweep — bounded repetition, never silence.
-    try {
-      const alertedAt = new Date().toISOString();
-      await updateAccountConfig(userId, platform as any, account.account_id, {
-        ads_scope_alerted_at: alertedAt,
-      });
-      config.ads_scope_alerted_at = alertedAt;
-    } catch (markError: any) {
-      console.warn(
-        `[MetaAdsCapabilitySync] Notified owner ${userId} about account ${account.account_id} but could not record it; a later run may notify again: ${markError?.message ?? markError}`
-      );
-    }
-
     console.log(
-      `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded and notified the owner`
+      `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded; the Settings row and the agent tool now report it as needing reconnection`
     );
-    return { outcome: 'revoked', alerted: true };
+    return { outcome: 'revoked' };
   } catch (error: any) {
     const message = error?.message || String(error);
     console.warn(
