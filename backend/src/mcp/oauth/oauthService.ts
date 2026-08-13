@@ -296,10 +296,9 @@ export class McpOAuthService {
     if (record.clientId !== clientId) return false;
     const userAgentMatches = record.userAgentHash === userAgentHash;
     const ipMatches = record.ipHash === ipHash;
-    // Avoid brittle handoffs: allow either browser identity or network affinity to
-    // match. Requiring both causes false negatives when users change network or
-    // edge-terminating proxies while continuing the same signup flow.
-    if (!userAgentMatches && !ipMatches) return false;
+    // MCP signup attribution is sensitive; require both user-agent and network
+    // affinity to match to prevent intent reuse across sessions.
+    if (!userAgentMatches || !ipMatches) return false;
     if (record.used) return false;
     if (record.purpose !== "mcp_signup") return false;
 

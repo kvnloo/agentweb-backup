@@ -3391,11 +3391,9 @@ mcpToolRegistry.register({
       stage: events?.onboardingStage ?? null,
       event_count: Array.isArray(events?.onboardingEvents) ? events.onboardingEvents.length : 0,
       brand_build:
-        typeof brandBuild?.status === "string"
-          ? brandBuild.status
-          : typeof brandBuild === "string"
-            ? brandBuild
-            : null,
+        typeof brandBuild?.status?.brandBuildStatus === "string"
+          ? brandBuild.status.brandBuildStatus
+          : null,
     });
   },
 });
