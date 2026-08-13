@@ -130,10 +130,15 @@ describe('resolveMetaPixelWithDefault', () => {
   const user = { connected_accounts: [{ platform: 'facebook', config: { account_type: 'ad_account', access_token: 'tok' } }] };
 
   it('uses the stored value directly when present, with zero network calls', async () => {
+    // The stored account must be declared connected — an explicit choice is only honored
+    // while the connection it names still exists (see the stale-selection tests below).
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
     expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
-    expect(getConnectedMetaAccountsList).not.toHaveBeenCalled();
+    // getConnectedMetaAccountsList IS now called (a local, already-loaded-record check).
+    // What must stay zero is Graph traffic: no credential fetch, no HTTP.
     expect(getMetaAccountCredentials).not.toHaveBeenCalled();
     expect(mockFetch).not.toHaveBeenCalled();
   });
@@ -218,6 +223,62 @@ describe('resolveMetaPixelWithDefault', () => {
 
     expect('unresolved' in result && result.unresolved).toBe(true);
     expect((result as any).reason).toContain('token expired');
+  });
+
+  // Greptile P1 on #2384: the stored pair is a snapshot of a choice made earlier, so it
+  // can outlive the connection it names (customer disconnects that Meta account, or a
+  // reconnect issues a new account id). Honoring it blindly then sends every subsequent
+  // booking down a path whose credentials no longer resolve — the CAPI leg throws, the
+  // job is marked failed and retried to exhaustion, and a perfectly healthy pixel on
+  // another connected account is never tried. Pass 1 of this feature had this check and
+  // the Pass-2 rework dropped it; these pin it so it can't be dropped again.
+  it('falls through to the default search when the stored account is no longer connected', async () => {
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'stillConnected' }]);
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'stillConnected', accessToken: 'tok', accountName: 'Live' });
+    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'healthyPixel' }] }) });
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', {
+      pixelId: 'stalePixel',
+      accountId: 'disconnectedAccount',
+    });
+
+    expect(result).toEqual({ pixelId: 'healthyPixel', accountId: 'stillConnected' });
+  });
+
+  it('is unresolved (not stale-selected) when the stored account is gone and no other account has a pixel', async () => {
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'otherAcc' }]);
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'otherAcc', accessToken: 'tok', accountName: 'Other' });
+    mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) });
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', {
+      pixelId: 'stalePixel',
+      accountId: 'disconnectedAccount',
+    });
+
+    expect('unresolved' in result && result.unresolved).toBe(true);
+    expect(result).not.toEqual({ pixelId: 'stalePixel', accountId: 'disconnectedAccount' });
+  });
+
+  it('still honors the stored pair when its account is connected, without any Graph traffic', async () => {
+    (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }, { accountId: 'storedAcc' }]);
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+    expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+    // The connectivity check is local (reads the already-loaded user record). What must
+    // NOT happen is a per-booking Graph round-trip just to confirm a stored choice.
+    expect(getMetaAccountCredentials).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('honors the stored pair when the connected-accounts list cannot be read, rather than discarding the choice', async () => {
+    // Defensive: a malformed/unreadable user record must not silently downgrade an
+    // explicit customer choice into "pick whatever comes first".
+    (getConnectedMetaAccountsList as jest.Mock).mockImplementation(() => { throw new Error('bad user record'); });
+
+    const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+    expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
   });
 
   it('ignores a partially-stored value (pixelId without accountId) and falls through to the default', async () => {

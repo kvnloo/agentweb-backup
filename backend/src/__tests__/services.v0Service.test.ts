@@ -847,6 +847,75 @@ describe("v0Service - generateLandingPage", () => {
       expect(result.metaAdAccountId).toBe("acc-auto");
       resolveSpy.mockRestore();
     });
+
+    // Negative/boundary coverage (CLAUDE.md Rule 2, Greptile P2 on #2384). The route
+    // validates shape + ownership before calling this service, so these pin what the
+    // service itself does if a malformed value ever reaches it another way (an internal
+    // caller, a future endpoint): treat it as "no override" and auto-resolve, never
+    // half-apply a pixel without its account.
+    it("ignores an override missing accountId and falls back to auto-resolution", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_partial" });
+
+      const result = await generateLandingPage(
+        "user-1", "Create page", "Partial override", {}, undefined, undefined,
+        { metaPixelOverride: { pixelId: "px-orphan" } as any }
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+
+    it("ignores an override missing pixelId and falls back to auto-resolution", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        pixelId: "px-auto",
+        accountId: "acc-auto",
+      });
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_partial_2" });
+
+      const result = await generateLandingPage(
+        "user-1", "Create page", "Partial override 2", {}, undefined, undefined,
+        { metaPixelOverride: { accountId: "acc-orphan" } as any }
+      );
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBe("px-auto");
+      expect(result.metaAdAccountId).toBe("acc-auto");
+      resolveSpy.mockRestore();
+    });
+
+    it("still deploys with no pixel when an override is absent AND auto-resolution is unresolved", async () => {
+      const resolveSpy = jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValueOnce({
+        unresolved: true,
+        reason: "2 ad accounts connected — ambiguous",
+      } as any);
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_unresolved" });
+
+      const result = await generateLandingPage("user-1", "Create page", "Unresolved", {});
+
+      expect(resolveSpy).toHaveBeenCalledTimes(1);
+      expect(result.metaPixelId).toBeUndefined();
+      expect(result.metaAdAccountId).toBeUndefined();
+      resolveSpy.mockRestore();
+    });
+
+    it("does not let a resolver throw abort the whole generation", async () => {
+      const resolveSpy = jest
+        .spyOn(metaService, "resolveMetaPixelForUser")
+        .mockRejectedValueOnce(new Error("graph exploded"));
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_throw" });
+
+      const result = await generateLandingPage("user-1", "Create page", "Resolver threw", {});
+
+      expect(result.id).toBe("test-uuid-1234");
+      expect(result.metaPixelId).toBeUndefined();
+      resolveSpy.mockRestore();
+    });
   });
 
   it("SUCCESS: recycles a prior failed record (no v0 chat) instead of orphaning it", async () => {

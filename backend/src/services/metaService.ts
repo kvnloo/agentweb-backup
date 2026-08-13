@@ -2404,11 +2404,37 @@ export class MetaService {
     userId: string,
     stored: { pixelId: string; accountId: string } | undefined,
   ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
-    if (stored?.pixelId && stored?.accountId) {
-      return { pixelId: stored.pixelId, accountId: stored.accountId };
-    }
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // The stored pair is a snapshot of a choice made earlier, so it can outlive the
+      // connection it names — the customer disconnects that Meta account, or a reconnect
+      // issues a different account id. Honoring it blindly sends every later booking down
+      // a path whose credentials no longer resolve: the CAPI leg throws, the job is marked
+      // failed and retried to exhaustion, and a healthy pixel on another connected account
+      // is never tried (Greptile P1 on #2384; Pass 1 of this feature had this check and the
+      // Pass-2 rework dropped it). The check is LOCAL — it reads the already-loaded user
+      // record — deliberately not a Graph round-trip on every booking just to confirm a
+      // stored choice. A pixel deleted from a still-connected account therefore still gets
+      // honored here and surfaces as a CAPI failure instead; catching that would cost a
+      // per-booking API call, which this resolver exists to avoid.
+      if (stored?.pixelId && stored?.accountId) {
+        let storedAccountStillConnected = true;
+        try {
+          storedAccountStillConnected = getConnectedMetaAccountsList(user)
+            .some((account: { accountId: string }) => account.accountId === stored.accountId);
+        } catch {
+          // Unreadable/malformed user record: keep the customer's explicit choice rather
+          // than silently downgrading it to "whatever account comes first".
+          storedAccountStillConnected = true;
+        }
+        if (storedAccountStillConnected) {
+          return { pixelId: stored.pixelId, accountId: stored.accountId };
+        }
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} is no longer connected — falling back to auto-resolution`,
+        );
+      }
 
       const accounts = getConnectedMetaAccountsList(user);
       if (accounts.length === 0) {

@@ -1286,10 +1286,14 @@ async function generateFirstPage(
   // instruction is included, same as GTM's "absent id" path.
   let metaPixelId: string | undefined;
   let metaAdAccountId: string | undefined;
-  if (metaPixelOverride) {
+  if (metaPixelOverride?.pixelId && metaPixelOverride?.accountId) {
     // ENG-1141: an explicit choice from the creation form's mandatory picker always
     // wins — skip resolveMetaPixelForUser entirely rather than calling it and
-    // discarding the result.
+    // discarding the result. BOTH halves are required: a pixel without the ad account
+    // it belongs to can't produce a CAPI send later (the account is where the token
+    // comes from), so a partial value falls back to auto-resolution rather than
+    // half-applying. The route validates shape before this, so this guards internal
+    // callers and future endpoints, not the picker itself.
     metaPixelId = metaPixelOverride.pixelId;
     metaAdAccountId = metaPixelOverride.accountId;
   } else {

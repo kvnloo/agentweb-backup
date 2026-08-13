@@ -198,6 +198,59 @@ describe('Meta V2 Routes', () => {
 
       expect(response.status).toBe(404);
     });
+
+    // Negative/boundary coverage (CLAUDE.md Rule 2, Greptile P2 on #2384). The picker
+    // UIs treat an empty list as "nothing to choose" rather than an error, so an empty
+    // 200 is the contract these pin — a 4xx/5xx here would surface as a broken dialog.
+    it('returns an empty list (not an error) when no Meta ad account is connected', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', connected_accounts: [] });
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toEqual([]);
+      expect(metaService.listPixels).not.toHaveBeenCalled();
+    });
+
+    it('returns an empty list when every connected account has zero pixels', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock).mockResolvedValue([]);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toEqual([]);
+    });
+
+    it('returns an empty list when EVERY account lookup fails, rather than a 500', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock).mockRejectedValue(new Error('token expired'));
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toEqual([]);
+    });
+
+    it('tolerates a null/undefined pixel list from Graph without throwing', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(undefined);
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(200);
+      expect(response.body.pixels).toEqual([]);
+    });
+
+    it('returns 500 when the user lookup itself fails', async () => {
+      (userDb.getUserById as jest.Mock).mockRejectedValue(new Error('dynamo down'));
+
+      const response = await request(app).get('/api/meta/v2/pixels');
+
+      expect(response.status).toBe(500);
+    });
   });
 
   describe('inline token self-heal (getMetaAccountCredentials)', () => {
