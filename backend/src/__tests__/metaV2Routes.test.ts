@@ -1,6 +1,7 @@
 import request from 'supertest';
 import express from 'express';
-import metaV2Router, { __clearPixelsCacheForTests } from '../routes/metaV2';
+import metaV2Router from '../routes/metaV2';
+import { __clearPixelsCacheForTests, invalidateCachedPixels } from '../services/metaPixelsCache';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
 
@@ -223,6 +224,31 @@ describe('Meta V2 Routes', () => {
       expect(second.body.cached).toBe(true);
       // Still 2 — the second request added no Graph traffic at all.
       expect(metaService.listPixels).toHaveBeenCalledTimes(2);
+    });
+
+    // The flow this cache could have broken: connect a Meta account, then immediately open
+    // the create dialog. /connected-accounts is uncached and reports the new account, so a
+    // cached "no pixels" answer would read as "nothing ambiguous to pick" — and the page
+    // would ship SILENTLY UNTRACKED, the exact failure ENG-1141 exists to prevent. A 60s
+    // self-heal doesn't help: that page stays untracked forever.
+    it('reflects a newly connected account immediately, not a TTL later', async () => {
+      // Before connecting: no Meta accounts, so an empty list gets cached.
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', connected_accounts: [] });
+      const before = await request(app).get('/api/meta/v2/pixels');
+      expect(before.body.pixels).toEqual([]);
+
+      // createAccount invalidates this user's entry (connectedAccountsDb) — simulated here,
+      // since this suite mocks the DB layer away.
+      invalidateCachedPixels('user123');
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(twoAccountUser);
+      (metaService.listPixels as jest.Mock)
+        .mockResolvedValueOnce([{ id: 'pxA1' }])
+        .mockResolvedValueOnce([{ id: 'pxB1' }]);
+
+      const after = await request(app).get('/api/meta/v2/pixels');
+      expect(after.body.pixels).toHaveLength(2);
+      expect(after.body.cached).toBeUndefined();
     });
 
     it('does not serve one user\'s pixels to another', async () => {

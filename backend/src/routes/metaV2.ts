@@ -3,6 +3,7 @@ import path from 'path';
 import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
+import { getCachedPixels, setCachedPixels } from '../services/metaPixelsCache';
 import {
   getConnectedMetaAccountsList,
   getMetaAccountCredentials,
@@ -187,45 +188,13 @@ router.get('/campaigns-and-adsets', async (req, res) => {
 // fatal to the whole request — same "never let one bad account break
 // everything" philosophy as resolveMetaPixelForUser itself.
 //
-// Cached per user for a short TTL: this fans out ONE Graph call per connected ad
-// account, and both callers (the landing-page create dialog and the Connected
-// Accounts card) refetch every time they open. An agency with 20 accounts would
-// otherwise spend 20 Graph calls per dialog-open, with the picker — and Generate
-// behind it — waiting on all of them. Pixels change rarely; a stale entry costs a
-// customer at most one minute before a newly created pixel appears.
+// Cached per user — see services/metaPixelsCache.ts for why the TTL alone is not
+// enough and connect/disconnect invalidate it explicitly.
 // ---------------------------------------------------------------------------
-const PIXELS_CACHE_TTL_MS = 60_000;
-/** Bounded so a large tenant can't grow this without limit; oldest entry is evicted. */
-const PIXELS_CACHE_MAX_ENTRIES = 500;
-const pixelsCache = new Map<string, { at: number; pixels: any[] }>();
-
-function readPixelsCache(userId: string): any[] | null {
-  const hit = pixelsCache.get(userId);
-  if (!hit) return null;
-  if (Date.now() - hit.at > PIXELS_CACHE_TTL_MS) {
-    pixelsCache.delete(userId);
-    return null;
-  }
-  return hit.pixels;
-}
-
-/** Test-only: process-level state would otherwise leak between cases in one suite. */
-export function __clearPixelsCacheForTests(): void {
-  pixelsCache.clear();
-}
-
-function writePixelsCache(userId: string, pixels: any[]): void {
-  if (pixelsCache.size >= PIXELS_CACHE_MAX_ENTRIES) {
-    const oldest = pixelsCache.keys().next().value;
-    if (oldest !== undefined) pixelsCache.delete(oldest);
-  }
-  pixelsCache.set(userId, { at: Date.now(), pixels });
-}
-
 router.get('/pixels', async (req, res) => {
   const userId = (req as any).user.userId;
   try {
-    const cached = readPixelsCache(userId);
+    const cached = getCachedPixels(userId);
     if (cached) return res.json({ pixels: cached, cached: true });
 
     const user = await userDb.getUserById(userId);
@@ -246,7 +215,7 @@ router.get('/pixels', async (req, res) => {
     );
 
     const pixels = perAccountPixels.flat();
-    writePixelsCache(userId, pixels);
+    setCachedPixels(userId, pixels);
     res.json({ pixels });
   } catch (error: any) {
     console.error('[MetaV2] /pixels error:', error);

@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
+import { invalidateCachedPixels } from './metaPixelsCache';
 
 // ============================================
 // Type Definitions
@@ -428,6 +429,12 @@ export const createAccount = async (
     connected_accounts: updatedAccounts,
   } as Partial<User>);
 
+  // ENG-1141: which pixels exist for this user just changed. Without this, connecting a
+  // Meta account and immediately opening the create dialog would read a cached "no pixels"
+  // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
+  // page. See services/metaPixelsCache.ts.
+  invalidateCachedPixels(userId);
+
   return accountConfig;
 };
 
@@ -682,6 +689,9 @@ export const deleteAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: a disconnect must not leave that account's pixels listed in the picker.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -711,6 +721,10 @@ export const deleteAccountById = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: same as deleteAccount — a disconnected account's pixels must stop being
+  // offered immediately, not a TTL later.
+  invalidateCachedPixels(userId);
 };
 
 /**
