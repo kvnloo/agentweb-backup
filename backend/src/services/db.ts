@@ -3073,21 +3073,16 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
-// A single UpdateExpression is capped at 4KB, so shed in batches. Each write shifts
-// the survivors down, which is why every batch removes from index 0 again.
-const MAX_RUN_RESULT_REMOVALS_PER_WRITE = 50;
-
-// A shed that loses its race is recomputed, not replayed — replaying a count taken
-// against a longer list would delete a second prefix nobody asked for.
+// A write that loses its race is recomputed, not replayed — replaying a list built
+// against different history would clobber whatever landed in between.
 const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
 
 /**
- * ENG-1048: how many of the OLDEST run results have to go for this row to accept one
- * more, and the history length that count was measured against. Returns null when
- * even the incoming result cannot fit, so the caller surfaces the original error
- * rather than writing a lie.
+ * ENG-1048: the run history this row can hold WITH one more result on the end, and
+ * the history that was derived from. Returns null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
  */
-const planOldestRunResultShed = async (scheduleId: string, runResult: any) => {
+const planRunResultShed = async (scheduleId: string, runResult: any) => {
   const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
   const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
   if (!existing) return null;
@@ -3105,7 +3100,58 @@ const planOldestRunResultShed = async (scheduleId: string, runResult: any) => {
       `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
     );
   }
-  return { dropped, observedLength: history.length };
+  return { kept, observed: history };
+};
+
+/**
+ * ENG-1048: shed the oldest runs AND record the incoming one in a single write, bound
+ * to the exact history the new list was built from.
+ *
+ * The two halves cannot be separated. Trim in one write and append in another, and a
+ * failure in between deletes history without recording the run it made room for. So:
+ * one `SET`, conditioned on the stored history still being what was read — length AND
+ * tail entry, because a concurrent recovery that drops one and appends one leaves the
+ * length untouched. On mismatch the caller recomputes; nothing is written from a read
+ * that has been overtaken.
+ */
+const writeShedRunResults = async (
+  scheduleId: string,
+  kept: any[],
+  observed: any[]
+): Promise<{ raced: true } | { raced: false; attributes: any }> => {
+  const values: Record<string, any> = {
+    ':runResults': kept,
+    ':updatedAt': new Date().toISOString(),
+    ':expectedLength': observed.length,
+  };
+  let condition = 'size(#runResults) = :expectedLength';
+  if (observed.length === 0) {
+    condition = `(attribute_not_exists(#runResults) OR ${condition})`;
+  } else {
+    condition += ` AND #runResults[${observed.length - 1}] = :expectedLast`;
+    values[':expectedLast'] = observed[observed.length - 1];
+  }
+
+  try {
+    const result = await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: { scheduleId },
+      UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: condition,
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+    return { raced: false, attributes: result.Attributes };
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `DynamoDB addRunResult: schedule ${scheduleId} run history moved under the shed — recomputing.`
+      );
+      return { raced: true };
+    }
+    throw error;
+  }
 };
 
 export const scheduleDb = {
@@ -3282,12 +3328,15 @@ export const scheduleDb = {
      */
     expect?: Record<string, any>,
     /**
-     * ENG-1048: shed this many of the OLDEST run results as part of THIS write. The
-     * trim exists to make room for the edit, so the two have to land together —
-     * shedding first and then failing the edit would delete history for a save that
-     * never happened. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     * ENG-1048: shed `count` of the OLDEST run results as part of THIS write. The trim
+     * exists to make room for the edit, so the two have to land together — shedding
+     * first and then failing the edit would delete history for a save that never
+     * happened. `expectedLength` binds the removal to the history the count was
+     * measured against, so a run recording at the same moment cannot leave this write
+     * taking a second prefix off an already-shortened list. Capped at
+     * MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
      */
-    removeOldestRunResults?: number
+    shedRunResults?: { count: number; expectedLength: number }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3323,12 +3372,14 @@ export const scheduleDb = {
       // tail, so index 0 still names the oldest entry. `runResults` is never also SET
       // here — overlapping document paths in one expression are rejected.
       let removeExpression = '';
-      if (removeOldestRunResults && removeOldestRunResults > 0) {
+      if (shedRunResults && shedRunResults.count > 0) {
         expressionAttributeNames['#runResults'] = 'runResults';
         removeExpression = ` REMOVE ${Array.from(
-          { length: Math.min(removeOldestRunResults, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
           (_, index) => `#runResults[${index}]`
         ).join(", ")}`;
+        conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
+        expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
       }
 
       const params: any = {
@@ -3379,20 +3430,11 @@ export const scheduleDb = {
       if (isDynamoItemSizeError(error)) {
         try {
           for (let attempt = 1; attempt <= MAX_RUN_RESULT_SHED_ATTEMPTS; attempt++) {
-            const plan = await planOldestRunResultShed(scheduleId, runResult);
-            if (plan === null || plan.dropped === 0) break;
-            // The count was measured against a history of `observedLength`. If another
-            // writer — a schedule edit shedding to fit, or another run — moved the list
-            // in between, applying it anyway would delete a second prefix off an
-            // already-shortened list. Recount against what is stored now instead.
-            const shed = await scheduleDb.dropOldestRunResults(
-              scheduleId,
-              plan.dropped,
-              plan.observedLength
-            );
-            if (shed === 'raced') continue;
-            const retried = await dynamodb.update(params).promise();
-            return retried.Attributes;
+            const plan = await planRunResultShed(scheduleId, runResult);
+            if (plan === null) break;
+            const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
+            if (written.raced) continue;
+            return written.attributes;
           }
         } catch (recoveryError) {
           // Recovery failed too — report the condition that actually stopped the write.
@@ -3404,50 +3446,6 @@ export const scheduleDb = {
     }
   },
 
-  /**
-   * ENG-1048: drop the `count` OLDEST run results, by index rather than by rewriting
-   * the list. The list is only ever appended to at the tail, so index 0 is stable
-   * under a concurrent run finishing mid-shed — whereas writing back a list built
-   * from an earlier read would silently erase that run's result. Every batch removes
-   * from 0 again because each write shifts the survivors down.
-   *
-   * `expectedLength` binds the removal to the history the count was measured against,
-   * so two writers shedding at once cannot each delete a prefix and take more than
-   * either needed. Returns 'raced' when it no longer holds — recount, don't replay.
-   */
-  async dropOldestRunResults(scheduleId: string, count: number, expectedLength?: number) {
-    if (!Number.isInteger(count) || count <= 0) return 'shed';
-    try {
-      for (let shed = 0; shed < count; shed += MAX_RUN_RESULT_REMOVALS_PER_WRITE) {
-        const batch = Math.min(MAX_RUN_RESULT_REMOVALS_PER_WRITE, count - shed);
-        const removals = Array.from({ length: batch }, (_, index) => `#runResults[${index}]`);
-        const params: any = {
-          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-          Key: { scheduleId },
-          UpdateExpression: `SET #updatedAt = :updatedAt REMOVE ${removals.join(', ')}`,
-          ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
-          ExpressionAttributeValues: { ':updatedAt': new Date().toISOString() },
-          ConditionExpression: 'attribute_exists(#runResults)',
-        };
-        if (expectedLength !== undefined) {
-          // Each batch expects what the previous ones left behind.
-          params.ConditionExpression += ' AND size(#runResults) = :expectedLength';
-          params.ExpressionAttributeValues[':expectedLength'] = expectedLength - shed;
-        }
-        await dynamodb.update(params).promise();
-      }
-      return 'shed';
-    } catch (error: any) {
-      if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
-        console.warn(
-          `DynamoDB dropOldestRunResults: schedule ${scheduleId} run history moved under the shed — recounting.`
-        );
-        return 'raced';
-      }
-      handleDynamoDbError(error, "dropOldestRunResults");
-      throw error;
-    }
-  },
 
   async getRunResults(scheduleId: string) {
     try {

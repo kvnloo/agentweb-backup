@@ -109,6 +109,9 @@ async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): 
 /** Raised when a schedule edit could not be committed together with its consent narrowing. */
 class ScheduleConsentRaceError extends Error {}
 
+/** ENG-1048: raised when run history moved out from under an edit's history shed. */
+class ScheduleHistoryRaceError extends Error {}
+
 const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 
 /**
@@ -146,15 +149,30 @@ async function applyScheduleEditWithConsentNarrowing(
   updates: any,
   firstRead: any,
   // ENG-1048: run results this edit has to shed to fit, carried by the SAME write so
-  // history is never deleted for an edit that then fails. A conditional retry below
-  // re-sends it unchanged: a rejected write removed nothing, so the indexes still hold.
-  removeOldestRunResults = 0
+  // history is never deleted for an edit that then fails, and bound to the history the
+  // count was measured against so it cannot take a second prefix off a list another
+  // writer already shortened.
+  shedRunResults?: { count: number; expectedLength: number }
 ): Promise<void> {
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
   const write = async (payload: any, expectation?: Record<string, any>) => {
-    if (removeOldestRunResults > 0) {
-      await scheduleDb.updateSchedule(scheduleId, payload, expectation, removeOldestRunResults);
+    if (shedRunResults && shedRunResults.count > 0) {
+      try {
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+      } catch (writeError: any) {
+        // The shed count belongs to the history it was measured against; it cannot be
+        // replayed against a different one. Hand back a conflict instead of retrying.
+        if (
+          writeError?.code === 'ConditionalCheckFailedException' ||
+          writeError?.name === 'ConditionalCheckFailedException'
+        ) {
+          throw new ScheduleHistoryRaceError(
+            `Run history for schedule ${scheduleId} moved while this edit was saving.`
+          );
+        }
+        throw writeError;
+      }
       return;
     }
     if (expectation) {
@@ -8783,7 +8801,14 @@ export const agentModeController = {
         scheduleId,
         updates,
         existingSchedule,
-        runResultsToShed
+        runResultsToShed > 0
+          ? {
+              count: runResultsToShed,
+              expectedLength: Array.isArray((existingSchedule as any).runResults)
+                ? (existingSchedule as any).runResults.length
+                : 0,
+            }
+          : undefined
       );
 
       res.json({
@@ -8802,6 +8827,17 @@ export const agentModeController = {
           error:
             'This schedule\'s publishing permission changed while you were saving, so nothing was ' +
             'saved. Reopen the schedule to see its current settings, then apply your change again.',
+        });
+      }
+      // ENG-1048: the shed was bound to the run history it was measured against, and
+      // that history moved, so nothing was written. Ask for a retry rather than
+      // replaying a removal count that would now take a prefix too many.
+      if (error instanceof ScheduleHistoryRaceError) {
+        console.warn(`AgentMode: ENG-1048 schedule update abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule recorded a run while you were saving, so nothing was saved. ' +
+            'Try again — its run history has changed.',
         });
       }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
