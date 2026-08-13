@@ -6559,6 +6559,11 @@ export const crmDb = {
       // caller resume a truncated import from the rows that never landed
       // rather than replaying the whole file (ENG-1133).
       rowOutcomes: leads.map(() => 'unprocessed' as LeadImportRowOutcome),
+      // Set when the existing-lead pre-read ran out of budget before it had
+      // read the whole list, so nothing was written (ENG-1133). Distinct from
+      // an ordinary partial: those rows are not merely unreached, they are
+      // unsafe to attempt until the list can be scanned.
+      dedupeIncomplete: false,
     };
 
     // ENG-1133: the import budget. `unitsDone` keeps the first unit of work
@@ -6580,7 +6585,26 @@ export const crmDb = {
         const result = await this.getLeadsByListId(listId, 100, lastKey);
         allExistingLeads.push(...result.items);
         lastKey = result.lastEvaluatedKey;
+        // ENG-1133: the pre-read is O(list size) and runs before any row is
+        // written, so on a very large or throttled list it can burn the whole
+        // budget — and then the caller's own timeout kills the turn with no
+        // ledger at all, which is the failure this ticket exists to remove.
+        // Stop and report instead. Writing on a half-read list is not the
+        // alternative: the dedupe maps below would be missing rows and every
+        // unmatched row would be inserted a second time.
+        if (lastKey && deadlineAt !== null && Date.now() >= deadlineAt) {
+          results.dedupeIncomplete = true;
+          break;
+        }
       } while (lastKey);
+
+      if (results.dedupeIncomplete) {
+        results.errors.push(
+          `Could not read the existing leads in this list within ${options.deadlineMs}ms, so no rows were imported. `
+          + 'Importing without the full list would duplicate rows that are already in it.',
+        );
+        return results;
+      }
 
       // Build dedup maps keyed by both email AND normalized LinkedIn URL.
       // Same person can appear with no email but a LinkedIn URL (typical for
@@ -7030,6 +7054,9 @@ export const crmDb = {
         rowOutcomes: results.rowOutcomes.map((outcome) =>
           outcome === 'anonymized_skipped' ? outcome : ('failed' as LeadImportRowOutcome),
         ),
+        // A hard failure, not an unreadable list — the caller should report the
+        // error, not the "this list is too large to import into" blocker.
+        dedupeIncomplete: false,
       };
     }
   },

@@ -10612,7 +10612,15 @@ export class AgentModeService {
           + `but unimportedRowRanges (${unimportedRowRanges}) lists EVERY missing position in the rows you just sent — resend all of them. `
           + `The import is not done until a result comes back with complete: true. `
         : '';
-      const message = attempted === 0
+      // The list itself could not be read inside the budget, so nothing was
+      // attempted. Resending the same rows would hit the same wall, so this is
+      // a blocker to report — not the resume path every other partial takes.
+      const dedupeIncomplete = (result as any).dedupeIncomplete === true;
+      const message = dedupeIncomplete
+        ? `Import not attempted: this list has more existing leads than can be read within the import budget, `
+          + `and importing without reading them first would duplicate rows already in the list. `
+          + `No rows were written. Do NOT retry the same call — tell the user the list is too large to import into and needs splitting or a smaller list.`
+        : attempted === 0
         ? 'No leads were processed.'
         : complete
           ? summary
@@ -10635,7 +10643,7 @@ export class AgentModeService {
         // succeeds while carrying `complete: false` and its resume list.
         success: complete || landed > 0,
         complete,
-        ...(complete || attempted === 0 ? {} : { resumable: true }),
+        ...(complete || attempted === 0 || dedupeIncomplete ? {} : { resumable: true }),
         message,
         attempted,
         // `reconciliation` is the ONLY set of counts on the wire. The legacy
