@@ -66,9 +66,9 @@ beforeEach(() => {
 });
 
 describe('email tool — org-shared mailbox resolution', () => {
-  it('resolves the account for the caller', async () => {
+  it('resolves a read for the caller', async () => {
     await tool.execute({ action: 'list', account_id: ACCOUNT_ID }, context);
-    expect(mockResolveEmailAccount).toHaveBeenCalledWith(CALLER_USER_ID, ACCOUNT_ID);
+    expect(mockResolveEmailAccount).toHaveBeenCalledWith(CALLER_USER_ID, ACCOUNT_ID, 'read');
   });
 
   it('searches as the mailbox owner, not the caller', async () => {
@@ -101,19 +101,47 @@ describe('email tool — org-shared mailbox resolution', () => {
     expect(result).toEqual({ emails: [MESSAGE], count: 1 });
   });
 
-  it('sends as the mailbox owner, not the caller', async () => {
+  it('resolves a send as a write, so a teammate’s mailbox can be refused', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...ORG_SHARED_ACCOUNT, ownerUserId: CALLER_USER_ID });
+
+    await tool.execute(
+      { action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', subject: 'Hi', body: 'Hello' },
+      context
+    );
+
+    expect(mockResolveEmailAccount).toHaveBeenCalledWith(CALLER_USER_ID, ACCOUNT_ID, 'send');
+  });
+
+  it('sends from the caller’s own mailbox', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...ORG_SHARED_ACCOUNT, ownerUserId: CALLER_USER_ID });
+
     const result = await tool.execute(
       { action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', subject: 'Hi', body: 'Hello' },
       context
     );
 
     expect(mockSendEmail).toHaveBeenCalledWith(
-      OWNER_USER_ID,
+      CALLER_USER_ID,
       ACCOUNT_ID,
       expect.objectContaining({ to: 'someone@example.com', subject: 'Hi', body: 'Hello' })
     );
-    expect(mockSendEmail).not.toHaveBeenCalledWith(CALLER_USER_ID, ACCOUNT_ID, expect.anything());
     expect(result).toEqual({ success: true, messageId: 'msg-sent', threadId: 't-1' });
+  });
+
+  it('surfaces the send refusal on a teammate’s shared mailbox as an error', async () => {
+    mockResolveEmailAccount.mockRejectedValue(
+      new MockEmailProviderError(
+        `Account "${ACCOUNT_ID}" belongs to a teammate and is shared with your organization for reading only.`
+      )
+    );
+
+    const result = await tool.execute(
+      { action: 'send', account_id: ACCOUNT_ID, to: 'someone@example.com', subject: 'Hi', body: 'Hello' },
+      context
+    );
+
+    expect(result.error).toContain('reading only');
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
   it('reads the caller\'s own mailbox as the caller', async () => {

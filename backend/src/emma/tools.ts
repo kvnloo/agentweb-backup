@@ -6366,7 +6366,12 @@ emmaToolRegistry.register({
     try {
       // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
       // record, and that is where the provider reads (and refreshes) its tokens.
-      const { provider, ownerUserId } = await resolveEmailAccount(userId, args.account_id);
+      // A send is resolved as a write, so it is refused on a teammate's mailbox.
+      const { provider, ownerUserId } = await resolveEmailAccount(
+        userId,
+        args.account_id,
+        args.action === 'send' ? 'send' : 'read'
+      );
 
       switch (args.action) {
         case 'search': {

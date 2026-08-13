@@ -129,6 +129,59 @@ describe('resolveEmailAccount — org-shared mailboxes (ENG-943)', () => {
   });
 });
 
+/**
+ * Reading a teammate's shared mailbox and SENDING from it are different acts.
+ * Org sharing was introduced as "share CRM across org members, keep other assets
+ * private" and extended one platform at a time; mail predates it entirely, so
+ * sending as a teammate was never granted. Fixing the read bug must not quietly
+ * hand it over — the ticket reports only reads.
+ */
+describe('resolveEmailAccount — send is own-mailbox only (ENG-943)', () => {
+  const shared = account('gmail', 'teammate@example.com', TEAMMATE);
+  const own = account('gmail', 'me@example.com', CALLER);
+
+  it('refuses to send from a teammate’s org-shared mailbox', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    await expect(resolveEmailAccount(CALLER, shared.account_id, 'send')).rejects.toThrow(
+      /shared with your organization for reading/i
+    );
+  });
+
+  it('names the mailbox it refused, rather than claiming it does not exist', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    await expect(resolveEmailAccount(CALLER, shared.account_id, 'send')).rejects.toThrow(
+      new RegExp(shared.account_id)
+    );
+  });
+
+  it('still sends from the caller’s own mailbox', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([own]);
+
+    const resolved = await resolveEmailAccount(CALLER, own.account_id, 'send');
+
+    expect(resolved.ownerUserId).toBe(CALLER);
+    expect(resolved.accountId).toBe(own.account_id);
+  });
+
+  it('still READS a teammate’s org-shared mailbox — the bug stays fixed', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    const resolved = await resolveEmailAccount(CALLER, shared.account_id, 'read');
+
+    expect(resolved.ownerUserId).toBe(TEAMMATE);
+  });
+
+  it('defaults to read when no operation is given', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    const resolved = await resolveEmailAccount(CALLER, shared.account_id);
+
+    expect(resolved.ownerUserId).toBe(TEAMMATE);
+  });
+});
+
 describe('resolveDefaultEmailAccount (ENG-943)', () => {
   it('falls back to an org-shared mailbox when the caller has none of their own', async () => {
     mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([

@@ -231,7 +231,12 @@ router.post('/email', async (req: Request, res: Response) => {
     await bootstrapEmailProviders();
     // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
     // record, and that is where the provider reads (and refreshes) its tokens.
-    const { provider, ownerUserId } = await resolveEmailAccount(userId(req), req.body.account_id);
+    // A send is resolved as a write, so it is refused on a teammate's mailbox.
+    const { provider, ownerUserId } = await resolveEmailAccount(
+      userId(req),
+      req.body.account_id,
+      req.body.action === 'send' ? 'send' : 'read'
+    );
 
     const { action } = req.body;
     let result;

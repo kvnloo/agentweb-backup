@@ -147,12 +147,28 @@ async function accessibleEmailAccounts(userId: string) {
 }
 
 /**
+ * What the caller intends to do with the mailbox.
+ *
+ * Reading a teammate's org-shared mailbox and SENDING mail as them are different
+ * acts, and only the first is in scope here. Org sharing arrived as "share CRM
+ * across org members, keep other assets private" and has been extended one
+ * platform at a time ever since; mail resolution predates the whole feature, so
+ * sending as a teammate was never granted — the exact-same caller-scoped lookup
+ * that caused ENG-943 also happened to block it. Restoring reads must not hand
+ * over send-as-a-teammate by accident, so writes stay own-mailbox only. ENG-943
+ * reports only reads, so the bug is fully fixed either way.
+ */
+export type EmailOperation = 'read' | 'send';
+
+/**
  * Resolve a connected account and return its platform + provider + owner.
- * Throws a descriptive error if the account isn't found or isn't an email platform.
+ * Throws a descriptive error if the account isn't found, isn't an email platform,
+ * or is a teammate's mailbox being resolved for a send.
  */
 export async function resolveEmailAccount(
   userId: string,
-  accountId: string
+  accountId: string,
+  operation: EmailOperation = 'read'
 ): Promise<ResolvedEmailAccount> {
   const accounts = (await getAccountsWithOwnerIncludingOrgShared(userId)) || [];
   const sameId = accounts.filter(acc => acc.account_id === accountId);
@@ -167,6 +183,20 @@ export async function resolveEmailAccount(
       throw new Error(`Account "${accountId}" is a ${sameId[0].platform} account, not an email account.`);
     }
     throw new Error(`Connected account "${accountId}" not found. Use list_connected_accounts to get valid account IDs.`);
+  }
+
+  // Say plainly that the mailbox exists and is reachable but not for this
+  // operation. Reusing the "not found" message here would send the caller (and
+  // the LLM) hunting for a bad account id, which is the confusion ENG-943 was
+  // filed about in the first place.
+  // EmailProviderError, not a bare Error: the tool layer converts that type into a
+  // clean tool error, while an untyped one falls through its string checks and is
+  // rethrown as a raw exception.
+  if (operation === 'send' && account.userId !== userId) {
+    throw new EmailProviderError(
+      `Account "${accountId}" belongs to a teammate and is shared with your organization for reading only. ` +
+        `Send from your own connected mailbox, or ask its owner to send.`
+    );
   }
 
   const platform = account.platform as EmailPlatform;
