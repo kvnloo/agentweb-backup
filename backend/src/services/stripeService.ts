@@ -1085,7 +1085,27 @@ function disputeEventTimestamp(dispute: any, kind: 'opened' | 'closed'): string 
     return new Date().toISOString();
   }
   const baseMs = Math.round(createdSec * 1000);
-  return new Date(baseMs + (kind === 'closed' ? 1 : 0)).toISOString();
+  // Fold dispute.id into a stable 0-499ms offset so two DIFFERENT disputes
+  // that share the same dispute.created second don't collide on the same
+  // (userId, timestamp) key. Same dispute across retries → same offset →
+  // same key → Put replaces (idempotent). ~500 slots per second → birthday
+  // collision needs ~26 same-second disputes for one billing user before
+  // hitting 50% probability, which the traffic shape does not sustain. The
+  // opened event uses the base offset; the closed event adds 500 so
+  // opened/closed for the same dispute stay on distinct sort keys without
+  // overlapping any other dispute's opened slot.
+  const idOffset = disputeIdOffsetMs(String(dispute?.id || ''));
+  const kindOffset = kind === 'closed' ? 500 : 0;
+  return new Date(baseMs + idOffset + kindOffset).toISOString();
+}
+
+function disputeIdOffsetMs(id: string): number {
+  // Simple deterministic 32-bit hash mapped into 0..499. Idempotent per id.
+  let h = 0;
+  for (let i = 0; i < id.length; i++) {
+    h = ((h << 5) - h + id.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h) % 500;
 }
 
 /**

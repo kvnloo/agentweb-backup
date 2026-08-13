@@ -47,8 +47,19 @@ const topUpCharge = {
 };
 
 const DISPUTE_CREATED_SEC = 1_800_000_000; // deterministic sample; Stripe-shape unix seconds
-const DISPUTE_OPENED_TS = new Date(DISPUTE_CREATED_SEC * 1000).toISOString();
-const DISPUTE_CLOSED_TS = new Date(DISPUTE_CREATED_SEC * 1000 + 1).toISOString();
+// Kept in sync with disputeIdOffsetMs() in stripeService.ts. Recompute here
+// so the assertions catch any drift in the offset formula.
+function idOffsetFor(id: string): number {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = ((h << 5) - h + id.charCodeAt(i)) | 0;
+  return Math.abs(h) % 500;
+}
+const DISPUTE_OPENED_TS = new Date(
+  DISPUTE_CREATED_SEC * 1000 + idOffsetFor('dp_1'),
+).toISOString();
+const DISPUTE_CLOSED_TS = new Date(
+  DISPUTE_CREATED_SEC * 1000 + idOffsetFor('dp_1') + 500,
+).toISOString();
 
 const fullDispute = {
   id: 'dp_1',
@@ -149,6 +160,26 @@ describe('AgentWeb Credits chargeback handling', () => {
       expect(record).toHaveBeenCalledTimes(1);
       const arg = (record.mock.calls[0]![0] as any);
       expect(arg.timestamp).toBe(DISPUTE_OPENED_TS);
+    });
+
+    it('separates two disputes that share the same dispute.created second by hashing the dispute id into the timestamp offset', async () => {
+      await handleChargeDisputeCreated(fullDispute);
+      const firstTs = (record.mock.calls[0]![0] as any).timestamp;
+
+      // Same createdSec, different dispute id → must produce a different sort
+      // key so the second dispute's audit row is not silently overwritten by
+      // the first one's Put.
+      await handleChargeDisputeCreated({ ...fullDispute, id: 'dp_2' });
+      const secondTs = (record.mock.calls[1]![0] as any).timestamp;
+
+      expect(firstTs).not.toBe(secondTs);
+      // Both must still be inside the same wall-clock second (baseMs ..
+      // baseMs+999) — the offset stays under 1000ms.
+      const baseMs = DISPUTE_CREATED_SEC * 1000;
+      expect(new Date(firstTs).getTime()).toBeGreaterThanOrEqual(baseMs);
+      expect(new Date(firstTs).getTime()).toBeLessThan(baseMs + 1000);
+      expect(new Date(secondTs).getTime()).toBeGreaterThanOrEqual(baseMs);
+      expect(new Date(secondTs).getTime()).toBeLessThan(baseMs + 1000);
     });
 
     it('records the true reversal outcome when no current-month grant exists to revoke', async () => {
