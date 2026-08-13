@@ -106,7 +106,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
+const ADMIN_SKILL_TOOL_NAMES = ['inspect_orphaned_org_join_requests', 'manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -344,6 +344,7 @@ import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import type { LeadImportRowOutcome } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -4508,6 +4509,7 @@ export class AgentModeService {
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
           generationHardCapMs,
+          turnHardCapMs,
           longestMediaCallMsThisRun,
           priorMediaCallKeys: mediaCallKeysThisRun,
           approvedRevisionImageSources,
@@ -6226,6 +6228,22 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1133: keep the import ledger out of the default "store {}" fallback.
+    // The turn that truncates is the turn that cannot report — the resume has to
+    // happen on the NEXT turn, which reads this stored result. Reduced to {} it
+    // had nothing to resume from, which is how a 97-row import that stopped at
+    // 75 ended in "please retry the request". The bulky `importedIdentifiers`
+    // echo is dropped (the model already saw it in the tool message); only the
+    // counts and the rows still owed are kept.
+    if (toolName === 'add_leads_to_list') {
+      const keep = ['success', 'complete', 'resumable', 'attempted', 'reconciliation', 'unimportedRows', 'unimportedRowsTruncated', 'unimportedRowRanges'];
+      const minimal: Record<string, any> = {};
+      for (const field of keep) {
+        if (result?.[field] !== undefined) minimal[field] = result[field];
+      }
+      return minimal;
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
@@ -6916,16 +6934,27 @@ export class AgentModeService {
           }
         };
       case 'add_leads_to_list':
-        const mockNewCount = Math.floor((args.leads?.length || 0) * 0.7);
-        const mockMergedCount = (args.leads?.length || 0) - mockNewCount;
+        // Mirrors the real result contract (ENG-1133): `attempted` +
+        // `reconciliation`, no legacy scalars beside them. A mock that answers
+        // in a shape the tool no longer returns teaches mockMode callers to read
+        // fields that will be missing in production.
+        const mockAttempted = args.leads?.length || 0;
+        const mockNewCount = Math.floor(mockAttempted * 0.7);
+        const mockMergedCount = mockAttempted - mockNewCount;
         return {
           success: true,
+          complete: true,
           message: `Successfully processed: ${mockNewCount} new lead(s) created, ${mockMergedCount} lead(s) merged.`,
-          successCount: args.leads?.length || 0,
-          newCount: mockNewCount,
-          mergedCount: mockMergedCount,
-          errorCount: 0,
-          errors: []
+          attempted: mockAttempted,
+          reconciliation: {
+            created: mockNewCount,
+            merged: mockMergedCount,
+            alreadyPresent: 0,
+            duplicateInRequest: 0,
+            anonymizedSkipped: 0,
+            failed: 0,
+            unprocessed: 0,
+          },
         };
       case 'create_gtm_plan':
         const mockPhases = args.phases || [
@@ -7554,6 +7583,7 @@ export class AgentModeService {
     isDelegatedAccess?: boolean;
     renderDeadlineMs?: number;
     runBudgetDeadlineMs?: number;
+    turnHardCapMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
@@ -7568,6 +7598,9 @@ export class AgentModeService {
     // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
     // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
     if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
+    // The turn's real wall-clock cap (ENG-907), for tools that must return their result
+    // before the turn is killed rather than be guillotined mid-write (ENG-1133).
+    if (input.turnHardCapMs != null) toolOptions.turnHardCapMs = input.turnHardCapMs;
 
     return this.executeTool(
       input.llmModel,
@@ -10797,7 +10830,16 @@ export class AgentModeService {
     }
   }
 
-  public async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+  public async addLeadsToList(
+    listId: string,
+    leads: any[],
+    userId: string,
+    // The turn's real wall-clock cap (epoch ms), threaded in by the dispatcher.
+    // The import budget is clamped to it so the write loop cannot outlive the
+    // turn and lose the ledger (ENG-1133). Undefined when the caller imposes no
+    // cap at all, in which case the flat budget stands.
+    options: { turnDeadlineMs?: number } = {},
+  ): Promise<any> {
     try {
       const { crmDb } = await import('./db');
 
@@ -10849,36 +10891,166 @@ export class AgentModeService {
         return formatted;
       });
 
-      const result = await crmDb.batchCreateLeads(listId, formattedLeads);
+      const { leadImportWriteBudgetMs } = await import('../utils/leadImportLedger');
+      const result = await crmDb.batchCreateLeads(listId, formattedLeads, {
+        // A file the user may re-send after a truncated run: dedupe the rows
+        // that carry no identity of their own, or every retry duplicates them.
+        dedupeByNameCompany: true,
+        // Come back with a resumable partial rather than being guillotined by
+        // the whole-turn cap with nothing to report (ENG-1133). Clamped to the
+        // run's remaining budget: a full-length budget started late in a turn
+        // would outlive the turn and lose the ledger it exists to produce.
+        deadlineMs: leadImportWriteBudgetMs(Date.now(), options.turnDeadlineMs),
+      });
+
+      // ENG-1133: report the import row by row, not just in aggregate. A large
+      // import can be cut off mid-way (the whole-turn cap fires between calls),
+      // and "25 new lead(s) created" tells the next turn nothing about WHICH
+      // rows landed — so the only offer left was "retry the whole request".
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, capLeadResumeRows, summarizeLeadRowNumbers } = await import('../utils/leadImportLedger');
+      const attempted = leads.length;
+      const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
+      const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
+      const reconciliation = {
+        created: tally('created'),
+        merged: tally('merged'),
+        alreadyPresent: tally('already_present'),
+        duplicateInRequest: tally('duplicate_in_request'),
+        anonymizedSkipped: tally('anonymized_skipped'),
+        failed: tally('failed'),
+        unprocessed: tally('unprocessed'),
+      };
+
+      // Rows can only be NAMED when the ledger is in input order. Without it the
+      // counts still reconcile, but pointing at a specific row would be a guess.
+      const importedIdentifiers: string[] = [];
+      const unimportedRows: Array<{ row: number; identifier: string; reason: LeadImportRowOutcome }> = [];
+      if (rowAligned) {
+        outcomes.forEach((outcome, index) => {
+          const identifier = describeLeadRow(leads[index], index);
+          if (outcome === 'created' || outcome === 'merged' || outcome === 'already_present') {
+            importedIdentifiers.push(identifier);
+          } else if (outcome === 'failed' || outcome === 'unprocessed') {
+            unimportedRows.push({ row: index + 1, identifier, reason: outcome });
+          }
+        });
+      }
+
+      const landed = reconciliation.created + reconciliation.merged + reconciliation.alreadyPresent;
+      const missing = reconciliation.failed + reconciliation.unprocessed;
+      const complete = attempted > 0 && missing === 0;
 
       const messageParts: string[] = [];
-      if (result.newCount > 0) {
-        messageParts.push(`${result.newCount} new lead(s) created`);
+      if (reconciliation.created > 0) {
+        messageParts.push(`${reconciliation.created} new lead(s) created`);
       }
-      if (result.mergedCount > 0) {
-        messageParts.push(`${result.mergedCount} lead(s) merged`);
+      if (reconciliation.merged > 0) {
+        messageParts.push(`${reconciliation.merged} lead(s) merged`);
       }
-      if (result.errorCount > 0) {
-        messageParts.push(`${result.errorCount} lead(s) failed`);
+      // A row already in the list, unchanged, is a completed row — saying so is
+      // what makes re-sending a partially-imported file readable as progress
+      // instead of as a failed import.
+      if (reconciliation.alreadyPresent > 0) {
+        messageParts.push(`${reconciliation.alreadyPresent} lead(s) already present and up to date`);
+      }
+      if (reconciliation.duplicateInRequest > 0) {
+        messageParts.push(`${reconciliation.duplicateInRequest} duplicate row(s) in the request skipped`);
       }
       // ENG-1002 (follow-up): say so when rows were refused as anonymized
       // placeholders, so the agent cannot report a clean import that silently
       // wrote fewer records than the caller handed over.
-      const anonymizedSkipped = result.anonymizedSkipped || 0;
-      if (anonymizedSkipped > 0) {
-        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      if (reconciliation.anonymizedSkipped > 0) {
+        messageParts.push(`${reconciliation.anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
+      if (reconciliation.failed > 0) {
+        messageParts.push(`${reconciliation.failed} lead(s) failed`);
+      }
+      if (reconciliation.unprocessed > 0) {
+        messageParts.push(`${reconciliation.unprocessed} lead(s) never processed`);
       }
 
+      const summary = messageParts.length > 0
+        ? `Successfully processed: ${messageParts.join(', ')}.`
+        : 'No leads were processed.';
+      // The resume list is budgeted by size, so every realistic partial names
+      // every missing row. If a pathological one is still trimmed, saying so is
+      // not optional: naming a slice is not a resume — the agent imports it,
+      // gets a clean `complete: true` for that call and reports the import
+      // finished, stranding the rest. `unimportedRowRanges` is the backstop that
+      // is never trimmed: every missing position in the rows just sent, run
+      // length encoded.
+      const unimportedRowRanges = summarizeLeadRowNumbers(unimportedRows.map(r => r.row));
+      const resume = unimportedRows.length > 0
+        ? capLeadResumeRows('unimportedRows', unimportedRows)
+        : {};
+      const resumeShown = (resume.unimportedRows || []).length;
+      const resumeTruncated = resumeShown > 0 && resumeShown < unimportedRows.length
+        ? `unimportedRows details only the FIRST ${resumeShown} of ${unimportedRows.length} missing rows, `
+          + `but unimportedRowRanges (${unimportedRowRanges}) lists EVERY missing position in the rows you just sent — resend all of them. `
+          + `The import is not done until a result comes back with complete: true. `
+        : '';
+      // The list itself could not be read inside the budget, so nothing was
+      // attempted. Resending the same rows would hit the same wall, so this is
+      // a blocker to report — not the resume path every other partial takes.
+      const dedupeIncomplete = (result as any).dedupeIncomplete === true;
+      // A partial is worth resuming only while rows remain that were never
+      // attempted: re-sending those makes progress. If nothing landed and every
+      // row was attempted, they all failed on write — resending the same rows
+      // would fail the same way, so that is a plain failure with no resume
+      // offer, not a resume the agent will loop on.
+      const resumable = !complete && attempted > 0 && !dedupeIncomplete
+        && (landed > 0 || reconciliation.unprocessed > 0);
+      const message = dedupeIncomplete
+        ? `Import not attempted: this list has more existing leads than can be read within the import budget, `
+          + `and importing without reading them first would duplicate rows already in the list. `
+          + `No rows were written. Do NOT retry the same call — tell the user the list is too large to import into and needs splitting or a smaller list.`
+        : attempted === 0
+        ? 'No leads were processed.'
+        : complete
+          ? summary
+          : !resumable
+          ? `Import failed: none of the ${attempted} row(s) could be written. ${summary} `
+            + `Every row was attempted, so re-sending them would fail the same way — `
+            + `report the errors to the user instead of retrying.`
+          : `Partial import: ${landed} of ${attempted} row(s) are in the list. ${summary} `
+            + `RESUME by calling add_leads_to_list again with ONLY the ${unimportedRows.length > 0 ? 'rows listed in unimportedRows' : 'rows that did not import'} — `
+            + `do not ask the user to retry the request. ${resumeTruncated}`
+            + `Re-sending an already-imported row is safe (it merges instead of duplicating).`;
+
       return {
-        success: result.successCount > 0,
-        message: messageParts.length > 0
-          ? `Successfully processed: ${messageParts.join(', ')}.`
-          : 'No leads were processed.',
-        successCount: result.successCount,
-        newCount: result.newCount || 0,
-        mergedCount: result.mergedCount || 0,
-        errorCount: result.errorCount,
-        anonymizedSkipped,
+        // An incomplete import is NOT a tool failure, and must not be reported
+        // as one. `success: false` is read at the dispatch boundary
+        // (toolResultError → executePreparedTools) and downgrades the whole call
+        // to a structured tool error: the model is then handed the message
+        // string ALONE — `unimportedRows` and `reconciliation` never reach it —
+        // the call is billed to failedFunctions, the CRM refresh is skipped, and
+        // the appended retryability verdict tells the agent "do NOT retry […]
+        // report the blocker to the user". That is precisely the whole-request
+        // hand-off this ticket exists to remove. So failure is reserved for a
+        // call that landed NOTHING AND has nothing left to resume; an import
+        // that wrote rows, or still owes rows it never reached, succeeds while
+        // carrying `complete: false` and its resume list. Success has to follow
+        // the resume offer exactly — `success: false` beside `resumable: true`
+        // would strip the resume list and tell the agent to stop, which is the
+        // contradiction this ticket removes.
+        success: complete || landed > 0 || resumable,
+        complete,
+        ...(resumable ? { resumable: true } : {}),
+        message,
+        attempted,
+        // `reconciliation` is the ONLY set of counts on the wire. The legacy
+        // scalars used to sit beside it and disagree with it: the DB layer's
+        // `errorCount` tallies in-request duplicates together with genuine
+        // write failures, so a clean import of a file containing one repeated
+        // row reported `errorCount: 1` next to `failed: 0`, and a model reading
+        // the payload could truthfully say a lead had failed when none had.
+        // Two counts of the same thing is exactly the "numbers don't add up"
+        // the ticket is about, so there is now one (ENG-1133).
+        reconciliation,
+        ...(importedIdentifiers.length > 0 ? capLeadRowList('importedIdentifiers', importedIdentifiers) : {}),
+        ...(unimportedRows.length > 0
+          ? { ...resume, unimportedRowRanges }
+          : {}),
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {
@@ -14886,13 +15058,20 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       // for a run whose production publish had already landed and been verified. It
       // is told what succeeded (below) and forbidden from turning an interruption
       // into a claim of lost work.
+      //
+      // ENG-1133: the ledger's numbers are INVOCATION counts, and unlabelled they
+      // read as a quantity of things. Handed {"add_leads_to_list":3} for a run that
+      // wrote 75 leads over three calls, this agent told the customer "I have
+      // successfully added the 3 leads to your CRM list" — the tool ran 3 times.
+      // The unit has to be on the wire, because the agent never sees tool RESULTS.
       const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
 
 TRUTHFULNESS RULES (these override tone):
 - The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
-- Do not attribute a failure to an operation that appears in the succeeded list.`;
+- Do not attribute a failure to an operation that appears in the succeeded list.
+- The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14905,10 +15084,10 @@ TRUTHFULNESS RULES (these override tone):
         parts.push('No work plan.');
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
-        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+        parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
-        parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
+        parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
       }
 
       const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
