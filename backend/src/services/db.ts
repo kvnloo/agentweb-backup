@@ -14,7 +14,7 @@ import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
-import { isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
+import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3073,8 +3073,8 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
-// A single UpdateExpression is capped, so shed in batches. Each write shifts the
-// survivors down, which is why every batch removes from index 0 again.
+// A single UpdateExpression is capped at 4KB, so shed in batches. Each write shifts
+// the survivors down, which is why every batch removes from index 0 again.
 const MAX_RUN_RESULT_REMOVALS_PER_WRITE = 50;
 
 /**
@@ -3275,7 +3275,14 @@ export const scheduleDb = {
      * ENG-827: attributes that must STILL hold for this write to land, as read a
      * moment ago. `undefined` means the attribute must still be absent.
      */
-    expect?: Record<string, any>
+    expect?: Record<string, any>,
+    /**
+     * ENG-1048: shed this many of the OLDEST run results as part of THIS write. The
+     * trim exists to make room for the edit, so the two have to land together —
+     * shedding first and then failing the edit would delete history for a save that
+     * never happened. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     */
+    removeOldestRunResults?: number
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3306,12 +3313,25 @@ export const scheduleDb = {
         expressionAttributeValues[`:${alias}`] = value;
       });
 
+      // ENG-1048: removing by index (rather than SETting a list built from a read)
+      // is what makes this safe against a run finishing mid-edit: appends land at the
+      // tail, so index 0 still names the oldest entry. `runResults` is never also SET
+      // here — overlapping document paths in one expression are rejected.
+      let removeExpression = '';
+      if (removeOldestRunResults && removeOldestRunResults > 0) {
+        expressionAttributeNames['#runResults'] = 'runResults';
+        removeExpression = ` REMOVE ${Array.from(
+          { length: Math.min(removeOldestRunResults, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          (_, index) => `#runResults[${index}]`
+        ).join(", ")}`;
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",

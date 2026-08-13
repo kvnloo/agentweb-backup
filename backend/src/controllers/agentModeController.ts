@@ -64,6 +64,7 @@ import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
 import {
+  MAX_ATOMIC_RUN_RESULT_REMOVALS,
   SCHEDULE_ITEM_BUDGET_BYTES,
   estimateDynamoItemBytes,
   isDynamoItemSizeError,
@@ -143,11 +144,29 @@ const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 async function applyScheduleEditWithConsentNarrowing(
   scheduleId: string,
   updates: any,
-  firstRead: any
+  firstRead: any,
+  // ENG-1048: run results this edit has to shed to fit, carried by the SAME write so
+  // history is never deleted for an edit that then fails. A conditional retry below
+  // re-sends it unchanged: a rejected write removed nothing, so the indexes still hold.
+  removeOldestRunResults = 0
 ): Promise<void> {
+  // Pass only the arguments this write actually needs, so an ordinary edit stays an
+  // ordinary two-argument update.
+  const write = async (payload: any, expectation?: Record<string, any>) => {
+    if (removeOldestRunResults > 0) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation, removeOldestRunResults);
+      return;
+    }
+    if (expectation) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+      return;
+    }
+    await scheduleDb.updateSchedule(scheduleId, payload);
+  };
+
   // An edit that does not move the required tools cannot move the scope: plain write.
   if (updates.requiredFunctionCalls === undefined) {
-    await scheduleDb.updateSchedule(scheduleId, updates);
+    await write(updates);
     return;
   }
 
@@ -195,11 +214,11 @@ async function applyScheduleEditWithConsentNarrowing(
 
     try {
       if (expectation) {
-        await scheduleDb.updateSchedule(scheduleId, { ...updates, ...consentUpdates }, expectation);
+        await write({ ...updates, ...consentUpdates }, expectation);
       } else {
         // Nothing to narrow — no condition to assert, and no reason to make an ordinary
         // edit fail because somebody touched consent at the same moment.
-        await scheduleDb.updateSchedule(scheduleId, updates);
+        await write(updates);
       }
       return;
     } catch (writeError: any) {
@@ -8730,7 +8749,7 @@ export const agentModeController = {
           // Never write run history back from the read above: a run finishing while
           // this edit is in flight appends to the tail, and a full-list write derived
           // from that earlier read would erase its result. Shed by index instead,
-          // once the rest of the edit is known to fit.
+          // inside the edit's own write.
           runResultsToShed = dropped;
         } else {
           updates[listKey] = kept;
@@ -8746,18 +8765,26 @@ export const agentModeController = {
           error: `Scheduled chat is too large to save (about ${Math.round(estimateDynamoItemBytes(projectedItem) / 1024)}KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
         });
       }
-
-      // Only now that the edit is known to fit — a rejected save must not have already
-      // cost the owner run history.
-      if (runResultsToShed > 0) {
-        await scheduleDb.dropOldestRunResults(scheduleId, runResultsToShed);
+      // Refuse rather than shed more history than the edit's own write can carry: the
+      // alternative is deleting history in a separate write and then possibly failing
+      // the edit, which costs the owner run history for a save that never happened.
+      if (runResultsToShed > MAX_ATOMIC_RUN_RESULT_REMOVALS) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit would mean dropping ${runResultsToShed} saved runs from this schedule's history at once. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
       }
 
       // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
       // neither can be acknowledged without the other. See
       // applyScheduleEditWithConsentNarrowing. The consent fields it may add are a
-      // handful of scalars, comfortably inside the budget's headroom.
-      await applyScheduleEditWithConsentNarrowing(scheduleId, updates, existingSchedule);
+      // handful of scalars, comfortably inside the budget's headroom. ENG-1048's run
+      // history shed rides the same write for the same reason.
+      await applyScheduleEditWithConsentNarrowing(
+        scheduleId,
+        updates,
+        existingSchedule,
+        runResultsToShed
+      );
 
       res.json({
         message: 'Scheduled chat updated successfully',

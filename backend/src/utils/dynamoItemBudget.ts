@@ -26,6 +26,15 @@ export const DYNAMO_MAX_ITEM_BYTES = 400 * 1024;
  */
 export const SCHEDULE_ITEM_BUDGET_BYTES = 380 * 1024;
 
+/**
+ * The most run results a single write can shed alongside an edit and stay inside
+ * DynamoDB's 4 KB `UpdateExpression` limit — each dropped entry is named by index.
+ * The shed has to ride the edit's own write (deleting history first and then failing
+ * the edit would cost the owner run history for a save that never happened), so a
+ * schedule needing more than this to fit is refused outright instead.
+ */
+export const MAX_ATOMIC_RUN_RESULT_REMOVALS = 100;
+
 const utf8 = (value: string): number => Buffer.byteLength(value, 'utf8');
 
 /**
