@@ -31,6 +31,11 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
+    // ENG-827 stamps the run's publish admission before the first turn. A missing mock
+    // throws, and the controller treats an unrecordable admission as draft-only — which
+    // strips the publish tool out of requiredFunctionCalls, so the requirement is never
+    // unmet and this suite's breaker never gets to fire.
+    updateSessionPublishAdmission: jest.fn(),
   },
 }));
 
