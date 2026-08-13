@@ -61,7 +61,6 @@ jest.mock('../services/db', () => ({
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
     updateSchedule: jest.fn(),
-    dropOldestRunResults: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
   userDb: {
@@ -436,7 +435,7 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
     await agentModeController.updateScheduledChat(req, res);
 
-    const dropped = mockScheduleDb.updateSchedule.mock.calls[0][3] as any as number;
+    const { count: dropped } = mockScheduleDb.updateSchedule.mock.calls[0][3] as any;
     expect(dropped).toBeGreaterThan(0);
     const kept = runResults.slice(dropped);
     // Newest runs survive; the oldest are the ones dropped.
@@ -465,11 +464,40 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
     await agentModeController.updateScheduledChat(req, res);
 
-    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
     const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
     expect(updates.runResults).toBeUndefined();
-    expect(mockScheduleDb.updateSchedule.mock.calls[0][3]).toBeGreaterThan(0);
+    const shed = mockScheduleDb.updateSchedule.mock.calls[0][3] as any;
+    expect(shed.count).toBeGreaterThan(0);
+    // Bound to the history the count was measured against, so a run recording at the
+    // same moment cannot make this removal take a second prefix.
+    expect(shed.expectedLength).toBe(12);
+  });
+
+  // FAIL: if that binding no longer holds, the save is refused — replaying a count
+  // taken against different history is what over-deletes
+  it('reports a conflict when run history moves while the edit is saving', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
+      promptRevisions: [],
+      runResults: Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) })),
+    }) as any);
+    mockScheduleDb.updateSchedule.mockRejectedValue(Object.assign(new Error('stale'), {
+      code: 'ConditionalCheckFailedException',
+    }));
+
+    const res = makeRes();
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-big' },
+      body: { startingMessage: 'q'.repeat(36000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect((res.json as jest.Mock).mock.calls[0][0].error).toMatch(/run history|try again/i);
+    // One attempt only: the shed count cannot be replayed against different history.
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
   });
 
   // FAIL: a save that is rejected must not have already dropped the owner's run history
@@ -486,7 +514,6 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     await agentModeController.updateScheduledChat(req, res);
 
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
 
@@ -514,7 +541,6 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     expect((res.json as jest.Mock).mock.calls[0][0].error).toMatch(/too large to save/i);
     expect((res.json as jest.Mock).mock.calls[0][0].error).toMatch(/saved runs/i);
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
-    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
   });
 
   // FAIL: a prompt that cannot fit at all is a client error with a reason, not a 500
@@ -590,7 +616,6 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
     expect(updates.promptRevisions).toHaveLength(2);
     expect(updates.runResults).toBeUndefined();
-    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
     expect(res.status).not.toHaveBeenCalledWith(400);
   });
 });
