@@ -39,12 +39,14 @@ export async function findOrphanedOrgJoinRequests(
   const organizations = orgs.slice(0, MAX_ORGANIZATIONS);
   const exceededOrganizationCap = orgs.length > MAX_ORGANIZATIONS;
   let pendingRequestsScanned = 0;
+  let organizationsScanned = 0;
   const missingUserReferences: OrphanedOrgJoinReference[] = [];
   let truncated = exceededOrganizationCap;
   const requestedByUserId = new Map<string, OrphanedOrgJoinReference[]>();
   const userIdsToLookup: string[] = [];
 
   orgLoop: for (const organization of organizations) {
+    organizationsScanned += 1;
     const requests = Array.isArray(organization.pendingDomainJoinRequests)
       ? organization.pendingDomainJoinRequests
       : [];
@@ -108,7 +110,7 @@ export async function findOrphanedOrgJoinRequests(
   }
 
   const result = {
-    organizationsScanned: organizations.length,
+    organizationsScanned,
     pendingRequestsScanned,
     missingUserReferences,
     truncated,
