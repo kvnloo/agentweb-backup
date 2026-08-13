@@ -2839,6 +2839,22 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
   }
 });
 
+// ─── Organization Diagnostics (admin-only) ─────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'inspect_orphaned_org_join_requests',
+  definition: {
+    name: 'inspect_orphaned_org_join_requests',
+    description: 'Inspect pending organization join requests whose user record no longer exists. Admin-only, read-only; repair is not supported by this tool.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  execute: async (_args: any, context: any) => jsonResult(await mcpFetch({
+    method: 'GET',
+    path: '/api/admin/org-diagnostics/orphaned-org-join-requests',
+    context: ctx(context),
+  })),
+});
+
 // ─── Client Health Assessment (admin-only) ──────────────────────────────────
 
 mcpToolRegistry.register({
