@@ -61,6 +61,11 @@ export async function findOrphanedOrgJoinRequests(
   }
 
   for (let i = 0; i < userIdsToLookup.length; i += MAX_USER_LOOKUP_BATCH) {
+    if (missingUserReferences.length >= MAX_RESULTS) {
+      truncated = true;
+      break;
+    }
+
     const batch = userIdsToLookup.slice(i, i + MAX_USER_LOOKUP_BATCH);
     const lookupResults = await Promise.all(
       batch.map(async (userId) => ({
