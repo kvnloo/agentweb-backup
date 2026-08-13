@@ -56,6 +56,7 @@ export interface OAuthSignupIntent {
   clientId: string;
   userAgentHash: string;
   ipHash: string;
+  handoffBindingHash?: string;
   purpose: "mcp_signup";
   used: boolean;
   expiresAt: number; // epoch seconds (DynamoDB TTL)
@@ -257,6 +258,7 @@ export class McpOAuthService {
     clientId: string,
     userAgentHash: string,
     ipHash: string,
+    handoffBindingHash?: string,
   ): Promise<void> {
     const nowSec = Math.floor(Date.now() / 1000);
     const record: OAuthSignupIntent = {
@@ -264,6 +266,7 @@ export class McpOAuthService {
       clientId,
       userAgentHash,
       ipHash,
+      ...(handoffBindingHash && { handoffBindingHash }),
       purpose: "mcp_signup",
       used: false,
       expiresAt: nowSec + 15 * 60,
@@ -283,6 +286,7 @@ export class McpOAuthService {
     clientId: string,
     userAgentHash: string,
     ipHash: string,
+    handoffBindingHash?: string,
   ): Promise<boolean> {
     const result = await dynamodb
       .get({
@@ -296,10 +300,20 @@ export class McpOAuthService {
     if (record.clientId !== clientId) return false;
     const userAgentMatches = record.userAgentHash === userAgentHash;
     const ipMatches = record.ipHash === ipHash;
-    // Avoid false negatives when network boundaries or browser fingerprints
-    // legitimately change during MCP sign-up. Accept if either binding signal
-    // still matches the original context.
-    if (!userAgentMatches && !ipMatches) return false;
+    const handoffBindingMatches =
+      typeof handoffBindingHash === "string" &&
+      record.handoffBindingHash &&
+      record.handoffBindingHash === handoffBindingHash;
+
+    // Preferred check: explicit handoff binding that is server-issued and
+    // carried in the signed signup intent. This avoids false negatives when
+    // the MCP tool and browser present different network/user-agent context.
+    if (!handoffBindingMatches) {
+      // Backward-compatible fallback: accept if either observed context signal
+      // matches, which avoids breaking older signup intents that did not include
+      // the binding hash.
+      if (!userAgentMatches && !ipMatches) return false;
+    }
     if (record.used) return false;
     if (record.purpose !== "mcp_signup") return false;
 

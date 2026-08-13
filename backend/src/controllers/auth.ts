@@ -177,6 +177,7 @@ export const register = async (req: Request, res: Response) => {
           purpose?: string;
           clientId?: string;
           intentId?: string;
+          intentBinding?: string;
         };
         if (
           intent?.purpose === "mcp_signup" &&
@@ -188,6 +189,9 @@ export const register = async (req: Request, res: Response) => {
             intent.clientId,
             computeBindingHash(req.get("user-agent") || ""),
             computeBindingHash(requestClientIp(req)),
+            typeof intent.intentBinding === "string"
+              ? computeBindingHash(intent.intentBinding)
+              : undefined,
           );
           if (canUseIntent) signupSource = "mcp";
         }

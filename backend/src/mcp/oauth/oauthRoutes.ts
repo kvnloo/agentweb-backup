@@ -230,19 +230,31 @@ export function setupMcpOAuth(app: express.Express) {
     // endpoint accepts MCP attribution only with this server-minted intent,
     // so a normal public signup cannot spoof acquisition source.
     const signupIntentId = crypto.randomBytes(24).toString('hex');
+    const signupIntentBinding = crypto.randomBytes(24).toString('hex');
     const intentContext = {
       userAgentHash: computeBindingHash(req.get('user-agent') || ''),
       ipHash: computeBindingHash(clientIpFromRequest(req)),
     };
     try {
-      await mcpOAuthService.createSignupIntent(signupIntentId, client_id, intentContext.userAgentHash, intentContext.ipHash);
+      await mcpOAuthService.createSignupIntent(
+        signupIntentId,
+        client_id,
+        intentContext.userAgentHash,
+        intentContext.ipHash,
+        computeBindingHash(signupIntentBinding),
+      );
     } catch (error) {
       console.error('[MCP-OAuth] Failed to store signup intent:', error);
       return res.status(503).json({ error: 'Unable to initialize MCP signup flow' });
     }
 
     const signupIntent = jwt.sign(
-      { purpose: 'mcp_signup', clientId: client_id, intentId: signupIntentId },
+      {
+        purpose: 'mcp_signup',
+        clientId: client_id,
+        intentId: signupIntentId,
+        intentBinding: signupIntentBinding,
+      },
       getJwtSecret(),
       { expiresIn: '15m' },
     );
