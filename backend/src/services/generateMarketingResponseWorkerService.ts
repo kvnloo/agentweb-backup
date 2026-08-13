@@ -36,6 +36,10 @@ interface GenerateMarketingResponseParams {
   // Explicit cost-policy fallback. `null` survives IPC and means no retry;
   // omission preserves the global admin fallback for unrestricted requests.
   transientFallbackModel?: string | null;
+  // ENG-936: approved source URLs for confirmed image revisions. When supplied,
+  // the tool dispatcher rejects confirm=true generate_image calls that reference
+  // any unapproved source image for this run.
+  approvedRevisionImageSources?: string[];
 }
 
 interface GenerateMarketingResponseResult {
