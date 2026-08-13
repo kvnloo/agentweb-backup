@@ -159,6 +159,27 @@ describe('scheduleDb.addRunResult item budget', () => {
       .rejects.toThrow('Item size has exceeded the maximum allowed size');
   });
 
+  // FAIL: an edit shedding history has the same exposure as the recovery — a recovery
+  // that drops one entry and appends its own leaves the length untouched, so length
+  // alone would wave a stale removal count through
+  it('binds an edit-time shed to the tail entry as well as the length', async () => {
+    mockDocumentClientMethods.update.mockReturnValue(resolved({ Attributes: {} }));
+    const last = { runId: 'run-11' };
+
+    await scheduleDb.updateSchedule(
+      'sched-1',
+      { startingMessage: 'new' },
+      undefined,
+      { count: 2, expectedLength: 12, expectedLast: last },
+    );
+
+    const params = mockDocumentClientMethods.update.mock.calls[0][0];
+    expect(params.UpdateExpression).toMatch(/REMOVE #runResults\[0\], #runResults\[1\]/);
+    expect(params.ConditionExpression).toContain('size(#runResults) = :expectedRunResultsLength');
+    expect(params.ConditionExpression).toContain('#runResults[11] = :expectedRunResultsLast');
+    expect(params.ExpressionAttributeValues[':expectedRunResultsLast']).toEqual(last);
+  });
+
   // FAIL: an unrelated failure must not trigger the read-modify-write path
   it('rethrows a non-size error without re-reading the row', async () => {
     mockDocumentClientMethods.update.mockReturnValue(rejected(Object.assign(new Error('nope'), {
