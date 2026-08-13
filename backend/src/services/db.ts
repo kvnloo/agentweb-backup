@@ -6581,8 +6581,33 @@ export const crmDb = {
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
       let lastKey = undefined;
+      // ENG-1133: checking the clock BETWEEN pages is not enough — a single
+      // page that stalls holds the await open past the budget and the check
+      // below is never reached, so the turn dies with no ledger anyway. Bound
+      // each page by whatever budget is left. A rejection still propagates: a
+      // query that fails is a real error, and nothing has been written yet.
+      const readExistingPage = async (startKey: any) => {
+        const read = this.getLeadsByListId(listId, 100, startKey);
+        if (deadlineAt === null) return read;
+        read.catch(() => undefined); // handled by the race; keeps Node quiet if we bail first
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) return null;
+        let timer: NodeJS.Timeout | undefined;
+        const expired = new Promise<null>(resolve => {
+          timer = setTimeout(() => resolve(null), remaining);
+        });
+        try {
+          return await Promise.race([read, expired]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
       do {
-        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        const result = await readExistingPage(lastKey);
+        if (result === null) {
+          results.dedupeIncomplete = true;
+          break;
+        }
         allExistingLeads.push(...result.items);
         lastKey = result.lastEvaluatedKey;
         // ENG-1133: the pre-read is O(list size) and runs before any row is
