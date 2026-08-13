@@ -482,28 +482,104 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       );
     });
 
-    it('does not alert on a later run that the pre-flight gate short-circuits', async () => {
-      // Second run in the common case: the recorded revocation makes the gate
-      // refuse before Meta is called at all, so the alert path is never reached.
+    /**
+     * The production state of account 922903076601160, read from the live record:
+     * `granted_scopes: []` + `ads_scope_revoked_at: 2026-07-31T07:00:21.688Z`.
+     *
+     * This is the account ENG-1158 was filed about, and it is the case the
+     * transition-only alert could never serve. Detection fired on 2026-07-31 —
+     * before any notification existed — so the revocation is on file while the
+     * owner has been told nothing. Every run since refuses at the pre-flight gate
+     * without calling Meta, so the post-flight detection path never runs again.
+     * Keyed off the transition, this owner would stay silent forever.
+     */
+    // A factory, not a shared constant: the alert marks the in-memory record so a
+    // single run cannot email twice, and a shared fixture would carry that mark
+    // between tests. A real run re-reads the account from DynamoDB each time.
+    const latchedBeforeAnyAlert = () => ({
+      id: 'user1',
+      connected_accounts: [
+        metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
+      ],
+    });
+
+    it('alerts the owner of an account latched before the alert existed', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
+      );
+      // Still gated off Meta — notifying must not cost the impossible read.
+      expect(metaService.listCampaigns).not.toHaveBeenCalled();
+    });
+
+    it('records that it told them, so the next blocked run stays quiet', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(userId).toBe('user1');
+      expect(platform).toBe('meta');
+      expect(accountId).toBe(AD_ACCOUNT_ID);
+      expect(typeof updates.ads_scope_alerted_at).toBe('string');
+      // Capability state is not touched — this write only records the notice.
+      expect(updates.granted_scopes).toBeUndefined();
+    });
+
+    it('does not alert twice for the same outage — one email per episode', async () => {
+      // Feed back exactly what the previous run persisted, as the next daily
+      // scheduled run would read it.
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         id: 'user1',
         connected_accounts: [
-          metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
+          metaAccount({
+            granted_scopes: [],
+            ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+            ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
+          }),
         ],
       });
 
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
 
-    it('does not alert again when the refusal reaches Meta but is already recorded — one email per episode', async () => {
-      // The case the gate does NOT cover: an affirmative `ads_read` grant beats
-      // the revocation marker in getMetaAdsScopeState, so pre-flight lets this
-      // through and Meta itself refuses. Detection re-runs and re-persists, but
-      // the owner was already told — re-telling them every scheduled run is spam.
-      // This is the only route that reaches the `persisted && !alreadyRecorded`
-      // dedup guard, so it is the only test that can fail for it.
+    it('does not email when the notice could not be recorded — better silent than daily spam', async () => {
+      // Without a durable marker there is nothing to stop the next run, and the
+      // next, from emailing again. An unsent notice is recoverable; a mail loop
+      // aimed at a customer is not.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+      mockUpdateAccountConfig.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      // ...and the caller still gets the actionable error.
+      expect(err.isMetaAdsScopeError).toBe(true);
+    });
+
+    it('still refuses with the actionable error when the alert itself throws', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(latchedBeforeAnyAlert());
+      mockNotifyMetaAdsScopeLost.mockRejectedValue(new Error('Resend down'));
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(err.isMetaAdsScopeError).toBe(true);
+      expect(err.message).toContain(META_ADS_RECONSENT_MESSAGE);
+    });
+
+    it('treats a reconnect that Meta still refuses as a new episode worth alerting', async () => {
+      // An affirmative `ads_read` grant beats the revocation marker in
+      // getMetaAdsScopeState, so pre-flight lets this through and Meta itself
+      // refuses. A grant recorded after the revocation means the owner has
+      // reconnected since — this is a fresh outage, not the one they were
+      // already told about, and the cleared marker is what makes it alertable.
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         id: 'user1',
         connected_accounts: [
@@ -519,9 +595,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
 
       // Meta was reached — this really did travel the post-flight path.
       expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
-      expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
-      // ...and the owner is not emailed a second time for the same episode.
-      expect(mockNotifyMetaAdsScopeLost).not.toHaveBeenCalled();
+      expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledTimes(1);
       // The caller still gets the actionable error.
       expect(err.isMetaAdsScopeError).toBe(true);
     });
