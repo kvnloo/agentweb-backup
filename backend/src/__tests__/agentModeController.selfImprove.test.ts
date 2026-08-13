@@ -436,8 +436,7 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
     await agentModeController.updateScheduledChat(req, res);
 
-    const [scheduleId, dropped] = mockScheduleDb.dropOldestRunResults.mock.calls[0] as any;
-    expect(scheduleId).toBe('sched-big');
+    const dropped = mockScheduleDb.updateSchedule.mock.calls[0][3] as any as number;
     expect(dropped).toBeGreaterThan(0);
     const kept = runResults.slice(dropped);
     // Newest runs survive; the oldest are the ones dropped.
@@ -448,8 +447,10 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
   // FAIL: the trimmed history must NEVER be written back from this handler's own read.
   // A run finishing while the owner saves an edit appends to the tail, and a full-list
-  // write derived from the earlier read would erase that completed run's result.
-  it('sheds run history by index instead of rewriting the list it read', async () => {
+  // write derived from the earlier read would erase that completed run's result. The
+  // shed also has to ride along with the edit, so a rejected save cannot leave history
+  // deleted for an edit that never landed.
+  it('sheds run history by index, in the same write as the edit', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
       promptRevisions: [],
       runResults: Array.from({ length: 12 }, (_, i) => ({ runId: `run-${i}`, summary: 'r'.repeat(30000) })),
@@ -464,9 +465,11 @@ describe('updateScheduledChat DynamoDB item budget', () => {
 
     await agentModeController.updateScheduledChat(req, res);
 
-    expect(mockScheduleDb.dropOldestRunResults).toHaveBeenCalled();
+    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
     const updates = mockScheduleDb.updateSchedule.mock.calls[0][1] as any;
     expect(updates.runResults).toBeUndefined();
+    expect(mockScheduleDb.updateSchedule.mock.calls[0][3]).toBeGreaterThan(0);
   });
 
   // FAIL: a save that is rejected must not have already dropped the owner's run history
@@ -483,6 +486,34 @@ describe('updateScheduledChat DynamoDB item budget', () => {
     await agentModeController.updateScheduledChat(req, res);
 
     expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
+    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  // FAIL: more history than one atomic write can shed is a 400, never a destructive
+  // pre-write followed by a failed edit
+  it('refuses to save rather than shed more history than one write can carry', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(nearLimitSchedule({
+      promptRevisions: [],
+      startingMessage: 'p'.repeat(300000),
+      // Thousands of tiny entries: fitting the item needs far more removals than a
+      // single UpdateExpression can name.
+      runResults: Array.from({ length: 6000 }, (_, i) => ({ runId: `r${i}` })),
+    }) as any);
+
+    const res = makeRes();
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-big' },
+      body: { startingMessage: 'q'.repeat(330000) },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect((res.json as jest.Mock).mock.calls[0][0].error).toMatch(/too large to save/i);
+    expect((res.json as jest.Mock).mock.calls[0][0].error).toMatch(/saved runs/i);
+    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
     expect(mockScheduleDb.dropOldestRunResults).not.toHaveBeenCalled();
   });
 
