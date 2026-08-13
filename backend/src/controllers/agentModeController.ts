@@ -2199,6 +2199,7 @@ type RunVerifiedChatResult = {
   // exhausted all 20 attempts for some other reason.
   publishHeldForApproval?: boolean;
   publishRequirementMismatch?: boolean;
+  publishToolFailing?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -3001,13 +3002,20 @@ export async function runVerifiedChat(
       if (publishIsTheOnlyThingLeft) {
         publishPressAttempts++;
       }
-      // A stalled publish requirement has two causes and they need opposite things
-      // from the owner, so the marker must not conflate them. Only SUCCEEDED
-      // external writes count as evidence the run published — a failed publish
-      // wrote nothing and is still a genuine withhold.
+      // A stalled publish requirement has three causes and they need different
+      // things from the owner, so the marker must not conflate them. Only
+      // SUCCEEDED external writes count as evidence the run published — a failed
+      // publish wrote nothing. But a failed publish is not silence either: it
+      // means the model DID reach for the tool and the integration is broken, so
+      // the attempted-but-unsuccessful names are reported separately.
       const externalWritesSucceeded = publishIsTheOnlyThingLeft
         ? allToolCalls
             .filter((tc: any) => tc && typeof tc.name === 'string' && toolCallSucceeded(tc))
+            .map((tc: any) => tc.name as string)
+        : [];
+      const publishToolsAttempted = publishIsTheOnlyThingLeft
+        ? allToolCalls
+            .filter((tc: any) => tc && typeof tc.name === 'string' && !toolCallSucceeded(tc))
             .map((tc: any) => tc.name as string)
         : [];
       const publishStall = publishIsTheOnlyThingLeft
@@ -3015,18 +3023,23 @@ export async function runVerifiedChat(
             pressAttempt: publishPressAttempts,
             unmetRequiredFunctions: functionCallMisses,
             externalWritesSucceeded,
+            publishToolsAttempted,
           })
         : null;
       if (publishStall) {
         const heldForApproval = publishStall === 'held-for-approval';
+        const toolFailing = publishStall === 'publish-tool-failing';
         console.warn(
           `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
           `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
-          `with [${functionCallMisses.join(', ')}] still ` +
-          `uncalled. Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
+          `with [${functionCallMisses.join(', ')}] still unmet. ` +
+          `Ending the run instead of re-pressing to ${maxAttempts} attempts — ` +
           (heldForApproval
-            ? `the content is held for approval, and repeating an identical press for an irreversible ` +
-              `publish only burns prompt-cache writes`
+            ? `the tool was never called and the content is held for approval, and repeating an ` +
+              `identical press for an irreversible publish only burns prompt-cache writes`
+            : toolFailing
+            ? `the run DID call [${functionCallMisses.join(', ')}] and every call failed, so the ` +
+              `integration is broken and pressing an erroring tool again cannot succeed`
             : `the run already wrote externally via [${externalWritesSucceeded.join(', ')}], so the ` +
               `schedule's requiredFunctionCalls names a tool this run does not use and pressing cannot ` +
               `succeed`) +
@@ -3036,6 +3049,8 @@ export async function runVerifiedChat(
           success: false,
           ...(heldForApproval
             ? { publishHeldForApproval: true }
+            : toolFailing
+            ? { publishToolFailing: true }
             : { publishRequirementMismatch: true }),
           content: allContent,
           toolCalls: allToolCalls,
@@ -3304,6 +3319,7 @@ export async function runScheduledChat(
   // with the publish tool still uncalled (content drafted and held, not published).
   publishHeldForApproval?: boolean;
   publishRequirementMismatch?: boolean;
+  publishToolFailing?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -4270,6 +4286,12 @@ export async function runScheduledChat(
       // approve a post already live on X is the false report this ticket is about.
       // What they need to fix is the schedule's required function.
       ...(result.publishRequirementMismatch ? { publishRequirementMismatch: true } : {}),
+      // ENG-947: the third cause, found on preview session 42004fa0 — the model
+      // DID call the named publish tool on every press and each call errored
+      // ("No twitter account connected"). Nothing is waiting on the owner here
+      // either: reporting it as held-for-approval sends them to an approval queue
+      // that is empty, when what they need is to reconnect the account.
+      ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)

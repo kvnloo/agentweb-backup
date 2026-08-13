@@ -138,4 +138,41 @@ describe('classifyPublishStall (ENG-947)', () => {
       'held-for-approval',
     );
   });
+
+  /**
+   * Found on a live preview run (session 42004fa0, 2026-08-13): the model called
+   * post_on_connected_account three times and every call failed with "No twitter
+   * account connected". Nothing was withheld and nothing was published — the tool
+   * is broken for this account. Reporting that as held-for-approval sends the
+   * owner looking for an approval queue when what they need is to reconnect the
+   * account, which is the same class of false report this ticket family is about.
+   */
+  it('reports a FAILING TOOL when the run did call the publish tool and it errored', () => {
+    expect(classify({ publishToolsAttempted: ['post_on_connected_account'] })).toBe(
+      'publish-tool-failing',
+    );
+  });
+
+  it('still reports a withhold when the publish tool was never reached', () => {
+    expect(classify({ publishToolsAttempted: [] })).toBe('held-for-approval');
+  });
+
+  it('lets a SUCCEEDED write through another tool outrank a failing attempt', () => {
+    // The thread went out via twitter_manage_post; that the named tool was also
+    // tried and failed does not make the live post disappear.
+    expect(
+      classify({
+        publishToolsAttempted: ['post_on_connected_account'],
+        externalWritesSucceeded: ['twitter_manage_post'],
+      }),
+    ).toBe('requirement-names-unused-publish-tool');
+  });
+
+  it('only counts attempts at a tool that is actually still unmet', () => {
+    // An attempt at some unrelated publish tool says nothing about why THIS
+    // requirement stalled.
+    expect(classify({ publishToolsAttempted: ['publish_landing_page_changes'] })).toBe(
+      'held-for-approval',
+    );
+  });
 });

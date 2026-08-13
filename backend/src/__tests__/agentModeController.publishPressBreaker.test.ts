@@ -270,7 +270,14 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect(result.functionCallMisses).toEqual(['post_on_connected_account']);
     // And the run is still capped rather than pressed to 20 — the two fixes compose.
     expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
-    expect((result as any).publishHeldForApproval).toBe(true);
+    // The model DID reach for the tool and it errored every time, so this is a
+    // broken integration, NOT content waiting on the owner. Reporting it as
+    // held-for-approval (as this originally did) sends them to an empty approval
+    // queue instead of to Settings → Connected Accounts. Re-confirmed live on
+    // preview session 42004fa0 (2026-08-13), where all three presses came back
+    // "No twitter account connected".
+    expect((result as any).publishToolFailing).toBe(true);
+    expect((result as any).publishHeldForApproval).toBeUndefined();
   });
 
   it('leaves a failed NON-publish required call counting as met, exactly as before', async () => {

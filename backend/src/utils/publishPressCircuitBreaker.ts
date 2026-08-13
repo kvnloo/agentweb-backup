@@ -86,19 +86,34 @@ export function shouldStopPressingForPublish(params: {
  * Why the run stalled on an unmet publish requirement. The distinction matters
  * because the two states need OPPOSITE things from the owner.
  *
- * - `held-for-approval`   nothing was published. The content is waiting on them.
+ * - `held-for-approval`   nothing was published and the model never reached for
+ *                         the tool. The content is waiting on them.
  * - `requirement-names-unused-publish-tool`
  *                         the run DID write externally, just not through the
  *                         tool the schedule names. Nothing is waiting on them;
  *                         their schedule's requiredFunctionCalls is wrong.
+ * - `publish-tool-failing`
+ *                         the model DID call the named publish tool and every
+ *                         call errored. Nothing is waiting on them either; the
+ *                         integration is broken.
  *
  * Observed: schedule 34154af9 "Kevin — X Evening Post" requires
  * post_on_connected_account, but its prompt asks for a 2-3 tweet thread, so the
  * model reaches for twitter_manage_post and publishes. Reporting that run as
  * held-for-approval would tell the owner to approve a thread already live on X —
  * the same class of false report this ticket family keeps producing.
+ *
+ * Observed for the third reason on preview session 42004fa0 (2026-08-13): the
+ * model called post_on_connected_account on all three presses and each one came
+ * back "No twitter account connected". Reporting THAT as held-for-approval sends
+ * the owner to an approval queue that has nothing in it, when the fix is to
+ * reconnect the account. Capping the press is still right — a tool erroring
+ * identically three times will not start working on the twentieth.
  */
-export type PublishStallReason = 'held-for-approval' | 'requirement-names-unused-publish-tool';
+export type PublishStallReason =
+  | 'held-for-approval'
+  | 'requirement-names-unused-publish-tool'
+  | 'publish-tool-failing';
 
 /**
  * Decide whether to stop pressing, and if so, WHY. `null` means keep pressing.
@@ -112,11 +127,18 @@ export type PublishStallReason = 'held-for-approval' | 'requirement-names-unused
  * A name that is itself still unmet is ignored: an unmet requirement is by
  * definition one the run did not satisfy, so counting it as evidence of a write
  * would let a malformed caller silently downgrade a genuine withhold.
+ *
+ * `publishToolsAttempted` is the opposite signal: names the run DID call and did
+ * NOT succeed at. Only an attempt at a tool that is itself still unmet counts —
+ * an attempt at some unrelated publish tool says nothing about why THIS
+ * requirement stalled. A succeeded write elsewhere still outranks it, because a
+ * post that is already live is the more consequential fact to report.
  */
 export function classifyPublishStall(params: {
   pressAttempt: number;
   unmetRequiredFunctions: string[];
   externalWritesSucceeded: string[];
+  publishToolsAttempted?: string[];
   maxPressAttempts?: number;
 }): PublishStallReason | null {
   const { unmetRequiredFunctions, externalWritesSucceeded } = params;
@@ -133,5 +155,9 @@ export function classifyPublishStall(params: {
   const wroteSomethingElse = (externalWritesSucceeded || []).some(
     (name) => typeof name === 'string' && !unmet.has(name) && isPowerTool(name),
   );
-  return wroteSomethingElse ? 'requirement-names-unused-publish-tool' : 'held-for-approval';
+  if (wroteSomethingElse) return 'requirement-names-unused-publish-tool';
+  const triedTheNamedTool = (params.publishToolsAttempted || []).some(
+    (name) => typeof name === 'string' && unmet.has(name),
+  );
+  return triedTheNamedTool ? 'publish-tool-failing' : 'held-for-approval';
 }
