@@ -49,7 +49,25 @@ export interface MonthlyLlmUsageCredits {
   debits?: LlmUsageDebit[];
   debitIds?: string[];
   totalDebitedMicroUsd?: number;
+  /**
+   * True once `debits[]` has been pruned to stay under DynamoDB's 400KB item
+   * limit. The granular tail is incomplete when set, but `totalDebitedMicroUsd`
+   * remains authoritative — it never decrements on prune. Consumers that need
+   * full granular audit should page to a dedicated table once this ever flips.
+   */
+  debitsTruncated?: boolean;
 }
+
+/**
+ * Cap on debit entries kept in-line on the user row before pruning starts.
+ * Each entry is ~150 bytes so 2000 entries ≈ 300KB, safely under DynamoDB's
+ * 400KB item-size limit while leaving headroom for the rest of the ledger
+ * (grants, reversals, admin fields). Realistic worst-case (top 1% of Pro
+ * users going many multiples over hard cap for a full month) sits an order
+ * of magnitude below this, so a single-item ledger is sustainable until we
+ * outgrow it and decide to move to a dedicated `AW-UsageDebits` table.
+ */
+const MAX_DEBITS_PER_LEDGER = 2000;
 
 export interface LlmUsageCreditAdjustment {
   purchasedMicroUsd: number;
@@ -336,7 +354,12 @@ export async function recordLlmUsageDebit(input: {
   now?: Date;
 }): Promise<{ debited: boolean; billingUserId: string; ledger: MonthlyLlmUsageCredits }> {
   const amountMicroUsd = Math.round(input.amountMicroUsd);
-  if (!input.workId.trim()) throw new Error('workId is required');
+  const workId = (input.workId || '').trim();
+  if (!workId) throw new Error('workId is required');
+  // Cap workId length so a runaway caller can't push a single debit entry
+  // toward the DynamoDB item ceiling. 256 chars is well above any real UUID
+  // or task/session id today; anything longer is almost certainly a bug.
+  if (workId.length > 256) throw new Error('workId must be at most 256 chars');
   if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) {
     throw new Error('amountMicroUsd must be a positive integer');
   }
@@ -344,7 +367,7 @@ export async function recordLlmUsageDebit(input: {
   const billingUserId = input.billingUserId;
   const month = getCurrentUsageMonth(input.now);
   const debitedAt = (input.now || new Date()).toISOString();
-  const debitId = `meter:${input.workId}`;
+  const debitId = `meter:${workId}`;
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const user = await userDb.getUserById(billingUserId) as User | undefined;
@@ -374,17 +397,39 @@ export async function recordLlmUsageDebit(input: {
 
     const debit: LlmUsageDebit = {
       id: debitId,
-      workId: input.workId,
+      workId,
       amountMicroUsd,
       debitedAt,
     };
+
+    // Item-size guard: keep in-line debits below the DynamoDB 400KB ceiling
+    // by dropping the oldest entry when the array hits MAX_DEBITS_PER_LEDGER.
+    // `totalDebitedMicroUsd` deliberately does NOT decrement — audit totals
+    // stay authoritative even after granular tail rows fall off; the
+    // debitsTruncated flag records that they did.
+    const existingDebits = current.debits || [];
+    const existingDebitIds = current.debitIds || [];
+    const willTruncate = existingDebits.length >= MAX_DEBITS_PER_LEDGER;
+    const keptDebits = willTruncate
+      ? existingDebits.slice(existingDebits.length - (MAX_DEBITS_PER_LEDGER - 1))
+      : existingDebits;
+    const keptDebitIds = willTruncate
+      ? existingDebitIds.slice(existingDebitIds.length - (MAX_DEBITS_PER_LEDGER - 1))
+      : existingDebitIds;
+    if (willTruncate) {
+      console.warn(
+        `[llmUsageCreditService] Pruning oldest debits for ${billingUserId} (${month}) — ledger reached ${existingDebits.length} entries. Migrate to a dedicated table if this fires often.`
+      );
+    }
+
     const next: MonthlyLlmUsageCredits = {
       ...current,
       month,
       version: (existing?.version || 0) + 1,
-      debits: [...(current.debits || []), debit],
-      debitIds: [...(current.debitIds || []), debitId],
+      debits: [...keptDebits, debit],
+      debitIds: [...keptDebitIds, debitId],
       totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
+      ...(willTruncate || current.debitsTruncated ? { debitsTruncated: true } : {}),
     };
 
     const condition: {
