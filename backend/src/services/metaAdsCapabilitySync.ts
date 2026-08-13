@@ -22,18 +22,29 @@
  * valid token, which is exactly what `debug_token` needs. This module is the
  * per-account reconciliation it performs.
  *
+ * WHY THIS ASKS BY TRYING, NOT BY READING SCOPES
+ * ----------------------------------------------
+ * Two independent grants must line up before an ads read works: the user
+ * granting our app `ads_read`, and the ad account's owner granting that user
+ * access to that ad account. A token's scopes only ever show the first.
+ * Production account 922903076601160 has the scope and not the account grant —
+ * `/me/permissions` reports `ads_read` granted with nothing declined, while the
+ * same token is refused by the ad account itself. Reconciling on scopes would
+ * therefore have declared the reported account healthy and cleared the very
+ * refusal that was protecting it.
+ *
  * THE ASYMMETRY THAT GOVERNS EVERY BRANCH
  * ---------------------------------------
- * Meta's answer is authoritative only when we actually get one.
- * `getGrantedScopes` returns `undefined` for a failed or error-shaped
- * `debug_token`, and that is NOT "nothing is granted" — treating it as such
- * would revoke every healthy connection we have during a Meta outage. So an
- * undetermined answer changes nothing at all, in either direction.
+ * Meta's answer is authoritative only when we actually get one. `probeAdsAccountAccess`
+ * returns 'unknown' for anything that is not a clear yes or a clear ads-scope
+ * refusal, and that is NOT "no access" — treating it as such would revoke every
+ * healthy connection we have during a Meta outage. An undetermined answer
+ * changes nothing at all, in either direction.
  */
 
 import { ConnectedAccount } from './connectedAccountsDb';
 import { metaService } from './metaService';
-import { getMetaAdsScopeState, META_ADS_READ_SCOPES } from '../utils/metaAdsScope';
+import { getMetaAdsScopeState } from '../utils/metaAdsScope';
 
 export type MetaAdsCapabilitySyncOutcome =
   /** Not a Meta ad account, or no token to ask with. */
@@ -54,11 +65,8 @@ export interface MetaAdsCapabilitySyncResult {
   error?: string;
 }
 
-const hasAdsScope = (scopes: string[]): boolean =>
-  scopes.some(s => (META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
-
 /**
- * Ask Meta what this connection is actually granted, and make our record agree.
+ * Ask Meta what this connection can actually do, and make our record agree.
  *
  * Never throws: this runs inside a sweep over every user, and one bad account
  * must not abort the rest.
@@ -80,26 +88,34 @@ export const syncMetaAdsCapability = async (
   }
 
   try {
-    const granted = await metaService.getGrantedScopes(config.access_token);
+    const access = await metaService.probeAdsAccountAccess(
+      config.access_token,
+      config.ad_account_id || account.account_id
+    );
 
     // Absence of proof. Change nothing — in either direction.
-    if (!granted) return { outcome: 'undetermined' };
+    if (access === 'unknown') return { outcome: 'undetermined' };
 
     const { updateAccountConfig } = await import('./connectedAccountsDb');
-    const capable = hasAdsScope(granted);
     const recordedState = getMetaAdsScopeState(config);
 
-    if (capable) {
-      // Already known good: the twice-daily no-op case. Skip the write.
-      if (recordedState === 'granted') return { outcome: 'unchanged' };
+    if (access === 'accessible') {
+      // Already not refusing: the twice-daily no-op case. Skip the write.
+      if (recordedState !== 'missing') return { outcome: 'unchanged' };
 
-      // The grant is back. Retract the refusal AND the notice — the notice must
-      // go too, or a future outage would be deduped against an episode that is
+      // Ads data reads. Retract the refusal AND the notice — the notice must go
+      // too, or a future outage would be deduped against an episode that is
       // already over and the owner would never hear about it.
-      await updateAccountConfig(userId, platform as any, account.account_id, { granted_scopes: granted }, {
+      //
+      // `granted_scopes` is deliberately left alone. It records what Meta said
+      // the USER granted; synthesising an ads scope into it to force a 'granted'
+      // reading would fabricate provenance. Dropping the marker moves the record
+      // to 'unknown', which is the honest state — we have not proven a grant, we
+      // have proven the read works — and 'unknown' is what stops the gate
+      // refusing.
+      await updateAccountConfig(userId, platform as any, account.account_id, {}, {
         unset: ['ads_scope_revoked_at', 'ads_scope_alerted_at'],
       });
-      config.granted_scopes = granted;
       delete config.ads_scope_revoked_at;
       delete config.ads_scope_alerted_at;
 
@@ -109,7 +125,7 @@ export const syncMetaAdsCapability = async (
       return { outcome: 'recovered' };
     }
 
-    // Not capable. Nothing to do if that is already recorded AND the owner has
+    // Denied. Nothing to do if that is already recorded AND the owner has
     // already been told about this same outage.
     const alreadyAlerted = !!config.ads_scope_alerted_at;
     if (recordedState === 'missing' && alreadyAlerted) return { outcome: 'unchanged' };
@@ -120,11 +136,9 @@ export const syncMetaAdsCapability = async (
     // loop aimed at a customer.
     const now = new Date().toISOString();
     await updateAccountConfig(userId, platform as any, account.account_id, {
-      granted_scopes: granted,
       ads_scope_revoked_at: config.ads_scope_revoked_at || now,
       ads_scope_alerted_at: now,
     });
-    config.granted_scopes = granted;
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     config.ads_scope_alerted_at = now;
 
