@@ -352,6 +352,51 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
 
+    /**
+     * The marker is claimed before sending so a mail failure cannot become a
+     * twice-daily loop. But keeping it when nothing was delivered would record
+     * the owner as told when they never were, and every later run trusts it —
+     * so the claim only stands if the notice actually went out (Greptile P1).
+     */
+    it('retracts the notice when nothing was delivered, so a later run retries', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
+      const account = latchedAccount();
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.alerted).toBe(false);
+      expect(account.config.ads_scope_alerted_at).toBeUndefined();
+      const retraction = mockUpdateAccountConfig.mock.calls.at(-1);
+      expect(retraction[4].unset).toContain('ads_scope_alerted_at');
+      // The revocation itself stands — protection is not undone by a mail failure.
+      expect(getMetaAdsScopeState(account.config)).toBe('missing');
+    });
+
+    it('keeps the notice when it was delivered', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(true);
+      const account = latchedAccount();
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.alerted).toBe(true);
+      expect(typeof account.config.ads_scope_alerted_at).toBe('string');
+    });
+
+    it('still reports the revocation when the retraction write itself fails', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockNotifyMetaAdsScopeLost.mockResolvedValue(false);
+      mockUpdateAccountConfig
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('dynamo unavailable'));
+
+      const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
+
+      expect(result.outcome).toBe('revoked');
+      expect(result.alerted).toBe(false);
+    });
+
     it('does not email when the notice could not be recorded', async () => {
       // Without a durable marker nothing stops the next sweep emailing again —
       // and this one runs every 12 hours, forever.

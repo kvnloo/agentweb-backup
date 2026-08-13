@@ -241,11 +241,34 @@ export const syncMetaAdsCapability = async (
     }
 
     const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
-    await notifyMetaAdsScopeLost({
+    const delivered = await notifyMetaAdsScopeLost({
       ownerUserId: userId,
       accountId: account.account_id,
       accountName: account.account_name,
     });
+
+    // The marker is claimed before sending so a mail failure cannot become a
+    // twice-daily mail loop. But keeping it when nothing was delivered — no
+    // address on file, a send failure, a non-production environment — would
+    // permanently record the owner as told when they were never told at all,
+    // and every later run trusts that marker. So retract it: the claim only
+    // stands if the notice actually went out (Greptile P1).
+    if (!delivered) {
+      try {
+        await updateAccountConfig(userId, platform as any, account.account_id, {}, {
+          unset: ['ads_scope_alerted_at'],
+        });
+        delete config.ads_scope_alerted_at;
+      } catch (retractError: any) {
+        console.warn(
+          `[MetaAdsCapabilitySync] Could not retract the unsent alert marker for user ${userId} account ${account.account_id}: ${retractError?.message ?? retractError}`
+        );
+      }
+      console.warn(
+        `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded, but the owner was NOT notified; a later run will retry`
+      );
+      return { outcome: 'revoked', alerted: false };
+    }
 
     console.log(
       `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded and notified the owner`

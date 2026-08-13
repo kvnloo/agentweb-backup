@@ -84,10 +84,16 @@ export const notifyMetaAdsScopeLost = async (params: {
   const key = `${ownerUserId}:${accountId ?? 'unknown'}`;
   const lastSent = recentlySent.get(key);
   if (lastSent !== undefined && Date.now() - lastSent < RESEND_GUARD_MS) {
+    // Reports TRUE on purpose. The contract of this return value is "has the
+    // owner been told", not "did this particular call send the mail" — callers
+    // retract their notice marker on false so a failed alert is retried. A
+    // duplicate inside the guard window means this process delivered it seconds
+    // ago, so returning false here would make the winner's marker get retracted
+    // by the loser and the owner emailed again on the next sweep.
     console.warn(
       `[MetaAdsScopeAlert] Skipped a duplicate ads-scope alert for ${key} — one was sent ${Math.round((Date.now() - lastSent) / 1000)}s ago`
     );
-    return false;
+    return true;
   }
   recentlySent.set(key, Date.now());
   pruneRecentlySent();

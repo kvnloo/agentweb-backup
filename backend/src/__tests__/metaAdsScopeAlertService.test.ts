@@ -59,7 +59,12 @@ describe('notifyMetaAdsScopeLost (ENG-1158)', () => {
       ]);
 
       expect(sendEmail).toHaveBeenCalledTimes(1);
-      expect([first, second].filter(Boolean)).toHaveLength(1);
+      // BOTH report true. The return value answers "has the owner been told",
+      // not "did this call send it" — callers retract their notice marker on
+      // false, so the loser reporting false would undo the winner's marker and
+      // get the owner emailed again on the next sweep.
+      expect(first).toBe(true);
+      expect(second).toBe(true);
     });
 
     it('does not suppress a different account for the same owner', async () => {

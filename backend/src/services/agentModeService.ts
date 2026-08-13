@@ -15461,11 +15461,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (connection.config) connection.config.ads_scope_alerted_at = alertedAt;
 
       const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
-      await notifyMetaAdsScopeLost({
+      const delivered = await notifyMetaAdsScopeLost({
         ownerUserId,
         accountId: connection.account_id,
         accountName: connection.account_name,
       });
+
+      // Retract the claim if nothing was delivered. Keeping it would record the
+      // owner as notified when they were never told — no address on file, a mail
+      // failure, a non-production environment — and every later run trusts this
+      // marker and stays silent (Greptile P1).
+      if (!delivered) {
+        await updateAccountConfig(ownerUserId, connection.platform as any, connection.account_id, {}, {
+          unset: ['ads_scope_alerted_at'],
+        });
+        if (connection.config) delete connection.config.ads_scope_alerted_at;
+      }
     } catch (alertError: any) {
       console.warn(
         `[AgentMode] ENG-1158: could not alert owner ${ownerUserId} about the missing Meta ads scope: ${alertError?.message ?? alertError}`
