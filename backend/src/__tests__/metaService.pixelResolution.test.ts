@@ -13,6 +13,10 @@
 
 import { metaService } from '../services/metaService';
 
+jest.mock('../services/metaPixelsCache', () => ({
+  getCachedPixels: jest.fn(() => null),
+}));
+
 jest.mock('../services/metaAccountCredentials', () => ({
   getConnectedMetaAccountsList: jest.fn(),
   getMetaAccountCredentials: jest.fn(),
@@ -130,9 +134,14 @@ describe('resolveMetaPixelWithDefault', () => {
   const user = { connected_accounts: [{ platform: 'facebook', config: { account_type: 'ad_account', access_token: 'tok' } }] };
 
   it('uses the stored value directly when present, with zero network calls', async () => {
-    // The stored account must be declared connected — an explicit choice is only honored
-    // while the connection it names still exists (see the stale-selection tests below).
+    // The stored account must be declared connected AND the pixel must still exist — an
+    // explicit choice is only honored while what it names is still real (see the
+    // stale-selection and stored-pixel-existence tests below). Both checks are local here:
+    // the connected list comes from the loaded user record, the pixel from the warm cache.
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    (require('../services/metaPixelsCache').getCachedPixels as jest.Mock)
+      .mockReturnValue([{ pixelId: 'storedPixel', accountId: 'storedAcc' }]);
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
@@ -261,6 +270,10 @@ describe('resolveMetaPixelWithDefault', () => {
 
   it('still honors the stored pair when its account is connected, without any Graph traffic', async () => {
     (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }, { accountId: 'storedAcc' }]);
+    // Warm cache: the pixel-existence check below is answered locally, so this stays zero-traffic.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    (require('../services/metaPixelsCache').getCachedPixels as jest.Mock)
+      .mockReturnValue([{ pixelId: 'storedPixel', accountId: 'storedAcc' }]);
 
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
@@ -279,6 +292,74 @@ describe('resolveMetaPixelWithDefault', () => {
     const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
     expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+  });
+
+  // Greptile (round 4) on #2384: checking only that the ACCOUNT is still connected leaves the
+  // other half of staleness — the pixel itself can be deleted from an account that is still
+  // connected. Verified through the shared /pixels cache so the common case costs nothing.
+  describe('stored pixel existence', () => {
+    const { getCachedPixels } = require('../services/metaPixelsCache');
+
+    it('honors the stored pixel when the warm cache lists it, with zero Graph traffic', async () => {
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue([{ pixelId: 'storedPixel', accountId: 'storedAcc' }]);
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+      expect(getMetaAccountCredentials).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('falls through when the warm cache shows the stored pixel is gone', async () => {
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue([{ pixelId: 'someOtherPixel', accountId: 'storedAcc' }]);
+      (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
+      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'someOtherPixel' }] }) });
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'deletedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'someOtherPixel', accountId: 'storedAcc' });
+    });
+
+    it('verifies against Graph exactly once when the cache is cold, and honors a pixel that exists', async () => {
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue(null);
+      (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
+      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'storedPixel' }] }) });
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls through to another account when a cold check shows the stored pixel is gone', async () => {
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }, { accountId: 'healthyAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue(null);
+      (getMetaAccountCredentials as jest.Mock)
+        .mockResolvedValueOnce({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Stored' })
+        .mockResolvedValueOnce({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Stored' })
+        .mockResolvedValueOnce({ accountId: 'healthyAcc', accessToken: 'tok2', accountName: 'Healthy' });
+      mockFetch
+        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })            // verification: gone
+        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [] }) })            // storedAcc has none
+        .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'live' }] }) });
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'deletedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'live', accountId: 'healthyAcc' });
+    });
+
+    it('keeps the stored choice when verification itself fails — an outage must not silently repoint attribution', async () => {
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue(null);
+      (getMetaAccountCredentials as jest.Mock).mockRejectedValue(new Error('graph unreachable'));
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+    });
   });
 
   it('ignores a partially-stored value (pixelId without accountId) and falls through to the default', async () => {

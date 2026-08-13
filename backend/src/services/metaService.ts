@@ -2399,6 +2399,46 @@ export class MetaService {
    * explicit `stored` choice (the Calendly card's own account/pixel dropdowns) always wins
    * when both fields are present. Never throws, same AC3 guarantee as resolveMetaPixelForUser.
    */
+  /**
+   * Does the stored pixel still exist on its (still-connected) account?
+   *
+   * Cache-first by design: `/pixels` already caches the customer's full pixel set per user and
+   * invalidates it on connect/disconnect, so a warm entry answers this for free. Only a cold
+   * cache costs one Graph call, scoped to the single stored account rather than a full fan-out.
+   *
+   * FAILS OPEN. If the check itself cannot run — expired token, Graph outage, malformed record —
+   * the answer is "keep the customer's explicit choice". Falling back to auto-resolution on an
+   * outage would silently repoint a working configuration at a different pixel, which is worse
+   * than briefly honoring one that may have been deleted (that case degrades visibly: the CAPI
+   * send fails and is recorded in the job's `failures`).
+   *
+   * The partial result is deliberately NOT written back into the /pixels cache: it covers one
+   * account, and storing it would make a later full read believe the customer has no others.
+   */
+  private async storedPixelStillExists(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string },
+  ): Promise<boolean> {
+    try {
+      const { getCachedPixels } = await import('./metaPixelsCache');
+      const cached = getCachedPixels(userId);
+      if (cached) {
+        return cached.some((p) => p.pixelId === stored.pixelId && p.accountId === stored.accountId);
+      }
+
+      const { getMetaAccountCredentials } = await import('./metaAccountCredentials');
+      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, stored.accountId);
+      const pixels = await this.listPixels(accountId, accessToken);
+      return (pixels || []).some((p: any) => p.id === stored.pixelId);
+    } catch (error: any) {
+      console.warn(
+        `[Meta] Could not verify stored pixel ${stored.pixelId} (keeping the customer's choice): ${error?.message}`,
+      );
+      return true;
+    }
+  }
+
   public async resolveMetaPixelWithDefault(
     user: any,
     userId: string,
@@ -2429,7 +2469,17 @@ export class MetaService {
           storedAccountStillConnected = true;
         }
         if (storedAccountStillConnected) {
-          return { pixelId: stored.pixelId, accountId: stored.accountId };
+          // The account surviving is only half of staleness — the pixel itself can be deleted
+          // from an account that is still connected (Greptile round 4 on #2384). Verified via
+          // the shared /pixels cache, so the common case (a customer who just looked at the
+          // picker, or any second booking inside the TTL) costs no Graph traffic at all.
+          if (await this.storedPixelStillExists(user, userId, stored)) {
+            return { pixelId: stored.pixelId, accountId: stored.accountId };
+          }
+          console.warn(
+            `[Meta] Stored Calendly attribution pixel ${stored.pixelId} no longer exists on account ` +
+            `${stored.accountId} — falling back to auto-resolution`,
+          );
         }
         console.warn(
           `[Meta] Stored Calendly attribution account ${stored.accountId} is no longer connected — falling back to auto-resolution`,

@@ -1068,23 +1068,31 @@ async function addSubPage(
   bridgeOutUrl?: string,
   metaPixelOverride?: { pixelId: string; accountId: string }
 ): Promise<GeneratedLandingPage> {
-  if (process.env.CODING_AGENT_SUBPAGES === "true") {
-    /*
-     * ENG-1141: the coding-agent engine has NO Meta tracking of any kind — it never reads
-     * site.metaPixelId either, so a page built here ships untracked whether or not a pixel
-     * was chosen. That is pre-existing and wider than this ticket, but it must not be
-     * silent: a customer who was just forced through a mandatory picker would otherwise get
-     * an untracked page with nothing anywhere saying why. Wiring tracking into that engine
-     * (agent-authored fireLeadTracking + the layout/capture sync this file does for the v0
-     * path) is real work and needs its own ticket; this flag is off by default today.
-     */
-    if (metaPixelOverride?.pixelId) {
-      console.warn(
-        `[V0 SERVICE] CODING_AGENT_SUBPAGES is on: the chosen Meta pixel ${metaPixelOverride.pixelId} ` +
-        `CANNOT be applied to /${buildPageSlug(name)} — that engine has no Meta tracking support at all. ` +
-        `The page will ship untracked.`,
-      );
-    }
+  /*
+   * ENG-1141: the coding-agent engine has NO Meta tracking installation of its own — it never
+   * reads site.metaPixelId, and it cannot inject the base snippet or sync the capture route.
+   * On a site that already HAS a pixel that's fine: its task tells the agent to mirror the
+   * home page's existing form wiring, so fireLeadTracking is copied along with the rest.
+   *
+   * The case it cannot serve is the one this ticket exists for — a site with NO pixel, where
+   * an explicit choice has to be INSTALLED (layout snippet + capture route + root record).
+   * Sending that through the agent would silently discard a selection the customer was just
+   * forced to make. So route those builds down the v0 path, which does install it, and accept
+   * one v0 generation for the page that sets a site's pixel up. Every later page on that site
+   * inherits it and goes back through the agent.
+   */
+  const codingAgentEnabled = process.env.CODING_AGENT_SUBPAGES === "true";
+  const overrideNeedsInstalling = Boolean(
+    !site.metaPixelId && metaPixelOverride?.pixelId && metaPixelOverride?.accountId,
+  );
+  if (codingAgentEnabled && overrideNeedsInstalling) {
+    console.log(
+      `[V0 SERVICE] Using the v0 path for /${buildPageSlug(name)} despite CODING_AGENT_SUBPAGES: ` +
+      `this build installs the chosen Meta pixel ${metaPixelOverride!.pixelId} site-wide, which the ` +
+      `coding-agent engine cannot do. Later pages on this site inherit it and use the agent again.`,
+    );
+  }
+  if (codingAgentEnabled && !overrideNeedsInstalling) {
     const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
     return addPageViaCodingAgent(site, userId, prompt, name, brandContext, {
       leadListId,

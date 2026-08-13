@@ -5027,6 +5027,79 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       mockChatsDownloadVersion.mockResolvedValueOnce(await createTrackedZip());
     };
 
+    // Greptile (round 4) on #2384: addSubPage handed the override to the coding-agent engine,
+    // which has no way to install it — silently discarding a selection the customer was just
+    // forced to make. Installing a pixel is exactly what the v0 path does, so route there.
+    describe("CODING_AGENT_SUBPAGES interaction", () => {
+      // CODING_AGENT_SUBPAGES is only consulted on the multi-site path (addSubPage). The
+      // legacy path this describe otherwise runs calls addPageToExistingRepo directly and
+      // never sees the flag, so DURABLE_LANDING_GENERATION has to be on for these to mean
+      // anything — without it the "routes to the agent" case silently tests nothing.
+      const ORIGINAL_AGENT = process.env.CODING_AGENT_SUBPAGES;
+      const ORIGINAL_DURABLE = process.env.DURABLE_LANDING_GENERATION;
+      afterEach(() => {
+        if (ORIGINAL_AGENT === undefined) delete process.env.CODING_AGENT_SUBPAGES;
+        else process.env.CODING_AGENT_SUBPAGES = ORIGINAL_AGENT;
+        if (ORIGINAL_DURABLE === undefined) delete process.env.DURABLE_LANDING_GENERATION;
+        else process.env.DURABLE_LANDING_GENERATION = ORIGINAL_DURABLE;
+      });
+
+      it("uses the v0 path (not the agent) when an override has to be installed on a pixel-less site", async () => {
+        process.env.CODING_AGENT_SUBPAGES = "true";
+        setupSiteRecordMock();
+        await setupTrackedV0Mocks();
+
+        mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
+        mockAxiosGet.mockResolvedValueOnce({
+          data: { content: Buffer.from("<html><head></head><body>{children}</body></html>").toString("base64") },
+        });
+        mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "abc123" } } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_page" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_track" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_layout" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "tree_sha" } });
+        mockAxiosPost.mockResolvedValueOnce({ data: { sha: "commit_sha" } });
+        mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+        setupVercelDeploySuccessMock();
+        mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+        setupSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+        const result = await generateLandingPage(
+          "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+          { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+        );
+
+        // Built by v0 (a chat was created) and the pixel really was installed.
+        expect(mockChatsCreate).toHaveBeenCalled();
+        expect(result.status).toBe("deployed");
+        const layoutBlob = committedBlobs().find((c) => c.includes("Meta Pixel Code"));
+        expect(layoutBlob).toContain("fbq('init', 'override-pixel')");
+      });
+
+      it("still uses the agent when the site already has a pixel — nothing to install, so the cheap engine wins", async () => {
+        process.env.CODING_AGENT_SUBPAGES = "true";
+        process.env.DURABLE_LANDING_GENERATION = "true";
+        const siteWithPixel = { ...existingSiteRecord, metaPixelId: "site-pixel", metaAdAccountId: "site-acct" };
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [siteWithPixel] }) });
+        mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: siteWithPixel }) });
+        mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+
+        // Measure the delta: this mock's call count is not reset between cases in this file,
+        // so an absolute assertion here would read the previous test's v0 build as this one's.
+        const v0ChatsBefore = mockChatsCreate.mock.calls.length;
+
+        await generateLandingPage(
+          "user-1", "Create pricing page", "Pricing", {}, "list_pricing", undefined,
+          { metaPixelOverride: { pixelId: "override-pixel", accountId: "override-acct" } }
+        ).catch(() => { /* the agent module is not mocked here; routing is what's asserted */ });
+
+        // No NEW v0 chat: the build went to the coding agent, as the flag intends.
+        expect(mockChatsCreate.mock.calls.length).toBe(v0ChatsBefore);
+      });
+    });
+
     it("ignores the override and inherits the site's own pixel when the site already has one", async () => {
       const siteWithPixel = { ...existingSiteRecord, metaPixelId: "site-pixel", metaAdAccountId: "site-acct" };
       mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [siteWithPixel] }) });
