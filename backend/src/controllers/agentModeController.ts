@@ -57,6 +57,9 @@ import {
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
   collectPublishActionsSince,
+  stripUnfoundedEntityCounts,
+  reconcileFalseDataWriteFailure,
+  appendConfirmedDataWriteNotice,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -64,6 +67,13 @@ import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
+import {
+  MAX_ATOMIC_RUN_RESULT_REMOVALS,
+  SCHEDULE_ITEM_BUDGET_BYTES,
+  estimateDynamoItemBytes,
+  isDynamoItemSizeError,
+  trimListToItemBudget,
+} from '../utils/dynamoItemBudget';
 import {
   getAllowedSkills,
   isSubscriptionFeatureEnabled,
@@ -103,6 +113,9 @@ async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): 
 /** Raised when a schedule edit could not be committed together with its consent narrowing. */
 class ScheduleConsentRaceError extends Error {}
 
+/** ENG-1048: raised when run history moved out from under an edit's history shed. */
+class ScheduleHistoryRaceError extends Error {}
+
 const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 
 /**
@@ -138,11 +151,44 @@ const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
 async function applyScheduleEditWithConsentNarrowing(
   scheduleId: string,
   updates: any,
-  firstRead: any
+  firstRead: any,
+  // ENG-1048: run results this edit has to shed to fit, carried by the SAME write so
+  // history is never deleted for an edit that then fails, and bound to the history the
+  // count was measured against so it cannot take a second prefix off a list another
+  // writer already shortened.
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
 ): Promise<void> {
+  // Pass only the arguments this write actually needs, so an ordinary edit stays an
+  // ordinary two-argument update.
+  const write = async (payload: any, expectation?: Record<string, any>) => {
+    if (shedRunResults && shedRunResults.count > 0) {
+      try {
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+      } catch (writeError: any) {
+        // The shed count belongs to the history it was measured against; it cannot be
+        // replayed against a different one. Hand back a conflict instead of retrying.
+        if (
+          writeError?.code === 'ConditionalCheckFailedException' ||
+          writeError?.name === 'ConditionalCheckFailedException'
+        ) {
+          throw new ScheduleHistoryRaceError(
+            `Run history for schedule ${scheduleId} moved while this edit was saving.`
+          );
+        }
+        throw writeError;
+      }
+      return;
+    }
+    if (expectation) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+      return;
+    }
+    await scheduleDb.updateSchedule(scheduleId, payload);
+  };
+
   // An edit that does not move the required tools cannot move the scope: plain write.
   if (updates.requiredFunctionCalls === undefined) {
-    await scheduleDb.updateSchedule(scheduleId, updates);
+    await write(updates);
     return;
   }
 
@@ -190,11 +236,11 @@ async function applyScheduleEditWithConsentNarrowing(
 
     try {
       if (expectation) {
-        await scheduleDb.updateSchedule(scheduleId, { ...updates, ...consentUpdates }, expectation);
+        await write({ ...updates, ...consentUpdates }, expectation);
       } else {
         // Nothing to narrow — no condition to assert, and no reason to make an ordinary
         // edit fail because somebody touched consent at the same moment.
-        await scheduleDb.updateSchedule(scheduleId, updates);
+        await write(updates);
       }
       return;
     } catch (writeError: any) {
@@ -816,7 +862,20 @@ async function getDiagnosticErrorMessage(
     };
     const message = await agentModeService.generateDiagnosticMessage(context);
     return {
-      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      // ENG-1173: three passes, in this order and for this reason.
+      //   1. strip — the agent's only numeric input is a tool-call histogram, so any
+      //      entity quantity it emits is unfounded. Remove it before anything reads
+      //      the prose, so a correction can never be appended under a wrong count.
+      //   2. publish reconcile — the ENG-971 guard, unchanged.
+      //   3. data-write reconcile — the same inversion after a confirmed CRM write.
+      //      Last because both share CORRECTION_MARKER and first-writer wins; a
+      //      landed publish is the more expensive thing to have re-run.
+      message: message
+        ? reconcileFalseDataWriteFailure(
+            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message), publishLedger),
+            publishLedger,
+          )
+        : null,
       publishLedger,
     };
   } catch {
@@ -6588,8 +6647,13 @@ export const agentModeController = {
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
-            diagnosticContent = appendConfirmedPublishNotice(
-              'The server restarted while processing your request. Please send your message again.',
+            // ENG-1173: same blanket "send it again" advice, same duplicate risk after
+            // a confirmed CRM write. The publish notice wins if both apply.
+            diagnosticContent = appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'The server restarted while processing your request. Please send your message again.',
+                publishLedger,
+              ),
               publishLedger,
             );
           } else {
@@ -6606,8 +6670,11 @@ export const agentModeController = {
           // the fixed string: a diagnosis message has already been judged on its own
           // prose, and a truthful one must not collect a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedPublishNotice(
-            'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedDataWriteNotice(
+            appendConfirmedPublishNotice(
+              'I encountered an error processing your request. Please try sending your message again.',
+              publishLedger,
+            ),
             publishLedger,
           ),
           timestamp: new Date().toISOString(),
@@ -7442,8 +7509,12 @@ export const agentModeController = {
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
-            diagnosticContent = appendConfirmedPublishNotice(
-              'The server restarted while processing your request. Please send your message again.',
+            // ENG-1173: see the matching comment on the regular /generate path.
+            diagnosticContent = appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'The server restarted while processing your request. Please send your message again.',
+                publishLedger,
+              ),
               publishLedger,
             );
           } else {
@@ -7458,8 +7529,11 @@ export const agentModeController = {
           // ENG-971: see the matching comment in generateResponse — the fixed
           // fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedPublishNotice(
-            'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedDataWriteNotice(
+            appendConfirmedPublishNotice(
+              'I encountered an error processing your request. Please try sending your message again.',
+              publishLedger,
+            ),
             publishLedger,
           ),
           timestamp: new Date().toISOString(),
@@ -8851,10 +8925,73 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
+      // ENG-1048: DynamoDB caps an item at 400KB, and a schedule row grows without
+      // bound along two axes — promptRevisions (a full prompt snapshot per edit) and
+      // runResults. A schedule with a ~35k-character prompt drifts into the ceiling,
+      // after which EVERY write is rejected and the prompt can never be updated
+      // again (the reported row sat 1KB under the limit with 334KB of revision
+      // history, so even a length-trimmed prompt still failed). Budget the projected
+      // item and shed the oldest history rather than failing the save.
+      const projectedItem: Record<string, any> = { ...existingSchedule, ...updates };
+      const observedRunResults: any[] = Array.isArray((existingSchedule as any).runResults)
+        ? (existingSchedule as any).runResults
+        : [];
+      let runResultsToShed = 0;
+      const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
+        if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
+        const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
+        if (list.length === 0) return;
+        const { kept, dropped } = trimListToItemBudget(projectedItem, listKey, list);
+        if (dropped === 0) return;
+        console.warn(
+          `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
+        );
+        if (listKey === 'runResults') {
+          // Never write run history back from the read above: a run finishing while
+          // this edit is in flight appends to the tail, and a full-list write derived
+          // from that earlier read would erase its result. Shed by index instead,
+          // inside the edit's own write.
+          runResultsToShed = dropped;
+        } else {
+          updates[listKey] = kept;
+        }
+        projectedItem[listKey] = kept;
+      };
+      // Revision history first: it is pure undo state. Run history is only shed once
+      // revisions are exhausted, because it feeds the run-health summary.
+      shedOldest('promptRevisions');
+      shedOldest('runResults');
+      if (estimateDynamoItemBytes(projectedItem) > SCHEDULE_ITEM_BUDGET_BYTES) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save (about ${Math.round(estimateDynamoItemBytes(projectedItem) / 1024)}KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
+      }
+      // Refuse rather than shed more history than the edit's own write can carry: the
+      // alternative is deleting history in a separate write and then possibly failing
+      // the edit, which costs the owner run history for a save that never happened.
+      if (runResultsToShed > MAX_ATOMIC_RUN_RESULT_REMOVALS) {
+        return res.status(400).json({
+          error: `Scheduled chat is too large to save — fitting it under DynamoDB's 400KB per-item limit would mean dropping ${runResultsToShed} saved runs from this schedule's history at once. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
+        });
+      }
+
       // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
       // neither can be acknowledged without the other. See
-      // applyScheduleEditWithConsentNarrowing.
-      await applyScheduleEditWithConsentNarrowing(scheduleId, updates, existingSchedule);
+      // applyScheduleEditWithConsentNarrowing. The consent fields it may add are a
+      // handful of scalars, comfortably inside the budget's headroom. ENG-1048's run
+      // history shed rides the same write for the same reason.
+      await applyScheduleEditWithConsentNarrowing(
+        scheduleId,
+        updates,
+        existingSchedule,
+        runResultsToShed > 0
+          ? {
+              count: runResultsToShed,
+              expectedLength: observedRunResults.length,
+              expectedLast: observedRunResults[observedRunResults.length - 1],
+            }
+          : undefined
+      );
 
       res.json({
         message: 'Scheduled chat updated successfully',
@@ -8874,10 +9011,28 @@ export const agentModeController = {
             'saved. Reopen the schedule to see its current settings, then apply your change again.',
         });
       }
+      // ENG-1048: the shed was bound to the run history it was measured against, and
+      // that history moved, so nothing was written. Ask for a retry rather than
+      // replaying a removal count that would now take a prefix too many.
+      if (error instanceof ScheduleHistoryRaceError) {
+        console.warn(`AgentMode: ENG-1048 schedule update abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule recorded a run while you were saving, so nothing was saved. ' +
+            'Try again — its run history has changed.',
+        });
+      }
       if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
         return res.status(400).json({ error: error.message });
       }
       console.error('AgentMode: Update scheduled chat error:', error);
+      // ENG-1048: an item-size rejection is a client-fixable condition, not a
+      // server fault — say so instead of returning an opaque, non-retryable 500.
+      if (isDynamoItemSizeError(error)) {
+        return res.status(400).json({
+          error: "Scheduled chat is too large to save — it exceeds DynamoDB's 400KB per-item limit. Shorten the starting message and try again.",
+        });
+      }
       res.status(500).json({ error: 'Failed to update scheduled chat' });
     }
   },
