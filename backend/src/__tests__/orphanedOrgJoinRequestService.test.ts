@@ -76,4 +76,23 @@ describe('findOrphanedOrgJoinRequests', () => {
     });
     expect(findUser).toHaveBeenCalledTimes(100);
   });
+
+  it('stops gathering user lookups after unique-user cap is reached', async () => {
+    const findUser = jest.fn(async () => ({}));
+    const orgRequestCount = 220;
+    const requests = Array.from({ length: orgRequestCount }, (_, index) => ({ userId: `present-${index}` }));
+    const result = await findOrphanedOrgJoinRequests({
+      listOrganizations: async () => [org('org-1', requests)],
+      findUser,
+      audit: jest.fn(),
+    });
+
+    expect(result).toMatchObject({
+      organizationsScanned: 1,
+      pendingRequestsScanned: 100,
+      missingUserReferences: [],
+      truncated: true,
+    });
+    expect(findUser).toHaveBeenCalledTimes(100);
+  });
 });

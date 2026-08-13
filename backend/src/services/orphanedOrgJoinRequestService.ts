@@ -4,6 +4,7 @@ import { recordAdminAudit } from './adminAuditLog';
 const MAX_RESULTS = 100;
 const MAX_ORGANIZATIONS = 1000;
 const MAX_USER_LOOKUP_BATCH = 25;
+const MAX_UNIQUE_USER_IDS_TO_LOOKUP = MAX_RESULTS;
 
 export interface OrphanedOrgJoinReference {
   orgId: string;
@@ -40,7 +41,7 @@ export async function findOrphanedOrgJoinRequests(
   const requestedByUserId = new Map<string, OrphanedOrgJoinReference[]>();
   const userIdsToLookup: string[] = [];
 
-  for (const organization of organizations) {
+  orgLoop: for (const organization of organizations) {
     const requests = Array.isArray(organization.pendingDomainJoinRequests)
       ? organization.pendingDomainJoinRequests
       : [];
@@ -53,6 +54,12 @@ export async function findOrphanedOrgJoinRequests(
       const existing = requestedByUserId.get(userId);
       if (existing) {
         existing.push(requestRef);
+        continue;
+      }
+
+      if (requestedByUserId.size >= MAX_UNIQUE_USER_IDS_TO_LOOKUP) {
+        truncated = true;
+        break orgLoop;
       } else {
         requestedByUserId.set(userId, [requestRef]);
         userIdsToLookup.push(userId);
