@@ -92,12 +92,9 @@ async function main(): Promise<void> {
         continue;
       }
       // Everything below is derived from `current`, the row we just re-read, and
-      // never from `skill`, the row the scan saw. The updatedAt guard above is
-      // necessary but not sufficient: a writer that mutates a field without
-      // bumping the timestamp would be silently reverted by spreading the stale
-      // scan row, and — worse — the backup would hold that same stale copy, so it
-      // could not restore what the write destroyed. Re-deriving costs one pure
-      // function call and removes the whole class of problem.
+      // never from `skill`, the row the scan saw — a writer that mutates a field
+      // without bumping the timestamp would otherwise be reverted by spreading the
+      // stale scan row, with a backup holding that same stale copy.
       const fresh = rewritePublishGate(current.systemPrompt);
       if (!fresh.applied.length) {
         console.log("    ! prose no longer matches on re-read — skipping rather than writing a guess");
@@ -106,7 +103,20 @@ async function main(): Promise<void> {
       }
       const backup = backupSkill(current, BACKUP_DIR, s);
       console.log(`    backup: ${path.relative(process.cwd(), backup)}`);
-      await skillService.updateSkill({ ...current, systemPrompt: fresh.systemPrompt });
+      try {
+        // Compare-and-swap on the timestamp we just read. The re-read above narrows
+        // the window; only this makes the write atomic. Without it a row edited in
+        // the gap between read and put is overwritten silently, and the backup we
+        // just wrote predates that edit, so it cannot restore it either.
+        await skillService.updateSkill({ ...current, systemPrompt: fresh.systemPrompt }, current.updatedAt);
+      } catch (error: any) {
+        if (error?.code === "ConditionalCheckFailedException" || error?.name === "ConditionalCheckFailedException") {
+          console.log("    ! changed mid-write (conditional check failed) — skipped, nothing was overwritten");
+          skipped++;
+          continue;
+        }
+        throw error;
+      }
       console.log("    applied ✅");
     }
     changed++;
