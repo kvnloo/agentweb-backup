@@ -2430,16 +2430,35 @@ describe('CRM Database Service', () => {
     // here on purpose: handleDynamoDbError always rethrows, so batchCreateLeads
     // propagates the failure instead of returning that object, and a test
     // pretending to reach it would only be pinning dead code.
-    it('propagates a failure that lands after the placeholder filter', async () => {
-      // incrementLeadCount rethrows, and it runs after the rows have already
-      // been classified — the narrow way into the outer catch.
+    // ENG-1133: incrementLeadCount / updateFieldNames run AFTER the rows are
+    // written. Letting either unwind into the outer catch threw away the ledger
+    // for an import that had already persisted — the caller was told the whole
+    // thing failed and would re-send rows that are in the list. Denormalized
+    // bookkeeping is recoverable; the ledger is not.
+    it('keeps the import and its ledger when post-write bookkeeping fails', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('DynamoDB unavailable')),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-fail' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual(['anonymized_skipped', 'created']);
+      expect(result.created).toHaveLength(1);
+      expect(result.anonymizedSkipped).toBe(1);
+    });
+
+    it('propagates a failure that lands before any row is written', async () => {
+      // The pre-read of the list's existing leads is the surviving way into the
+      // outer catch: nothing has been written, so there is no ledger to lose.
+      mockDocumentClientMethods.query.mockReturnValue({
         promise: jest.fn().mockRejectedValue(new Error('DynamoDB unavailable')),
       });
 
       await expect(
         crmDb.batchCreateLeads(listId, [
-          { firstName: 'LinkedIn', lastName: 'Member' },
           { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-fail' },
         ]),
       ).rejects.toThrow('DynamoDB unavailable');
@@ -2454,6 +2473,266 @@ describe('CRM Database Service', () => {
       expect(result.anonymizedSkipped).toBe(0);
       expect(result.newCount).toBe(2);
       expect(result.created).toHaveLength(2);
+    });
+  });
+
+  // ENG-1133: a large import that dies part-way (agent-mode whole-turn cap)
+  // can only be resumed if the caller can tell, row by row, what landed and
+  // what did not. Aggregate counts alone ("25 new lead(s) created") make a
+  // resume indistinguishable from a restart.
+  describe('per-row import ledger (resumable partial imports)', () => {
+    const listId = 'list_ledger';
+
+    const primeWrites = () => {
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    };
+
+    const primeExisting = (items: any[]) => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: items }),
+      });
+    };
+
+    beforeEach(primeWrites);
+
+    it('classifies every input row in rowOutcomes, aligned to input order', async () => {
+      primeExisting([
+        { leadId: 'lead_merge', listId, email: 'merge@example.com', firstName: 'Old' },
+        { leadId: 'lead_same', listId, email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'brand-new@example.com', firstName: 'Brand', lastName: 'New' },
+        { email: 'merge@example.com', firstName: 'Updated' },
+        { email: 'same@example.com', firstName: 'Same', lastName: 'Person' },
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { email: 'brand-new@example.com', firstName: 'Dup', lastName: 'Row' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual([
+        'created',
+        'merged',
+        'already_present',
+        'anonymized_skipped',
+        'duplicate_in_request',
+      ]);
+      // A row that was already in the list, unchanged, used to vanish from
+      // every counter — the resume path read that as "nothing happened".
+      expect(result.alreadyPresentCount).toBe(1);
+      expect(result.rowOutcomes).toHaveLength(5);
+    });
+
+    it('marks rows as failed — never unprocessed — when their batch write fails', async () => {
+      primeExisting([]);
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'a@example.com' },
+        { email: 'b@example.com' },
+      ]);
+
+      expect(result.rowOutcomes).toEqual(['failed', 'failed']);
+      expect(result.errorCount).toBe(2);
+    });
+
+    // The customer report calls this one out directly: "rows without email may
+    // not dedupe safely". Without an identity axis for them, re-submitting a
+    // partially-imported CSV duplicates every email-less row it already wrote.
+    it('dedupes an email-less, linkedin-less row against the list by name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Acme', title: 'CTO' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(0);
+      expect(result.rowOutcomes).toEqual(['merged']);
+    });
+
+    it('still creates an email-less row when no existing lead shares its name + company', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Globex' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+
+    // Narrow by design: a row that carries its own identity (email or
+    // LinkedIn URL) must keep the existing behaviour, or two genuinely
+    // different people who share a name at one company get silently merged.
+    it('does not name-match a row that carries its own email identity', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'ann.lee.2@example.com', firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ], { dedupeByNameCompany: true });
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
+    });
+
+    // ENG-1133 acceptance criterion 1: an import that cannot finish must RETURN
+    // a partial naming the rows it never reached, rather than run until a
+    // caller-level timeout kills the turn with no tool result at all. Without a
+    // budget `unprocessed` was unreachable — every path assigned a terminal
+    // outcome — so the resumable contract could never actually fire.
+    describe('write budget', () => {
+      /** Push the clock past the deadline once the first unit of work is done. */
+      const expireAfterFirstUnit = (budgetMs: number) => {
+        const start = Date.now();
+        let calls = 0;
+        jest.spyOn(Date, 'now').mockImplementation(() => {
+          calls++;
+          // Two reads happen before any row is written and must see budget
+          // left: the one that sets the deadline, and the one that bounds the
+          // first existing-lead page. Everything after them reads as expired.
+          return calls <= 2 ? start : start + budgetMs + 1;
+        });
+      };
+
+      afterEach(() => {
+        (Date.now as any).mockRestore?.();
+      });
+
+      it('stops on the budget and leaves the rows it never reached unprocessed', async () => {
+        // 30 rows = two write chunks (25 + 5). The first is unconditional, the
+        // second is past the deadline.
+        const rows = Array.from({ length: 30 }, (_, i) => ({ email: `budget${i}@example.com` }));
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(listId, rows, { deadlineMs: 1000 });
+
+        expect(result.newCount).toBe(25);
+        expect(result.rowOutcomes.filter((o: string) => o === 'created')).toHaveLength(25);
+        expect(result.rowOutcomes.filter((o: string) => o === 'unprocessed')).toHaveLength(5);
+        // Not billed as failures — those rows were never attempted, and a
+        // resume must retry them rather than treat them as rejected.
+        expect(result.errorCount).toBe(0);
+      });
+
+      it('stops the merge loop on the budget too', async () => {
+        // Merges are one sequential round-trip per row, so a file re-sent after
+        // a partial run — every row already present — is the slowest shape here
+        // and the one a resume produces. The budget has to bound it, not just
+        // the batched creates.
+        primeExisting([
+          { leadId: 'lead_m1', listId, email: 'm1@example.com', title: 'Old' },
+          { leadId: 'lead_m2', listId, email: 'm2@example.com', title: 'Old' },
+          { leadId: 'lead_m3', listId, email: 'm3@example.com', title: 'Old' },
+        ]);
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(listId, [
+          { email: 'm1@example.com', title: 'New' },
+          { email: 'm2@example.com', title: 'New' },
+          { email: 'm3@example.com', title: 'New' },
+        ], { deadlineMs: 1000 });
+
+        expect(result.rowOutcomes).toEqual(['merged', 'unprocessed', 'unprocessed']);
+      });
+
+      // The pre-read is O(list size) and runs before any row is written, so on
+      // a huge or throttled list it can burn the whole budget and let the
+      // caller's own timeout kill the turn with no ledger at all — the exact
+      // failure this ticket is about.
+      it('stops when the existing-lead pre-read cannot finish inside the budget', async () => {
+        // Every page reports another page behind it, so the pre-read would never
+        // end on its own. The budget has to end it.
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { leadId: 'next' } }),
+        });
+        expireAfterFirstUnit(1000);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'preread@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        // Nothing written: the dedupe maps are missing rows, so every unmatched
+        // row would be inserted a second time.
+        expect(result.newCount).toBe(0);
+        expect(result.mergedCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
+        expect(result.errors[0]).toMatch(/Could not read the existing leads/);
+      });
+
+      // Checking the clock between pages does not help if one page never comes
+      // back: the await holds and the check is never reached.
+      it('stops when a single existing-lead page stalls past the budget', async () => {
+        mockDocumentClientMethods.query.mockReturnValue({
+          promise: jest.fn().mockReturnValue(new Promise(() => {})),
+        });
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'stall@example.com' }],
+          { deadlineMs: 50 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(true);
+        expect(result.newCount).toBe(0);
+        expect(result.rowOutcomes).toEqual(['unprocessed']);
+      });
+
+      it('does not flag an incomplete pre-read when the list reads cleanly', async () => {
+        primeExisting([{ leadId: 'lead_a', listId, email: 'a@example.com' }]);
+
+        const result = await crmDb.batchCreateLeads(
+          listId,
+          [{ email: 'b@example.com' }],
+          { deadlineMs: 1000 },
+        );
+
+        expect(result.dedupeIncomplete).toBe(false);
+        expect(result.newCount).toBe(1);
+      });
+
+      it('imports everything when no budget is given', async () => {
+        const rows = Array.from({ length: 30 }, (_, i) => ({ email: `nobudget${i}@example.com` }));
+
+        const result = await crmDb.batchCreateLeads(listId, rows);
+
+        expect(result.newCount).toBe(30);
+        expect(result.rowOutcomes.filter((o: string) => o === 'unprocessed')).toHaveLength(0);
+      });
+    });
+
+    // The name+company fallback is a GUESS — two different people with the same
+    // name at one company collapse into one. Callers that sync from a system
+    // with its own stable record ids (HubSpot, Attio) must never get it, so it
+    // is opt-in and OFF by default.
+    it('does not name-match at all unless the caller opts in', async () => {
+      primeExisting([
+        { leadId: 'lead_ann', listId, firstName: 'Ann', lastName: 'Lee', company: 'Acme' },
+      ]);
+
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Ann', lastName: 'Lee', company: 'Acme', title: 'CTO' },
+      ]);
+
+      expect(result.newCount).toBe(1);
+      expect(result.rowOutcomes).toEqual(['created']);
     });
   });
 

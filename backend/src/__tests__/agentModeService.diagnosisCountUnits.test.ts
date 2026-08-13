@@ -22,19 +22,22 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 /**
- * ENG-1173. The ENG-971 fix gave the diagnosis agent the run's success ledger, which
- * was right — but it is a histogram of tool-call COUNTS, handed over as bare JSON
- * under the label "Succeeded operations" with no unit anywhere in the prompt.
+ * ENG-1173 / ENG-1133. The ENG-971 fix gave the diagnosis agent the run's success
+ * ledger, which was right — but it is a histogram of tool-call COUNTS, handed over as
+ * bare JSON under the label "Succeeded operations" with no unit anywhere in the prompt.
  *
  * Production session 39eb5663 carried `{"add_leads_to_list": 3}` (three batches of
  * 25 = 75 leads written) and the model reported "successfully added the 3 leads".
  * Reading `3` as a lead count is the only reasonable reading of what it was sent.
  *
- * The prompt must state the unit and forbid restating these numbers as quantities of
- * anything. The deterministic strip in falseFailureReport is the backstop; this is
- * the fix at the source.
+ * The prompt-level fix SHIPPED WITH ENG-1133, which reached the same diagnosis from
+ * the import side and labelled both ledgers (succeeded AND failed — this file pins
+ * both). These tests are therefore a regression pin on wording that already landed,
+ * not a claim to it. ENG-1173's own contribution is the deterministic backstop in
+ * falseFailureReport: a prompt rule is guidance, not a guarantee, and the model is
+ * still free to ignore it.
  */
-describe('generateDiagnosticMessage — tool-call counts are labelled, not entity counts (ENG-1173)', () => {
+describe('generateDiagnosticMessage — run counts are labelled, not entity counts (ENG-1133)', () => {
   let svc: AgentModeService;
   let callLLM: jest.SpyInstance;
   let consoleErrorSpy: jest.SpyInstance;
@@ -83,19 +86,32 @@ describe('generateDiagnosticMessage — tool-call counts are labelled, not entit
     };
   };
 
-  it('states in the user prompt that the numbers are tool-call counts', async () => {
+  it('states in the user prompt that the numbers are run counts', async () => {
     const { user } = await promptFor(PROD_CONTEXT);
 
-    expect(user).toMatch(/how many times .*was called|number of times|tool-call counts/i);
+    expect(user).toMatch(/number of times it RAN/i);
+    expect(user).toMatch(/NOT a count of records/i);
     // The ledger itself is still sent — this adds the unit, it does not remove data.
     expect(user).toContain('add_leads_to_list');
+  });
+
+  it('labels the FAILED ledger with the same unit', async () => {
+    const { user } = await promptFor({
+      ...PROD_CONTEXT,
+      failedFunctions: { add_leads_to_list: 2 },
+    });
+
+    expect(user).toMatch(/Failed operations[^\n]*number of times it FAILED/i);
+    expect(user).toMatch(/Failed operations[^\n]*NOT a count of records/i);
   });
 
   it('forbids restating those counts as a quantity of records', async () => {
     const { system } = await promptFor(PROD_CONTEXT);
 
-    expect(system).toMatch(/never state (?:a |any )?(?:number|quantity|count)/i);
+    expect(system).toMatch(/never restate a run count as a quantity/i);
     expect(system).toMatch(/leads|records|rows/i);
+    // Names the exact production misreading so the rule cannot be softened blindly.
+    expect(system).toMatch(/add_leads_to_list["']?:\s*3/);
   });
 
   it('still carries the ENG-971 no-lost-work rules', async () => {
@@ -105,10 +121,10 @@ describe('generateDiagnosticMessage — tool-call counts are labelled, not entit
     expect(system).toMatch(/succeeded/i);
   });
 
-  it('omits the unit note when there is no success ledger', async () => {
+  it('omits the success section (and its unit note) when nothing succeeded', async () => {
     const { user } = await promptFor({ ...PROD_CONTEXT, succeededFunctions: {} });
 
     expect(user).not.toMatch(/Succeeded operations/i);
-    expect(user).not.toMatch(/tool-call counts/i);
+    expect(user).not.toMatch(/number of times it RAN/i);
   });
 });
