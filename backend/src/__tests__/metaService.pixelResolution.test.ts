@@ -351,14 +351,33 @@ describe('resolveMetaPixelWithDefault', () => {
       expect(result).toEqual({ pixelId: 'live', accountId: 'healthyAcc' });
     });
 
-    it('keeps the stored choice when verification itself fails — an outage must not silently repoint attribution', async () => {
+    // Greptile round 5 on #2384: these two failures look alike and must not behave alike.
+    it('keeps the stored choice when META is unreachable — an outage must not silently repoint attribution', async () => {
       (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }]);
       (getCachedPixels as jest.Mock).mockReturnValue(null);
-      (getMetaAccountCredentials as jest.Mock).mockRejectedValue(new Error('graph unreachable'));
+      (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'storedAcc', accessToken: 'tok', accountName: 'Acc' });
+      mockFetch.mockRejectedValue(new Error('graph unreachable'));
 
       const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
 
       expect(result).toEqual({ pixelId: 'storedPixel', accountId: 'storedAcc' });
+    });
+
+    it('abandons the stored choice when its own credentials are unusable, so a healthy account still wins', async () => {
+      // Credentials failing is evidence about the PAIR, not about Meta: keeping it would send
+      // every later booking down a path that cannot resolve, retried to exhaustion, while a
+      // healthy pixel sits unused — the very failure the connectivity check exists to prevent.
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'storedAcc' }, { accountId: 'healthyAcc' }]);
+      (getCachedPixels as jest.Mock).mockReturnValue(null);
+      (getMetaAccountCredentials as jest.Mock)
+        .mockRejectedValueOnce(new Error('token revoked'))                                              // verification
+        .mockRejectedValueOnce(new Error('token revoked'))                                              // storedAcc during search
+        .mockResolvedValueOnce({ accountId: 'healthyAcc', accessToken: 'tok2', accountName: 'Healthy' });
+      mockFetch.mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ data: [{ id: 'livePixel' }] }) });
+
+      const result = await metaService.resolveMetaPixelWithDefault(user, 'user1', { pixelId: 'storedPixel', accountId: 'storedAcc' });
+
+      expect(result).toEqual({ pixelId: 'livePixel', accountId: 'healthyAcc' });
     });
   });
 

@@ -2428,10 +2428,40 @@ export class MetaService {
       }
 
       const { getMetaAccountCredentials } = await import('./metaAccountCredentials');
-      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, stored.accountId);
-      const pixels = await this.listPixels(accountId, accessToken);
-      return (pixels || []).some((p: any) => p.id === stored.pixelId);
+
+      // Two failures that must NOT be treated alike (Greptile round 5 on #2384).
+      //
+      // Credentials failing is evidence about the stored pair itself: that account's token is
+      // gone or unusable, so keeping the selection would send every later booking down a path
+      // whose credentials cannot resolve — retried to exhaustion while a healthy pixel on
+      // another connected account sits unused. That is the exact failure the connectivity
+      // check exists to prevent, so treat it as "not usable" and let the search continue.
+      let credentials: { accountId: string; accessToken: string };
+      try {
+        credentials = await getMetaAccountCredentials(user, userId, stored.accountId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} has no usable credentials ` +
+          `(${error?.message}) — falling back to auto-resolution`,
+        );
+        return false;
+      }
+
+      // A Graph failure is evidence about Meta, not about the choice. Keep it: repointing a
+      // working configuration because of a transient outage is worse than briefly honoring a
+      // pixel that may have been deleted, which degrades visibly as a recorded CAPI failure.
+      try {
+        const pixels = await this.listPixels(credentials.accountId, credentials.accessToken);
+        return (pixels || []).some((p: any) => p.id === stored.pixelId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Could not reach Meta to verify stored pixel ${stored.pixelId} ` +
+          `(keeping the customer's choice): ${error?.message}`,
+        );
+        return true;
+      }
     } catch (error: any) {
+      // The cache lookup or module import failed — nothing learned about the pair either way.
       console.warn(
         `[Meta] Could not verify stored pixel ${stored.pixelId} (keeping the customer's choice): ${error?.message}`,
       );
