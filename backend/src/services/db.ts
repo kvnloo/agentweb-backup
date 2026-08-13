@@ -3073,14 +3073,16 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+// A single UpdateExpression is capped, so shed in batches. Each write shifts the
+// survivors down, which is why every batch removes from index 0 again.
+const MAX_RUN_RESULT_REMOVALS_PER_WRITE = 50;
+
 /**
- * ENG-1048: `addRunResult` appends with `list_append`, which cannot shed anything,
- * so once a schedule row reaches DynamoDB's 400KB item limit every subsequent run
- * silently fails to record its result. Re-read the row, drop the oldest runs until
- * the item fits, and write the trimmed history back. Returns null when even the
- * incoming result cannot fit, so the caller surfaces the original error.
+ * ENG-1048: how many of the OLDEST run results have to go for this row to accept one
+ * more. Returns 0 when nothing needs shedding and null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
  */
-const appendRunResultWithinBudget = async (scheduleId: string, runResult: any) => {
+const countOldestRunResultsToShed = async (scheduleId: string, runResult: any) => {
   const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
   const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
   if (!existing) return null;
@@ -3093,20 +3095,12 @@ const appendRunResultWithinBudget = async (scheduleId: string, runResult: any) =
     appended,
   );
   if (kept.length === 0) return null;
-
-  console.warn(
-    `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropped the ${dropped} oldest of ${appended.length} run results to record this run`
-  );
-
-  const result = await dynamodb.update({
-    TableName: tableName,
-    Key: { scheduleId },
-    UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
-    ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
-    ExpressionAttributeValues: { ':runResults': kept, ':updatedAt': new Date().toISOString() },
-    ReturnValues: 'ALL_NEW',
-  }).promise();
-  return result.Attributes;
+  if (dropped > 0) {
+    console.warn(
+      `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
+    );
+  }
+  return dropped;
 };
 
 export const scheduleDb = {
@@ -3334,34 +3328,71 @@ export const scheduleDb = {
   },
 
   async addRunResult(scheduleId: string, runResult: any) {
-    try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
-        },
-        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-        ExpressionAttributeNames: {
-          '#runResults': 'runResults',
-          '#updatedAt': 'updatedAt',
-        },
-        ExpressionAttributeValues: {
-          ':runResult': [runResult],
-          ':emptyList': [],
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: {
+        scheduleId,
+      },
+      UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#runResults': 'runResults',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':runResult': [runResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
 
+    try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
       // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry once.
       if (isDynamoItemSizeError(error)) {
-        const healed = await appendRunResultWithinBudget(scheduleId, runResult);
-        if (healed) return healed;
+        try {
+          const toShed = await countOldestRunResultsToShed(scheduleId, runResult);
+          if (toShed !== null && toShed > 0) {
+            await scheduleDb.dropOldestRunResults(scheduleId, toShed);
+            const retried = await dynamodb.update(params).promise();
+            return retried.Attributes;
+          }
+        } catch (recoveryError) {
+          // Recovery failed too — report the condition that actually stopped the write.
+          console.error(`DynamoDB addRunResult: could not make room on schedule ${scheduleId}:`, recoveryError);
+        }
       }
       handleDynamoDbError(error, "addRunResult");
+      throw error;
+    }
+  },
+
+  /**
+   * ENG-1048: drop the `count` OLDEST run results, by index rather than by rewriting
+   * the list. The list is only ever appended to at the tail, so index 0 is stable
+   * under a concurrent run finishing mid-shed — whereas writing back a list built
+   * from an earlier read would silently erase that run's result. Every batch removes
+   * from 0 again because each write shifts the survivors down.
+   */
+  async dropOldestRunResults(scheduleId: string, count: number) {
+    if (!Number.isInteger(count) || count <= 0) return;
+    try {
+      for (let shed = 0; shed < count; shed += MAX_RUN_RESULT_REMOVALS_PER_WRITE) {
+        const batch = Math.min(MAX_RUN_RESULT_REMOVALS_PER_WRITE, count - shed);
+        const removals = Array.from({ length: batch }, (_, index) => `#runResults[${index}]`);
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          Key: { scheduleId },
+          UpdateExpression: `SET #updatedAt = :updatedAt REMOVE ${removals.join(', ')}`,
+          ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+          ExpressionAttributeValues: { ':updatedAt': new Date().toISOString() },
+          ConditionExpression: 'attribute_exists(#runResults)',
+        }).promise();
+      }
+    } catch (error) {
+      handleDynamoDbError(error, "dropOldestRunResults");
       throw error;
     }
   },

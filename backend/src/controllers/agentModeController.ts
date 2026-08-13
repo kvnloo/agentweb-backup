@@ -8716,6 +8716,7 @@ export const agentModeController = {
       // history, so even a length-trimmed prompt still failed). Budget the projected
       // item and shed the oldest history rather than failing the save.
       const projectedItem: Record<string, any> = { ...existingSchedule, ...updates };
+      let runResultsToShed = 0;
       const shedOldest = (listKey: 'promptRevisions' | 'runResults') => {
         if (estimateDynamoItemBytes(projectedItem) <= SCHEDULE_ITEM_BUDGET_BYTES) return;
         const list = Array.isArray(projectedItem[listKey]) ? projectedItem[listKey] : [];
@@ -8725,7 +8726,15 @@ export const agentModeController = {
         console.warn(
           `AgentMode: schedule ${scheduleId} is over the DynamoDB item budget — dropped the ${dropped} oldest of ${list.length} ${listKey} entries to fit`
         );
-        updates[listKey] = kept;
+        if (listKey === 'runResults') {
+          // Never write run history back from the read above: a run finishing while
+          // this edit is in flight appends to the tail, and a full-list write derived
+          // from that earlier read would erase its result. Shed by index instead,
+          // once the rest of the edit is known to fit.
+          runResultsToShed = dropped;
+        } else {
+          updates[listKey] = kept;
+        }
         projectedItem[listKey] = kept;
       };
       // Revision history first: it is pure undo state. Run history is only shed once
@@ -8736,6 +8745,12 @@ export const agentModeController = {
         return res.status(400).json({
           error: `Scheduled chat is too large to save (about ${Math.round(estimateDynamoItemBytes(projectedItem) / 1024)}KB against DynamoDB's 400KB per-item limit) even after dropping saved history. The starting message is ${effectiveStartingMessage.length} characters — shorten it and try again.`,
         });
+      }
+
+      // Only now that the edit is known to fit — a rejected save must not have already
+      // cost the owner run history.
+      if (runResultsToShed > 0) {
+        await scheduleDb.dropOldestRunResults(scheduleId, runResultsToShed);
       }
 
       // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
