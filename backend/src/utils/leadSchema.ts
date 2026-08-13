@@ -52,6 +52,24 @@ export interface LeadAttributionFields {
   utmSource?: string;
   /** Denormalized from firstTouch.utm.medium. */
   utmMedium?: string;
+  /**
+   * Denormalized from `firstTouch.clickIds` — the paid-click identifiers that
+   * acquired this lead (`gclid`, `fbclid`, `ttclid`, `liFatId`, …).
+   *
+   * Deliberately a MAP, not one column per platform: `normalizeAttribution`
+   * already accepts click IDs we have not enumerated here, and a new ad
+   * platform must not require a schema change to be carried (ENG-1176 AC3).
+   *
+   * Written ONLY when at least one non-empty value was captured, so
+   * `attribute_exists(clickIds)` answers "did a paid click acquire this lead?"
+   * — the question `firstTouch` famously cannot answer (see the warning above).
+   * An empty map would silently count an organic lead as attributed.
+   *
+   * Set once, from `firstTouch` only. A repeat visit carrying a fresh `gclid`
+   * must not overwrite the click that actually acquired the lead, which is why
+   * `lastTouch` never feeds this field.
+   */
+  clickIds?: Record<string, string>;
 }
 
 export const LEAD_LIFECYCLES = [
@@ -346,5 +364,37 @@ export function buildLeadAttributionFields(
   if (finalSource) out.utmSource = finalSource;
   if (finalMedium) out.utmMedium = finalMedium;
 
+  // Denormalize the click IDs the same way, and for the same reason: today they
+  // are reachable only by walking the firstTouch blob, so "what share of this
+  // account's leads carry a click ID" needs a scan (ENG-1176 / ENG-926 §F).
+  //
+  // Copied into a fresh object rather than referenced, so a later mutation of
+  // the stored blob cannot silently change the denormalized answer.
+  const clickIds = pruneClickIds(ext.clickIds) || pruneClickIds(ext.firstTouch?.clickIds);
+  if (clickIds) out.clickIds = clickIds;
+
   return out;
+}
+
+/**
+ * Keep only the string click-ID values that carry something.
+ *
+ * Returns `undefined` — not `{}` — when nothing survives, because the caller
+ * distinguishes "no paid click" (field absent) from "paid click" (field
+ * present). An empty map written to the row would make every organic lead look
+ * attributed to `attribute_exists`.
+ *
+ * Non-string values are dropped rather than coerced: a numeric `gclid` is
+ * upstream corruption, and `String(12345)` would launder it into something that
+ * looks like a real click ID in a report.
+ */
+export function pruneClickIds(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) out[key] = trimmed;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
