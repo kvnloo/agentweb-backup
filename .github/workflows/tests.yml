@@ -645,17 +645,29 @@ jobs:
       # environment actually came up on it. Every AWS failure fails this step —
       # see .github/scripts/eb-deploy.sh (ENG-734, wired to staging in ENG-743).
       # The script's own budget stays under this step's timeout so it always
-      # reports the reason instead of being killed mid-poll; together they keep
-      # the 35 minutes the previous deploy + readiness steps allowed.
+      # reports the reason instead of being killed mid-poll.
+      #
+      # These three numbers are sized for Immutable, which ENG-1128 enabled on
+      # staging on 2026-08-11. Immutable launches a parallel fleet, swaps it in,
+      # and then drains the old one — and that drain is deliberate, not slack:
+      # asgLifecycleGuard.ts parks each dying instance in Terminating:Wait for
+      # up to DRAIN_CEILING_MS (10 min) so in-flight scheduled runs finish
+      # instead of being killed mid-execution (ENG-657, ENG-764). Rollouts now
+      # measure 9-40 min against the 30 this used to allow, so deploys that had
+      # already succeeded were failing here on a budget calibrated for the old
+      # Rolling policy (ENG-1183). The settle cap has to move with them: it
+      # waits out a pre-existing update, and a busy Immutable environment stays
+      # busy far longer than its 600s default assumed.
       - name: Deploy to Elastic Beanstalk and verify the environment took it
-        timeout-minutes: 35
+        timeout-minutes: 50
         env:
           EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}
           EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}
           EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
-          EB_TOTAL_TIMEOUT_SECONDS: '1800'
+          EB_TOTAL_TIMEOUT_SECONDS: '2700'
+          EB_SETTLE_TIMEOUT_SECONDS: '1200'
         run: bash .github/scripts/eb-deploy.sh
 
       # Only reachable when the step above proved the environment is Ready on
