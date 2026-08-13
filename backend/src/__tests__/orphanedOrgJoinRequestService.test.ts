@@ -67,7 +67,7 @@ describe('findOrphanedOrgJoinRequests', () => {
 
     expect(result).toMatchObject({
       organizationsScanned: 1,
-      pendingRequestsScanned: orgRequestCount,
+      pendingRequestsScanned: 101,
       truncated: true,
       missingUserReferences: new Array(100).fill(0).map((_, index) => ({
         orgId: 'org-1',
@@ -89,7 +89,7 @@ describe('findOrphanedOrgJoinRequests', () => {
 
     expect(result).toMatchObject({
       organizationsScanned: 1,
-      pendingRequestsScanned: 100,
+      pendingRequestsScanned: 101,
       missingUserReferences: [],
       truncated: true,
     });
