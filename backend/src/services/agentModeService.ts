@@ -30568,17 +30568,43 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  /**
+   * Resolve a connected account the caller can actually reach — their own, or one a
+   * teammate explicitly shared with the org — together with the id of the member who
+   * OWNS it.
+   *
+   * list_connected_accounts reports that own+org-shared set, so resolving against the
+   * caller's own record alone made a listed account come back "not found or access
+   * denied" from the very tools the list points at (ENG-943, first found on the mail
+   * tools). The owner id is load-bearing downstream too: adapters persist a refreshed
+   * token with updateAccountTokens(userId, …), so passing the caller would write a
+   * teammate's rotated token onto the caller's record and leave the owner's stale.
+   *
+   * Read paths only. An irreversible write additionally re-reads the owner record at
+   * the last moment to catch a mid-flight disconnect — see postOnConnectedAccount.
+   */
+  private async resolveAccessibleAccount(
+    callerUserId: string,
+    accountId: string
+  ): Promise<{ account: any; ownerUserId: string } | null> {
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const accounts = (await getAccountsWithOwnerIncludingOrgShared(callerUserId)) || [];
+    const account = accounts.find((a: any) => a.account_id === accountId);
+    if (!account) return null;
+    return { account, ownerUserId: (account as any).userId || callerUserId };
+  }
+
   async listLinkedInComments(userId: string, accountId: string, postUrn: string): Promise<any> {
     console.log('[AgentMode] listLinkedInComments called:', { userId, accountId, postUrn });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const account = await getAccountById(accountId, userId);
-      if (!account) {
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return { success: false, message: 'Account not found or access denied' };
       }
+      const { account, ownerUserId } = resolved;
 
       if (account.platform !== 'linkedin') {
         return { success: false, message: 'Listing comments is currently only supported for LinkedIn accounts' };
@@ -30589,7 +30615,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Listing comments is not supported for this platform' };
       }
 
-      const comments = await adapter.getComments(account, postUrn, userId);
+      const comments = await adapter.getComments(account, postUrn, ownerUserId);
 
       return {
         success: true,
@@ -30790,22 +30816,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // Load metrics for connected account helper
   async loadConnectedAccountMetrics(userId: string, accountId: string, startDate?: Date, endDate?: Date): Promise<any> {
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
-        const account = await getAccountById(accountId, userId);
+        const resolved = await this.resolveAccessibleAccount(userId, accountId);
 
-        if (!account) {
+        if (!resolved) {
           return {
             success: false,
             message: 'Account not found or access denied'
           };
         }
+        const { account, ownerUserId } = resolved;
 
         const adapter = socialPlatformService.getAdapter(account.platform);
 
-        const metrics = await adapter.getAccountMetrics(account, userId, startDate, endDate);
+        const metrics = await adapter.getAccountMetrics(account, ownerUserId, startDate, endDate);
 
         return {
           success: true,
@@ -30852,20 +30878,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
-      const { getAccountById } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      // Verify account ownership
-      const account = await getAccountById(accountId, userId);
-      if (!account) {
+      // Verify the caller can reach this account (own or org-shared)
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
       const adapter = socialPlatformService.getAdapter(account.platform);
-      const analytics = await adapter.getPostAnalytics(account, postIds, userId);
+      const analytics = await adapter.getPostAnalytics(account, postIds, ownerUserId);
 
       // Check for any errors in the results
       const failedCount = analytics.filter((a: any) => a.error).length;
