@@ -872,10 +872,21 @@ async function getDiagnosticErrorMessage(
       succeededFunctions,
       importTotalsSummary: describeLeadImportTotals(importTotals),
     };
-    // Only figures the transcript proves may survive the ENG-1173 strip.
-    const foundedCounts = importTotals?.known
-      ? [importTotals.landed, importTotals.attempted, importTotals.attempted - importTotals.landed]
-      : [];
+    // Only figures the transcript proves may survive the ENG-1173 strip — and only
+    // `landed`, deliberately.
+    //
+    // Admitting `attempted` and the shortfall alongside it looks harmless (all three
+    // are measured) but the guard can only test numeric membership, not what the
+    // sentence claims about the number. With 75 of 97 landed, a founded set of
+    // {75, 97, 22} lets "I added 97 leads" and "I added 22 leads" through as
+    // successful-write claims — a false success, which is the exact harm this work
+    // exists to prevent (Greptile P1 on this PR).
+    //
+    // `landed` is the only figure that is true under the claim the model is most
+    // likely to make ("I added N"). The useful partial phrasing survives anyway:
+    // "75 of 97 leads" is left whole by the N-of-M rule above, which never rewrites
+    // an N-of-M construction.
+    const foundedCounts = importTotals?.known ? [importTotals.landed] : [];
     const message = await agentModeService.generateDiagnosticMessage(context);
     return {
       // ENG-1173: three passes, in this order and for this reason.

@@ -116,6 +116,76 @@ describe('collectLeadImportTotals (ENG-1174)', () => {
   });
 });
 
+/**
+ * ENG-1174 self-review. Both of these shipped-looking behaviours are the SAME class of
+ * defect the whole line of work exists to remove: a confident, wrong number.
+ */
+/**
+ * Greptile P1 on this PR. `attempted` and the shortfall are measured too, but the
+ * guard can only test numeric membership — not what the sentence claims. Admitting
+ * them lets "I added 97 leads" pass as a successful-write claim when 75 landed.
+ */
+describe('only the landed total is founded (ENG-1174)', () => {
+  const founded = [75]; // landed, for a 75-of-97 partial
+
+  it.each(['I added 97 leads.', 'I added 22 leads.'])(
+    'rejects a measured figure that is not the landed count: %s',
+    (text) => {
+      expect(stripUnfoundedEntityCounts(text, founded)).toBe('I added the leads.');
+    },
+  );
+
+  it('permits the landed count itself', () => {
+    expect(stripUnfoundedEntityCounts('I added 75 leads.', founded)).toBe('I added 75 leads.');
+  });
+
+  it('leaves the N-of-M partial phrasing whole, so nothing useful is lost', () => {
+    const partial = 'I added 75 of 97 leads before the run stopped.';
+    expect(stripUnfoundedEntityCounts(partial, founded)).toBe(partial);
+  });
+});
+
+describe('founded counts must not leak across entity types (ENG-1174)', () => {
+  // Row totals for a LEAD import — never a count of emails, posts or campaigns.
+  const founded = [75, 97, 22];
+
+  it.each([
+    ['I sent 75 emails before the run stopped.', /75\s+emails/],
+    ['I published 22 posts.', /22\s+posts/],
+    ['I created 97 campaigns.', /97\s+campaigns/],
+  ])('does not let a row total authorise a different noun: %s', (text, forbidden) => {
+    expect(stripUnfoundedEntityCounts(text, founded)).not.toMatch(forbidden);
+  });
+
+  it.each(['leads', 'rows', 'records', 'contacts', 'prospects'])(
+    'still permits the founded figure on the noun it was measured for: %s',
+    (noun) => {
+      const text = `I added 75 ${noun} before the run stopped.`;
+      expect(stripUnfoundedEntityCounts(text, founded)).toBe(text);
+    },
+  );
+});
+
+describe('a batch that cannot be attributed to this turn (ENG-1174)', () => {
+  const SINCE = Date.parse('2026-08-11T13:41:00.000Z');
+
+  it('degrades to UNKNOWN rather than silently under-reporting', () => {
+    const stamped = toolMsg(batch(25), '2026-08-11T13:47:05.310Z');
+    const unstamped = { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify(batch(25)) };
+
+    // Silently skipping the unstamped batch would report 50 of 75 as authoritative.
+    expect(collectLeadImportTotals([stamped, unstamped as any, stamped], SINCE).known).toBe(false);
+  });
+
+  it('still ignores a batch that genuinely belongs to an earlier turn', () => {
+    const earlier = toolMsg(batch(25), '2026-08-11T10:00:00.000Z');
+    const thisTurn = toolMsg(batch(25), '2026-08-11T13:47:05.310Z');
+
+    expect(collectLeadImportTotals([earlier, thisTurn], SINCE))
+      .toEqual({ landed: 25, attempted: 25, known: true });
+  });
+});
+
 describe('describeLeadImportTotals (ENG-1174)', () => {
   it('states landed of attempted when the import is short', () => {
     const line = describeLeadImportTotals({ landed: 75, attempted: 97, known: true });
@@ -174,7 +244,7 @@ describe('39eb5663 replayed end to end (ENG-1174)', () => {
 
   it('turns the run into a founded set that permits 75 and rejects 3', () => {
     const totals = collectLeadImportTotals(messages, SINCE);
-    const founded = [totals.landed, totals.attempted, totals.attempted - totals.landed];
+    const founded = [totals.landed];
 
     expect(describeLeadImportTotals(totals)).toMatch(/75/);
 

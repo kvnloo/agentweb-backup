@@ -514,6 +514,17 @@ const UNFOUNDED_COUNT_RE = new RegExp(
 );
 
 /**
+ * ENG-1174: the nouns a founded count may legitimately attach to.
+ *
+ * Every founded figure this module is given comes from a lead import, so it is a count
+ * of ROWS. Allowing it on any noun at all would let "I sent 75 emails" stand because 75
+ * happened to be the row total — a number that is true about one thing asserted about
+ * another. If a second source of founded counts is ever added, it must arrive with its
+ * own noun set rather than widening this one.
+ */
+const FOUNDED_COUNT_NOUNS_RE = /^(?:leads?|rows?|records?|contacts?|prospects?)$/i;
+
+/**
  * ENG-1173 kill switch — ON by default; set AGENT_DIAGNOSIS_COUNT_GUARD=false to stand
  * the count strip and the data-write notices down.
  *
@@ -570,7 +581,12 @@ export function stripUnfoundedEntityCounts(content: string, foundedCounts?: numb
       // to remove. An N-of-M construction is left alone entirely.
       if (/\bof\s+$/i.test(whole.slice(0, offset))) return match;
 
-      if (founded.size > 0) {
+      // A founded figure is founded FOR A PARTICULAR THING. The only source of these
+      // today is a lead import (collectLeadImportTotals), so 75 is 75 rows — it says
+      // nothing about emails, posts or campaigns. Without this check the guard let
+      // "I sent 75 emails" through purely because 75 happened to be the row total,
+      // which is the same confident-wrong-number defect this module exists to remove.
+      if (founded.size > 0 && FOUNDED_COUNT_NOUNS_RE.test(noun)) {
         const digits = match.match(/\d[\d,]*/);
         const value = digits ? Number(digits[0].replace(/,/g, '')) : NaN;
         if (Number.isFinite(value) && founded.has(value)) return match;

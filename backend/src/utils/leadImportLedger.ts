@@ -253,9 +253,14 @@ export function collectLeadImportTotals(
 
     const rawTs = message.timestamp || message.metadata?.timestamp;
     const ts = rawTs ? Date.parse(rawTs) : NaN;
-    // No usable timestamp means it cannot be attributed to THIS turn. Counting it
-    // could import an earlier turn's rows into this turn's report.
-    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    // No usable timestamp: this batch can be neither included nor excluded with
+    // confidence. SKIPPING it is the dangerous choice — the surviving batches still
+    // report `known: true`, so a 75-row import silently becomes an authoritative
+    // "50". An unattributable batch therefore poisons the whole sum.
+    if (!Number.isFinite(ts)) return UNKNOWN_TOTALS;
+    // A batch that provably predates this turn is a different matter: it is excluded
+    // on evidence, not on ignorance, so the remaining sum stays trustworthy.
+    if (ts < sinceMs) continue;
 
     const text = typeof message.content === 'string' ? message.content : '';
     // A tool result wearing the error envelope is a FAILED call, never a total.
