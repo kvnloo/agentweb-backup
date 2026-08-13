@@ -116,13 +116,50 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
 const CONFIRMED_DATA_WRITE_TOOLS: ReadonlySet<string> = new Set<string>([
   'add_leads_to_list',
   'create_lead_list',
+  'add_lead_engagement',
+  // Enrichment spends paid Apollo / LinkedIn credits and writes back to the CRM, so a
+  // needless re-run costs real money on top of duplicating work.
+  'enrich_leads_execute',
+  'enrich_lead_custom',
+  // Created in the user's OWN Drive — a re-run leaves them with two of the file.
+  'create_google_doc',
+  'create_google_sheet',
+  'create_knowledge_base',
 ]);
 
 /** Plain-language labels for the data-write set. Deliberately carry no quantities. */
 const DATA_WRITE_ACTION_LABELS: Record<string, string> = {
   add_leads_to_list: 'added leads to your list',
   create_lead_list: 'created your lead list',
+  add_lead_engagement: 'recorded a lead engagement event',
+  enrich_leads_execute: 'ran enrichment on your lead list',
+  enrich_lead_custom: 'enriched a lead',
+  create_google_doc: 'created a Google Doc in your Drive',
+  create_google_sheet: 'created a Google Sheet in your Drive',
+  create_knowledge_base: 'created a knowledge base',
 };
+
+/**
+ * Deliberately EXCLUDED, and the reasons follow the same rule as the publish set —
+ * a name has to confirm the outcome on its own, because on the diagnosis path the
+ * name is all that survives the throw:
+ *
+ *   `import_leads_from_search` — ENG-1002 and ENG-1068 both record its
+ *   written-vs-reported counts disagreeing, so "it wrote something" is not yet a
+ *   claim this module can stand behind.
+ *
+ *   `create_blog_article`, `create_book`, `create_social_media_posts` — these produce
+ *   DRAFTS, not published artifacts, exactly like the `generate_landing_page` case
+ *   above. Re-running a draft is cheap; telling the user not to is simply false.
+ *
+ *   `create_task_from_prompt` / `create_task_from_template` /
+ *   `create_image_task_from_prompt` — all three are marked [DEPRECATED] in the tool
+ *   registry and are being phased out.
+ *
+ *   Every `update_*` and `delete_*` tool — these overwrite or remove a known target,
+ *   so a repeat converges on the same state instead of duplicating it. Re-running is
+ *   the safe advice there, which is the opposite of what this notice says.
+ */
 
 /** Plain-language label per tool, so the correction reads as prose, not tool names. */
 const PUBLISH_ACTION_LABELS: Record<string, string> = {
@@ -519,6 +556,30 @@ export function collectConfirmedDataWriteActions(
   return out;
 }
 
+/**
+ * A run can both publish AND write data. The publish reconciler runs first and stamps
+ * CORRECTION_MARKER, and a bare `includes(CORRECTION_MARKER)` bail-out would then drop
+ * the data-write warning entirely — the user is told not to re-run the deploy, and
+ * nothing warns them off re-running the import that would duplicate records.
+ *
+ * So instead of yielding, extend the banner that is already there with the actions it
+ * does not already name. Idempotent by construction: an action whose label is already
+ * present is never re-added, so a second pass changes nothing.
+ */
+function extendExistingCorrection(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  const missing = collectConfirmedDataWriteActions(toolCalls)
+    .filter((action) => !content.includes(action));
+  if (missing.length === 0) return content;
+
+  return (
+    `${content.replace(/\s+$/, '')} It also ${missing.join('; ')} — that data is written `
+    + 'and saved, so please do NOT re-run that either; a repeat can create duplicate records.'
+  );
+}
+
 /** The visible correction appended after a confirmed, duplicate-unsafe data write. */
 function buildDataWriteNotice(actions: string[]): string {
   return (
@@ -545,7 +606,7 @@ export function appendConfirmedDataWriteNotice(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
-  if (content.includes(CORRECTION_MARKER)) return content;
+  if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
 
   const actions = collectConfirmedDataWriteActions(toolCalls);
   if (actions.length === 0) return content;
@@ -568,7 +629,8 @@ export function reconcileFalseDataWriteFailure(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
 ): string {
   if (typeof content !== 'string' || content.trim().length === 0) return content;
-  if (content.includes(CORRECTION_MARKER)) return content;
+  // A publish correction is already here — extend it rather than drop the warning.
+  if (content.includes(CORRECTION_MARKER)) return extendExistingCorrection(content, toolCalls);
   if (!assertsUnsavedInterruption(content)) return content;
 
   const actions = collectConfirmedDataWriteActions(toolCalls);

@@ -197,15 +197,34 @@ describe('appendConfirmedDataWriteNotice (ENG-1173)', () => {
     expect(appendConfirmedDataWriteNotice(fallback, [{ name: 'get_lead_lists' }])).toBe(fallback);
   });
 
-  it('yields to a publish correction already on the text — one banner, not two', () => {
+  /**
+   * A run that both published and imported must warn about BOTH. Yielding to the
+   * existing banner would tell the user not to re-run the deploy while leaving the
+   * duplicate-creating import unmentioned.
+   */
+  it('extends a publish correction instead of dropping the data-write warning', () => {
     const fallback = 'The run timed out and your changes were not saved. Please try again.';
     const ledger = [{ name: 'publish_landing_page_changes' }, { name: 'add_leads_to_list' }];
 
     const afterPublish = reconcileFalseFailureReport(fallback, ledger);
-    expect(afterPublish).not.toBe(fallback);
+    expect(afterPublish).toMatch(/published your landing-page changes/i);
+    expect(afterPublish).not.toMatch(/added leads to your list/i);
 
     const afterBoth = appendConfirmedDataWriteNotice(afterPublish, ledger);
-    expect(afterBoth).toBe(afterPublish);
+    expect(afterBoth.startsWith(afterPublish)).toBe(true);
+    expect(afterBoth).toMatch(/published your landing-page changes/i);
+    expect(afterBoth).toMatch(/added leads to your list/i);
+    // One banner, not two.
+    expect(afterBoth.match(/⚠️ Correction/g)).toHaveLength(1);
+  });
+
+  it('is idempotent once both halves are named', () => {
+    const fallback = 'The run timed out and your changes were not saved. Please try again.';
+    const ledger = [{ name: 'publish_landing_page_changes' }, { name: 'add_leads_to_list' }];
+    const once = appendConfirmedDataWriteNotice(reconcileFalseFailureReport(fallback, ledger), ledger);
+
+    expect(appendConfirmedDataWriteNotice(once, ledger)).toBe(once);
+    expect(reconcileFalseDataWriteFailure(once, ledger)).toBe(once);
   });
 
   it('tolerates empty content and a null ledger', () => {
@@ -244,5 +263,42 @@ describe('data-write confirmation must not widen the publish gate (ENG-1173)', (
   it('ignores read-only lookups and unknown tools', () => {
     expect(collectConfirmedDataWriteActions([{ name: 'get_lead_lists' }, { name: 'nope' }]))
       .toEqual([]);
+  });
+
+  it('covers the other duplicate-unsafe writes found in the tool registry', () => {
+    const covered = [
+      'add_lead_engagement',
+      'enrich_leads_execute',
+      'enrich_lead_custom',
+      'create_google_doc',
+      'create_google_sheet',
+      'create_knowledge_base',
+    ];
+    for (const name of covered) {
+      expect(collectConfirmedDataWriteActions([{ name }])).toHaveLength(1);
+    }
+  });
+
+  /**
+   * Each exclusion is a decision, not an oversight — see the block comment beside
+   * CONFIRMED_DATA_WRITE_TOOLS. Drafts are cheap to re-run, deprecated tools are on
+   * their way out, updates/deletes converge instead of duplicating, and
+   * import_leads_from_search has known count defects (ENG-1002 / ENG-1068).
+   */
+  it('stays out of drafts, deprecated tools, updates and deletes', () => {
+    const excluded = [
+      'import_leads_from_search',
+      'create_blog_article',
+      'create_social_media_posts',
+      'create_task_from_prompt',
+      'create_image_task_from_prompt',
+      'update_lead',
+      'update_lead_list',
+      'delete_leads',
+      'delete_lead_list',
+    ];
+    for (const name of excluded) {
+      expect(collectConfirmedDataWriteActions([{ name }])).toEqual([]);
+    }
   });
 });
