@@ -59,12 +59,51 @@ describe('notifyMetaAdsScopeLost (ENG-1158)', () => {
       ]);
 
       expect(sendEmail).toHaveBeenCalledTimes(1);
-      // BOTH report true. The return value answers "has the owner been told",
-      // not "did this call send it" — callers retract their notice marker on
-      // false, so the loser reporting false would undo the winner's marker and
-      // get the owner emailed again on the next sweep.
+      // Both joiners get the SAME real outcome — here, a success.
       expect(first).toBe(true);
       expect(second).toBe(true);
+    });
+
+    /**
+     * The first version of this guard recorded the attempt BEFORE sending, so a
+     * failed send made every later caller report true — the callers then kept a
+     * notice marker for an email that never went out and the owner was silenced
+     * for good. Exactly the bug the marker retraction exists to prevent
+     * (Greptile P1 on that guard).
+     */
+    it('reports a failed send as failed to every joiner, never as sent', async () => {
+      getUserById.mockResolvedValue({ userId: 'owner1', email: 'owner@example.com' });
+      sendEmail.mockRejectedValue(new Error('Resend down'));
+
+      const [first, second] = await Promise.all([
+        notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '922903076601160' }),
+        notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: '922903076601160' }),
+      ]);
+
+      expect(first).toBe(false);
+      expect(second).toBe(false);
+    });
+
+    it('lets a later attempt retry after a failed send', async () => {
+      // Nothing lingers to suppress the retry: the guard lives only for the
+      // duration of the attempt, so the next run genuinely tries again.
+      getUserById.mockResolvedValue({ userId: 'owner1', email: 'owner@example.com' });
+      sendEmail.mockRejectedValueOnce(new Error('Resend down'));
+
+      const failed = await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: 'a1' });
+      const retried = await notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: 'a1' });
+
+      expect(failed).toBe(false);
+      expect(retried).toBe(true);
+      expect(sendEmail).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports a missing address as failed, so the notice is retracted', async () => {
+      getUserById.mockResolvedValue({ userId: 'owner1', email: undefined });
+
+      await expect(
+        notifyMetaAdsScopeLost({ ownerUserId: 'owner1', accountId: 'a1' })
+      ).resolves.toBe(false);
     });
 
     it('does not suppress a different account for the same owner', async () => {

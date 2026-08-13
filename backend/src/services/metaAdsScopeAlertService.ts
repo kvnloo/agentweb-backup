@@ -27,25 +27,28 @@ import { META_ADS_RECONSENT_MESSAGE } from '../utils/metaAdsScope';
  * outage or a missing user record must not become the thing the customer sees.
  */
 /**
- * How long one owner+account pair is considered "just told". Long enough to
- * cover two runs overlapping, short enough that it can never swallow a genuine
- * alert for a later, separate outage — the durable marker handles that.
+ * Singleflight: owner+account -> the send currently in flight for it.
+ *
+ * Concurrent callers join the same attempt and receive the same answer, which
+ * is what closes the race on `ads_scope_alerted_at` — that marker is written by
+ * a read-modify-write with no condition, so two runs can both read "not yet
+ * alerted" and both send.
+ *
+ * Deliberately an in-flight promise rather than a "recently sent" timestamp.
+ * A timestamp recorded before the attempt turns a FAILED send into a reported
+ * success for anyone arriving later, so the callers keep a notice marker for an
+ * email that never went out and the owner is silenced permanently (Greptile P1
+ * on the first version of this guard). Sharing the promise instead means every
+ * joiner gets the real outcome: all true, or all false and all retract.
+ *
+ * Entries live only for the duration of the send, so the map cannot grow.
+ * Covers one process, like the token-refresh singleflight it mirrors.
  */
-const RESEND_GUARD_MS = 15 * 60 * 1000;
+const inFlightAlerts = new Map<string, Promise<boolean>>();
 
-/** owner+account -> epoch ms of the last send attempt from this process. */
-const recentlySent = new Map<string, number>();
-
-/** Keep the guard map from growing without bound on a long-lived process. */
-const pruneRecentlySent = (now: number = Date.now()): void => {
-  for (const [key, at] of recentlySent) {
-    if (now - at >= RESEND_GUARD_MS) recentlySent.delete(key);
-  }
-};
-
-/** Test seam: forget every in-process send record. */
+/** Test seam: forget every in-flight send. */
 export const __resetMetaAdsScopeAlertGuard = (): void => {
-  recentlySent.clear();
+  inFlightAlerts.clear();
 };
 
 export const notifyMetaAdsScopeLost = async (params: {
@@ -75,28 +78,35 @@ export const notifyMetaAdsScopeLost = async (params: {
     return false;
   }
 
-  // In-process guard against two runs racing on the same account. The durable
-  // `ads_scope_alerted_at` marker is the real dedup, but it is written by a
-  // read-modify-write with no condition, so two concurrent callers can both read
-  // "not yet alerted" and both send. Mirrors the singleflight already used for
-  // token refresh, and like it covers one process — which is the whole of prod
-  // today (see metaTokenRefresh's note on the single instance).
+  // Join an in-flight send for this exact owner+account rather than starting a
+  // second one. Every joiner gets the real outcome, so a failure is never
+  // reported to anyone as a success.
   const key = `${ownerUserId}:${accountId ?? 'unknown'}`;
-  const lastSent = recentlySent.get(key);
-  if (lastSent !== undefined && Date.now() - lastSent < RESEND_GUARD_MS) {
-    // Reports TRUE on purpose. The contract of this return value is "has the
-    // owner been told", not "did this particular call send the mail" — callers
-    // retract their notice marker on false so a failed alert is retried. A
-    // duplicate inside the guard window means this process delivered it seconds
-    // ago, so returning false here would make the winner's marker get retracted
-    // by the loser and the owner emailed again on the next sweep.
-    console.warn(
-      `[MetaAdsScopeAlert] Skipped a duplicate ads-scope alert for ${key} — one was sent ${Math.round((Date.now() - lastSent) / 1000)}s ago`
-    );
-    return true;
+  let inFlight = inFlightAlerts.get(key);
+  if (!inFlight) {
+    inFlight = deliverMetaAdsScopeAlert({ ownerUserId, accountId, accountName });
+    inFlightAlerts.set(key, inFlight);
+    void inFlight.finally(() => inFlightAlerts.delete(key));
+  } else {
+    console.warn(`[MetaAdsScopeAlert] Joined an in-flight ads-scope alert for ${key}`);
   }
-  recentlySent.set(key, Date.now());
-  pruneRecentlySent();
+  return inFlight;
+};
+
+/**
+ * Actually build and send the notice. Never throws and never rejects — it rides
+ * alongside a user-facing error that must reach the caller intact, so a mail
+ * outage or a missing user record must not become the thing the customer sees.
+ *
+ * Returns false for every outcome in which the owner was NOT told, so callers
+ * can retract their notice marker and let a later run retry.
+ */
+const deliverMetaAdsScopeAlert = async (params: {
+  ownerUserId: string;
+  accountId?: string;
+  accountName?: string;
+}): Promise<boolean> => {
+  const { ownerUserId, accountId, accountName } = params;
 
   try {
     const owner = await userDb.getUserById(ownerUserId);
