@@ -1,12 +1,8 @@
-const mockGetAccountByPlatform = jest.fn();
+const mockResolveDefaultEmailAccount = jest.fn();
 const mockListEmails = jest.fn();
 const mockSearchEmails = jest.fn();
 const mockGetEmails = jest.fn();
 const mockResolveEmailAccount = jest.fn();
-
-jest.mock('../../services/connectedAccountsDb', () => ({
-  getAccountByPlatform: (...args: any[]) => mockGetAccountByPlatform(...args),
-}));
 
 jest.mock('../../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
@@ -16,6 +12,7 @@ jest.mock('../../services/emailProviderService', () => ({
     getEmails: (...args: any[]) => mockGetEmails(...args),
   }),
   resolveEmailAccount: (...args: any[]) => mockResolveEmailAccount(...args),
+  resolveDefaultEmailAccount: (...args: any[]) => mockResolveDefaultEmailAccount(...args),
   EmailProviderError: class EmailProviderError extends Error {},
 }));
 
@@ -27,7 +24,19 @@ if (!tool) throw new Error('read_verification_code tool not registered');
 
 const context = { userId: 'user-123', sessionId: 'session-abc', llmModel: 'test-model', service: {} };
 
-const GMAIL_ACCOUNT = { platform: 'gmail', account_id: 'founders@agentweb.pro', account_name: 'founders@agentweb.pro' };
+const GMAIL_PROVIDER = {
+  listEmails: (...args: any[]) => mockListEmails(...args),
+  searchEmails: (...args: any[]) => mockSearchEmails(...args),
+  getEmails: (...args: any[]) => mockGetEmails(...args),
+};
+
+/** What resolveDefaultEmailAccount hands back for a caller's own Gmail. */
+const GMAIL_ACCOUNT = {
+  platform: 'gmail',
+  provider: GMAIL_PROVIDER,
+  accountId: 'founders@agentweb.pro',
+  ownerUserId: 'user-123',
+};
 
 /** A message summary as the email providers return it. */
 function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string }> = {}) {
@@ -50,9 +59,7 @@ function summary(over: Partial<{ id: string; subject: string; from: string; date
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockGetAccountByPlatform.mockImplementation(async (_userId: string, platform: string) =>
-    platform === 'gmail' ? GMAIL_ACCOUNT : null
-  );
+  mockResolveDefaultEmailAccount.mockResolvedValue(GMAIL_ACCOUNT);
   mockListEmails.mockResolvedValue([]);
   mockSearchEmails.mockResolvedValue([]);
   mockGetEmails.mockResolvedValue([]);
@@ -187,7 +194,7 @@ describe('read_verification_code — failure paths', () => {
   });
 
   it('fails loudly when the user has no connected mailbox', async () => {
-    mockGetAccountByPlatform.mockResolvedValue(null);
+    mockResolveDefaultEmailAccount.mockResolvedValue(null);
 
     const result = await tool.execute({ wait_seconds: 0 }, context);
 
@@ -399,6 +406,8 @@ describe('read_verification_code — success paths', () => {
     mockResolveEmailAccount.mockResolvedValue({
       platform: 'outlook',
       provider: { listEmails: mockListEmails, searchEmails: mockSearchEmails, getEmails: mockGetEmails },
+      accountId: 'work-outlook',
+      ownerUserId: 'user-123',
     });
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 998877' }]);
@@ -499,6 +508,8 @@ describe('read_verification_code — success paths', () => {
     mockResolveEmailAccount.mockResolvedValue({
       platform: 'outlook',
       provider: { listEmails: mockListEmails, searchEmails: mockSearchEmails, getEmails: mockGetEmails },
+      accountId: 'work-outlook',
+      ownerUserId: 'user-123',
     });
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 998877' }]);
@@ -508,6 +519,141 @@ describe('read_verification_code — success paths', () => {
     expect(result.success).toBe(true);
     expect(result.code).toBe('998877');
     expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-123', 'work-outlook');
-    expect(mockGetAccountByPlatform).not.toHaveBeenCalled();
+    expect(mockResolveDefaultEmailAccount).not.toHaveBeenCalled();
+  });
+});
+
+// ── ENG-943: org-shared mailboxes ──────────────────────────────────────────
+// list_connected_accounts reports a teammate's shared Gmail, so this tool has
+// to be able to read it — and has to read it AS THE OWNER, since that is the
+// record holding the OAuth tokens.
+describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
+  const SHARED_MAILBOX = {
+    platform: 'gmail',
+    provider: GMAIL_PROVIDER,
+    accountId: 'teammate@agentweb.pro',
+    ownerUserId: 'teammate-user-id',
+  };
+
+  it('reads an auto-resolved org-shared mailbox as its owner', async () => {
+    mockResolveDefaultEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    // A shared mailbox is re-checked before each read round, on both the named
+    // and the auto-resolved path, so sharing revoked mid-wait takes effect.
+    mockResolveEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute({ wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('424242');
+    expect(mockListEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', 'INBOX', expect.any(Number));
+    expect(mockGetEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', ['msg-1']);
+  });
+
+  it('reads an explicitly named org-shared mailbox as its owner', async () => {
+    mockResolveEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-123', 'teammate@agentweb.pro');
+    expect(mockGetEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', ['msg-1']);
+  });
+
+  /**
+   * The mailbox is resolved once, then polled for up to MAX_WAIT_SECONDS. On a
+   * teammate's shared mailbox that leaves a window — up to 180s across ~36 poll
+   * rounds — in which the owner can stop sharing while the loop keeps reading
+   * with the captured owner identity, handing over a code that arrived after
+   * access was withdrawn. The disclosure dialog promises an admin can "stop
+   * sharing at any time", so revocation has to take effect within the call, not
+   * only at the next one. Re-check before each round; the caller's OWN mailbox
+   * needs no check and pays nothing.
+   */
+  it('stops reading a shared mailbox once the owner withdraws sharing', async () => {
+    mockResolveEmailAccount.mockResolvedValueOnce(SHARED_MAILBOX);
+    // Sharing is withdrawn between resolution and the read.
+    mockResolveEmailAccount.mockRejectedValue(
+      new Error('Connected account "teammate@agentweb.pro" not found. Use list_connected_accounts to get valid account IDs.')
+    );
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(result.code).toBeUndefined();
+    // The point of the guard: no read is attempted after access is gone.
+    expect(mockListEmails).not.toHaveBeenCalled();
+    expect(mockGetEmails).not.toHaveBeenCalled();
+  });
+
+  it('stops when the mailbox is still reachable but has changed owner', async () => {
+    mockResolveEmailAccount.mockResolvedValueOnce(SHARED_MAILBOX);
+    mockResolveEmailAccount.mockResolvedValue({ ...SHARED_MAILBOX, ownerUserId: 'someone-else' });
+    mockListEmails.mockResolvedValue([summary()]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(mockListEmails).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The pre-read check cannot stop a revocation that lands after it passes —
+   * the provider authenticates with the owner's credentials, which un-sharing
+   * does not invalidate. What can be stopped is the disclosure: check again
+   * before the code leaves the tool, and withhold it.
+   */
+  it('withholds a code it already read when sharing ends mid-round', async () => {
+    // Passes the pre-read check, fails the one guarding the return.
+    mockResolveEmailAccount
+      .mockResolvedValueOnce(SHARED_MAILBOX) // initial resolution
+      .mockResolvedValueOnce(SHARED_MAILBOX) // pre-read check
+      .mockRejectedValue(new Error('Connected account "teammate@agentweb.pro" not found.'));
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    // The read happened — the guard is about what gets handed back.
+    expect(mockGetEmails).toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(result.code).toBeUndefined();
+    expect(result.magic_link).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('424242');
+  });
+
+  it('does not re-check the caller’s own mailbox', async () => {
+    mockResolveEmailAccount.mockResolvedValue({ ...GMAIL_ACCOUNT, accountId: 'me@agentweb.pro' });
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'me@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    // Resolved once, never re-resolved: an own mailbox cannot be un-shared.
+    expect(mockResolveEmailAccount).toHaveBeenCalledTimes(1);
   });
 });
