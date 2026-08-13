@@ -141,9 +141,27 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(platform).toBe('meta');
       expect(accountId).toBe(AD_ACCOUNT_ID);
       expect(typeof updates.ads_scope_revoked_at).toBe('string');
+      // The grant must be narrowed too, or the revocation is inert — see below.
+      expect(updates.granted_scopes).toEqual(['pages_show_list']);
       expect(mockNotifyMetaAdsScopeLost).toHaveBeenCalledWith(
         expect.objectContaining({ ownerUserId: 'user1', accountId: AD_ACCOUNT_ID })
       );
+    });
+
+    /**
+     * Caught by running the reconciler against a real denied account: the marker
+     * was written and getMetaAdsScopeState still returned 'granted', because an
+     * affirmative ads scope in `granted_scopes` outranks `ads_scope_revoked_at`.
+     * The revocation was recorded and changed nothing — the gate kept letting
+     * reads through and Settings kept saying "Active".
+     */
+    it('makes the revocation actually take effect, not merely record it', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(getMetaAdsScopeState(account.config)).toBe('missing');
     });
 
     it('alerts the owner of an account latched before any alert existed', async () => {

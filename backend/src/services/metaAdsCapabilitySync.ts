@@ -44,7 +44,7 @@
 
 import { ConnectedAccount } from './connectedAccountsDb';
 import { metaService } from './metaService';
-import { getMetaAdsScopeState } from '../utils/metaAdsScope';
+import { getMetaAdsScopeState, META_ADS_READ_SCOPES } from '../utils/metaAdsScope';
 
 export type MetaAdsCapabilitySyncOutcome =
   /** Not a Meta ad account, or no token to ask with. */
@@ -134,11 +134,29 @@ export const syncMetaAdsCapability = async (
     // BEFORE sending. This sweep repeats every 12 hours forever, so an
     // unwritable marker has to fail towards silence rather than towards a mail
     // loop aimed at a customer.
+    // Narrow the recorded grant as well as stamping the refusal, exactly as the
+    // post-flight path does. Without this the revocation is inert: an affirmative
+    // ads scope in `granted_scopes` outranks `ads_scope_revoked_at` in
+    // getMetaAdsScopeState, so the gate would keep letting reads through and the
+    // Settings row would keep saying "Active" while every read fails. Caught by
+    // running this against a real denied account, where the marker was written
+    // and the state stayed 'granted'.
+    //
+    // Honest as a record, too: Meta just refused this ad account for lack of an
+    // ads permission, so whatever the user granted our app, the ads grant is not
+    // in effect for this connection.
+    const previous: unknown = config.granted_scopes;
+    const retained = (Array.isArray(previous) ? previous : [])
+      .filter((s: unknown): s is string => typeof s === 'string')
+      .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+
     const now = new Date().toISOString();
     await updateAccountConfig(userId, platform as any, account.account_id, {
+      granted_scopes: retained,
       ads_scope_revoked_at: config.ads_scope_revoked_at || now,
       ads_scope_alerted_at: now,
     });
+    config.granted_scopes = retained;
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     config.ads_scope_alerted_at = now;
 
