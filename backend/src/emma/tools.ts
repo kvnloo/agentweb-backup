@@ -3420,7 +3420,7 @@ emmaToolRegistry.register({
   name: 'add_leads_to_list',
   definition: {
     name: 'add_leads_to_list',
-    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
+    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. IMPORTING A FILE: pass the WHOLE set of rows in ONE call — the backend already writes in chunks internally, and splitting a file across many calls only burns turn time and risks the import being cut off part-way. The call is safe to repeat: a row that is already in the list merges or is reported as already present, it is never duplicated (rows with no email and no LinkedIn URL dedupe on name+company). RESULT: `attempted`, a `reconciliation` breakdown (created / merged / alreadyPresent / duplicateInRequest / anonymizedSkipped / failed / unprocessed), `importedIdentifiers` naming every row now in the list, and — when the import did not complete — `resumable: true`, `unimportedRows` naming the rows that did not land, and `unimportedRowRanges` giving the positions of EVERY row that did not land within the rows you just sent (e.g. "7,19,101-220"). On a very large partial `unimportedRows` can be trimmed and says so; `unimportedRowRanges` is never truncated, so resend every row it names. If you get a partial result, immediately call this tool again with just those rows, and repeat until a result comes back with `complete: true`. Never end the turn telling the user to retry the import themselves.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3448,7 +3448,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId);
+    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+      // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
+      // soft deadline, which is neither a bound on the turn nor still meaningful once it
+      // has passed (ENG-1133).
+      turnDeadlineMs: context?.turnHardCapMs,
+    });
   }
 });
 
