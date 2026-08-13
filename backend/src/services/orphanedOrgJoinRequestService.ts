@@ -5,6 +5,7 @@ const MAX_RESULTS = 100;
 const MAX_ORGANIZATIONS = 1000;
 const MAX_USER_LOOKUP_BATCH = 25;
 const MAX_UNIQUE_USER_IDS_TO_LOOKUP = MAX_RESULTS;
+const MAX_PENDING_REQUESTS_PER_ORGANIZATION = 1000;
 
 export interface OrphanedOrgJoinReference {
   orgId: string;
@@ -25,7 +26,7 @@ type Dependencies = {
 };
 
 const defaultDependencies: Dependencies = {
-  listOrganizations: () => orgDb.listAll(MAX_ORGANIZATIONS),
+  listOrganizations: () => orgDb.listAll(MAX_ORGANIZATIONS + 1),
   findUser: (userId) => userDb.getUserById(userId),
   audit: (event) => recordAdminAudit(event as any),
 };
@@ -34,10 +35,12 @@ export async function findOrphanedOrgJoinRequests(
   dependencies: Partial<Dependencies> = {},
 ): Promise<OrphanedOrgJoinDiagnostic> {
   const deps = { ...defaultDependencies, ...dependencies };
-  const organizations = await deps.listOrganizations();
+  const orgs = await deps.listOrganizations();
+  const organizations = orgs.slice(0, MAX_ORGANIZATIONS);
+  const exceededOrganizationCap = orgs.length > MAX_ORGANIZATIONS;
   let pendingRequestsScanned = 0;
   const missingUserReferences: OrphanedOrgJoinReference[] = [];
-  let truncated = false;
+  let truncated = exceededOrganizationCap;
   const requestedByUserId = new Map<string, OrphanedOrgJoinReference[]>();
   const userIdsToLookup: string[] = [];
 
@@ -45,7 +48,10 @@ export async function findOrphanedOrgJoinRequests(
     const requests = Array.isArray(organization.pendingDomainJoinRequests)
       ? organization.pendingDomainJoinRequests
       : [];
-    for (const request of requests) {
+    const exceededPendingCap = requests.length > MAX_PENDING_REQUESTS_PER_ORGANIZATION;
+    const requestWindow = requests.slice(0, MAX_PENDING_REQUESTS_PER_ORGANIZATION);
+
+    for (const request of requestWindow) {
       if (!request || typeof request.userId !== 'string' || !request.userId.trim()) continue;
 
       const userId = request.userId.trim();
@@ -64,6 +70,11 @@ export async function findOrphanedOrgJoinRequests(
         requestedByUserId.set(userId, [requestRef]);
         userIdsToLookup.push(userId);
       }
+    }
+
+    if (exceededPendingCap) {
+      truncated = true;
+      break orgLoop;
     }
   }
 
