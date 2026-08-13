@@ -26,6 +26,28 @@ import { META_ADS_RECONSENT_MESSAGE } from '../utils/metaAdsScope';
  * alongside a user-facing error that must reach the caller intact, so a mail
  * outage or a missing user record must not become the thing the customer sees.
  */
+/**
+ * How long one owner+account pair is considered "just told". Long enough to
+ * cover two runs overlapping, short enough that it can never swallow a genuine
+ * alert for a later, separate outage — the durable marker handles that.
+ */
+const RESEND_GUARD_MS = 15 * 60 * 1000;
+
+/** owner+account -> epoch ms of the last send attempt from this process. */
+const recentlySent = new Map<string, number>();
+
+/** Keep the guard map from growing without bound on a long-lived process. */
+const pruneRecentlySent = (now: number = Date.now()): void => {
+  for (const [key, at] of recentlySent) {
+    if (now - at >= RESEND_GUARD_MS) recentlySent.delete(key);
+  }
+};
+
+/** Test seam: forget every in-process send record. */
+export const __resetMetaAdsScopeAlertGuard = (): void => {
+  recentlySent.clear();
+};
+
 export const notifyMetaAdsScopeLost = async (params: {
   ownerUserId: string;
   accountId?: string;
@@ -39,12 +61,36 @@ export const notifyMetaAdsScopeLost = async (params: {
   // about an account they cannot see. `sendOncallAlert` guards itself the same
   // way for the same reason. Callers still record the marker, so a real
   // production sweep is unaffected by whatever a preview did.
-  if (process.env.NODE_ENV !== 'production') {
-    console.log(
-      `[MetaAdsScopeAlert] [DEV] Suppressed ads-scope alert to owner ${ownerUserId} for account ${accountId ?? 'unknown'}`
+  //
+  // Logged at WARN naming the environment it actually saw, because the failure
+  // this guard can cause is silence: if production's NODE_ENV were ever not
+  // exactly 'production', the alert half of ENG-1158 would be inert and look
+  // identical to "nobody needed telling" — which is the very bug this ticket is
+  // about. One grep for this line answers it.
+  const env = process.env.NODE_ENV || '(unset)';
+  if (env !== 'production') {
+    console.warn(
+      `[MetaAdsScopeAlert] Suppressed ads-scope alert to owner ${ownerUserId} for account ${accountId ?? 'unknown'} — NODE_ENV is "${env}", alerts send only from production`
     );
     return false;
   }
+
+  // In-process guard against two runs racing on the same account. The durable
+  // `ads_scope_alerted_at` marker is the real dedup, but it is written by a
+  // read-modify-write with no condition, so two concurrent callers can both read
+  // "not yet alerted" and both send. Mirrors the singleflight already used for
+  // token refresh, and like it covers one process — which is the whole of prod
+  // today (see metaTokenRefresh's note on the single instance).
+  const key = `${ownerUserId}:${accountId ?? 'unknown'}`;
+  const lastSent = recentlySent.get(key);
+  if (lastSent !== undefined && Date.now() - lastSent < RESEND_GUARD_MS) {
+    console.warn(
+      `[MetaAdsScopeAlert] Skipped a duplicate ads-scope alert for ${key} — one was sent ${Math.round((Date.now() - lastSent) / 1000)}s ago`
+    );
+    return false;
+  }
+  recentlySent.set(key, Date.now());
+  pruneRecentlySent();
 
   try {
     const owner = await userDb.getUserById(ownerUserId);
