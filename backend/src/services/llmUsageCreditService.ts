@@ -11,6 +11,15 @@ export interface LlmUsageCreditGrant {
   grantedBy?: string;
 }
 
+export interface LlmUsageDebit {
+  /** Deterministic id derived from workId — `meter:{workId}` today. */
+  id: string;
+  /** Work unit that produced the spend (session/task/coding-agent run id). */
+  workId: string;
+  amountMicroUsd: number;
+  debitedAt: string;
+}
+
 export interface MonthlyLlmUsageCredits {
   month: string;
   version?: number;
@@ -28,6 +37,18 @@ export interface MonthlyLlmUsageCredits {
     amountMicroUsd: number;
     reversedAt: string;
   }>;
+  /**
+   * Append-only debit ledger (ENG-1138 AC5a). Populated by
+   * `recordLlmUsageDebit`. Each entry ties an amount drawn from the
+   * purchased/admin allowance pool to the work unit that caused it — used by
+   * reconciliation, by the AC4 carryover computation ("purchased not yet
+   * consumed"), and by the AC5b reversal-review check ("did we revoke money
+   * the customer had already spent"). Missing/empty for accounts that never
+   * crossed the hard threshold or predate this ship.
+   */
+  debits?: LlmUsageDebit[];
+  debitIds?: string[];
+  totalDebitedMicroUsd?: number;
 }
 
 export interface LlmUsageCreditAdjustment {
@@ -293,4 +314,115 @@ export async function reverseMonthlyPurchasedLlmUsageCredit(input: {
     }
   }
   throw new Error(`Concurrent usage-credit reversals did not settle for ${input.billingUserId}`);
+}
+
+/**
+ * Record an append-only debit against the AgentWeb Credits wallet (ENG-1138
+ * AC5a). Idempotent by `workId` — the same work unit debited twice returns
+ * `{debited: false}` on the second call, so a fire-and-forget caller on the
+ * metering chokepoint can be retried after a transient DynamoDB failure
+ * without double-charging the customer.
+ *
+ * NOT wired into `meterUserUsage` in this PR — that's a follow-up. This
+ * function ships the data-plane API; the chokepoint call site + guard-test
+ * allowlist update land in PR3 alongside AC4 (cross-month carryover) and
+ * AC5b (reversal-past-consumption review flag), both of which lean on this
+ * ledger to know how much of the allowance was actually consumed.
+ */
+export async function recordLlmUsageDebit(input: {
+  billingUserId: string;
+  workId: string;
+  amountMicroUsd: number;
+  now?: Date;
+}): Promise<{ debited: boolean; billingUserId: string; ledger: MonthlyLlmUsageCredits }> {
+  const amountMicroUsd = Math.round(input.amountMicroUsd);
+  if (!input.workId.trim()) throw new Error('workId is required');
+  if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) {
+    throw new Error('amountMicroUsd must be a positive integer');
+  }
+
+  const billingUserId = input.billingUserId;
+  const month = getCurrentUsageMonth(input.now);
+  const debitedAt = (input.now || new Date()).toISOString();
+  const debitId = `meter:${input.workId}`;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const user = await userDb.getUserById(billingUserId) as User | undefined;
+    if (!user) throw new Error(`User not found: ${billingUserId}`);
+    const existing = user.llmUsageCredits;
+    const current = existing?.month === month
+      ? existing
+      : {
+          month,
+          version: 0,
+          totalPurchasedMicroUsd: 0,
+          totalPurchasedReversedMicroUsd: 0,
+          totalAdminGrantedMicroUsd: 0,
+          totalMigrationOffsetMicroUsd: 0,
+          grantIds: [],
+          grants: [],
+          reversalIds: [],
+          reversals: [],
+          debits: [],
+          debitIds: [],
+          totalDebitedMicroUsd: 0,
+        };
+
+    if ((current.debitIds || []).includes(debitId)) {
+      return { debited: false, billingUserId, ledger: current };
+    }
+
+    const debit: LlmUsageDebit = {
+      id: debitId,
+      workId: input.workId,
+      amountMicroUsd,
+      debitedAt,
+    };
+    const next: MonthlyLlmUsageCredits = {
+      ...current,
+      month,
+      version: (existing?.version || 0) + 1,
+      debits: [...(current.debits || []), debit],
+      debitIds: [...(current.debitIds || []), debitId],
+      totalDebitedMicroUsd: (current.totalDebitedMicroUsd || 0) + amountMicroUsd,
+    };
+
+    const condition: {
+      expression: string;
+      names: Record<string, string>;
+      values?: Record<string, any>;
+    } = existing
+      ? existing.version == null
+        ? {
+            expression: '#creditLedger.#month = :expectedMonth AND #creditLedger.#grantIds = :expectedGrantIds AND attribute_not_exists(#creditLedger.#version)',
+            names: {
+              '#creditLedger': 'llmUsageCredits',
+              '#month': 'month',
+              '#grantIds': 'grantIds',
+              '#version': 'version',
+            },
+            values: {
+              ':expectedMonth': existing.month,
+              ':expectedGrantIds': existing.grantIds || [],
+            },
+          }
+        : {
+            expression: '#creditLedger.#version = :expectedVersion',
+            names: { '#creditLedger': 'llmUsageCredits', '#version': 'version' },
+            values: { ':expectedVersion': existing.version },
+          }
+      : {
+          expression: 'attribute_not_exists(#creditLedger)',
+          names: { '#creditLedger': 'llmUsageCredits' },
+        };
+
+    try {
+      await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      return { debited: true, billingUserId, ledger: next };
+    } catch (error) {
+      if (isConditionalFailure(error)) continue;
+      throw error;
+    }
+  }
+  throw new Error(`Concurrent usage-credit debits did not settle for ${billingUserId}`);
 }
