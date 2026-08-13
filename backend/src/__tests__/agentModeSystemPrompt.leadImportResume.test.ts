@@ -31,6 +31,17 @@ describe('Agent Mode system prompt — resumable lead imports', () => {
     expect(description).toContain('complete: true');
   });
 
+  // The detailed resume list is capped, so on a large partial it names only the
+  // first slice. Emma has to resume from the uncapped range summary instead, or
+  // she finishes the slice, reads `complete: true` and strands the rest.
+  it('points Emma at the uncapped range summary, not the capped detail list', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('unimportedRowRanges');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toMatch(/never is, so resend everything it names/);
+    const description = emmaToolRegistry.getTool('add_leads_to_list')?.definition.description || '';
+    expect(description).toContain('unimportedRowRanges');
+    expect(description).toMatch(/never truncated/);
+  });
+
   it('carries the same resume contract on the tool definition Emma actually reads', () => {
     const description = emmaToolRegistry.getTool('add_leads_to_list')?.definition.description || '';
     expect(description).toContain('unimportedRows');

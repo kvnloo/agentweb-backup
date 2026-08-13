@@ -172,6 +172,9 @@ describe('ENG-1133 — a partial lead import survives the dispatch boundary', ()
       resumable: true,
       attempted: 3,
       unimportedRows: [{ row: 3, identifier: 'c@example.com', reason: 'failed' }],
+      // The uncapped set of missing positions has to survive too: on a large
+      // partial it is the only complete account of what is still owed.
+      unimportedRowRanges: '3',
     });
     expect(call.result.reconciliation).toMatchObject({ created: 2, failed: 1 });
   });

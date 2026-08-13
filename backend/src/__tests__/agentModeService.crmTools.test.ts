@@ -1324,9 +1324,38 @@ describe('AgentModeService - CRM Tools', () => {
         expect(result.complete).toBe(false);
         expect(result.unimportedRows).toHaveLength(100);
         expect(result.unimportedRowsTruncated).toEqual({ shown: 100, total: 200 });
-        // The full shortfall, not just the slice that fits.
+        // The authoritative set: every missing position, not the slice that fits.
+        expect(result.unimportedRowRanges).toBe('51-250');
         expect(result.message).toMatch(/FIRST 100 of 200 missing rows/);
+        expect(result.message).toMatch(/unimportedRowRanges \(51-250\) lists EVERY missing position/);
         expect(result.message).toMatch(/not done until a result comes back with complete: true/);
+      });
+
+      // A resume that only ever sees the first 100 of 200 missing rows imports
+      // them, gets `complete: true` for that call, and stops — stranding the
+      // other 100. The ranges are what make the resume deterministic.
+      it('names every missing row position, including the ones past the detail cap', async () => {
+        const rows = Array.from({ length: 250 }, (_, i) => ({ email: `row${i}@example.com` }));
+        mockCrmDb.batchCreateLeads.mockResolvedValue({
+          successCount: 50,
+          newCount: 50,
+          mergedCount: 0,
+          errorCount: 0,
+          errors: [],
+          rowOutcomes: rows.map((_, i) => (i < 50 ? 'created' : 'unprocessed')),
+        } as any);
+
+        const result = await service.addLeadsToList(listId, rows, userId);
+
+        const missing = new Set<number>();
+        for (const part of (result.unimportedRowRanges as string).split(',')) {
+          const [start, end] = part.split('-').map(Number);
+          for (let row = start; row <= (end ?? start); row++) missing.add(row);
+        }
+        expect(missing.size).toBe(200);
+        expect(missing.has(51)).toBe(true);
+        expect(missing.has(250)).toBe(true);
+        expect(missing.has(50)).toBe(false);
       });
 
       it('does not claim truncation when the whole resume list fits', async () => {
