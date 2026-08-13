@@ -72,6 +72,18 @@ describe('ENG-936: image revisions must use the approved source URL', () => {
     ).toBe(false);
   });
 
+  it('rejects source-less generate_image calls', () => {
+    expect(
+      isApprovedRevisionSource(
+        {
+          name: 'generate_image',
+          arguments: {},
+        },
+        approvedUrl
+      )
+    ).toBe(false);
+  });
+
   it('does not block non-generate_image calls', () => {
     expect(isApprovedRevisionSource({ name: 'update_html_file' }, approvedUrl)).toBe(true);
   });

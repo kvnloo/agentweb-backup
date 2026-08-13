@@ -43,8 +43,9 @@ function normalizeInputImages(toolCall: any): string[] {
 }
 
 export function isApprovedRevisionSource(toolCall: any, approvedAssetUrl: string): boolean {
+  if (toolCall?.name !== 'generate_image') return true;
   const inputImages = normalizeInputImages(toolCall);
-  if (inputImages.length === 0) return true;
+  if (inputImages.length === 0) return false;
   return inputImages.includes(approvedAssetUrl);
 }
 
