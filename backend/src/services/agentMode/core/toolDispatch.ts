@@ -376,7 +376,12 @@ function isApprovedImageSourceForRevision(
 
   const inputImages = getInputImages(args);
   if (!Array.isArray(inputImages) || inputImages.length === 0) {
-    return { approved: true };
+    return {
+      approved: false,
+      errorMessage:
+        `generate_image confirmation requires explicit approved source inputImages. ` +
+        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
+    };
   }
 
   const mismatch = inputImages.find((url) => !approvedSources.includes(url));
