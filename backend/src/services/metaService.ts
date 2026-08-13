@@ -772,67 +772,64 @@ export class MetaService {
    * Returns `undefined` — never `[]` — when the grant could not be determined, so
    * callers can distinguish "we could not ask" from "nothing was granted". Storing
    * an empty array in the former case would later read as an authoritative refusal.
-   *
-   * Asks `/me/permissions` first and falls back to `debug_token` (ENG-1158).
-   * `debug_token` must be called with an APP token, so it answers only for tokens
-   * minted by the app whose credentials we currently hold — anything else comes
-   * back "(#100) The App_id in the input_token did not match the Viewing App" and
-   * the grant reads as undeterminable forever. Verified live: every Meta ad
-   * account on the dev test user fails debug_token exactly that way, while
-   * `/me/permissions` — which needs only the user token — returns the full grant.
-   * It also states `granted` vs `declined` outright rather than leaving a
-   * declined permission to be inferred from its absence.
    */
-  public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
-    const fromPermissions = await this.getGrantedScopesFromPermissions(accessToken);
-    if (fromPermissions) return fromPermissions;
-    return this.getGrantedScopesFromDebugToken(accessToken);
-  }
-
   /**
-   * Read the grant from `/me/permissions`, which authenticates with the user
-   * token itself and so has no app-identity precondition.
+   * Can this token actually read ads data for this ad account, right now?
    *
-   * Returns `undefined` on any failure or empty answer so the caller can fall
-   * back — an empty granted list is far likelier to be a failure than a real
-   * grant of nothing (Meta always includes `public_profile` on a live token).
+   * WHY A REAL READ AND NOT A SCOPE LOOKUP (ENG-1158)
+   * -------------------------------------------------
+   * Two independent grants have to line up before an ads read works, and only
+   * one of them is visible in a token's scopes:
+   *
+   *   1. the USER granting our app `ads_read` at the OAuth dialog, and
+   *   2. the AD ACCOUNT's owner granting that user access to that ad account.
+   *
+   * Production account 922903076601160 has (1) and not (2). Verified live:
+   * `/me/permissions` reports `ads_read` and `ads_management` as granted with
+   * nothing declined, while the very same token gets
+   * "(#200) Ad account owner has NOT grant ads_management or ads_read permission"
+   * from that ad account. Any capability answer derived from scopes alone
+   * therefore reports "capable" for exactly the account that cannot read — the
+   * trap `utils/metaAdsScope.ts` was written to avoid, one level further down.
+   *
+   * So we ask the only question that has an authoritative answer: we try. The
+   * cheapest read on the ad account node is enough; verified live to succeed on
+   * a working account and to return the (#200) refusal on the broken one.
+   *
+   * Returns 'unknown' for anything that is not a clear yes or a clear ads-scope
+   * refusal — a rate limit or an outage must never be read as incapability.
    */
-  private async getGrantedScopesFromPermissions(accessToken: string): Promise<string[] | undefined> {
+  public async probeAdsAccountAccess(
+    accessToken: string,
+    adAccountId: string
+  ): Promise<'accessible' | 'denied' | 'unknown'> {
     try {
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const id = `act_${String(adAccountId).replace('act_', '')}`;
       const res = await fetch(
-        `https://graph.facebook.com/${apiVersion}/me/permissions` +
-          `?access_token=${encodeURIComponent(accessToken)}`
+        `https://graph.facebook.com/${apiVersion}/${id}` +
+          `?fields=id&access_token=${encodeURIComponent(accessToken)}`
       );
       const body: any = await res.json();
 
-      if (body?.error) {
-        console.warn(
-          `[MetaService] getGrantedScopes: /me/permissions returned an error: ${body.error?.message ?? 'unknown'}`
-        );
-        return undefined;
+      if (body?.id) return 'accessible';
+      if (!body?.error) return 'unknown';
+
+      // Reuse the deliberately strict predicate rather than re-deciding here:
+      // Meta stamps a whole family of unrelated failures as permission errors,
+      // and only one of them means "no ads access".
+      const { isMetaAdsScopeRefusal } = await import('../utils/metaAdsScope');
+      if (isMetaAdsScopeRefusal({ structuredError: body.error, message: body.error?.message })) {
+        return 'denied';
       }
-
-      if (!Array.isArray(body?.data)) return undefined;
-
-      // Only 'granted'. A declined permission is listed too, and counting it
-      // would report capability for a connection the user explicitly refused.
-      const granted = body.data
-        .filter((entry: any) => entry?.status === 'granted')
-        .map((entry: any) => entry?.permission)
-        .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
-        .map((s: string) => s.trim());
-
-      if (granted.length === 0) return undefined;
-      return Array.from(new Set(granted));
+      return 'unknown';
     } catch (error: any) {
-      console.warn(`[MetaService] getGrantedScopes: /me/permissions failed: ${error?.message ?? error}`);
-      return undefined;
+      console.warn(`[MetaService] probeAdsAccountAccess failed: ${error?.message ?? error}`);
+      return 'unknown';
     }
   }
 
-  /** The original `debug_token` route, kept as a fallback. */
-  private async getGrantedScopesFromDebugToken(accessToken: string): Promise<string[] | undefined> {
+  public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
     try {
       const { getMetaCredentials } = await import('../utils/secretsManager');
       const creds = await getMetaCredentials();

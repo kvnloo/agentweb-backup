@@ -88,90 +88,10 @@ describe('metaService.getGrantedScopes (ENG-629)', () => {
 
     await metaService.getGrantedScopes(accessToken);
 
-    const urls = ((global as any).fetch as jest.Mock).mock.calls.map((c: any[]) => c[0] as string);
-    const debugUrl = urls.find(u => u.includes('debug_token'));
-    expect(debugUrl).toBeDefined();
-    expect(debugUrl).toContain(`input_token=${accessToken}`);
-    expect(debugUrl).toContain('access_token=app-id%7Capp-secret');
-  });
-
-  /**
-   * ENG-1158. `debug_token` authenticates with an APP token, so it can only
-   * answer for tokens minted by the app whose credentials we currently hold.
-   * Verified live against the dev test user: every Meta ad account there comes
-   * back "(#100) The App_id in the input_token did not match the Viewing App",
-   * leaving the grant permanently undeterminable — which silently disables both
-   * connect-time recording and the capability reconciler. `/me/permissions`
-   * needs only the user token and has no such precondition.
-   */
-  describe('/me/permissions is preferred over debug_token', () => {
-    it('asks /me/permissions first, using the user token', async () => {
-      mockFetchOnce({ data: [{ permission: 'ads_read', status: 'granted' }] });
-
-      await metaService.getGrantedScopes(accessToken);
-
-      const firstUrl = ((global as any).fetch as jest.Mock).mock.calls[0][0] as string;
-      expect(firstUrl).toContain('/me/permissions');
-      expect(firstUrl).toContain(`access_token=${accessToken}`);
-    });
-
-    it('returns the granted permissions without consulting debug_token at all', async () => {
-      mockFetchOnce({
-        data: [
-          { permission: 'ads_read', status: 'granted' },
-          { permission: 'pages_show_list', status: 'granted' },
-        ],
-      });
-
-      const result = await metaService.getGrantedScopes(accessToken);
-
-      expect(result).toEqual(expect.arrayContaining(['ads_read', 'pages_show_list']));
-      const urls = ((global as any).fetch as jest.Mock).mock.calls.map((c: any[]) => c[0] as string);
-      expect(urls.some(u => u.includes('debug_token'))).toBe(false);
-    });
-
-    it('excludes declined permissions — the whole point of asking', async () => {
-      // A declined permission is listed too. Counting it would report capability
-      // for a connection the user explicitly refused, which is OPS-79 again.
-      mockFetchOnce({
-        data: [
-          { permission: 'public_profile', status: 'granted' },
-          { permission: 'ads_read', status: 'declined' },
-          { permission: 'ads_management', status: 'declined' },
-        ],
-      });
-
-      const result = await metaService.getGrantedScopes(accessToken);
-
-      expect(result).toEqual(['public_profile']);
-      expect(result).not.toContain('ads_read');
-    });
-
-    it('falls back to debug_token when /me/permissions errors', async () => {
-      (global as any).fetch = jest
-        .fn()
-        .mockResolvedValueOnce({ json: async () => ({ error: { message: 'nope', code: 190 } }) })
-        .mockResolvedValueOnce({ json: async () => ({ data: { scopes: ['ads_read'] } }) });
-
-      await expect(metaService.getGrantedScopes(accessToken)).resolves.toEqual(['ads_read']);
-    });
-
-    it('falls back to debug_token when /me/permissions returns an unusable shape', async () => {
-      (global as any).fetch = jest
-        .fn()
-        .mockResolvedValueOnce({ json: async () => ({ data: {} }) })
-        .mockResolvedValueOnce({ json: async () => ({ data: { scopes: ['ads_management'] } }) });
-
-      await expect(metaService.getGrantedScopes(accessToken)).resolves.toEqual(['ads_management']);
-    });
-
-    it('returns undefined when neither route can answer', async () => {
-      (global as any).fetch = jest
-        .fn()
-        .mockResolvedValue({ json: async () => ({ error: { message: 'app mismatch', code: 100 } }) });
-
-      await expect(metaService.getGrantedScopes(accessToken)).resolves.toBeUndefined();
-    });
+    const calledUrl = ((global as any).fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(calledUrl).toContain('debug_token');
+    expect(calledUrl).toContain(`input_token=${accessToken}`);
+    expect(calledUrl).toContain('access_token=app-id%7Capp-secret');
   });
 
   it('returns undefined (not an empty array) when Meta returns an error payload', async () => {
