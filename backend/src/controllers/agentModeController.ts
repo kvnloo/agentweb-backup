@@ -57,6 +57,9 @@ import {
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
   collectPublishActionsSince,
+  stripUnfoundedEntityCounts,
+  reconcileFalseDataWriteFailure,
+  appendConfirmedDataWriteNotice,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -859,7 +862,20 @@ async function getDiagnosticErrorMessage(
     };
     const message = await agentModeService.generateDiagnosticMessage(context);
     return {
-      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      // ENG-1173: three passes, in this order and for this reason.
+      //   1. strip — the agent's only numeric input is a tool-call histogram, so any
+      //      entity quantity it emits is unfounded. Remove it before anything reads
+      //      the prose, so a correction can never be appended under a wrong count.
+      //   2. publish reconcile — the ENG-971 guard, unchanged.
+      //   3. data-write reconcile — the same inversion after a confirmed CRM write.
+      //      Last because both share CORRECTION_MARKER and first-writer wins; a
+      //      landed publish is the more expensive thing to have re-run.
+      message: message
+        ? reconcileFalseDataWriteFailure(
+            reconcileFalseFailureReport(stripUnfoundedEntityCounts(message), publishLedger),
+            publishLedger,
+          )
+        : null,
       publishLedger,
     };
   } catch {
@@ -6631,8 +6647,13 @@ export const agentModeController = {
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
-            diagnosticContent = appendConfirmedPublishNotice(
-              'The server restarted while processing your request. Please send your message again.',
+            // ENG-1173: same blanket "send it again" advice, same duplicate risk after
+            // a confirmed CRM write. The publish notice wins if both apply.
+            diagnosticContent = appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'The server restarted while processing your request. Please send your message again.',
+                publishLedger,
+              ),
               publishLedger,
             );
           } else {
@@ -6649,8 +6670,11 @@ export const agentModeController = {
           // the fixed string: a diagnosis message has already been judged on its own
           // prose, and a truthful one must not collect a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedPublishNotice(
-            'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedDataWriteNotice(
+            appendConfirmedPublishNotice(
+              'I encountered an error processing your request. Please try sending your message again.',
+              publishLedger,
+            ),
             publishLedger,
           ),
           timestamp: new Date().toISOString(),
@@ -7485,8 +7509,12 @@ export const agentModeController = {
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
             publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
-            diagnosticContent = appendConfirmedPublishNotice(
-              'The server restarted while processing your request. Please send your message again.',
+            // ENG-1173: see the matching comment on the regular /generate path.
+            diagnosticContent = appendConfirmedDataWriteNotice(
+              appendConfirmedPublishNotice(
+                'The server restarted while processing your request. Please send your message again.',
+                publishLedger,
+              ),
               publishLedger,
             );
           } else {
@@ -7501,8 +7529,11 @@ export const agentModeController = {
           // ENG-971: see the matching comment in generateResponse — the fixed
           // fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || appendConfirmedPublishNotice(
-            'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedDataWriteNotice(
+            appendConfirmedPublishNotice(
+              'I encountered an error processing your request. Please try sending your message again.',
+              publishLedger,
+            ),
             publishLedger,
           ),
           timestamp: new Date().toISOString(),
