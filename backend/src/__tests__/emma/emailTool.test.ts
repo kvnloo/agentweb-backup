@@ -17,9 +17,14 @@ const mockSendEmail = jest.fn();
 
 class MockEmailProviderError extends Error {}
 
+const mockAssertStillAccessible = jest.fn();
+
 jest.mock('../../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
   resolveEmailAccount: (...args: any[]) => mockResolveEmailAccount(...args),
+  // Re-checked at the last moment before the provider is called with the
+  // owner's credentials — see assertStillAccessible.
+  assertStillAccessible: (...args: any[]) => mockAssertStillAccessible(...args),
   EmailProviderError: MockEmailProviderError,
 }));
 

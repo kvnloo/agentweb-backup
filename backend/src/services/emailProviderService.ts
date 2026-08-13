@@ -227,6 +227,42 @@ export async function resolveEmailAccount(
 }
 
 /**
+ * Re-verify a resolved mailbox immediately before the provider is called.
+ *
+ * Sharing is checked when the mailbox is resolved, and the provider is then
+ * called with the OWNER's credentials — which stay valid whether or not sharing
+ * is still on. This narrows the gap between the two by re-checking at the last
+ * point before use.
+ *
+ * It does not close it, and nothing at this layer can: revoking an org share
+ * withdraws our authorization, not the OAuth grant, so any check we make sits in
+ * front of a credential that still works. Closing it properly means invalidating
+ * or re-scoping the owner's token when sharing is turned off — a change to the
+ * sharing feature itself, not to these read paths.
+ *
+ * The caller's own mailbox cannot be un-shared from under them, so it is never
+ * re-checked and pays nothing.
+ */
+export async function assertStillAccessible(
+  callerUserId: string,
+  resolved: ResolvedEmailAccount,
+  operation: EmailOperation = 'read'
+): Promise<void> {
+  if (resolved.ownerUserId === callerUserId) return;
+
+  // Throws if the mailbox is no longer reachable at all.
+  const recheck = await resolveEmailAccount(callerUserId, resolved.accountId, operation);
+
+  // Still reachable but under a different owner ⇒ not the mailbox we were
+  // authorised for.
+  if (recheck.ownerUserId !== resolved.ownerUserId) {
+    throw new EmailProviderError(
+      `Access to mailbox "${resolved.accountId}" changed while this request was in flight. Retry.`
+    );
+  }
+}
+
+/**
  * Pick a mailbox for a caller who didn't name one, in EMAIL_PLATFORMS order and
  * preferring the caller's own account over a teammate's shared one. Null when
  * the caller can reach no mailbox at all.

@@ -35,6 +35,7 @@ import {
   registerEmailProvider,
   resolveEmailAccount,
   resolveDefaultEmailAccount,
+  assertStillAccessible,
   EmailProviderError,
   type IEmailService,
 } from '../services/emailProviderService';
@@ -256,6 +257,55 @@ describe('resolveDefaultEmailAccount (ENG-943)', () => {
     ]);
 
     await expect(resolveDefaultEmailAccount(CALLER)).resolves.toBeNull();
+  });
+});
+
+/**
+ * Sharing is checked at resolution; the provider is then called with the OWNER's
+ * credentials, which stay valid whether or not sharing is still on. This
+ * re-checks at the last point before that call. It narrows the gap rather than
+ * closing it — un-sharing withdraws our authorization, not the OAuth grant — so
+ * what is pinned here is that a revocation landing before the read is honoured,
+ * and that an own mailbox pays nothing for the check.
+ */
+describe('assertStillAccessible (ENG-943)', () => {
+  const shared = account('gmail', 'teammate@example.com', TEAMMATE);
+  const own = account('gmail', 'me@example.com', CALLER);
+  const resolvedShared = {
+    platform: 'gmail' as const,
+    provider: makeMockProvider(),
+    accountId: shared.account_id,
+    ownerUserId: TEAMMATE,
+  };
+
+  it('passes while the mailbox is still shared', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    await expect(assertStillAccessible(CALLER, resolvedShared)).resolves.toBeUndefined();
+  });
+
+  it('rejects once the owner has stopped sharing', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
+
+    await expect(assertStillAccessible(CALLER, resolvedShared)).rejects.toThrow(/not found/i);
+  });
+
+  it('rejects when the mailbox resolves to a different owner', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+      account('gmail', 'teammate@example.com', 'someone-else'),
+    ]);
+
+    await expect(assertStillAccessible(CALLER, resolvedShared)).rejects.toThrow(
+      EmailProviderError
+    );
+  });
+
+  it('does not re-read anything for the caller’s own mailbox', async () => {
+    const resolvedOwn = { ...resolvedShared, accountId: own.account_id, ownerUserId: CALLER };
+
+    await assertStillAccessible(CALLER, resolvedOwn);
+
+    expect(mockGetAccountsWithOwnerIncludingOrgShared).not.toHaveBeenCalled();
   });
 });
 

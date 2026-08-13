@@ -6361,7 +6361,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, assertStillAccessible, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6372,11 +6372,13 @@ emmaToolRegistry.register({
       // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
       // record, and that is where the provider reads (and refreshes) its tokens.
       // A send is resolved as a write, so it is refused on a teammate's mailbox.
-      const { provider, ownerUserId } = await resolveEmailAccount(
-        userId,
-        args.account_id,
-        args.action === 'send' ? 'send' : 'read'
-      );
+      const operation = args.action === 'send' ? 'send' : 'read';
+      const resolved = await resolveEmailAccount(userId, args.account_id, operation);
+      // Last point before the provider is called with the owner's credentials:
+      // re-verify a teammate's shared mailbox is still shared. See
+      // assertStillAccessible for what this does and does not close.
+      await assertStillAccessible(userId, resolved, operation);
+      const { provider, ownerUserId } = resolved;
 
       switch (args.action) {
         case 'search': {

@@ -227,16 +227,17 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 router.post('/email', async (req: Request, res: Response) => {
   try {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, assertStillAccessible } = await import('../services/emailProviderService');
     await bootstrapEmailProviders();
     // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
     // record, and that is where the provider reads (and refreshes) its tokens.
     // A send is resolved as a write, so it is refused on a teammate's mailbox.
-    const { provider, ownerUserId } = await resolveEmailAccount(
-      userId(req),
-      req.body.account_id,
-      req.body.action === 'send' ? 'send' : 'read'
-    );
+    const operation = req.body.action === 'send' ? 'send' : 'read';
+    const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
+    // Last point before the provider is called with the owner's credentials —
+    // see assertStillAccessible for what this does and does not close.
+    await assertStillAccessible(userId(req), resolved, operation);
+    const { provider, ownerUserId } = resolved;
 
     const { action } = req.body;
     let result;
