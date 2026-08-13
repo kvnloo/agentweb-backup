@@ -216,6 +216,53 @@ describe('AgentModeService - Social Media Tools', () => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
     });
 
+    // ENG-827 (Greptile, security): admission to publish is granted BEFORE the slow
+    // work — resolving accounts, downloading media, uploading a video (minutes on
+    // YouTube). A consent withdrawal landing during that work must still stop the
+    // post, so the handler re-validates at its last moment before committing.
+    it('does NOT create the post when consent is withdrawn while the call is in flight', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        {
+          assertPublishStillAuthorized: async () => ({
+            success: false as const,
+            error: 'post_on_connected_account was not executed: this unattended scheduled run is not authorized to publish.',
+          }),
+        }
+      );
+
+      // Not reaching the adapter IS the fix — the post cannot be un-made.
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not authorized to publish');
+    });
+
+    it('posts normally when the in-flight re-check still allows it', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        { assertPublishStillAuthorized: async () => null }
+      );
+
+      expect(mockAdapter.createPost).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
+
     it('should successfully post content to account', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockGetAccountByIdConsistent.mockResolvedValue(mockLinkedInAccount as any);
@@ -238,7 +285,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'Hello from the API!',
         [],
-        'user-123'
+        'user-123',
+        // ENG-827: the last-moment consent re-check, undefined outside a gated
+        // scheduled dispatch so interactive posting is unchanged.
+        undefined
       );
       expect(result.success).toBe(true);
       expect(result.post_id).toBe('urn:li:share:123');
@@ -402,6 +452,62 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(mockGetAccountsWithOwnerIncludingOrgShared).toHaveBeenCalledWith('user-123');
       expect(result.success).toBe(true);
+    });
+  });
+
+  // ENG-827 (Greptile, security): the mixed-action tools publish too — an X thread,
+  // a LinkedIn repost — and the dispatcher now hands them the same last-moment
+  // re-check. A callback that is attached but never consumed enforces nothing.
+  describe('mid-flight consent withdrawal on the action-scoped publishing tools', () => {
+    const withdrawn = {
+      assertPublishStillAuthorized: async () => ({
+        success: false as const,
+        error: 'twitter_manage_post was not executed: this unattended scheduled run is not authorized to publish.',
+      }),
+    };
+
+    it('ABANDONS an X thread when consent is withdrawn after account resolution', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([
+        { account_id: 'x-1', platform: 'twitter', userId: 'user-123' },
+      ] as any);
+
+      const result = await service.twitterManagePost(
+        'user-123',
+        { action: 'post_thread', tweets: ['one', 'two'] },
+        withdrawn
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not authorized to publish');
+    });
+
+    it('ABANDONS a LinkedIn repost before it resolves the account', async () => {
+      const result = await service.linkedinManagePost(
+        'user-123',
+        { action: 'repost', account_id: 'urn:li:organization:123456', post_urn: 'urn:li:ugcPost:1' },
+        withdrawn
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not authorized to publish');
+      // The public write is never reached — that is the property under test.
+      expect(mockGetAccountById).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when no re-check is attached — a read call pays nothing', async () => {
+      // The dispatcher attaches the hook only for a call it classified as
+      // publishing, so an analytics read arrives with no hook at all.
+      mockGetAccountById.mockResolvedValue(null as any);
+
+      const result = await service.linkedinManagePost(
+        'user-123',
+        { action: 'repost', account_id: 'urn:li:organization:123456', post_urn: 'urn:li:ugcPost:1' }
+      );
+
+      // Got past the gate and into the handler proper.
+      expect(mockGetAccountById).toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Account not found');
     });
   });
 
@@ -736,7 +842,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         undefined,
-        'user-123'
+        'user-123',
+        // ENG-827: the consent re-check, run inside the adapter after the token
+        // refresh. Undefined here — this is not a scheduled run.
+        undefined
       );
     });
 
@@ -756,7 +865,8 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         'Great post!',
-        'user-123'
+        'user-123',
+        undefined
       );
     });
 
@@ -864,7 +974,7 @@ describe('AgentModeService - Social Media Tools', () => {
         commentary: 'Nice!',
       });
 
-      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!');
+      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!', undefined);
     });
 
     it('should dispatch comment action', async () => {
@@ -877,7 +987,7 @@ describe('AgentModeService - Social Media Tools', () => {
         comment_text: 'Hello',
       });
 
-      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined);
+      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined, undefined);
     });
 
     it('should dispatch list_comments action', async () => {

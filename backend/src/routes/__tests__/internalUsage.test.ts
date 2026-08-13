@@ -17,7 +17,15 @@ jest.mock('../../middleware/auth', () => ({
 }));
 
 jest.mock('../../services/usageRecorderService', () => ({
+  // ENG-1134: the route now prices each record to compute its quota charge, so
+  // computeCostMicroUsd must stay real. Stubbing the whole module made every
+  // request throw "computeCostMicroUsd is not a function" — which then surfaced
+  // as the 500-path assertions failing with the wrong message.
+  ...jest.requireActual('../../services/usageRecorderService'),
   recordUsage: jest.fn(),
+}));
+jest.mock('../../services/tokenUsageService', () => ({
+  incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
 }));
 
 import internalUsageRoutes from '../internalUsage';
@@ -105,7 +113,7 @@ describe('POST /api/internal/usage', () => {
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
   });
 
-  it('forwards a valid record to recordUsage with agent_task defaults', async () => {
+  it('forwards a valid record to recordUsage, namespaced as engine spend', async () => {
     const minimal = {
       model: 'gemini-3.5-flash',
       inputTokens: 10,
@@ -122,7 +130,7 @@ describe('POST /api/internal/usage', () => {
       taskId: 'task-42',
       model: 'anthropic.claude-sonnet-4-6',
       provider: 'anthropic',
-      feature: 'agent_task',
+      feature: 'engine:agent_task',
       inputTokens: 1000,
       outputTokens: 250,
       cacheReadTokens: 100,
@@ -133,7 +141,7 @@ describe('POST /api/internal/usage', () => {
       taskId: undefined,
       model: 'gemini-3.5-flash',
       provider: 'unknown',
-      feature: 'agent_task',
+      feature: 'engine:agent_task',
       inputTokens: 10,
       outputTokens: 5,
       cacheReadTokens: 0,

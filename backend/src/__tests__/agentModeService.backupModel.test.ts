@@ -72,6 +72,31 @@ describe('AgentModeService - Backup Model Fallback', () => {
   });
 
   describe('getBackupModel()', () => {
+    it('uses the policy-approved fallback instead of the global premium backup', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6'
+      });
+
+      const backup = await agentModeService.getBackupModel(
+        'gemini-3.1-flash-lite',
+        'anthropic.claude-haiku-4-5-20251001-v1:0'
+      );
+
+      expect(backup).toBe('anthropic.claude-haiku-4-5-20251001-v1:0');
+      expect(settingsService.getSetting).not.toHaveBeenCalled();
+    });
+
+    it('disables transient fallback when optimized policy has no second approved model', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6'
+      });
+
+      const backup = await agentModeService.getBackupModel('gemini-3.1-flash-lite', null);
+
+      expect(backup).toBeNull();
+      expect(settingsService.getSetting).not.toHaveBeenCalled();
+    });
+
     it('should return admin-configured backup model when setting exists and is valid', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: 'anthropic.claude-sonnet-4-6'

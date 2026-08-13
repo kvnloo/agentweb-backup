@@ -1061,6 +1061,10 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       costUsed?: number;
       costAllowance?: number | null;
       costPercentUsed?: number;
+      // ENG-1116: which dimension actually gated. Without it a cost block over an
+      // also-exceeded token counter would be worded in tokens, contradicting the
+      // in-app message the same block produces.
+      costEnforced?: boolean;
     }
   ) {
     try {

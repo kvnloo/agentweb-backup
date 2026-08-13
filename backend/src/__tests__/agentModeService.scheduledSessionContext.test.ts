@@ -338,6 +338,89 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(nonAdmin).toContain('PER-ENTITY COMPLETION LOOP');
     expect(adminDirective).toContain('PER-ENTITY COMPLETION LOOP');
   });
+
+  // ── (8) Publish authorization signal (ENG-827) ──────────────────────────────
+  // Regression coverage for sessions 1b28ae36 / a924892d (Kevin — Daily LinkedIn
+  // / X posts): the agent drafted a 5/5 post, then refused post_on_connected_account
+  // in an unattended run because it had no machine-readable signal that the
+  // schedule authorized live publishing, so it fell back to refusing and the
+  // required-tool checker nudged it in a loop that burned the run. The directive
+  // must carry an explicit, deterministic publish-authorization block — not leave
+  // it to the model to guess.
+  // An authorized directive is ALWAYS tool-scoped — the resolver cannot produce
+  // 'authorized' with an empty tool list, so the prompt never emits an unscoped
+  // publish mandate (Greptile P1 #5).
+  const publishAuthorizedDirective = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+  const publishGatedDirective = getUnattendedExecutionDirective('scheduled', false, 'withheld');
+
+  it('always carries an explicit PUBLISH AUTHORIZATION block on scheduled runs', () => {
+    expect(publishAuthorizedDirective).toContain('PUBLISH AUTHORIZATION');
+    expect(publishGatedDirective).toContain('PUBLISH AUTHORIZATION');
+    // default (no publishAuthorized arg) is the safe, publish-gated variant
+    expect(directive).toContain('PUBLISH AUTHORIZATION');
+  });
+
+  it('AUTHORIZES publishing (satisfies the approval gate, requires the publish tool) when pre-authorized', () => {
+    expect(publishAuthorizedDirective).toContain('PRE-AUTHORIZED to publish');
+    expect(publishAuthorizedDirective).toContain('ALREADY SATISFIED');
+    // it must name the concrete publishing tool the run was refusing to call
+    expect(publishAuthorizedDirective).toContain('post_on_connected_account');
+    expect(publishAuthorizedDirective).toContain('you MUST call post_on_connected_account');
+    // and it must NOT tell the run to withhold / seek sign-off
+    expect(publishAuthorizedDirective.toLowerCase()).not.toContain('awaiting the owner');
+  });
+
+  it('WITHHOLDS publishing deterministically (draft + notify once, no loop) when NOT pre-authorized', () => {
+    expect(publishGatedDirective).toContain('NOT pre-authorized to publish');
+    expect(publishGatedDirective.toLowerCase()).toContain('do not call a live-publishing tool');
+    expect(publishGatedDirective).toContain('post_on_connected_account');
+    // draft-and-notify is the correct COMPLETE terminal state, not a failure
+    expect(publishGatedDirective.toLowerCase()).toContain('awaiting the owner');
+    expect(publishGatedDirective.toLowerCase()).toContain('not unfinished');
+    // and it must stop the nudge loop rather than re-attempting the withheld publish
+    expect(publishGatedDirective.toLowerCase()).toContain('do not repeatedly');
+  });
+
+  it('safe-by-default: omitting publishAuthorized yields the publish-GATED block, never the authorized one', () => {
+    expect(directive).toContain('NOT pre-authorized to publish');
+    expect(directive).not.toContain('PRE-AUTHORIZED to publish');
+  });
+
+  it('still returns empty (no publish block) for non-scheduled sessions even when publishAuthorized is true', () => {
+    expect(getUnattendedExecutionDirective('regular', false, 'authorized')).toBe('');
+    expect(getUnattendedExecutionDirective(undefined, true, 'authorized')).toBe('');
+  });
+
+  it('names the exact publish tools the owner approved, and scopes to them', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+    expect(scoped).toContain('approved post_on_connected_account');
+    expect(scoped).toContain('covers ONLY post_on_connected_account');
+    expect(scoped).not.toContain('publish_landing_page_changes');
+  });
+
+  // Consent is tool-scoped, so authorization with no approved tool has unknown scope
+  // and must NOT become a licence to reach for any live-publishing tool. The resolver
+  // already refuses to emit this state; this is defence in depth.
+  it('emits NO authorization block when authorized with no tools named', () => {
+    const broad = getUnattendedExecutionDirective('scheduled', false, 'authorized', []);
+    expect(broad).not.toContain('PRE-AUTHORIZED to publish');
+    expect(broad).toContain('NOT pre-authorized to publish');
+  });
+
+  // Greptile P1: the prompt is rebuilt (and the schedule re-read) on EVERY
+  // verification attempt, while the required-function checker fixes its list once
+  // from its own snapshot. If an unreadable schedule emitted the prohibition, a
+  // single throttled read would forbid a tool the checker still demands —
+  // re-creating the nudge-loop contradiction. 'unknown' must stay silent.
+  it('emits NO publish block when authorization could not be determined', () => {
+    const unknown = getUnattendedExecutionDirective('scheduled', false, 'unknown');
+    expect(unknown).not.toContain('PUBLISH AUTHORIZATION');
+    expect(unknown).not.toContain('NOT pre-authorized to publish');
+    expect(unknown).not.toContain('PRE-AUTHORIZED to publish');
+    expect(unknown.toLowerCase()).not.toContain('do not call a live-publishing tool');
+    // the rest of the unattended directive is unaffected
+    expect(unknown).toContain('PER-ENTITY COMPLETION LOOP');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

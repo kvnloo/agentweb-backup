@@ -17,6 +17,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { ctx, jsonResult } from './toolHelpers';
+import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -187,13 +188,19 @@ mcpToolRegistry.register({
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
         llm_model: { type: 'string', description: 'LLM model to use (optional)' },
+        backup_model: { type: 'string', description: 'Backup model to use if the preferred model is restricted by optimized usage (optional). The server remains authoritative.' },
         media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
     }
   },
   execute: async (args: any, context: any) => {
-    const body: any = { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model };
+    const body: any = {
+      sessionId: args.session_id,
+      userMessage: args.message,
+      llmModel: args.llm_model,
+      llmBackupModel: args.backup_model,
+    };
     if (args.media_urls && args.media_urls.length > 0) {
       body.attachments = args.media_urls.map((url: string) => {
         const filename = url.split('/').pop()?.split('?')[0] || 'image';
@@ -287,6 +294,19 @@ mcpToolRegistry.register({
   },
   execute: async (_args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/sessions', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'emma_list_models',
+  definition: {
+    name: 'emma_list_models',
+    description: 'List the Emma models currently selectable for this account, plus the eligible scheduled-chat backup models. The result is cost-policy aware: after optimized usage begins it omits restricted premium models, and when usage is paused canGenerate is false.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/model-options', context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -501,7 +521,9 @@ mcpToolRegistry.register({
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
         llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
+        backup_model: { type: 'string', description: 'Backup model for scheduled runs if the preferred model becomes unavailable or is restricted by optimized usage (create/update). If omitted, the server assigns the admin-configured optimized default and marks it for user confirmation.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
+        revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
@@ -529,6 +551,7 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
@@ -552,8 +575,31 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+
+        // ENG-827: the publish setting never travels on this generic body — that route
+        // ignores it, so a revoke sent there would be silently dropped. It goes to the
+        // dedicated revoke-only endpoint, and it goes FIRST: if the ordinary update then
+        // fails, the schedule is already in the SAFER (not publishing) state. Revoking
+        // afterwards would leave publishing enabled whenever the second call failed.
+        //
+        // ONE DIRECTION ONLY. The endpoint rejects anything but `authorized: false`, so
+        // no argument the model can pass turns publishing on. Do not name the underlying
+        // schedule field anywhere in this file — a source-scanning test
+        // (schedulePublishApproval.mcpGuard.test.ts) enforces that it stays unwritable
+        // through the generic surface.
+        let publishConsent: any;
+        if (args.revoke_autopublish === true) {
+          publishConsent = await mcpFetch({
+            method: 'POST',
+            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            context: c,
+            body: { authorized: false },
+          });
+        }
+
+        if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
-        return jsonResult(data);
+        return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
         const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });
@@ -767,6 +813,7 @@ mcpToolRegistry.register({
         variable_values: { type: 'object', description: 'Variable values for the template placeholders' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
+        backup_model: { type: 'string', description: 'Backup model if the preferred model is restricted at run time. If omitted, the server assigns the admin-configured optimized default and marks it for confirmation.' },
       },
       required: ['template_id']
     }
@@ -781,6 +828,7 @@ mcpToolRegistry.register({
     if (args.variable_values !== undefined) body.variableValues = args.variable_values;
     if (args.run_count !== undefined) body.runCount = args.run_count;
     if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+    if (args.backup_model !== undefined) body.llmBackupModel = args.backup_model;
     const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
     return jsonResult(data);
   }
@@ -1290,11 +1338,16 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last moment before the article goes live on the CMS.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return { success: false, message: withdrawn.error };
     const { agentModeService } = await import('../../services/agentModeService');
     return await agentModeService.publishBlogArticle(
       args.title, args.description, args.hero_image_url, args.blog_html_url,
       context?.userId, context?.sessionId,
-      args.status, args.author, args.categories
+      args.status, args.author, args.categories,
+      // The check above guards entry; this one rides through the HTML fetch inside.
+      context?.assertPublishStillAuthorized
     );
   }
 });
@@ -1338,6 +1391,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before this becomes a live post.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
       body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
@@ -1726,6 +1782,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before the deployment goes live.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST',
       path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
