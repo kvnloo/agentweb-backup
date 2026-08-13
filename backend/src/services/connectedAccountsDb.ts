@@ -611,7 +611,19 @@ export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
   accountId: string,
-  configUpdates: Record<string, any>
+  configUpdates: Record<string, any>,
+  options?: {
+    /**
+     * Config keys to REMOVE outright, applied after the merge.
+     *
+     * A plain merge can only ever add or overwrite, so a field that records a
+     * past observation — `ads_scope_revoked_at`, say — has no way to be retracted
+     * once it is wrong. Setting it to `undefined` is not equivalent: the key
+     * survives the spread and its removal would then depend on marshalling
+     * behaviour rather than on anything stated here. Deleting is explicit.
+     */
+    unset?: string[];
+  }
 ): Promise<void> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -628,12 +640,17 @@ export const updateAccountConfig = async (
   }
 
   const existingAccount = accounts[accountIndex];
+  const mergedConfig: Record<string, any> = {
+    ...existingAccount.config,
+    ...configUpdates,
+  };
+  for (const key of options?.unset || []) {
+    delete mergedConfig[key];
+  }
+
   const updatedAccount: ConnectedAccountConfig = {
     ...existingAccount,
-    config: {
-      ...existingAccount.config,
-      ...configUpdates,
-    },
+    config: mergedConfig as ConnectedAccountConfig['config'],
     updated_at: new Date().toISOString(),
   };
 
