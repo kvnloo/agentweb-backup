@@ -36,6 +36,7 @@ import {
   resolveEmailAccount,
   resolveDefaultEmailAccount,
   assertStillAccessible,
+  withAccessGuard,
   EmailProviderError,
   type IEmailService,
 } from '../services/emailProviderService';
@@ -305,6 +306,62 @@ describe('assertStillAccessible (ENG-943)', () => {
 
     await assertStillAccessible(CALLER, resolvedOwn);
 
+    expect(mockGetAccountsWithOwnerIncludingOrgShared).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Checking only before the read leaves the gap every permission check has: it
+ * passes, the call goes out, and a revocation in between does not stop it —
+ * un-sharing withdraws our authorization, not the owner's OAuth credentials.
+ * The half that CAN be closed is disclosure, by checking again before the
+ * result is returned.
+ */
+describe('withAccessGuard (ENG-943)', () => {
+  const shared = account('gmail', 'teammate@example.com', TEAMMATE);
+  const resolvedShared = {
+    platform: 'gmail' as const,
+    provider: makeMockProvider(),
+    accountId: shared.account_id,
+    ownerUserId: TEAMMATE,
+  };
+
+  it('returns the result while the mailbox stays shared', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([shared]);
+
+    await expect(
+      withAccessGuard(CALLER, resolvedShared, 'read', async () => ['a message'])
+    ).resolves.toEqual(['a message']);
+  });
+
+  it('withholds a result already read when sharing ends during the read', async () => {
+    // Shared for the pre-check, gone by the post-check.
+    mockGetAccountsWithOwnerIncludingOrgShared
+      .mockResolvedValueOnce([shared])
+      .mockResolvedValue([]);
+    const read = jest.fn().mockResolvedValue(['secret mail']);
+
+    await expect(withAccessGuard(CALLER, resolvedShared, 'read', read)).rejects.toThrow(
+      /not found/i
+    );
+    // The read ran — what the guard prevents is handing the result back.
+    expect(read).toHaveBeenCalled();
+  });
+
+  it('never runs the read at all when sharing is already gone', async () => {
+    mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([]);
+    const read = jest.fn();
+
+    await expect(withAccessGuard(CALLER, resolvedShared, 'read', read)).rejects.toThrow();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('costs an own mailbox nothing on either side', async () => {
+    const resolvedOwn = { ...resolvedShared, ownerUserId: CALLER };
+
+    await expect(
+      withAccessGuard(CALLER, resolvedOwn, 'read', async () => 'ok')
+    ).resolves.toBe('ok');
     expect(mockGetAccountsWithOwnerIncludingOrgShared).not.toHaveBeenCalled();
   });
 });

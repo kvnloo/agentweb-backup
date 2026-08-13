@@ -25,6 +25,9 @@ jest.mock('../../services/emailProviderService', () => ({
   // Re-checked at the last moment before the provider is called with the
   // owner's credentials — see assertStillAccessible.
   assertStillAccessible: (...args: any[]) => mockAssertStillAccessible(...args),
+  // Guards each provider call on both sides; the real one re-checks sharing
+  // before the call and again before the result is returned.
+  withAccessGuard: (_u: any, _r: any, _o: any, read: () => any) => read(),
   EmailProviderError: MockEmailProviderError,
 }));
 

@@ -613,6 +613,35 @@ describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
     expect(mockListEmails).not.toHaveBeenCalled();
   });
 
+  /**
+   * The pre-read check cannot stop a revocation that lands after it passes —
+   * the provider authenticates with the owner's credentials, which un-sharing
+   * does not invalidate. What can be stopped is the disclosure: check again
+   * before the code leaves the tool, and withhold it.
+   */
+  it('withholds a code it already read when sharing ends mid-round', async () => {
+    // Passes the pre-read check, fails the one guarding the return.
+    mockResolveEmailAccount
+      .mockResolvedValueOnce(SHARED_MAILBOX) // initial resolution
+      .mockResolvedValueOnce(SHARED_MAILBOX) // pre-read check
+      .mockRejectedValue(new Error('Connected account "teammate@agentweb.pro" not found.'));
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    // The read happened — the guard is about what gets handed back.
+    expect(mockGetEmails).toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('mailbox_error');
+    expect(result.code).toBeUndefined();
+    expect(result.magic_link).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain('424242');
+  });
+
   it('does not re-check the caller’s own mailbox', async () => {
     mockResolveEmailAccount.mockResolvedValue({ ...GMAIL_ACCOUNT, accountId: 'me@agentweb.pro' });
     mockListEmails.mockResolvedValue([summary()]);

@@ -263,6 +263,37 @@ export async function assertStillAccessible(
 }
 
 /**
+ * Run a mailbox operation with the sharing checked on BOTH sides of it.
+ *
+ * The pre-check alone leaves the gap every permission check has: it passes, the
+ * provider call goes out, and a revocation landing in between does not stop it,
+ * because the provider authenticates with the owner's OAuth credentials, which
+ * un-sharing does not touch. Checking again after the read closes the part that
+ * actually matters — the caller is not handed content their access no longer
+ * covers.
+ *
+ * What this does NOT do, and cannot from here: stop the request itself. The
+ * provider may already have served it. The result is discarded rather than
+ * returned, so nothing is disclosed, but the call happened. Preventing that
+ * needs the credential invalidated when sharing is switched off — a change to
+ * the sharing feature, tracked separately.
+ *
+ * Own mailboxes skip both checks (see assertStillAccessible) and pay nothing.
+ */
+export async function withAccessGuard<T>(
+  callerUserId: string,
+  resolved: ResolvedEmailAccount,
+  operation: EmailOperation,
+  read: () => Promise<T>
+): Promise<T> {
+  await assertStillAccessible(callerUserId, resolved, operation);
+  const result = await read();
+  // Re-check before the result leaves this function, not just before the call.
+  await assertStillAccessible(callerUserId, resolved, operation);
+  return result;
+}
+
+/**
  * Pick a mailbox for a caller who didn't name one, in EMAIL_PLATFORMS order and
  * preferring the caller's own account over a teammate's shared one. Null when
  * the caller can reach no mailbox at all.

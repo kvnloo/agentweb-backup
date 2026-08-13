@@ -452,6 +452,20 @@ emmaToolRegistry.register({
 
           if (!code && !magicLink) continue;
 
+          // A code is the most sensitive thing this tool can hand back, so the
+          // share is checked once more before it leaves — not only before the
+          // read that found it. A revocation landing mid-round discloses
+          // nothing. The read itself already happened; see stillAccessible.
+          if (!(await stillAccessible())) {
+            return {
+              success: false,
+              reason: 'mailbox_error',
+              message:
+                `Access to mailbox "${accountId}" ended while the code was being read — its owner stopped sharing ` +
+                `it with your organization. The code was not returned. ${NO_FABRICATION_NOTE}`,
+            };
+          }
+
           return {
             success: true,
             code: code ?? undefined,

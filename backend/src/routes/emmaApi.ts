@@ -227,36 +227,37 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 router.post('/email', async (req: Request, res: Response) => {
   try {
-    const { bootstrapEmailProviders, resolveEmailAccount, assertStillAccessible } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
     await bootstrapEmailProviders();
     // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
     // record, and that is where the provider reads (and refreshes) its tokens.
     // A send is resolved as a write, so it is refused on a teammate's mailbox.
     const operation = req.body.action === 'send' ? 'send' : 'read';
     const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
-    // Last point before the provider is called with the owner's credentials —
-    // see assertStillAccessible for what this does and does not close.
-    await assertStillAccessible(userId(req), resolved, operation);
     const { provider, ownerUserId } = resolved;
+    // Every provider call runs inside withAccessGuard: a teammate's shared
+    // mailbox is re-checked immediately before the call AND before the result is
+    // returned, so a share revoked mid-read discloses nothing.
+    const guarded = <T,>(read: () => Promise<T>) => withAccessGuard(userId(req), resolved, operation, read);
 
     const { action } = req.body;
     let result;
     switch (action) {
       case 'search': {
         const maxResults = Math.min(req.body.max_results || 10, 50);
-        const emails = await provider.searchEmails(ownerUserId, req.body.account_id, req.body.query, maxResults);
+        const emails = await guarded(() => provider.searchEmails(ownerUserId, req.body.account_id, req.body.query, maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'list': {
         const maxResults = Math.min(req.body.max_results || 20, 50);
-        const emails = await provider.listEmails(ownerUserId, req.body.account_id, req.body.folder || 'INBOX', maxResults);
+        const emails = await guarded(() => provider.listEmails(ownerUserId, req.body.account_id, req.body.folder || 'INBOX', maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
-        const emails = await provider.getEmails(ownerUserId, req.body.account_id, ids);
+        const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;
       }
