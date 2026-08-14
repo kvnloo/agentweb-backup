@@ -5156,12 +5156,18 @@ router.post("/users/:userId/llm-usage-credit", async (req, res) => {
     // Admin grants are audited in cents on payment-history — sub-cent grants
     // cannot be represented faithfully there, so reject them here with a 400
     // instead of letting the service layer throw and surface as a generic 500.
-    const amountMicroUsd = Math.round(amountUsd * 1_000_000);
-    if (amountMicroUsd % 10_000 !== 0) {
+    // Check whole-cent-ness BEFORE rounding: a naive `Math.round(x * 1e6) % 1e4`
+    // silently lifts $0.0099999 to 1c and grants it. Comparing the pre-round
+    // value against its rounded-cents equivalent (with a floating-point
+    // epsilon) catches over-precise input up to representation limits.
+    const centsExact = amountUsd * 100;
+    const centsRounded = Math.round(centsExact);
+    if (Math.abs(centsExact - centsRounded) > 1e-6) {
       return res.status(400).json({
         message: "amountUsd must be in whole cents (2 decimal places max)",
       });
     }
+    const amountMicroUsd = centsRounded * 10_000;
     if (typeof reason !== "string" || !reason.trim()) {
       return res.status(400).json({ message: "reason is required" });
     }

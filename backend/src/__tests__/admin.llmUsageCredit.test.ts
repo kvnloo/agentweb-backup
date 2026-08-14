@@ -76,6 +76,9 @@ describe('admin one-time LLM usage credits', () => {
     // Sub-cent amounts fail with a clean 400 instead of a generic 500 from
     // the whole-cent check in grantMonthlyLlmUsageCredit. 0.005 = half a cent.
     [{ amountUsd: 0.005, reason: 'x', idempotencyKey: 'valid_key' }, 'whole cents'],
+    // Just-below-a-cent must not silently round up to 1c. The naive
+    // Math.round-then-modulo check missed this — the epsilon check catches it.
+    [{ amountUsd: 0.0099999, reason: 'x', idempotencyKey: 'valid_key' }, 'whole cents'],
   ])('rejects an invalid grant before writing: %p', async (payload, message) => {
     const res = await request(app)
       .post('/api/admin/users/member-1/llm-usage-credit')
