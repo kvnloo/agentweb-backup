@@ -41,6 +41,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
 import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
@@ -3331,6 +3332,7 @@ export class AgentModeService {
     // batch in the controller can persist only the un-checkpointed tail.
     let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
+    const runEmitter = new RunEmitter(agentRuntimeRunId, () => {}, onProgress);
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,
@@ -3990,7 +3992,7 @@ export class AgentModeService {
         await flushCheckpoint();
 
         if (onProgress) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'thinking',
             toolCalls: iteration === 1 ? [] : toolCalls.slice()
@@ -4136,7 +4138,7 @@ export class AgentModeService {
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
               if (onProgress) {
-                onProgress({
+                runEmitter.emitLegacy({
                   iteration,
                   status: 'switching_model',
                   toolCalls: toolCalls.slice(),
@@ -4430,7 +4432,7 @@ export class AgentModeService {
 
           // Send progress update: final response ready
           if (onProgress) {
-            onProgress({
+            runEmitter.emitLegacy({
               iteration,
               status: 'complete',
               toolCalls: toolCalls.slice()
@@ -4457,7 +4459,7 @@ export class AgentModeService {
                   suggestedReplies: suggestions,
                 };
                 if (onProgress) {
-                  onProgress({ iteration, status: 'suggestions', suggestions });
+                  runEmitter.emitLegacy({ iteration, status: 'suggestions', suggestions });
                 }
               }
             } catch {
@@ -4478,7 +4480,7 @@ export class AgentModeService {
         // once cancelled, emitting executing_tools would re-open the optimistic
         // "Generating image..." panel on a turn the user was already told had failed.
         if (onProgress && !isCancelled?.()) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'executing_tools',
             toolCalls: toolCalls.slice(),
@@ -4580,7 +4582,7 @@ export class AgentModeService {
         // would otherwise emit tool_executed with a real imageUrl — surfacing a SECOND
         // image on a turn the user already retried.
         if (onProgress && !isCancelled?.()) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'tool_executed',
             toolCalls: toolCalls.slice(toolCallsLengthBeforeIteration),
@@ -4629,7 +4631,7 @@ export class AgentModeService {
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
-            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
           }
           break;
         }
