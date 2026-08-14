@@ -346,6 +346,7 @@ import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -11185,7 +11186,11 @@ export class AgentModeService {
           icpMatch: lead.icpMatch?.isMatch || false,
           icpScore: lead.icpMatch?.score || null,
           engagementCount: lead.engagementCount || 0,
-          isEngaged: lead.isEngaged || false
+          isEngaged: lead.isEngaged || false,
+          // ENG-1175 AC2 — the list path returns the same attribution shape as
+          // the detail path. Spread last so it can only add keys, never shadow
+          // an existing one; absent attribution adds nothing at all.
+          ...projectLeadAttribution(lead),
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
@@ -11202,7 +11207,11 @@ export class AgentModeService {
     lead: any,
     filters: Array<{ field: string; operator: string; value?: any }>,
     searchQuery: string,
-    standardFields: string[],
+    // readonly: callers pass the shared LEAD_STANDARD_FILTER_FIELDS constant
+    // (ENG-1218), which must not be mutable through this parameter — a callee
+    // reordering or trimming it would silently change how the OTHER resolver
+    // behaves, which is the class of bug this constant exists to end.
+    standardFields: readonly string[],
   ): boolean {
     if (searchQuery) {
       const fields = [
@@ -11392,7 +11401,11 @@ export class AgentModeService {
       // deliberately NOT fixed here — promoting them changes how an existing
       // filter behaves for anyone with a same-named custom field, which is a
       // separate seam. Tracked on ENG-1175.
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt', 'clickIds'];
+      // ENG-1218: shared with the other filter resolver. A field missing here
+      // does not error — it resolves to customFields[field], so `is_empty`
+      // matches EVERY lead. On the destructive path that is data loss behind a
+      // confirm gate whose preview looks correct.
+      const standardFields = LEAD_STANDARD_FILTER_FIELDS as readonly string[];
       const matchingLeads: Array<{ lead: any; listId: string; listName: string }> = [];
 
       let stopIdx = -1;
@@ -11481,6 +11494,12 @@ export class AgentModeService {
             isEngaged: entry.lead.isEngaged || false,
             customFields: entry.lead.customFields || {},
             ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            // ENG-1175. This is the call both launch gates make to answer "did
+            // the gclid survive to the stored row?" — Google Pre-Launch Gate
+            // step 6.6 and the Meta gate's T11. Without these fields the gate
+            // reads a lead with no attribution in it and reports a BLOCK on a
+            // correctly-attributed lead.
+            ...projectLeadAttribution(entry.lead),
           };
         }),
         matchCount: matchingLeads.length,
@@ -11642,7 +11661,11 @@ export class AgentModeService {
           messageDraft: lead.messageDraft || null,
           selectedSenderId: lead.selectedSenderId || null,
           createdAt: lead.createdAt,
-          updatedAt: lead.updatedAt
+          updatedAt: lead.updatedAt,
+          // ENG-1175 AC1 — firstTouch when one exists, the field omitted
+          // entirely when it does not. Never an empty object: that would report
+          // "capture ran and found nothing" for a lead capture never touched.
+          ...projectLeadAttribution(lead),
         },
         engagementSummary: {
           total: engagementCount.total,
@@ -12094,7 +12117,11 @@ export class AgentModeService {
       // made `is_empty` match EVERYTHING, so "delete the leads with no click ID"
       // selected the attributed leads too. The two-phase confirm gate was the
       // only thing between that and data loss, and its preview looked correct.
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt', 'clickIds'];
+      // ENG-1218: shared with the other filter resolver. A field missing here
+      // does not error — it resolves to customFields[field], so `is_empty`
+      // matches EVERY lead. On the destructive path that is data loss behind a
+      // confirm gate whose preview looks correct.
+      const standardFields = LEAD_STANDARD_FILTER_FIELDS as readonly string[];
 
       // Helper function to check if a lead matches all filters
       const leadMatchesFilters = (lead: any): boolean => {
