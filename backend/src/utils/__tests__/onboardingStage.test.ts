@@ -1,6 +1,7 @@
 import {
   deriveOnboardingStage,
   isOnboardingStage,
+  isLifecycleNeutralOnboardingEvent,
   ALL_ONBOARDING_STAGES,
   ALLOWED_ONBOARDING_EVENTS,
   OnboardingEvent,
@@ -186,5 +187,19 @@ describe("ALLOWED_ONBOARDING_EVENTS", () => {
   it("rejects made-up event names — allowlist is strict", () => {
     expect(ALLOWED_ONBOARDING_EVENTS.has("totally_made_up")).toBe(false);
     expect(ALLOWED_ONBOARDING_EVENTS.has("")).toBe(false);
+  });
+});
+
+describe("isLifecycleNeutralOnboardingEvent", () => {
+  it.each([
+    "voice_onboarding_presented",
+    "voice_onboarding_started",
+    "voice_onboarding_text_fallback",
+  ])("marks %s as lifecycle-neutral", (event) => {
+    expect(isLifecycleNeutralOnboardingEvent(event)).toBe(true);
+  });
+
+  it("does not mark lifecycle progression events as neutral", () => {
+    expect(isLifecycleNeutralOnboardingEvent("goal_selected")).toBe(false);
   });
 });

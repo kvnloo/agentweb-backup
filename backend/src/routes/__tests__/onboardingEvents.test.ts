@@ -310,6 +310,33 @@ describe("POST /api/onboarding/events", () => {
     expect(res.status).toBe(200);
   });
 
+  it.each([
+    "voice_onboarding_presented",
+    "voice_onboarding_started",
+    "voice_onboarding_text_fallback",
+  ])(
+    "records %s without initializing lifecycle stage or firing contact automation",
+    async (event) => {
+      const app = makeApp();
+      const res = await request(app)
+        .post("/api/onboarding/events")
+        .send({ event });
+
+      expect(res.status).toBe(200);
+      expect(res.body.onboardingStage).toBeNull();
+      expect(mockUpdateUser).toHaveBeenCalledWith(
+        "user-123",
+        expect.objectContaining({
+          onboardingEvents: [expect.objectContaining({ event })],
+        }),
+      );
+      expect(mockUpdateUser.mock.calls[0][1]).toEqual(
+        expect.objectContaining({ onboardingStage: null }),
+      );
+      expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+    },
+  );
+
   it("dual-writes every onboarding event to the matching Lead (fire-and-forget)", async () => {
     const app = makeApp();
     const res = await request(app)
