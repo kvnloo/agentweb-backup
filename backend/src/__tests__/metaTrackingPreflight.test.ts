@@ -455,3 +455,34 @@ describe('detectMetaPixels — keyword-led regex and non-source attributes', () 
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 7. `\bsrc` has a word boundary before it inside `data-src`, so the
+ * previous round's fix still read a lazy-load/documentation attribute as the image source.
+ */
+describe('detectMetaPixels — the beacon src must be the real src attribute', () => {
+  // No plain `src` on the tag at all: with one present the old pattern matched IT first and
+  // the bug hid behind attribute ordering. This is the shape that actually reproduces.
+  it('ignores a beacon URL parked in data-src', () => {
+    expect(detectMetaPixels(
+      `<img class="beacon" data-src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/>`,
+    )).toEqual([]);
+  });
+
+  it('ignores a beacon URL in any other -src suffixed attribute', () => {
+    expect(detectMetaPixels(
+      `<img lazy-src="https://www.facebook.com/tr?id=${PIXEL}"/>`,
+    )).toEqual([]);
+  });
+
+  it('does not confuse srcset with src', () => {
+    expect(detectMetaPixels(
+      `<img srcset="https://www.facebook.com/tr?id=${PIXEL} 2x" src="/logo.png"/>`,
+    )).toEqual([]);
+  });
+
+  it('still detects the beacon on a newline-separated src attribute', () => {
+    expect(detectMetaPixels(`<img height="1"\n  src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/>`))
+      .toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

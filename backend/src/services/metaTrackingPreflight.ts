@@ -245,7 +245,10 @@ export function detectMetaPixels(html: string): string[] {
    * quoting it, a dashboard printing it — as an install, which is the same inert-text false
    * pass the script scan above exists to prevent, one element type over.
    */
-  for (const m of html.matchAll(/<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+  // `\ssrc`, not `\bsrc`: a word boundary also sits inside `data-src` and `lazy-src`, so a
+  // beacon parked in a lazy-load or documentation attribute read as the real source. Only an
+  // attribute that starts right after whitespace is the tag's own `src`.
+  for (const m of html.matchAll(/<img\b[^>]*?\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
     const src = m[1] ?? m[2] ?? m[3] ?? '';
     // The URL has to be what the browser REQUESTS. Sitting in a data- attribute (or any
     // other attribute) it is documentation, and no tracking request is ever made.
