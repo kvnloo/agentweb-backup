@@ -416,10 +416,31 @@ export function pruneClickIds(raw: unknown): Record<string, string> | undefined 
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** A stored blob is usable only if it is a plain, non-empty object. */
+/**
+ * The keys `normalizeAttribution` can actually produce. See AttributionTouch.
+ */
+const TOUCH_KEYS = ['timestamp', 'utm', 'clickIds', 'referrer', 'landingUrl', 'sessionId'] as const;
+
+/**
+ * A stored blob is usable only if it is a plain object carrying at least one
+ * key attribution could have written.
+ *
+ * Being a non-empty object is NOT sufficient. A legacy or corrupt row such as
+ * `{ legacyBlob: true }` would otherwise be promoted to a valid `firstTouch`,
+ * and every consumer that reads presence-as-capture would report that capture
+ * ran on a record where nothing was captured. That is the same class of wrong
+ * answer as an empty object, arriving by a different route — and the warning on
+ * `firstTouch` above explains why "did capture run?" is a question people
+ * actually ask of this field.
+ *
+ * One recognised key is enough. The capture middleware always writes
+ * `timestamp` + `landingUrl`, but a touch narrowed to a single real field is
+ * still real data rather than corruption, and discarding it would lose
+ * attribution we genuinely hold.
+ */
 function usableTouch(raw: unknown): AttributionTouch | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  if (Object.keys(raw as object).length === 0) return undefined;
+  if (!TOUCH_KEYS.some((key) => (raw as Record<string, unknown>)[key] !== undefined)) return undefined;
   // Deep copy: the response must not alias the record the rest of the request
   // is still reading, and must not be mutable back into it.
   return JSON.parse(JSON.stringify(raw)) as AttributionTouch;

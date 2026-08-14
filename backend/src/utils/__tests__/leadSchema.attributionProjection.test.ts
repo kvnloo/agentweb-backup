@@ -31,6 +31,25 @@ describe('projectLeadAttribution (ENG-1175)', () => {
       expect(out).not.toHaveProperty('firstTouch');
     });
 
+    it('omits a non-empty object carrying no recognisable attribution key', () => {
+      // Being an object is not enough. A corrupt or legacy blob like this would
+      // otherwise be promoted to a valid firstTouch, and every consumer that
+      // reads presence-as-capture would report that capture ran on a record
+      // where nothing was captured — the exact confusion AC1/AC4 exist to stop.
+      expect(projectLeadAttribution({ firstTouch: { foo: 'bar' } })).not.toHaveProperty('firstTouch');
+      expect(projectLeadAttribution({ lastTouch: { 0: 'x', legacyBlob: true } })).not.toHaveProperty('lastTouch');
+    });
+
+    it('keeps a touch carrying any single recognised key', () => {
+      // The capture middleware always writes timestamp + landingUrl, but a
+      // touch narrowed to just one real field is still real data, not corruption.
+      for (const key of ['timestamp', 'landingUrl', 'referrer']) {
+        expect(projectLeadAttribution({ firstTouch: { [key]: 'x' } })).toHaveProperty('firstTouch');
+      }
+      expect(projectLeadAttribution({ firstTouch: { utm: { source: 'google' } } })).toHaveProperty('firstTouch');
+      expect(projectLeadAttribution({ firstTouch: { clickIds: { gclid: 'g' } } })).toHaveProperty('firstTouch');
+    });
+
     it.each([
       ['a string', 'gclid=123'],
       ['an array', [{ utm: { source: 'google' } }]],
