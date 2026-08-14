@@ -66,6 +66,28 @@ export interface MetaAdsScopeConfigLike {
    * a confirmation.
    */
   ads_scope_denied_seen_at?: unknown;
+  /**
+   * Which of the two independent grants is actually missing, set alongside
+   * `ads_scope_revoked_at` (ENG-1158 follow-up).
+   *
+   * Meta requires TWO separate grants before an ads read works: the user
+   * authorizing our app for `ads_read`/`ads_management` (OAuth), and the ad
+   * account's owner separately granting that user access to that specific ad
+   * account (Business Manager asset roles) — a screen our OAuth flow never
+   * touches. `ads_scope_revoked_at` alone cannot say which is missing, and
+   * guessing wrong sends a customer to reconnect and re-approve a grant they
+   * already have, for a permission reconnecting can never restore.
+   *
+   * 'oauth'   — our own record shows no ads scope granted to the app. Reconnect
+   *             is the correct, sufficient fix.
+   * 'asset'   — the app grant is confirmed present; Meta refused the ad account
+   *             read anyway. Only the ad account's own admin, in Meta Business
+   *             Settings, can fix this — reconnecting changes nothing.
+   * Absent    — tier could not be determined (e.g. the classifying call itself
+   *             failed); falls back to the OAuth-tier message, matching this
+   *             module's behaviour before this distinction existed.
+   */
+  ads_scope_tier?: unknown;
 }
 
 /**
@@ -80,6 +102,21 @@ export const META_ADS_RECONSENT_MESSAGE =
   '"ads_read" (or "ads_management") permission, so no campaign or insights data could be read. ' +
   'Reconnect Meta under Settings -> Connected accounts and approve the Ads permissions when prompted, ' +
   'then run this again. No metrics were retrieved.';
+
+/**
+ * The asset-tier counterpart to `META_ADS_RECONSENT_MESSAGE` (ENG-1158 follow-up).
+ *
+ * Used only when `ads_scope_tier === 'asset'` — the app-level grant is confirmed
+ * present, so telling the owner to reconnect and re-approve permissions they
+ * already granted would send them through a flow that cannot fix this and leave
+ * them locked out with no correct next step.
+ */
+export const META_ADS_ASSET_ACCESS_MESSAGE =
+  'Meta Ads access is not authorized for this ad account. This Meta account has already granted AgentWeb the ' +
+  '"ads_read" (or "ads_management") permission, but the ad account itself has not granted this person access, ' +
+  'so no campaign or insights data could be read. Reconnecting will not fix this. Ask whoever manages this ad ' +
+  'account in Meta Business Settings to add this person with Ads permissions, then run this again. ' +
+  'No metrics were retrieved.';
 
 const isAdsScope = (value: unknown): boolean =>
   typeof value === 'string' &&
@@ -159,7 +196,11 @@ export const describeMetaAdsCapability = (
   const state = getMetaAdsScopeState(account?.config);
   if (state === 'granted') return { ads_capable: true };
   if (state === 'missing') {
-    return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
+    const message =
+      account?.config?.ads_scope_tier === 'asset'
+        ? META_ADS_ASSET_ACCESS_MESSAGE
+        : META_ADS_RECONSENT_MESSAGE;
+    return { ads_capable: false, capability_warning: message };
   }
   return {};
 };

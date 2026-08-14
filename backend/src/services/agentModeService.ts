@@ -15491,13 +15491,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           .filter((s: unknown) => typeof s === 'string')
           .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
 
+        // Which of the two independent grants is actually missing (ENG-1158
+        // follow-up)? Without this, the re-consent message tells an owner who
+        // already granted the app scope to reconnect and re-approve a
+        // permission they already have — for a gap that lives on the ad
+        // account, not the OAuth connection, which reconnecting cannot touch.
+        const tier = await metaService.classifyAdsRefusalTier(connection.config?.access_token);
+
         const { updateAccountConfig } = await import('./connectedAccountsDb');
         await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
           // Meta just told us authoritatively that no ads scope is granted.
           // Recording it converts every subsequent attempt into a pre-flight refusal.
           granted_scopes: retained,
           ads_scope_revoked_at: new Date().toISOString(),
-        });
+          ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+        }, tier === 'unknown' ? { unset: ['ads_scope_tier'] } : undefined);
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`

@@ -124,7 +124,7 @@ export const syncMetaAdsCapability = async (
       // cannot stand as a grant. Absent reads as 'unknown', which says exactly
       // what we know: the read works; what was granted, we would have to re-ask.
       const unset = ['ads_scope_denied_seen_at'];
-      if (wasRefusing) unset.push('ads_scope_revoked_at', 'granted_scopes');
+      if (wasRefusing) unset.push('ads_scope_revoked_at', 'granted_scopes', 'ads_scope_tier');
 
       await updateAccountConfig(userId, platform as any, account.account_id, {}, { unset });
       for (const key of unset) delete config[key];
@@ -187,13 +187,23 @@ export const syncMetaAdsCapability = async (
       .filter((s: unknown): s is string => typeof s === 'string')
       .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
 
+    // Which of the two independent grants is actually missing (ENG-1158
+    // follow-up)? An independent, fresh check — not derived from `retained`
+    // above, which is our own subtraction and would always say "gone" for
+    // both tiers alike. `access_token` is still the token that was just
+    // refused, so this call cannot itself trigger a re-refusal.
+    const tier = await metaService.classifyAdsRefusalTier(config.access_token);
+
     await updateAccountConfig(userId, platform as any, account.account_id, {
       granted_scopes: retained,
       ads_scope_revoked_at: config.ads_scope_revoked_at || now,
-    }, { unset: ['ads_scope_denied_seen_at'] });
+      ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+    }, { unset: tier === 'unknown' ? ['ads_scope_denied_seen_at', 'ads_scope_tier'] : ['ads_scope_denied_seen_at'] });
     config.granted_scopes = retained;
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     delete config.ads_scope_denied_seen_at;
+    if (tier !== 'unknown') config.ads_scope_tier = tier;
+    else delete config.ads_scope_tier;
 
     console.log(
       `[MetaAdsCapabilitySync] Ads access missing for user ${userId} account ${account.account_id} — recorded; the Settings row and the agent tool now report it as needing reconnection`

@@ -829,6 +829,33 @@ export class MetaService {
     }
   }
 
+  /**
+   * When `probeAdsAccountAccess` has just returned 'denied', which of the two
+   * independent grants is actually missing? (ENG-1158 follow-up)
+   *
+   * The ad-account refusal alone cannot say — Meta stamps the same (#200)
+   * shape whether the app never got `ads_read` or the app has it and the ad
+   * account's owner just hasn't granted this person access to that asset.
+   * Telling an owner who already granted the app scope to "reconnect and
+   * approve Ads permissions" sends them through a flow that cannot fix
+   * anything and leaves them locked out with no correct next step.
+   *
+   * Resolved by checking `debug_token`'s `granted_scopes` for the same token:
+   * present → the app grant is confirmed, so the ad account itself is the
+   * gap ('asset'). Absent → the app was never granted the scope ('oauth').
+   * Undetermined (debug_token itself failed) → 'unknown', which callers must
+   * treat as "fall back to the OAuth-tier message" rather than guess.
+   */
+  public async classifyAdsRefusalTier(accessToken: string): Promise<'oauth' | 'asset' | 'unknown'> {
+    const { META_ADS_READ_SCOPES } = await import('../utils/metaAdsScope');
+    const scopes = await this.getGrantedScopes(accessToken);
+    if (scopes === undefined) return 'unknown';
+    const hasAdsScope = scopes.some(s =>
+      (META_ADS_READ_SCOPES as readonly string[]).includes(String(s).trim())
+    );
+    return hasAdsScope ? 'asset' : 'oauth';
+  }
+
   public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
     try {
       const { getMetaCredentials } = await import('../utils/secretsManager');
