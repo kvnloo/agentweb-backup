@@ -415,3 +415,53 @@ export function pruneClickIds(raw: unknown): Record<string, string> | undefined 
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
+
+/** A stored blob is usable only if it is a plain, non-empty object. */
+function usableTouch(raw: unknown): AttributionTouch | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  if (Object.keys(raw as object).length === 0) return undefined;
+  // Deep copy: the response must not alias the record the rest of the request
+  // is still reading, and must not be mutable back into it.
+  return JSON.parse(JSON.stringify(raw)) as AttributionTouch;
+}
+
+/**
+ * The single attribution shape returned by every lead-returning path
+ * (ENG-1175). Spread it into a projection; do not re-derive it inline.
+ *
+ * ONE definition on purpose. ENG-1176 shipped two defects — one on the
+ * destructive delete path — because the standard-field list had been copied
+ * into eight places and the copies drifted. The logic was shared, the data was
+ * not. Three projections each maintaining their own idea of "the attribution
+ * fields" would reproduce that exactly, and the failure would again be a
+ * confidently wrong answer rather than an error.
+ *
+ * Every field is OMITTED when absent rather than emitted empty or null. That is
+ * the whole contract, and it is load-bearing: `firstTouch: {}` would report
+ * "capture ran and found nothing" for a lead where capture never ran at all,
+ * and those are different answers to the only question the launch gates ask
+ * (ENG-1175 AC1/AC4). The same reasoning drives the empty-map rule on
+ * `clickIds` — see `pruneClickIds` above.
+ *
+ * A malformed stored blob is dropped, not thrown on: the caller asked for a
+ * lead, and one corrupt attribution field must not make the whole record
+ * unreadable.
+ */
+export function projectLeadAttribution(lead: any): Partial<LeadAttributionFields> {
+  if (!lead || typeof lead !== 'object') return {};
+  const out: Partial<LeadAttributionFields> = {};
+
+  const firstTouch = usableTouch(lead.firstTouch);
+  if (firstTouch) out.firstTouch = firstTouch;
+
+  const lastTouch = usableTouch(lead.lastTouch);
+  if (lastTouch) out.lastTouch = lastTouch;
+
+  if (typeof lead.utmSource === 'string' && lead.utmSource.trim()) out.utmSource = lead.utmSource;
+  if (typeof lead.utmMedium === 'string' && lead.utmMedium.trim()) out.utmMedium = lead.utmMedium;
+
+  const clickIds = pruneClickIds(lead.clickIds);
+  if (clickIds) out.clickIds = clickIds;
+
+  return out;
+}
