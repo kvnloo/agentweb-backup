@@ -47,14 +47,21 @@ const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
 const ROOT = "billing-root";
 const ORG = "org-1";
 
-const row = (userId: string, costMicroUsd: number) => ({
+/**
+ * A ledger row. `billingUserId` defaults to the acting user because that is what
+ * production rows actually carry: `recordUsage` falls back to `ctx.billingUserId
+ * || userId`, and no agent-mode call site passed one until ENG-1217. A row whose
+ * `billingUserId` differs from its `userId` is therefore a DELIBERATE record of
+ * where the spend was billed, which is exactly what makes it trustworthy.
+ */
+const row = (userId: string, costMicroUsd: number, billingUserId?: string) => ({
   userId,
   date: "2026-08-01",
   sk: "2026-08-01#anthropic.claude-opus-5#agent_task",
   model: "anthropic.claude-opus-5",
   feature: "agent_task",
   costMicroUsd,
-  billingUserId: ROOT,
+  billingUserId: billingUserId ?? userId,
 });
 
 beforeEach(() => {
@@ -81,10 +88,14 @@ describe("resolvePooledLedgerUserIds", () => {
     expect(new Set(ids)).toEqual(new Set([ROOT, "member-a", "member-b"]));
   });
 
-  it("keeps every member partition available for historical billing attribution", async () => {
-    // Current subscription state cannot be applied to the entire historical
-    // partition: a member may have switched from org billing to personal
-    // billing (or back) during the queried cycle.
+  it("returns a self-payer's partition as a CANDIDATE, not as pooled spend", async () => {
+    // ENG-1084 decides whose spend counts, but that is a per-ROW question and it
+    // is answered in `readPooledLedgerRows`. Discovery only answers "which
+    // partitions could hold a row billed to this subject", and a self-payer's
+    // partition can: they may have been pooling earlier in the same cycle.
+    // Excluding them here is what made the window unreadable at a transition —
+    // the partition was never queried, so those rows could not be recovered by
+    // any later filter.
     mockUser.mockResolvedValue({ userId: ROOT, orgId: ORG });
     mockOrg.mockResolvedValue({ orgId: ORG, ownerUserId: ROOT });
     mockMembers.mockResolvedValue([
@@ -94,7 +105,9 @@ describe("resolvePooledLedgerUserIds", () => {
       { userId: "pooled", orgId: ORG, subscription_status: "past_due" },
     ]);
     const ids = await resolvePooledLedgerUserIds(ROOT);
-    expect(new Set(ids)).toEqual(new Set([ROOT, "self-payer", "trialing-self-payer", "pooled"]));
+    expect(new Set(ids)).toEqual(
+      new Set([ROOT, "self-payer", "trialing-self-payer", "pooled"]),
+    );
   });
 
   it("never returns a duplicate id, even though getOrgMembers includes the owner", async () => {
@@ -143,27 +156,6 @@ describe("readPooledLedgerRows", () => {
     expect(mockQuery).toHaveBeenCalledWith("member-a", "2026-08-01", "2026-08-11");
   });
 
-  it("retains rows billed to the root after a member switches to personal billing", async () => {
-    mockUser.mockResolvedValue({ userId: ROOT, orgId: ORG });
-    mockOrg.mockResolvedValue({ orgId: ORG, ownerUserId: ROOT });
-    mockMembers.mockResolvedValue([
-      { userId: ROOT, orgId: ORG },
-      { userId: "member-a", orgId: ORG, subscription_status: "active" },
-    ]);
-    mockQuery.mockImplementation(async (uid: string) =>
-      uid === ROOT
-        ? [row(ROOT, 10)]
-        : [
-            { ...row("member-a", 20), billingUserId: ROOT },
-            { ...row("member-a", 30), billingUserId: "member-a" },
-          ],
-    );
-
-    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
-    expect(rows.filter((entry) => entry.billingUserId === ROOT)).toHaveLength(2);
-    expect(rows.filter((entry) => entry.billingUserId === "member-a")).toHaveLength(0);
-  });
-
   it("fails loud when one member's partition cannot be read", async () => {
     // Swallowing the error into empty rows would understate burn and overstate
     // runway — confidently wrong beats visibly broken only if you never have to
@@ -184,5 +176,115 @@ describe("readPooledLedgerRows", () => {
     const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
     expect(rows).toHaveLength(1);
     expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Which ROWS in those partitions belong to the subject.
+ *
+ * Discovery is a current-state question and can only ever be one; membership is
+ * not versioned anywhere. Attribution is a historical question, and answering it
+ * from current state is what breaks at a transition: a member who starts their
+ * own subscription mid-cycle takes their whole cycle's history out of the org's
+ * burn, and a member who cancels theirs mid-cycle hands the org a whole cycle it
+ * was never billed for. Both move the forecast, and the first moves it in the
+ * dangerous direction — burn drops, runway lengthens, the customer is reassured
+ * and then stops.
+ *
+ * So the row decides, whenever the row knows: a recorded `billingUserId` that
+ * differs from the acting user is a statement made at write time about where that
+ * spend landed. Where the row does not know — every row written before ENG-1217
+ * tagged the agent-mode path — current membership is the honest fallback, and it
+ * is no worse than what it replaces.
+ */
+describe("readPooledLedgerRows — attribution within a partition", () => {
+  const orgWith = (members: Array<{ userId: string; subscription_status?: string }>) => {
+    mockUser.mockResolvedValue({ userId: ROOT, orgId: ORG });
+    mockOrg.mockResolvedValue({ orgId: ORG, ownerUserId: ROOT });
+    mockMembers.mockResolvedValue(members.map((m) => ({ ...m, orgId: ORG })));
+  };
+
+  it("keeps a member's rows that recorded this subject as the payer", async () => {
+    orgWith([{ userId: ROOT }, { userId: "member-a" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT ? [row(ROOT, 10)] : [row("member-a", 90, ROOT)],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows.reduce((s, r) => s + r.costMicroUsd, 0)).toBe(100);
+  });
+
+  it("drops a member's rows that recorded somebody else as the payer", async () => {
+    // The member is in the org and currently pools, but these particular rows say
+    // they were billed elsewhere. The record outranks the inference.
+    orgWith([{ userId: ROOT }, { userId: "member-a" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT ? [row(ROOT, 10)] : [row("member-a", 90, "some-other-root")],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].costMicroUsd).toBe(10);
+  });
+
+  it("recovers the pre-transition history of a member who now self-pays", async () => {
+    // THE regression this exists for. `inheritsOrgBilling` is false for them
+    // today, so the old reader never queried their partition and the org's burn
+    // silently lost the first half of its own cycle.
+    orgWith([{ userId: ROOT }, { userId: "switcher", subscription_status: "active" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT
+        ? [row(ROOT, 10)]
+        : [
+            // Written while they still pooled onto the org.
+            row("switcher", 70, ROOT),
+            // Written after they started paying for themselves.
+            row("switcher", 500),
+          ],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows.reduce((s, r) => s + r.costMicroUsd, 0)).toBe(80);
+  });
+
+  it("never lends a self-payer's own spend to the org (ENG-1084 still holds)", async () => {
+    orgWith([{ userId: ROOT }, { userId: "self-payer", subscription_status: "active" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT ? [row(ROOT, 10)] : [row("self-payer", 900)],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].userId).toBe(ROOT);
+  });
+
+  it("falls back to current membership for rows written before the tag", async () => {
+    // Untagged rows carry `billingUserId === userId` and say nothing. A member who
+    // pools today is assumed to have pooled then — the same assumption the reader
+    // made for every row before this change, now confined to the rows that
+    // genuinely cannot answer for themselves.
+    orgWith([{ userId: ROOT }, { userId: "member-a", subscription_status: "canceled" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT ? [row(ROOT, 10)] : [row("member-a", 90)],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows.reduce((s, r) => s + r.costMicroUsd, 0)).toBe(100);
+  });
+
+  it("always keeps the subject's own partition, whatever the rows claim", async () => {
+    // `inheritsOrgBilling` is false for the billing root by construction
+    // (`isBillingRoot`), so using it as the row test unguarded would throw away
+    // the root's own spend — the largest partition in most orgs.
+    orgWith([{ userId: ROOT }, { userId: "member-a" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT ? [row(ROOT, 42)] : [],
+    );
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].costMicroUsd).toBe(42);
+  });
+
+  it("keeps a solo user's rows without consulting membership at all", async () => {
+    mockUser.mockResolvedValue({ userId: ROOT, orgId: null });
+    mockQuery.mockResolvedValue([row(ROOT, 5)]);
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows).toHaveLength(1);
+    expect(mockMembers).not.toHaveBeenCalled();
   });
 });
