@@ -450,6 +450,25 @@ export async function runMetaTrackingGate(
    * move AC4 forbids everywhere else in this gate.
    */
   if (adId && destinationUrls.length === 0) {
+    /*
+     * Before blocking, look the ad up account-wide. A COPY_AD's SOURCE ad legitimately lives
+     * in another campaign — that is what copying between campaigns means — and its
+     * destination is perfectly readable, so blocking on the campaign-scoped miss alone would
+     * refuse a valid launch over a page we could have checked. Only pay for this wider read
+     * on the miss.
+     */
+    try {
+      const accountWide = await metaService.listAdsForUtmAudit(accountId, accessToken, undefined as any);
+      const named = (accountWide ?? []).filter((a: any) => String(a?.adId) === String(adId));
+      const found = named.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
+      if (found.length > 0) {
+        destinationUrls = found;
+      }
+    } catch {
+      // Fall through to the block below: a lookup that failed is not a lookup that passed.
+    }
+  }
+  if (adId && destinationUrls.length === 0) {
     const message =
       `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
       `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +

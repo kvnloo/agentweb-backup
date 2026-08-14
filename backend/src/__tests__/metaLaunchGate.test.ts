@@ -566,3 +566,38 @@ describe('named-ad scoping must not silently pass (ENG-941)', () => {
     expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
   });
 });
+
+/*
+ * Greptile P1, round 12 — the previous round's fix over-corrected. A COPY_AD's SOURCE ad
+ * legitimately lives in another campaign (that is what copying between campaigns means), and
+ * its destination is readable account-wide. Blocking there refuses a valid launch over a page
+ * we could have checked. The rule that has to hold is narrower: block only when the ad cannot
+ * be found AT ALL.
+ */
+describe('named-ad lookup falls back to the account before blocking (ENG-941)', () => {
+  it('verifies a copy whose source ad lives in a different campaign', async () => {
+    mockListAds
+      .mockResolvedValueOnce([]) // campaign-scoped: source ad is not in this campaign
+      .mockResolvedValueOnce([   // account-wide: it is right here
+        { adId: 'ad-42', campaignId: 'other-campaign', destinationUrls: ['https://site.example/source'] },
+      ]);
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
+    expect(out.proceed).toBe(true);
+    expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/source']);
+  });
+
+  it('still blocks when the ad cannot be found anywhere on the account', async () => {
+    mockListAds.mockResolvedValue([]);
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('ad-42');
+  });
+
+  it('does not pay for the account-wide lookup when the campaign scope already found the ad', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/lp'] },
+    ]);
+    await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
+    expect(mockListAds).toHaveBeenCalledTimes(1);
+  });
+});

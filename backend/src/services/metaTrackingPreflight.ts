@@ -265,6 +265,11 @@ export function detectMetaPixels(html: string): string[] {
     // is valid HTML, and matching only quoted values read it as executable.
     const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs || '');
     const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3])?.toLowerCase();
+    // A script with a `src` loads the external file and its inline content is ignored
+    // ENTIRELY by the browser, whatever the type says — so a snippet written between those
+    // tags never runs. (The external file itself is out of reach here: this gate reads the
+    // served HTML rather than following and executing every script it references.)
+    if (/\bsrc\s*=/i.test(attrs || '')) return '<script></script>';
     if (type && !isExecutableScriptType(type)) return '<script></script>';
     const live = stripInertJavaScript(body);
     executable.push(live);

@@ -572,3 +572,22 @@ describe('detectMetaPixels — unquoted script type attributes', () => {
     expect(detectMetaPixels(`<script type=text/javascript>fbq('init', '${PIXEL}');</script>`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 12. A <script src="…"> element loads the external file and its INLINE
+ * content is ignored entirely by the browser — so a pixel snippet written between those tags
+ * never runs, no matter what its type says.
+ */
+describe('detectMetaPixels — external scripts ignore their inline body', () => {
+  it('ignores an fbq init inside a script that has a src', () => {
+    expect(detectMetaPixels(
+      `<script src="/app.js">fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([]);
+  });
+
+  it('still reads a normal inline script that follows one', () => {
+    expect(detectMetaPixels(
+      `<script src="/app.js">fbq('init','${OTHER_PIXEL}')</script><script>fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});
