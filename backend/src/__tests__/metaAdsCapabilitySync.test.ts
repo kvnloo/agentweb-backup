@@ -360,15 +360,35 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
       mockClassifyAdsRefusalTier.mockResolvedValue('asset');
       const account = latchedAccount(); // no ads_scope_tier — the real production shape
+      const configSnapshot = { ...account.config };
 
       const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('unchanged'); // nothing user-visible changes...
       expect(mockClassifyAdsRefusalTier).toHaveBeenCalledWith('EAA-token');
-      expect(account.config.ads_scope_tier).toBe('asset'); // ...but the tier is now known
-      const configSnapshot = { ...account.config, ads_scope_tier: undefined };
+      // ...but the write it would make on a real (non-mocked) CAS loop carries
+      // the now-known tier. The mock here doesn't invoke the closure, so the
+      // local mirror (`applied`-gated) correctly stays untouched — assert on
+      // what the write itself would do, not on the local side effect.
       const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
       expect(updates.ads_scope_tier).toBe('asset');
+    });
+
+    it('rejects the backfill write when a concurrent writer already recorded a tier', async () => {
+      // Greptile P1: the guard inside the write must actually gate the write,
+      // not just be decorative — a fresh read that already carries a tier
+      // (another process won the race) must produce a true no-op, which the
+      // outer code then must not misreport as an applied backfill.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount();
+      const concurrentlyWonConfig = { ...account.config, ads_scope_tier: 'oauth' };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], concurrentlyWonConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
     });
 
     it('does not backfill when the tier cannot be determined', async () => {

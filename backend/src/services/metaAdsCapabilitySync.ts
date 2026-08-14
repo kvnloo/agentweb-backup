@@ -187,6 +187,11 @@ export const syncMetaAdsCapability = async (
       if (!config.ads_scope_tier) {
         const backfillTier = await metaService.classifyAdsRefusalTier(config.access_token);
         if (backfillTier !== 'unknown') {
+          // Report back whether the write actually applied (Greptile P1):
+          // a guard inside can no-op this on a concurrent tier already being
+          // recorded, or a newer probe having landed — the local mutation and
+          // the log line below must not claim a backfill that didn't happen.
+          let applied = false;
           await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
             if (getMetaAdsScopeState(freshConfig) !== 'missing' || freshConfig.ads_scope_tier) {
               return { updates: {}, unset: [] };
@@ -195,12 +200,15 @@ export const syncMetaAdsCapability = async (
             if (typeof storedProbedAt === 'string' && storedProbedAt > probedAt) {
               return { updates: {}, unset: [] };
             }
+            applied = true;
             return { updates: { ads_scope_tier: backfillTier, ads_capability_probed_at: probedAt } };
           });
-          config.ads_scope_tier = backfillTier;
-          console.log(
-            `[MetaAdsCapabilitySync] Backfilled ads-refusal tier for user ${userId} account ${account.account_id} — was already latched before tier classification shipped`
-          );
+          if (applied) {
+            config.ads_scope_tier = backfillTier;
+            console.log(
+              `[MetaAdsCapabilitySync] Backfilled ads-refusal tier for user ${userId} account ${account.account_id} — was already latched before tier classification shipped`
+            );
+          }
         }
       }
       return { outcome: 'unchanged' };
