@@ -191,9 +191,30 @@ export const syncMetaAdsCapability = async (
     // actually wanted and every surface already reports it.
     const now = new Date().toISOString();
     if (!config.ads_scope_denied_seen_at) {
-      await updateAccountConfig(userId, platform as any, account.account_id, {
-        ads_scope_denied_seen_at: now,
+      // The probedAt guard (Greptile P1 follow-up) applies here too, not only
+      // to the confirmed transitions. Without it, a suspicion write delayed
+      // past a concurrent recovery could still land afterward — carrying no
+      // marker of its own staleness — and sit there until an unrelated LATER
+      // denial reads it as "already suspected", skips the two-strike wait, and
+      // confirms a false revocation the recovery had already disproved.
+      // Stamping probedAt here too, not just on revoke/recover, means every
+      // write — suspicion included — always defers to whichever Meta signal
+      // was actually learned most recently.
+      let wasStale = false;
+      await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+        const storedProbedAt = freshConfig.ads_capability_probed_at;
+        if (typeof storedProbedAt === 'string' && storedProbedAt > now) {
+          wasStale = true;
+          return { updates: {}, unset: [] };
+        }
+        return { updates: { ads_scope_denied_seen_at: now, ads_capability_probed_at: now } };
       });
+      if (wasStale) {
+        console.log(
+          `[MetaAdsCapabilitySync] Ads access refusal for user ${userId} account ${account.account_id} is stale — a newer Meta signal already landed, ignoring`
+        );
+        return { outcome: 'undetermined' };
+      }
       config.ads_scope_denied_seen_at = now;
       console.log(
         `[MetaAdsCapabilitySync] Ads access refused for user ${userId} account ${account.account_id} — recorded as suspected, awaiting confirmation next sweep`
