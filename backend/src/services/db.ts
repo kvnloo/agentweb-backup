@@ -6049,6 +6049,58 @@ export const crmDb = {
   },
 
   /**
+   * ENG-926 §C: atomically record that one Meta conversion event has been relayed.
+   *
+   * Deliberately NOT a field on updateLead. Writing the whole array there is a
+   * read-modify-write against a snapshot taken when the relay started, so two conversions
+   * racing on the same lead (a `qualified` and a `won` landing together) each write
+   * `[...their stale list, their event]` and the later write erases the earlier marker —
+   * after which a transition back to that status resends the conversion, leaving only
+   * Meta's own dedup between us and a double-counted deal (Greptile P1 on #2412).
+   *
+   * `list_append` on the stored value plus a `contains` guard makes the append atomic and
+   * idempotent: concurrent relays for different events both survive, and a repeat of the
+   * same event is refused by the condition rather than duplicated into the list.
+   */
+  async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Deliberately does NOT touch updatedAt, for two independent reasons.
+          //
+          // Correctness: updatedAt is the range key on the three sparse cross-tenant lookup
+          // GSIs, so writing it forces DynamoDB to re-project the row — and a legacy row
+          // carrying email/linkedin/nameCompanyKey as "" then fails with ValidationException
+          // (the exact hazard updateLead carries self-heal logic for, which this leaner
+          // write does not have).
+          //
+          // Behaviour: this is internal bookkeeping, not a user edit. Bumping updatedAt
+          // would reorder the customer's CRM list under an updatedAt sort and mark leads as
+          // recently-touched because a Meta event fired, which is not something they did.
+          UpdateExpression: 'SET #m = list_append(if_not_exists(#m, :empty), :new)',
+          ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+          ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+          ExpressionAttributeValues: {
+            ':empty': [],
+            ':new': [eventName],
+            ':event': eventName,
+          },
+        })
+        .promise();
+    } catch (error: any) {
+      // The guard firing means this event is already recorded — the desired end state, not
+      // a failure. Anything else is worth surfacing, but never worth throwing into a relay
+      // whose Meta send has already succeeded.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+      console.error(
+        `[CRM] appendMetaConversionSent failed for lead ${leadId} (${eventName}): ${error?.message}`,
+      );
+    }
+  },
+
+  /**
    * Cross-tenant lookup by email — backs CRM-history Tier 0. Queries the
    * EmailLookupIndex GSI globally (no userId filter) so a sibling lead
    * enriched on ANY user's list is returned. Sort key `updatedAt` means
@@ -6301,15 +6353,11 @@ export const crmDb = {
      *  will do a single consolidated updateFieldNames after bulk writes (avoids
      *  read-modify-write races under parallel workers). */
     skipFieldNamesUpdate?: boolean;
-    /** ENG-926 §C: Meta conversion events already relayed for this lead
-     *  (e.g. `['QualifiedLead','Purchase']`). Written by the relay itself; a lead
-     *  going won → lost → won must not double-count a Purchase. */
-    metaConversionsSent?: string[];
-    /** ENG-926 §C: suppress the CRM → Meta conversion relay for this write.
-     *  Required on the relay's own bookkeeping write (or recording a send would
-     *  re-enter the relay), and set by bulk/backfill paths that move status on
-     *  many historical leads at once — those are not live conversions and must not
-     *  fan out thousands of Purchase events. */
+    /** ENG-926 §C: suppress the CRM → Meta conversion relay for this write. The relay's
+     *  own bookkeeping no longer goes through updateLead (see appendMetaConversionSent),
+     *  so this exists for bulk/backfill paths that move status across many historical
+     *  leads at once — those are not live conversions and must not fan out thousands of
+     *  Purchase events. No such path exists today; this is the seam for the first one. */
     suppressConversionRelay?: boolean;
   }) {
     try {
@@ -6573,12 +6621,6 @@ export const crmDb = {
         }
       }
 
-      if (updates.metaConversionsSent !== undefined) {
-        setExpressions.push('#metaConversionsSent = :metaConversionsSent');
-        expressionAttributeNames['#metaConversionsSent'] = 'metaConversionsSent';
-        expressionAttributeValues[':metaConversionsSent'] = updates.metaConversionsSent;
-      }
-
       if (updates.dealValue !== undefined) {
         if (updates.dealValue === null) {
           removeExpressions.push('#dealValue');
@@ -6780,10 +6822,13 @@ export const crmDb = {
       ) {
         void (async () => {
           try {
-            const { relayLeadStatusEvent } = await import('./metaConversionRelay');
+            const { dispatchLeadStatusConversion } = await import('./metaConversionRelay');
             const list = await this.getLeadListById(listId);
             if (!list?.userId) return;
-            await relayLeadStatusEvent({
+            // Durable: enqueues before processing, so a Meta failure or a rate-limit pause
+            // is retried by the queue poller instead of being lost forever (Greptile P1 on
+            // #2412 — the only other trigger is a status CHANGE, and a won deal stays won).
+            await dispatchLeadStatusConversion({
               listId,
               userId: list.userId as string,
               lead: result.Attributes as any,

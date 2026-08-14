@@ -43,9 +43,11 @@ jest.mock('aws-sdk', () => ({
   })),
 }));
 
-const relaySpy = jest.fn().mockResolvedValue({ skipped: true, reason: 'test' });
+// db.ts dispatches through the DURABLE entry point (enqueue-then-process), not the raw
+// relay — mocking the raw relay here would leave the hook calling an unmocked queue path.
+const relaySpy = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/metaConversionRelay', () => ({
-  relayLeadStatusEvent: (...args: any[]) => relaySpy(...args),
+  dispatchLeadStatusConversion: (...args: any[]) => relaySpy(...args),
 }));
 
 import { crmDb } from '../services/db';
@@ -119,10 +121,9 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(relaySpy).not.toHaveBeenCalled();
   });
 
-  it('does NOT dispatch when suppressConversionRelay is set — the relay\'s own bookkeeping write', async () => {
+  it('does NOT dispatch when suppressConversionRelay is set — the backfill seam', async () => {
     await crmDb.updateLead('list-1', 'lead-1', {
       status: 'won',
-      metaConversionsSent: ['Purchase'],
       suppressConversionRelay: true,
     });
     await flush();
@@ -130,20 +131,43 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(relaySpy).not.toHaveBeenCalled();
   });
 
-  it('persists metaConversionsSent', async () => {
-    await crmDb.updateLead('list-1', 'lead-1', {
-      metaConversionsSent: ['Purchase'],
-      suppressConversionRelay: true,
-    });
+  it('records a relayed conversion atomically, never as a whole-array overwrite', async () => {
+    // A read-modify-write here is what let two concurrent relays erase each other's
+    // marker (Greptile P1 on #2412), so the append and its idempotence guard are the
+    // behaviour under test — not merely that the field gets written.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'Purchase');
 
     const params = leadUpdateParams();
-    expect(params.UpdateExpression).toContain('#metaConversionsSent = :metaConversionsSent');
-    expect(params.ExpressionAttributeValues[':metaConversionsSent']).toEqual(['Purchase']);
+    expect(params.UpdateExpression).toContain('list_append(if_not_exists(#m, :empty), :new)');
+    expect(params.ConditionExpression).toContain('NOT contains(#m, :event)');
+    expect(params.ExpressionAttributeValues[':new']).toEqual(['Purchase']);
+    expect(params.ExpressionAttributeValues[':event']).toBe('Purchase');
   });
 
-  it('keeps relay bookkeeping out of the list fieldNames (never a CSV/filter column)', async () => {
+  it('does not touch updatedAt — it is a GSI range key, and this is not a user edit', async () => {
+    // Writing updatedAt forces DynamoDB to re-project the three sparse lookup GSIs, which
+    // throws ValidationException on a legacy row carrying "" for email/linkedin/
+    // nameCompanyKey — the hazard updateLead has self-heal logic for and this leaner write
+    // does not. It would also reorder the customer's CRM list under an updatedAt sort
+    // because a Meta event fired, which is not something they did.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'Purchase');
+
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).not.toContain('updatedAt');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':now');
+  });
+
+  it('treats the idempotence guard firing as success, not an error', async () => {
+    const err: any = new Error('conditional check failed');
+    err.code = 'ConditionalCheckFailedException';
+    updatePromiseMock.mockRejectedValueOnce(err);
+
+    await expect(crmDb.appendMetaConversionSent('list-1', 'lead-1', 'Purchase')).resolves.toBeUndefined();
+  });
+
+  it('keeps the backfill seam out of the list fieldNames (never a CSV/filter column)', async () => {
     await crmDb.updateLead('list-1', 'lead-1', {
-      metaConversionsSent: ['Purchase'],
+      firstName: 'Jane',
       suppressConversionRelay: true,
     });
 
@@ -151,7 +175,6 @@ describe('updateLead → conversion relay dispatch', () => {
       .map((c) => c[0])
       .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-LeadLists'));
     const serialized = JSON.stringify(listUpdates);
-    expect(serialized).not.toContain('metaConversionsSent');
     expect(serialized).not.toContain('suppressConversionRelay');
   });
 

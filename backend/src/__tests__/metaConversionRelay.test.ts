@@ -268,7 +268,7 @@ describe('relayLeadStatusEvent — sending', () => {
   it('records the event on the lead so it can never fire twice', async () => {
     const deps = makeDeps();
     await relayLeadStatusEvent(ctx(), deps);
-    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', ['Purchase']);
+    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'Purchase');
   });
 });
 
@@ -287,8 +287,10 @@ describe('relayLeadStatusEvent — fire-once', () => {
   it('won → lost → won fires Purchase exactly once', async () => {
     const deps = makeDeps();
     const sent: string[] = [];
-    (deps.recordSent as jest.Mock).mockImplementation(async (_l, _i, names: string[]) => {
-      sent.push(...names);
+    // recordSent takes ONE event name (the atomic append), not the whole array — spreading
+    // a string here previously pushed individual characters and quietly broke the fixture.
+    (deps.recordSent as jest.Mock).mockImplementation(async (_l, _i, name: string) => {
+      sent.push(name);
     });
 
     await relayLeadStatusEvent(ctx({ lead: makeLead(), previousStatus: 'new' }), deps);

@@ -148,7 +148,9 @@ export interface RelayDeps {
     accessToken: string,
     event: Record<string, any>,
   ) => Promise<{ success: true; fbtraceId?: string; usage?: any } | { success: false; error: string; usage?: any }>;
-  recordSent: (listId: string, leadId: string, eventNames: string[]) => Promise<void>;
+  /** Atomic single-event append. Takes ONE event, not the whole array: handing it a list
+   *  would reintroduce the read-modify-write race it exists to remove. */
+  recordSent: (listId: string, leadId: string, eventName: string) => Promise<void>;
   shouldAttemptSend: (listId: string) => boolean;
   isAccountPaused: (accountId: string) => boolean;
   recordUsage?: (accountId: string, usage?: any) => void;
@@ -164,7 +166,12 @@ export interface RelayContext {
 
 export type RelayResult =
   | { sent: true; eventName: string; eventId: string }
-  | { skipped: true; reason: string }
+  /** `retryable` separates a skip that is terminal (the lead opted out, the event already
+   *  went, this status is not a conversion) from one that is purely temporal — the send
+   *  budget is exhausted, or Meta has throttled this ad account. Collapsing the two is how
+   *  a throttled Purchase gets silently dropped forever: the status never changes again,
+   *  so nothing ever re-dispatches it (Greptile P1 on #2412). */
+  | { skipped: true; reason: string; retryable: boolean }
   | { failed: true; error: string };
 
 /** Lazily-bound production dependencies. Every Meta import is dynamic: this module is
@@ -192,15 +199,7 @@ async function defaultDeps(): Promise<RelayDeps> {
       return { ...creds, currency };
     },
     sendEvent: (pixelId, accessToken, event) => metaService.sendCapiLeadEvent(pixelId, accessToken, event as any),
-    recordSent: async (listId, leadId, eventNames) => {
-      await crmDb.updateLead(listId, leadId, {
-        metaConversionsSent: eventNames,
-        // Must not recurse: this write is itself an updateLead, and without the
-        // suppression flag recording a Purchase would re-enter the relay.
-        suppressConversionRelay: true,
-        skipFieldNamesUpdate: true,
-      } as any);
-    },
+    recordSent: (listId, leadId, eventName) => crmDb.appendMetaConversionSent(listId, leadId, eventName),
     shouldAttemptSend: shouldAttemptCapiSend,
     isAccountPaused: isCapiAccountPaused,
     recordUsage: recordCapiUsage,
@@ -228,15 +227,18 @@ export async function relayLeadStatusEvent(
   // and it also makes the suppression untestable from outside (no log line is
   // indistinguishable from the relay never running). Transitions that never mapped to an
   // event at all stay quiet: every lead moving new -> contacted would otherwise be noise.
-  const skip = (reason: string, mapped: boolean): RelayResult => {
+  const skip = (reason: string, mapped: boolean, retryable = false): RelayResult => {
     if (mapped) {
-      console.log(`[CAPI Relay] skipped for lead ${leadId} (list ${listId}): ${reason}`);
+      console.log(
+        `[CAPI Relay] skipped for lead ${leadId} (list ${listId}): ${reason}` +
+        (retryable ? ' — will retry' : ''),
+      );
     }
-    return { skipped: true, reason };
+    return { skipped: true, reason, retryable };
   };
 
   try {
-    if (!leadId) return { skipped: true, reason: 'lead has no leadId' };
+    if (!leadId) return { skipped: true, reason: 'lead has no leadId', retryable: false };
 
     const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
     if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false);
@@ -261,7 +263,7 @@ export async function relayLeadStatusEvent(
     }
 
     if (!d.shouldAttemptSend(listId)) {
-      return skip('per-list CAPI send budget exhausted', true);
+      return skip('per-list CAPI send budget exhausted', true, true);
     }
 
     const owner = await d.getUserById(userId);
@@ -281,7 +283,7 @@ export async function relayLeadStatusEvent(
     }
 
     if (d.isAccountPaused(resolution.accountId)) {
-      return skip(`ad account ${resolution.accountId} paused by Meta rate limiting`, true);
+      return skip(`ad account ${resolution.accountId} paused by Meta rate limiting`, true, true);
     }
 
     const creds = await d.getCredentials(owner, userId, resolution.accountId);
@@ -330,7 +332,7 @@ export async function relayLeadStatusEvent(
     );
 
     try {
-      await d.recordSent(listId, leadId, [...alreadySent, mapped.eventName]);
+      await d.recordSent(listId, leadId, mapped.eventName);
     } catch (error: any) {
       // The send already happened and Meta has it. Losing the bookkeeping write means a
       // later transition could re-attempt — which the deterministic event_id makes safe,
@@ -344,5 +346,117 @@ export async function relayLeadStatusEvent(
   } catch (error: any) {
     console.error(`[CAPI Relay] threw for lead ${leadId} (list ${listId}): ${error?.message}`);
     return { failed: true, error: error?.message || 'Unknown error relaying conversion' };
+  }
+}
+
+// ─── Durable dispatch ────────────────────────────────────────────────────────
+//
+// Greptile P1 on #2412: the original hook was fire-and-forget with no retry, so a relay
+// that failed (Meta 5xx, a token that could not refresh) or was skipped for a purely
+// temporal reason (send budget exhausted, ad account throttled by Meta) lost that
+// conversion permanently. Nothing would ever re-dispatch it, because the only trigger is
+// a status CHANGE and a won deal sits at `won` forever.
+//
+// That is this card's own failure mode reproduced inside the fix for it, so it goes
+// through the same durable queue the Calendly CAPI leg already uses (routes/
+// calendlyWebhook.ts, itself hardened by a Greptile P1 on #2291): enqueue-and-claim in one
+// atomic write, process inline, and on failure mark the job failed so the poller retries
+// it with the queue's own backoff and attempt ceiling.
+
+export const RELAY_QUEUE_SOURCE = 'meta_conversion_relay';
+
+export interface ConversionRelayJobPayload {
+  listId: string;
+  leadId: string;
+  userId: string;
+}
+
+/** Re-reads the lead and its list rather than trusting the payload. A retry can run minutes
+ *  or hours after the transition that queued it: the deal may have been reopened, the lead
+ *  may have opted out since, or the event may already have gone via another path. Re-running
+ *  the full relay against current state is what makes a retry safe rather than a replay. */
+export async function processConversionRelayJob(payload: ConversionRelayJobPayload): Promise<void> {
+  const { crmDb } = await import('./db');
+  const lead = await crmDb.getLeadById(payload.listId, payload.leadId);
+  if (!lead) {
+    console.log(`[CAPI Relay] lead ${payload.leadId} no longer exists — dropping queued conversion`);
+    return;
+  }
+  const list = await crmDb.getLeadListById(payload.listId);
+
+  const result = await relayLeadStatusEvent({
+    listId: payload.listId,
+    userId: payload.userId,
+    lead,
+    statusConfig: (list as any)?.statusConfig,
+  });
+
+  // Throwing is how the queue learns to retry — markJobFailed runs in the caller's catch.
+  if ('failed' in result) {
+    throw new Error(result.error);
+  }
+  if ('skipped' in result && result.retryable) {
+    throw new Error(result.reason);
+  }
+}
+
+/** Registered at boot (imported for its side effect from app.ts). The poller warns and
+ *  leaves a job claimed-but-unprocessed when no processor is registered for its source, so
+ *  registering lazily on first dispatch would strand every job queued before the first
+ *  transition of a process's life. */
+export function registerConversionRelayProcessor(): void {
+  // Required lazily to keep this module importable from db.ts without dragging the queue
+  // (and its own db dependency) into that import chain.
+  const { registerProcessor } = require('./asyncJobQueue');
+  registerProcessor(RELAY_QUEUE_SOURCE, processConversionRelayJob);
+}
+
+/**
+ * Entry point used by db.ts's updateLead hook. Enqueues durably, then processes inline so
+ * the common case still lands within the same request.
+ *
+ * The dedupe key is (list, lead, event-bearing status) rather than a timestamp, so a repeat
+ * transition collapses onto the same job instead of queueing a second conversion — the same
+ * fire-once property `metaConversionsSent` gives, enforced a second time at the queue.
+ */
+export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<void> {
+  const { enqueueJob, markJobComplete, markJobFailed, startHeartbeat } = await import('./asyncJobQueue');
+
+  const leadId = ctx.lead?.leadId;
+  if (!leadId) return;
+
+  // Nothing to queue if this status was never a conversion — keeps the job table free of a
+  // row for every `new -> contacted` in the product.
+  const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
+  if (!mapped) return;
+
+  const dedupeKey = `${ctx.listId}:${leadId}:${mapped.eventName}`;
+  const payload: ConversionRelayJobPayload = {
+    listId: ctx.listId,
+    leadId,
+    userId: ctx.userId,
+  };
+
+  const enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
+  if (enqueued === 'duplicate') {
+    // Already queued or already handled for this exact conversion.
+    return;
+  }
+  if (enqueued === 'unavailable') {
+    // The queue table is unreachable. Fall back to a best-effort inline send rather than
+    // dropping the conversion outright — degraded, but not silent.
+    console.warn(`[CAPI Relay] queue unavailable for ${dedupeKey} — attempting inline send without retry`);
+    await relayLeadStatusEvent(ctx);
+    return;
+  }
+
+  const stopHeartbeat = startHeartbeat(RELAY_QUEUE_SOURCE, dedupeKey);
+  try {
+    await processConversionRelayJob(payload);
+    await markJobComplete(RELAY_QUEUE_SOURCE, dedupeKey);
+  } catch (error) {
+    await markJobFailed(RELAY_QUEUE_SOURCE, dedupeKey, error);
+  } finally {
+    stopHeartbeat();
   }
 }
