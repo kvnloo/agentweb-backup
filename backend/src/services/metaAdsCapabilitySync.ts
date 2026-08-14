@@ -126,7 +126,17 @@ export const syncMetaAdsCapability = async (
       const unset = ['ads_scope_denied_seen_at'];
       if (wasRefusing) unset.push('ads_scope_revoked_at', 'granted_scopes', 'ads_scope_tier');
 
-      await updateAccountConfig(userId, platform as any, account.account_id, {}, { unset });
+      // Function form (Greptile P1): a CAS retry must decide what to unset from
+      // THIS attempt's fresh read, not the read from before the conflict — a
+      // stale 'wasRefusing' reapplied on retry could erase a recovery a
+      // concurrent writer landed in between.
+      await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+        const freshUnset = ['ads_scope_denied_seen_at'];
+        if (getMetaAdsScopeState(freshConfig) === 'missing') {
+          freshUnset.push('ads_scope_revoked_at', 'granted_scopes', 'ads_scope_tier');
+        }
+        return { updates: {}, unset: freshUnset };
+      });
       for (const key of unset) delete config[key];
 
       // A cleared suspicion is not a recovery: nothing user-visible was ever
@@ -194,11 +204,29 @@ export const syncMetaAdsCapability = async (
     // refused, so this call cannot itself trigger a re-refusal.
     const tier = await metaService.classifyAdsRefusalTier(config.access_token);
 
-    await updateAccountConfig(userId, platform as any, account.account_id, {
-      granted_scopes: retained,
-      ads_scope_revoked_at: config.ads_scope_revoked_at || now,
-      ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
-    }, { unset: tier === 'unknown' ? ['ads_scope_denied_seen_at', 'ads_scope_tier'] : ['ads_scope_denied_seen_at'] });
+    // Function form (Greptile P1): `retained` above is computed from the read
+    // at the top of this call, which is exactly what a CAS retry must NOT
+    // reapply blindly — if a concurrent recovery landed between our read and
+    // write, retrying with this stale `retained` would re-narrow a grant that
+    // had just been restored. `tier` stays fixed: it came from a live Meta
+    // call made once, not from local state that can go stale.
+    await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+      const freshPrevious: unknown = freshConfig.granted_scopes;
+      const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
+        .filter((s: unknown): s is string => typeof s === 'string')
+        .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+      return {
+        updates: {
+          granted_scopes: freshRetained,
+          ads_scope_revoked_at: freshConfig.ads_scope_revoked_at || now,
+          ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+        },
+        unset:
+          tier === 'unknown'
+            ? ['ads_scope_denied_seen_at', 'ads_scope_tier']
+            : ['ads_scope_denied_seen_at'],
+      };
+    });
     config.granted_scopes = retained;
     config.ads_scope_revoked_at = config.ads_scope_revoked_at || now;
     delete config.ads_scope_denied_seen_at;
