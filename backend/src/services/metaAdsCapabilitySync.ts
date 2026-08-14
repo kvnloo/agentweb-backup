@@ -193,6 +193,15 @@ export const syncMetaAdsCapability = async (
           // the log line below must not claim a backfill that didn't happen.
           let applied = false;
           await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+            // Reset on every invocation, not just set-once: a CAS conflict
+            // re-invokes this closure on each retry attempt, and only the
+            // LAST invocation's outcome corresponds to what actually gets
+            // persisted (updateAccountConfig returns as soon as one attempt's
+            // write succeeds). Without the reset, an earlier attempt setting
+            // this true would survive even if that attempt's write then lost
+            // its own conflict and a later, guard-rejecting attempt is the
+            // one that actually lands (Greptile P1).
+            applied = false;
             if (getMetaAdsScopeState(freshConfig) !== 'missing' || freshConfig.ads_scope_tier) {
               return { updates: {}, unset: [] };
             }

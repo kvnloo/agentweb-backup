@@ -391,6 +391,38 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(unset).toEqual([]);
     });
 
+    /**
+     * Greptile P1 (2nd round): the closure is invoked once per CAS retry
+     * attempt, not once total. A stale `applied = true` from an earlier
+     * attempt that then lost its own write race must not survive into the
+     * later attempt whose write actually lands — simulated here by having
+     * the mock invoke the captured closure twice, mirroring what the real
+     * CAS loop in connectedAccountsDb.ts does on a conflict-then-retry.
+     */
+    it('does not report success from a stale earlier attempt when the retry that lands is a no-op', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount();
+
+      mockUpdateAccountConfig.mockImplementationOnce((_u, _p, _a, configUpdates) => {
+        // Attempt 1: guard passes, would have applied — but its own write
+        // loses the race (simulated by just discarding the result and
+        // retrying, exactly like a ConditionalCheckFailedException would).
+        configUpdates(account.config);
+        // Attempt 2 (the one that actually lands): a concurrent writer won
+        // in between — the fresh read now already carries a tier.
+        configUpdates({ ...account.config, ads_scope_tier: 'oauth' });
+        return Promise.resolve(undefined);
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      // The local mirror and (by extension) the success log must reflect
+      // attempt 2's outcome — a no-op — not attempt 1's stale success. The
+      // real account object passed in is never mutated by this call.
+      expect(account.config.ads_scope_tier).toBeUndefined();
+    });
+
     it('does not backfill when the tier cannot be determined', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
       mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
