@@ -23,8 +23,14 @@ import { preflightMetaTrackingGate } from './metaTrackingPreflight';
 
 /** Entity types whose activation actually starts (or resumes) paid delivery. */
 const SPEND_ENTITIES = new Set(['CAMPAIGN', 'AD_SET', 'AD']);
-/** Actions that can carry a status transition. */
-const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE']);
+/**
+ * Actions that can carry a status transition.
+ *
+ * COPY_AD belongs here even though it reads as a duplication: `copyMetaAdsAd` ends in
+ * `status: params.status || 'PAUSED'`, so a copy requested as ACTIVE starts paid delivery
+ * exactly like a CREATE does. Leaving it out made "copy this ad, live" a way past the gate.
+ */
+const SPEND_ACTIONS = new Set(['CREATE', 'UPDATE', 'COPY_AD']);
 
 export interface MetaGateCredentials {
   accountId: string;
@@ -170,7 +176,24 @@ function extractDestinationUrls(node: any, depth = 0): string[] {
 
 export function collectPendingDestinations(entityType: string, action: string, params: any): string[] {
   if (!params || typeof params !== 'object') return [];
-  if (action !== 'CREATE' && action !== 'UPDATE') return [];
+  if (action !== 'CREATE' && action !== 'UPDATE' && action !== 'COPY_AD') return [];
+
+  /*
+   * A copy can retarget the new ad: `copyMetaAdsAd` reads
+   * `params.link_url || params.destination || params.url` (agentModeService.ts:16191).
+   * Those two aliases are read ONLY there, so they are collected only here — elsewhere the
+   * write path drops them, and checking a URL the ad can never point at would block a
+   * launch over a page nobody is buying traffic to.
+   *
+   * With no override the copy inherits the source creative's destination, and the source ad
+   * IS in the ad list — so returning nothing here is correct, not a gap.
+   */
+  if (action === 'COPY_AD') {
+    if (entityType !== 'AD') return [];
+    const copied = [params.link_url, params.destination, params.url]
+      .find((v: any) => typeof v === 'string' && v.trim());
+    return copied ? [String(copied).trim()] : [];
+  }
   /*
    * UPDATE is included for AD because an ad update carrying creative content (`link_url`,
    * a creative object) makes Meta build and swap in a NEW creative — so the ad list still

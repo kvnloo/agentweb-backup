@@ -455,3 +455,43 @@ describe('inline creative swap on AD UPDATE (ENG-941)', () => {
     expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
   });
 });
+
+/*
+ * Greptile P1, round 8 ("Active copied ads bypass preflight"). COPY_AD is a third way to
+ * create an ad, and `copyMetaAdsAd` ends in `status: params.status || 'PAUSED'` — so a copy
+ * requested as ACTIVE starts delivering. SPEND_ACTIONS covered only CREATE and UPDATE, so
+ * the gate never ran for it.
+ *
+ * It also carries its own destination override: `copyMetaAdsAd` reads
+ * `params.link_url || params.destination || params.url` (agentModeService.ts:16191), so all
+ * three aliases have to be collected HERE or the copy is checked against the source ad's
+ * old page while serving a new one.
+ */
+describe('COPY_AD (ENG-941)', () => {
+  const { isMetaSpendStartingWrite, collectPendingDestinations } = require('../services/metaLaunchGate');
+
+  it('treats a copy requested as ACTIVE as spend-starting', () => {
+    expect(isMetaSpendStartingWrite('AD', 'COPY_AD', { status: 'ACTIVE' })).toBe(true);
+  });
+
+  it('leaves an ordinary copy alone — copies default to PAUSED', () => {
+    expect(isMetaSpendStartingWrite('AD', 'COPY_AD', {})).toBe(false);
+    expect(isMetaSpendStartingWrite('AD', 'COPY_AD', { status: 'PAUSED' })).toBe(false);
+  });
+
+  it('collects the copy\'s destination override under any alias the copy path reads', () => {
+    expect(collectPendingDestinations('AD', 'COPY_AD', { link_url: 'https://a/1' })).toEqual(['https://a/1']);
+    expect(collectPendingDestinations('AD', 'COPY_AD', { destination: 'https://a/2' })).toEqual(['https://a/2']);
+    expect(collectPendingDestinations('AD', 'COPY_AD', { url: 'https://a/3' })).toEqual(['https://a/3']);
+  });
+
+  it('collects nothing when the copy keeps the source destination', () => {
+    // Nothing inline: the source ad is what serves, and the gate checks it via the ad list.
+    expect(collectPendingDestinations('AD', 'COPY_AD', { name: 'Copy of X' })).toEqual([]);
+  });
+
+  it('does not collect those aliases on paths that never read them', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', { destination: 'https://a/2' })).toEqual([]);
+    expect(collectPendingDestinations('AD', 'UPDATE', { url: 'https://a/3' })).toEqual([]);
+  });
+});
