@@ -59,17 +59,47 @@ function transactionCancelledReasons(error: any): any[] | null {
   return error?.CancellationReasons || [];
 }
 
+// DDB optimistic-concurrency conflict: two concurrent TransactWrites touch
+// the same item and DDB rolls one back. Retriable — the losing caller
+// should re-attempt with the same intent. Surfaces two ways:
+//   1. Top-level error.code = 'TransactionConflictException'
+//   2. TransactionCanceledException where EVERY at-fault reason is
+//      'TransactionConflict' (non-faulting slots carry Code 'None')
+// Handling only ConditionalCheckFailed lets this class escape as an
+// unhandled throw under real webhook fan-out (caught 2026-08-14 via
+// live-test on Dev-AW-PaymentHistory with Promise.all-based redelivery).
+// `.every` (rather than `.some`) is required so a mixed cancellation
+// pairing TransactionConflict with a permanent reason (e.g.
+// ValidationError, ResourceNotFound) is NOT swallowed as retriable —
+// otherwise the permanent cause would be masked by the exhaustion error
+// after 8 wasted attempts.
+function isRetriableTransactionConflict(error: any): boolean {
+  if (error?.code === 'TransactionConflictException') return true;
+  const reasons = transactionCancelledReasons(error);
+  if (!reasons?.length) return false;
+  let sawConflict = false;
+  for (const r of reasons) {
+    const code = r?.Code;
+    if (code === 'TransactionConflict') { sawConflict = true; continue; }
+    if (code === 'None') continue;
+    return false;
+  }
+  return sawConflict;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Bounded retry budget for main-row (userId, timestamp) collisions between
-// two DISTINCT events for the same user landing in the same millisecond.
-// Node's Date.now() has ms resolution, so a 2ms wait guarantees the next
-// mint bumps; 8 attempts covers unrealistic worst-case pileups. Marker
-// collisions (same dedupKey) are handled separately in one shot — no retry.
-const MAX_TIMESTAMP_COLLISION_RETRIES = 8;
-const TIMESTAMP_COLLISION_BACKOFF_MS = 2;
+// two DISTINCT events for the same user landing in the same millisecond,
+// and for DDB optimistic-concurrency `TransactionConflict` rollbacks under
+// concurrent webhook fan-out. Node's Date.now() has ms resolution, so a
+// 2ms wait guarantees the next timestamp mint bumps; 8 attempts covers
+// unrealistic worst-case pileups. Marker collisions (same dedupKey) are a
+// real duplicate and handled separately in one shot — no retry.
+const MAX_TRANSACT_RETRIES = 8;
+const TRANSACT_RETRY_BACKOFF_MS = 2;
 
 export const paymentHistoryDb = {
   /**
@@ -110,8 +140,8 @@ export const paymentHistoryDb = {
       // dedupKey, same (userId, timestamp)). On main-row collision, retry
       // with a fresh timestamp — marker collision is a real duplicate and
       // returns immediately.
-      for (let attempt = 0; attempt < MAX_TIMESTAMP_COLLISION_RETRIES; attempt++) {
-        if (attempt > 0) await sleep(TIMESTAMP_COLLISION_BACKOFF_MS);
+      for (let attempt = 0; attempt < MAX_TRANSACT_RETRIES; attempt++) {
+        if (attempt > 0) await sleep(TRANSACT_RETRY_BACKOFF_MS);
         const timestamp = attempt === 0
           ? (record.timestamp || new Date().toISOString())
           : new Date().toISOString();
@@ -147,25 +177,26 @@ export const paymentHistoryDb = {
         } catch (error: any) {
           const reasons = transactionCancelledReasons(error);
           if (reasons) {
-            const markerFailed = reasons[1]?.Code === 'ConditionalCheckFailed';
-            const mainRowFailed = reasons[0]?.Code === 'ConditionalCheckFailed';
-            if (markerFailed) {
+            // Marker condition is a real duplicate — never retry, never
+            // fall through to conflict/collision handling.
+            if (reasons[1]?.Code === 'ConditionalCheckFailed') {
               console.log(
                 `[PaymentHistory] Skipping duplicate via dedupKey=${opts.dedupKey} (userId=${record.userId})`,
               );
               return { written: false };
             }
-            if (mainRowFailed) {
-              // Same-ms collision with a different event; retry with a
-              // freshly minted timestamp after a brief backoff.
-              continue;
-            }
+            // Main-row condition = same-ms distinct-event PK collision;
+            // retry with a freshly minted timestamp.
+            if (reasons[0]?.Code === 'ConditionalCheckFailed') continue;
           }
+          // Optimistic-concurrency conflict from concurrent TransactWrites
+          // touching the same item — retriable with same intent.
+          if (isRetriableTransactionConflict(error)) continue;
           throw error;
         }
       }
       throw new Error(
-        `payment history main-row timestamp collision unresolved after ${MAX_TIMESTAMP_COLLISION_RETRIES} attempts (userId=${record.userId}, dedupKey=${opts.dedupKey})`,
+        `payment history transact-write unresolved after ${MAX_TRANSACT_RETRIES} attempts (userId=${record.userId}, dedupKey=${opts.dedupKey})`,
       );
     }
 

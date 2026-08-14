@@ -344,7 +344,88 @@ describe('paymentHistoryDb', () => {
         amount: 2500,
         currency: 'usd',
         status: 'disputed',
-      }, { dedupKey: 'dispute:opened:dp_x' })).rejects.toThrow(/timestamp collision unresolved/);
+      }, { dedupKey: 'dispute:opened:dp_x' })).rejects.toThrow(/transact-write unresolved/);
+    });
+
+    it('retries on TransactionConflict cancellation reason (concurrent txn contention)', async () => {
+      let call = 0;
+      mockTransactWrite.mockImplementation(() => ({
+        promise: () => {
+          call++;
+          if (call === 1) {
+            return Promise.reject({
+              code: 'TransactionCanceledException',
+              CancellationReasons: [{ Code: 'None' }, { Code: 'TransactionConflict' }],
+            });
+          }
+          return Promise.resolve();
+        },
+      }));
+
+      const result = await paymentHistoryDb.record({
+        userId: 'user-conflict',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_conflict' });
+
+      expect(result).toEqual({ written: true });
+      expect(mockTransactWrite).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT retry when TransactionConflict is mixed with a permanent reason', async () => {
+      // Mixed cancellation: main-row hit a permanent ValidationError while
+      // marker slot happened to see a concurrent conflict. Classifying the
+      // whole cancellation as retriable would mask the permanent cause and
+      // return a generic "unresolved after 8 attempts" error instead.
+      mockTransactWrite.mockImplementation(() => ({
+        promise: () => Promise.reject({
+          code: 'TransactionCanceledException',
+          CancellationReasons: [
+            { Code: 'ValidationError', Message: 'permanent' },
+            { Code: 'TransactionConflict' },
+          ],
+        }),
+      }));
+
+      await expect(
+        paymentHistoryDb.record({
+          userId: 'user-mixed',
+          timestamp: '2026-08-14T09:00:00.000Z',
+          eventType: 'dispute_opened',
+          amount: 2500,
+          currency: 'usd',
+          status: 'disputed',
+        }, { dedupKey: 'dispute:opened:dp_mixed' })
+      ).rejects.toMatchObject({ code: 'TransactionCanceledException' });
+
+      // Bailed on first attempt — no retry, permanent cause surfaced intact
+      expect(mockTransactWrite).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries on top-level TransactionConflictException', async () => {
+      let call = 0;
+      mockTransactWrite.mockImplementation(() => ({
+        promise: () => {
+          call++;
+          if (call === 1) return Promise.reject({ code: 'TransactionConflictException' });
+          return Promise.resolve();
+        },
+      }));
+
+      const result = await paymentHistoryDb.record({
+        userId: 'user-conflict-top',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_conflict_top' });
+
+      expect(result).toEqual({ written: true });
+      expect(mockTransactWrite).toHaveBeenCalledTimes(2);
     });
 
     it('dedupKey takes precedence over legacy invoice dedup path', async () => {
