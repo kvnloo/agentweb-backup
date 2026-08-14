@@ -12,8 +12,12 @@
  *
  * This module is deliberately dependency-light and its translation is pure/exported
  * so the request<->response mapping (the risky part of a provider-transport change)
- * can be characterization-tested without the SDK or the network.
+ * can be characterization-tested without the SDK or the network. The single
+ * exception is the synthesised tool-call id, which must be unique per session and
+ * therefore draws randomness — see `mintToolCallId` (ENG-1206).
  */
+
+import { randomBytes } from 'crypto';
 
 /** Minimal shape of the OpenAI chat-completions params the agent loop passes in. */
 export interface OpenAIChatParams {
@@ -420,6 +424,32 @@ export function toGeminiRequest(
  * response the agent loop reads (`choices[0].message`, `finish_reason`,
  * `stop_reason`, `usage`). Pure.
  */
+/**
+ * Gemini returns no id on a functionCall, so the adapter mints one. It has to be
+ * unique for the life of the SESSION, not merely within one response.
+ *
+ * `toolDispatch` offloads a large tool response to
+ * `tool-responses/{sessionId}/{toolCall.id}.txt`, so two turns that each open
+ * with the same tool would write the same key and the later page would silently
+ * destroy the earlier one. That is ENG-1206, observed in prod session
+ * d5898ffd: `get_leads` page 2 overwrote page 1 at `call_get_leads_0.txt`, the
+ * follow-up read came back `not_found`, and the agent answered from a set it
+ * could no longer assemble.
+ *
+ * A per-response index alone is what caused the bug. A content hash would be no
+ * better — the exact failure was the SAME tool called with the SAME arguments on
+ * consecutive turns. Hence a random suffix, which also stops a model guessing a
+ * neighbouring key (it invented `call_read_tool_response_1.txt` in that session)
+ * instead of using the key it was handed.
+ *
+ * The name is kept for debuggability and sanitised because the id becomes an S3
+ * object name.
+ */
+function mintToolCallId(name: unknown, indexInResponse: number): string {
+  const safeName = String(name || 'fn').replace(/[^A-Za-z0-9_-]/g, '_');
+  return `call_${safeName}_${indexInResponse}_${randomBytes(4).toString('hex')}`;
+}
+
 export function fromGeminiResponse(resp: any): any {
   const candidate = resp?.candidates?.[0];
   const parts: any[] = candidate?.content?.parts || [];
@@ -433,7 +463,7 @@ export function fromGeminiResponse(resp: any): any {
     if (part.thought === true) continue;
     if (part.functionCall) {
       const toolCall: any = {
-        id: `call_${part.functionCall.name || 'fn'}_${toolCalls.length}`,
+        id: mintToolCallId(part.functionCall.name, toolCalls.length),
         type: 'function',
         function: {
           name: part.functionCall.name,
