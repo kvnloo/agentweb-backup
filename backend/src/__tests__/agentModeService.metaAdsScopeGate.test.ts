@@ -22,9 +22,11 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   }))
 }));
 
+const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
 jest.mock('../services/metaService', () => ({
   metaService: {
-    listCampaigns: jest.fn()
+    listCampaigns: jest.fn(),
+    classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
   }
 }));
 
@@ -88,6 +90,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
     mockIsTokenValid.mockResolvedValue(true);
+    mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
   });
 
   // ── AC2 + AC3: fail closed BEFORE calling Meta when we know scopes are missing ──
@@ -252,6 +255,20 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(Array.isArray(updates.granted_scopes)).toBe(true);
       expect(updates.granted_scopes).not.toContain('ads_read');
       expect(updates.granted_scopes).not.toContain('ads_management');
+    });
+
+    it('records which grant is missing when the tier can be classified', async () => {
+      // Mirrors metaAdsCapabilitySync's own classification (ENG-1158 follow-up):
+      // an app-level grant confirmed present means the gap is on the ad account,
+      // not the OAuth connection, and the re-consent message must say so.
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      const updates = mockUpdateAccountConfig.mock.calls[0][3];
+      expect(updates.ads_scope_tier).toBe('asset');
     });
 
     it('records a signal strong enough that the NEXT read fails without calling Meta', async () => {

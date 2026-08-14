@@ -28,9 +28,11 @@
  */
 
 const mockProbeAdsAccountAccess = jest.fn();
+const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
 jest.mock('../services/metaService', () => ({
   metaService: {
     probeAdsAccountAccess: (...args: any[]) => mockProbeAdsAccountAccess(...args),
+    classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
   },
 }));
 
@@ -70,6 +72,7 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
+    mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
   });
 
   describe('recovery — the owner re-granted the permission outside our OAuth flow', () => {
@@ -146,6 +149,23 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(account.config.granted_scopes).toBeUndefined();
     });
 
+    it('clears the recorded tier along with the refusal it retracts', async () => {
+      // A stale 'asset' tier surviving a recovery would keep pointing an owner
+      // at Business Manager for a connection that is fully healthy again.
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = metaAccount({
+        granted_scopes: [],
+        ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+        ads_scope_tier: 'asset',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
+      expect(options.unset).toContain('ads_scope_tier');
+      expect(account.config.ads_scope_tier).toBeUndefined();
+    });
+
     it('reports a cleared suspicion as unchanged, not as a recovery', async () => {
       // Nothing user-visible was ever wrong, so counting it as a recovery would
       // make a transient blip read in monitoring as a customer outage resolved.
@@ -209,6 +229,39 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(result.outcome).toBe('revoked');
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
+    });
+
+    it('classifies and records which grant is actually missing on confirmation', async () => {
+      // Production shape: the app-level scope is still confirmed present at
+      // debug_token, so the gap is on the ad account, not the OAuth connection.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(mockClassifyAdsRefusalTier).toHaveBeenCalledWith('EAA-token');
+      expect(account.config.ads_scope_tier).toBe('asset');
+      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      expect(updates.ads_scope_tier).toBe('asset');
+    });
+
+    it('does not assert a tier it could not determine', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
+      const account = metaAccount({
+        granted_scopes: ['ads_read'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      expect(account.config.ads_scope_tier).toBeUndefined();
+      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
+      expect(options.unset).toContain('ads_scope_tier');
     });
 
     it('forgets the suspicion as soon as one probe succeeds', async () => {

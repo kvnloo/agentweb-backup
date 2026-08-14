@@ -17,6 +17,7 @@
 import {
   META_ADS_READ_SCOPES,
   META_ADS_RECONSENT_MESSAGE,
+  META_ADS_ASSET_ACCESS_MESSAGE,
   getMetaAdsScopeState,
   hasMetaAdsReadScope,
   isMetaAdsScopeRefusal,
@@ -442,6 +443,29 @@ describe('describeMetaAdsCapability', () => {
 
   it('stays silent on a legacy record we know nothing about', () => {
     expect(describeMetaAdsCapability(adAccount({}))).toEqual({});
+  });
+
+  it('reports the asset-tier message when the app grant is confirmed but the ad account refused', () => {
+    // Account 922903076601160's actual production shape: the app-level scope is
+    // confirmed present (verified live via debug_token), so reconnecting cannot
+    // fix this — only the ad account owner granting asset access can.
+    expect(
+      describeMetaAdsCapability(
+        adAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_tier: 'asset',
+        })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_ASSET_ACCESS_MESSAGE });
+  });
+
+  it('falls back to the OAuth-tier message when the tier could not be determined', () => {
+    expect(
+      describeMetaAdsCapability(
+        adAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' })
+      )
+    ).toEqual({ ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE });
   });
 
   it('tolerates a null/undefined account without throwing', () => {
