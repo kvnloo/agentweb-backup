@@ -175,8 +175,36 @@ export const syncMetaAdsCapability = async (
       return { outcome: 'recovered' };
     }
 
-    // Denied, and already recorded as such: nothing left to do.
-    if (recordedState === 'missing') return { outcome: 'unchanged' };
+    // Denied, and already recorded as such. The revocation itself needs no
+    // rewrite — but an account already latched BEFORE tier classification
+    // shipped has no ads_scope_tier, and would otherwise carry the generic
+    // OAuth-tier message forever: this branch is the only place tier gets
+    // computed, and an account that's already 'missing' never reaches it
+    // through the normal suspect-then-confirm path again while it stays
+    // denied. Backfill once, guarded so it only ever runs until a tier is
+    // recorded.
+    if (recordedState === 'missing') {
+      if (!config.ads_scope_tier) {
+        const backfillTier = await metaService.classifyAdsRefusalTier(config.access_token);
+        if (backfillTier !== 'unknown') {
+          await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+            if (getMetaAdsScopeState(freshConfig) !== 'missing' || freshConfig.ads_scope_tier) {
+              return { updates: {}, unset: [] };
+            }
+            const storedProbedAt = freshConfig.ads_capability_probed_at;
+            if (typeof storedProbedAt === 'string' && storedProbedAt > probedAt) {
+              return { updates: {}, unset: [] };
+            }
+            return { updates: { ads_scope_tier: backfillTier, ads_capability_probed_at: probedAt } };
+          });
+          config.ads_scope_tier = backfillTier;
+          console.log(
+            `[MetaAdsCapabilitySync] Backfilled ads-refusal tier for user ${userId} account ${account.account_id} — was already latched before tier classification shipped`
+          );
+        }
+      }
+      return { outcome: 'unchanged' };
+    }
 
     // First refusal we have seen for this connection: record the suspicion and
     // stop. Confirmation comes from the next sweep, 12 hours later. One denied
