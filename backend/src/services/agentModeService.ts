@@ -71,7 +71,7 @@ import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
-import { meterUsageFromResponse } from '../utils/llmClients';
+import { getBedrockMantleClient, meterUsageFromResponse } from '../utils/llmClients';
 import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
@@ -2084,6 +2084,9 @@ export class AgentModeService {
   }
 
   public async getClientForModel(model: string): Promise<any> {
+    if (model.startsWith('xai.')) {
+      return getBedrockMantleClient({ feature: 'agent_task' }, model as 'xai.grok-4.3');
+    }
     if (model.startsWith('anthropic.')) {
       return this.getBedrockClient(model);
     }
@@ -2800,6 +2803,8 @@ export class AgentModeService {
     'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
     // Haiku 4.5 still accepts temperature (also live-verified).
     'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    // AWS Bedrock Mantle — OpenAI-compatible endpoint, API-key auth.
+    'xai.grok-4.3': { client: null, supportsTemperature: false, maxTools: 128, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2989,7 +2994,14 @@ export class AgentModeService {
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
     } else if (!client) {
-      if (model.startsWith('anthropic.')) {
+      if (model.startsWith('xai.')) {
+        client = getBedrockMantleClient(
+          { ...usageContext, feature: usageContext?.feature || 'agent_task' },
+          model as 'xai.grok-4.3',
+          { metered: false },
+        );
+        this.llmModels[model].client = client;
+      } else if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
@@ -3028,7 +3040,8 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
+              provider: model.startsWith('xai.') ? 'xAI'
+                : model.startsWith('gemini-') ? 'gemini'
                 : model.startsWith('anthropic.') ? 'bedrock'
                 : model.startsWith('claude-') ? 'vertex'
                 : 'azure-openai',

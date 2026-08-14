@@ -104,6 +104,12 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
  *   price page is tagged with `// UNVERIFIED`.
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
+  // AWS Bedrock Mantle / xAI Grok 4.3 — official Standard tier pricing.
+  // Cached-input and reasoning-token fields are normalized by the Mantle
+  // adapter; cache reads use the shared 10% convention until AWS publishes a
+  // separate Grok cache rate.
+  'xai.grok-4.3': withDerivedCache(1.25, 2.5),
+
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
   // ENG-893: every cacheWritePerM here is the DEFAULT-TTL (1.25x) rate, even
   // for models agent-mode invokes with `ttl: '1h'`. The 1-hour rate is 2x, but

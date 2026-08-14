@@ -426,6 +426,37 @@ export function getAzureClient(
   return wrapOpenAICompatible(client, "azure-openai", meterCtx);
 }
 
+/**
+ * Metered OpenAI-compatible client for Amazon Bedrock Mantle.
+ *
+ * Mantle is a separate endpoint class from Bedrock Runtime: it accepts a
+ * Bedrock API key and exposes OpenAI Chat Completions/Responses semantics.
+ * Keep this factory deliberately narrow until additional Mantle models have
+ * their own registry and pricing contracts.
+ */
+export function getBedrockMantleClient(
+  meterCtx: MeterContext,
+  model: string = "xai.grok-4.3",
+  overrides?: { apiKey?: string; region?: string; metered?: boolean }
+): OpenAI {
+  if (model !== "xai.grok-4.3") {
+    throw new Error(`Unsupported Bedrock Mantle model: ${model}`);
+  }
+
+  const apiKey = overrides?.apiKey ?? process.env.BEDROCK_MANTLE_API_KEY;
+  if (!apiKey) {
+    throw new Error("BEDROCK_MANTLE_API_KEY must be set for Bedrock Mantle");
+  }
+
+  const region = overrides?.region ?? process.env.BEDROCK_MANTLE_REGION ?? "us-west-2";
+  const client = new OpenAI({
+    apiKey,
+    baseURL: `https://bedrock-mantle.${region}.api.aws/openai/v1`,
+  });
+  if (overrides?.metered === false) return client;
+  return wrapOpenAICompatible(client, "xAI", meterCtx);
+}
+
 // ── Bedrock wrapping ──────────────────────────────────────────────────────────
 
 /** Strip an inference-profile ARN down to the bare model id for pricing lookups. */
