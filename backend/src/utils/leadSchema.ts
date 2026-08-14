@@ -415,3 +415,110 @@ export function pruneClickIds(raw: unknown): Record<string, string> | undefined 
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
+
+/**
+ * The keys `normalizeAttribution` can actually produce. See AttributionTouch.
+ */
+const TOUCH_SCALAR_KEYS = ['timestamp', 'referrer', 'landingUrl', 'sessionId'] as const;
+
+/** The UTM spec is closed, so an unrecognised subkey is corruption. */
+const UTM_KEYS = ['source', 'medium', 'campaign', 'content', 'term'] as const;
+
+/**
+ * Does this nested map hold at least one real value?
+ *
+ * `allowedKeys` is applied to `utm` and deliberately NOT to `clickIds`, and the
+ * asymmetry is the point. ENG-1176 made `clickIds` a map rather than one column
+ * per platform so that a new ad network does not require a schema change to be
+ * carried — `normalizeAttribution` already accepts click IDs not enumerated in
+ * `AttributionTouch`. Restricting it to a known key list would silently drop
+ * real paid-click attribution, which is precisely the failure ENG-1176 exists
+ * to prevent. Do not "tighten" clickIds to match utm; there is a test pinning
+ * this.
+ */
+function hasMeaningfulMap(value: unknown, allowedKeys?: readonly string[]): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.entries(value as Record<string, unknown>).some(
+    ([key, v]) =>
+      (!allowedKeys || allowedKeys.includes(key)) && typeof v === 'string' && v.trim() !== '',
+  );
+}
+
+/**
+ * A stored blob is usable only if it is a plain object carrying at least one
+ * key attribution could have written, holding a value that actually says
+ * something.
+ *
+ * Two things are deliberately NOT sufficient.
+ *
+ * Being a non-empty object: a legacy row such as `{ legacyBlob: true }` would
+ * otherwise be promoted to a valid `firstTouch`.
+ *
+ * Carrying a recognised KEY: `{ timestamp: null }`, `{ landingUrl: '' }` and
+ * `{ clickIds: {} }` hold exactly as much attribution as `{}` does. A key is
+ * not evidence; a key with a real value is.
+ *
+ * Both routes end in the same wrong answer — every consumer that reads
+ * presence-as-capture reports that capture ran on a record where nothing was
+ * captured. The warning on `firstTouch` above explains why "did capture run?"
+ * is a question people genuinely ask of this field, which is what makes a
+ * false positive here expensive rather than untidy.
+ *
+ * One meaningful key is enough. The capture middleware always writes
+ * `timestamp` + `landingUrl`, but a touch narrowed to a single real field is
+ * still real data rather than corruption, and discarding it would lose
+ * attribution we genuinely hold.
+ */
+function usableTouch(raw: unknown): AttributionTouch | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const touch = raw as Record<string, unknown>;
+  const hasScalar = TOUCH_SCALAR_KEYS.some(
+    (key) => typeof touch[key] === 'string' && (touch[key] as string).trim() !== '',
+  );
+  const hasMap = hasMeaningfulMap(touch.utm, UTM_KEYS) || hasMeaningfulMap(touch.clickIds);
+  if (!hasScalar && !hasMap) return undefined;
+  // Deep copy: the response must not alias the record the rest of the request
+  // is still reading, and must not be mutable back into it.
+  return JSON.parse(JSON.stringify(raw)) as AttributionTouch;
+}
+
+/**
+ * The single attribution shape returned by every lead-returning path
+ * (ENG-1175). Spread it into a projection; do not re-derive it inline.
+ *
+ * ONE definition on purpose. ENG-1176 shipped two defects — one on the
+ * destructive delete path — because the standard-field list had been copied
+ * into eight places and the copies drifted. The logic was shared, the data was
+ * not. Three projections each maintaining their own idea of "the attribution
+ * fields" would reproduce that exactly, and the failure would again be a
+ * confidently wrong answer rather than an error.
+ *
+ * Every field is OMITTED when absent rather than emitted empty or null. That is
+ * the whole contract, and it is load-bearing: `firstTouch: {}` would report
+ * "capture ran and found nothing" for a lead where capture never ran at all,
+ * and those are different answers to the only question the launch gates ask
+ * (ENG-1175 AC1/AC4). The same reasoning drives the empty-map rule on
+ * `clickIds` — see `pruneClickIds` above.
+ *
+ * A malformed stored blob is dropped, not thrown on: the caller asked for a
+ * lead, and one corrupt attribution field must not make the whole record
+ * unreadable.
+ */
+export function projectLeadAttribution(lead: any): Partial<LeadAttributionFields> {
+  if (!lead || typeof lead !== 'object') return {};
+  const out: Partial<LeadAttributionFields> = {};
+
+  const firstTouch = usableTouch(lead.firstTouch);
+  if (firstTouch) out.firstTouch = firstTouch;
+
+  const lastTouch = usableTouch(lead.lastTouch);
+  if (lastTouch) out.lastTouch = lastTouch;
+
+  if (typeof lead.utmSource === 'string' && lead.utmSource.trim()) out.utmSource = lead.utmSource;
+  if (typeof lead.utmMedium === 'string' && lead.utmMedium.trim()) out.utmMedium = lead.utmMedium;
+
+  const clickIds = pruneClickIds(lead.clickIds);
+  if (clickIds) out.clickIds = clickIds;
+
+  return out;
+}
