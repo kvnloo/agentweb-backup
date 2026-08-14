@@ -383,6 +383,22 @@ describe("GET /api/onboarding/events/me", () => {
     expect(res.body.onboardingEvents).toEqual([]);
   });
 
+  it("preserves a persisted null stage after a voice-only event", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingStage: null,
+      onboardingEvents: [
+        { event: "voice_onboarding_presented", ts: "2026-04-18T10:00:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app).get("/api/onboarding/events/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBeNull();
+  });
+
   it("returns 404 when user is missing", async () => {
     mockGetUserById.mockResolvedValueOnce(undefined);
     const app = makeApp();

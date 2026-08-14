@@ -196,9 +196,14 @@ router.get("/events/me", authenticateToken, async (req, res) => {
     )
       ? ((user as any).onboardingEvents as OnboardingEvent[])
       : [];
-    const stage = deriveOnboardingStage(events, {
-      lastActiveAt: (user as any).lastActiveAt,
-    });
+    // Persisted stage is authoritative when present, including null for a
+    // first lifecycle-neutral voice event. Falling back to derivation keeps
+    // this endpoint compatible with users created before stage persistence.
+    const stage = Object.prototype.hasOwnProperty.call(user, "onboardingStage")
+      ? (user as any).onboardingStage
+      : deriveOnboardingStage(events, {
+          lastActiveAt: (user as any).lastActiveAt,
+        });
     return res.json({
       onboardingEvents: events,
       onboardingStage: stage,
