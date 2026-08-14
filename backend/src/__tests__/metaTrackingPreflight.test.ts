@@ -486,3 +486,40 @@ describe('detectMetaPixels — the beacon src must be the real src attribute', (
       .toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 9. Two more precision failures in the same two scanners: a regex after
+ * a CONTROL parenthesis (`if (x) /…/.test(s)`), which the position classifier read as
+ * division, and an <img> whose non-source attribute VALUE contains serialized `src="…"`
+ * markup, which the raw-tag regex bound to as though it were the real source.
+ */
+describe('detectMetaPixels — control-flow regex and embedded attribute markup', () => {
+  it('ignores a pixel-shaped regex used as a test after an if(...)', () => {
+    expect(detectMetaPixels(
+      `<script>if (x) /fbq('init','${PIXEL}')/.test(s) && go();</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores one after while(...) and for(...) too', () => {
+    expect(detectMetaPixels(`<script>while (n) /fbq('init','${PIXEL}')/.exec(s);</script>`)).toEqual([]);
+    expect(detectMetaPixels(`<script>for (;;) /fbq('init','${PIXEL}')/.exec(s);</script>`)).toEqual([]);
+  });
+
+  it('still treats a parenthesised expression followed by a slash as division', () => {
+    expect(detectMetaPixels(
+      `<script>var avg = (a + b) / 2; fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('ignores serialized img markup embedded in another attribute value', () => {
+    expect(detectMetaPixels(
+      `<img alt="paste this: &nbsp; src=&quot;x&quot;" data-doc='example src="https://www.facebook.com/tr?id=${PIXEL}"' src="/logo.png"/>`,
+    )).toEqual([]);
+  });
+
+  it('still reads the real src when other attributes are present', () => {
+    expect(detectMetaPixels(
+      `<img data-doc='some notes' src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView" alt="x"/>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

@@ -102,14 +102,28 @@ export function stripInertJavaScript(src: string): string {
    * stays arithmetic — mis-reading that would swallow the live code after it.
    */
   const REGEX_START_AFTER_KEYWORD = /\b(return|typeof|instanceof|case|in|of|do|else|void|delete|new|yield|await|throw)$/;
+  /*
+   * `)` is the genuinely ambiguous one: `(a + b) / 2` is division, but `if (x) /re/.test(s)`
+   * is a regex. What separates them is the word before the OPENING paren, so each `(` is
+   * pushed onto a stack recording whether it opened a control clause, and the matching `)`
+   * pops it. Guessing either way without that context breaks real code — as division it
+   * leaves inert patterns readable as installs, as regex it swallows live code.
+   */
+  const CONTROL_KEYWORD = /\b(if|for|while|switch|catch|with)$/;
+  const parenStack: boolean[] = [];
+  let lastClosedParenWasControl = false;
   let prevSignificant = '';
   let sinceLineStart = '';
   let out = '';
   let i = 0;
   while (i < src.length) {
     const c = src[i];
+    if (c === '(') parenStack.push(CONTROL_KEYWORD.test(sinceLineStart.trimEnd()));
+    else if (c === ')') lastClosedParenWasControl = parenStack.pop() === true;
     const regexPosition =
-      REGEX_START_AFTER.has(prevSignificant) || REGEX_START_AFTER_KEYWORD.test(sinceLineStart.trimEnd());
+      REGEX_START_AFTER.has(prevSignificant) ||
+      REGEX_START_AFTER_KEYWORD.test(sinceLineStart.trimEnd()) ||
+      (prevSignificant === ')' && lastClosedParenWasControl);
     if (c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*' && regexPosition) {
       // A regex literal is real code, but a PATTERN never initializes a pixel — matching
       // `fbq('init', …)` is in fact what a consent-manager or a scanner does. Dropped
@@ -245,15 +259,23 @@ export function detectMetaPixels(html: string): string[] {
    * quoting it, a dashboard printing it — as an install, which is the same inert-text false
    * pass the script scan above exists to prevent, one element type over.
    */
-  // `\ssrc`, not `\bsrc`: a word boundary also sits inside `data-src` and `lazy-src`, so a
-  // beacon parked in a lazy-load or documentation attribute read as the real source. Only an
-  // attribute that starts right after whitespace is the tag's own `src`.
-  for (const m of html.matchAll(/<img\b[^>]*?\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
-    const src = m[1] ?? m[2] ?? m[3] ?? '';
-    // The URL has to be what the browser REQUESTS. Sitting in a data- attribute (or any
-    // other attribute) it is documentation, and no tracking request is ever made.
-    const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(src)?.[1];
-    if (id) found.add(`PIXEL:${id}`);
+  /*
+   * The tag's attributes are walked rather than pattern-matched against the raw tag text.
+   * Anchoring on `src=` inside the tag kept binding to the wrong thing: first `data-src`
+   * (a word boundary sits inside it), then serialized markup like
+   * `data-doc='example src="…"'`, where the match landed INSIDE another attribute's value.
+   * Consuming each value as a unit makes embedded text unreachable by construction, which a
+   * position-anchored regex over the same string cannot be.
+   *
+   * Only a real `src` counts: it is the attribute the browser actually requests, and a
+   * beacon URL anywhere else is documentation that fires nothing.
+   */
+  for (const tag of html.matchAll(/<img\b([^>]*)>/gi)) {
+    for (const attr of (tag[1] || '').matchAll(/([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+      if (attr[1].toLowerCase() !== 'src') continue;
+      const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(attr[2] ?? attr[3] ?? attr[4] ?? '')?.[1];
+      if (id) found.add(`PIXEL:${id}`);
+    }
   }
 
   return [...found];

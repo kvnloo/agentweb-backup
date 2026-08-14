@@ -188,12 +188,7 @@ export function collectPendingDestinations(entityType: string, action: string, p
    * With no override the copy inherits the source creative's destination, and the source ad
    * IS in the ad list — so returning nothing here is correct, not a gap.
    */
-  if (action === 'COPY_AD') {
-    if (entityType !== 'AD') return [];
-    const copied = [params.link_url, params.destination, params.url]
-      .find((v: any) => typeof v === 'string' && v.trim());
-    return copied ? [String(copied).trim()] : [];
-  }
+  if (action === 'COPY_AD' && entityType !== 'AD') return [];
   /*
    * UPDATE is included for AD because an ad update carrying creative content (`link_url`,
    * a creative object) makes Meta build and swap in a NEW creative — so the ad list still
@@ -209,6 +204,18 @@ export function collectPendingDestinations(entityType: string, action: string, p
 
   push(params.link_url);
   push(params.destination_url);
+  /*
+   * `destination` and `url` are aliases, not decoration: AgentModeService.CREATIVE_CONTENT_KEYS
+   * is ['link_url', 'destination', 'url', …], so either one both TRIGGERS the creative swap
+   * (agentModeService.ts:17255) and becomes the new link (17324), and copyMetaAdsAd reads the
+   * same three (16191). Collected for every AD write rather than only the paths known to read
+   * them today — the cost of an extra URL here is a false block on a page nobody is buying
+   * traffic to, while the cost of a missing one is spend against a page never checked.
+   */
+  if (entityType === 'AD') {
+    push(params.destination);
+    push(params.url);
+  }
   out.push(...extractDestinationUrls(params.creative ?? params.ad_creative));
   return [...new Set(out)];
 }

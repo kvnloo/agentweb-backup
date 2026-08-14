@@ -490,8 +490,38 @@ describe('COPY_AD (ENG-941)', () => {
     expect(collectPendingDestinations('AD', 'COPY_AD', { name: 'Copy of X' })).toEqual([]);
   });
 
-  it('does not collect those aliases on paths that never read them', () => {
-    expect(collectPendingDestinations('AD', 'CREATE', { destination: 'https://a/2' })).toEqual([]);
-    expect(collectPendingDestinations('AD', 'UPDATE', { url: 'https://a/3' })).toEqual([]);
+  /*
+   * This test used to assert the opposite — that CREATE/UPDATE never read these aliases —
+   * which was my own wrong premise from a too-narrow grep, not a fact about the code. See
+   * 'destination aliases on AD writes' below: CREATIVE_CONTENT_KEYS includes both.
+   */
+  it('collects the same aliases on the other AD write paths', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', { destination: 'https://a/2' })).toEqual(['https://a/2']);
+    expect(collectPendingDestinations('AD', 'UPDATE', { url: 'https://a/3' })).toEqual(['https://a/3']);
+  });
+});
+
+/*
+ * Greptile P1, round 9 ("Creative-swap aliases evade preflight"). I rejected this in round 6
+ * after grepping metaService.ts and finding the aliases unused. That was the wrong file:
+ * AgentModeService.CREATIVE_CONTENT_KEYS is ['link_url', 'destination', 'url', ...], so
+ * either alias BOTH triggers the creative swap (agentModeService.ts:17255) and becomes the
+ * new link (17324). They are destination inputs on every AD write, not dead params.
+ */
+describe('destination aliases on AD writes (ENG-941)', () => {
+  const { collectPendingDestinations } = require('../services/metaLaunchGate');
+
+  it('collects params.destination and params.url on an AD UPDATE', () => {
+    expect(collectPendingDestinations('AD', 'UPDATE', { destination: 'https://a/1' })).toEqual(['https://a/1']);
+    expect(collectPendingDestinations('AD', 'UPDATE', { url: 'https://a/2' })).toEqual(['https://a/2']);
+  });
+
+  it('collects them on an AD CREATE too, so the collector cannot drift from the key list', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', { destination: 'https://a/1' })).toEqual(['https://a/1']);
+  });
+
+  it('does not collect them for entities that carry no creative', () => {
+    expect(collectPendingDestinations('AD_SET', 'CREATE', { destination: 'https://a/1' })).toEqual([]);
+    expect(collectPendingDestinations('CAMPAIGN', 'CREATE', { url: 'https://a/1' })).toEqual([]);
   });
 });
