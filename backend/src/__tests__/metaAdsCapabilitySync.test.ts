@@ -223,16 +223,45 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
     it('records the suspicion without stripping the grant or alerting', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
       const account = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+      const configSnapshot = { ...account.config };
 
       const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('suspected');
-      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
       expect(typeof updates.ads_scope_denied_seen_at).toBe('string');
       expect(updates.granted_scopes).toBeUndefined();
       expect(updates.ads_scope_revoked_at).toBeUndefined();
       // The connection keeps working in the meantime.
       expect(getMetaAdsScopeState(account.config)).not.toBe('missing');
+    });
+
+    /**
+     * Greptile P1 follow-up (2nd round): the suspicion write is not exempt
+     * from the probedAt guard either. Without it, a suspicion delayed past a
+     * concurrent recovery could still land afterward, sit unmarked as stale,
+     * and let a later UNRELATED denial read it as "already suspected" —
+     * skipping the two-strike wait and false-confirming a revocation the
+     * recovery had already disproved.
+     */
+    it('does not record a suspicion that a newer recovery has already superseded', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+      const configSnapshot = { ...account.config };
+
+      const newerFreshConfig = {
+        ...configSnapshot,
+        ads_capability_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('suspected'); // decided from the (stale) outer read
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      // But the actual persisted write, seeing the newer signal on its own
+      // fresh read, must refuse to record the now-superseded suspicion.
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
     });
 
     it('acts on the second consecutive denial', async () => {
