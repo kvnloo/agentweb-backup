@@ -353,10 +353,75 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
 
       expect(getMetaAdsScopeState(account.config)).toBe('missing');
     });
+  });
 
+  /**
+   * Greptile P1 follow-up: a plain fresh-read retry only guarantees the WRITE
+   * reflects current DB state, not that the DECISION being written is the
+   * newer of two independently-arrived-at conclusions. Two processes can each
+   * probe Meta for the same account close together — this sweep and a live
+   * chat run's read failure — and reach opposite answers. Whichever write
+   * loses a CAS conflict must not reapply its own now-stale decision over a
+   * newer one that landed in between.
+   */
+  describe('a newer probe elsewhere always wins (probedAt guard)', () => {
+    it('does not reverse a recovery that was probed more recently than this denial', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+      const configSnapshot = { ...account.config };
 
+      // Simulate: between this call's probe and its write, a concurrent
+      // recovery landed with a probe timestamp in the future relative to
+      // whatever this call captures internally (any probedAt this call
+      // computes falls before "the year 3000").
+      const newerFreshConfig = {
+        ...configSnapshot,
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_capability_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+      delete newerFreshConfig.ads_scope_revoked_at;
 
+      await syncMetaAdsCapability(account, 'user1');
 
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
+    });
+
+    it('does not reverse a revocation that was probed more recently than this recovery', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('accessible');
+      const account = latchedAccount();
+      const configSnapshot = { ...account.config };
+
+      const newerFreshConfig = {
+        ...configSnapshot,
+        ads_scope_revoked_at: '2026-08-14T12:00:00.000Z',
+        ads_capability_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
+    });
+
+    it('stamps its own probe time on a write that does apply', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+      const configSnapshot = { ...account.config };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(typeof updates.ads_capability_probed_at).toBe('string');
+    });
   });
 
   describe('never acts on absence of proof', () => {

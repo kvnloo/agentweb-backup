@@ -292,6 +292,27 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(updates.ads_scope_tier).toBe('asset');
     });
 
+    /**
+     * Greptile P1 follow-up: this path acts on a SINGLE read failure — weaker
+     * evidence than the sweep's two-strike confirmation — so if the sweep
+     * already recorded a newer, opposite conclusion (a recovery) between this
+     * failure and the write landing, that newer signal must win.
+     */
+    it('does not revoke over a recovery the sweep already confirmed more recently', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      const newerFreshConfig = {
+        ...legacyUser.connected_accounts[0].config,
+        ads_capability_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
+    });
+
     it('records a signal strong enough that the NEXT read fails without calling Meta', async () => {
       // AC3, end to end. Asserting "the persisted array has no ads scope" is not
       // enough: for a legacy record the retained array is [], which is
