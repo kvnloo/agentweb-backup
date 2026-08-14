@@ -10,6 +10,19 @@
  * ads grant is authoritatively missing reports as needing reconnection, carries
  * the reason, and — critically — an unprovable legacy record does NOT.
  */
+// metaAccountCredentials is mocked below, before any import that would trigger
+// it (jest.mock is hoisted above imports). Without this, routes/connectedAccounts.ts
+// pulls in the real chain — metaAccountCredentials -> metaTokenRefresh -> metaService
+// -> config/integrations -> utils/secretsManager — whose module body constructs a real
+// `new AWS.SecretsManager()` at load time. That throws under this project's
+// jest/ts-jest combination regardless of whether a test exercises Meta credentials at
+// all (same test-harness-only artifact as the @slack/web-api mock in jest.config.js;
+// see the identical fix already applied in connectedAccounts.test.ts).
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock('../services/metaAccountCredentials', () => ({
+  assertOwnedMetaPixel: (...a: any[]) => mockAssertOwnedMetaPixel(...a),
+}));
+
 const mockOrphanTableMethods = {
   put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
   get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
