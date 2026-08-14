@@ -7622,7 +7622,7 @@ export const crmDb = {
    *
    * Writes three top-level attributes on the Lead:
    *   - onboardingEvents: OnboardingEvent[] (full log mirror)
-   *   - onboardingStage: OnboardingStage
+   *   - onboardingStage: OnboardingStage (when a lifecycle stage exists)
    *   - onboardingDeviationCount: int
    *
    * Overwrites atomically — this is a pure projection of User state.
@@ -7633,19 +7633,22 @@ export const crmDb = {
     leadId: string,
     analytics: {
       onboardingEvents: unknown[];
-      onboardingStage: string;
+      onboardingStage?: string;
       onboardingDeviationCount: number;
     },
   ): Promise<void> {
     const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    const stageUpdate = analytics.onboardingStage === undefined
+      ? ''
+      : ', onboardingStage = :stage';
     await dynamodb.update({
       TableName: TABLE_NAME,
       Key: { listId, leadId },
       UpdateExpression:
-        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+        `SET onboardingEvents = :events${stageUpdate}, onboardingDeviationCount = :dc, updatedAt = :updatedAt`,
       ExpressionAttributeValues: {
         ':events': analytics.onboardingEvents,
-        ':stage': analytics.onboardingStage,
+        ...(analytics.onboardingStage !== undefined && { ':stage': analytics.onboardingStage }),
         ':dc': analytics.onboardingDeviationCount,
         ':updatedAt': new Date().toISOString(),
       },
