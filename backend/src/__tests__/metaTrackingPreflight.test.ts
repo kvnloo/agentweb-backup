@@ -681,3 +681,30 @@ describe('detectMetaPixels — the beacon must actually address Meta', () => {
     expect(detectMetaPixels(`<img src="//www.facebook.com/tr?id=${PIXEL}"/>`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 16. The two halves had drifted apart: `stripInertJavaScript` recognised
+ * pixel-shaped text only as `tr?id=`, while `beaconPixelId` accepts `id` in ANY query
+ * position. A JS string holding a reordered beacon URL therefore survived scrubbing and was
+ * then read as a real image by the document-wide scan. Whenever one half accepts more than
+ * the other recognises, the difference is a bypass.
+ */
+describe('detectMetaPixels — inert detection must match what the beacon parser accepts', () => {
+  it('ignores a reordered beacon URL inside a JS string', () => {
+    expect(detectMetaPixels(
+      `<script>var s = '<img src="https://www.facebook.com/tr?ev=PageView&id=${PIXEL}">';</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores a beacon URL with no id parameter at all in a JS string', () => {
+    expect(detectMetaPixels(
+      `<script>var s = '<img src="https://www.facebook.com/tr?ev=PageView">'; log(s);</script>`,
+    )).toEqual([]);
+  });
+
+  it('still accepts a real beacon whose query is reordered', () => {
+    expect(detectMetaPixels(
+      `<img src="https://www.facebook.com/tr?ev=PageView&id=${PIXEL}&noscript=1"/>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

@@ -87,7 +87,15 @@ export const META_TRACKING_MECHANISMS: string[] = [
  * someone to deliberately write unreachable pixel code on their own landing page.
  */
 export function stripInertJavaScript(src: string): string {
-  const isInert = (body: string) => /fbq\s*\(/i.test(body) || /facebook\.com\/tr\?id=/i.test(body);
+  /*
+   * Deliberately broader than what `beaconPixelId` accepts. This half only decides whether a
+   * literal is DOCUMENTATION rather than code, and the two must not drift: matching
+   * `tr?id=` while the beacon parser accepts `id` in any query position left a reordered URL
+   * (`tr?ev=PageView&id=…`) surviving here and counted as an install there. Whenever one
+   * half accepts more than the other recognises, the difference is a bypass — so this one
+   * takes any facebook.com/tr reference, and over-stripping only ever costs a block.
+   */
+  const isInert = (body: string) => /fbq\s*\(/i.test(body) || /facebook\.com\/tr\b/i.test(body);
   /*
    * A `/` starts a regex literal only where an expression may begin; after a value it is
    * division. Deciding on the previous significant character keeps `total / 2` and
