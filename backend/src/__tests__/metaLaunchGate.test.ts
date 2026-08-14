@@ -307,3 +307,114 @@ describe('Greptile findings (ENG-941)', () => {
     expect(urls).toContain('https://site.example/brand-new');
   });
 });
+
+/*
+ * Greptile P1, round 3 ("Referenced destination remains unchecked"). `collectPendingDestinations`
+ * reads INLINE creative shapes, but Meta's documented ad-create path references an existing
+ * creative by id — the destination then lives only on that creative, and the new ad has no
+ * entry in the ad list to fall back on. The gate checked siblings (or nothing) and let an
+ * ACTIVE ad launch at a destination it never looked at.
+ */
+describe('referenced creative destinations (ENG-941)', () => {
+  const { collectPendingCreativeIds } = require('../services/metaLaunchGate');
+
+  it('collects a referenced creative id from either shape Meta accepts', () => {
+    expect(collectPendingCreativeIds('AD', 'CREATE', { creative_id: '120299' })).toEqual(['120299']);
+    expect(collectPendingCreativeIds('AD', 'CREATE', { creative: { creative_id: '120299' } })).toEqual(['120299']);
+    expect(collectPendingCreativeIds('AD', 'CREATE', { creative: { id: '120299' } })).toEqual(['120299']);
+  });
+
+  it('collects nothing when the creative is inlined or absent', () => {
+    expect(collectPendingCreativeIds('AD', 'CREATE', { creative: { link_url: 'https://a/1' } })).toEqual([]);
+    expect(collectPendingCreativeIds('AD', 'CREATE', null)).toEqual([]);
+    expect(collectPendingCreativeIds('CAMPAIGN', 'CREATE', { creative_id: '120299' })).toEqual([]);
+  });
+
+  /*
+   * The creative-SWAP path (AD UPDATE with params.creative_id) is documented in the tool
+   * itself. It has the same hole in a different place: the ad exists, so the gate reads its
+   * destination from the ad list — which is the OLD creative's destination, not the one this
+   * write is about to make serve.
+   */
+  it('collects a swapped-in creative id on an AD UPDATE', () => {
+    expect(collectPendingCreativeIds('AD', 'UPDATE', { creative_id: '120299' })).toEqual(['120299']);
+  });
+
+  it('uses the swapped-in destination instead of the ad\'s current one', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/old'] },
+    ]);
+    await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1',
+      { resolveCreativeDestinations: jest.fn().mockResolvedValue(['https://site.example/new']) },
+      'ad-42', [], ['120299'],
+    );
+    expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
+  });
+
+  it('resolves a referenced creative to its destination and checks it', async () => {
+    mockListAds.mockResolvedValue([]);
+    const resolveCreativeDestinations = jest.fn().mockResolvedValue(['https://site.example/referenced']);
+    await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
+      { resolveCreativeDestinations }, undefined, [], ['120299'],
+    );
+    expect(resolveCreativeDestinations).toHaveBeenCalledWith('120299', 'tok');
+    expect(mockPreflight.mock.calls[0][0]).toContain('https://site.example/referenced');
+  });
+
+  it('blocks when a referenced creative cannot be resolved — an unreadable destination is not a measured one', async () => {
+    mockListAds.mockResolvedValue([]);
+    const resolveCreativeDestinations = jest.fn().mockRejectedValue(new Error('Graph 400'));
+    const out = await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
+      { resolveCreativeDestinations }, undefined, [], ['120299'],
+    );
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('120299');
+    expect(mockPreflight).not.toHaveBeenCalled();
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+  });
+
+  it('blocks when a referenced creative resolves to no destination at all — the shape was not understood', async () => {
+    mockListAds.mockResolvedValue([]);
+    const out = await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1',
+      { resolveCreativeDestinations: jest.fn().mockResolvedValue([]) }, undefined, [], ['120299'],
+    );
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('120299');
+  });
+
+  it('still honours an explicit override when a creative cannot be resolved', async () => {
+    mockListAds.mockResolvedValue([]);
+    const out = await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', true, 'sess-1',
+      { resolveCreativeDestinations: jest.fn().mockRejectedValue(new Error('Graph 400')) }, undefined, [], ['120299'],
+    );
+    expect(out.proceed).toBe(true);
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
+  });
+});
+
+/*
+ * The inline collector previously enumerated a fixed list of creative shapes. Meta keeps
+ * adding them (video CTA, asset feed, call-to-action link specs), and a shape nobody
+ * enumerated yields no destination — a silent fail-open. Collecting by KEY across the
+ * creative object instead means a new shape is covered the day Meta ships it.
+ */
+describe('inline creative destination extraction (ENG-941)', () => {
+  const { collectPendingDestinations } = require('../services/metaLaunchGate');
+
+  it('finds a destination nested in a shape the old fixed list did not enumerate', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', {
+      creative: { object_story_spec: { template_data: { call_to_action: { value: { link: 'https://a/deep' } } } } },
+    })).toEqual(['https://a/deep']);
+  });
+
+  it('does not mistake creative assets for destinations', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', {
+      creative: { image_url: 'https://cdn/x.png', thumbnail_url: 'https://cdn/t.png', video_id: '123' },
+    })).toEqual([]);
+  });
+});

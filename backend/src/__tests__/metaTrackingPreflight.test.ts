@@ -294,3 +294,61 @@ describe('only executable script counts (ENG-941, Greptile round 2)', () => {
     }
   });
 });
+
+/*
+ * Greptile P1, round 3 ("Inert JavaScript passes preflight"). Restricting the scan to
+ * executable <script> blocks was the second narrowing and still not enough: pixel-shaped
+ * text inside a JS comment or a string literal sits in an executable block and never runs.
+ * A page that merely *shows* an install snippet then reads as measured, which is exactly
+ * the page this gate exists to catch.
+ */
+describe('detectMetaPixels — inert JavaScript inside an executable script', () => {
+  it('ignores an fbq init inside a // line comment', () => {
+    expect(detectMetaPixels(`<script>
+      // fbq('init', '${PIXEL}');
+      console.log('no tracking');
+    </script>`)).toEqual([]);
+  });
+
+  it('ignores an fbq init inside a /* block comment */', () => {
+    expect(detectMetaPixels(`<script>/* example: fbq('init', '${PIXEL}') */</script>`)).toEqual([]);
+  });
+
+  it('ignores an fbq init that only exists inside a string literal', () => {
+    expect(detectMetaPixels(
+      `<script>var snippet = "fbq('init', '${PIXEL}');"; document.title = snippet;</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores an fbq init inside a template literal', () => {
+    expect(detectMetaPixels(
+      '<script>const help = `paste fbq(\'init\', \'' + PIXEL + '\')  into your head tag`;</script>',
+    )).toEqual([]);
+  });
+
+  it('ignores a noscript tracking URL that only exists inside a JS string', () => {
+    expect(detectMetaPixels(
+      `<script>var sample = "<img src='https://www.facebook.com/tr?id=${PIXEL}&ev=PageView'/>";</script>`,
+    )).toEqual([]);
+  });
+
+  it('still detects a real install that sits alongside commented-out example code', () => {
+    expect(detectMetaPixels(`<script>
+      // old pixel, removed: fbq('init', '${OTHER_PIXEL}');
+      fbq('init', '${PIXEL}');
+    </script>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('still detects a real install written with double quotes after a comment', () => {
+    expect(detectMetaPixels(
+      `<script>/* base code */ fbq("init", "${PIXEL}"); fbq("track", "PageView");</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('does not let an apostrophe in a comment swallow a real install below it', () => {
+    expect(detectMetaPixels(`<script>
+      // don't remove this
+      fbq('init', '${PIXEL}');
+    </script>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});
