@@ -161,6 +161,62 @@ describe("meteringFeature — provenance tag written at metering time", () => {
     expect(meteringFeature("agent_task:scheduled", "scheduled")).toBe("agent_task:scheduled");
     expect(meteringFeature("x-account:1340767380", "regular")).toBe("x-account:1340767380");
   });
+
+  // ENG-1217 AC8 needs the EXACT schedule named, so provenance carries a third
+  // segment. `normaliseFeature` reads [0] and `sourceOf` reads [1], so neither
+  // existing grouping notices it.
+  it("carries the schedule id as a third segment for a scheduled run", () => {
+    expect(meteringFeature("agent_task", "scheduled", "abc-123")).toBe("agent_task:scheduled:abc-123");
+  });
+
+  it("still tags a scheduled run whose schedule id could not be parsed", () => {
+    // Better a run known to be scheduled but unattributed than one that loses
+    // its provenance entirely because the pageIdentifier was malformed.
+    expect(meteringFeature("agent_task", "scheduled", null)).toBe("agent_task:scheduled");
+    expect(meteringFeature("agent_task", "scheduled", "")).toBe("agent_task:scheduled");
+  });
+
+  it("never attaches a schedule id to interactive work", () => {
+    // An interactive session has no schedule; a stray id here would invent one.
+    expect(meteringFeature("agent_task", "regular", "abc-123")).toBe("agent_task:interactive");
+  });
+
+  it("drops a schedule id containing the separators the key relies on", () => {
+    // `#` separates sort-key components and `:` separates qualifiers. An id
+    // carrying either would silently re-shape the key, so it is refused rather
+    // than written — the run stays attributed as scheduled, just unnamed.
+    expect(meteringFeature("agent_task", "scheduled", "a:b")).toBe("agent_task:scheduled");
+    expect(meteringFeature("agent_task", "scheduled", "a#b")).toBe("agent_task:scheduled");
+  });
+});
+
+describe("attributeCosts — per-schedule attribution (ENG-1217 AC3/AC4/AC8)", () => {
+  it("groups tagged scheduled spend by the individual schedule", () => {
+    const result = attributeCosts([
+      row({ feature: "agent_task:scheduled:sched-a", costMicroUsd: 60 * USD, callCount: 6 }),
+      row({ feature: "agent_task:scheduled:sched-b", costMicroUsd: 30 * USD, callCount: 3 }),
+      row({ feature: "agent_task:interactive", costMicroUsd: 10 * USD }),
+    ]);
+    expect(result.bySchedule!.map((d) => d.key)).toEqual(["sched-a", "sched-b"]);
+    expect(result.bySchedule![0].costMicroUsd).toBe(60 * USD);
+    expect(result.bySchedule![0].callCount).toBe(6);
+  });
+
+  it("leaves source and feature grouping untouched by the third segment", () => {
+    const result = attributeCosts([
+      row({ feature: "agent_task:scheduled:sched-a", costMicroUsd: 60 * USD }),
+      row({ feature: "agent_task:interactive", costMicroUsd: 40 * USD }),
+    ]);
+    expect(result.byFeature.map((d) => d.key)).toEqual(["agent_task"]);
+    expect(result.bySource!.map((d) => d.key)).toEqual(["scheduled", "interactive"]);
+    expect(result.bySource![0].costMicroUsd).toBe(60 * USD);
+  });
+
+  it("withholds the schedule split when no row names a schedule", () => {
+    const result = attributeCosts([row({ feature: "agent_task:scheduled", costMicroUsd: 10 * USD })]);
+    expect(result.bySchedule).toBeNull();
+    expect(result.unavailableGroupings).toContain("per_schedule");
+  });
 });
 
 describe("attributeCosts — scheduled vs interactive (ENG-1210 AC6)", () => {

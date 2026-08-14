@@ -4082,7 +4082,7 @@ export class AgentModeService {
             // time. The ledger row is keyed `date#model#feature` and aggregates
             // sessionId away, so `feature` is the only dimension that survives to
             // answer "what is my scheduled work costing me".
-            usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType) },
+            usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn
           });
@@ -4160,7 +4160,7 @@ export class AgentModeService {
                 temperature: 0.1,
                 // Same provenance as the primary call this retries — a backup-model
                 // retry of a scheduled run is still scheduled spend.
-                usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType) },
+                usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
               }), synthesisRetryDeadlineMs);

@@ -76,6 +76,13 @@ export interface CostAttribution {
    * and reporting "0% scheduled" would be a false statement about real usage.
    */
   bySource: CostDriver[] | null;
+  /**
+   * Spend per individual schedule, keyed by scheduleId, for rows that name one.
+   * null while no row does. ENG-1217 AC8 requires naming the exact schedule, and
+   * a resolver joins these ids to schedule titles — this layer stays read-only
+   * over the ledger and never invents a name it cannot key.
+   */
+  bySchedule: CostDriver[] | null;
   /** Cost whose provenance predates the tag. Stated, never folded into a source. */
   sourceUnattributedMicroUsd: number;
   /** Named groupings this data set cannot support, so callers state it rather than imply zero. */
@@ -94,6 +101,14 @@ function normaliseFeature(feature: string): string {
 function sourceOf(feature: string): UsageSource | null {
   const qualifier = (feature || "").split(":")[1]?.trim();
   return qualifier && SOURCE_TAGS.includes(qualifier) ? (qualifier as UsageSource) : null;
+}
+
+/** The schedule a `feature` names, or null when the row is not schedule-tagged. */
+function scheduleOf(feature: string): string | null {
+  // Only meaningful under the `scheduled` source — a third segment on anything
+  // else is not a schedule id.
+  if (sourceOf(feature) !== "scheduled") return null;
+  return (feature || "").split(":")[2]?.trim() || null;
 }
 
 /**
@@ -116,14 +131,34 @@ function sourceOf(feature: string): UsageSource | null {
  * would do so in the direction that flatters us, by making unexplained spend look
  * like something the customer chose to run.
  */
-export function meteringFeature(base: string, sessionType?: string | null): string {
+export function meteringFeature(
+  base: string,
+  sessionType?: string | null,
+  scheduleId?: string | null,
+): string {
   const feature = (base || "").trim();
   // A feature that already carries a qualifier keeps it: either it is already
   // tagged, or it is a dimension like `x-account:<id>` that must not be rewritten.
   if (!feature || feature.includes(":")) return feature;
   const type = (sessionType || "").trim();
   if (!type) return feature;
-  return `${feature}:${type === "scheduled" ? "scheduled" : "interactive"}`;
+  if (type !== "scheduled") {
+    // Interactive work has no schedule. Accepting an id here would invent one.
+    return `${feature}:interactive`;
+  }
+
+  // ENG-1217 AC8 names the exact schedule, which needs a THIRD segment. Existing
+  // readers are unaffected by construction: `normaliseFeature` takes [0] and
+  // `sourceOf` takes [1].
+  //
+  // `#` separates sort-key components and `:` separates qualifiers, so an id
+  // carrying either would silently re-shape the key. Such an id is refused
+  // rather than written — the run stays correctly attributed as scheduled, it
+  // just goes unnamed, which is the honest-remainder outcome rather than a
+  // corrupted key. The same applies when the pageIdentifier could not be parsed.
+  const id = (scheduleId || "").trim();
+  if (!id || id.includes(":") || id.includes("#")) return `${feature}:scheduled`;
+  return `${feature}:scheduled:${id}`;
 }
 
 function toDrivers(totals: Map<string, { cost: number; calls: number }>, grandTotal: number): CostDriver[] {
@@ -143,6 +178,7 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
   const byModel = new Map<string, { cost: number; calls: number }>();
   const byFeature = new Map<string, { cost: number; calls: number }>();
   const bySource = new Map<string, { cost: number; calls: number }>();
+  const bySchedule = new Map<string, { cost: number; calls: number }>();
   let total = 0;
   let unattributed = 0;
   let sourceUnattributed = 0;
@@ -160,6 +196,12 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
       bySource.set(source, { cost: s.cost + cost, calls: s.calls + calls });
     } else {
       sourceUnattributed += cost;
+    }
+
+    const schedule = scheduleOf(row.feature);
+    if (schedule) {
+      const sc = bySchedule.get(schedule) || { cost: 0, calls: 0 };
+      bySchedule.set(schedule, { cost: sc.cost + cost, calls: sc.calls + calls });
     }
 
     const model = (row.model || "").trim();
@@ -185,14 +227,24 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
   // cutover reports the split it can prove plus the remainder it cannot, rather
   // than suppressing a real answer until the whole cycle is tagged.
   const sourceAvailable = bySource.size > 0;
+  const scheduleAvailable = bySchedule.size > 0;
+
+  // Named separately: a cycle can know scheduled-vs-interactive while still not
+  // naming any individual schedule (a run whose pageIdentifier would not parse
+  // is tagged `scheduled` with no id), so one grouping can be available while
+  // the other is not.
+  const unavailable: string[] = [];
+  if (!sourceAvailable) unavailable.push("scheduled_vs_interactive");
+  if (!scheduleAvailable) unavailable.push("per_schedule");
 
   return {
     totalCostMicroUsd: total,
     byModel: toDrivers(byModel, total),
     byFeature: toDrivers(byFeature, total),
     bySource: sourceAvailable ? toDrivers(bySource, total) : null,
+    bySchedule: scheduleAvailable ? toDrivers(bySchedule, total) : null,
     sourceUnattributedMicroUsd: sourceUnattributed,
-    unavailableGroupings: sourceAvailable ? [] : ["scheduled_vs_interactive"],
+    unavailableGroupings: unavailable,
     unattributedMicroUsd: unattributed,
     reconciles: attributed + unattributed === total,
   };
