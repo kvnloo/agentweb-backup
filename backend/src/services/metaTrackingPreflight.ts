@@ -198,6 +198,34 @@ export function stripInertJavaScript(src: string): string {
  * counting it would make this gate pass exactly the pages it exists to catch.
  */
 /**
+ * The pixel id of a Meta beacon request, or undefined.
+ *
+ * Substring matching counted any URL that merely CONTAINED `facebook.com/tr?id=<pixel>` —
+ * a proxy or redirect carrying it as a query parameter, a lookalike path on someone else's
+ * CDN — as an install, when no request reaches Meta at all. The src is parsed and its host
+ * checked, so what counts is where the browser actually sends the request.
+ *
+ * An unparseable src yields nothing, which reads as "no pixel found" — a block. That is the
+ * direction this whole gate fails in.
+ */
+function beaconPixelId(src: string): string | undefined {
+  if (!src) return undefined;
+  let parsed: URL;
+  try {
+    // Base covers protocol-relative (`//www.facebook.com/tr`) and relative srcs alike; a
+    // relative one can never be a Meta beacon, and its host will not match below.
+    parsed = new URL(src.trim(), 'https://relative.invalid');
+  } catch {
+    return undefined;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host !== 'facebook.com' && !host.endsWith('.facebook.com')) return undefined;
+  if (!/^\/tr\/?$/.test(parsed.pathname)) return undefined;
+  const id = parsed.searchParams.get('id') ?? '';
+  return /^\d{6,}$/.test(id) ? id : undefined;
+}
+
+/**
  * Parse a tag's attribute string into name → value.
  *
  * Anchoring a regex at `type=` or `src=` inside the raw tag text kept binding to the wrong
@@ -327,7 +355,7 @@ export function detectMetaPixels(html: string): string[] {
    * beacon URL anywhere else is documentation that fires nothing.
    */
   for (const tag of html.matchAll(/<img\b([^>]*)>/gi)) {
-    const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(parseTagAttributes(tag[1]).get('src') ?? '')?.[1];
+    const id = beaconPixelId(parseTagAttributes(tag[1]).get('src') ?? '');
     if (id) found.add(`PIXEL:${id}`);
   }
 

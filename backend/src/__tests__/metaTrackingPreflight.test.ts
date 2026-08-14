@@ -650,3 +650,34 @@ describe('detectMetaPixels — scripts inside noscript never run', () => {
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 15. The beacon was matched as a SUBSTRING of the src, so any URL that
+ * merely contained `facebook.com/tr?id=<pixel>` — a proxy/redirect query parameter, or a
+ * lookalike path on someone else's host — counted as an install. The request has to actually
+ * go to Meta, so the src is parsed and its host checked.
+ */
+describe('detectMetaPixels — the beacon must actually address Meta', () => {
+  it('ignores a third-party URL carrying the beacon as a query parameter', () => {
+    expect(detectMetaPixels(
+      `<img src="https://analytics.example.com/proxy?u=https://www.facebook.com/tr?id=${PIXEL}"/>`,
+    )).toEqual([]);
+  });
+
+  it('ignores a lookalike host with the beacon in its path', () => {
+    expect(detectMetaPixels(`<img src="https://cdn.example.com/www.facebook.com/tr?id=${PIXEL}"/>`)).toEqual([]);
+  });
+
+  it('ignores a domain that merely ends in something facebook-ish', () => {
+    expect(detectMetaPixels(`<img src="https://notfacebook.com/tr?id=${PIXEL}"/>`)).toEqual([]);
+  });
+
+  it('accepts the real beacon on www.facebook.com', () => {
+    expect(detectMetaPixels(`<img src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('accepts it on the bare domain and protocol-relative form', () => {
+    expect(detectMetaPixels(`<img src="https://facebook.com/tr?id=${PIXEL}"/>`)).toEqual([`PIXEL:${PIXEL}`]);
+    expect(detectMetaPixels(`<img src="//www.facebook.com/tr?id=${PIXEL}"/>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});
