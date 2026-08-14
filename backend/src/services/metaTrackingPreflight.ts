@@ -88,8 +88,23 @@ export function detectMetaPixels(html: string): string[] {
     .replace(/&lt;script[\s\S]*?&lt;\/script&gt;/gi, ' ')
     .replace(/&lt;[\s\S]{0,400}?&gt;/g, ' ');
 
-  // fbq('init', '123456789012345') — quotes may be single or double, whitespace arbitrary.
-  for (const m of html.matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
+  /*
+   * An `fbq('init', …)` only measures anything if it EXECUTES, so look for it inside
+   * executable <script> blocks rather than anywhere in the document. Scanning the whole
+   * page treats prose, JSON config and JS string literals as an install — the "inert pixel
+   * text" false pass. Blocks with a `type` that is not JavaScript (text/template,
+   * application/json, text/x-handlebars) are markup or data, never executed, so they are
+   * excluded too.
+   */
+  const executableScripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
+    .filter(m => {
+      const type = /type\s*=\s*['"]([^'"]+)['"]/i.exec(m[1] || '')?.[1]?.toLowerCase();
+      return !type || /javascript|ecmascript|module/.test(type);
+    })
+    .map(m => m[2])
+    .join('\n');
+
+  for (const m of executableScripts.matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
     found.add(`PIXEL:${m[1]}`);
   }
   // The <noscript> fallback image: facebook.com/tr?id=123456789012345

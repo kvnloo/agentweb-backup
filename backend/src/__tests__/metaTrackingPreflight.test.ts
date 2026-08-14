@@ -26,7 +26,9 @@ src="https://www.facebook.com/tr?id=${id}&ev=PageView&noscript=1"/></noscript>
 
 describe('detectMetaPixels', () => {
   it('finds a pixel id from an fbq init call', () => {
-    expect(detectMetaPixels(`fbq('init', '${PIXEL}');`)).toEqual([`PIXEL:${PIXEL}`]);
+    // Wrapped in <script> because that is the only place an fbq call executes — a bare
+    // fragment is prose, and treating it as an install is the false pass Greptile found.
+    expect(detectMetaPixels(`<script>fbq('init', '${PIXEL}');</script>`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 
   it('finds a pixel id from the noscript tracking image', () => {
@@ -36,7 +38,7 @@ describe('detectMetaPixels', () => {
   });
 
   it('accepts double-quoted init calls and arbitrary whitespace', () => {
-    expect(detectMetaPixels(`fbq(  "init" ,   "${PIXEL}" )`)).toEqual([`PIXEL:${PIXEL}`]);
+    expect(detectMetaPixels(`<script>fbq(  "init" ,   "${PIXEL}" )</script>`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 
   it('de-duplicates a pixel that appears in both the script and the noscript fallback', () => {
@@ -255,5 +257,40 @@ describe('inert pixel text is not an install (ENG-941, Greptile)', () => {
       fetchHtml: fetchOk(`<html><head>${pixelHtml(PX)}</head><body><pre>fbq('init','999999999')</pre></body></html>`),
     });
     expect(g.results[0].status).toBe('measured');
+  });
+});
+
+describe('only executable script counts (ENG-941, Greptile round 2)', () => {
+  const fetchOk = (html: string) => async () => html;
+  const PX2 = '1012387921717047';
+
+  it('ignores a pixel id sitting in a JSON config block', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX2], {
+      fetchHtml: fetchOk(`<html><head><script type="application/json">{"snippet":"fbq('init','${PX2}')"}</script></head></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('ignores a pixel inside a non-executing template block', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX2], {
+      fetchHtml: fetchOk(`<html><head><script type="text/template">fbq('init','${PX2}');</script></head></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('ignores an fbq call written in plain prose outside any script', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX2], {
+      fetchHtml: fetchOk(`<html><body><p>Paste fbq('init', '${PX2}') into your head tag.</p></body></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('still detects a real install, including type="module" and no-type scripts', async () => {
+    for (const attr of ['', ' type="text/javascript"', ' type="module"']) {
+      const g = await preflightMetaTrackingGate(['https://s/lp'], [PX2], {
+        fetchHtml: fetchOk(`<html><head><script${attr}>fbq('init','${PX2}');</script></head></html>`),
+      });
+      expect(g.results[0].status).toBe('measured');
+    }
   });
 });
