@@ -109,4 +109,37 @@ describe("fetchGoogleAnalyticsMetrics — topPagesBySessions", () => {
       "userEngagementDuration",
     ]);
   });
+
+  it("does not present a failed sessions query as an empty (zero-page) ranking", async () => {
+    mockRunReport.mockImplementation(async (req: any) => {
+      const orderMetric = req.orderBys?.[0]?.metric?.metricName;
+      const dimensionNames = (req.dimensions || []).map((d: any) => d.name);
+
+      if (dimensionNames.includes("pagePath")) {
+        if (orderMetric === "userEngagementDuration") {
+          return [{ rows: [HIGH_ENGAGEMENT_PAGE] }];
+        }
+        if (orderMetric === "sessions") {
+          throw new Error("GA4 quota exceeded");
+        }
+      }
+      return [{ rows: [] }];
+    });
+
+    const resolvedConfig = {
+      properties: [{ propertyId: "123456789", label: "Main Site" }],
+      clarityProjects: [],
+      gaFilteredDomains: [],
+    } as any;
+
+    const result = await fetchGoogleAnalyticsMetrics("user-1", "30d", undefined, resolvedConfig);
+    const propertyMetrics = result.metrics[0];
+
+    // A silent [] here would read as "GA4 confirms zero session data" — indistinguishable
+    // from a real empty result. The field must be absent, with the failure surfaced instead.
+    expect(propertyMetrics.topPagesBySessions).toBeUndefined();
+    expect(propertyMetrics.topPagesBySessionsError).toEqual(expect.stringContaining("Could not fetch"));
+    // The engagement query succeeding independently must still come through.
+    expect(propertyMetrics.topPagesByEngagement).toHaveLength(1);
+  });
 });
