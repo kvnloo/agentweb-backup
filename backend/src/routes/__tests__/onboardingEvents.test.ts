@@ -484,6 +484,22 @@ describe("GET /api/onboarding/events/me", () => {
     expect(res.body.onboardingStage).toBeNull();
   });
 
+  it("preserves a legacy signed_up_no_start stage for mixed history on read", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingEvents: [
+        { event: "signed_up", ts: "2026-04-18T10:00:00Z" },
+        { event: "voice_onboarding_presented", ts: "2026-04-18T10:01:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app).get("/api/onboarding/events/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("signed_up_no_start");
+  });
+
   it("returns 404 when user is missing", async () => {
     mockGetUserById.mockResolvedValueOnce(undefined);
     const app = makeApp();

@@ -219,12 +219,17 @@ router.get("/events/me", authenticateToken, async (req, res) => {
     const derivedStage = deriveOnboardingStage(events, {
       lastActiveAt: (user as any).lastActiveAt,
     });
+    const hasPriorLifecycleEvent = events.some(
+      (item) => !LATERAL_ONBOARDING_EVENTS.has(item?.event),
+    );
     const hasLateralEvent = events.some((item) =>
       LATERAL_ONBOARDING_EVENTS.has(item?.event),
     );
     const stage = hasPersistedStage
       ? (user as any).onboardingStage
-      : hasLateralEvent && derivedStage === "signed_up_no_start"
+      : hasLateralEvent &&
+          !hasPriorLifecycleEvent &&
+          derivedStage === "signed_up_no_start"
         ? null
         : derivedStage;
     return res.json({
