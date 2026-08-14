@@ -33,6 +33,14 @@ const MAX_EVENTS_PER_USER = 50;
 // Cap per-event payload to prevent abuse / runaway DynamoDB item size.
 const MAX_DATA_BYTES = 2048;
 
+// These beta funnel signals are analytics-only. They are persisted in the
+// event log, but must never create a lifecycle transition or timeline entry.
+const LATERAL_ONBOARDING_EVENTS = new Set([
+  "voice_onboarding_presented",
+  "voice_onboarding_started",
+  "voice_onboarding_text_fallback",
+]);
+
 /**
  * POST /api/onboarding/events
  * Body: { event: string, data?: object }
@@ -116,7 +124,12 @@ router.post("/events", authenticateToken, async (req, res) => {
 
     // Mirror stage transitions into the contact activity timeline.
     // Fire-and-forget — must never break the onboarding event handler.
-    if (newStage && newStage !== previousStage && user.email) {
+    if (
+      newStage &&
+      newStage !== previousStage &&
+      !LATERAL_ONBOARDING_EVENTS.has(event) &&
+      user.email
+    ) {
       onOnboardingStageChanged({
         userId,
         email: user.email,

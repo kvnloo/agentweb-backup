@@ -101,6 +101,36 @@ describe("POST /api/onboarding/events", () => {
     );
   });
 
+  it("does not emit a lifecycle transition for a first voice beta event", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "voice_onboarding_presented" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("signed_up_no_start");
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
+  it("keeps the existing lifecycle stage unchanged for later voice events", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingStage: "goal_selected",
+      onboardingEvents: [
+        { event: "goal_selected", ts: "2026-04-18T10:00:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "voice_onboarding_started" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("goal_selected");
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
   it("appends to an existing event log", async () => {
     mockGetUserById.mockResolvedValueOnce({
       userId: "user-123",
