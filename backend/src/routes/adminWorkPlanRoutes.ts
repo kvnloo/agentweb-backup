@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import sharp from "sharp";
 import { workPlanService } from "../services/workPlanService";
-import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
+import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -115,8 +115,101 @@ router.put("/:planId", async (req, res) => {
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
-    const normalizedSteps = normalized?.steps;
+    let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
+
+    // ENG-1221. These guards used to live only inside manage_predefined_work_plan,
+    // one layer ABOVE the write — so a caller reaching this endpoint directly got
+    // no protection, `steps_mode` silently ignored, and every omitted field on a
+    // partial steps array erased. That destroyed all ten step descriptions on the
+    // Google Pre-Launch Gate plan and answered HTTP 200 with a null diff.
+    // The rules now live where the damage happens, and the tool shares them.
+    let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+    if (normalizedSteps !== undefined) {
+      const rawMode = (req.body as any).steps_mode ?? (req.body as any).stepsMode;
+      if (rawMode !== undefined && rawMode !== 'merge' && rawMode !== 'replace') {
+        // Never accept-and-disregard: the caller believes a merge happened.
+        return res.status(400).json({
+          message: `Unrecognised steps_mode "${rawMode}". Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
+        });
+      }
+      const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
+      const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
+
+      if (mode === 'merge') {
+        const ambiguous = findAmbiguousMergeTargets(existingSteps, normalizedSteps);
+        if (ambiguous.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: a step title matches more than one step, so there is no way to tell which one to amend.',
+            ambiguousSteps: ambiguous,
+            howToProceed: ['Retry with stepCount on each ambiguous step to name the one you mean.'],
+          });
+        }
+        const conflicting = findConflictingMergeTargets(existingSteps, normalizedSteps);
+        if (conflicting.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.',
+            conflictingSteps: conflicting,
+            howToProceed: ['Combine the changes for each step into a single entry, then retry.'],
+          });
+        }
+        // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
+        // becomes "Step N", the two list fields become []. Merging that would
+        // write those invented values over the real ones, which is the same
+        // data loss by a different route: it is exactly how the Pre-Launch Gate
+        // titles were truncated from "Step 1: Scope the launch" to "Step 1".
+        // So merge only the fields the caller genuinely supplied, using the
+        // normalized values (for alias canonicalisation, ENG-889) but the raw
+        // payload as the authority on which keys were present.
+        const rawSteps: any[] = steps;
+        const supplied = normalizedSteps.map((norm: any, i: number) => {
+          const raw = rawSteps[i] ?? {};
+          const has = (...keys: string[]) => keys.some((k) => raw[k] !== undefined);
+          const out: any = { stepCount: norm.stepCount };
+          if (has('title', 'step_title')) out.title = norm.title;
+          if (has('description')) out.description = norm.description;
+          if (has('userInstructions', 'user_instructions')) out.userInstructions = norm.userInstructions;
+          if (has('requiredFunctionCalls', 'required_function_calls')) out.requiredFunctionCalls = norm.requiredFunctionCalls;
+          if (has('skillIds', 'skill_ids')) out.skillIds = norm.skillIds;
+          if (has('expectedAssetCount', 'expected_asset_count')) out.expectedAssetCount = norm.expectedAssetCount;
+          return out;
+        });
+        normalizedSteps = mergeWorkPlanSteps(existingSteps, supplied);
+      } else if (req.body.confirm_step_removal !== true) {
+        // A replace stores exactly what was sent, so both a shrink and a
+        // gutting of the steps it keeps are destructive. Refuse either.
+        if (normalizedSteps.length < existingSteps.length) {
+          const preview = summarizeStepChange(existingSteps, normalizedSteps, 'replace');
+          return res.status(400).json({
+            message: `Refusing to update: this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+            stepsWouldBeRemoved: preview.stepsRemoved,
+            removedStepTitles: preview.droppedStepTitles,
+            howToProceed: [
+              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+              'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true.',
+            ],
+          });
+        }
+        const contentLoss = findStepContentLoss(existingSteps, normalizedSteps);
+        if (contentLoss.length > 0) {
+          return res.status(400).json({
+            message: `Refusing to update: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+            stepsWouldBeRemoved: 0,
+            stepContentLoss: contentLoss,
+            howToProceed: [
+              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+              'To keep these steps as they are, re-send each one with its current fields.',
+              'To intentionally clear them, retry with confirm_step_removal=true.',
+            ],
+          });
+        }
+      }
+
+      // AC3: a step change always reports a diff. A 200 with a null diff used to
+      // be indistinguishable from a successful no-op, which is exactly why a
+      // destructive write could pass unnoticed.
+      stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
+    }
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
@@ -134,7 +227,13 @@ router.put("/:planId", async (req, res) => {
     // `updated` was built by spreading the plan we read, so it carries the
     // pre-write revision. Answer with the one the write produced.
     const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
-    const saved = { ...updated, steps_rev };
+    const saved = {
+      ...updated,
+      steps_rev,
+      // ENG-1221 AC3 — always surface the diff when steps moved, so a
+      // destructive write can never read as a successful no-op.
+      ...(stepsChange && { stepsChange }),
+    };
     res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
     // A competing write landed between the caller's read and this one, so the
