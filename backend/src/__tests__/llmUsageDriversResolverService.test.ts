@@ -236,6 +236,33 @@ describe("resolveUsageDrivers", () => {
     expect(rec.estimatedDaysRecovered).toBe(313);
   });
 
+  it("does not let a mismetered $0 row penalise the recommendation", async () => {
+    // A model gains its price entry separately from its registry entry (see the
+    // "Adding a New Bedrock/Vertex Claude Model" runbook), and until it lands
+    // `computeCostMicroUsd` returns 0 while the token counts are still written.
+    // Repricing those tokens pushed the counterfactual day ABOVE the observed
+    // day — the estimate was charged for a metering gap rather than a price
+    // difference, and the customer was quoted fewer days than switching gives.
+    //
+    // Invariant: a row that consumed none of the allowance cannot change the
+    // recovery, in either direction.
+    const base = opusLedger();
+    mockQuery.mockResolvedValueOnce(base);
+    const clean = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    mockQuery.mockResolvedValueOnce([
+      ...base,
+      // Same day, same model, recorded before pricing existed.
+      { ...base[9], sk: base[9].sk.replace("agent_task", "chat"), feature: "chat", costMicroUsd: 0 },
+    ]);
+    const withMismetered = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    const pick = (r: Awaited<ReturnType<typeof resolveUsageDrivers>>) =>
+      r.recommendations.find((x) => x.toModel === HAIKU)!.estimatedDaysRecovered;
+    expect(pick(clean)).toBeGreaterThan(0);
+    expect(pick(withMismetered)).toBe(pick(clean));
+  });
+
   it("still reports drivers when no forecast is possible, just without day counts", async () => {
     // Day one of a cycle: spend exists but no complete day, so the runway
     // withholds a forecast. Drivers are still true and useful.

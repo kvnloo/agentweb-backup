@@ -200,6 +200,36 @@ describe("estimateModelSavings — counterfactual repricing (ENG-1213 AC3)", () 
     })).toBeNull();
   });
 
+  it("ignores rows recorded at zero cost, which consumed none of the allowance", () => {
+    // `computeCostMicroUsd` returns 0 for a model with no price entry but still
+    // writes the token counts, so a model priced MID-CYCLE carries token-bearing
+    // $0 rows for the rest of that cycle. Repricing those tokens invents a cost
+    // for the target on one side of a comparison whose other side is literally
+    // zero — which understates the saving, and on a model whose rows are mostly
+    // mismetered flips it negative and suppresses the recommendation outright.
+    const est = estimateModelSavings(
+      [
+        row({ inputTokens: 1_000_000, outputTokens: 0, costMicroUsd: 5 * USD }),
+        // Identical usage, recorded before the price entry landed.
+        row({ inputTokens: 1_000_000, outputTokens: 0, costMicroUsd: 0 }),
+      ],
+      { fromModel: "anthropic.claude-opus-5", toModel: "anthropic.claude-haiku-4-5-20251001-v1:0" },
+    );
+    // Only the priced row is repriced: 1M input at haiku's $1/1M.
+    expect(est!.observedCostMicroUsd).toBe(5 * USD);
+    expect(est!.estimatedCostMicroUsd).toBe(1 * USD);
+    expect(est!.estimatedSavingsMicroUsd).toBe(4 * USD);
+  });
+
+  it("withholds an estimate when every row for the model was recorded at zero cost", () => {
+    // Nothing was charged, so there is no saving to claim — and no basis for
+    // asserting the target would have been dearer either.
+    expect(estimateModelSavings(
+      [row({ inputTokens: 1_000_000, outputTokens: 0, costMicroUsd: 0 })],
+      { fromModel: "anthropic.claude-opus-5", toModel: "anthropic.claude-haiku-4-5-20251001-v1:0" },
+    )).toBeNull();
+  });
+
   it("never proposes switching a model to itself", () => {
     expect(estimateModelSavings(opusRows, {
       fromModel: "anthropic.claude-opus-5",

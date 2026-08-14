@@ -160,7 +160,20 @@ export function estimateModelSavings(
   // on a screen that asks someone to change how their account runs.
   if (!fromPrice || !toPrice) return null;
 
-  const source = rows.filter((r) => (r.model || "").trim() === fromModel);
+  // Rows recorded at zero cost are excluded, not repriced. `computeCostMicroUsd`
+  // returns 0 for a model with no price entry but still writes the token counts,
+  // so a model that gains its price MID-CYCLE carries token-bearing $0 rows for
+  // the rest of that cycle (the registry entry and the pricing entry are separate
+  // steps in the add-a-model runbook). Repricing those tokens would invent a cost
+  // for the target on one side of a comparison whose other side is literally
+  // zero, so the "saving" would measure a metering gap rather than a price
+  // difference — understating it, or on a mostly-mismetered model flipping it
+  // negative and suppressing a genuinely good recommendation.
+  //
+  // A row that consumed none of the allowance can neither save nor add any.
+  const source = rows.filter(
+    (r) => (r.model || "").trim() === fromModel && (r.costMicroUsd || 0) > 0,
+  );
   if (source.length === 0) return null;
 
   let observed = 0;
@@ -168,14 +181,15 @@ export function estimateModelSavings(
   let output = 0;
   let cacheRead = 0;
   let cacheWrite = 0;
+  // Every surviving row costs something, so `observed` is necessarily > 0 — the
+  // "nothing to reprice" case is already handled by the empty-source check above.
   for (const r of source) {
-    observed += Math.max(0, r.costMicroUsd || 0);
+    observed += r.costMicroUsd;
     input_ += r.inputTokens || 0;
     output += r.outputTokens || 0;
     cacheRead += r.cacheReadTokens || 0;
     cacheWrite += r.cacheWriteTokens || 0;
   }
-  if (observed === 0 && input_ + output + cacheRead + cacheWrite === 0) return null;
 
   // `tokens * ratePerMillion` already yields MICRO-USD: a rate is USD per 1e6
   // tokens, so the 1e6 in the rate's denominator and the 1e6 in a micro-dollar
