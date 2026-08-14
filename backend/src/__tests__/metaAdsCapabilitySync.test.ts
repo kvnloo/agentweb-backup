@@ -329,14 +329,72 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
     });
 
-    it('is a no-op when the refusal is already on record', async () => {
+    it('is a no-op when the refusal is already on record and the tier is already known', async () => {
       // An account the agent path already caught is already reported as
       // degraded by every surface; there is nothing left to record.
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
 
+      const result = await syncMetaAdsCapability(
+        metaAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_tier: 'asset',
+        }),
+        'user1'
+      );
+
+      expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The account production 922903076601160 was actually found in: latched
+     * 'missing' since before tier classification shipped. The confirm-branch
+     * above is the only place tier is ever computed, and an already-'missing'
+     * account never reaches it again through the normal suspect-then-confirm
+     * path while it stays denied — without this backfill, it would carry the
+     * generic OAuth-tier message forever, the exact account this whole
+     * feature was built for never actually benefiting from it.
+     */
+    it('backfills the tier for an account latched before tier classification existed', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount(); // no ads_scope_tier — the real production shape
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('unchanged'); // nothing user-visible changes...
+      expect(mockClassifyAdsRefusalTier).toHaveBeenCalledWith('EAA-token');
+      expect(account.config.ads_scope_tier).toBe('asset'); // ...but the tier is now known
+      const configSnapshot = { ...account.config, ads_scope_tier: undefined };
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates.ads_scope_tier).toBe('asset');
+    });
+
+    it('does not backfill when the tier cannot be determined', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
+
       const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
 
       expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('does not re-backfill an account whose tier is already recorded', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+
+      await syncMetaAdsCapability(
+        metaAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_tier: 'oauth',
+        }),
+        'user1'
+      );
+
+      expect(mockClassifyAdsRefusalTier).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
   });
