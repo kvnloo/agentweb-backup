@@ -304,6 +304,14 @@ import {
   validateNegativeCampaignCriteria,
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
+import {
+  isMetaSpendStartingWrite,
+  runMetaTrackingGate,
+  collectPendingDestinations,
+  collectPendingCreativeIds,
+  computeTrackingOverrideDigest,
+  trackingOverrideTokenMatches,
+} from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
@@ -18344,6 +18352,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
     }
 
+    /*
+     * ENG-941: waiving the tracking check is the single most consequential thing that can
+     * ride along in these params, and it was invisible here. Per ENG-388 the override is
+     * user-granted — but "user-granted" means nothing if the confirmation the user approves
+     * never mentions it. Surfaced in the summary so approving a launch cannot silently
+     * approve launching without measurement.
+     */
+    if (params?.override_tracking_check === true) {
+      target.override_tracking_check = true;
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
+
     return { summary: lines.join(' '), target };
   }
 
@@ -18722,7 +18745,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
     // gate-only flag and is stripped before dispatch so it never reaches Meta.
     const confirmed = params.confirm === true;
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+    /*
+     * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
+     * the confirmed execution are two separate calls with separately supplied params, so a
+     * model could preview a plain activation, let the user approve THAT, and then add
+     * `override_tracking_check` to the replay — waiving the measurement check on something
+     * the user was never told would skip it. An override the model can introduce after
+     * approval is not user-granted, whatever the tool description says.
+     *
+     * So the override is bound to the approval: a preview that carries one issues an HMAC
+     * over that exact call, and the override only counts when the replay presents that token
+     * back. No token, a forged token, or a token for different arguments all fall back into
+     * a fresh preview — which discloses the override and issues the matching token, so the
+     * path is a loop rather than a dead end. Nothing changes for a launch that waives
+     * nothing: those never need a token.
+     */
+    const overrideClaimed = (params as any)?.override_tracking_check === true;
+    const overrideDigest = overrideClaimed
+      ? computeTrackingOverrideDigest(getJwtSecret(), {
+          entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+        })
+      : '';
+    const overrideApproved =
+      overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
@@ -18745,13 +18791,77 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          (overrideClaimed
+            ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
+              `WARNING above and approve it explicitly; the replay must additionally carry ` +
+              `params.tracking_override_token exactly as returned here, or the override will not apply.`
+            : ''),
+        // Only issued when an override was actually described in this preview, so it can only
+        // ever approve a waiver the user was shown.
+        ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
         target
       } as any;
     }
     if ('confirm' in params) {
       params = { ...params };
       delete params.confirm;
+    }
+    if ('tracking_override_token' in params) {
+      params = { ...params };
+      delete (params as any).tracking_override_token;
+    }
+
+    /*
+     * ENG-941: deterministic pre-flight tracking gate.
+     *
+     * Placed here, at the shared write path, rather than on the two named launch tools.
+     * This method can flip a campaign, ad set or ad to ACTIVE directly, so a gate that
+     * only guarded those tools could be bypassed by choosing this one instead — and a
+     * safety gate you can route around is not a safety gate.
+     *
+     * `override_tracking_check` is stripped from params before dispatch for the same
+     * reason `confirm` is above: it is our flag, not a Meta field, and must never reach
+     * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
+     * only override path — no portal control — and it is recorded on the run record.
+     *
+     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
+     * so it only runs on a confirmed call. The two ask different questions — that gate
+     * asks "did a human intend this?", this one asks "can it report a conversion?" —
+     * and doing the network checks on an unconfirmed preview would waste them.
+     */
+    // Reaching here with an override means it survived the binding check above, so it is one
+    // the user was shown and approved — never one the model added to the replay.
+    const overrideTrackingCheck = overrideApproved;
+    if (params && typeof params === 'object' && 'override_tracking_check' in params) {
+      params = { ...params };
+      delete (params as any).override_tracking_check;
+    }
+    if (isMetaSpendStartingWrite(entity_type, action, params)) {
+      const gateCreds = await this.getMetaCredentials(userId, account_id);
+      const gate = await runMetaTrackingGate(
+        gateCreds,
+        campaign_id,
+        `${entity_type}_${action}`,
+        overrideTrackingCheck,
+        sessionId,
+        {},
+        // Activating one ad is judged on that ad's own destination, not its siblings'.
+        entity_type === 'AD' ? ad_id : undefined,
+        /*
+         * An ad being CREATED as ACTIVE has no entry in the ad list yet, so its destination
+         * has to come from the request itself or it ships unchecked. Meta carries the
+         * destination on the creative, which is why several shapes are possible here.
+         */
+        collectPendingDestinations(entity_type, action, params),
+        /*
+         * And when the ad references an existing creative by id instead of inlining one —
+         * the documented path — the destination is on that creative, so the gate resolves
+         * it through Graph rather than checking nothing.
+         */
+        collectPendingCreativeIds(entity_type, action, params),
+      );
+      if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
     switch (entity_type) {
@@ -19380,6 +19490,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
       lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
     }
+    /*
+     * ENG-941: the preview_token now covers `override_tracking_check`, so the override
+     * cannot be added after approval — but binding it to an approval that never mentioned
+     * it just moves the hole. The user has to be told what they are waiving, in the text
+     * they actually read, or "user-granted" means nothing. Same wording as the shared write
+     * path's confirmation, deliberately: one sentence for one decision.
+     */
+    if (args?.override_tracking_check === true) {
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
     return lines.join(' ');
   }
 
@@ -19459,6 +19582,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lookalike_country: args.lookalike_country,
       exclude_audience_id: args.exclude_audience_id,
       ad_set_params: args.ad_set_params,
+      /*
+       * ENG-941 (Greptile security P1): the override was NOT part of what the preview token
+       * signed, so it could be added to the confirmed replay without changing the digest —
+       * waiving the tracking check on a launch the user approved without one. Including it
+       * means adding it invalidates the approval and forces a fresh, disclosing preview.
+       */
+      override_tracking_check: args.override_tracking_check === true,
     };
     return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
   }
@@ -19618,6 +19748,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workflow: 'targeted_audience' | 'retargeting',
     source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
   ): Promise<any> {
+      /*
+       * ENG-941: the named ENG-600 launch flows create their ad set directly rather than
+       * going through callMetaMarketingApi, so the gate there does not cover them. Without
+       * this, these two tools are the bypass.
+       *
+       * Ad sets default to PAUSED (metaService: `status: params.status || 'PAUSED'`), so a
+       * launch only starts paid delivery when the caller explicitly asks for ACTIVE — which
+       * is exactly what isMetaSpendStartingWrite tests. Reusing that predicate keeps one
+       * definition of "this spends money" instead of a second, drifting copy.
+       *
+       * Runs after the confirmation step above and before anything is created, so a blocked
+       * launch leaves no audience, lookalike or ad set behind.
+       */
+      if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
+        const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        const gate = await runMetaTrackingGate(
+          gateCreds,
+          args.campaign_id,
+          `${workflow.toUpperCase()}_LAUNCH`,
+          args?.override_tracking_check === true,
+          args?.session_id,
+        );
+        if (!gate.proceed) return gate.blockResult;
+      }
+
       const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
 
       let attachAudienceId = seed.audience!.id;
