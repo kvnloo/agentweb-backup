@@ -417,3 +417,41 @@ describe('detectMetaPixels — regex literals and inert containers', () => {
     )).toEqual([]);
   });
 });
+
+/*
+ * Greptile P1, round 6. Two narrower versions of the same two holes: a regex in a
+ * KEYWORD-led expression position (`return /…/`), which a character-only allowlist cannot
+ * see, and the tracking URL sitting in a non-source attribute of an <img>, which the
+ * browser never requests.
+ */
+describe('detectMetaPixels — keyword-led regex and non-source attributes', () => {
+  it('ignores a pixel-shaped regex returned from a function', () => {
+    expect(detectMetaPixels(
+      `<script>function p(){ return /fbq('init','${PIXEL}')/; }</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores a pixel-shaped regex in other keyword positions', () => {
+    expect(detectMetaPixels(`<script>if (typeof /fbq('init','${PIXEL}')/ === 'object') x();</script>`)).toEqual([]);
+    expect(detectMetaPixels(`<script>switch (s) { case /fbq('init','${PIXEL}')/: break; }</script>`)).toEqual([]);
+  });
+
+  it('does not treat an identifier ending in a keyword as a regex position', () => {
+    // `myreturn / 2` is division; mis-reading it would swallow the real install after it.
+    expect(detectMetaPixels(
+      `<script>var x = myreturn / 2; fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('ignores the tracking URL in an inert attribute of an image', () => {
+    expect(detectMetaPixels(
+      `<img src="/logo.png" data-doc="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/>`,
+    )).toEqual([]);
+  });
+
+  it('still detects the beacon when the tracking URL IS the src', () => {
+    expect(detectMetaPixels(
+      `<img data-note="example" src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

@@ -95,12 +95,22 @@ export function stripInertJavaScript(src: string): string {
    * the next slash, which is how a scrubber starts causing false blocks.
    */
   const REGEX_START_AFTER = new Set(['', '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '~', '^', '<', '>', '\n']);
+  /*
+   * A regex can also follow a KEYWORD (`return /…/`, `typeof /…/`, `case /…/`), where the
+   * previous significant character is a plain letter and the set above says "division".
+   * Matched on a word boundary so an identifier merely ENDING in a keyword (`myreturn / 2`)
+   * stays arithmetic — mis-reading that would swallow the live code after it.
+   */
+  const REGEX_START_AFTER_KEYWORD = /\b(return|typeof|instanceof|case|in|of|do|else|void|delete|new|yield|await|throw)$/;
   let prevSignificant = '';
+  let sinceLineStart = '';
   let out = '';
   let i = 0;
   while (i < src.length) {
     const c = src[i];
-    if (c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*' && REGEX_START_AFTER.has(prevSignificant)) {
+    const regexPosition =
+      REGEX_START_AFTER.has(prevSignificant) || REGEX_START_AFTER_KEYWORD.test(sinceLineStart.trimEnd());
+    if (c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*' && regexPosition) {
       // A regex literal is real code, but a PATTERN never initializes a pixel — matching
       // `fbq('init', …)` is in fact what a consent-manager or a scanner does. Dropped
       // wholesale rather than inspected: there is no case where keeping one adds signal.
@@ -117,6 +127,7 @@ export function stripInertJavaScript(src: string): string {
       if (terminated) {
         out += ' ';
         prevSignificant = ' ';
+        sinceLineStart += ' ';
         i = j + 1;
         continue;
       }
@@ -126,6 +137,7 @@ export function stripInertJavaScript(src: string): string {
     if (c === '/' && src[i + 1] === '/') {
       while (i < src.length && src[i] !== '\n') i++;
       prevSignificant = '\n';
+      sinceLineStart = '';
       continue;
     }
     if (c === '/' && src[i + 1] === '*') {
@@ -151,11 +163,13 @@ export function stripInertJavaScript(src: string): string {
       out += isInert(body) ? ' ' : c + body + (closed ? c : '');
       // A string is a VALUE, so a `/` after it is division, never a regex.
       prevSignificant = c;
+      sinceLineStart += c;
       i = closed ? j + 1 : j;
       continue;
     }
     out += c;
     if (c === '\n' || !/\s/.test(c)) prevSignificant = c;
+    sinceLineStart = c === '\n' ? '' : sinceLineStart + c;
     i++;
   }
   return out;
@@ -231,8 +245,12 @@ export function detectMetaPixels(html: string): string[] {
    * quoting it, a dashboard printing it — as an install, which is the same inert-text false
    * pass the script scan above exists to prevent, one element type over.
    */
-  for (const m of html.matchAll(/<img\b[^>]*facebook\.com\/tr\?id=(\d{6,})/gi)) {
-    found.add(`PIXEL:${m[1]}`);
+  for (const m of html.matchAll(/<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+    const src = m[1] ?? m[2] ?? m[3] ?? '';
+    // The URL has to be what the browser REQUESTS. Sitting in a data- attribute (or any
+    // other attribute) it is documentation, and no tracking request is ever made.
+    const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(src)?.[1];
+    if (id) found.add(`PIXEL:${id}`);
   }
 
   return [...found];
