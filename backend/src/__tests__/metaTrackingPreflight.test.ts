@@ -591,3 +591,35 @@ describe('detectMetaPixels — external scripts ignore their inline body', () =>
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 13. The script-type matcher took the first `type=` SUBSTRING in the
+ * attribute string, so metadata containing `type="text/javascript"` shadowed the tag's real
+ * `type="text/template"`. Identical shape to the <img src> finding in round 9 — fixed the
+ * same way, by walking attributes rather than anchoring inside the raw tag text.
+ */
+describe('detectMetaPixels — attribute values cannot impersonate the type', () => {
+  it('ignores a template script whose metadata mentions an executable type', () => {
+    expect(detectMetaPixels(
+      `<script data-note='type="text/javascript"' type="text/template">fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores one where the impersonating text comes from a src-shaped attribute', () => {
+    expect(detectMetaPixels(
+      `<script data-doc="type=text/javascript src=x" type=text/x-template>fbq('init','${PIXEL}')</script>`,
+    )).toEqual([]);
+  });
+
+  it('still executes a real script carrying unrelated metadata', () => {
+    expect(detectMetaPixels(
+      `<script data-note='type="text/template"' type="text/javascript">fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('does not treat a src mentioned inside another attribute as an external script', () => {
+    expect(detectMetaPixels(
+      `<script data-doc='src="/app.js"'>fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

@@ -198,6 +198,25 @@ export function stripInertJavaScript(src: string): string {
  * counting it would make this gate pass exactly the pages it exists to catch.
  */
 /**
+ * Parse a tag's attribute string into name → value.
+ *
+ * Anchoring a regex at `type=` or `src=` inside the raw tag text kept binding to the wrong
+ * thing — first `data-src`, then serialized markup inside another attribute's VALUE, then
+ * metadata mentioning `type="text/javascript"` ahead of the real `type="text/template"`.
+ * Consuming each value as a unit makes all of those unreachable by construction, which no
+ * amount of anchoring on a flat string can achieve. First occurrence wins, matching how a
+ * browser treats a duplicated attribute.
+ */
+function parseTagAttributes(attrs: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const m of (attrs || '').matchAll(/([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+    const name = m[1].toLowerCase();
+    if (!out.has(name)) out.set(name, m[2] ?? m[3] ?? m[4] ?? '');
+  }
+  return out;
+}
+
+/**
  * The script types a browser actually executes.
  *
  * Substring matching was the bug: `text/javascript-template` and
@@ -263,13 +282,13 @@ export function detectMetaPixels(html: string): string[] {
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (_full, attrs: string, body: string) => {
     // All three attribute-value forms, not just the quoted one: `<script type=text/template>`
     // is valid HTML, and matching only quoted values read it as executable.
-    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs || '');
-    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3])?.toLowerCase();
+    const parsed = parseTagAttributes(attrs);
+    const type = parsed.get('type')?.toLowerCase();
     // A script with a `src` loads the external file and its inline content is ignored
     // ENTIRELY by the browser, whatever the type says — so a snippet written between those
     // tags never runs. (The external file itself is out of reach here: this gate reads the
     // served HTML rather than following and executing every script it references.)
-    if (/\bsrc\s*=/i.test(attrs || '')) return '<script></script>';
+    if (parsed.has('src')) return '<script></script>';
     if (type && !isExecutableScriptType(type)) return '<script></script>';
     const live = stripInertJavaScript(body);
     executable.push(live);
@@ -300,11 +319,8 @@ export function detectMetaPixels(html: string): string[] {
    * beacon URL anywhere else is documentation that fires nothing.
    */
   for (const tag of html.matchAll(/<img\b([^>]*)>/gi)) {
-    for (const attr of (tag[1] || '').matchAll(/([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
-      if (attr[1].toLowerCase() !== 'src') continue;
-      const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(attr[2] ?? attr[3] ?? attr[4] ?? '')?.[1];
-      if (id) found.add(`PIXEL:${id}`);
-    }
+    const id = /facebook\.com\/tr\?id=(\d{6,})/i.exec(parseTagAttributes(tag[1]).get('src') ?? '')?.[1];
+    if (id) found.add(`PIXEL:${id}`);
   }
 
   return [...found];
