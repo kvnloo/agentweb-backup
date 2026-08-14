@@ -390,7 +390,7 @@ describe('SEO Agent Mode Tools', () => {
         seoDomains: ['example.com'],
       });
 
-      // Mock runReport calls: overall, pages engagement, daily, traffic sources
+      // Mock runReport calls: overall, pages engagement, pages sessions, daily, traffic sources
       mockRunReport
         .mockResolvedValueOnce([{
           rows: [{
@@ -403,7 +403,8 @@ describe('SEO Agent Mode Tools', () => {
             ]
           }]
         }])
-        .mockResolvedValueOnce([{ rows: [] }])
+        .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }])
         .mockResolvedValueOnce([{ rows: [] }]);
 
@@ -490,7 +491,7 @@ describe('SEO Agent Mode Tools', () => {
         seoDomains: ['example.com'],
       });
 
-      // overall, pages engagement, daily, traffic sources (with conversions), conversions-by-source
+      // overall, pages engagement, pages sessions, daily, traffic sources (with conversions), conversions-by-source
       mockRunReport
         .mockResolvedValueOnce([{
           rows: [{
@@ -500,6 +501,7 @@ describe('SEO Agent Mode Tools', () => {
           }]
         }])
         .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }]) // daily
         .mockResolvedValueOnce([{              // traffic sources with conversions
           rows: [{
@@ -528,6 +530,7 @@ describe('SEO Agent Mode Tools', () => {
       mockRunReport
         .mockResolvedValueOnce([{ rows: [] }]) // overall
         .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // pages sessions
         .mockResolvedValueOnce([{ rows: [] }]) // daily
         .mockResolvedValueOnce([{ rows: [] }]) // traffic sources
         .mockResolvedValueOnce([{              // conversions by source+event
