@@ -98,13 +98,13 @@ export function evaluateLlmUsageMode(input: {
   if (costUsedMicroUsd >= policy.hardCostThresholdMicroUsd) {
     return { usageMode: "paused", admissionAllowed: false, reason: "hard_threshold_reached" };
   }
-  if (policy.enforcementState === "hard_only") {
-    return { usageMode: "full_choice", admissionAllowed: true, reason: "hard_cap_only" };
-  }
-  if (costUsedMicroUsd >= policy.optimizationCostThresholdMicroUsd) {
-    return { usageMode: "optimized", admissionAllowed: true, reason: "optimization_threshold_reached" };
-  }
-  return { usageMode: "full_choice", admissionAllowed: true, reason: "below_optimization_threshold" };
+  // ENG-1211: there is exactly one enforcement boundary now — the hard cap.
+  // `enforce` and `hard_only` are therefore equivalent, and
+  // `optimizationCostThresholdMicroUsd` no longer gates anything. It is retained
+  // on the policy (and still validated) because ENG-1212's runway forecast reads
+  // it as an alert threshold and ENG-1209 AC6 keeps legacy config readable for
+  // rollback — but it can never again change, block, or rewrite a model.
+  return { usageMode: "full_choice", admissionAllowed: true, reason: "hard_cap_only" };
 }
 
 export function selectPolicyModel(input: {
@@ -131,65 +131,31 @@ export function selectPolicyModel(input: {
     };
   }
 
-  if (input.usageMode === "full_choice") {
-    if (requestedModel && supported.has(requestedModel)) {
-      return {
-        requestedModel,
-        effectiveModel: requestedModel,
-        backupModel,
-        backupSource: input.backupSource || null,
-        modelSelection: "honored",
-        reason: "requested_model_allowed",
-      };
-    }
-    if (!supported.has(input.systemDefaultModel)) {
-      throw new InvalidLlmUsagePolicyError("system default model is not supported");
-    }
-    return {
-      requestedModel,
-      effectiveModel: input.systemDefaultModel,
-      backupModel,
-      backupSource: input.backupSource || null,
-      modelSelection: requestedModel ? "corrected" : "defaulted",
-      reason: requestedModel ? "requested_model_unavailable_using_default" : "no_requested_model_using_default",
-    };
-  }
-
-  if (!input.policy) throw new InvalidLlmUsagePolicyError("optimized mode requires a policy");
-  const errors = validateLlmUsagePolicy(input.policy);
-  if (errors.length > 0) throw new InvalidLlmUsagePolicyError(errors.join("; "));
-  const optimized = new Set(
-    input.policy.optimizedModelIds.filter((model) => supported.has(model))
-  );
-  if (optimized.size === 0 || !optimized.has(input.policy.optimizedDefaultModel)) {
-    throw new InvalidLlmUsagePolicyError("optimized catalog has no valid supported default");
-  }
-  if (requestedModel && optimized.has(requestedModel)) {
+  // ENG-1211: every non-paused mode honors the user's choice. A stored or
+  // in-flight `optimized` value from before the cutover lands here too and is
+  // treated as full choice — the value stays parseable for rollback (ENG-1209
+  // AC6) but cannot coerce a model (ENG-1211 AC5). The former optimized branch,
+  // which substituted a user backup or the admin-configured optimized default,
+  // is deleted: that substitution IS the behavior this ticket removes.
+  if (requestedModel && supported.has(requestedModel)) {
     return {
       requestedModel,
       effectiveModel: requestedModel,
       backupModel,
       backupSource: input.backupSource || null,
       modelSelection: "honored",
-      reason: "requested_model_allowed_in_optimized_mode",
+      reason: "requested_model_allowed",
     };
   }
-  if (backupModel && input.backupSource === "user" && optimized.has(backupModel)) {
-    return {
-      requestedModel,
-      effectiveModel: backupModel,
-      backupModel,
-      backupSource: "user",
-      modelSelection: "corrected",
-      reason: "requested_model_blocked_using_user_backup",
-    };
+  if (!supported.has(input.systemDefaultModel)) {
+    throw new InvalidLlmUsagePolicyError("system default model is not supported");
   }
   return {
     requestedModel,
-    effectiveModel: input.policy.optimizedDefaultModel,
-    backupModel: input.policy.optimizedDefaultModel,
-    backupSource: "system",
-    modelSelection: "corrected",
-    reason: "requested_model_blocked_using_optimized_default",
+    effectiveModel: input.systemDefaultModel,
+    backupModel,
+    backupSource: input.backupSource || null,
+    modelSelection: requestedModel ? "corrected" : "defaulted",
+    reason: requestedModel ? "requested_model_unavailable_using_default" : "no_requested_model_using_default",
   };
 }

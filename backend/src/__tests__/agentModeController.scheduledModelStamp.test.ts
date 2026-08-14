@@ -246,7 +246,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     expect(mockAlert).not.toHaveBeenCalled();
   });
 
-  it('uses the user-selected eligible backup after the optimization threshold', async () => {
+  it('honors the schedule model past the former optimization threshold (ENG-1211)', async () => {
     mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
       billingUserId: 'test-user-123',
       policy: {
@@ -269,20 +269,22 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       llmBackupSource: 'user',
     } as any, 'test-user-123', false);
 
-    expect(stampedModel()).toBe('gpt-5-chat-2');
+    // ENG-1211: the schedule's own model now runs. A user backup is no longer
+    // substituted below the hard cap — that substitution is the deleted behavior.
+    expect(stampedModel()).toBe('anthropic.claude-opus-5');
     expect(stampedPolicyDecision()).toEqual(expect.objectContaining({
       requestedModel: 'anthropic.claude-opus-5',
-      effectiveModel: 'gpt-5-chat-2',
+      effectiveModel: 'anthropic.claude-opus-5',
       backupModel: 'gpt-5-chat-2',
       backupSource: 'user',
-      modelSelection: 'corrected',
-      modelSelectionReason: 'requested_model_blocked_using_user_backup',
+      modelSelection: 'honored',
+      modelSelectionReason: 'requested_model_allowed',
       usageMode: 'optimized',
       usagePolicyVersion: 'pro-v1',
       recordedAt: expect.any(String),
     }));
     expect(mockWorker.runInWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ llmModel: 'gpt-5-chat-2' }),
+      expect.objectContaining({ llmModel: 'anthropic.claude-opus-5' }),
       expect.any(Function),
     );
   });
@@ -304,7 +306,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
 });
 
 describe('getModelOptions — authoritative model discovery', () => {
-  it('returns only optimized models as selectable after the optimization threshold', async () => {
+  it('keeps every entitled model selectable past the former optimization threshold (ENG-1211)', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue([
       'anthropic.claude-opus-5', 'gpt-5-chat-2',
     ] as any);
@@ -329,10 +331,14 @@ describe('getModelOptions — authoritative model discovery', () => {
       { json, status } as any,
     );
 
+    // ENG-1211 AC1: nothing below the hard cap hides a model, so the picker
+    // offers the full entitled set even on a legacy `optimized` usage state.
+    // scheduleBackupModels still exposes the cheap catalog for the legacy backup
+    // field and the ENG-1213 recommendation surface.
     expect(json).toHaveBeenCalledWith(expect.objectContaining({
       usageMode: 'optimized',
       canGenerate: true,
-      selectableModels: ['gpt-5-chat-2'],
+      selectableModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
       allModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
       scheduleBackupModels: ['gpt-5-chat-2'],
     }));
