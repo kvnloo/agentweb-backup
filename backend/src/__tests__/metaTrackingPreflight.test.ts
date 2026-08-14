@@ -352,3 +352,35 @@ describe('detectMetaPixels — inert JavaScript inside an executable script', ()
     </script>`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 4 ("Fallback URL text passes tracking"). The noscript fallback was
+ * matched anywhere in the document, so a page that merely MENTIONS the URL — a link to it,
+ * a support article quoting it, an analytics dashboard printing it — reported the account's
+ * pixel as installed. The `<img>` beacon is the thing that actually fires; the text is not.
+ */
+describe('detectMetaPixels — the noscript fallback must be a real request', () => {
+  it('ignores the tracking URL sitting in ordinary prose', () => {
+    expect(detectMetaPixels(
+      `<html><body><p>Your beacon is https://www.facebook.com/tr?id=${PIXEL}&ev=PageView</p></body></html>`,
+    )).toEqual([]);
+  });
+
+  it('ignores the tracking URL used as a link target rather than an image', () => {
+    expect(detectMetaPixels(
+      `<a href="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView">docs</a>`,
+    )).toEqual([]);
+  });
+
+  it('still detects the real noscript beacon', () => {
+    expect(detectMetaPixels(
+      `<noscript><img height="1" width="1" style="display:none"
+       src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView&noscript=1"/></noscript>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('detects a beacon whose src attribute is unquoted or single-quoted', () => {
+    expect(detectMetaPixels(`<img src='https://www.facebook.com/tr?id=${PIXEL}&ev=PageView'/>`)).toEqual([`PIXEL:${PIXEL}`]);
+    expect(detectMetaPixels(`<img width=1 src=https://www.facebook.com/tr?id=${PIXEL} />`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

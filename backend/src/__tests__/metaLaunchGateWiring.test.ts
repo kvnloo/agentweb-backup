@@ -306,3 +306,30 @@ describe('audience launch preview token covers the override (ENG-941)', () => {
       .toEqual((service as any).computeAudienceCampaignArgsDigest({ ...baseArgs, override_tracking_check: true }));
   });
 });
+
+/*
+ * Greptile P1, round 4, security ("Audience override remains undisclosed"). Binding the
+ * override into the named launch's preview_token made it un-addable after approval — but
+ * the summary the user actually reads never said the tracking check would be skipped, so
+ * the approval it binds to was still an uninformed one. Binding without disclosure moves
+ * the hole rather than closing it.
+ */
+describe('audience launch preview discloses the override (ENG-941)', () => {
+  const plan = { plannedAction: 'create' as const, sourceSummary: 'a CSV of 120 contacts' };
+  const args = {
+    account_id: ACCOUNT, campaign_id: CAMPAIGN, audience_name: 'Test audience',
+    ad_set_params: { status: 'ACTIVE' },
+  };
+
+  it('warns in the summary when the launch waives the tracking check', () => {
+    const summary = (service as any).buildAudienceCampaignConfirmationSummary(
+      'targeted_audience', { ...args, override_tracking_check: true }, plan,
+    );
+    expect(summary).toContain('SKIP the tracking pre-flight check');
+  });
+
+  it('says nothing about tracking when no waiver is requested', () => {
+    const summary = (service as any).buildAudienceCampaignConfirmationSummary('targeted_audience', args, plan);
+    expect(summary).not.toContain('SKIP the tracking pre-flight check');
+  });
+});
