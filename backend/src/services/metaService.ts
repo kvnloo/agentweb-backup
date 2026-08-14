@@ -2475,7 +2475,15 @@ export class MetaService {
   public async resolveMetaPixelForUser(
     user: any,
     userId: string,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2584,7 +2592,15 @@ export class MetaService {
     user: any,
     userId: string,
     stored: { pixelId: string; accountId: string } | undefined,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2641,6 +2657,10 @@ export class MetaService {
       // resolver exists to fix). One account's failure (expired token, Graph error)
       // is skipped, not fatal — the next account still gets a fair try.
       let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      // A caught failure here is a credential refresh or a Graph call going wrong, not a
+      // statement about how this account is configured — so the result is unresolved but
+      // retryable, unlike "every connected account genuinely has zero pixels".
+      let sawTransientFailure = false;
       for (const account of accounts) {
         try {
           const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
@@ -2650,11 +2670,13 @@ export class MetaService {
           }
         } catch (error: any) {
           lastReason = error?.message || lastReason;
+          sawTransientFailure = true;
         }
       }
-      return { unresolved: true, reason: lastReason };
+      return { unresolved: true, reason: lastReason, transient: sawTransientFailure };
     } catch (error: any) {
-      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+      // An unexpected throw out of the resolver itself is likewise not a configuration fact.
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel', transient: true };
     }
   }
 

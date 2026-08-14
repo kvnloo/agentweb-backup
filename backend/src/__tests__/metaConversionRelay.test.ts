@@ -353,6 +353,40 @@ describe('relayLeadStatusEvent — skips (expected, never errors)', () => {
     expect(deps.sendEvent).not.toHaveBeenCalled();
   });
 
+  it('marks a TRANSIENT resolution failure retryable — a Graph 5xx must not drop the conversion', async () => {
+    // resolveMetaPixelWithDefault never throws, so a credential-refresh or Graph failure
+    // arrives looking identical to "this account has no pixel". Treating both as terminal
+    // is how the conversion this whole card exists to protect gets dropped anyway.
+    const deps = makeDeps({
+      resolvePixel: jest
+        .fn()
+        .mockResolvedValue({ unresolved: true, reason: 'Graph API error 500', transient: true }),
+    });
+
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ skipped: true, retryable: true });
+  });
+
+  it('marks a STRUCTURAL resolution failure terminal — five retries cannot conjure a pixel', async () => {
+    const deps = makeDeps({
+      resolvePixel: jest
+        .fn()
+        .mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected', transient: false }),
+    });
+
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ skipped: true, retryable: false });
+  });
+
+  it('treats an unresolved result with no transient flag as terminal, not retryable', async () => {
+    const deps = makeDeps({
+      resolvePixel: jest.fn().mockResolvedValue({ unresolved: true, reason: 'legacy caller' }),
+    });
+
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ skipped: true, retryable: false });
+  });
+
   it('skips when the pixel is unresolved — the lead write must still stand', async () => {
     const deps = makeDeps({
       resolvePixel: jest.fn().mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' }),

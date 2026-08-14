@@ -137,7 +137,10 @@ export interface RelayDeps {
     owner: any,
     userId: string,
     stored?: { pixelId: string; accountId: string },
-  ) => Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }>;
+  ) => Promise<
+    | { pixelId: string; accountId: string }
+    | { unresolved: true; reason: string; transient?: boolean }
+  >;
   getCredentials: (
     owner: any,
     userId: string,
@@ -279,7 +282,11 @@ export async function relayLeadStatusEvent(
     // connected at all, which resolves as unresolved immediately below.
     const resolution = await d.resolvePixel(owner, userId);
     if ('unresolved' in resolution) {
-      return skip(`pixel unresolved: ${resolution.reason}`, true);
+      // Retry only a transient failure. "No Meta ad account connected" or "no pixels on any
+      // connected account" is a configuration fact that five retries cannot change, whereas
+      // a Graph 5xx or a token that failed to refresh is exactly the case whose conversion
+      // would otherwise be dropped forever (Greptile on #2412, second pass).
+      return skip(`pixel unresolved: ${resolution.reason}`, true, resolution.transient === true);
     }
 
     if (d.isAccountPaused(resolution.accountId)) {
