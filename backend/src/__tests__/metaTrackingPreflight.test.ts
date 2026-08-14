@@ -523,3 +523,33 @@ describe('detectMetaPixels — control-flow regex and embedded attribute markup'
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 10. Two more inert regions: a script whose type merely CONTAINS
+ * "javascript" (`text/javascript-template` is a template, not code — per the HTML spec an
+ * unrecognised type is never executed), and markup sitting as text inside a <style> block.
+ */
+describe('detectMetaPixels — script types and style blocks', () => {
+  it('ignores a script whose type only contains "javascript"', () => {
+    expect(detectMetaPixels(
+      `<script type="text/javascript-template">fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([]);
+  });
+
+  it('ignores other template-ish types built on the same substrings', () => {
+    expect(detectMetaPixels(`<script type="application/javascript+handlebars">fbq('init','${PIXEL}')</script>`)).toEqual([]);
+    expect(detectMetaPixels(`<script type="text/x-module">fbq('init','${PIXEL}')</script>`)).toEqual([]);
+  });
+
+  it('still executes the standard executable types, including a charset parameter', () => {
+    expect(detectMetaPixels(`<script type="text/javascript">fbq('init','${PIXEL}')</script>`)).toEqual([`PIXEL:${PIXEL}`]);
+    expect(detectMetaPixels(`<script type="application/javascript; charset=utf-8">fbq('init','${PIXEL}')</script>`)).toEqual([`PIXEL:${PIXEL}`]);
+    expect(detectMetaPixels(`<script type="module">fbq('init','${PIXEL}')</script>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('ignores beacon markup sitting as text inside a <style> block', () => {
+    expect(detectMetaPixels(
+      `<style>/* <img src="https://www.facebook.com/tr?id=${PIXEL}"/> */ body{color:red}</style>`,
+    )).toEqual([]);
+  });
+});

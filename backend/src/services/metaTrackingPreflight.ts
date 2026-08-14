@@ -197,6 +197,27 @@ export function stripInertJavaScript(src: string): string {
  * can load the library and never call `fbq('init', …)`, which measures nothing — and
  * counting it would make this gate pass exactly the pages it exists to catch.
  */
+/**
+ * The script types a browser actually executes.
+ *
+ * Substring matching was the bug: `text/javascript-template` and
+ * `application/javascript+handlebars` both CONTAIN "javascript" while being templates a
+ * browser never runs. Per the HTML spec an unrecognised type is not executed at all, so
+ * this is an exact allowlist with any `;charset=…` parameter trimmed off.
+ */
+function isExecutableScriptType(type: string): boolean {
+  const bare = type.split(';')[0].trim().toLowerCase();
+  return (
+    bare === 'module' ||
+    bare === 'text/javascript' ||
+    bare === 'application/javascript' ||
+    bare === 'text/ecmascript' ||
+    bare === 'application/ecmascript' ||
+    bare === 'text/jscript' ||
+    bare === 'application/x-javascript'
+  );
+}
+
 export function detectMetaPixels(html: string): string[] {
   if (!html || typeof html !== 'string') return [];
   const found = new Set<string>();
@@ -216,7 +237,7 @@ export function detectMetaPixels(html: string): string[] {
      * is ever requested, and no script inside one ever runs. A component library shipping a
      * pixel snippet in a template would otherwise read as an install on every page.
      */
-    .replace(/<(code|pre|textarea|template)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(code|pre|textarea|template|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
     // Escaped script blocks: strip the WHOLE block, not just its escaped tags. Removing only
     // `&lt;script&gt;` leaves the fbq call between them looking like a live install, which is
     // precisely how a docs page explaining pixel setup would read as measured.
@@ -241,7 +262,7 @@ export function detectMetaPixels(html: string): string[] {
    */
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (_full, attrs: string, body: string) => {
     const type = /type\s*=\s*['"]([^'"]+)['"]/i.exec(attrs || '')?.[1]?.toLowerCase();
-    if (type && !/javascript|ecmascript|module/.test(type)) return '<script></script>';
+    if (type && !isExecutableScriptType(type)) return '<script></script>';
     const live = stripInertJavaScript(body);
     executable.push(live);
     return `<script>${live}</script>`;
