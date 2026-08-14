@@ -15501,8 +15501,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // back. `tier` and `revokedAt` stay fixed: both are fresh judgments made
         // once (a live Meta call, this call's own timestamp), not derived from
         // local state that can go stale.
+        // The probedAt guard (Greptile P1 follow-up, mirrors the sibling in
+        // metaAdsCapabilitySync.ts): this single read failure is weaker
+        // evidence than the sweep's two-strike confirmation, so if the sweep
+        // already recorded a NEWER probe (e.g. a recovery landing moments
+        // after this failure), that signal wins — do nothing rather than
+        // revoke over a connection just confirmed healthy.
         const { updateAccountConfig } = await import('./connectedAccountsDb');
         await updateAccountConfig(userId, connection.platform as any, connection.account_id, freshConfig => {
+          const storedProbedAt = freshConfig.ads_capability_probed_at;
+          if (typeof storedProbedAt === 'string' && storedProbedAt > revokedAt) {
+            return { updates: {}, unset: [] };
+          }
+
           const freshPrevious: unknown = freshConfig.granted_scopes;
           const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
             .filter((s: unknown) => typeof s === 'string')
@@ -15513,6 +15524,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             updates: {
               granted_scopes: freshRetained,
               ads_scope_revoked_at: revokedAt,
+              ads_capability_probed_at: revokedAt,
               ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
             },
             unset: tier === 'unknown' ? ['ads_scope_tier'] : undefined,

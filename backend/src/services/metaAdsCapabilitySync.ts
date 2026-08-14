@@ -98,6 +98,12 @@ export const syncMetaAdsCapability = async (
     // Absence of proof. Change nothing — in either direction.
     if (access === 'unknown') return { outcome: 'undetermined' };
 
+    // The moment THIS probe's answer was learned (Greptile P1 follow-up — see
+    // ads_capability_probed_at doc in utils/metaAdsScope.ts). Captured once,
+    // right after the probe resolves, so every retry of the write below
+    // guards against a concurrent writer's NEWER probe, not against itself.
+    const probedAt = new Date().toISOString();
+
     const { updateAccountConfig } = await import('./connectedAccountsDb');
     const recordedState = getMetaAdsScopeState(config);
 
@@ -130,12 +136,26 @@ export const syncMetaAdsCapability = async (
       // THIS attempt's fresh read, not the read from before the conflict — a
       // stale 'wasRefusing' reapplied on retry could erase a recovery a
       // concurrent writer landed in between.
+      //
+      // The probedAt guard (Greptile P1 follow-up) covers the deeper version
+      // of the same race: even a retry that reads fresh DB state is still
+      // running the DECISION "this is a recovery", made from a probe that
+      // could be older than a conflicting write that landed in between — e.g.
+      // a live chat run's read failure revoking this account moments after
+      // this sweep's probe found it accessible. If the state we just read
+      // already carries a newer probe's timestamp, that signal is more
+      // current than ours; do nothing rather than overwrite it.
       await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+        const storedProbedAt = freshConfig.ads_capability_probed_at;
+        if (typeof storedProbedAt === 'string' && storedProbedAt > probedAt) {
+          return { updates: {}, unset: [] };
+        }
+
         const freshUnset = ['ads_scope_denied_seen_at'];
         if (getMetaAdsScopeState(freshConfig) === 'missing') {
           freshUnset.push('ads_scope_revoked_at', 'granted_scopes', 'ads_scope_tier');
         }
-        return { updates: {}, unset: freshUnset };
+        return { updates: { ads_capability_probed_at: probedAt }, unset: freshUnset };
       });
       for (const key of unset) delete config[key];
 
@@ -210,7 +230,18 @@ export const syncMetaAdsCapability = async (
     // write, retrying with this stale `retained` would re-narrow a grant that
     // had just been restored. `tier` stays fixed: it came from a live Meta
     // call made once, not from local state that can go stale.
+    //
+    // The probedAt guard (Greptile P1 follow-up) covers the case a plain
+    // fresh-read retry cannot: a concurrent recovery whose probe is NEWER than
+    // ours, landed after our read but before our write. Reading its fresh
+    // granted_scopes and re-narrowing would still reverse it — the guard makes
+    // the write no-op instead, so the more current signal always wins.
     await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+      const storedProbedAt = freshConfig.ads_capability_probed_at;
+      if (typeof storedProbedAt === 'string' && storedProbedAt > probedAt) {
+        return { updates: {}, unset: [] };
+      }
+
       const freshPrevious: unknown = freshConfig.granted_scopes;
       const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
         .filter((s: unknown): s is string => typeof s === 'string')
@@ -219,6 +250,7 @@ export const syncMetaAdsCapability = async (
         updates: {
           granted_scopes: freshRetained,
           ads_scope_revoked_at: freshConfig.ads_scope_revoked_at || now,
+          ads_capability_probed_at: probedAt,
           ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
         },
         unset:

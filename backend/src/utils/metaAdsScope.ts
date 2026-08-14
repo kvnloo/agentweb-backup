@@ -88,6 +88,24 @@ export interface MetaAdsScopeConfigLike {
    *             module's behaviour before this distinction existed.
    */
   ads_scope_tier?: unknown;
+  /**
+   * When the Meta signal behind the last revoke-or-recover write was learned
+   * (ISO 8601), set alongside every such write (ENG-1158 follow-up — Greptile).
+   *
+   * Two independent processes can reach a capability conclusion for the same
+   * account close together — the 12-hourly sweep's probe and a live chat run's
+   * read failure — and a CAS retry alone only guarantees the WRITE reflects
+   * fresh DB state, not that the DECISION being written is the newer of the
+   * two. Without this, the loser of that race can still overwrite the
+   * winner's transition with individually-fresh-looking values, just derived
+   * from a stale decision.
+   *
+   * Every revoke/recover write compares its own probe's timestamp against
+   * this field on the config it just read and no-ops if the stored one is
+   * newer — the most recent real signal from Meta always wins, regardless of
+   * which write reaches the database first.
+   */
+  ads_capability_probed_at?: unknown;
 }
 
 /**
