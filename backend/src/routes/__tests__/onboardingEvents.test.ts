@@ -138,6 +138,27 @@ describe("POST /api/onboarding/events", () => {
     expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
   });
 
+  it("preserves a legacy user's derived lifecycle stage for a voice event", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingEvents: [
+        { event: "goal_selected", ts: "2026-04-18T10:00:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "voice_onboarding_started" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("goal_selected");
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "user-123",
+      expect.objectContaining({ onboardingStage: "goal_selected" }),
+    );
+  });
+
   it("appends to an existing event log", async () => {
     mockGetUserById.mockResolvedValueOnce({
       userId: "user-123",
@@ -415,6 +436,21 @@ describe("GET /api/onboarding/events/me", () => {
       userId: "user-123",
       email: "user@example.com",
       onboardingStage: null,
+      onboardingEvents: [
+        { event: "voice_onboarding_presented", ts: "2026-04-18T10:00:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app).get("/api/onboarding/events/me");
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBeNull();
+  });
+
+  it("keeps a legacy voice-only user lifecycle-neutral on read", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
       onboardingEvents: [
         { event: "voice_onboarding_presented", ts: "2026-04-18T10:00:00Z" },
       ],
