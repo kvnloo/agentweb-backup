@@ -118,3 +118,57 @@ describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
     expect(adSetSpy).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The ENG-600 named launch flows create their ad set directly rather than going through
+ * callMetaMarketingApi, so they need their own hook — without it they are the way around
+ * the gate. These assert the hook exists and that a block prevents any audience or ad set
+ * from being created.
+ */
+describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
+  let seedSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    seedSpy = jest
+      .spyOn(service as any, 'resolveOrCreateSeedAudience')
+      .mockResolvedValue({ audience: { id: 'aud-1' } });
+  });
+
+  const run = (adSetParams: any, extra: any = {}) =>
+    (service as any).executeAudienceCampaignLaunch(
+      'user-1',
+      { account_id: ACCOUNT, campaign_id: CAMPAIGN, ad_set_params: adSetParams, session_id: 'sess-1', ...extra },
+      'targeted_audience',
+      { type: 'csv', csvUrl: 'https://x/y.csv' },
+    );
+
+  it('blocks an ACTIVE launch before any audience is created', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+    (runMetaTrackingGate as jest.Mock).mockResolvedValue({
+      proceed: false,
+      blockResult: { success: false, blocked: true, reason: 'tracking_preflight', error: 'blocked' },
+    });
+
+    const res: any = await run({ status: 'ACTIVE' });
+
+    expect(res).toEqual(expect.objectContaining({ blocked: true, reason: 'tracking_preflight' }));
+    expect(seedSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not gate a launch whose ad set is not being activated', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(false);
+    await run({ status: 'PAUSED' }).catch(() => undefined);
+    expect(runMetaTrackingGate).not.toHaveBeenCalled();
+  });
+
+  it('passes the campaign, override and session through to the gate', async () => {
+    (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+    (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
+
+    await run({ status: 'ACTIVE' }, { override_tracking_check: true }).catch(() => undefined);
+
+    expect(runMetaTrackingGate).toHaveBeenCalledWith(
+      expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1',
+    );
+  });
+});
