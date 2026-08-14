@@ -159,6 +159,28 @@ describe("POST /api/onboarding/events", () => {
     );
   });
 
+  it("preserves a legacy signed_up_no_start stage after a voice event", async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: "user-123",
+      email: "user@example.com",
+      onboardingEvents: [
+        { event: "signed_up", ts: "2026-04-18T10:00:00Z" },
+      ],
+    });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/api/onboarding/events")
+      .send({ event: "voice_onboarding_started" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.onboardingStage).toBe("signed_up_no_start");
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "user-123",
+      expect.objectContaining({ onboardingStage: "signed_up_no_start" }),
+    );
+    expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
+  });
+
   it("appends to an existing event log", async () => {
     mockGetUserById.mockResolvedValueOnce({
       userId: "user-123",

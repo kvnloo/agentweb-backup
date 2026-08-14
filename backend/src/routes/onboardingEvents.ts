@@ -118,13 +118,16 @@ router.post("/events", authenticateToken, async (req, res) => {
     const previousStage = hasPersistedStage
       ? (user as any).onboardingStage ?? null
       : null;
+    const hasPriorLifecycleEvent = existing.some(
+      (item) => !LATERAL_ONBOARDING_EVENTS.has(item?.event),
+    );
     // Analytics-only voice events must not create or change lifecycle state.
     // They remain in the event stream, while all lifecycle consumers see the
     // previously persisted stage unchanged.
     const newStage = LATERAL_ONBOARDING_EVENTS.has(event)
       ? hasPersistedStage
         ? previousStage
-        : derivedStage === "signed_up_no_start"
+        : derivedStage === "signed_up_no_start" && !hasPriorLifecycleEvent
           ? null
           : derivedStage
       : derivedStage;
