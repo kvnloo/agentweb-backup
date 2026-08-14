@@ -222,37 +222,50 @@ export async function relayLeadStatusEvent(
   const { listId, userId, lead } = ctx;
   const leadId = lead?.leadId;
 
+  // A skip that reaches here AFTER the status mapped to a real conversion event is worth
+  // saying out loud. This card exists because a tracking failure was "silent by
+  // construction" — a suppressed Purchase that logs nothing is the same shape of problem,
+  // and it also makes the suppression untestable from outside (no log line is
+  // indistinguishable from the relay never running). Transitions that never mapped to an
+  // event at all stay quiet: every lead moving new -> contacted would otherwise be noise.
+  const skip = (reason: string, mapped: boolean): RelayResult => {
+    if (mapped) {
+      console.log(`[CAPI Relay] skipped for lead ${leadId} (list ${listId}): ${reason}`);
+    }
+    return { skipped: true, reason };
+  };
+
   try {
     if (!leadId) return { skipped: true, reason: 'lead has no leadId' };
 
     const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
-    if (!mapped) return { skipped: true, reason: `status "${lead.status}" is not a conversion transition` };
+    if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false);
 
     // §B's opt-out, honored here rather than waiting for the consent field: contactStatus
     // already carries a lead's explicit decline, and firing a CAPI conversion for someone
     // who opted out is the compliance problem the card names.
     const contactStatus = normalize(lead.contactStatus);
     if (contactStatus === 'unsubscribed' || contactStatus === 'do_not_contact') {
-      return { skipped: true, reason: `lead opted out (contactStatus=${lead.contactStatus})` };
+      return skip(`lead opted out (contactStatus=${lead.contactStatus})`, true);
     }
 
     // Never pollute a real ad account with the automated smoke test's synthetic lead —
     // same guard the form-submission path applies (routes/webhooks.ts).
     if (isSmokeTestEmail(lead.email)) {
-      return { skipped: true, reason: 'smoke-test lead' };
+      return skip('smoke-test lead', true);
     }
 
     const alreadySent: string[] = Array.isArray(lead.metaConversionsSent) ? lead.metaConversionsSent : [];
     if (alreadySent.includes(mapped.eventName)) {
-      return { skipped: true, reason: `${mapped.eventName} already sent for this lead` };
+      return skip(`${mapped.eventName} already sent for this lead`, true);
     }
 
     if (!d.shouldAttemptSend(listId)) {
-      return { skipped: true, reason: 'per-list CAPI send budget exhausted' };
+      return skip('per-list CAPI send budget exhausted', true);
     }
 
     const owner = await d.getUserById(userId);
-    if (!owner) return { skipped: true, reason: `owner ${userId} not found` };
+    if (!owner) return skip(`owner ${userId} not found`, true);
 
     // NOTE — no surface-level opt-out exists for CRM-sourced conversions yet. ENG-1141's
     // `attributionDisabled` is deliberately per-surface and lives on the CALENDLY
@@ -264,11 +277,11 @@ export async function relayLeadStatusEvent(
     // connected at all, which resolves as unresolved immediately below.
     const resolution = await d.resolvePixel(owner, userId);
     if ('unresolved' in resolution) {
-      return { skipped: true, reason: `pixel unresolved: ${resolution.reason}` };
+      return skip(`pixel unresolved: ${resolution.reason}`, true);
     }
 
     if (d.isAccountPaused(resolution.accountId)) {
-      return { skipped: true, reason: `ad account ${resolution.accountId} paused by Meta rate limiting` };
+      return skip(`ad account ${resolution.accountId} paused by Meta rate limiting`, true);
     }
 
     const creds = await d.getCredentials(owner, userId, resolution.accountId);

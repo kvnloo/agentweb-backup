@@ -403,6 +403,57 @@ describe('relayLeadStatusEvent — skips (expected, never errors)', () => {
   });
 });
 
+describe('relayLeadStatusEvent — a suppressed conversion is never silent', () => {
+  // Found in live testing: the opt-out case produced no log line at all, which is
+  // indistinguishable from the relay never having run. On a card that exists because a
+  // tracking failure was "silent by construction", a silently-suppressed Purchase is the
+  // same shape of bug.
+  let logSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => logSpy.mockRestore());
+
+  const skipLines = () =>
+    logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('skipped'));
+
+  it('logs when an opted-out lead suppresses a real conversion', async () => {
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ contactStatus: 'unsubscribed' }) }), makeDeps());
+
+    expect(skipLines()).toHaveLength(1);
+    expect(skipLines()[0]).toContain('opted out');
+    expect(skipLines()[0]).toContain('lead-1');
+  });
+
+  it('logs when a fire-once skip suppresses a real conversion', async () => {
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ metaConversionsSent: ['Purchase'] }) }),
+      makeDeps(),
+    );
+
+    expect(skipLines()[0]).toContain('already sent');
+  });
+
+  it('logs when the pixel is unresolved', async () => {
+    const deps = makeDeps({
+      resolvePixel: jest.fn().mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' }),
+    });
+    await relayLeadStatusEvent(ctx(), deps);
+
+    expect(skipLines()[0]).toContain('pixel unresolved');
+  });
+
+  it('stays QUIET for a status that was never a conversion — every lead moving new to contacted would be noise', async () => {
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'contacted' }), previousStatus: 'new' }),
+      makeDeps(),
+    );
+
+    expect(skipLines()).toHaveLength(0);
+  });
+});
+
 describe('relayLeadStatusEvent — failures never break the lead write', () => {
   it('returns a failure (does not throw) when Meta rejects the event', async () => {
     const deps = makeDeps({
