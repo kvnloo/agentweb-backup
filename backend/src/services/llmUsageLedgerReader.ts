@@ -35,7 +35,6 @@
  */
 
 import { userDb, orgDb } from "./db";
-import { inheritsOrgBilling } from "./orgAuthz";
 import { usageRecordDb, type UsageRecordRow } from "./usageRecordDb";
 
 /**
@@ -46,6 +45,11 @@ import { usageRecordDb, type UsageRecordRow } from "./usageRecordDb";
  * callers resolve the billing subject before calling, so it should not arise —
  * but widening a non-root's read to the whole org would expose one tenant's usage
  * to another, so the safe direction on an unexpected input is to narrow.
+ *
+ * The returned list intentionally includes every org member, even members with
+ * their own current subscription. A member's current subscription status cannot
+ * be applied to the entire historical partition: `billingUserId` on each row is
+ * the authoritative attribution for that day's aggregate.
  */
 export async function resolvePooledLedgerUserIds(billingUserId: string): Promise<string[]> {
   const user = await userDb.getUserById(billingUserId);
@@ -64,14 +68,7 @@ export async function resolvePooledLedgerUserIds(billingUserId: string): Promise
   const ids = new Set<string>([billingUserId]);
   for (const member of members || []) {
     if (!member?.userId || member.userId === billingUserId) continue;
-    if (
-      inheritsOrgBilling(
-        { userId: member.userId, orgId: user.orgId, subscription_status: member.subscription_status },
-        org,
-      )
-    ) {
-      ids.add(member.userId);
-    }
+    ids.add(member.userId);
   }
   return [...ids];
 }
@@ -94,5 +91,9 @@ export async function readPooledLedgerRows(
   const perUser = await Promise.all(
     userIds.map((userId) => usageRecordDb.queryByUserDateRange(userId, startDate, endDate)),
   );
-  return perUser.flat();
+  // Read every member partition so a subscription transition inside the date
+  // range cannot hide rows that were billed to the root before the transition.
+  // Keep only rows attributed to this subject; this also excludes rows billed to
+  // a member's personal subscription after the transition.
+  return perUser.flat().filter((row) => row.billingUserId === billingUserId);
 }

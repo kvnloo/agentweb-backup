@@ -54,6 +54,7 @@ const row = (userId: string, costMicroUsd: number) => ({
   model: "anthropic.claude-opus-5",
   feature: "agent_task",
   costMicroUsd,
+  billingUserId: ROOT,
 });
 
 beforeEach(() => {
@@ -80,9 +81,10 @@ describe("resolvePooledLedgerUserIds", () => {
     expect(new Set(ids)).toEqual(new Set([ROOT, "member-a", "member-b"]));
   });
 
-  it("excludes a member paying for their own live subscription (ENG-1084)", async () => {
-    // Their spend is billed to them, not to the org. Counting it against the
-    // org's runway would charge the org for usage someone else pays for.
+  it("keeps every member partition available for historical billing attribution", async () => {
+    // Current subscription state cannot be applied to the entire historical
+    // partition: a member may have switched from org billing to personal
+    // billing (or back) during the queried cycle.
     mockUser.mockResolvedValue({ userId: ROOT, orgId: ORG });
     mockOrg.mockResolvedValue({ orgId: ORG, ownerUserId: ROOT });
     mockMembers.mockResolvedValue([
@@ -92,7 +94,7 @@ describe("resolvePooledLedgerUserIds", () => {
       { userId: "pooled", orgId: ORG, subscription_status: "past_due" },
     ]);
     const ids = await resolvePooledLedgerUserIds(ROOT);
-    expect(new Set(ids)).toEqual(new Set([ROOT, "pooled"]));
+    expect(new Set(ids)).toEqual(new Set([ROOT, "self-payer", "trialing-self-payer", "pooled"]));
   });
 
   it("never returns a duplicate id, even though getOrgMembers includes the owner", async () => {
@@ -139,6 +141,27 @@ describe("readPooledLedgerRows", () => {
     expect(rows.reduce((s, r) => s + r.costMicroUsd, 0)).toBe(100);
     expect(mockQuery).toHaveBeenCalledTimes(2);
     expect(mockQuery).toHaveBeenCalledWith("member-a", "2026-08-01", "2026-08-11");
+  });
+
+  it("retains rows billed to the root after a member switches to personal billing", async () => {
+    mockUser.mockResolvedValue({ userId: ROOT, orgId: ORG });
+    mockOrg.mockResolvedValue({ orgId: ORG, ownerUserId: ROOT });
+    mockMembers.mockResolvedValue([
+      { userId: ROOT, orgId: ORG },
+      { userId: "member-a", orgId: ORG, subscription_status: "active" },
+    ]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === ROOT
+        ? [row(ROOT, 10)]
+        : [
+            { ...row("member-a", 20), billingUserId: ROOT },
+            { ...row("member-a", 30), billingUserId: "member-a" },
+          ],
+    );
+
+    const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
+    expect(rows.filter((entry) => entry.billingUserId === ROOT)).toHaveLength(2);
+    expect(rows.filter((entry) => entry.billingUserId === "member-a")).toHaveLength(0);
   });
 
   it("fails loud when one member's partition cannot be read", async () => {
