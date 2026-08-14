@@ -7,11 +7,13 @@
 
 const mockPut = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
 const mockQuery = jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+const mockTransactWrite = jest.fn().mockReturnValue({ promise: () => Promise.resolve() });
 
 jest.mock('aws-sdk', () => {
   const DocumentClient = jest.fn().mockImplementation(() => ({
     put: mockPut,
     query: mockQuery,
+    transactWrite: mockTransactWrite,
   }));
   return {
     config: { update: jest.fn() },
@@ -55,9 +57,10 @@ import { paymentHistoryDb, PaymentHistoryRecord } from '../services/paymentHisto
 describe('paymentHistoryDb', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    // Reset query mock to return empty by default
+    // Reset mocks to defaults
     mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
     mockPut.mockReturnValue({ promise: () => Promise.resolve() });
+    mockTransactWrite.mockReturnValue({ promise: () => Promise.resolve() });
   });
 
   describe('record()', () => {
@@ -195,6 +198,171 @@ describe('paymentHistoryDb', () => {
 
       // put SHOULD be called because eventType is different
       expect(mockPut).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('dedup by dedupKey (atomic)', () => {
+    it('writes main row + sentinel-partition marker atomically via TransactWriteItems', async () => {
+      const record: PaymentHistoryRecord = {
+        userId: 'user-atomic',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+        metadata: { disputeId: 'dp_atomic' },
+      };
+
+      const result = await paymentHistoryDb.record(record, { dedupKey: 'dispute:opened:dp_atomic' });
+
+      expect(result).toEqual({ written: true });
+      expect(mockPut).not.toHaveBeenCalled();
+      expect(mockTransactWrite).toHaveBeenCalledTimes(1);
+      const arg = mockTransactWrite.mock.calls[0][0];
+      expect(arg.TransactItems).toHaveLength(2);
+      expect(arg.TransactItems[0].Put.Item).toMatchObject({
+        userId: 'user-atomic',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+      });
+      expect(arg.TransactItems[1].Put.Item).toMatchObject({
+        userId: '__dedup__',
+        timestamp: 'dispute:opened:dp_atomic',
+        mainUserId: 'user-atomic',
+      });
+      expect(arg.TransactItems[1].Put.ConditionExpression).toBe('attribute_not_exists(userId)');
+    });
+
+    it('returns {written: false} without throwing when the marker condition fails on redelivery', async () => {
+      mockTransactWrite.mockReturnValueOnce({
+        promise: () => Promise.reject({
+          code: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }],
+        }),
+      });
+
+      const result = await paymentHistoryDb.record({
+        userId: 'user-dup',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_dup' });
+
+      expect(result).toEqual({ written: false });
+    });
+
+    it('propagates non-conditional transaction errors', async () => {
+      mockTransactWrite.mockReturnValueOnce({
+        promise: () => Promise.reject({ code: 'ProvisionedThroughputExceededException' }),
+      });
+
+      await expect(paymentHistoryDb.record({
+        userId: 'user-err',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_err' })).rejects.toMatchObject({
+        code: 'ProvisionedThroughputExceededException',
+      });
+    });
+
+    it('retries with a fresh timestamp when the main-row Put collides but the dedup marker succeeds', async () => {
+      // Distinct dispute events for the same user landing in the same
+      // millisecond used to overwrite each other's audit row because the
+      // marker keys differed while (userId, timestamp) collided. Now the
+      // main-row Put is condition-guarded and the txn cancels with reason
+      // index 0 (main) = ConditionalCheckFailed; we retry with a new ts.
+      let call = 0;
+      mockTransactWrite.mockImplementation(() => ({
+        promise: () => {
+          call++;
+          if (call === 1) {
+            return Promise.reject({
+              code: 'TransactionCanceledException',
+              CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }],
+            });
+          }
+          return Promise.resolve();
+        },
+      }));
+
+      const result = await paymentHistoryDb.record({
+        userId: 'user-collide',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_collide' });
+
+      expect(result).toEqual({ written: true });
+      expect(mockTransactWrite).toHaveBeenCalledTimes(2);
+      // Second attempt must have used a freshly minted timestamp, not the
+      // caller-supplied one that just collided.
+      const secondArg = mockTransactWrite.mock.calls[1][0];
+      expect(secondArg.TransactItems[0].Put.Item.timestamp).not.toBe('2026-08-14T09:00:00.000Z');
+    });
+
+    it('does NOT retry when the marker condition fails (real duplicate)', async () => {
+      mockTransactWrite.mockReturnValueOnce({
+        promise: () => Promise.reject({
+          code: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }],
+        }),
+      });
+
+      const result = await paymentHistoryDb.record({
+        userId: 'user-real-dup',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_dup' });
+
+      expect(result).toEqual({ written: false });
+      expect(mockTransactWrite).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws when timestamp collisions persist past the retry budget', async () => {
+      // Simulate all attempts colliding on the main-row PK.
+      mockTransactWrite.mockImplementation(() => ({
+        promise: () => Promise.reject({
+          code: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }],
+        }),
+      }));
+
+      await expect(paymentHistoryDb.record({
+        userId: 'user-forever-collide',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'dispute_opened',
+        amount: 2500,
+        currency: 'usd',
+        status: 'disputed',
+      }, { dedupKey: 'dispute:opened:dp_x' })).rejects.toThrow(/timestamp collision unresolved/);
+    });
+
+    it('dedupKey takes precedence over legacy invoice dedup path', async () => {
+      // Even with stripeInvoiceId set, dedupKey routes to TransactWrite
+      // (invoice dedup is left in place only for callers that never migrate).
+      await paymentHistoryDb.record({
+        userId: 'user-mix',
+        timestamp: '2026-08-14T09:00:00.000Z',
+        eventType: 'payment_succeeded',
+        amount: 2999,
+        currency: 'usd',
+        status: 'paid',
+        stripeInvoiceId: 'in_mix',
+      }, { dedupKey: 'invoice:in_mix:payment_succeeded' });
+
+      expect(mockQuery).not.toHaveBeenCalled();
+      expect(mockPut).not.toHaveBeenCalled();
+      expect(mockTransactWrite).toHaveBeenCalledTimes(1);
     });
   });
 
