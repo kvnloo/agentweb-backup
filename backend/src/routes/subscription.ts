@@ -2,6 +2,8 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
+import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
+import { toCustomerRunway } from '../services/llmUsageForecastService';
 
 const router = express.Router();
 
@@ -17,6 +19,36 @@ router.get('/usage', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting token usage:', error);
     res.status(500).json({ error: 'Failed to get token usage' });
+  }
+});
+
+/**
+ * ENG-1212 — customer-facing usage runway.
+ *
+ * Sibling of `/usage`, which reports where the account stands today; this
+ * reports where it is heading. ENG-1214's UI consumes it.
+ *
+ * `toCustomerRunway` is not optional decoration: the resolver returns internal
+ * micro-USD ceilings and raw burn rates for admin diagnostics, and AC4 forbids
+ * those reaching a customer. Strip at the boundary, once, here.
+ */
+router.get('/usage-runway', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const { available, runway } = await resolveUsageRunway(userId);
+    if (!available || !runway) {
+      // A tier with no configured cost policy has no ceiling to forecast
+      // against. Say so plainly rather than returning a zeroed forecast the UI
+      // would render as "on track".
+      return res.json({ available: false, runway: null });
+    }
+    res.json({ available: true, runway: toCustomerRunway(runway) });
+  } catch (error) {
+    console.error('Error getting usage runway:', error);
+    res.status(500).json({ error: 'Failed to get usage runway' });
   }
 });
 
