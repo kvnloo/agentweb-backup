@@ -352,7 +352,7 @@ async function resolveEffectiveModelForUser(input: {
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
-}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
+}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource | null; llmBackupNeedsConfirmation: boolean }> {
   const usage = await getEffectiveLlmUsagePolicy(input.userId);
   const scheduledDefault = typeof agentModeService.getScheduledChatsDefaultModel === 'function'
     ? await agentModeService.getScheduledChatsDefaultModel()
@@ -363,28 +363,29 @@ async function resolveScheduleBackup(input: {
     : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const supported = new Set(supportedModelIds);
   const requested = input.requestedBackupModel?.trim();
-  const optimized = new Set(usage.policy?.optimizedModelIds || []);
-  if (requested && supported.has(requested) && (!usage.policy || optimized.has(requested))) {
-    return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
+
+  // ENG-1211: a backup is now only ever a user's explicit preference, and nothing
+  // below the hard cap consults it. Two behaviors are therefore deleted:
+  //
+  //  1. Inventing a system default when none was asked for. That is what
+  //     stamped `gemini-3.1-flash-lite` + `needsConfirmation: true` onto 177
+  //     rows, and leaving it in would keep manufacturing dead artifacts and
+  //     corrupting ENG-1209's inventory with rows nobody chose.
+  //  2. Rejecting a requested backup for not being in the optimized catalog.
+  //     Restricting which models a user may pick, below the hard cap, is exactly
+  //     the class of behavior AC1 removes — the catalog no longer gates anything.
+  //
+  // A requested model is still validated against the supported registry, because
+  // an unknown id would fail at dispatch rather than at configuration time.
+  if (!requested) {
+    return { llmBackupModel: '', llmBackupSource: null, llmBackupNeedsConfirmation: false };
   }
-  if (requested) {
-    const error = new Error('Backup model is not available for optimized usage');
+  if (!supported.has(requested)) {
+    const error = new Error(`Backup model '${requested}' is not a supported model`);
     error.name = 'InvalidScheduledBackupModelError';
     throw error;
   }
-  const configuredDefault = usage.policy?.optimizedDefaultModel || systemDefaultModel;
-  if (
-    !configuredDefault ||
-    !supported.has(configuredDefault) ||
-    (usage.policy && !optimized.has(configuredDefault))
-  ) {
-    throw new Error('No valid optimized backup model is configured for this account');
-  }
-  return {
-    llmBackupModel: configuredDefault,
-    llmBackupSource: 'system',
-    llmBackupNeedsConfirmation: true,
-  };
+  return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
 }
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
