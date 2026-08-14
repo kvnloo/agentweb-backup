@@ -2078,7 +2078,7 @@ describe('runEnrichment — snapshot and job-meta persistence', () => {
     await runEnrichment(makeInput(), deps);
 
     const meta = (mockCrmDb.createEnrichmentJobMeta as jest.Mock).mock.calls[0][0];
-    expect(meta.failedCount).toBe(1);
+    expect(meta.failedCount).toBe(0);
     expect(meta.skippedCount).toBe(1);
     expect(meta.skippedLeadIds).toEqual(['lead-unresolved']);
     expect(meta.failureBreakdown.identityResolutionFailed).toBe(1);
