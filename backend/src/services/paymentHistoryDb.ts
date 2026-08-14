@@ -54,11 +54,22 @@ export interface RecordResult {
   written: boolean;
 }
 
-function isTransactDedupFailure(error: any): boolean {
-  if (error?.code !== 'TransactionCanceledException') return false;
-  const reasons = error?.CancellationReasons || [];
-  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+function transactionCancelledReasons(error: any): any[] | null {
+  if (error?.code !== 'TransactionCanceledException') return null;
+  return error?.CancellationReasons || [];
 }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Bounded retry budget for main-row (userId, timestamp) collisions between
+// two DISTINCT events for the same user landing in the same millisecond.
+// Node's Date.now() has ms resolution, so a 2ms wait guarantees the next
+// mint bumps; 8 attempts covers unrealistic worst-case pileups. Marker
+// collisions (same dedupKey) are handled separately in one shot — no retry.
+const MAX_TIMESTAMP_COLLISION_RETRIES = 8;
+const TIMESTAMP_COLLISION_BACKOFF_MS = 2;
 
 export const paymentHistoryDb = {
   /**
@@ -74,54 +85,91 @@ export const paymentHistoryDb = {
    *    webhook redelivery matters.
    */
   async record(record: PaymentHistoryRecord, opts?: RecordOptions): Promise<RecordResult> {
-    const item: Record<string, any> = {
-      userId: record.userId,
-      timestamp: record.timestamp || new Date().toISOString(),
-      eventType: record.eventType,
-      amount: record.amount,
-      currency: record.currency,
-      status: record.status,
+    const buildItem = (timestamp: string): Record<string, any> => {
+      const item: Record<string, any> = {
+        userId: record.userId,
+        timestamp,
+        eventType: record.eventType,
+        amount: record.amount,
+        currency: record.currency,
+        status: record.status,
+      };
+      if (record.stripeInvoiceId) item.stripeInvoiceId = record.stripeInvoiceId;
+      if (record.stripeSubscriptionId) item.stripeSubscriptionId = record.stripeSubscriptionId;
+      if (record.priceId) item.priceId = record.priceId;
+      if (record.planName) item.planName = record.planName;
+      if (record.metadata) item.metadata = record.metadata;
+      return item;
     };
 
-    if (record.stripeInvoiceId) item.stripeInvoiceId = record.stripeInvoiceId;
-    if (record.stripeSubscriptionId) item.stripeSubscriptionId = record.stripeSubscriptionId;
-    if (record.priceId) item.priceId = record.priceId;
-    if (record.planName) item.planName = record.planName;
-    if (record.metadata) item.metadata = record.metadata;
-
     if (opts?.dedupKey) {
-      try {
-        await dynamodb
-          .transactWrite({
-            TransactItems: [
-              { Put: { TableName: TABLE_NAME, Item: item } },
-              {
-                Put: {
-                  TableName: TABLE_NAME,
-                  Item: {
-                    userId: DEDUP_PARTITION,
-                    timestamp: opts.dedupKey,
-                    mainUserId: record.userId,
-                    mainTimestamp: item.timestamp,
-                    createdAt: new Date().toISOString(),
+      // Guard BOTH puts with attribute_not_exists so two DISTINCT events for
+      // the same user landing in the same millisecond can't overwrite each
+      // other's audit row. Marker condition catches redelivery (same
+      // dedupKey); main-row condition catches same-ms collision (different
+      // dedupKey, same (userId, timestamp)). On main-row collision, retry
+      // with a fresh timestamp — marker collision is a real duplicate and
+      // returns immediately.
+      for (let attempt = 0; attempt < MAX_TIMESTAMP_COLLISION_RETRIES; attempt++) {
+        if (attempt > 0) await sleep(TIMESTAMP_COLLISION_BACKOFF_MS);
+        const timestamp = attempt === 0
+          ? (record.timestamp || new Date().toISOString())
+          : new Date().toISOString();
+        const item = buildItem(timestamp);
+        try {
+          await dynamodb
+            .transactWrite({
+              TransactItems: [
+                {
+                  Put: {
+                    TableName: TABLE_NAME,
+                    Item: item,
+                    ConditionExpression: 'attribute_not_exists(userId)',
                   },
-                  ConditionExpression: 'attribute_not_exists(userId)',
                 },
-              },
-            ],
-          })
-          .promise();
-        return { written: true };
-      } catch (error: any) {
-        if (isTransactDedupFailure(error)) {
-          console.log(
-            `[PaymentHistory] Skipping duplicate via dedupKey=${opts.dedupKey} (userId=${record.userId})`,
-          );
-          return { written: false };
+                {
+                  Put: {
+                    TableName: TABLE_NAME,
+                    Item: {
+                      userId: DEDUP_PARTITION,
+                      timestamp: opts.dedupKey,
+                      mainUserId: record.userId,
+                      mainTimestamp: timestamp,
+                      createdAt: new Date().toISOString(),
+                    },
+                    ConditionExpression: 'attribute_not_exists(userId)',
+                  },
+                },
+              ],
+            })
+            .promise();
+          return { written: true };
+        } catch (error: any) {
+          const reasons = transactionCancelledReasons(error);
+          if (reasons) {
+            const markerFailed = reasons[1]?.Code === 'ConditionalCheckFailed';
+            const mainRowFailed = reasons[0]?.Code === 'ConditionalCheckFailed';
+            if (markerFailed) {
+              console.log(
+                `[PaymentHistory] Skipping duplicate via dedupKey=${opts.dedupKey} (userId=${record.userId})`,
+              );
+              return { written: false };
+            }
+            if (mainRowFailed) {
+              // Same-ms collision with a different event; retry with a
+              // freshly minted timestamp after a brief backoff.
+              continue;
+            }
+          }
+          throw error;
         }
-        throw error;
       }
+      throw new Error(
+        `payment history main-row timestamp collision unresolved after ${MAX_TIMESTAMP_COLLISION_RETRIES} attempts (userId=${record.userId}, dedupKey=${opts.dedupKey})`,
+      );
     }
+
+    const item = buildItem(record.timestamp || new Date().toISOString());
 
     // Legacy invoice-based dedup: keeps the same query-then-put behavior for
     // existing subscription-billing callers. Prefer dedupKey for new writes.
