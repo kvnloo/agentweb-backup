@@ -11172,7 +11172,11 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} lead(s)`,
+        // ENG-1207: same contract as searchLeads — a truncated page must not be
+        // phrased as a total.
+        message: cursor
+          ? `Showing the first ${matchingLeads.length} lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} lead(s)`,
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
@@ -11470,7 +11474,16 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} matching lead(s)`,
+        // ENG-1207: only an exhausted scan may be phrased as a total. When the
+        // scan stopped at the caller's limit, say so — a bare "Found 20" reads
+        // as "there are 20", which is how a weak model concluded a 98-match
+        // filter had 20 hits, wrote 17 of them and reported the job complete
+        // (prod session d5898ffd). The true total is deliberately NOT stated:
+        // the scan breaks at the limit, so it was never counted and any "of N"
+        // here would be invented.
+        message: cursorOut
+          ? `Showing the first ${matchingLeads.length} matching lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} matching lead(s)`,
         leads: matchingLeads.map((entry) => {
           // Per-field provenance sidecar — lets the agent cite source, provider,
           // URL and confidence per field for list-wide queries (e.g. "funding
