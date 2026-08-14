@@ -612,6 +612,12 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         console.warn("Error fetching top pages by engagement:", engagementError.message);
       }
 
+      // Same rows, sorted by sessions instead of engagement duration — lets callers answer
+      // "top pages by volume" from a field that is already correctly ordered, instead of
+      // having to sort topPagesByEngagement themselves (ENG-1187: a hand-sorted ranking over
+      // this array was asserted wrong in a client-facing report).
+      const topPagesBySessions = [...topPagesByEngagement].sort((a, b) => b.sessions - a.sessions);
+
       // Fetch daily data for timeline
       const [dailyResponse] = await gaClient.runReport({
         property: `properties/${propertyId}`,
@@ -780,6 +786,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
         conversionsBySource,
         topPagesByEngagement,
+        topPagesBySessions,
         dateRange: { startDate: startDateStr, endDate: endDateStr },
       };
     } catch (error: any) {
