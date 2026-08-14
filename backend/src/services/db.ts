@@ -640,6 +640,8 @@ export interface User {
   lastTouch?: import("../types/attribution").AttributionTouch;
   utmSource?: string;
   utmMedium?: string;
+  /** Denormalized from firstTouch.clickIds — see utils/leadSchema.ts (ENG-1176). */
+  clickIds?: Record<string, string>;
   /**
    * Saved CRM views — user's customized filter+sort combinations applied
    * to the /crm dashboard tabs. Built-in presets are injected by the
@@ -5648,6 +5650,8 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    /** Explicit override for the denormalized click IDs; derived from firstTouch when omitted. */
+    clickIds?: Record<string, string>;
     // CRM-history Tier 0: list-owner denormalized onto the lead for audit
     // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
     // userId, so userId is not load-bearing for retrieval — only audit.
@@ -5794,6 +5798,7 @@ export const crmDb = {
         lastTouch: leadData.lastTouch || leadData.firstTouch,
         utmSource: leadData.utmSource,
         utmMedium: leadData.utmMedium,
+        clickIds: leadData.clickIds,
       });
       Object.assign(item, attributionFields);
 
@@ -6281,6 +6286,8 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    /** Explicit override for the denormalized click IDs; derived from firstTouch when omitted. */
+    clickIds?: Record<string, string>;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
@@ -6645,6 +6652,10 @@ export const crmDb = {
       if (updates.utmMedium !== undefined) {
         setExpressions.push('utmMedium = :utmMedium');
         expressionAttributeValues[':utmMedium'] = updates.utmMedium;
+      }
+      if (updates.clickIds !== undefined) {
+        setExpressions.push('clickIds = :clickIds');
+        expressionAttributeValues[':clickIds'] = updates.clickIds;
       }
 
       // Always update updatedAt

@@ -153,6 +153,14 @@ interface CalendlyJobPayload {
   userId: string;
   accountId: string;
   bookingLeadListId?: string;
+  // ENG-1141: this connection's own Meta attribution choice, if the customer set one on
+  // the Calendly card — resolveMetaPixelWithDefault uses it directly when both are
+  // present, falling back to the caller's first connected account/pixel otherwise.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  /** ENG-1141: the customer explicitly turned Meta attribution off for this connection.
+   *  Distinct from "unset", which means auto-resolve — see CalendlyConfig's own comment. */
+  attributionDisabled?: boolean;
   email?: string;
   firstName?: string;
   lastName?: string;
@@ -228,32 +236,42 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
   const failures: string[] = [];
 
   try {
-    const pixelResolution = await metaService.resolveMetaPixelForUser(owner, payload.userId);
-    if ('unresolved' in pixelResolution) {
-      console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
+    const storedAttribution = payload.attributionPixelId && payload.attributionAccountId
+      ? { pixelId: payload.attributionPixelId, accountId: payload.attributionAccountId }
+      : undefined;
+    // ENG-1141: an explicit opt-out short-circuits before resolution — not an error, and NOT
+    // a failure to record: the booking and its CRM-forward below proceed exactly as normal.
+    // Checked before the stored pair so a leftover selection can't resurrect attribution.
+    if (payload.attributionDisabled) {
+      console.log(`[Calendly Webhook] Meta attribution disabled for user ${payload.userId} — booking saved, CAPI skipped`);
     } else {
-      const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
-      const { accessToken } = await getMetaAccountCredentials(owner, payload.userId, pixelResolution.accountId);
-
-      const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
-        eventId: payload.uri,
-        email: payload.email,
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        eventTimeSeconds: payload.eventTimeSeconds,
-        // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
-        // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
-        eventName: 'Schedule',
-      });
-
-      if (result.success) {
-        console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${payload.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+      const pixelResolution = await metaService.resolveMetaPixelWithDefault(owner, payload.userId, storedAttribution);
+      if ('unresolved' in pixelResolution) {
+        console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
       } else {
-        console.error(`[Calendly Webhook] CAPI send failed for user ${payload.userId}: ${result.error}`);
-        // sendCapiLeadEvent returns { success: false }, it doesn't throw — a soft
-        // failure like this was silently swallowed here (Greptile P1 on #2291),
-        // recorded nowhere, so the job still completed and the poller never retried.
-        failures.push(`CAPI: ${result.error}`);
+        const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+        const { accessToken } = await getMetaAccountCredentials(owner, payload.userId, pixelResolution.accountId);
+
+        const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
+          eventId: payload.uri,
+          email: payload.email,
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          eventTimeSeconds: payload.eventTimeSeconds,
+          // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
+          // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
+          eventName: 'Schedule',
+        });
+
+        if (result.success) {
+          console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${payload.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+        } else {
+          console.error(`[Calendly Webhook] CAPI send failed for user ${payload.userId}: ${result.error}`);
+          // sendCapiLeadEvent returns { success: false }, it doesn't throw — a soft
+          // failure like this was silently swallowed here (Greptile P1 on #2291),
+          // recorded nowhere, so the job still completed and the poller never retried.
+          failures.push(`CAPI: ${result.error}`);
+        }
       }
     }
   } catch (capiError: any) {
@@ -671,6 +689,9 @@ async function prepareCalendlyDelivery(req: express.Request): Promise<PreparedCa
     userId: resolved.userId,
     accountId: resolved.account.account_id,
     bookingLeadListId: resolved.account.config?.booking_lead_list_id,
+    attributionPixelId: resolved.account.config?.attributionPixelId,
+    attributionAccountId: resolved.account.config?.attributionAccountId,
+    attributionDisabled: resolved.account.config?.attributionDisabled === true,
     email: parsed.payload.email,
     firstName,
     lastName,

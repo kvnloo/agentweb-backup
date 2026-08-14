@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
+import { invalidateCachedPixels } from './metaPixelsCache';
 
 // ============================================
 // Type Definitions
@@ -312,6 +313,20 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // persisted here so every later delivery reuses it directly — see
   // resolveOrCreateBookingList in calendlyWebhook.ts.
   booking_lead_list_id?: string;
+  // ENG-1141: which Meta pixel/ad account CAPI attribution uses for this connection's
+  // bookings. Unlike landing pages (per-generation choice, no stored default — a human
+  // is present at creation time), a booking webhook is unattended, so this has to be
+  // settable once and reused — see resolveMetaPixelWithDefault in metaService.ts, which
+  // falls back to the caller's first connected account/first pixel when unset.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  // ENG-1141: an explicit "don't wire Meta up at all" choice. Distinct from simply leaving
+  // the pair unset, which means "auto-resolve to my first account/pixel" — a customer who
+  // connected Calendly purely for scheduling has no way to express "no Meta attribution"
+  // otherwise, and would silently get CAPI Schedule events fired against whichever ad
+  // account happened to be first. When true, the booking is still created and CRM-forwarded
+  // exactly as before; only the CAPI leg is skipped.
+  attributionDisabled?: boolean;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
@@ -414,6 +429,12 @@ export const createAccount = async (
     connected_accounts: updatedAccounts,
   } as Partial<User>);
 
+  // ENG-1141: which pixels exist for this user just changed. Without this, connecting a
+  // Meta account and immediately opening the create dialog would read a cached "no pixels"
+  // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
+  // page. See services/metaPixelsCache.ts.
+  invalidateCachedPixels(userId);
+
   return accountConfig;
 };
 
@@ -440,7 +461,19 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
  *
  * Own accounts are always returned (ownerUserId === callerUserId). Other
  * members' accounts are included only when sharedWithOrg === true.
- * Deduplication is by account_id — the caller's own account wins on conflict.
+ * Deduplication is by platform + account_id — the caller's own account wins on
+ * conflict.
+ *
+ * Platform is part of the key because account_id alone does not identify an
+ * account: one Google account connected for both Gmail and Drive carries the
+ * same address on both rows. Keying on the id alone dropped whichever of the
+ * two came second, and dropped a teammate's shared account entirely if the
+ * caller happened to hold any account at the same id on any platform. For a
+ * mailbox that is not cosmetic — losing the Gmail row makes it unresolvable
+ * again, which is ENG-943's symptom reached by another route, and one the
+ * resolver's own "prefer the email platform" guard cannot catch because the row
+ * never arrives. Own accounts were never deduped at all, so consumers already
+ * handle one address appearing on two platforms.
  */
 export const getAccountsWithOwnerIncludingOrgShared = async (
   callerUserId: string
@@ -461,15 +494,21 @@ export const getAccountsWithOwnerIncludingOrgShared = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  const seen = new Set(ownAccounts.map(a => a.account_id));
+  // platform + account_id, not account_id alone — see the note above. The
+  // separator is written as an escape and never as a literal control character:
+  // a raw NUL in the source makes git and grep treat this entire file as
+  // binary, which silently costs every diff and review of it.
+  const identity = (account: { platform: string; account_id: string }) =>
+    `${account.platform}\u0000${account.account_id}`;
+  const seen = new Set(ownAccounts.map(identity));
   const sharedAccounts: ConnectedAccountWithUser[] = [];
 
   for (const member of members) {
     if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
     for (const account of memberAccounts) {
-      if (account.sharedWithOrg && !seen.has(account.account_id)) {
-        seen.add(account.account_id);
+      if (account.sharedWithOrg && !seen.has(identity(account))) {
+        seen.add(identity(account));
         sharedAccounts.push({ ...account, userId: member.userId });
       }
     }
@@ -715,6 +754,9 @@ export const deleteAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: a disconnect must not leave that account's pixels listed in the picker.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -744,6 +786,10 @@ export const deleteAccountById = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: same as deleteAccount — a disconnected account's pixels must stop being
+  // offered immediately, not a TTL later.
+  invalidateCachedPixels(userId);
 };
 
 /**

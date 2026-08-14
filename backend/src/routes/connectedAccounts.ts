@@ -12,6 +12,7 @@ import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { userDb, orgDb, crmDb } from '../services/db';
 import { can } from "../services/orgAuthz";
+import { assertOwnedMetaPixel } from '../services/metaAccountCredentials';
 
 const router = express.Router();
 
@@ -313,6 +314,15 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // data, plus the actionable reason when it cannot. Absent entirely for
         // every other account, and for Meta records whose grant we cannot prove.
         ...adsCapability,
+        // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
+        // explicitly chosen, or undefined until the customer picks one (the frontend
+        // defaults the picker's display to the first connected account/pixel, matching
+        // resolveMetaPixelWithDefault's own fallback, but nothing is persisted until set).
+        attribution_pixel_id: acc.platform === 'calendly' ? (acc.config as any).attributionPixelId : undefined,
+        attribution_account_id: acc.platform === 'calendly' ? (acc.config as any).attributionAccountId : undefined,
+        // ENG-1141: the explicit "don't track in Meta" opt-out, distinct from the pair simply
+        // being unset (which auto-resolves) — the picker needs to render the difference.
+        attribution_disabled: acc.platform === 'calendly' ? (acc.config as any).attributionDisabled === true : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
@@ -478,6 +488,64 @@ router.patch('/connected-accounts/calendly/:accountId/booking-list', authenticat
     }
     console.error('Update Calendly booking-list error:', error);
     res.status(500).json({ error: 'Failed to update Calendly booking list' });
+  }
+});
+
+// ENG-1141: which Meta pixel/ad account this Calendly connection's bookings attribute
+// to — a booking webhook is unattended, so unlike landing pages this needs a settable,
+// persisted choice rather than a per-creation prompt (resolveMetaPixelWithDefault falls
+// back to the caller's first connected account/pixel when unset). Never trusts the
+// client to submit a valid pair — assertOwnedMetaPixel re-validates against the
+// caller's own connected Meta accounts before persisting, same as the landing-page
+// generation-time override.
+router.patch('/connected-accounts/calendly/:accountId/attribution', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { pixelId, accountId: metaAccountId, disabled } = req.body;
+
+  // ENG-1141: two valid shapes — a real pixel/account pair, or `disabled: true` meaning
+  // "don't wire Meta up for this connection at all". The opt-out is NOT the same as leaving
+  // the pair unset: unset means "auto-resolve to my first account/pixel", so a customer who
+  // uses Calendly purely for scheduling had no way to decline CAPI events entirely.
+  const isOptOut = disabled === true;
+  if (!isOptOut && (typeof pixelId !== 'string' || !pixelId || typeof metaAccountId !== 'string' || !metaAccountId)) {
+    return res.status(400).json({ error: 'pixelId and accountId are required, or pass disabled: true to turn attribution off' });
+  }
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (isOptOut) {
+      // Clear any previously-stored pair alongside the flag, so re-enabling later is an
+      // explicit choice rather than silently resurrecting a months-old selection.
+      await updateAccountConfig(userId, 'calendly', accountId, {
+        attributionPixelId: undefined,
+        attributionAccountId: undefined,
+        attributionDisabled: true,
+      });
+      return res.json({ success: true, accountId, attributionDisabled: true });
+    }
+
+    const { accountId: resolvedAccountId } = await assertOwnedMetaPixel(user, userId, pixelId, metaAccountId);
+
+    await updateAccountConfig(userId, 'calendly', accountId, {
+      attributionPixelId: pixelId,
+      attributionAccountId: resolvedAccountId,
+      attributionDisabled: false,
+    });
+    res.json({ success: true, accountId, attributionPixelId: pixelId, attributionAccountId: resolvedAccountId });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No calendly account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (typeof error?.message === 'string' && (
+      error.message.includes('not one of your connected accounts') || error.message.includes('was not found on ad account')
+    )) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Update Calendly attribution error:', error);
+    res.status(500).json({ error: 'Failed to update Calendly attribution' });
   }
 });
 
