@@ -67,3 +67,25 @@ describe('LLMService temperature handling', () => {
     expect(args).toHaveProperty('temperature', 0.8);
   });
 });
+
+describe('LLMService bearer-only model guard', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it.each([
+    'anthropic.claude-opus-4-8',
+    'anthropic.claude-opus-5',
+    'anthropic.claude-sonnet-5',
+  ])('fails loudly for bearer-only model %s', (model) => {
+    expect(() => createLLMService(model)).toThrow(
+      new RegExp(`${model}.*bearer-token account`),
+    );
+    expect(BedrockMock).not.toHaveBeenCalled();
+  });
+
+  it('still constructs a SigV4 model that LLMService can reach', () => {
+    expect(() => createLLMService('anthropic.claude-sonnet-4-6')).not.toThrow();
+    expect(BedrockMock).toHaveBeenCalledTimes(1);
+  });
+});
