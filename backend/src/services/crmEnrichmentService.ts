@@ -345,8 +345,9 @@ export class CrmEnrichmentService {
     call: (model: string) => Promise<any>,
     primaryModel: string,
     label: string,
+    fallbackModel: string = CrmEnrichmentService.LLM_FALLBACK_MODEL,
   ): Promise<any> {
-    const fallback = CrmEnrichmentService.LLM_FALLBACK_MODEL;
+    const fallback = fallbackModel;
 
     // Circuit open: skip the primary entirely for the cooldown period. Saves
     // a 60s timeout per call when Gemini's preview model is broadly degraded.
