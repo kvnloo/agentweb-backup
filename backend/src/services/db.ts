@@ -6301,6 +6301,16 @@ export const crmDb = {
      *  will do a single consolidated updateFieldNames after bulk writes (avoids
      *  read-modify-write races under parallel workers). */
     skipFieldNamesUpdate?: boolean;
+    /** ENG-926 §C: Meta conversion events already relayed for this lead
+     *  (e.g. `['QualifiedLead','Purchase']`). Written by the relay itself; a lead
+     *  going won → lost → won must not double-count a Purchase. */
+    metaConversionsSent?: string[];
+    /** ENG-926 §C: suppress the CRM → Meta conversion relay for this write.
+     *  Required on the relay's own bookkeeping write (or recording a send would
+     *  re-enter the relay), and set by bulk/backfill paths that move status on
+     *  many historical leads at once — those are not live conversions and must not
+     *  fan out thousands of Purchase events. */
+    suppressConversionRelay?: boolean;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -6563,6 +6573,12 @@ export const crmDb = {
         }
       }
 
+      if (updates.metaConversionsSent !== undefined) {
+        setExpressions.push('#metaConversionsSent = :metaConversionsSent');
+        expressionAttributeNames['#metaConversionsSent'] = 'metaConversionsSent';
+        expressionAttributeValues[':metaConversionsSent'] = updates.metaConversionsSent;
+      }
+
       if (updates.dealValue !== undefined) {
         if (updates.dealValue === null) {
           removeExpressions.push('#dealValue');
@@ -6718,7 +6734,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -6741,6 +6757,45 @@ export const crmDb = {
         const existingFieldNames = (list?.fieldNames as string[]) || [];
         const allFieldNames = [...existingFieldNames, ...fieldNames];
         await this.updateFieldNames(listId, allFieldNames);
+      }
+
+      // ENG-926 §C: relay a real status TRANSITION to Meta as a conversion.
+      //
+      // Hooked here rather than at the ~25 individual updateLead call sites because the
+      // case that matters most is a closed-won arriving from an external-CRM sync, not a
+      // human clicking a dropdown — a per-route hook would miss exactly that. This is the
+      // one chokepoint that already holds both halves of the transition (the pre-read
+      // existingLeadForGuard, and ALL_NEW in `result`).
+      //
+      // Fire-and-forget with a dynamic import: db.ts is a leaf the Meta services import,
+      // so a static import would be circular. A relay failure must never affect the lead
+      // write that has already succeeded above, so nothing here is awaited or rethrown.
+      const previousStatus = existingLeadForGuard?.status ?? null;
+      const nextStatus = (result.Attributes as any)?.status ?? null;
+      if (
+        !updates.suppressConversionRelay &&
+        updates.status !== undefined &&
+        nextStatus &&
+        String(previousStatus ?? '') !== String(nextStatus)
+      ) {
+        void (async () => {
+          try {
+            const { relayLeadStatusEvent } = await import('./metaConversionRelay');
+            const list = await this.getLeadListById(listId);
+            if (!list?.userId) return;
+            await relayLeadStatusEvent({
+              listId,
+              userId: list.userId as string,
+              lead: result.Attributes as any,
+              previousStatus,
+              statusConfig: (list as any).statusConfig,
+            });
+          } catch (relayError: any) {
+            console.error(
+              `[CAPI Relay] dispatch failed for lead ${leadId} (list ${listId}): ${relayError?.message}`,
+            );
+          }
+        })();
       }
 
       return result.Attributes;
