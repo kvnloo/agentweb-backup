@@ -623,3 +623,30 @@ describe('detectMetaPixels — attribute values cannot impersonate the type', ()
     )).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 14. A <script> nested in <noscript> runs only when scripting is
+ * DISABLED — i.e. never, for the browsers a paid campaign's traffic arrives in. The fix has
+ * to be surgical: <noscript> is also where the legitimate <img> beacon lives, so the
+ * container itself cannot be stripped the way <template> and <style> were.
+ */
+describe('detectMetaPixels — scripts inside noscript never run', () => {
+  it('ignores an fbq init inside a noscript-nested script', () => {
+    expect(detectMetaPixels(
+      `<noscript><script>fbq('init', '${PIXEL}');</script></noscript>`,
+    )).toEqual([]);
+  });
+
+  it('still counts the beacon image in the same noscript block', () => {
+    expect(detectMetaPixels(
+      `<noscript><script>fbq('init','${OTHER_PIXEL}')</script>` +
+      `<img height="1" width="1" src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/></noscript>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('still reads a real inline script outside the noscript block', () => {
+    expect(detectMetaPixels(
+      `<noscript><script>fbq('init','${OTHER_PIXEL}')</script></noscript><script>fbq('init','${PIXEL}')</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});

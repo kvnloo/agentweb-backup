@@ -257,6 +257,14 @@ export function detectMetaPixels(html: string): string[] {
      * pixel snippet in a template would otherwise read as an install on every page.
      */
     .replace(/<(code|pre|textarea|template|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    /*
+     * A <script> nested in <noscript> runs only when scripting is DISABLED — never, for the
+     * browsers a paid campaign's traffic actually arrives in. Emptied rather than dropping
+     * the whole container, because <noscript> is also where the legitimate <img> beacon
+     * lives: stripping it wholesale would delete the very fallback this gate accepts.
+     */
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, block =>
+      block.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' '))
     // Escaped script blocks: strip the WHOLE block, not just its escaped tags. Removing only
     // `&lt;script&gt;` leaves the fbq call between them looking like a live install, which is
     // precisely how a docs page explaining pixel setup would read as measured.
