@@ -25,7 +25,8 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
-import { readPooledLedgerRows } from "./llmUsageLedgerReader";
+import { readPooledLedgerRows, resolvePooledLedgerUserIds } from "./llmUsageLedgerReader";
+import { scheduleDb } from "./db";
 import { agentModeService } from "./agentModeService";
 import {
   attributeCosts,
@@ -61,11 +62,31 @@ export interface UsageRecommendation {
   alternatives: UsageRecommendationAlternative[];
 }
 
+/**
+ * One named schedule's share of the allowance (ENG-1217 AC4/AC8).
+ *
+ * `title`/`frequency` are null when the schedule can no longer be resolved — a
+ * deleted schedule still consumed the allowance, so its spend is reported under
+ * its id rather than dropped. Dropping it would make the driver list quietly
+ * total less than the bill, which is the failure `reconciles` exists to catch.
+ */
+export interface ScheduleDriver {
+  scheduleId: string;
+  title: string | null;
+  frequency: string | null;
+  shareOfTotal: number;
+  callCount: number;
+  /** INTERNAL — stripped before reaching a customer. */
+  costMicroUsd: number;
+}
+
 export interface ResolvedUsageDrivers {
   billingUserId: string;
   available: boolean;
   attribution: CostAttribution | null;
   recommendations: UsageRecommendation[];
+  /** Empty until the metering tag has named at least one schedule this cycle. */
+  scheduleDrivers: ScheduleDriver[];
 }
 
 function utcDay(date: Date): string {
@@ -88,7 +109,13 @@ export async function resolveUsageDrivers(
   const usage = await getEffectiveLlmUsagePolicy(userId);
 
   if (!usage.policy) {
-    return { billingUserId: usage.billingUserId, available: false, attribution: null, recommendations: [] };
+    return {
+      billingUserId: usage.billingUserId,
+      available: false,
+      attribution: null,
+      recommendations: [],
+      scheduleDrivers: [],
+    };
   }
 
   const { cycleStartDate, cycleResetDate } = resolveCycle(today);
@@ -240,11 +267,45 @@ export async function resolveUsageDrivers(
     });
   }
 
+  // ENG-1217 AC4/AC8: an opportunity has to name the work and its recurrence, so
+  // the ledger's scheduleId is joined to the schedule record here — the resolver
+  // is the layer with DB access, keeping `attributeCosts` pure over the ledger.
+  //
+  // Schedules are read for every POOLED member, not just the root: an org
+  // member's schedule is billed to the root, so naming it means reading that
+  // member's schedules too. Same reasoning as the pooled ledger read itself.
+  let scheduleDrivers: ScheduleDriver[] = [];
+  if (attribution.bySchedule?.length) {
+    const pooledUserIds = await resolvePooledLedgerUserIds(usage.billingUserId);
+    const lists = await Promise.all(
+      pooledUserIds.map((id) => scheduleDb.getSchedulesByUserId(id)),
+    );
+    const byId = new Map<string, { title?: string; frequency?: string }>();
+    for (const sched of lists.flat()) {
+      if (sched?.scheduleId) byId.set(sched.scheduleId, sched);
+    }
+    scheduleDrivers = attribution.bySchedule.map((d) => {
+      const meta = byId.get(d.key);
+      return {
+        scheduleId: d.key,
+        // A schedule deleted mid-cycle still consumed the allowance. Report it
+        // under its id with a null title so the UI can say "deleted schedule",
+        // rather than dropping spend the customer was charged for.
+        title: meta?.title ?? null,
+        frequency: meta?.frequency ?? null,
+        shareOfTotal: d.shareOfTotal,
+        callCount: d.callCount,
+        costMicroUsd: d.costMicroUsd,
+      };
+    });
+  }
+
   return {
     billingUserId: usage.billingUserId,
     available: true,
     attribution,
     recommendations: [...best.values()].sort(byImpact),
+    scheduleDrivers,
   };
 }
 
@@ -277,6 +338,14 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
           hasUntaggedSourceSpend: resolved.attribution.sourceUnattributedMicroUsd > 0,
         }
       : null,
+    // Named work with its recurrence, and no micro-USD (ENG-1212 AC4).
+    scheduleDrivers: resolved.scheduleDrivers.map((d) => ({
+      scheduleId: d.scheduleId,
+      title: d.title,
+      frequency: d.frequency,
+      shareOfTotal: d.shareOfTotal,
+      callCount: d.callCount,
+    })),
     recommendations: resolved.recommendations.map((r) => ({
       fromModel: r.fromModel,
       toModel: r.toModel,

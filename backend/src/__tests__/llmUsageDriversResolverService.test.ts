@@ -30,6 +30,7 @@ jest.mock("../services/agentModeService", () => ({
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
+  scheduleDb: { getSchedulesByUserId: jest.fn() },
 }));
 
 import {
@@ -38,7 +39,7 @@ import {
 } from "../services/llmUsageDriversResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
-import { userDb, orgDb } from "../services/db";
+import { userDb, orgDb, scheduleDb } from "../services/db";
 import { agentModeService } from "../services/agentModeService";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
@@ -46,6 +47,7 @@ const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
 const mockUser = userDb.getUserById as jest.Mock;
 const mockOrg = orgDb.getOrgById as jest.Mock;
 const mockMembers = orgDb.getOrgMembers as jest.Mock;
+const mockSchedules = scheduleDb.getSchedulesByUserId as jest.Mock;
 const mockModels = agentModeService.getSupportedModels as jest.Mock;
 const USD = 1_000_000;
 
@@ -54,6 +56,7 @@ const soloAccount = () => {
   mockUser.mockResolvedValue({ userId: "billing-root", orgId: null });
   mockOrg.mockResolvedValue(null);
   mockMembers.mockResolvedValue([]);
+  mockSchedules.mockResolvedValue([]);
 };
 
 const OPUS = "anthropic.claude-opus-5";
@@ -107,6 +110,76 @@ describe("resolveUsageDrivers", () => {
   it("reads the ledger for the billing subject over the current cycle", async () => {
     await resolveUsageDrivers("org-member-9", { today: "2026-08-11" });
     expect(mockQuery).toHaveBeenCalledWith("billing-root", "2026-08-01", "2026-08-11");
+  });
+
+  it("names each schedule and its recurrence, so an opportunity is actionable (ENG-1217 AC4/AC8)", async () => {
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:sched-a", costMicroUsd: 60 * USD, callCount: 6 },
+      { date: "2026-08-03", model: OPUS, feature: "agent_task:interactive", costMicroUsd: 40 * USD, callCount: 4 },
+    ]);
+    mockSchedules.mockResolvedValue([
+      { scheduleId: "sched-a", title: "Lead list enrichment", frequency: "daily" },
+      { scheduleId: "sched-unused", title: "Something else", frequency: "weekly" },
+    ]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    expect(scheduleDrivers).toHaveLength(1);
+    expect(scheduleDrivers[0]).toMatchObject({
+      scheduleId: "sched-a",
+      title: "Lead list enrichment",
+      frequency: "daily",
+      callCount: 6,
+    });
+    expect(scheduleDrivers[0].shareOfTotal).toBeCloseTo(0.6, 5);
+  });
+
+  it("reports a schedule it can no longer resolve rather than dropping its spend", async () => {
+    // A deleted schedule still consumed the allowance. Dropping it would make
+    // the driver list quietly total less than the bill; naming it `null` lets
+    // the UI say "deleted schedule" instead of implying the spend never existed.
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:ghost", costMicroUsd: 50 * USD, callCount: 5 },
+    ]);
+    mockSchedules.mockResolvedValue([]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(scheduleDrivers).toHaveLength(1);
+    expect(scheduleDrivers[0].scheduleId).toBe("ghost");
+    expect(scheduleDrivers[0].title).toBeNull();
+  });
+
+  it("looks up schedules across every pooled member, not only the root", async () => {
+    // An org member's schedule is billed to the root, so naming it requires
+    // reading that member's schedules too.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root", orgId: "org-1" },
+      { userId: "member-a", orgId: "org-1" },
+    ]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === "member-a"
+        ? [{ date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:m-sched", costMicroUsd: 50 * USD, callCount: 5 }]
+        : [],
+    );
+    mockSchedules.mockImplementation(async (uid: string) =>
+      uid === "member-a" ? [{ scheduleId: "m-sched", title: "Member digest", frequency: "weekly" }] : [],
+    );
+
+    const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+    expect(scheduleDrivers[0].title).toBe("Member digest");
+  });
+
+  it("keeps schedule drivers free of internal dollars at the customer boundary", async () => {
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:sched-a", costMicroUsd: 60 * USD, callCount: 6 },
+    ]);
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", title: "Lead list enrichment", frequency: "daily" }]);
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+    expect(customer.scheduleDrivers[0]).toHaveProperty("title", "Lead list enrichment");
+    expect(customer.scheduleDrivers[0]).not.toHaveProperty("costMicroUsd");
   });
 
   it("attributes every pooled member's spend, not just the root's own", async () => {
