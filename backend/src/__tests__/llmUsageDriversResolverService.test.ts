@@ -168,12 +168,46 @@ describe("resolveUsageDrivers", () => {
 
   it("expresses each saving as days of runway recovered", async () => {
     const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
-    const toHaiku = recommendations.find((r) => r.toModel === HAIKU)!;
+    const opus = recommendations.find((r) => r.fromModel === OPUS)!;
     // Opus $5/day -> Haiku is 1/5 the rate, so burn drops and the runway extends.
-    expect(toHaiku.estimatedDaysRecovered!).toBeGreaterThan(0);
+    expect(opus.toModel).toBe(HAIKU);
+    expect(opus.estimatedDaysRecovered!).toBeGreaterThan(0);
     // And a bigger cut must recover at least as many days as a smaller one.
-    const toSonnet = recommendations.find((r) => r.toModel === SONNET)!;
-    expect(toHaiku.estimatedDaysRecovered!).toBeGreaterThanOrEqual(toSonnet.estimatedDaysRecovered!);
+    const sonnet = opus.alternatives.find((a) => a.toModel === SONNET)!;
+    expect(opus.estimatedDaysRecovered!).toBeGreaterThanOrEqual(sonnet.estimatedDaysRecovered!);
+  });
+
+  it("emits ONE non-overlapping opportunity per model, alternatives nested (ENG-1210)", async () => {
+    // Harsha's ENG-1214 direction asks for "ranked non-overlapping optimization
+    // opportunities". Opus->Sonnet and Opus->Haiku are not two wins a customer
+    // can bank; they are two ways to spend the same driver once. Listing both at
+    // the top level implies their days-recovered figures add up, when picking
+    // either one makes the other's estimate obsolete.
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const fromModels = recommendations.map((r) => r.fromModel);
+    expect(new Set(fromModels).size).toBe(fromModels.length);
+
+    // The surviving one is the best of its group; the rest stay reachable.
+    const opus = recommendations.find((r) => r.fromModel === OPUS)!;
+    expect(opus.toModel).toBe(HAIKU);
+    expect(opus.alternatives.map((a) => a.toModel)).toEqual([SONNET]);
+    expect(opus.estimatedDaysRecovered!).toBeGreaterThanOrEqual(
+      opus.alternatives[0].estimatedDaysRecovered!,
+    );
+  });
+
+  it("keeps an alternative out of the customer payload's headline choice", async () => {
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+    const fromModels = customer.recommendations.map((r) => r.fromModel);
+    expect(new Set(fromModels).size).toBe(fromModels.length);
+    // Alternatives cross the boundary too — ENG-1214 needs them for the picker —
+    // but carry no internal dollar amounts.
+    for (const r of customer.recommendations) {
+      for (const alt of r.alternatives) {
+        expect(alt).not.toHaveProperty("estimatedSavingsMicroUsd");
+        expect(alt).toHaveProperty("estimatedDaysRecovered");
+      }
+    }
   });
 
   it("ranks recommendations by impact, largest first", async () => {

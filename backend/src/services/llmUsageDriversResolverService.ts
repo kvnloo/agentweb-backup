@@ -35,6 +35,14 @@ import {
 } from "./llmUsageAttributionService";
 import { computeUsageRunway } from "./llmUsageForecastService";
 
+/** A different target for the SAME driver — an alternative, never an extra win. */
+export interface UsageRecommendationAlternative {
+  toModel: string;
+  estimatedDaysRecovered: number | null;
+  /** INTERNAL — stripped before reaching a customer. */
+  estimatedSavingsMicroUsd: number;
+}
+
 export interface UsageRecommendation {
   fromModel: string;
   toModel: string;
@@ -45,6 +53,12 @@ export interface UsageRecommendation {
   isEstimate: true;
   requiresConfirmation: true;
   basis: string;
+  /**
+   * The other eligible targets for this same driver, ranked. Kept so a picker can
+   * offer the choice, but deliberately NOT top-level entries: see the grouping
+   * note in `resolveUsageDrivers`.
+   */
+  alternatives: UsageRecommendationAlternative[];
 }
 
 export interface ResolvedUsageDrivers {
@@ -185,19 +199,53 @@ export async function resolveUsageDrivers(
         isEstimate: true,
         requiresConfirmation: true,
         basis: est.basis,
+        alternatives: [],
       });
     }
   }
 
   // Highest impact first. Fall back to raw saving when no forecast exists, so the
   // order stays meaningful on day one of a cycle.
-  recommendations.sort(
-    (a, b) =>
-      (b.estimatedDaysRecovered ?? -1) - (a.estimatedDaysRecovered ?? -1) ||
-      b.estimatedSavingsMicroUsd - a.estimatedSavingsMicroUsd,
-  );
+  const byImpact = (a: { estimatedDaysRecovered: number | null; estimatedSavingsMicroUsd: number },
+                    b: { estimatedDaysRecovered: number | null; estimatedSavingsMicroUsd: number }) =>
+    (b.estimatedDaysRecovered ?? -1) - (a.estimatedDaysRecovered ?? -1) ||
+    b.estimatedSavingsMicroUsd - a.estimatedSavingsMicroUsd;
 
-  return { billingUserId: usage.billingUserId, available: true, attribution, recommendations };
+  recommendations.sort(byImpact);
+
+  // ENG-1210: collapse to ONE non-overlapping opportunity per driver.
+  //
+  // Opus->Sonnet and Opus->Haiku are not two savings a customer can bank; they
+  // are two ways to spend the same driver once. Listed side by side they read as
+  // additive, and each one's "days recovered" is computed against the SAME
+  // baseline — so accepting either makes the other's figure obsolete rather than
+  // incremental. Ranked opportunities have to be independently actionable or the
+  // ranking is a lie about what the customer gets.
+  //
+  // Different drivers do NOT overlap: `estimateModelSavings` filters rows by
+  // `fromModel`, so two drivers reprice disjoint spend and their savings compose.
+  // Only the same-driver alternatives collapse.
+  const best = new Map<string, UsageRecommendation>();
+  for (const rec of recommendations) {
+    const held = best.get(rec.fromModel);
+    // The list is already impact-sorted, so the first per driver is the best.
+    if (!held) {
+      best.set(rec.fromModel, rec);
+      continue;
+    }
+    held.alternatives.push({
+      toModel: rec.toModel,
+      estimatedDaysRecovered: rec.estimatedDaysRecovered,
+      estimatedSavingsMicroUsd: rec.estimatedSavingsMicroUsd,
+    });
+  }
+
+  return {
+    billingUserId: usage.billingUserId,
+    available: true,
+    attribution,
+    recommendations: [...best.values()].sort(byImpact),
+  };
 }
 
 export interface CustomerDriver {
@@ -236,6 +284,12 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
       isEstimate: r.isEstimate,
       requiresConfirmation: r.requiresConfirmation,
       basis: r.basis,
+      // Alternatives cross the boundary so ENG-1214's picker can offer the
+      // choice, but carry days only — never the internal saving.
+      alternatives: r.alternatives.map((a) => ({
+        toModel: a.toModel,
+        estimatedDaysRecovered: a.estimatedDaysRecovered,
+      })),
     })),
   };
 }
