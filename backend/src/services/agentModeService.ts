@@ -19490,6 +19490,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
       lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
     }
+    /*
+     * ENG-941: the preview_token now covers `override_tracking_check`, so the override
+     * cannot be added after approval — but binding it to an approval that never mentioned
+     * it just moves the hole. The user has to be told what they are waiving, in the text
+     * they actually read, or "user-granted" means nothing. Same wording as the shared write
+     * path's confirmation, deliberately: one sentence for one decision.
+     */
+    if (args?.override_tracking_check === true) {
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
     return lines.join(' ');
   }
 

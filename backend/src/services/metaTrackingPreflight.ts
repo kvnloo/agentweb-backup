@@ -181,8 +181,16 @@ export function detectMetaPixels(html: string): string[] {
   for (const m of executable.join('\n').matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
     found.add(`PIXEL:${m[1]}`);
   }
-  // The <noscript> fallback image: facebook.com/tr?id=123456789012345
-  for (const m of html.matchAll(/facebook\.com\/tr\?id=(\d{6,})/gi)) {
+  /*
+   * The <noscript> fallback, which measures by REQUESTING an image:
+   *   <img src="https://www.facebook.com/tr?id=123456789012345&ev=PageView"/>
+   *
+   * Matched only as an actual `<img>` source, never as free text. Scanning the whole
+   * document counted a page that merely mentions the URL — a link to it, a support article
+   * quoting it, a dashboard printing it — as an install, which is the same inert-text false
+   * pass the script scan above exists to prevent, one element type over.
+   */
+  for (const m of html.matchAll(/<img\b[^>]*facebook\.com\/tr\?id=(\d{6,})/gi)) {
     found.add(`PIXEL:${m[1]}`);
   }
 
