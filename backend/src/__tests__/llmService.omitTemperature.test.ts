@@ -77,6 +77,7 @@ describe('LLMService bearer-only model guard', () => {
     'anthropic.claude-opus-4-8',
     'anthropic.claude-opus-5',
     'anthropic.claude-sonnet-5',
+    'claude-opus-4-8',
   ])('fails loudly for bearer-only model %s', (model) => {
     expect(() => createLLMService(model)).toThrow(
       new RegExp(`${model}.*bearer-token account`),
