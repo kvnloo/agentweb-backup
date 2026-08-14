@@ -63,14 +63,28 @@ function transactionCancelledReasons(error: any): any[] | null {
 // the same item and DDB rolls one back. Retriable — the losing caller
 // should re-attempt with the same intent. Surfaces two ways:
 //   1. Top-level error.code = 'TransactionConflictException'
-//   2. TransactionCanceledException with any reason.Code = 'TransactionConflict'
+//   2. TransactionCanceledException where EVERY at-fault reason is
+//      'TransactionConflict' (non-faulting slots carry Code 'None')
 // Handling only ConditionalCheckFailed lets this class escape as an
 // unhandled throw under real webhook fan-out (caught 2026-08-14 via
 // live-test on Dev-AW-PaymentHistory with Promise.all-based redelivery).
+// `.every` (rather than `.some`) is required so a mixed cancellation
+// pairing TransactionConflict with a permanent reason (e.g.
+// ValidationError, ResourceNotFound) is NOT swallowed as retriable —
+// otherwise the permanent cause would be masked by the exhaustion error
+// after 8 wasted attempts.
 function isRetriableTransactionConflict(error: any): boolean {
   if (error?.code === 'TransactionConflictException') return true;
   const reasons = transactionCancelledReasons(error);
-  return !!reasons?.some((r: any) => r?.Code === 'TransactionConflict');
+  if (!reasons?.length) return false;
+  let sawConflict = false;
+  for (const r of reasons) {
+    const code = r?.Code;
+    if (code === 'TransactionConflict') { sawConflict = true; continue; }
+    if (code === 'None') continue;
+    return false;
+  }
+  return sawConflict;
 }
 
 function sleep(ms: number): Promise<void> {
