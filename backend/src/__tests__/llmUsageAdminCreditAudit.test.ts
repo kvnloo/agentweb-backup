@@ -234,6 +234,47 @@ describe('admin-grant audit trail (AC7)', () => {
     expect(mockGetUserById).toHaveBeenCalledTimes(2);
   });
 
+  it('retries on a TransactionConflictException (concurrent transaction on the same item)', async () => {
+    const conflictErr: any = new Error('Transaction conflict');
+    conflictErr.code = 'TransactionConflictException';
+    mockTransactWrite
+      .mockReturnValueOnce({ promise: async () => { throw conflictErr; } })
+      .mockReturnValueOnce({ promise: async () => ({}) });
+
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId: 'u1',
+      grantId: 'admin:conflict-retry',
+      source: 'admin',
+      amountMicroUsd: 4_000_000,
+      grantedBy: 'admin@agentweb.pro',
+      now: NOW,
+    });
+
+    expect(result.granted).toBe(true);
+    expect(mockTransactWrite).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on a TransactionCanceledException whose cancellation reason is TransactionConflict', async () => {
+    const cancelErr: any = new Error('Transaction canceled by conflict');
+    cancelErr.code = 'TransactionCanceledException';
+    cancelErr.CancellationReasons = [{ Code: 'None' }, { Code: 'TransactionConflict' }];
+    mockTransactWrite
+      .mockReturnValueOnce({ promise: async () => { throw cancelErr; } })
+      .mockReturnValueOnce({ promise: async () => ({}) });
+
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId: 'u1',
+      grantId: 'admin:cancel-reason-conflict',
+      source: 'admin',
+      amountMicroUsd: 1_000_000,
+      grantedBy: 'admin@agentweb.pro',
+      now: NOW,
+    });
+
+    expect(result.granted).toBe(true);
+    expect(mockTransactWrite).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects sub-cent admin grants so the payment-history amount (in cents) can represent them exactly', async () => {
     await expect(
       grantMonthlyLlmUsageCredit({

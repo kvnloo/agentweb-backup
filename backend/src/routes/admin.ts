@@ -5162,7 +5162,11 @@ router.post("/users/:userId/llm-usage-credit", async (req, res) => {
     // epsilon) catches over-precise input up to representation limits.
     const centsExact = amountUsd * 100;
     const centsRounded = Math.round(centsExact);
-    if (Math.abs(centsExact - centsRounded) > 1e-6) {
+    // Tight epsilon (1e-9) — legitimate 2-decimal IEEE-754 representations
+    // (`0.10 * 100 = 10.000000000000002`) sit at ~2e-15 and pass; over-precise
+    // inputs like `0.009999999` (1e-7 diff) fail. 1e-6 was too loose and let
+    // 7-9-nines sub-cent inputs silently lift to 1c.
+    if (Math.abs(centsExact - centsRounded) > 1e-9) {
       return res.status(400).json({
         message: "amountUsd must be in whole cents (2 decimal places max)",
       });

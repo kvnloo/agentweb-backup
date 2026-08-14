@@ -79,6 +79,9 @@ describe('admin one-time LLM usage credits', () => {
     // Just-below-a-cent must not silently round up to 1c. The naive
     // Math.round-then-modulo check missed this — the epsilon check catches it.
     [{ amountUsd: 0.0099999, reason: 'x', idempotencyKey: 'valid_key' }, 'whole cents'],
+    // Even tighter near-cent: 7-nines was slipping through the 1e-6 epsilon —
+    // tightened to 1e-9 so this class of over-precise input rejects too.
+    [{ amountUsd: 0.009999999, reason: 'x', idempotencyKey: 'valid_key' }, 'whole cents'],
   ])('rejects an invalid grant before writing: %p', async (payload, message) => {
     const res = await request(app)
       .post('/api/admin/users/member-1/llm-usage-credit')

@@ -331,13 +331,19 @@ export async function grantMonthlyLlmUsageCredit(input: {
 /**
  * A TransactWriteItems that fails because ONE of its condition checks did not
  * hold surfaces as `TransactionCanceledException` with `CancellationReasons[i]
- * .Code === 'ConditionalCheckFailed'`. Retry treats this identically to a
- * plain conditional failure — the loop rebuilds from the fresh ledger.
+ * .Code === 'ConditionalCheckFailed'`. `TransactionConflictException` (and
+ * the `TransactionConflict` cancellation reason) is the sibling case where
+ * another transaction is currently modifying the same item — also retryable
+ * by rebuilding from the fresh ledger. Retry treats all of them identically
+ * to a plain conditional failure.
  */
 function isTransactionalConditionalFailure(error: any): boolean {
+  if (error?.code === 'TransactionConflictException') return true;
   if (error?.code !== 'TransactionCanceledException') return false;
   const reasons = error?.CancellationReasons || [];
-  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+  return reasons.some(
+    (r: any) => r?.Code === 'ConditionalCheckFailed' || r?.Code === 'TransactionConflict',
+  );
 }
 
 /**
