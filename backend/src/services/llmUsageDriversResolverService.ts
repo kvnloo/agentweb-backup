@@ -25,7 +25,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
-import { usageRecordDb } from "./usageRecordDb";
+import { readPooledLedgerRows } from "./llmUsageLedgerReader";
 import { agentModeService } from "./agentModeService";
 import {
   attributeCosts,
@@ -78,7 +78,10 @@ export async function resolveUsageDrivers(
   }
 
   const { cycleStartDate, cycleResetDate } = resolveCycle(today);
-  const rows = await usageRecordDb.queryByUserDateRange(usage.billingUserId, cycleStartDate, today);
+  // Pooled read, not a single partition: rows are keyed by the ACTING user, so an
+  // org root's own partition omits every member whose spend it pays for. See
+  // `llmUsageLedgerReader`.
+  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
 
   const ledger: AttributionRow[] = rows.map((r) => ({
     date: r.date,
@@ -217,9 +220,13 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
       ? {
           byModel: toShares(resolved.attribution.byModel),
           byFeature: toShares(resolved.attribution.byFeature),
+          // null until the metering tag has produced at least one row this cycle.
+          bySource: resolved.attribution.bySource ? toShares(resolved.attribution.bySource) : null,
           // Named so a UI can say "we can't break this down" rather than imply zero.
           unavailableGroupings: resolved.attribution.unavailableGroupings,
           hasUnattributed: resolved.attribution.unattributedMicroUsd > 0,
+          // Lets the UI caveat a partial split instead of presenting it as whole.
+          hasUntaggedSourceSpend: resolved.attribution.sourceUnattributedMicroUsd > 0,
         }
       : null,
     recommendations: resolved.recommendations.map((r) => ({

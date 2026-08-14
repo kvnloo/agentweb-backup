@@ -10,6 +10,12 @@
  *   - the ledger is read for the BILLING SUBJECT, not the caller, or an org
  *     member would see their own sliver of a pooled account's runway;
  *   - customer responses never carry internal dollar amounts (AC4).
+ *
+ * `../services/db` is mocked explicitly even though this suite does not test org
+ * behaviour. Without it these tests still passed, but only because the real
+ * `getUserById` swallows its own AWS error and returns undefined — so they were
+ * exercising a failed database call and calling it a solo user. A test that
+ * passes for that reason is not evidence of anything.
  */
 
 jest.mock("../services/llmUsagePolicyResolverService", () => ({
@@ -18,15 +24,30 @@ jest.mock("../services/llmUsagePolicyResolverService", () => ({
 jest.mock("../services/usageRecordDb", () => ({
   usageRecordDb: { queryByUserDateRange: jest.fn() },
 }));
+jest.mock("../services/db", () => ({
+  userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
+}));
 
 import { resolveUsageRunway } from "../services/llmUsageRunwayResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { userDb, orgDb } from "../services/db";
 import { toCustomerRunway } from "../services/llmUsageForecastService";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
+const mockUser = userDb.getUserById as jest.Mock;
+const mockOrg = orgDb.getOrgById as jest.Mock;
+const mockMembers = orgDb.getOrgMembers as jest.Mock;
 const USD = 1_000_000;
+
+/** Default to a solo account. Call AFTER jest.clearAllMocks(), which wipes it. */
+const soloAccount = () => {
+  mockUser.mockResolvedValue({ userId: "billing-root", orgId: null });
+  mockOrg.mockResolvedValue(null);
+  mockMembers.mockResolvedValue([]);
+};
 
 const policyFor = (over: Record<string, unknown> = {}) => ({
   billingUserId: "billing-root",
@@ -59,6 +80,7 @@ const ledgerDays = (n: number, perDayUsd: number, month = "2026-08") =>
 describe("resolveUsageRunway", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(ledgerDays(10, 5));
   });
@@ -71,6 +93,38 @@ describe("resolveUsageRunway", () => {
   it("queries only the current cycle, ending at the in-progress day", async () => {
     await resolveUsageRunway("user-1", { today: "2026-08-11" });
     expect(mockQuery).toHaveBeenCalledWith("billing-root", "2026-08-01", "2026-08-11");
+  });
+
+  it("reads every pooled member's partition, not just the root's own", async () => {
+    // Resolving the billing subject is NOT the same as reading its ledger: rows
+    // are partitioned by the ACTING user, so the root's partition holds only the
+    // root's calls while `costUsedMicroUsd` is already pooled. Reading one and
+    // dividing by the other overstates the runway — the customer is told they
+    // are fine and then stops mid-cycle.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root", orgId: "org-1" },
+      { userId: "member-a", orgId: "org-1" },
+    ]);
+    // Each member burns the same amount, so a pooled read sees double the burn.
+    mockQuery.mockResolvedValue(ledgerDays(10, 5));
+
+    const pooled = await resolveUsageRunway("member-a", { today: "2026-08-11" });
+
+    expect(mockQuery).toHaveBeenCalledWith("member-a", "2026-08-01", "2026-08-11");
+    expect(mockQuery).toHaveBeenCalledWith("billing-root", "2026-08-01", "2026-08-11");
+
+    // And the extra burn must actually reach the forecast, not just be fetched.
+    mockQuery.mockClear();
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: null });
+    const solo = await resolveUsageRunway("member-a", { today: "2026-08-11" });
+    expect(pooled.runway!.diagnostics.forecastBurnMicroUsdPerDay!).toBeGreaterThan(
+      solo.runway!.diagnostics.forecastBurnMicroUsdPerDay!,
+    );
+    expect(pooled.runway!.estimatedDaysRemaining!).toBeLessThan(
+      solo.runway!.estimatedDaysRemaining!,
+    );
   });
 
   it("projects a runway from the policy counter and the ledger", async () => {

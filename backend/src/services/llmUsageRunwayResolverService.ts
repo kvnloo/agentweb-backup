@@ -13,6 +13,14 @@
  * show a sliver of the account's spend and forecast a runway several times too
  * long — the ENG-1200 investigation showed one root covering four humans.
  *
+ * Resolving that subject is necessary but NOT sufficient, and the first cut of
+ * this file got it wrong: ledger rows are partitioned by the ACTING user, so the
+ * root's partition holds only the root's own calls. Reading it while
+ * `costUsedMicroUsd` is already pooled reproduces the very error described above.
+ * `readPooledLedgerRows` closes that gap by reading every partition that bills
+ * here; see `llmUsageLedgerReader` for why the predicate must be the same one
+ * `resolveBillingUserId` uses.
+ *
  * ## Cycle boundaries
  *
  * The included allowance resets monthly at 00:00 UTC on the 1st, which is what
@@ -23,7 +31,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
-import { usageRecordDb } from "./usageRecordDb";
+import { readPooledLedgerRows } from "./llmUsageLedgerReader";
 import {
   computeUsageRunway,
   type UsageRunway,
@@ -68,11 +76,13 @@ export async function resolveUsageRunway(
 
   // Query to `today` inclusive: the calculator discards the in-progress day
   // itself, but fetching it keeps this boundary in one place rather than two.
-  const rows = await usageRecordDb.queryByUserDateRange(
-    usage.billingUserId,
-    cycleStartDate,
-    today,
-  );
+  //
+  // Read through the POOLED reader, not `queryByUserDateRange` directly. The
+  // billing subject is resolved above, but ledger rows are partitioned by the
+  // ACTING user, so a root's own partition is only its own calls — while
+  // `costUsedMicroUsd` is already pooled. Mixing the two divides the account's
+  // consumption by one person's burn and overstates the runway.
+  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
 
   const runway = computeUsageRunway({
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —

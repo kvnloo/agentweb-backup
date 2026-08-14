@@ -24,6 +24,13 @@ jest.mock("../services/usageRecordDb", () => ({
 jest.mock("../services/agentModeService", () => ({
   agentModeService: { getSupportedModels: jest.fn() },
 }));
+// Mocked explicitly: without it these tests still passed, but only because the
+// real `getUserById` swallows its own AWS error and returns undefined, so they
+// were exercising a failed database call and calling it a solo user.
+jest.mock("../services/db", () => ({
+  userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
+}));
 
 import {
   resolveUsageDrivers,
@@ -31,12 +38,23 @@ import {
 } from "../services/llmUsageDriversResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { userDb, orgDb } from "../services/db";
 import { agentModeService } from "../services/agentModeService";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
+const mockUser = userDb.getUserById as jest.Mock;
+const mockOrg = orgDb.getOrgById as jest.Mock;
+const mockMembers = orgDb.getOrgMembers as jest.Mock;
 const mockModels = agentModeService.getSupportedModels as jest.Mock;
 const USD = 1_000_000;
+
+/** Default to a solo account. Call AFTER jest.clearAllMocks(), which wipes it. */
+const soloAccount = () => {
+  mockUser.mockResolvedValue({ userId: "billing-root", orgId: null });
+  mockOrg.mockResolvedValue(null);
+  mockMembers.mockResolvedValue([]);
+};
 
 const OPUS = "anthropic.claude-opus-5";
 const SONNET = "anthropic.claude-sonnet-5";
@@ -80,6 +98,7 @@ const opusLedger = () =>
 describe("resolveUsageDrivers", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
@@ -88,6 +107,31 @@ describe("resolveUsageDrivers", () => {
   it("reads the ledger for the billing subject over the current cycle", async () => {
     await resolveUsageDrivers("org-member-9", { today: "2026-08-11" });
     expect(mockQuery).toHaveBeenCalledWith("billing-root", "2026-08-01", "2026-08-11");
+  });
+
+  it("attributes every pooled member's spend, not just the root's own", async () => {
+    // Rows are partitioned by the ACTING user, so reading only the billing
+    // root's partition omits the spend of every member it pays for — the
+    // drivers list would then rank a fraction of the account's real usage.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root", orgId: "org-1" },
+      { userId: "member-a", orgId: "org-1" },
+    ]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      uid === "member-a"
+        ? [{ date: "2026-08-02", model: SONNET, feature: "chat", costMicroUsd: 40 * USD, callCount: 1 }]
+        : opusLedger(),
+    );
+
+    const { attribution } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
+
+    // The member's model shows up as a driver at all...
+    expect(attribution!.byModel.map((d) => d.key)).toContain(SONNET);
+    // ...and its cost is included in the account total, not dropped.
+    expect(attribution!.byModel.find((d) => d.key === SONNET)!.costMicroUsd).toBe(40 * USD);
+    expect(attribution!.reconciles).toBe(true);
   });
 
   it("returns cost drivers grouped by model and feature", async () => {
@@ -275,6 +319,7 @@ describe("resolveUsageDrivers", () => {
 describe("toCustomerDrivers — AC4 exposure boundary", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
