@@ -72,6 +72,38 @@ export interface LeadAttributionFields {
   clickIds?: Record<string, string>;
 }
 
+/**
+ * Every top-level lead attribute a CRM filter may name (ENG-1218).
+ *
+ * ONE definition, consumed by both filter resolvers. It is not a convenience:
+ * the filter engine resolves an unknown field to `lead.customFields[field]`
+ * rather than erroring, so a field missing from this list does not fail — it
+ * silently matches EVERY lead on `is_empty` and none on `is_not_empty`.
+ *
+ * `searchLeads` and `deleteLeadsByFilter` previously kept separate copies, and
+ * both had drifted from the lead shape by 22 fields. Because one of those paths
+ * is destructive, "delete the leads with no lifecycle set" selected the entire
+ * list, and the confirm gate's preview displayed that wrong count as if it were
+ * correct. ENG-1176 hit the same defect on `clickIds`, fixed the search path,
+ * and missed the delete path precisely because the lists were separate.
+ *
+ * Adding a filterable field to the lead shape means adding it HERE, once.
+ * `customFields` is deliberately absent — it is the fallback container, not a
+ * filterable attribute.
+ */
+export const LEAD_STANDARD_FILTER_FIELDS = [
+  'leadId',
+  'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes',
+  'linkedin', 'companyLinkedin', 'status', 'dealValue', 'dealCurrency',
+  'selectedSenderId',
+  'contactStatus', 'contactStatusReason', 'contactStatusNote', 'contactStatusUpdatedBy',
+  'domain', 'accountOwnerUserId', 'pocEmails',
+  'priority', 'expectedClose', 'closedDate',
+  'heatScore', 'healthScore', 'lifecycle', 'role', 'isPrimary',
+  'firstTouch', 'lastTouch', 'utmSource', 'utmMedium', 'clickIds',
+  'createdAt', 'updatedAt',
+] as const;
+
 export const LEAD_LIFECYCLES = [
   'unknown',
   'inbox',
