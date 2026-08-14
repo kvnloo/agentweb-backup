@@ -55,6 +55,24 @@ describe('projectLeadAttribution (ENG-1175)', () => {
       expect(projectLeadAttribution({ firstTouch: touch })).not.toHaveProperty('firstTouch');
     });
 
+    it('omits a touch whose utm holds only unrecognised subkeys', () => {
+      // The UTM spec is closed — source/medium/campaign/content/term. A blob of
+      // arbitrary keys under `utm` is corruption, not a campaign.
+      expect(projectLeadAttribution({ firstTouch: { utm: { unexpected: 'x' } } }))
+        .not.toHaveProperty('firstTouch');
+    });
+
+    it('KEEPS a click ID from a platform we have never enumerated', () => {
+      // Deliberately permissive, and the opposite of the utm rule above.
+      // ENG-1176 made clickIds a map precisely so a new ad platform does not
+      // need a schema change to be carried. Restricting it to a known key list
+      // would silently drop real paid-click attribution — the exact failure
+      // that feature exists to prevent. Do not "tighten" this to match utm.
+      const out = projectLeadAttribution({ firstTouch: { clickIds: { msclkid: 'bing-123' } } });
+      expect(out.firstTouch).toBeDefined();
+      expect((out.firstTouch as any).clickIds.msclkid).toBe('bing-123');
+    });
+
     it('keeps a touch carrying any single recognised key', () => {
       // The capture middleware always writes timestamp + landingUrl, but a
       // touch narrowed to just one real field is still real data, not corruption.

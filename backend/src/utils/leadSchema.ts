@@ -420,13 +420,28 @@ export function pruneClickIds(raw: unknown): Record<string, string> | undefined 
  * The keys `normalizeAttribution` can actually produce. See AttributionTouch.
  */
 const TOUCH_SCALAR_KEYS = ['timestamp', 'referrer', 'landingUrl', 'sessionId'] as const;
-const TOUCH_MAP_KEYS = ['utm', 'clickIds'] as const;
 
-/** A nested map counts only if it holds at least one non-empty string value. */
-function hasMeaningfulMap(value: unknown): boolean {
+/** The UTM spec is closed, so an unrecognised subkey is corruption. */
+const UTM_KEYS = ['source', 'medium', 'campaign', 'content', 'term'] as const;
+
+/**
+ * Does this nested map hold at least one real value?
+ *
+ * `allowedKeys` is applied to `utm` and deliberately NOT to `clickIds`, and the
+ * asymmetry is the point. ENG-1176 made `clickIds` a map rather than one column
+ * per platform so that a new ad network does not require a schema change to be
+ * carried — `normalizeAttribution` already accepts click IDs not enumerated in
+ * `AttributionTouch`. Restricting it to a known key list would silently drop
+ * real paid-click attribution, which is precisely the failure ENG-1176 exists
+ * to prevent. Do not "tighten" clickIds to match utm; there is a test pinning
+ * this.
+ */
+function hasMeaningfulMap(value: unknown, allowedKeys?: readonly string[]): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  return Object.values(value as Record<string, unknown>)
-    .some((v) => typeof v === 'string' && v.trim() !== '');
+  return Object.entries(value as Record<string, unknown>).some(
+    ([key, v]) =>
+      (!allowedKeys || allowedKeys.includes(key)) && typeof v === 'string' && v.trim() !== '',
+  );
 }
 
 /**
@@ -460,7 +475,7 @@ function usableTouch(raw: unknown): AttributionTouch | undefined {
   const hasScalar = TOUCH_SCALAR_KEYS.some(
     (key) => typeof touch[key] === 'string' && (touch[key] as string).trim() !== '',
   );
-  const hasMap = TOUCH_MAP_KEYS.some((key) => hasMeaningfulMap(touch[key]));
+  const hasMap = hasMeaningfulMap(touch.utm, UTM_KEYS) || hasMeaningfulMap(touch.clickIds);
   if (!hasScalar && !hasMap) return undefined;
   // Deep copy: the response must not alias the record the rest of the request
   // is still reading, and must not be mutable back into it.
