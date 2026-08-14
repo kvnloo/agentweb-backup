@@ -4,6 +4,7 @@ import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { toCustomerRunway } from '../services/llmUsageForecastService';
+import { resolveUsageDrivers, toCustomerDrivers } from '../services/llmUsageDriversResolverService';
 
 const router = express.Router();
 
@@ -49,6 +50,31 @@ router.get('/usage-runway', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting usage runway:', error);
     res.status(500).json({ error: 'Failed to get usage runway' });
+  }
+});
+
+/**
+ * ENG-1213 — what is consuming the allowance, and what switching would recover.
+ *
+ * Companion to `/usage-runway`: that says how long the allowance lasts, this says
+ * why and what to do about it. ENG-1214/ENG-1217's runway UI renders both.
+ *
+ * `toCustomerDrivers` strips internal micro-USD totals and raw savings at this
+ * boundary — a customer sees shares, counts and day figures only. The service
+ * never applies a switch; every recommendation is returned with
+ * `requiresConfirmation`.
+ */
+router.get('/usage-drivers', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const resolved = await resolveUsageDrivers(userId);
+    res.json(toCustomerDrivers(resolved));
+  } catch (error) {
+    console.error('Error getting usage drivers:', error);
+    res.status(500).json({ error: 'Failed to get usage drivers' });
   }
 });
 
