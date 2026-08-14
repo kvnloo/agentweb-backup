@@ -61,6 +61,72 @@ export const META_TRACKING_MECHANISMS: string[] = [
 ];
 
 /**
+ * Remove the parts of a JavaScript source that never execute: comments, and string or
+ * template literals whose *content* is itself pixel-shaped text.
+ *
+ * Restricting the scan to executable `<script>` blocks (the previous narrowing) still
+ * counted an install snippet a page merely *displays* — `// fbq('init', …)` left behind by
+ * a migration, or `var snippet = "fbq('init', …)"` rendered into a help page. Both sit in
+ * a live script and neither ever runs.
+ *
+ * Written as a single-pass scanner rather than another regex because the two constructs
+ * nest: a comment can contain a quote, a string can contain a comment marker, and no
+ * regex reads that correctly (three regex passes each narrowed the hole without closing
+ * it). String literals that do NOT contain an fbq call are preserved verbatim, because a
+ * genuine install carries its pixel id in exactly such a literal — dropping all literals
+ * would delete the id this function exists to read.
+ *
+ * Failure direction is deliberate: an exotic construct this scanner misreads (a regex
+ * literal containing an unbalanced quote, say) can only cause text to be dropped, which
+ * yields "no pixel found" — a block. Failing toward a block is the same choice the rest
+ * of the gate makes.
+ *
+ * Known residual, stated rather than implied: an `fbq('init', …)` inside a dead branch
+ * (`if (false) { … }`) is real, parseable code and still reads as an install. Answering
+ * that needs an executor, not a parser, and it is not an accident mode — it requires
+ * someone to deliberately write unreachable pixel code on their own landing page.
+ */
+export function stripInertJavaScript(src: string): string {
+  const isInert = (body: string) => /fbq\s*\(/i.test(body) || /facebook\.com\/tr\?id=/i.test(body);
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      let body = '';
+      while (j < src.length) {
+        if (src[j] === '\\') { body += src[j] + (src[j + 1] ?? ''); j += 2; continue; }
+        if (src[j] === c) break;
+        // An unterminated single-line string is a mis-parse (most often an apostrophe in
+        // text this scanner reached anyway). Stop at the newline so the rest of the file
+        // is still scanned normally instead of being swallowed to EOF.
+        if (c !== '`' && src[j] === '\n') break;
+        body += src[j];
+        j++;
+      }
+      const closed = j < src.length && src[j] === c;
+      out += isInert(body) ? ' ' : c + body + (closed ? c : '');
+      i = closed ? j + 1 : j;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/**
  * Inspect served HTML for Meta pixel installs. Pure and side-effect-free.
  * Returns de-duplicated `PIXEL:<id>` labels (empty ⇒ no pixel detected).
  *
@@ -96,15 +162,23 @@ export function detectMetaPixels(html: string): string[] {
    * application/json, text/x-handlebars) are markup or data, never executed, so they are
    * excluded too.
    */
-  const executableScripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)]
-    .filter(m => {
-      const type = /type\s*=\s*['"]([^'"]+)['"]/i.exec(m[1] || '')?.[1]?.toLowerCase();
-      return !type || /javascript|ecmascript|module/.test(type);
-    })
-    .map(m => m[2])
-    .join('\n');
+  const executable: string[] = [];
+  /*
+   * Each script block is rewritten in place: an executable one keeps only its code that
+   * actually runs (comments and inert literals stripped), a non-executable one is emptied.
+   * Rewriting rather than only collecting matters for the `<noscript>` scan below, which
+   * runs over the whole document — otherwise a tracking URL sitting in a JS string would
+   * still be counted there after being correctly discarded here.
+   */
+  html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (_full, attrs: string, body: string) => {
+    const type = /type\s*=\s*['"]([^'"]+)['"]/i.exec(attrs || '')?.[1]?.toLowerCase();
+    if (type && !/javascript|ecmascript|module/.test(type)) return '<script></script>';
+    const live = stripInertJavaScript(body);
+    executable.push(live);
+    return `<script>${live}</script>`;
+  });
 
-  for (const m of executableScripts.matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
+  for (const m of executable.join('\n').matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
     found.add(`PIXEL:${m[1]}`);
   }
   // The <noscript> fallback image: facebook.com/tr?id=123456789012345
