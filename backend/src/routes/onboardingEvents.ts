@@ -108,10 +108,16 @@ router.post("/events", authenticateToken, async (req, res) => {
     // Append + cap to the last MAX_EVENTS_PER_USER events (FIFO drop).
     const appended = [...existing, newEvent].slice(-MAX_EVENTS_PER_USER);
 
-    const newStage = deriveOnboardingStage(appended, {
+    const derivedStage = deriveOnboardingStage(appended, {
       lastActiveAt: (user as any).lastActiveAt,
     });
     const previousStage = (user as any).onboardingStage ?? null;
+    // Analytics-only voice events must not create or change lifecycle state.
+    // They remain in the event stream, while all lifecycle consumers see the
+    // previously persisted stage unchanged.
+    const newStage = LATERAL_ONBOARDING_EVENTS.has(event)
+      ? previousStage
+      : derivedStage;
 
     const updated = await userDb.updateUser(userId, {
       onboardingEvents: appended,

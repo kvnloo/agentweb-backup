@@ -108,7 +108,14 @@ describe("POST /api/onboarding/events", () => {
       .send({ event: "voice_onboarding_presented" });
 
     expect(res.status).toBe(200);
-    expect(res.body.onboardingStage).toBe("signed_up_no_start");
+    expect(res.body.onboardingStage).toBeNull();
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "user-123",
+      expect.objectContaining({ onboardingStage: null }),
+    );
+    expect(mockMirrorOnboardingEventToLead).toHaveBeenCalledWith(
+      expect.objectContaining({ onboardingStage: null }),
+    );
     expect(mockOnOnboardingStageChanged).not.toHaveBeenCalled();
   });
 
