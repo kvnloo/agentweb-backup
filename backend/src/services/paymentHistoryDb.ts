@@ -7,6 +7,11 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const TABLE_NAME = `${TABLE_PREFIX}AW-PaymentHistory`;
 
+// Sentinel partition for dedup markers. Real users have opaque IDs that never
+// collide with this literal, so markers coexist with data rows in one table
+// without polluting getByUserId queries.
+const DEDUP_PARTITION = '__dedup__';
+
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
 export type PaymentEventType =
@@ -35,22 +40,40 @@ export interface PaymentHistoryRecord {
   metadata?: Record<string, any>;
 }
 
+export interface RecordOptions {
+  /**
+   * When set, the write is guarded by an atomic dedup marker on the sentinel
+   * partition. Concurrent writes with the same dedupKey race on a
+   * ConditionExpression instead of a bounded query-then-put window, so
+   * webhook redeliveries can never double-write regardless of history depth.
+   */
+  dedupKey?: string;
+}
+
+export interface RecordResult {
+  written: boolean;
+}
+
+function isTransactDedupFailure(error: any): boolean {
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some((r: any) => r?.Code === 'ConditionalCheckFailed');
+}
+
 export const paymentHistoryDb = {
   /**
-   * Record a payment event. Deduplicates by stripeInvoiceId if provided.
+   * Record a payment event.
+   *
+   * Deduplication strategies (checked in order):
+   *  - `opts.dedupKey`: atomic — TransactWriteItems puts the main row plus a
+   *    marker row on the sentinel dedup partition with
+   *    `attribute_not_exists(userId)`. Race-safe under concurrent redelivery.
+   *  - `stripeInvoiceId` (legacy): best-effort query-then-put via GSI. Kept
+   *    for existing subscription-billing callers that already keyed off it.
+   *    Prefer `dedupKey` for new callers where correctness under concurrent
+   *    webhook redelivery matters.
    */
-  async record(record: PaymentHistoryRecord): Promise<void> {
-    // Dedup: if stripeInvoiceId is provided and eventType matches, check for existing record
-    if (record.stripeInvoiceId) {
-      const existing = await this.getByStripeInvoiceId(record.stripeInvoiceId);
-      if (existing.some(r => r.eventType === record.eventType)) {
-        console.log(
-          `[PaymentHistory] Skipping duplicate: ${record.eventType} for invoice ${record.stripeInvoiceId}`
-        );
-        return;
-      }
-    }
-
+  async record(record: PaymentHistoryRecord, opts?: RecordOptions): Promise<RecordResult> {
     const item: Record<string, any> = {
       userId: record.userId,
       timestamp: record.timestamp || new Date().toISOString(),
@@ -66,12 +89,54 @@ export const paymentHistoryDb = {
     if (record.planName) item.planName = record.planName;
     if (record.metadata) item.metadata = record.metadata;
 
-    await dynamodb
-      .put({
-        TableName: TABLE_NAME,
-        Item: item,
-      })
-      .promise();
+    if (opts?.dedupKey) {
+      try {
+        await dynamodb
+          .transactWrite({
+            TransactItems: [
+              { Put: { TableName: TABLE_NAME, Item: item } },
+              {
+                Put: {
+                  TableName: TABLE_NAME,
+                  Item: {
+                    userId: DEDUP_PARTITION,
+                    timestamp: opts.dedupKey,
+                    mainUserId: record.userId,
+                    mainTimestamp: item.timestamp,
+                    createdAt: new Date().toISOString(),
+                  },
+                  ConditionExpression: 'attribute_not_exists(userId)',
+                },
+              },
+            ],
+          })
+          .promise();
+        return { written: true };
+      } catch (error: any) {
+        if (isTransactDedupFailure(error)) {
+          console.log(
+            `[PaymentHistory] Skipping duplicate via dedupKey=${opts.dedupKey} (userId=${record.userId})`,
+          );
+          return { written: false };
+        }
+        throw error;
+      }
+    }
+
+    // Legacy invoice-based dedup: keeps the same query-then-put behavior for
+    // existing subscription-billing callers. Prefer dedupKey for new writes.
+    if (record.stripeInvoiceId) {
+      const existing = await this.getByStripeInvoiceId(record.stripeInvoiceId);
+      if (existing.some(r => r.eventType === record.eventType)) {
+        console.log(
+          `[PaymentHistory] Skipping duplicate: ${record.eventType} for invoice ${record.stripeInvoiceId}`,
+        );
+        return { written: false };
+      }
+    }
+
+    await dynamodb.put({ TableName: TABLE_NAME, Item: item }).promise();
+    return { written: true };
   },
 
   /**

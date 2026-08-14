@@ -1045,64 +1045,36 @@ export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
     ? 'revoked'
     : 'no_current_month_grant';
 
-  // Idempotency via query-before-put on disputeId in metadata (the earlier
-  // "deterministic timestamp derived from dispute.created + id-hash offset"
-  // scheme still collided on the ~500 slots per second and let two disputes
-  // for the same billing user in the same second silently overwrite each
-  // other's audit rows). Wall-clock timestamp lets each dispute keep its
-  // own row, and the query check keeps webhook retries from appending a
-  // duplicate. Reversal is already idempotent via its own reversalId key.
-  if (await disputeHistoryAlreadyRecorded(user.userId, 'dispute_opened', dispute.id)) {
-    console.log(`[STRIPE] dispute_opened for ${dispute.id} already recorded — skipping duplicate history`);
+  // Atomic idempotency via dedupKey: paymentHistoryDb writes the main row +
+  // a marker on the sentinel dedup partition in a single TransactWriteItems.
+  // A concurrent redelivery races on ConditionalCheckFailed on the marker
+  // and no-ops — no bounded lookback window to slip past. Reversal is
+  // already idempotent via its own reversalId key.
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_opened',
+      amount: amountDisputedCents,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: reversalOutcome === 'revoked' ? 'disputed' : 'disputed_no_action',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeReason: dispute.reason,
+        revokedMicroUsd,
+        reversalOutcome,
+      },
+    },
+    { dedupKey: `dispute:opened:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_opened for ${dispute.id} already recorded — skipped duplicate history`);
     return;
   }
-  await paymentHistoryDb.record({
-    userId: user.userId,
-    timestamp: new Date().toISOString(),
-    eventType: 'dispute_opened',
-    amount: amountDisputedCents,
-    currency: dispute.currency || charge.currency || 'usd',
-    status: reversalOutcome === 'revoked' ? 'disputed' : 'disputed_no_action',
-    metadata: {
-      chargeId: charge.id,
-      disputeId: dispute.id,
-      disputeReason: dispute.reason,
-      revokedMicroUsd,
-      reversalOutcome,
-    },
-  });
 
   console.log(
     `[STRIPE] Credit purchase disputed: user ${user.userId}, dispute=${dispute.id}, revoked=${revokedMicroUsd} microUSD (${reversalOutcome})`
-  );
-}
-
-/**
- * Idempotency check for dispute-driven payment-history rows: scans the user's
- * recent history for a row with the same event type AND matching disputeId
- * in metadata. Returns true if one is already recorded, so the caller can
- * skip a duplicate Put on webhook redelivery.
- *
- * Replaces an earlier deterministic-timestamp scheme (dispute.created +
- * id-hash offset) that collided at scale: distinct disputes for the same
- * billing user with hash-colliding ids in the same second overwrote each
- * other's audit rows. Query-before-put has bounded cost (100-row lookup)
- * and no collision risk.
- *
- * Lookback of 100 covers realistic redelivery windows (minutes-to-hours).
- * If a user ever accumulates more than 100 payment events between an
- * original dispute event and its redelivery, the dedup window slips and a
- * duplicate could land — the fix at that scale is a GSI on disputeId.
- */
-const DISPUTE_HISTORY_DEDUP_LOOKBACK = 100;
-async function disputeHistoryAlreadyRecorded(
-  userId: string,
-  eventType: 'dispute_opened' | 'dispute_closed',
-  disputeId: string,
-): Promise<boolean> {
-  const recent = await paymentHistoryDb.getByUserId(userId, DISPUTE_HISTORY_DEDUP_LOOKBACK);
-  return recent.some(
-    (r) => r.eventType === eventType && (r.metadata as any)?.disputeId === disputeId,
   );
 }
 
@@ -1133,26 +1105,29 @@ export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
     return;
   }
 
-  // Idempotency via query-before-put on disputeId in metadata (see
-  // handleChargeDisputeCreated for the rationale — the deterministic-
-  // timestamp scheme it replaced collided at scale).
-  if (await disputeHistoryAlreadyRecorded(user.userId, 'dispute_closed', dispute.id)) {
-    console.log(`[STRIPE] dispute_closed for ${dispute.id} already recorded — skipping duplicate history`);
+  // Atomic idempotency via dedupKey (see handleChargeDisputeCreated for the
+  // same rationale — TransactWriteItems marker on the sentinel dedup
+  // partition, no bounded lookback to slip past).
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_closed',
+      amount: Number(dispute.amount) || 0,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: dispute.status || 'closed',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeStatus: dispute.status,
+      },
+    },
+    { dedupKey: `dispute:closed:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_closed for ${dispute.id} already recorded — skipped duplicate history`);
     return;
   }
-  await paymentHistoryDb.record({
-    userId: user.userId,
-    timestamp: new Date().toISOString(),
-    eventType: 'dispute_closed',
-    amount: Number(dispute.amount) || 0,
-    currency: dispute.currency || charge.currency || 'usd',
-    status: dispute.status || 'closed',
-    metadata: {
-      chargeId: charge.id,
-      disputeId: dispute.id,
-      disputeStatus: dispute.status,
-    },
-  });
 
   console.log(
     `[STRIPE] Credit dispute closed as "${dispute.status}": user ${user.userId}, dispute=${dispute.id}. ` +

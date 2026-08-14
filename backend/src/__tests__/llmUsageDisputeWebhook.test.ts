@@ -61,22 +61,19 @@ const fullDispute = {
 describe('AgentWeb Credits chargeback handling', () => {
   let getUser: jest.SpyInstance;
   let record: jest.SpyInstance;
-  let getByUserId: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.STRIPE_SECRET_KEY = 'sk_test_dummy';
     mockStripe.charges.retrieve.mockResolvedValue(topUpCharge);
     getUser = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'u1' } as any);
-    record = jest.spyOn(paymentHistoryDb, 'record').mockResolvedValue(undefined as any);
-    // Default: no prior history for the user, so dedup lets the write through.
-    getByUserId = jest.spyOn(paymentHistoryDb, 'getByUserId').mockResolvedValue([]);
+    // Default: dedup lets the write through (atomic marker didn't exist yet).
+    record = jest.spyOn(paymentHistoryDb, 'record').mockResolvedValue({ written: true });
   });
 
   afterEach(() => {
     getUser.mockRestore();
     record.mockRestore();
-    getByUserId.mockRestore();
   });
 
   describe('dispute opened', () => {
@@ -145,41 +142,26 @@ describe('AgentWeb Credits chargeback handling', () => {
       expect(first[0].reversalId).toBe(second[0].reversalId);
     });
 
-    it('skips a duplicate dispute_opened history row when the same disputeId is already recorded', async () => {
-      // Simulate a prior dispute_opened row for this dispute in history.
-      getByUserId.mockResolvedValueOnce([
-        {
-          userId: 'u1',
-          timestamp: '2026-08-13T10:00:00.000Z',
-          eventType: 'dispute_opened',
-          amount: 2500,
-          currency: 'usd',
-          status: 'disputed',
-          metadata: { disputeId: 'dp_1' },
-        },
-      ]);
-
-      await handleChargeDisputeCreated(fullDispute);
-
-      expect(record).not.toHaveBeenCalled();
-    });
-
-    it('does not treat an unrelated dispute_opened row as a duplicate', async () => {
-      getByUserId.mockResolvedValueOnce([
-        {
-          userId: 'u1',
-          timestamp: '2026-08-13T10:00:00.000Z',
-          eventType: 'dispute_opened',
-          amount: 4200,
-          currency: 'usd',
-          status: 'disputed',
-          metadata: { disputeId: 'dp_OTHER' },
-        },
-      ]);
+    it('passes a disputeId-keyed dedupKey so paymentHistoryDb can no-op on redelivery', async () => {
+      // On redelivery, the atomic marker Put in paymentHistoryDb.record fails
+      // its ConditionExpression and the caller sees {written: false}. No
+      // bounded lookback window to slip past — race-safe under concurrent
+      // webhook fan-out.
+      record.mockResolvedValueOnce({ written: false });
 
       await handleChargeDisputeCreated(fullDispute);
 
       expect(record).toHaveBeenCalledTimes(1);
+      const [, opts] = record.mock.calls[0] as any[];
+      expect(opts).toEqual({ dedupKey: 'dispute:opened:dp_1' });
+    });
+
+    it('scopes the dedupKey per disputeId so distinct disputes both record', async () => {
+      await handleChargeDisputeCreated(fullDispute);
+      await handleChargeDisputeCreated({ ...fullDispute, id: 'dp_OTHER' });
+
+      const keys = (record.mock.calls as any[]).map(([, o]) => o?.dedupKey);
+      expect(keys).toEqual(['dispute:opened:dp_1', 'dispute:opened:dp_OTHER']);
     });
 
     it('records the true reversal outcome when no current-month grant exists to revoke', async () => {
@@ -188,7 +170,7 @@ describe('AgentWeb Credits chargeback handling', () => {
       await handleChargeDisputeCreated(fullDispute);
 
       expect(record).toHaveBeenCalledTimes(1);
-      const arg = (record.mock.calls[0]![0] as any);
+      const arg = ((record.mock.calls[0] as any[])[0]);
       expect(arg.status).toBe('disputed_no_action');
       expect(arg.metadata).toMatchObject({
         revokedMicroUsd: 0,
@@ -199,7 +181,7 @@ describe('AgentWeb Credits chargeback handling', () => {
     it('records the revoked amount when the reversal succeeds', async () => {
       await handleChargeDisputeCreated(fullDispute);
 
-      const arg = (record.mock.calls[0]![0] as any);
+      const arg = ((record.mock.calls[0] as any[])[0]);
       expect(arg.status).toBe('disputed');
       expect(arg.metadata).toMatchObject({
         revokedMicroUsd: 10_000_000,
@@ -222,40 +204,22 @@ describe('AgentWeb Credits chargeback handling', () => {
       expect(mockReverse).not.toHaveBeenCalled();
     });
 
-    it('skips a duplicate dispute_closed row when the same disputeId is already recorded', async () => {
-      getByUserId.mockResolvedValueOnce([
-        {
-          userId: 'u1',
-          timestamp: '2026-08-13T10:00:00.000Z',
-          eventType: 'dispute_closed',
-          amount: 2500,
-          currency: 'usd',
-          status: 'won',
-          metadata: { disputeId: 'dp_1' },
-        },
-      ]);
-
-      await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
-
-      expect(record).not.toHaveBeenCalled();
-    });
-
-    it('records dispute_closed even when a prior dispute_opened row for the same id exists — different event types are not duplicates', async () => {
-      getByUserId.mockResolvedValueOnce([
-        {
-          userId: 'u1',
-          timestamp: '2026-08-13T10:00:00.000Z',
-          eventType: 'dispute_opened',
-          amount: 2500,
-          currency: 'usd',
-          status: 'disputed',
-          metadata: { disputeId: 'dp_1' },
-        },
-      ]);
+    it('passes a disputeId-keyed dedupKey so paymentHistoryDb can no-op on redelivery', async () => {
+      record.mockResolvedValueOnce({ written: false });
 
       await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
 
       expect(record).toHaveBeenCalledTimes(1);
+      const [, opts] = record.mock.calls[0] as any[];
+      expect(opts).toEqual({ dedupKey: 'dispute:closed:dp_1' });
+    });
+
+    it('dispute_opened and dispute_closed for the same dispute use distinct dedupKeys', async () => {
+      await handleChargeDisputeCreated(fullDispute);
+      await handleChargeDisputeClosed({ ...fullDispute, status: 'won' });
+
+      const keys = (record.mock.calls as any[]).map(([, o]) => o?.dedupKey);
+      expect(keys).toEqual(['dispute:opened:dp_1', 'dispute:closed:dp_1']);
     });
   });
 });
