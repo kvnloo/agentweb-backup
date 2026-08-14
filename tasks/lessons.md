@@ -181,3 +181,24 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
 - Why it happened
 - How to prevent it
 - Example or reference
+
+## Reading an adjacent function is not reading the function (ENG-941, 2026-08-14)
+
+- **What went wrong:** claimed "ad sets default to PAUSED" and built the launch gate's predicate on it. `createAdSet` sets status only when provided, so an omitted status falls through to Meta's default of ACTIVE — an ad set created with no status started delivering completely ungated. Same day, claimed "Emma has exactly 4 landing-page tools" and used it to conclude a capability didn't exist.
+- **Why it happened:** the PAUSED default was read from `createCampaign`, one function away. The tool list was read from a gating array in `agentModeService`, not the registry in `emma/tools.ts`. Both sources were adjacent, plausible, and wrong. Both claims were stated with confidence.
+- **How to prevent it:** before asserting a default, a capability, or a list, open the exact function or registry that produces it. "I checked" means naming the file and line you checked, not the neighbourhood. If a claim is load-bearing for a design decision, quote the line.
+- **Reference:** `metaService.createAdSet` vs `createCampaign`; `emma/tools.ts` registry vs `agentModeService.ts:6565`.
+
+## A safety gate must be tested for being reached, not just for being right (ENG-941, 2026-08-14)
+
+- **What went wrong:** the pure check and the enforcement logic were both well covered, and neither would have failed if the gate were never called at all.
+- **Why it happened:** unit tests exercise a function directly. A gate that is wired in wrongly — or after an earlier early-return — is indistinguishable from a correct one at that level. The first wiring test immediately revealed the ENG-400 confirmation gate returns before the tracking gate is reached.
+- **How to prevent it:** for anything that blocks, add a test that drives the real entry point and asserts the downstream write did NOT happen. Assert the absence of the side effect, not just the returned verdict.
+- **Reference:** `metaLaunchGateWiring.test.ts`.
+
+## Run the whole suite, and don't trust a CI score you didn't attribute to a commit (ENG-941, 2026-08-14)
+
+- **What went wrong:** ran only the suites that looked related, and pushed. The full run found 1 failure in 22,920 — the gate correctly failing closed in a suite that mocks neither credentials nor the Graph API. Separately, a failing "Require Greptile Review" was read as a verdict on fixed code when it was re-reading a review posted before the fixes.
+- **Why it happened:** a new dependency reaches suites that never mentioned it. And the required check re-reads the last posted review, so its state can lag the head by an entire round.
+- **How to prevent it:** run `npm test` in full before pushing anything that adds a dependency to a shared path. To judge a review, count the review comments and check which head they were posted against — do not read the score string alone.
+- **Reference:** `agentModeService.audienceCampaignWorkflows.test.ts`; PR #2406.
