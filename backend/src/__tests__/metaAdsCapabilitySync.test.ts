@@ -68,6 +68,20 @@ const metaAccount = (config: Record<string, any>) =>
 const latchedAccount = () =>
   metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' });
 
+/**
+ * updateAccountConfig's 4th arg is now either a plain object or a function of
+ * the freshly-read config (Greptile P1: a CAS retry must recompute a derived
+ * update from what it actually reads, not reapply a stale precomputed one).
+ * Resolves either form against `freshConfig` the way the real CAS loop would.
+ */
+const resolveMutation = (call: any[], freshConfig: Record<string, any>) => {
+  const [, , , configUpdates, options] = call;
+  if (typeof configUpdates === 'function') {
+    return configUpdates(freshConfig);
+  }
+  return { updates: configUpdates, unset: options?.unset };
+};
+
 describe('syncMetaAdsCapability (ENG-1158)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -79,12 +93,13 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
     it('retracts the revocation when the ad account actually serves a read', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('accessible');
       const account = latchedAccount();
+      const configSnapshot = { ...account.config };
 
       const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('recovered');
-      const [, , , updates, options] = mockUpdateAccountConfig.mock.calls[0];
-      expect(options.unset).toEqual(
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(unset).toEqual(
         expect.arrayContaining(['ads_scope_revoked_at', 'granted_scopes'])
       );
       // Nothing is asserted about the grant itself: we proved the read works,
@@ -141,11 +156,12 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
         granted_scopes: ['pages_show_list'],
         ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
       });
+      const configSnapshot = { ...account.config };
 
       await syncMetaAdsCapability(account, 'user1');
 
-      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
-      expect(options.unset).toContain('granted_scopes');
+      const { unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(unset).toContain('granted_scopes');
       expect(account.config.granted_scopes).toBeUndefined();
     });
 
@@ -158,11 +174,12 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
         ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
         ads_scope_tier: 'asset',
       });
+      const configSnapshot = { ...account.config };
 
       await syncMetaAdsCapability(account, 'user1');
 
-      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
-      expect(options.unset).toContain('ads_scope_tier');
+      const { unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(unset).toContain('ads_scope_tier');
       expect(account.config.ads_scope_tier).toBeUndefined();
     });
 
@@ -240,12 +257,13 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
         granted_scopes: ['ads_read'],
         ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
       });
+      const configSnapshot = { ...account.config };
 
       await syncMetaAdsCapability(account, 'user1');
 
       expect(mockClassifyAdsRefusalTier).toHaveBeenCalledWith('EAA-token');
       expect(account.config.ads_scope_tier).toBe('asset');
-      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
       expect(updates.ads_scope_tier).toBe('asset');
     });
 
@@ -256,12 +274,13 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
         granted_scopes: ['ads_read'],
         ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
       });
+      const configSnapshot = { ...account.config };
 
       await syncMetaAdsCapability(account, 'user1');
 
       expect(account.config.ads_scope_tier).toBeUndefined();
-      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
-      expect(options.unset).toContain('ads_scope_tier');
+      const { unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(unset).toContain('ads_scope_tier');
     });
 
     it('forgets the suspicion as soon as one probe succeeds', async () => {
@@ -272,11 +291,12 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
         granted_scopes: ['ads_read'],
         ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
       });
+      const configSnapshot = { ...account.config };
 
       await syncMetaAdsCapability(account, 'user1');
 
-      const [, , , , options] = mockUpdateAccountConfig.mock.calls[0];
-      expect(options.unset).toContain('ads_scope_denied_seen_at');
+      const { unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(unset).toContain('ads_scope_denied_seen_at');
       expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
     });
 
@@ -296,20 +316,20 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
   describe('proactive detection — scope lost with no run to notice it', () => {
     it('records the revocation and alerts the owner', async () => {
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      const account = metaAccount({
+        granted_scopes: ['ads_read', 'pages_show_list'],
+        ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
+      });
+      const configSnapshot = { ...account.config };
 
-      const result = await syncMetaAdsCapability(
-        metaAccount({
-          granted_scopes: ['ads_read', 'pages_show_list'],
-          ads_scope_denied_seen_at: '2026-08-12T07:00:00.000Z',
-        }),
-        'user1'
-      );
+      const result = await syncMetaAdsCapability(account, 'user1');
 
       expect(result.outcome).toBe('revoked');
-      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      const [userId, platform, accountId] = mockUpdateAccountConfig.mock.calls[0];
       expect(userId).toBe('user1');
       expect(platform).toBe('meta');
       expect(accountId).toBe(AD_ACCOUNT_ID);
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
       expect(typeof updates.ads_scope_revoked_at).toBe('string');
       // The grant must be narrowed too, or the revocation is inert — see below.
       expect(updates.granted_scopes).toEqual(['pages_show_list']);

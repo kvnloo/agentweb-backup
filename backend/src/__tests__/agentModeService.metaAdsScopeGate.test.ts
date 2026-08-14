@@ -30,6 +30,20 @@ jest.mock('../services/metaService', () => ({
   }
 }));
 
+/**
+ * updateAccountConfig's 4th arg is now either a plain object or a function of
+ * the freshly-read config (Greptile P1: a CAS retry must recompute a derived
+ * update from what it actually reads, not reapply a stale precomputed one).
+ * Resolves either form against `freshConfig` the way the real CAS loop would.
+ */
+const resolveMutation = (call: any[], freshConfig: Record<string, any>) => {
+  const [, , , configUpdates, options] = call;
+  if (typeof configUpdates === 'function') {
+    return configUpdates(freshConfig);
+  }
+  return { updates: configUpdates, unset: options?.unset };
+};
+
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn()
@@ -248,10 +262,14 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
-      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      const [userId, platform, accountId] = mockUpdateAccountConfig.mock.calls[0];
       expect(userId).toBe('user1');
       expect(platform).toBe('meta');
       expect(accountId).toBe(AD_ACCOUNT_ID);
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
       expect(Array.isArray(updates.granted_scopes)).toBe(true);
       expect(updates.granted_scopes).not.toContain('ads_read');
       expect(updates.granted_scopes).not.toContain('ads_management');
@@ -267,7 +285,10 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
 
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
-      const updates = mockUpdateAccountConfig.mock.calls[0][3];
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
       expect(updates.ads_scope_tier).toBe('asset');
     });
 
@@ -282,7 +303,10 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
-      const persisted = mockUpdateAccountConfig.mock.calls[0][3];
+      const { updates: persisted } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
 
       // Feed exactly what we persisted back in, as the next run would read it.
       (userDb.getUserById as jest.Mock).mockResolvedValue({
@@ -498,7 +522,10 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
-      const [, , , updates] = mockUpdateAccountConfig.mock.calls[0];
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
       expect(typeof updates.ads_scope_revoked_at).toBe('string');
       expect(updates.granted_scopes).not.toContain('ads_read');
     });

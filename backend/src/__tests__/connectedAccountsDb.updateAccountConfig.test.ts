@@ -147,6 +147,51 @@ describe('updateAccountConfig', () => {
         updateAccountConfig('user-1', 'meta', '922903076601160', {})
       ).rejects.toThrow(/dynamo exploded/);
     });
+
+    /**
+     * Greptile P1: a fixed `configUpdates` object is fine when the update
+     * doesn't depend on current state, but reapplying it unchanged on a CAS
+     * retry is wrong the moment it does — a stale-derived write could clobber
+     * whatever the winning concurrent writer just landed. The function form
+     * exists so each retry recomputes from what THAT attempt actually read.
+     */
+    it('recomputes a derived update from the state each retry attempt reads, not the first', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce(conflict).mockResolvedValueOnce(undefined);
+
+      // Second read simulates a concurrent recovery landing between attempts:
+      // the ads scope is back, which a stale-derived narrowing must not undo.
+      (userDb.getUserByIdConsistent as jest.Mock)
+        .mockResolvedValueOnce({
+          userId: 'user-1',
+          email: 'founders@agentweb.pro',
+          connected_accounts: [metaAccount()],
+        })
+        .mockResolvedValueOnce({
+          userId: 'user-1',
+          email: 'founders@agentweb.pro',
+          connected_accounts: [
+            {
+              ...metaAccount(),
+              config: { ...metaAccount().config, granted_scopes: ['ads_read'] },
+            },
+          ],
+        });
+
+      await updateAccountConfig('user-1', 'meta', '922903076601160', freshConfig => ({
+        updates: {
+          // Derived from whatever THIS attempt actually read — mirrors the
+          // narrowing logic in metaAdsCapabilitySync.ts.
+          granted_scopes: (freshConfig.granted_scopes as string[]).filter((s: string) => s !== 'ads_read'),
+        },
+      }));
+
+      expect((userDb.getUserByIdConsistent as jest.Mock).mock.calls).toHaveLength(2);
+      const config = (userDb.updateUser as jest.Mock).mock.calls[1][1].connected_accounts[0].config;
+      // The retry saw ['ads_read'] on its own read and correctly narrowed it —
+      // not the first read's [], reapplied blind.
+      expect(config.granted_scopes).toEqual([]);
+    });
   });
 
   it('throws when the account is not connected', async () => {
