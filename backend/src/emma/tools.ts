@@ -876,13 +876,13 @@ emmaToolRegistry.register({
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
 
-⚠️ LAUNCH GATE (ENG-941): setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a
-  pre-flight tracking check on the campaign's destination URLs first. A destination is measurable only if its
-  served HTML carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some
-  other account will never receive these conversions, so it does not count. If any destination fails, the launch
-  is BLOCKED (result has blocked=true, reason='tracking_preflight') and the message names each destination and
-  what was checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel
-  is receiving events server-side, the page may be measured through the Conversions API, which this check cannot
+LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a pre-flight
+  tracking check on the campaign's destination URLs first. A destination is measurable only if its served HTML
+  carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some other account
+  will never receive these conversions, so it does not count. If any destination fails, the launch is BLOCKED
+  (result has blocked=true, reason='tracking_preflight') and the message names each destination and what was
+  checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel is
+  receiving events server-side, the page may be measured through the Conversions API, which this check cannot
   see. Only pass params.override_tracking_check=true if the user explicitly chooses to launch anyway — never set
   it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
   or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
