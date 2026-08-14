@@ -307,4 +307,63 @@ describe('sendCapiLeadEvent', () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.data[0].event_time).toBeGreaterThanOrEqual(before);
   });
+
+  // ENG-926 §C: custom_data carries the revenue on a closed-won Purchase. Without
+  // value/currency the event still counts but is useless for value-based bidding, which
+  // is the entire reason the CRM → Meta relay exists.
+  describe('custom_data', () => {
+    beforeEach(() => {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+      });
+    });
+
+    it('omits custom_data entirely when no customData is passed — existing callers unchanged', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0]).not.toHaveProperty('custom_data');
+    });
+
+    it('emits value and currency when both are supplied', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', {
+        ...baseEvent,
+        eventName: 'Purchase',
+        customData: { value: 5000, currency: 'USD' },
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0].custom_data).toEqual({ value: 5000, currency: 'USD' });
+    });
+
+    it('emits currency alone when the deal has no value — a won deal with no amount is still a conversion', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', {
+        ...baseEvent,
+        eventName: 'Purchase',
+        customData: { currency: 'EUR' },
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0].custom_data).toEqual({ currency: 'EUR' });
+    });
+
+    it('emits a zero value rather than dropping it — 0 is a real amount, not "absent"', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', {
+        ...baseEvent,
+        eventName: 'Purchase',
+        customData: { value: 0, currency: 'USD' },
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0].custom_data.value).toBe(0);
+    });
+
+    it('omits custom_data when the object is present but empty', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, customData: {} });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0]).not.toHaveProperty('custom_data');
+    });
+  });
 });

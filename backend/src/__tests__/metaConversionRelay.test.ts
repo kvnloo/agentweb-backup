@@ -1,0 +1,442 @@
+/**
+ * ENG-926 §C — CRM → Meta event relay.
+ *
+ * The card's missing return path: today conversion data flows Meta → us and stops at
+ * `Lead`. Nothing tells Meta what became of the lead, so Meta optimizes toward form
+ * fills rather than revenue. This relays `qualified` and closed-won back.
+ *
+ * Two properties matter more than the mapping itself and are tested hardest here:
+ *   1. fire-once — a lead going won → lost → won must not double-count a Purchase,
+ *      which is the exact failure §E's dedup contract exists to prevent;
+ *   2. never fail-closed — a missing pixel, a missing dealValue or a Meta-side error
+ *      must never break the lead write that already succeeded. Failing closed here
+ *      IS the original RankAI silent-undercounting bug.
+ */
+
+import {
+  mapStatusToMetaEvent,
+  buildRelayEventId,
+  buildFbcFromFirstTouch,
+  relayLeadStatusEvent,
+  RelayDeps,
+} from '../services/metaConversionRelay';
+
+const LEAD_STATUS_CONFIG = [
+  { value: 'new', label: 'New', color: 'gray', type: 'active' as const },
+  { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' as const },
+  { value: 'won', label: 'Won', color: 'green', type: 'won' as const },
+  { value: 'lost', label: 'Lost', color: 'red', type: 'lost' as const },
+];
+
+const OWNER = { email: 'owner@example.com', connected_accounts: [] };
+
+function makeDeps(overrides: Partial<RelayDeps> = {}): RelayDeps {
+  return {
+    getUserById: jest.fn().mockResolvedValue(OWNER),
+    resolvePixel: jest.fn().mockResolvedValue({ pixelId: 'px1', accountId: 'acct1' }),
+    getCredentials: jest
+      .fn()
+      .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct', currency: 'USD' }),
+    sendEvent: jest.fn().mockResolvedValue({ success: true, fbtraceId: 'trace1' }),
+    recordSent: jest.fn().mockResolvedValue(undefined),
+    shouldAttemptSend: jest.fn().mockReturnValue(true),
+    isAccountPaused: jest.fn().mockReturnValue(false),
+    ...overrides,
+  };
+}
+
+function makeLead(overrides: Record<string, any> = {}) {
+  return {
+    leadId: 'lead-1',
+    listId: 'list-1',
+    email: 'buyer@example.com',
+    firstName: 'Jane',
+    lastName: 'Doe',
+    status: 'won',
+    dealValue: 5000,
+    dealCurrency: 'USD',
+    ...overrides,
+  };
+}
+
+const ctx = (overrides: Record<string, any> = {}) => ({
+  listId: 'list-1',
+  userId: 'user-1',
+  lead: makeLead(),
+  previousStatus: 'new',
+  statusConfig: LEAD_STATUS_CONFIG,
+  ...overrides,
+});
+
+describe('mapStatusToMetaEvent', () => {
+  it('maps a won-type status to Purchase as a value event', () => {
+    expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'won')).toEqual({
+      eventName: 'Purchase',
+      isValueEvent: true,
+    });
+  });
+
+  it('maps qualified to the custom QualifiedLead event, not a standard Meta event', () => {
+    // Deliberately custom: Meta has no standard event that honestly means MQL, and
+    // reusing SubmitApplication would pollute a name Meta's models hold priors on.
+    expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'qualified')).toEqual({
+      eventName: 'QualifiedLead',
+      isValueEvent: false,
+    });
+  });
+
+  it('maps a RENAMED status whose type is won — customers rename statuses', () => {
+    const renamed = [
+      { value: 'deal_closed', label: 'Deal Closed!', color: 'green', type: 'won' as const },
+    ];
+    expect(mapStatusToMetaEvent(renamed, 'deal_closed')).toEqual({
+      eventName: 'Purchase',
+      isValueEvent: true,
+    });
+  });
+
+  it('returns null for statuses that are not a conversion (new, contacted, lost, churned)', () => {
+    expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'new')).toBeNull();
+    expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'lost')).toBeNull();
+  });
+
+  it('falls back to the platform default status config when a list has none', () => {
+    expect(mapStatusToMetaEvent(undefined, 'won')).toEqual({
+      eventName: 'Purchase',
+      isValueEvent: true,
+    });
+  });
+
+  it('returns null for an unknown status rather than guessing', () => {
+    expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'not_a_real_status')).toBeNull();
+  });
+});
+
+describe('buildRelayEventId', () => {
+  it('is deterministic for the same lead and event', () => {
+    expect(buildRelayEventId('lead-1', 'Purchase')).toBe(buildRelayEventId('lead-1', 'Purchase'));
+  });
+
+  it('differs across leads and across events', () => {
+    expect(buildRelayEventId('lead-1', 'Purchase')).not.toBe(buildRelayEventId('lead-2', 'Purchase'));
+    expect(buildRelayEventId('lead-1', 'Purchase')).not.toBe(buildRelayEventId('lead-1', 'QualifiedLead'));
+  });
+
+  it('carries NO timestamp — a timestamped id would defeat Meta-side dedup on a retry', () => {
+    const first = buildRelayEventId('lead-1', 'Purchase');
+    const second = buildRelayEventId('lead-1', 'Purchase');
+    expect(first).toBe(second);
+    expect(first).toMatch(/^[a-f0-9]{64}$/);
+  });
+});
+
+describe('buildFbcFromFirstTouch', () => {
+  // fbc arrives as a browser cookie at capture time and is never persisted, so weeks later
+  // when the deal closes the only surviving click signal is the stored fbclid. Meta's fbc
+  // is a documented deterministic encoding of it, so it can be rebuilt rather than lost.
+  it('rebuilds fbc from a stored fbclid using the touch timestamp', () => {
+    expect(
+      buildFbcFromFirstTouch({
+        timestamp: '2026-08-01T00:00:00.000Z',
+        clickIds: { fbclid: 'abc123' },
+      }),
+    ).toBe(`fb.1.${Date.parse('2026-08-01T00:00:00.000Z')}.abc123`);
+  });
+
+  it('returns undefined with no fbclid — an organic lead has no click to invent', () => {
+    expect(buildFbcFromFirstTouch({ timestamp: '2026-08-01T00:00:00.000Z' })).toBeUndefined();
+    expect(buildFbcFromFirstTouch({ clickIds: { gclid: 'g1' } })).toBeUndefined();
+    expect(buildFbcFromFirstTouch(undefined)).toBeUndefined();
+  });
+
+  it('falls back to now when the stored timestamp is unparseable, rather than emitting NaN', () => {
+    const fbc = buildFbcFromFirstTouch({ timestamp: 'not-a-date', clickIds: { fbclid: 'abc123' } });
+    expect(fbc).toMatch(/^fb\.1\.\d+\.abc123$/);
+    expect(fbc).not.toContain('NaN');
+  });
+});
+
+describe('relayLeadStatusEvent — sending', () => {
+  it('reconstructs fbc from the lead first touch and sends the landing URL', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(
+      ctx({
+        lead: makeLead({
+          firstTouch: {
+            timestamp: '2026-08-01T00:00:00.000Z',
+            clickIds: { fbclid: 'abc123' },
+            landingUrl: 'https://example.com/lp?utm_source=facebook',
+          },
+        }),
+      }),
+      deps,
+    );
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.fbc).toBe(`fb.1.${Date.parse('2026-08-01T00:00:00.000Z')}.abc123`);
+    expect(event.sourceUrl).toBe('https://example.com/lp?utm_source=facebook');
+  });
+
+  it('never sends fbp — it is a capture-time cookie that is not persisted on the lead', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx(), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.fbp).toBeUndefined();
+  });
+
+  it('sends Purchase with value and currency from the lead record', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(ctx(), deps);
+
+    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
+    const [pixelId, accessToken, event] = (deps.sendEvent as jest.Mock).mock.calls[0];
+    expect(pixelId).toBe('px1');
+    expect(accessToken).toBe('tok');
+    expect(event.eventName).toBe('Purchase');
+    expect(event.customData).toEqual({ value: 5000, currency: 'USD' });
+  });
+
+  it('falls back to the ad account currency when the lead has no dealCurrency', async () => {
+    // Not cosmetic: a non-USD account reported as USD is silently wrong, since Meta
+    // accepts whatever denomination it is handed.
+    const deps = makeDeps({
+      getCredentials: jest
+        .fn()
+        .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct', currency: 'INR' }),
+    });
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ dealCurrency: undefined }) }), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData.currency).toBe('INR');
+  });
+
+  it('prefers the deal currency over the account currency when both exist', async () => {
+    const deps = makeDeps({
+      getCredentials: jest
+        .fn()
+        .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct', currency: 'INR' }),
+    });
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ dealCurrency: 'EUR' }) }), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData.currency).toBe('EUR');
+  });
+
+  it('falls back to USD only when neither the deal nor the account names a currency', async () => {
+    const deps = makeDeps({
+      getCredentials: jest
+        .fn()
+        .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct' }),
+    });
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ dealCurrency: undefined }) }), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData.currency).toBe('USD');
+  });
+
+  it('still sends Purchase when dealValue is absent — no value, but never a dropped conversion', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ dealValue: undefined, dealCurrency: undefined }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData?.value).toBeUndefined();
+  });
+
+  it('sends QualifiedLead with no custom_data at all', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'qualified' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ sent: true, eventName: 'QualifiedLead' });
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData).toBeUndefined();
+  });
+
+  it('sends even when the lead carries no fbc/fbp — email alone still matches', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ sent: true });
+  });
+
+  it('records the event on the lead so it can never fire twice', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx(), deps);
+    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', ['Purchase']);
+  });
+});
+
+describe('relayLeadStatusEvent — fire-once', () => {
+  it('does not re-send when the event is already in metaConversionsSent', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ metaConversionsSent: ['Purchase'] }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('won → lost → won fires Purchase exactly once', async () => {
+    const deps = makeDeps();
+    const sent: string[] = [];
+    (deps.recordSent as jest.Mock).mockImplementation(async (_l, _i, names: string[]) => {
+      sent.push(...names);
+    });
+
+    await relayLeadStatusEvent(ctx({ lead: makeLead(), previousStatus: 'new' }), deps);
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'lost', metaConversionsSent: [...sent] }), previousStatus: 'won' }),
+      deps,
+    );
+    await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'won', metaConversionsSent: [...sent] }), previousStatus: 'lost' }),
+      deps,
+    );
+
+    const purchases = (deps.sendEvent as jest.Mock).mock.calls.filter(
+      (c) => c[2].eventName === 'Purchase',
+    );
+    expect(purchases).toHaveLength(1);
+  });
+
+  it('allows QualifiedLead and Purchase on the same lead — different events, both real', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'won', metaConversionsSent: ['QualifiedLead'] }) }),
+      deps,
+    );
+    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
+  });
+});
+
+describe('relayLeadStatusEvent — skips (expected, never errors)', () => {
+  it('skips a lead who opted out (contactStatus unsubscribed)', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ contactStatus: 'unsubscribed' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips a do-not-contact lead', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ contactStatus: 'do-not-contact' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips when the status change is not a conversion transition', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ status: 'contacted' }), previousStatus: 'new' }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips when the pixel is unresolved — the lead write must still stand', async () => {
+    const deps = makeDeps({
+      resolvePixel: jest.fn().mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' }),
+    });
+
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips the automated smoke-test lead so real ad accounts are never polluted', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ email: 'smoke-test+1755200000000@agentweb.pro' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips when the per-list send budget is exhausted', async () => {
+    const deps = makeDeps({ shouldAttemptSend: jest.fn().mockReturnValue(false) });
+    const result = await relayLeadStatusEvent(ctx(), deps);
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips when the ad account is paused by Meta-reported throttling', async () => {
+    const deps = makeDeps({ isAccountPaused: jest.fn().mockReturnValue(true) });
+    const result = await relayLeadStatusEvent(ctx(), deps);
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('skips when the owner no longer exists', async () => {
+    const deps = makeDeps({ getUserById: jest.fn().mockResolvedValue(null) });
+    const result = await relayLeadStatusEvent(ctx(), deps);
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('does NOT record a send when it skipped', async () => {
+    const deps = makeDeps({ shouldAttemptSend: jest.fn().mockReturnValue(false) });
+    await relayLeadStatusEvent(ctx(), deps);
+    expect(deps.recordSent).not.toHaveBeenCalled();
+  });
+});
+
+describe('relayLeadStatusEvent — failures never break the lead write', () => {
+  it('returns a failure (does not throw) when Meta rejects the event', async () => {
+    const deps = makeDeps({
+      sendEvent: jest.fn().mockResolvedValue({ success: false, error: 'Invalid parameter' }),
+    });
+
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ failed: true });
+  });
+
+  it('does NOT record the event as sent when Meta rejected it — it must be retryable', async () => {
+    const deps = makeDeps({
+      sendEvent: jest.fn().mockResolvedValue({ success: false, error: 'Invalid parameter' }),
+    });
+
+    await relayLeadStatusEvent(ctx(), deps);
+    expect(deps.recordSent).not.toHaveBeenCalled();
+  });
+
+  it('does not throw when credential resolution throws', async () => {
+    const deps = makeDeps({
+      getCredentials: jest.fn().mockRejectedValue(new Error('token expired and refresh failed')),
+    });
+
+    await expect(relayLeadStatusEvent(ctx(), deps)).resolves.toMatchObject({ failed: true });
+  });
+
+  it('does not throw when the owner lookup itself throws', async () => {
+    const deps = makeDeps({ getUserById: jest.fn().mockRejectedValue(new Error('DynamoDB down')) });
+    await expect(relayLeadStatusEvent(ctx(), deps)).resolves.toMatchObject({ failed: true });
+  });
+
+  it('does not throw when recording the send fails after a successful Meta send', async () => {
+    const deps = makeDeps({ recordSent: jest.fn().mockRejectedValue(new Error('write failed')) });
+    await expect(relayLeadStatusEvent(ctx(), deps)).resolves.toBeDefined();
+  });
+});
