@@ -840,20 +840,48 @@ export class MetaService {
    * approve Ads permissions" sends them through a flow that cannot fix
    * anything and leaves them locked out with no correct next step.
    *
-   * Resolved by checking `debug_token`'s `granted_scopes` for the same token:
-   * present → the app grant is confirmed, so the ad account itself is the
-   * gap ('asset'). Absent → the app was never granted the scope ('oauth').
-   * Undetermined (debug_token itself failed) → 'unknown', which callers must
-   * treat as "fall back to the OAuth-tier message" rather than guess.
+   * Deliberately calls `/me/permissions`, NOT `debug_token` (`getGrantedScopes`).
+   * `debug_token` authenticates with an APP token and only answers for a token
+   * minted by the app whose credentials are currently configured — verified
+   * live to fail with "(#100) The App_id in the input_token did not match the
+   * Viewing App" on this repo's own dev test accounts, which would have made
+   * this classifier silently inert wherever that mismatch holds. `/me/permissions`
+   * authenticates with the USER token being classified, same as
+   * `probeAdsAccountAccess`, so it carries no such precondition — this is the
+   * exact call the original investigation used to diagnose account
+   * 922903076601160 live.
+   *
+   * present + granted → the app grant is confirmed, so the ad account itself is
+   * the gap ('asset'). Absent or declined → the app was never granted the scope
+   * ('oauth'). Undetermined (the call itself failed) → 'unknown', which callers
+   * must treat as "fall back to the OAuth-tier message" rather than guess.
    */
   public async classifyAdsRefusalTier(accessToken: string): Promise<'oauth' | 'asset' | 'unknown'> {
-    const { META_ADS_READ_SCOPES } = await import('../utils/metaAdsScope');
-    const scopes = await this.getGrantedScopes(accessToken);
-    if (scopes === undefined) return 'unknown';
-    const hasAdsScope = scopes.some(s =>
-      (META_ADS_READ_SCOPES as readonly string[]).includes(String(s).trim())
-    );
-    return hasAdsScope ? 'asset' : 'oauth';
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (!Array.isArray(body?.data)) {
+        console.warn(
+          `[MetaService] classifyAdsRefusalTier: /me/permissions returned an unexpected shape: ${body?.error?.message ?? 'no data array'}`
+        );
+        return 'unknown';
+      }
+
+      const { META_ADS_READ_SCOPES } = await import('../utils/metaAdsScope');
+      const hasAdsScope = body.data.some(
+        (p: any) =>
+          (META_ADS_READ_SCOPES as readonly string[]).includes(String(p?.permission).trim()) &&
+          p?.status === 'granted'
+      );
+      return hasAdsScope ? 'asset' : 'oauth';
+    } catch (error: any) {
+      console.warn(`[MetaService] classifyAdsRefusalTier failed: ${error?.message ?? error}`);
+      return 'unknown';
+    }
   }
 
   public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {

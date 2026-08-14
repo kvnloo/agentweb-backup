@@ -107,3 +107,59 @@ describe('metaService.probeAdsAccountAccess (ENG-1158)', () => {
     });
   });
 });
+
+describe('metaService.classifyAdsRefusalTier (ENG-1158 follow-up)', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+    delete (global as any).fetch;
+  });
+
+  /** The live /me/permissions response for account 922903076601160. */
+  const APP_GRANT_CONFIRMED = {
+    data: [
+      { permission: 'ads_read', status: 'granted' },
+      { permission: 'ads_management', status: 'granted' },
+      { permission: 'pages_show_list', status: 'granted' },
+    ],
+  };
+
+  it("classifies 'asset' when the app grant is confirmed present", async () => {
+    mockFetch(APP_GRANT_CONFIRMED);
+
+    await expect(metaService.classifyAdsRefusalTier('EAA-token')).resolves.toBe('asset');
+  });
+
+  it("classifies 'oauth' when no ads scope was ever granted", async () => {
+    mockFetch({ data: [{ permission: 'pages_show_list', status: 'granted' }] });
+
+    await expect(metaService.classifyAdsRefusalTier('EAA-token')).resolves.toBe('oauth');
+  });
+
+  it("classifies 'oauth' when the ads scope was explicitly declined", async () => {
+    mockFetch({ data: [{ permission: 'ads_read', status: 'declined' }] });
+
+    await expect(metaService.classifyAdsRefusalTier('EAA-token')).resolves.toBe('oauth');
+  });
+
+  it('authenticates with the USER token, not an app token — no debug_token app-id precondition', async () => {
+    mockFetch(APP_GRANT_CONFIRMED);
+
+    await metaService.classifyAdsRefusalTier('EAA-token');
+
+    const url = (global.fetch as jest.Mock).mock.calls[0][0] as string;
+    expect(url).toContain('/me/permissions');
+    expect(url).toContain('access_token=EAA-token');
+  });
+
+  it("returns 'unknown' rather than guessing on a malformed payload", async () => {
+    mockFetch({ error: { message: 'some transient failure' } });
+
+    await expect(metaService.classifyAdsRefusalTier('EAA-token')).resolves.toBe('unknown');
+  });
+
+  it("returns 'unknown' rather than throwing when the request itself fails", async () => {
+    (global as any).fetch = jest.fn().mockRejectedValue(new Error('ECONNRESET'));
+
+    await expect(metaService.classifyAdsRefusalTier('EAA-token')).resolves.toBe('unknown');
+  });
+});
