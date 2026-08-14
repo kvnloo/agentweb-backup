@@ -94,7 +94,15 @@ export async function resolveUsageDrivers(
 
   const attribution = attributeCosts(ledger);
 
-  const dailyCostMicroUsd = ledger.map((r) => ({ date: r.date, costMicroUsd: r.costMicroUsd }));
+  // Collapse to one total per DATE up front. computeUsageRunway sums duplicates
+  // itself, so the baseline is correct either way — but the counterfactual below
+  // must subtract a day's saving exactly once, which is only well-defined against
+  // a per-date total.
+  const observedByDate = new Map<string, number>();
+  for (const r of ledger) {
+    observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
+  }
+  const dailyCostMicroUsd = [...observedByDate.entries()].map(([date, costMicroUsd]) => ({ date, costMicroUsd }));
   const baseline = computeUsageRunway({
     costUsedMicroUsd: usage.costUsedMicroUsd,
     hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
@@ -132,9 +140,15 @@ export async function resolveUsageDrivers(
         const share = est.observedCostMicroUsd > 0 ? r.costMicroUsd / est.observedCostMicroUsd : 0;
         savingByDate.set(r.date, (savingByDate.get(r.date) || 0) + est.estimatedSavingsMicroUsd * share);
       }
-      const counterfactualDaily = dailyCostMicroUsd.map((d) => ({
-        date: d.date,
-        costMicroUsd: Math.max(0, d.costMicroUsd - (savingByDate.get(d.date) || 0)),
+      // Subtract from a per-DATE total, not per row. The ledger is keyed
+      // date#model#feature, so a busy day is many rows; deducting the whole
+      // day's saving from each of them subtracts it several times over,
+      // understating counterfactual burn and inflating the days figure the
+      // customer is being asked to act on. In the worst case every row floors at
+      // zero and the forecast disappears entirely.
+      const counterfactualDaily = [...observedByDate.entries()].map(([date, cost]) => ({
+        date,
+        costMicroUsd: Math.max(0, cost - (savingByDate.get(date) || 0)),
       }));
       const projected = computeUsageRunway({
         costUsedMicroUsd: usage.costUsedMicroUsd,

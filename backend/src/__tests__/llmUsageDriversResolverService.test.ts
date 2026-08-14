@@ -162,6 +162,39 @@ describe("resolveUsageDrivers", () => {
     expect(recommendations).toEqual([]);
   });
 
+  it("does not inflate days recovered when a date has several ledger rows", async () => {
+    // The ledger is keyed date#model#feature, so a busy day is MANY rows. An
+    // earlier version built the counterfactual per row and subtracted the whole
+    // day's saving once per row, understating counterfactual burn and inflating
+    // the days figure the customer is asked to act on.
+    //
+    // Invariant: the same spend expressed as one row per day or two must yield
+    // the same recovery.
+    const oneRowPerDay = Array.from({ length: 10 }, (_, i) => ({
+      userId: "billing-root",
+      sk: `2026-08-${String(i + 1).padStart(2, "0")}#${OPUS}#agent_task`,
+      date: `2026-08-${String(i + 1).padStart(2, "0")}`,
+      model: OPUS, feature: "agent_task",
+      inputTokens: 500_000, outputTokens: 100_000, cacheReadTokens: 0, cacheWriteTokens: 0,
+      costMicroUsd: 5 * USD, callCount: 4, billingUserId: "billing-root",
+    }));
+    // Identical totals, split across two rows per day (two features).
+    const twoRowsPerDay = oneRowPerDay.flatMap((r) => ([
+      { ...r, feature: "agent_task", inputTokens: 250_000, outputTokens: 50_000, costMicroUsd: 2.5 * USD },
+      { ...r, sk: r.sk.replace("agent_task", "chat"), feature: "chat",
+        inputTokens: 250_000, outputTokens: 50_000, costMicroUsd: 2.5 * USD },
+    ]));
+
+    mockQuery.mockResolvedValueOnce(oneRowPerDay);
+    const single = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    mockQuery.mockResolvedValueOnce(twoRowsPerDay);
+    const split = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    const pick = (r: Awaited<ReturnType<typeof resolveUsageDrivers>>) =>
+      r.recommendations.find((x) => x.toModel === HAIKU)!.estimatedDaysRecovered;
+    expect(pick(split)).toBe(pick(single));
+  });
+
   it("still reports drivers when no forecast is possible, just without day counts", async () => {
     // Day one of a cycle: spend exists but no complete day, so the runway
     // withholds a forecast. Drivers are still true and useful.
