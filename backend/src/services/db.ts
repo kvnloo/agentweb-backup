@@ -4,7 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -14,6 +14,7 @@ import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3074,6 +3075,87 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+// A write that loses its race is recomputed, not replayed — replaying a list built
+// against different history would clobber whatever landed in between.
+const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
+
+/**
+ * ENG-1048: the run history this row can hold WITH one more result on the end, and
+ * the history that was derived from. Returns null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
+ */
+const planRunResultShed = async (scheduleId: string, runResult: any) => {
+  const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+  const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
+  if (!existing) return null;
+
+  const history = Array.isArray(existing.runResults) ? existing.runResults : [];
+  const appended = [...history, runResult];
+  const { kept, dropped } = trimListToItemBudget(
+    { ...existing, runResults: appended },
+    'runResults',
+    appended,
+  );
+  if (kept.length === 0) return null;
+  if (dropped > 0) {
+    console.warn(
+      `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
+    );
+  }
+  return { kept, observed: history };
+};
+
+/**
+ * ENG-1048: shed the oldest runs AND record the incoming one in a single write, bound
+ * to the exact history the new list was built from.
+ *
+ * The two halves cannot be separated. Trim in one write and append in another, and a
+ * failure in between deletes history without recording the run it made room for. So:
+ * one `SET`, conditioned on the stored history still being what was read — length AND
+ * tail entry, because a concurrent recovery that drops one and appends one leaves the
+ * length untouched. On mismatch the caller recomputes; nothing is written from a read
+ * that has been overtaken.
+ */
+const writeShedRunResults = async (
+  scheduleId: string,
+  kept: any[],
+  observed: any[]
+): Promise<{ raced: true } | { raced: false; attributes: any }> => {
+  const values: Record<string, any> = {
+    ':runResults': kept,
+    ':updatedAt': new Date().toISOString(),
+    ':expectedLength': observed.length,
+  };
+  let condition = 'size(#runResults) = :expectedLength';
+  if (observed.length === 0) {
+    condition = `(attribute_not_exists(#runResults) OR ${condition})`;
+  } else {
+    condition += ` AND #runResults[${observed.length - 1}] = :expectedLast`;
+    values[':expectedLast'] = observed[observed.length - 1];
+  }
+
+  try {
+    const result = await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: { scheduleId },
+      UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: condition,
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+    return { raced: false, attributes: result.Attributes };
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `DynamoDB addRunResult: schedule ${scheduleId} run history moved under the shed — recomputing.`
+      );
+      return { raced: true };
+    }
+    throw error;
+  }
+};
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3246,7 +3328,19 @@ export const scheduleDb = {
      * ENG-827: attributes that must STILL hold for this write to land, as read a
      * moment ago. `undefined` means the attribute must still be absent.
      */
-    expect?: Record<string, any>
+    expect?: Record<string, any>,
+    /**
+     * ENG-1048: shed `count` of the OLDEST run results as part of THIS write. The trim
+     * exists to make room for the edit, so the two have to land together — shedding
+     * first and then failing the edit would delete history for a save that never
+     * happened. `expectedLength` binds the removal to the history the count was
+     * measured against, so a run recording at the same moment cannot leave this write
+     * taking a second prefix off an already-shortened list. `expectedLast` pins the
+     * tail with it: an overflow recovery that drops one entry and appends its own
+     * leaves the length unchanged, and length alone would wave the stale count
+     * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     */
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3277,12 +3371,33 @@ export const scheduleDb = {
         expressionAttributeValues[`:${alias}`] = value;
       });
 
+      // ENG-1048: removing by index (rather than SETting a list built from a read)
+      // is what makes this safe against a run finishing mid-edit: appends land at the
+      // tail, so index 0 still names the oldest entry. `runResults` is never also SET
+      // here — overlapping document paths in one expression are rejected.
+      let removeExpression = '';
+      if (shedRunResults && shedRunResults.count > 0) {
+        expressionAttributeNames['#runResults'] = 'runResults';
+        removeExpression = ` REMOVE ${Array.from(
+          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          (_, index) => `#runResults[${index}]`
+        ).join(", ")}`;
+        conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
+        expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
+        if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
+          conditionExpressions.push(
+            `#runResults[${shedRunResults.expectedLength - 1}] = :expectedRunResultsLast`
+          );
+          expressionAttributeValues[':expectedRunResultsLast'] = shedRunResults.expectedLast;
+        }
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
@@ -3299,32 +3414,48 @@ export const scheduleDb = {
   },
 
   async addRunResult(scheduleId: string, runResult: any) {
-    try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
-        },
-        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-        ExpressionAttributeNames: {
-          '#runResults': 'runResults',
-          '#updatedAt': 'updatedAt',
-        },
-        ExpressionAttributeValues: {
-          ':runResult': [runResult],
-          ':emptyList': [],
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: {
+        scheduleId,
+      },
+      UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#runResults': 'runResults',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':runResult': [runResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
 
+    try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
+      // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
+      if (isDynamoItemSizeError(error)) {
+        try {
+          for (let attempt = 1; attempt <= MAX_RUN_RESULT_SHED_ATTEMPTS; attempt++) {
+            const plan = await planRunResultShed(scheduleId, runResult);
+            if (plan === null) break;
+            const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
+            if (written.raced) continue;
+            return written.attributes;
+          }
+        } catch (recoveryError) {
+          // Recovery failed too — report the condition that actually stopped the write.
+          console.error(`DynamoDB addRunResult: could not make room on schedule ${scheduleId}:`, recoveryError);
+        }
+      }
       handleDynamoDbError(error, "addRunResult");
       throw error;
     }
   },
+
 
   async getRunResults(scheduleId: string) {
     try {
@@ -6662,7 +6793,31 @@ export const crmDb = {
      *  leak into CSV exports, email-template variables, or the
      *  lead-filter UI. */
     system?: Record<string, any>;
-  }>) {
+  }>, options: {
+    /**
+     * Wall-clock budget for this import (ENG-1133). When it runs out, the
+     * importer stops between units of work and leaves the rows it never reached
+     * as `unprocessed`, so the caller gets a resumable partial instead of being
+     * cut off mid-import by a caller-level timeout with nothing to show for it.
+     * Omitted (the default) means no budget — every existing caller is unchanged.
+     *
+     * At least one unit of work is always attempted, so a resume can never spin
+     * without making progress.
+     */
+    deadlineMs?: number;
+    /**
+     * Dedupe rows that carry NEITHER an email NOR a LinkedIn URL against the
+     * list's existing rows on name+company (ENG-1133).
+     *
+     * Opt-in, because it is a guess: two genuinely different people with the
+     * same name at the same company collapse into one. That trade is right for
+     * a file import a user may re-send (the alternative is a duplicate of every
+     * email-less row on every retry) and wrong for a sync from a system that
+     * has its own stable record ids — HubSpot/Attio contacts must not be merged
+     * on a name collision.
+     */
+    dedupeByNameCompany?: boolean;
+  } = {}) {
     // Declared OUTSIDE the try so the catch below can still see what was
     // already classified. Refused placeholders are counted before any write
     // happens, and a later DynamoDB failure must not relabel them as database
@@ -6683,18 +6838,86 @@ export const crmDb = {
       // Rows refused because they are LinkedIn's anonymized placeholder
       // rather than a person (ENG-1002). Reported, never dropped silently.
       anonymizedSkipped: 0,
+      // Rows that matched a lead already in the list and needed no change.
+      // They used to fall out of every counter, so an import re-sent after a
+      // partial run reported "No leads were processed" even though every row
+      // was safely in place (ENG-1133).
+      alreadyPresentCount: 0,
+      // What happened to each input row, aligned to the input array. Lets a
+      // caller resume a truncated import from the rows that never landed
+      // rather than replaying the whole file (ENG-1133).
+      rowOutcomes: leads.map(() => 'unprocessed' as LeadImportRowOutcome),
+      // Set when the existing-lead pre-read ran out of budget before it had
+      // read the whole list, so nothing was written (ENG-1133). Distinct from
+      // an ordinary partial: those rows are not merely unreached, they are
+      // unsafe to attempt until the list can be scanned.
+      dedupeIncomplete: false,
     };
+
+    // ENG-1133: the import budget. `unitsDone` keeps the first unit of work
+    // unconditional — a budget already spent by the pre-read must still write
+    // something, or a resume would come back with the same rows outstanding
+    // forever.
+    const deadlineAt = options.deadlineMs && options.deadlineMs > 0
+      ? Date.now() + options.deadlineMs
+      : null;
+    let unitsDone = 0;
+    const outOfTime = () => deadlineAt !== null && unitsDone > 0 && Date.now() >= deadlineAt;
 
     try {
       // Get existing leads to check for duplicates by email
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
       let lastKey = undefined;
+      // ENG-1133: checking the clock BETWEEN pages is not enough — a single
+      // page that stalls holds the await open past the budget and the check
+      // below is never reached, so the turn dies with no ledger anyway. Bound
+      // each page by whatever budget is left. A rejection still propagates: a
+      // query that fails is a real error, and nothing has been written yet.
+      const readExistingPage = async (startKey: any) => {
+        const read = this.getLeadsByListId(listId, 100, startKey);
+        if (deadlineAt === null) return read;
+        read.catch(() => undefined); // handled by the race; keeps Node quiet if we bail first
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) return null;
+        let timer: NodeJS.Timeout | undefined;
+        const expired = new Promise<null>(resolve => {
+          timer = setTimeout(() => resolve(null), remaining);
+        });
+        try {
+          return await Promise.race([read, expired]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
       do {
-        const result = await this.getLeadsByListId(listId, 100, lastKey);
+        const result = await readExistingPage(lastKey);
+        if (result === null) {
+          results.dedupeIncomplete = true;
+          break;
+        }
         allExistingLeads.push(...result.items);
         lastKey = result.lastEvaluatedKey;
+        // ENG-1133: the pre-read is O(list size) and runs before any row is
+        // written, so on a very large or throttled list it can burn the whole
+        // budget — and then the caller's own timeout kills the turn with no
+        // ledger at all, which is the failure this ticket exists to remove.
+        // Stop and report instead. Writing on a half-read list is not the
+        // alternative: the dedupe maps below would be missing rows and every
+        // unmatched row would be inserted a second time.
+        if (lastKey && deadlineAt !== null && Date.now() >= deadlineAt) {
+          results.dedupeIncomplete = true;
+          break;
+        }
       } while (lastKey);
+
+      if (results.dedupeIncomplete) {
+        results.errors.push(
+          `Could not read the existing leads in this list within ${options.deadlineMs}ms, so no rows were imported. `
+          + 'Importing without the full list would duplicate rows that are already in it.',
+        );
+        return results;
+      }
 
       // Build dedup maps keyed by both email AND normalized LinkedIn URL.
       // Same person can appear with no email but a LinkedIn URL (typical for
@@ -6702,23 +6925,35 @@ export const crmDb = {
       // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
       const existingLeadsByLinkedIn = new Map<string, any>();
+      // ENG-1133: last-resort identity for rows that carry neither an email nor
+      // a LinkedIn URL. Computed from the stored fields rather than read from
+      // the persisted `nameCompanyKey` attribute so legacy rows written before
+      // that attribute existed still dedupe.
+      const existingLeadsByNameCompany = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
         const liKey = normalizeLinkedInUrl(lead.linkedin);
         if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
+        if (options.dedupeByNameCompany) {
+          const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+          if (nameCompanyKey && !existingLeadsByNameCompany.has(nameCompanyKey)) {
+            existingLeadsByNameCompany.set(nameCompanyKey, lead);
+          }
+        }
       });
 
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
-      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
+      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0]; index: number }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
       // The map value carries the row's original index so `results.created` can
       // report which input row each written lead came from (ENG-1002).
       const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
+      const seenNameCompany = new Set<string>();
       leads.forEach((lead, index) => {
         // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
         // one point every write path converges, so no caller can reintroduce
@@ -6727,6 +6962,7 @@ export const crmDb = {
         // sourceIndex pointing at its ORIGINAL position for callers joining on it.
         if (isLinkedInPlaceholderName(lead)) {
           results.anonymizedSkipped++;
+          results.rowOutcomes[index] = 'anonymized_skipped';
           return;
         }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
@@ -6736,13 +6972,14 @@ export const crmDb = {
           if (uniqueLeads.has(emailKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate email "${lead.email}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
 
           // Check against existing leads — if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
-            leadsToUpdate.push({ existingLead, newData: lead });
+            leadsToUpdate.push({ existingLead, newData: lead, index });
             return;
           }
         }
@@ -6754,16 +6991,44 @@ export const crmDb = {
           if (seenLinkedIn.has(liKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate LinkedIn URL "${lead.linkedin}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
           // Existing-list dedup: same URL → merge into existing lead.
           const existingByLi = existingLeadsByLinkedIn.get(liKey);
           if (existingByLi) {
-            leadsToUpdate.push({ existingLead: existingByLi, newData: lead });
+            leadsToUpdate.push({ existingLead: existingByLi, newData: lead, index });
             seenLinkedIn.add(liKey);
             return;
           }
           seenLinkedIn.add(liKey);
+        }
+
+        // ENG-1133: a row with neither an email nor a LinkedIn URL has no
+        // identity to dedupe on, so re-sending a file after a truncated import
+        // wrote it a second time. Fall back to the name+company key — but ONLY
+        // for those rows: a row that carries its own identity keeps the
+        // behaviour above, or two different people who happen to share a name
+        // at one company would be silently merged. Opt-in per caller, see
+        // `options.dedupeByNameCompany`.
+        const nameCompanyKey =
+          options.dedupeByNameCompany && !lead.email?.trim() && !liKey
+            ? computeNameCompanyKey(lead.firstName, lead.lastName, lead.company)
+            : undefined;
+        if (nameCompanyKey) {
+          if (seenNameCompany.has(nameCompanyKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate name/company "${lead.firstName} ${lead.lastName} @ ${lead.company}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
+            return;
+          }
+          const existingByName = existingLeadsByNameCompany.get(nameCompanyKey);
+          if (existingByName) {
+            leadsToUpdate.push({ existingLead: existingByName, newData: lead, index });
+            seenNameCompany.add(nameCompanyKey);
+            return;
+          }
+          seenNameCompany.add(nameCompanyKey);
         }
 
         uniqueLeads.set(emailKey, { lead, index });
@@ -6779,6 +7044,11 @@ export const crmDb = {
       // Process new leads in batches of 25 (DynamoDB batch write limit)
       const batchSize = 25;
       for (let i = 0; i < newLeads.length; i += batchSize) {
+        // Out of budget: stop here and leave the rest `unprocessed` (ENG-1133).
+        // Their outcomes are already initialised to that, so the caller is told
+        // exactly which rows it still owes.
+        if (outOfTime()) break;
+        unitsDone++;
         const batch = newLeads.slice(i, i + batchSize);
 
         const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
@@ -6853,10 +7123,18 @@ export const crmDb = {
           // Promote batch IDs into the global created list only after the write
           // succeeds — keeps results.created in sync with what's actually persisted.
           results.created.push(...batchCreated);
+          batchCreated.forEach(({ sourceIndex }) => {
+            results.rowOutcomes[sourceIndex] = 'created';
+          });
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
-            results.errors.push(`Row ${i + index + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            // Report the row's position in the CALLER's array, not in the
+            // filtered new-lead array — otherwise the row a resume is told to
+            // retry is not the row that failed (ENG-1133).
+            const sourceIndex = newLeadSourceIndices[i + index];
+            results.errors.push(`Row ${sourceIndex + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            results.rowOutcomes[sourceIndex] = 'failed';
           });
         }
       }
@@ -6903,16 +7181,30 @@ export const crmDb = {
         }
       });
 
-      // Update field names in list
+      // Update field names in list. Best-effort: this is display bookkeeping,
+      // and letting it throw would unwind into the catch below and discard the
+      // per-row ledger for an import whose rows are already written — the
+      // caller would be told the whole import failed and would re-send rows
+      // that are in the list (ENG-1133).
       if (allFieldNames.length > 0) {
-        const list = await this.getLeadListById(listId);
-        const existingFieldNames = (list?.fieldNames as string[]) || [];
-        const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
-        await this.updateFieldNames(listId, combinedFieldNames);
+        try {
+          const list = await this.getLeadListById(listId);
+          const existingFieldNames = (list?.fieldNames as string[]) || [];
+          const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
+          await this.updateFieldNames(listId, combinedFieldNames);
+        } catch (fieldNameError: any) {
+          console.error(`batchCreateLeads: failed to update field names for ${listId}:`, fieldNameError?.message || fieldNameError);
+        }
       }
 
       // Process leads to update (merge existing leads with new data)
-      for (const { existingLead, newData } of leadsToUpdate) {
+      for (const { existingLead, newData, index: sourceIndex } of leadsToUpdate) {
+        // Each merge is its own sequential round-trip, so a re-sent file whose
+        // rows are all already present is the slowest shape this function has —
+        // and the one a resume produces. Stop on the budget rather than run past
+        // the caller's timeout (ENG-1133).
+        if (outOfTime()) break;
+        unitsDone++;
         try {
           // Helper to normalize values for comparison
           const normalize = (value: any): string => {
@@ -7021,17 +7313,32 @@ export const crmDb = {
             await this.updateLead(listId, existingLead.leadId, updates);
             results.successCount++;
             results.mergedCount++;
+            results.rowOutcomes[sourceIndex] = 'merged';
+          } else {
+            // No changes needed — the row is already in the list exactly as
+            // supplied. Still an accounted-for outcome, not a silent drop
+            // (ENG-1133): a resume re-sending completed rows lands here.
+            results.alreadyPresentCount++;
+            results.rowOutcomes[sourceIndex] = 'already_present';
           }
-          // If no changes, skip the update (don't count as merged)
         } catch (updateError: any) {
           results.errorCount++;
-          results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.errors.push(`Row ${sourceIndex + 1}: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.rowOutcomes[sourceIndex] = 'failed';
         }
       }
 
-      // Update lead count (only for new leads, updates don't change count)
-      if (newLeads.length > 0) {
-        await this.incrementLeadCount(listId, newLeads.length);
+      // Update lead count (only for new leads, updates don't change count).
+      // Counts rows actually WRITTEN, not rows selected for writing: a batch
+      // that failed, or one the budget stopped us reaching, must not inflate the
+      // list's count (ENG-1133). Best-effort for the same reason as the field
+      // names above — a denormalized counter is recoverable, the ledger is not.
+      if (results.created.length > 0) {
+        try {
+          await this.incrementLeadCount(listId, results.created.length);
+        } catch (countError: any) {
+          console.error(`batchCreateLeads: failed to increment lead count for ${listId}:`, countError?.message || countError);
+        }
       }
 
       return results;
@@ -7053,6 +7360,16 @@ export const crmDb = {
         errors: [`Batch upload failed: ${error.message}`],
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
         anonymizedSkipped: results.anonymizedSkipped,
+        alreadyPresentCount: 0,
+        // Nothing survived the failure, so every row that was not refused
+        // outright is reported as failed rather than left `unprocessed` —
+        // a resume must retry them, not assume they were never reached.
+        rowOutcomes: results.rowOutcomes.map((outcome) =>
+          outcome === 'anonymized_skipped' ? outcome : ('failed' as LeadImportRowOutcome),
+        ),
+        // A hard failure, not an unreadable list — the caller should report the
+        // error, not the "this list is too large to import into" blocker.
+        dedupeIncomplete: false,
       };
     }
   },
@@ -9314,6 +9631,26 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing, optionally capped for administrative diagnostics. */
+  async listAll(maxItems?: number): Promise<Organization[]> {
+    if (!maxItems || maxItems < 1) {
+      return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+    }
+
+    const organizations: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        Limit: maxItems - organizations.length,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      organizations.push(...((result.Items || []) as Organization[]));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && organizations.length < maxItems);
+    return organizations;
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,

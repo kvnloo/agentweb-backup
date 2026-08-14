@@ -41,9 +41,6 @@ const INBOX_SCAN_SIZE = 25;
 /** Bodies fetched per pass — codes land at the top of the inbox, not page 3. */
 const MAX_BODIES_PER_PASS = 5;
 
-/** Email platforms tried, in order, when the caller does not name an account. */
-const AUTO_RESOLVE_PLATFORMS = ['gmail', 'outlook'] as const;
-
 const NO_FABRICATION_NOTE =
   'Do NOT guess a code and do NOT continue as if the login succeeded — report the failure instead.';
 
@@ -252,22 +249,31 @@ emmaToolRegistry.register({
       ? Date.parse(args.since)
       : invokedAt - DEFAULT_FRESHNESS_GRACE_MS;
 
-    const { bootstrapEmailProviders, resolveEmailAccount, getEmailProvider } = await import(
+    const { bootstrapEmailProviders, resolveEmailAccount, resolveDefaultEmailAccount } = await import(
       '../services/emailProviderService'
     );
     await bootstrapEmailProviders();
 
     // ── Resolve the mailbox ────────────────────────────────────────────────
+    // Both paths resolve over the accounts the caller can actually reach — own
+    // AND org-shared — which is the same set list_connected_accounts reports.
+    // Reading only the caller's own record made a shared mailbox listed as
+    // active unusable here, and left an unattended run with no way to finish an
+    // email-code login (ENG-943).
     let provider: any;
     let accountId: string;
     let platform: string;
+    // The mailbox's owner, which is whose record the provider must authenticate
+    // against — not necessarily the caller.
+    let mailboxUserId: string;
 
     if (args?.account_id) {
       try {
         const resolved = await resolveEmailAccount(userId, args.account_id);
         provider = resolved.provider;
         platform = resolved.platform;
-        accountId = args.account_id;
+        accountId = resolved.accountId;
+        mailboxUserId = resolved.ownerUserId;
       } catch (error: any) {
         return {
           success: false,
@@ -276,17 +282,21 @@ emmaToolRegistry.register({
         };
       }
     } else {
-      const { getAccountByPlatform } = await import('../services/connectedAccountsDb');
-      let account: any = null;
-      let foundPlatform = '';
-      for (const candidate of AUTO_RESOLVE_PLATFORMS) {
-        account = await getAccountByPlatform(userId, candidate as any);
-        if (account) {
-          foundPlatform = candidate;
-          break;
-        }
+      // A lookup failure here is not "no mailbox connected" — saying so would
+      // send an unattended run off to report a missing account when the account
+      // is fine and the read simply failed. Report it as a mailbox error, the
+      // same reason the provider read failures below use.
+      let resolved: Awaited<ReturnType<typeof resolveDefaultEmailAccount>>;
+      try {
+        resolved = await resolveDefaultEmailAccount(userId);
+      } catch (error: any) {
+        return {
+          success: false,
+          reason: 'mailbox_error',
+          message: `Could not resolve a mailbox to read the code from: ${error?.message || error}. ${NO_FABRICATION_NOTE}`,
+        };
       }
-      if (!account) {
+      if (!resolved) {
         return {
           success: false,
           reason: 'no_email_account',
@@ -295,10 +305,31 @@ emmaToolRegistry.register({
             `then retry. ${NO_FABRICATION_NOTE}`,
         };
       }
-      provider = getEmailProvider(foundPlatform as any);
-      platform = foundPlatform;
-      accountId = account.account_id;
+      provider = resolved.provider;
+      platform = resolved.platform;
+      accountId = resolved.accountId;
+      mailboxUserId = resolved.ownerUserId;
     }
+
+    // Sharing is checked once, above, but the loop below reads the mailbox for
+    // up to MAX_WAIT_SECONDS across ~36 rounds, always authenticating as the
+    // owner captured at resolution. On a teammate's shared mailbox that leaves a
+    // window in which the owner stops sharing and the caller still receives a
+    // code that arrived afterwards. The share dialog tells an admin they can
+    // "stop sharing at any time", so revocation has to bite inside the call.
+    //
+    // The caller's OWN mailbox cannot be un-shared from under them, so it is
+    // never re-checked and pays nothing — which is every caller outside an org.
+    const stillAccessible = async (): Promise<boolean> => {
+      if (mailboxUserId === userId) return true;
+      try {
+        const recheck = await resolveEmailAccount(userId, accountId);
+        // Owner changed ⇒ this is no longer the mailbox we were authorised for.
+        return recheck.ownerUserId === mailboxUserId;
+      } catch {
+        return false;
+      }
+    };
 
     // ── Poll for a fresh matching message ──────────────────────────────────
     const deadline = Date.now() + waitSeconds * 1000;
@@ -307,6 +338,16 @@ emmaToolRegistry.register({
     let sawFreshMatchWithoutCode = false;
 
     for (;;) {
+      if (!(await stillAccessible())) {
+        return {
+          success: false,
+          reason: 'mailbox_error',
+          message:
+            `Access to mailbox "${accountId}" ended while waiting for the code — its owner stopped sharing it ` +
+            `with your organization. ${NO_FABRICATION_NOTE}`,
+        };
+      }
+
       // Two sources, unioned: a provider search (sees archived/filtered mail and
       // is not bounded by the scan size) and the INBOX scan (needs no query
       // support and is the only source for non-Gmail providers). A search
@@ -323,7 +364,7 @@ emmaToolRegistry.register({
       let searched: any[] = [];
       if (query) {
         try {
-          searched = (await provider.searchEmails(userId, accountId, query, INBOX_SCAN_SIZE)) || [];
+          searched = (await provider.searchEmails(mailboxUserId, accountId, query, INBOX_SCAN_SIZE)) || [];
         } catch (error: any) {
           console.warn(`[read_verification_code] Mailbox search failed, using the inbox scan only: ${error?.message || error}`);
         }
@@ -331,7 +372,7 @@ emmaToolRegistry.register({
 
       let listed: any[] = [];
       try {
-        listed = (await provider.listEmails(userId, accountId, 'INBOX', INBOX_SCAN_SIZE)) || [];
+        listed = (await provider.listEmails(mailboxUserId, accountId, 'INBOX', INBOX_SCAN_SIZE)) || [];
       } catch (error: any) {
         return {
           success: false,
@@ -368,7 +409,7 @@ emmaToolRegistry.register({
         const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
         let details: any[] = [];
         try {
-          details = await provider.getEmails(userId, accountId, ids);
+          details = await provider.getEmails(mailboxUserId, accountId, ids);
         } catch (error: any) {
           return {
             success: false,
@@ -410,6 +451,20 @@ emmaToolRegistry.register({
           }
 
           if (!code && !magicLink) continue;
+
+          // A code is the most sensitive thing this tool can hand back, so the
+          // share is checked once more before it leaves — not only before the
+          // read that found it. A revocation landing mid-round discloses
+          // nothing. The read itself already happened; see stillAccessible.
+          if (!(await stillAccessible())) {
+            return {
+              success: false,
+              reason: 'mailbox_error',
+              message:
+                `Access to mailbox "${accountId}" ended while the code was being read — its owner stopped sharing ` +
+                `it with your organization. The code was not returned. ${NO_FABRICATION_NOTE}`,
+            };
+          }
 
           return {
             success: true,

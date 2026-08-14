@@ -2393,6 +2393,161 @@ export class MetaService {
   }
 
   /**
+   * Calendly's resolution (ENG-1141) — deliberately NOT resolveMetaPixelForUser, because
+   * a booking webhook is unattended (no human to prompt when ambiguous), so this defaults
+   * to the caller's first connected account and its first pixel instead of refusing. An
+   * explicit `stored` choice (the Calendly card's own account/pixel dropdowns) always wins
+   * when both fields are present. Never throws, same AC3 guarantee as resolveMetaPixelForUser.
+   */
+  /**
+   * Does the stored pixel still exist on its (still-connected) account?
+   *
+   * Cache-first by design: `/pixels` already caches the customer's full pixel set per user and
+   * invalidates it on connect/disconnect, so a warm entry answers this for free. Only a cold
+   * cache costs one Graph call, scoped to the single stored account rather than a full fan-out.
+   *
+   * FAILS OPEN. If the check itself cannot run — expired token, Graph outage, malformed record —
+   * the answer is "keep the customer's explicit choice". Falling back to auto-resolution on an
+   * outage would silently repoint a working configuration at a different pixel, which is worse
+   * than briefly honoring one that may have been deleted (that case degrades visibly: the CAPI
+   * send fails and is recorded in the job's `failures`).
+   *
+   * The partial result is deliberately NOT written back into the /pixels cache: it covers one
+   * account, and storing it would make a later full read believe the customer has no others.
+   */
+  private async storedPixelStillExists(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string },
+  ): Promise<boolean> {
+    try {
+      const { getCachedPixels } = await import('./metaPixelsCache');
+      const cached = getCachedPixels(userId);
+      if (cached) {
+        return cached.some((p) => p.pixelId === stored.pixelId && p.accountId === stored.accountId);
+      }
+
+      const { getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // Two failures that must NOT be treated alike (Greptile round 5 on #2384).
+      //
+      // Credentials failing is evidence about the stored pair itself: that account's token is
+      // gone or unusable, so keeping the selection would send every later booking down a path
+      // whose credentials cannot resolve — retried to exhaustion while a healthy pixel on
+      // another connected account sits unused. That is the exact failure the connectivity
+      // check exists to prevent, so treat it as "not usable" and let the search continue.
+      let credentials: { accountId: string; accessToken: string };
+      try {
+        credentials = await getMetaAccountCredentials(user, userId, stored.accountId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} has no usable credentials ` +
+          `(${error?.message}) — falling back to auto-resolution`,
+        );
+        return false;
+      }
+
+      // A Graph failure is evidence about Meta, not about the choice. Keep it: repointing a
+      // working configuration because of a transient outage is worse than briefly honoring a
+      // pixel that may have been deleted, which degrades visibly as a recorded CAPI failure.
+      try {
+        const pixels = await this.listPixels(credentials.accountId, credentials.accessToken);
+        return (pixels || []).some((p: any) => p.id === stored.pixelId);
+      } catch (error: any) {
+        console.warn(
+          `[Meta] Could not reach Meta to verify stored pixel ${stored.pixelId} ` +
+          `(keeping the customer's choice): ${error?.message}`,
+        );
+        return true;
+      }
+    } catch (error: any) {
+      // The cache lookup or module import failed — nothing learned about the pair either way.
+      console.warn(
+        `[Meta] Could not verify stored pixel ${stored.pixelId} (keeping the customer's choice): ${error?.message}`,
+      );
+      return true;
+    }
+  }
+
+  public async resolveMetaPixelWithDefault(
+    user: any,
+    userId: string,
+    stored: { pixelId: string; accountId: string } | undefined,
+  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      // The stored pair is a snapshot of a choice made earlier, so it can outlive the
+      // connection it names — the customer disconnects that Meta account, or a reconnect
+      // issues a different account id. Honoring it blindly sends every later booking down
+      // a path whose credentials no longer resolve: the CAPI leg throws, the job is marked
+      // failed and retried to exhaustion, and a healthy pixel on another connected account
+      // is never tried (Greptile P1 on #2384; Pass 1 of this feature had this check and the
+      // Pass-2 rework dropped it). The check is LOCAL — it reads the already-loaded user
+      // record — deliberately not a Graph round-trip on every booking just to confirm a
+      // stored choice. A pixel deleted from a still-connected account therefore still gets
+      // honored here and surfaces as a CAPI failure instead; catching that would cost a
+      // per-booking API call, which this resolver exists to avoid.
+      if (stored?.pixelId && stored?.accountId) {
+        let storedAccountStillConnected = true;
+        try {
+          storedAccountStillConnected = getConnectedMetaAccountsList(user)
+            .some((account: { accountId: string }) => account.accountId === stored.accountId);
+        } catch {
+          // Unreadable/malformed user record: keep the customer's explicit choice rather
+          // than silently downgrading it to "whatever account comes first".
+          storedAccountStillConnected = true;
+        }
+        if (storedAccountStillConnected) {
+          // The account surviving is only half of staleness — the pixel itself can be deleted
+          // from an account that is still connected (Greptile round 4 on #2384). Verified via
+          // the shared /pixels cache, so the common case (a customer who just looked at the
+          // picker, or any second booking inside the TTL) costs no Graph traffic at all.
+          if (await this.storedPixelStillExists(user, userId, stored)) {
+            return { pixelId: stored.pixelId, accountId: stored.accountId };
+          }
+          console.warn(
+            `[Meta] Stored Calendly attribution pixel ${stored.pixelId} no longer exists on account ` +
+            `${stored.accountId} — falling back to auto-resolution`,
+          );
+        }
+        console.warn(
+          `[Meta] Stored Calendly attribution account ${stored.accountId} is no longer connected — falling back to auto-resolution`,
+        );
+      }
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+
+      // Search every connected account in order for the first one that actually has
+      // a pixel — the whole point of this resolver is "always resolvable once ANY
+      // connected account has a pixel," so it can't stop at accounts[0] just because
+      // that particular account happens to have none (a real regression caught live:
+      // a customer's first-listed account had 0 pixels while a later one had 1, and
+      // the naive accounts[0]-only version reproduced the exact silent-skip bug this
+      // resolver exists to fix). One account's failure (expired token, Graph error)
+      // is skipped, not fatal — the next account still gets a fair try.
+      let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      for (const account of accounts) {
+        try {
+          const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
+          const pixels = await this.listPixels(accountId, accessToken);
+          if (pixels && pixels.length > 0) {
+            return { pixelId: pixels[0].id, accountId };
+          }
+        } catch (error: any) {
+          lastReason = error?.message || lastReason;
+        }
+      }
+      return { unresolved: true, reason: lastReason };
+    } catch (error: any) {
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
    * Server-side Meta Conversions API (CAPI) send. Fires a `Lead` event directly to
    * Meta from our own trusted backend — never from a generated customer repo, which would
    * require shipping an access token into code we push to a customer-owned deployment.

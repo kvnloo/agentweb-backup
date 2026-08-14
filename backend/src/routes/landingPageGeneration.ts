@@ -54,6 +54,7 @@ import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnab
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
+import { assertOwnedMetaPixel } from "../services/metaAccountCredentials";
 
 const router = Router();
 
@@ -388,7 +389,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url, meta_pixel_override } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
@@ -409,6 +410,42 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         }
       } catch {
         return res.status(400).json({ error: "bridge_out_url must be a well-formed http(s) URL" });
+      }
+    }
+
+    // ENG-1141: an explicit pixel/account choice from the creation form's mandatory
+    // picker (shown only when the customer's Meta connections are genuinely
+    // ambiguous). Never trusts the client — assertOwnedMetaPixel re-validates the
+    // pair belongs to the caller's own connected Meta accounts before it's allowed
+    // to influence generation, same check the Calendly attribution route reuses.
+    let metaPixelOverride: { pixelId: string; accountId: string } | undefined;
+    if (meta_pixel_override !== undefined && meta_pixel_override !== null) {
+      if (
+        typeof meta_pixel_override !== "object" ||
+        typeof meta_pixel_override.pixelId !== "string" || !meta_pixel_override.pixelId ||
+        typeof meta_pixel_override.accountId !== "string" || !meta_pixel_override.accountId
+      ) {
+        return res.status(400).json({ error: "meta_pixel_override must be an object with pixelId and accountId" });
+      }
+      try {
+        const { accountId: resolvedAccountId } = await assertOwnedMetaPixel(
+          caller, userId, meta_pixel_override.pixelId, meta_pixel_override.accountId
+        );
+        metaPixelOverride = { pixelId: meta_pixel_override.pixelId, accountId: resolvedAccountId };
+      } catch (err: any) {
+        if (err?.ownershipViolation) {
+          // The customer picked something that isn't theirs — a real rejection.
+          return res.status(400).json({ error: err?.message || "Invalid meta_pixel_override" });
+        }
+        // Anything else means we couldn't REACH Meta to verify (Graph down, expired token,
+        // network). Failing here would block page generation entirely on Meta's uptime — a
+        // much worse outcome than shipping the page and resolving tracking normally, which is
+        // exactly what happened before this option existed. Degrade, don't block.
+        console.warn(
+          `[LP GENERATION] Could not verify meta_pixel_override for user ${userId} ` +
+          `(continuing without it): ${err?.message}`,
+        );
+        metaPixelOverride = undefined;
       }
     }
 
@@ -533,6 +570,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
       mode: effectiveMode,
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
+      metaPixelOverride,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
