@@ -1006,6 +1006,7 @@ export async function runEnrichment(
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
   let identityResolutionFailed = 0;
+  const skippedLeadIds: string[] = [];
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
   let updateFailed = 0;
@@ -1085,6 +1086,7 @@ export async function runEnrichment(
       switch (outcome.failureCategory) {
         case 'identityResolution':
           identityResolutionFailed += 1;
+          if (skippedLeadIds.length <= 5000) skippedLeadIds.push(lead.leadId);
           continue;
         case 'llmOrParse':
           llmOrParseFailed += 1;
@@ -1236,11 +1238,15 @@ export async function runEnrichment(
       expiresAt: jobExpiresAt,
       processedCount: processed,
       failedCount: totalFailed,
-      skippedCount: 0,
+      skippedCount: identityResolutionFailed,
       ...(attemptedLeadIds.length <= 5000
         ? { attemptedLeadIds }
         : { leadsDeduplicationUnavailable: true }),
+      ...(skippedLeadIds.length <= 5000
+        ? { skippedLeadIds }
+        : { skippedDeduplicationUnavailable: true }),
       failureBreakdown: {
+        identityResolutionFailed,
         searchWebFailed: 0,
         linkedinFailed: apolloFailed,
         llmOrParseFailed,
