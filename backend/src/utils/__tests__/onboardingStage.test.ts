@@ -165,6 +165,10 @@ describe("ALLOWED_ONBOARDING_EVENTS", () => {
       "brand_build_status",
       "onboarding_abandoned",
       "deviation",
+      // Voice-onboarding default beta funnel.
+      "voice_onboarding_presented",
+      "voice_onboarding_started",
+      "voice_onboarding_text_fallback",
     ];
     for (const name of expected) {
       expect(ALLOWED_ONBOARDING_EVENTS.has(name)).toBe(true);

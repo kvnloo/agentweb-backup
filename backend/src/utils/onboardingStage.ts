@@ -77,6 +77,11 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "brand_fallback_manual",
   "onboarding_abandoned",
   "deviation",
+  // Voice-onboarding default beta funnel. These are deliberately lateral
+  // signals: they must not change a user's derived lifecycle stage.
+  "voice_onboarding_presented",
+  "voice_onboarding_started",
+  "voice_onboarding_text_fallback",
   // Outreach (test-env re-enable — not committed to harsha/dev)
   "outreach_channel_connect_already_connected",
   "outreach_channel_connect_clicked",
