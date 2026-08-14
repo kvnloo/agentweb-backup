@@ -351,6 +351,24 @@ describe('Admin subscription types routes', () => {
     expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
   });
 
+  it('rejects preview models from an admin-configured optimized catalog', async () => {
+    const res = await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'preview-v1', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3-flash-preview'],
+          optimizedDefaultModel: 'gemini-3-flash-preview',
+        },
+      }],
+    }).expect(400);
+
+    expect(res.body.message).toContain("'gemini-3-flash-preview' is preview");
+    expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+  });
+
   it('round-trips admin-priced additional usage packages', async () => {
     const llmUsageTopUp = {
       enabled: true,

@@ -1,6 +1,7 @@
 import {
   evaluateLlmUsageMode,
   selectPolicyModel,
+  validateLlmUsagePolicy,
   type LlmUsagePolicy,
 } from "../services/llmUsagePolicyService";
 
@@ -12,6 +13,42 @@ const policy: LlmUsagePolicy = {
   optimizedModelIds: ["gemini-3.1-flash-lite", "anthropic.claude-haiku-4-5-20251001-v1:0"],
   optimizedDefaultModel: "gemini-3.1-flash-lite",
 };
+
+describe("validateLlmUsagePolicy optimized catalog lifecycle", () => {
+  it("accepts an admin-configured catalog made only of stable model ids", () => {
+    expect(validateLlmUsagePolicy(policy)).toEqual([]);
+  });
+
+  it("rejects preview models from optimized mode", () => {
+    expect(validateLlmUsagePolicy({
+      ...policy,
+      optimizedModelIds: ["gemini-3-flash-preview"],
+      optimizedDefaultModel: "gemini-3-flash-preview",
+    })).toContain("optimizedModelIds must contain only stable models; 'gemini-3-flash-preview' is preview");
+  });
+
+  it.each(["vendor-model-beta", "vendor-model-experimental"])(
+    "rejects the non-GA lifecycle marker in %s",
+    (model) => {
+      expect(validateLlmUsagePolicy({
+        ...policy,
+        optimizedModelIds: [model],
+        optimizedDefaultModel: model,
+      }).join("; ")).toContain(`'${model}'`);
+    }
+  );
+
+  it.each(["vendor-model-legacy", "vendor-model-deprecated"])(
+    "rejects the retired lifecycle marker in %s",
+    (model) => {
+      expect(validateLlmUsagePolicy({
+        ...policy,
+        optimizedModelIds: [model],
+        optimizedDefaultModel: model,
+      }).join("; ")).toContain(`'${model}'`);
+    }
+  );
+});
 
 describe("evaluateLlmUsageMode", () => {
   it.each([
