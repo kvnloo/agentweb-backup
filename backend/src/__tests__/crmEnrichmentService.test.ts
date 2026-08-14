@@ -1719,6 +1719,87 @@ describe('CrmEnrichmentService template fallback chain', () => {
   });
 });
 
+describe('CrmEnrichmentService cross-provider timeout fallback', () => {
+  const input = {
+    leadContext: { company: 'Acme Corp' },
+    webContext: 'Acme Corp source context',
+    linkedinContext: '',
+    spec: {
+      userId: 'user-fallback',
+      instruction: 'Find company size',
+      outputFields: ['company_size'],
+    },
+    lead: { leadId: 'lead-fallback' },
+    enrichConfig: {
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  afterEach(() => {
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  it('uses the fallback model client after a primary timeout', async () => {
+    const primaryCreate = jest.fn().mockRejectedValue(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }));
+    const fallbackCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    const fallbackClient = { chat: { completions: { create: fallbackCreate } } };
+    mockAgentModeService.getClientForModel
+      .mockResolvedValueOnce(primaryClient as any)
+      .mockResolvedValueOnce(fallbackClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(primaryCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
+  });
+
+  it('does not resolve the fallback client when the primary succeeds', async () => {
+    const primaryCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(1);
+    expect(primaryCreate.mock.calls[0][0].model).toBe('gpt-5-chat-2');
+  });
+
+  it('keeps non-timeout provider errors on the primary path', async () => {
+    const providerError = new Error('provider rejected request');
+    const primaryCreate = jest.fn().mockRejectedValue(providerError);
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    await expect((new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    )).rejects.toThrow('provider rejected request');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(2);
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(1, 'gpt-5-chat-2');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(2, 'gpt-5-chat-2');
+  });
+});
+
 // ─── suggestEnrichment ────────────────────────────────────────────────────────
 
 describe('CrmEnrichmentService.suggestEnrichment', () => {

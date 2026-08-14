@@ -949,22 +949,27 @@ export class CrmEnrichmentService {
 
     const userPrompt = `Lead context:\n${JSON.stringify(leadContext, null, 2)}\n${webContext ? `\nWeb search results:\n${webContext}` : ''}${linkedinContext ? `\nLinkedIn data:${linkedinContext}` : ''}\n\nExtract only what is explicitly present in the sources above. Do not infer or fabricate any value. Return null for any field not found in the data.`;
 
-    const llmClient = await agentModeService.getClientForModel(dataExtractionModel);
     console.log(`[CrmEnrichment][extractFieldsViaLLM] calling LLM model=${dataExtractionModel} outputFields=${JSON.stringify(spec.outputFields)}`);
     const tLlm = Date.now();
     let response: Record<string, unknown> | null = null;
 
     try {
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          response_format: { type: 'json_object' },
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        async (model) => {
+          // Resolve the client from the model actually selected. A timeout can
+          // cross providers; reusing the primary client's transport with the
+          // fallback model silently sends the fallback request to the wrong API.
+          const llmClient = await agentModeService.getClientForModel(model);
+          return llmClient.chat.completions.create({
+            model,
+            temperature: 0,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            response_format: { type: 'json_object' },
+          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
+        },
         dataExtractionModel,
         'extractFieldsViaLLM:json',
       );
@@ -984,14 +989,17 @@ export class CrmEnrichmentService {
       const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, retryExample);
 
       const retry = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: strictRetryPrompt },
-          ],
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        async (model) => {
+          const llmClient = await agentModeService.getClientForModel(model);
+          return llmClient.chat.completions.create({
+            model,
+            temperature: 0,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: strictRetryPrompt },
+            ],
+          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
+        },
         dataExtractionModel,
         'extractFieldsViaLLM:plain',
       );
@@ -1114,17 +1122,19 @@ export class CrmEnrichmentService {
     if (claims.length === 0) return;
 
     try {
-      const llmClient = await agentModeService.getClientForModel(enrichConfig.dataExtractionModel);
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        (model) => llmClient.chat.completions.create({
-          model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: buildCriticSystemPrompt() },
-            { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
-          ],
-          response_format: { type: 'json_object' },
-        }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS }),
+        async (model) => {
+          const llmClient = await agentModeService.getClientForModel(model);
+          return llmClient.chat.completions.create({
+            model,
+            temperature: 0,
+            messages: [
+              { role: 'system', content: buildCriticSystemPrompt() },
+              { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
+            ],
+            response_format: { type: 'json_object' },
+          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
+        },
         enrichConfig.dataExtractionModel,
         'criticPass',
       );
