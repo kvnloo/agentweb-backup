@@ -270,3 +270,40 @@ describe('scoping and bypass fixes (ENG-941)', () => {
     expect(urls).toEqual(['https://site.example/good', 'https://site.example/bad']);
   });
 });
+
+/**
+ * Greptile findings on PR #2406, all three real:
+ *  - an ad created ACTIVE was checked against its siblings, shipping its own destination unchecked
+ *  - inert pixel text (comments, docs snippets) counted as an install
+ *  - the override was trusted but never disclosed in the confirmation the user approves
+ */
+describe('Greptile findings (ENG-941)', () => {
+  const { collectPendingDestinations } = require('../services/metaLaunchGate');
+
+  it('collects the destination of an ad being created, from any of the shapes Meta accepts', () => {
+    expect(collectPendingDestinations('AD', 'CREATE', { link_url: 'https://a/1' })).toEqual(['https://a/1']);
+    expect(collectPendingDestinations('AD', 'CREATE', {
+      creative: { object_story_spec: { link_data: { link: 'https://a/2' } } },
+    })).toEqual(['https://a/2']);
+    expect(collectPendingDestinations('AD', 'CREATE', {
+      creative: { asset_feed_spec: { link_urls: [{ website_url: 'https://a/3' }, { link: 'https://a/4' }] } },
+    })).toEqual(['https://a/3', 'https://a/4']);
+  });
+
+  it('collects nothing for updates or unrelated entities', () => {
+    expect(collectPendingDestinations('AD', 'UPDATE', { link_url: 'https://a/1' })).toEqual([]);
+    expect(collectPendingDestinations('CAMPAIGN', 'CREATE', { link_url: 'https://a/1' })).toEqual([]);
+    expect(collectPendingDestinations('AD', 'CREATE', null)).toEqual([]);
+  });
+
+  it('checks a newly created ad\'s own destination, not just the existing campaign ads', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'existing', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/already-fine'] },
+    ]);
+    await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_CREATE', false, 'sess-1', {}, undefined, ['https://site.example/brand-new'],
+    );
+    const urls = mockPreflight.mock.calls[0][0];
+    expect(urls).toContain('https://site.example/brand-new');
+  });
+});

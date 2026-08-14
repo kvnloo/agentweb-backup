@@ -224,3 +224,36 @@ describe('destinations a pixel could never live on (ENG-941)', () => {
     expect(peak).toBeGreaterThan(1);
   });
 });
+
+describe('inert pixel text is not an install (ENG-941, Greptile)', () => {
+  const fetchOk = (html: string) => async () => html;
+  const PX = '1012387921717047';
+
+  it('ignores a commented-out pixel', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX], {
+      fetchHtml: fetchOk(`<html><head><!-- ${pixelHtml(PX)} --></head><body>x</body></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('ignores a pixel shown inside a code sample', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX], {
+      fetchHtml: fetchOk(`<html><body><pre>fbq('init', '${PX}');</pre></body></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('ignores an escaped snippet in prose, as a docs page would render it', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX], {
+      fetchHtml: fetchOk(`<html><body>Add &lt;script&gt;fbq('init','${PX}')&lt;/script&gt; to your head.</body></html>`),
+    });
+    expect(g.results[0].status).toBe('unmeasured');
+  });
+
+  it('still detects a real install on a page that also documents one', async () => {
+    const g = await preflightMetaTrackingGate(['https://s/lp'], [PX], {
+      fetchHtml: fetchOk(`<html><head>${pixelHtml(PX)}</head><body><pre>fbq('init','999999999')</pre></body></html>`),
+    });
+    expect(g.results[0].status).toBe('measured');
+  });
+});

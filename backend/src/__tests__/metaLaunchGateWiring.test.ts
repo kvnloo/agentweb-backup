@@ -11,6 +11,9 @@
 jest.mock('../services/metaLaunchGate', () => ({
   isMetaSpendStartingWrite: jest.fn(),
   runMetaTrackingGate: jest.fn(),
+  // Real implementation: it is a pure params reader, and stubbing it would hide whether the
+  // write path actually passes a creating ad's destination through to the gate.
+  collectPendingDestinations: jest.requireActual('../services/metaLaunchGate').collectPendingDestinations,
 }));
 
 import { AgentModeService } from '../services/agentModeService';
@@ -84,7 +87,7 @@ describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
     // override reached the gate...
     // Last arg is the ad id, scoped only for AD writes — undefined for a campaign write.
     expect(runMetaTrackingGate).toHaveBeenCalledWith(
-      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', true, 'sess-1', {}, undefined,
+      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', true, 'sess-1', {}, undefined, [],
     );
     // ...and never reached Meta, which would reject an unknown field.
     const paramsSent = manageCampaignsSpy.mock.calls[0][4];
@@ -101,7 +104,7 @@ describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
     );
 
     expect(runMetaTrackingGate).toHaveBeenCalledWith(
-      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1', {}, undefined,
+      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1', {}, undefined, [],
     );
   });
 
@@ -186,6 +189,6 @@ it('scopes an AD activation to that ad, so a sibling\'s untracked page cannot bl
   );
 
   expect(runMetaTrackingGate).toHaveBeenCalledWith(
-    expect.anything(), CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-42',
+    expect.anything(), CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-42', [],
   );
 });

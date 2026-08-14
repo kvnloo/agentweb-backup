@@ -304,7 +304,7 @@ import {
   validateNegativeCampaignCriteria,
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
-import { isMetaSpendStartingWrite, runMetaTrackingGate } from './metaLaunchGate';
+import { isMetaSpendStartingWrite, runMetaTrackingGate, collectPendingDestinations } from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
@@ -18345,6 +18345,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
     }
 
+    /*
+     * ENG-941: waiving the tracking check is the single most consequential thing that can
+     * ride along in these params, and it was invisible here. Per ENG-388 the override is
+     * user-granted — but "user-granted" means nothing if the confirmation the user approves
+     * never mentions it. Surfaced in the summary so approving a launch cannot silently
+     * approve launching without measurement.
+     */
+    if (params?.override_tracking_check === true) {
+      target.override_tracking_check = true;
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
+
     return { summary: lines.join(' '), target };
   }
 
@@ -18789,6 +18804,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         {},
         // Activating one ad is judged on that ad's own destination, not its siblings'.
         entity_type === 'AD' ? ad_id : undefined,
+        /*
+         * An ad being CREATED as ACTIVE has no entry in the ad list yet, so its destination
+         * has to come from the request itself or it ships unchecked. Meta carries the
+         * destination on the creative, which is why several shapes are possible here.
+         */
+        collectPendingDestinations(entity_type, action, params),
       );
       if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }

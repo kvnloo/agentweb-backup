@@ -104,6 +104,33 @@ export interface MetaMeasurementCheckRecord {
  * block ordinary Meta work (creative uploads, audience syncs, reads); anything
  * tighter would let spend start ungated.
  */
+/**
+ * Destinations carried by the request itself, for an entity that does not exist yet.
+ *
+ * A CREATE cannot be checked against the ad list — there is no ad to list. Meta keeps the
+ * destination on the creative, and callers reach it by several shapes depending on whether
+ * they inline the creative or reference one, so all the common ones are collected. Anything
+ * unrecognised simply yields nothing, and the usual rules then apply.
+ */
+export function collectPendingDestinations(entityType: string, action: string, params: any): string[] {
+  if (action !== 'CREATE' || !params || typeof params !== 'object') return [];
+  if (entityType !== 'AD' && entityType !== 'AD_SET') return [];
+
+  const out: string[] = [];
+  const push = (v: any) => { if (typeof v === 'string' && v.trim()) out.push(v.trim()); };
+
+  push(params.link_url);
+  push(params.destination_url);
+  const creative = params.creative ?? params.ad_creative;
+  if (creative && typeof creative === 'object') {
+    push(creative.link_url);
+    push(creative.object_story_spec?.link_data?.link);
+    push(creative.object_story_spec?.video_data?.call_to_action?.value?.link);
+    for (const spec of creative.asset_feed_spec?.link_urls ?? []) push(spec?.website_url ?? spec?.link);
+  }
+  return [...new Set(out)];
+}
+
 export function isMetaSpendStartingWrite(entityType: string, action: string, params: any): boolean {
   if (!params || typeof params !== 'object') return false;
   if (!SPEND_ENTITIES.has(entityType)) return false;
@@ -145,6 +172,7 @@ export async function runMetaTrackingGate(
   sessionId?: string,
   deps: MetaGateDeps = {},
   adId?: string,
+  pendingDestinations: string[] = [],
 ): Promise<{ proceed: boolean; blockResult?: any }> {
   const { accountId, accessToken } = creds;
 
@@ -187,7 +215,16 @@ export async function runMetaTrackingGate(
      * level still check the campaign, since either can put several ads live at once.
      */
     const scoped = adId ? (ads ?? []).filter((a: any) => String(a?.adId) === String(adId)) : (ads ?? []);
-    destinationUrls = scoped.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
+    /*
+     * `pendingDestinations` carries the destination of an ad being CREATED. It cannot come
+     * from the ad list — the ad does not exist yet — so an ad created directly as ACTIVE
+     * would otherwise be checked against its siblings and ship an unchecked destination.
+     * That is the bypass this closes.
+     */
+    destinationUrls = [
+      ...scoped.flatMap((a: any) => a?.destinationUrls ?? []),
+      ...(pendingDestinations ?? []),
+    ].filter(Boolean);
     pixelIds = (pixels ?? []).map((p: any) => String(p?.id)).filter((id: string) => id && id !== 'undefined');
   } catch (err: any) {
     const message =

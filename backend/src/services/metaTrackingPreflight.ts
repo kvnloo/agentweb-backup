@@ -72,6 +72,22 @@ export function detectMetaPixels(html: string): string[] {
   if (!html || typeof html !== 'string') return [];
   const found = new Set<string>();
 
+  /*
+   * Strip places where pixel-shaped text is documentation rather than an install:
+   * HTML comments (including commented-out snippets left behind by a migration) and
+   * escaped/`<code>`/`<pre>` blocks, which is how a page ends up "measured" merely by
+   * explaining how to install a pixel. A commented-out pixel measures nothing, and
+   * counting it would pass exactly the page this gate exists to catch.
+   */
+  html = html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(code|pre|textarea)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    // Escaped script blocks: strip the WHOLE block, not just its escaped tags. Removing only
+    // `&lt;script&gt;` leaves the fbq call between them looking like a live install, which is
+    // precisely how a docs page explaining pixel setup would read as measured.
+    .replace(/&lt;script[\s\S]*?&lt;\/script&gt;/gi, ' ')
+    .replace(/&lt;[\s\S]{0,400}?&gt;/g, ' ');
+
   // fbq('init', '123456789012345') — quotes may be single or double, whitespace arbitrary.
   for (const m of html.matchAll(/fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d{6,})['"]/gi)) {
     found.add(`PIXEL:${m[1]}`);
