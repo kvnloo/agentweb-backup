@@ -17,6 +17,7 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { pruneClickIds } from '../utils/leadSchema';
 import { normalizeAttribution } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
@@ -616,8 +617,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // (lastTouch === firstTouch forever for any repeat-touch lead).
       //   - lastTouch  : ALWAYS refreshed when this touch carries attribution.
       //   - firstTouch : immutable — only backfilled if the lead has none yet.
-      //   - utmSource / utmMedium : denormalized from firstTouch — only
-      //     backfilled when absent, never overwritten.
+      //   - utmSource / utmMedium / clickIds : denormalized from firstTouch —
+      //     only backfilled when absent, never overwritten.
       if (touch) {
         updates.lastTouch = touch;
         changed = true;
@@ -628,6 +629,13 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           }
           if (!existingLead.utmMedium && touch.utm?.medium) {
             updates.utmMedium = touch.utm.medium;
+          }
+          // ENG-1176. Same immutability contract as the UTM denorm above: the
+          // click that acquired the lead is stamped once. A later touch
+          // carrying a fresh gclid refreshes lastTouch and nothing else.
+          const derivedClickIds = pruneClickIds(touch.clickIds);
+          if (!existingLead.clickIds && derivedClickIds) {
+            updates.clickIds = derivedClickIds;
           }
         }
       }

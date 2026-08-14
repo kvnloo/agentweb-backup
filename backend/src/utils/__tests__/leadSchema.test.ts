@@ -324,4 +324,119 @@ describe('buildLeadAttributionFields', () => {
     expect(fields.utmSource).toBe('linkedin');
     expect(fields.utmMedium).toBe('social');
   });
+
+  // ENG-1176 — denormalized click IDs.
+  //
+  // firstTouch.clickIds.gclid is written correctly today but is only reachable
+  // by walking the blob, so "what share of this account's leads carry a click
+  // ID" is not answerable by query (ENG-926 §F). These cover the denormalized
+  // top-level `clickIds` map.
+  describe('clickIds denormalization (ENG-1176)', () => {
+    const gclidTouch: AttributionTouch = {
+      timestamp: '2026-08-13T10:00:00.000Z',
+      utm: { source: 'google', medium: 'cpc', campaign: 'brand' },
+      clickIds: { gclid: 'Cj0KCQjw_test_gclid' },
+      landingUrl: 'https://example.com/?gclid=Cj0KCQjw_test_gclid',
+    };
+
+    it('denormalizes clickIds from firstTouch', () => {
+      const fields = buildLeadAttributionFields({ firstTouch: gclidTouch });
+      expect(fields.clickIds).toEqual({ gclid: 'Cj0KCQjw_test_gclid' });
+    });
+
+    it('carries every captured platform, not just gclid', () => {
+      const multi: AttributionTouch = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { gclid: 'g-1', fbclid: 'f-1' },
+      };
+      const fields = buildLeadAttributionFields({ firstTouch: multi });
+      expect(fields.clickIds).toEqual({ gclid: 'g-1', fbclid: 'f-1' });
+    });
+
+    it('carries a platform the schema never named, with no code change', () => {
+      // AC3: adding a third platform must not require a schema change. ttclid
+      // and liFatId are already captured by normalizeAttribution; anything else
+      // an upstream capture adds must survive too.
+      const exotic = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { msclkid: 'm-1' },
+      } as unknown as AttributionTouch;
+      const fields = buildLeadAttributionFields({ firstTouch: exotic });
+      expect(fields.clickIds).toEqual({ msclkid: 'm-1' });
+    });
+
+    it('omits clickIds entirely when firstTouch has no clickIds block', () => {
+      // AC4: a lead written before this change, or from an untagged visit,
+      // reports the field as ABSENT — never an empty object, which would count
+      // as "carries a click ID" in an attribute_exists check.
+      const fields = buildLeadAttributionFields({ firstTouch: fullTouch });
+      expect('clickIds' in fields).toBe(false);
+    });
+
+    it('omits clickIds when every captured value is blank', () => {
+      const blank = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { gclid: '   ', fbclid: '' },
+      } as unknown as AttributionTouch;
+      const fields = buildLeadAttributionFields({ firstTouch: blank });
+      expect('clickIds' in fields).toBe(false);
+    });
+
+    it('drops blank values but keeps the populated ones', () => {
+      const partial = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { gclid: 'g-1', fbclid: '  ' },
+      } as unknown as AttributionTouch;
+      const fields = buildLeadAttributionFields({ firstTouch: partial });
+      expect(fields.clickIds).toEqual({ gclid: 'g-1' });
+    });
+
+    it('ignores non-string click-ID values rather than storing them', () => {
+      const junk = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { gclid: 12345, fbclid: null, ttclid: 'ok' },
+      } as unknown as AttributionTouch;
+      const fields = buildLeadAttributionFields({ firstTouch: junk });
+      expect(fields.clickIds).toEqual({ ttclid: 'ok' });
+    });
+
+    it('does not derive clickIds from lastTouch', () => {
+      // AC2: set-once, mirroring firstTouch. A repeat visit carrying a new
+      // gclid must not overwrite the click that actually acquired the lead.
+      const fields = buildLeadAttributionFields({ lastTouch: gclidTouch });
+      expect('clickIds' in fields).toBe(false);
+    });
+
+    it('prefers an explicit clickIds override over the derived value', () => {
+      const fields = buildLeadAttributionFields({
+        firstTouch: gclidTouch,
+        clickIds: { gclid: 'admin-corrected' },
+      });
+      expect(fields.clickIds).toEqual({ gclid: 'admin-corrected' });
+    });
+
+    it('falls back to the derived value when the override is empty or malformed', () => {
+      expect(
+        buildLeadAttributionFields({ firstTouch: gclidTouch, clickIds: {} }).clickIds
+      ).toEqual({ gclid: 'Cj0KCQjw_test_gclid' });
+      expect(
+        buildLeadAttributionFields({
+          firstTouch: gclidTouch,
+          clickIds: 'not-an-object' as unknown as Record<string, string>,
+        }).clickIds
+      ).toEqual({ gclid: 'Cj0KCQjw_test_gclid' });
+    });
+
+    it('does not mutate the caller\'s firstTouch', () => {
+      const touch: AttributionTouch = {
+        timestamp: '2026-08-13T10:00:00.000Z',
+        clickIds: { gclid: 'g-1' },
+      };
+      const before = JSON.parse(JSON.stringify(touch));
+      const fields = buildLeadAttributionFields({ firstTouch: touch });
+      expect(touch).toEqual(before);
+      // The denormalized copy must not alias the blob's own object.
+      expect(fields.clickIds).not.toBe(touch.clickIds);
+    });
+  });
 });
