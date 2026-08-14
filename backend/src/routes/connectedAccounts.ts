@@ -6,6 +6,7 @@ import { refreshCalendlyAccessToken } from './calendlyAuth';
 import { registerProcessor, updateJobPayload } from '../services/asyncJobQueue';
 import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup, getOrphanedCalendlyWebhook, recordOrphanedCalendlyWebhook } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
+import { describeMetaAdsCapability } from '../utils/metaAdsScope';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
@@ -240,6 +241,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       let status: string;
       let expiryMessage: string;
 
+      // Meta ad accounts only, and only when we can prove the answer — the same
+      // annotation the agent's list_connected_accounts tool reports, so the model
+      // and the account owner can never be told two different things (ENG-1158).
+      const adsCapability = describeMetaAdsCapability(acc as any);
+
       if (acc.platform === 'unipile') {
         // Unipile manages credentials; use the real status from their API
         const unipileStatus = unipileStatusMap.get(acc.account_id) || 'OK';
@@ -259,6 +265,14 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // reconnect prompt instead of a misleading "Connected" badge.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — X revoked the token';
+      } else if (adsCapability.ads_capable === false) {
+        // The token is valid and unexpired, but the Meta account never granted (or
+        // has since lost) ads_read/ads_management, so this ad account cannot serve
+        // the only thing it exists for. Reporting it as "Connected" is what let a
+        // multi-day zero-data reporting outage go unnoticed (ENG-1158) — surface it
+        // as needing reconnection so the row shows the Reconnect action.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — Meta Ads permission not granted';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.
@@ -296,6 +310,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // Calendly only: which lead list bookings land in — explicitly chosen or
         // auto-resolved server-side on first booking (ENG-524 CRM-forward).
         booking_lead_list_id: acc.platform === 'calendly' ? (acc.config as any).booking_lead_list_id : undefined,
+        // Meta ad accounts only: whether this connection can actually read ads
+        // data, plus the actionable reason when it cannot. Absent entirely for
+        // every other account, and for Meta records whose grant we cannot prove.
+        ...adsCapability,
         // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
         // explicitly chosen, or undefined until the customer picks one (the frontend
         // defaults the picker's display to the first connected account/pixel, matching

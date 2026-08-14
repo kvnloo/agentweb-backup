@@ -15513,23 +15513,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (connection?.account_id && connection?.platform) {
       try {
-        const previous: unknown = connection.config?.granted_scopes;
-        const retained = (Array.isArray(previous) ? previous : [])
-          .filter((s: unknown) => typeof s === 'string')
-          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+        // Which of the two independent grants is actually missing (ENG-1158
+        // follow-up)? Without this, the re-consent message tells an owner who
+        // already granted the app scope to reconnect and re-approve a
+        // permission they already have — for a gap that lives on the ad
+        // account, not the OAuth connection, which reconnecting cannot touch.
+        const tier = await metaService.classifyAdsRefusalTier(connection.config?.access_token);
+        const revokedAt = new Date().toISOString();
 
+        // Function form (Greptile P1 on the sibling call in metaAdsCapabilitySync):
+        // `retained` must come from the config a CAS retry actually just read, not
+        // from `connection.config` captured before this call — otherwise a retry
+        // after a concurrent recovery would re-narrow a grant that had just come
+        // back. `tier` and `revokedAt` stay fixed: both are fresh judgments made
+        // once (a live Meta call, this call's own timestamp), not derived from
+        // local state that can go stale.
+        // The probedAt guard (Greptile P1 follow-up, mirrors the sibling in
+        // metaAdsCapabilitySync.ts): this single read failure is weaker
+        // evidence than the sweep's two-strike confirmation, so if the sweep
+        // already recorded a NEWER probe (e.g. a recovery landing moments
+        // after this failure), that signal wins — do nothing rather than
+        // revoke over a connection just confirmed healthy.
         const { updateAccountConfig } = await import('./connectedAccountsDb');
-        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
-          // Meta just told us authoritatively that no ads scope is granted.
-          // Recording it converts every subsequent attempt into a pre-flight refusal.
-          granted_scopes: retained,
-          ads_scope_revoked_at: new Date().toISOString(),
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, freshConfig => {
+          const storedProbedAt = freshConfig.ads_capability_probed_at;
+          if (typeof storedProbedAt === 'string' && storedProbedAt > revokedAt) {
+            return { updates: {}, unset: [] };
+          }
+
+          const freshPrevious: unknown = freshConfig.granted_scopes;
+          const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
+            .filter((s: unknown) => typeof s === 'string')
+            .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+          return {
+            // Meta just told us authoritatively that no ads scope is granted.
+            // Recording it converts every subsequent attempt into a pre-flight refusal.
+            updates: {
+              granted_scopes: freshRetained,
+              ads_scope_revoked_at: revokedAt,
+              ads_capability_probed_at: revokedAt,
+              ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+            },
+            unset: tier === 'unknown' ? ['ads_scope_tier'] : undefined,
+          };
         });
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
         );
       }
+
+      // Deliberately does NOT notify the owner. The 12-hourly capability sweep
+      // is the single notifier (ENG-1158): it probes every Meta ad account and
+      // alerts on exactly the accounts this path records, so notifying here too
+      // would only buy latency — at the price of two processes racing to email
+      // the same owner for one episode, which no in-process guard can dedupe.
+      // One sender, one process, no cross-process coordination to get wrong.
     }
 
     throw buildMetaAdsScopeError({
@@ -30355,17 +30394,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
    */
   private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
-    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
-    if (acc?.config?.account_type !== 'ad_account') return {};
-
-    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
-    const state = getMetaAdsScopeState(acc.config);
-
-    if (state === 'granted') return { ads_capable: true };
-    if (state === 'missing') {
-      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
-    }
-    return {};
+    // Delegates to the shared helper so this payload and the Settings → Connected
+    // accounts payload are provably the same judgement (ENG-1158). They used to be
+    // computed independently, which is how an account could be "degraded" here and
+    // a green "Connected" row in the UI at the same moment.
+    const { describeMetaAdsCapability } = await import('../utils/metaAdsScope');
+    return describeMetaAdsCapability(acc);
   }
 
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
