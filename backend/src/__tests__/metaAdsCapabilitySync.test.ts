@@ -329,14 +329,124 @@ describe('syncMetaAdsCapability (ENG-1158)', () => {
       expect(account.config.ads_scope_denied_seen_at).toBeUndefined();
     });
 
-    it('is a no-op when the refusal is already on record', async () => {
+    it('is a no-op when the refusal is already on record and the tier is already known', async () => {
       // An account the agent path already caught is already reported as
       // degraded by every surface; there is nothing left to record.
       mockProbeAdsAccountAccess.mockResolvedValue('denied');
 
+      const result = await syncMetaAdsCapability(
+        metaAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_tier: 'asset',
+        }),
+        'user1'
+      );
+
+      expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    /**
+     * The account production 922903076601160 was actually found in: latched
+     * 'missing' since before tier classification shipped. The confirm-branch
+     * above is the only place tier is ever computed, and an already-'missing'
+     * account never reaches it again through the normal suspect-then-confirm
+     * path while it stays denied — without this backfill, it would carry the
+     * generic OAuth-tier message forever, the exact account this whole
+     * feature was built for never actually benefiting from it.
+     */
+    it('backfills the tier for an account latched before tier classification existed', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount(); // no ads_scope_tier — the real production shape
+      const configSnapshot = { ...account.config };
+
+      const result = await syncMetaAdsCapability(account, 'user1');
+
+      expect(result.outcome).toBe('unchanged'); // nothing user-visible changes...
+      expect(mockClassifyAdsRefusalTier).toHaveBeenCalledWith('EAA-token');
+      // ...but the write it would make on a real (non-mocked) CAS loop carries
+      // the now-known tier. The mock here doesn't invoke the closure, so the
+      // local mirror (`applied`-gated) correctly stays untouched — assert on
+      // what the write itself would do, not on the local side effect.
+      const { updates } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], configSnapshot);
+      expect(updates.ads_scope_tier).toBe('asset');
+    });
+
+    it('rejects the backfill write when a concurrent writer already recorded a tier', async () => {
+      // Greptile P1: the guard inside the write must actually gate the write,
+      // not just be decorative — a fresh read that already carries a tier
+      // (another process won the race) must produce a true no-op, which the
+      // outer code then must not misreport as an applied backfill.
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount();
+      const concurrentlyWonConfig = { ...account.config, ads_scope_tier: 'oauth' };
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], concurrentlyWonConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
+    });
+
+    /**
+     * Greptile P1 (2nd round): the closure is invoked once per CAS retry
+     * attempt, not once total. A stale `applied = true` from an earlier
+     * attempt that then lost its own write race must not survive into the
+     * later attempt whose write actually lands — simulated here by having
+     * the mock invoke the captured closure twice, mirroring what the real
+     * CAS loop in connectedAccountsDb.ts does on a conflict-then-retry.
+     */
+    it('does not report success from a stale earlier attempt when the retry that lands is a no-op', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      const account = latchedAccount();
+
+      mockUpdateAccountConfig.mockImplementationOnce((_u, _p, _a, configUpdates) => {
+        // Attempt 1: guard passes, would have applied — but its own write
+        // loses the race (simulated by just discarding the result and
+        // retrying, exactly like a ConditionalCheckFailedException would).
+        configUpdates(account.config);
+        // Attempt 2 (the one that actually lands): a concurrent writer won
+        // in between — the fresh read now already carries a tier.
+        configUpdates({ ...account.config, ads_scope_tier: 'oauth' });
+        return Promise.resolve(undefined);
+      });
+
+      await syncMetaAdsCapability(account, 'user1');
+
+      // The local mirror and (by extension) the success log must reflect
+      // attempt 2's outcome — a no-op — not attempt 1's stale success. The
+      // real account object passed in is never mutated by this call.
+      expect(account.config.ads_scope_tier).toBeUndefined();
+    });
+
+    it('does not backfill when the tier cannot be determined', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
+
       const result = await syncMetaAdsCapability(latchedAccount(), 'user1');
 
       expect(result.outcome).toBe('unchanged');
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+    });
+
+    it('does not re-backfill an account whose tier is already recorded', async () => {
+      mockProbeAdsAccountAccess.mockResolvedValue('denied');
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+
+      await syncMetaAdsCapability(
+        metaAccount({
+          granted_scopes: [],
+          ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+          ads_scope_tier: 'oauth',
+        }),
+        'user1'
+      );
+
+      expect(mockClassifyAdsRefusalTier).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
   });

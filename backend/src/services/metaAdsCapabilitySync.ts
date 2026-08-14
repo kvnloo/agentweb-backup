@@ -175,8 +175,53 @@ export const syncMetaAdsCapability = async (
       return { outcome: 'recovered' };
     }
 
-    // Denied, and already recorded as such: nothing left to do.
-    if (recordedState === 'missing') return { outcome: 'unchanged' };
+    // Denied, and already recorded as such. The revocation itself needs no
+    // rewrite — but an account already latched BEFORE tier classification
+    // shipped has no ads_scope_tier, and would otherwise carry the generic
+    // OAuth-tier message forever: this branch is the only place tier gets
+    // computed, and an account that's already 'missing' never reaches it
+    // through the normal suspect-then-confirm path again while it stays
+    // denied. Backfill once, guarded so it only ever runs until a tier is
+    // recorded.
+    if (recordedState === 'missing') {
+      if (!config.ads_scope_tier) {
+        const backfillTier = await metaService.classifyAdsRefusalTier(config.access_token);
+        if (backfillTier !== 'unknown') {
+          // Report back whether the write actually applied (Greptile P1):
+          // a guard inside can no-op this on a concurrent tier already being
+          // recorded, or a newer probe having landed — the local mutation and
+          // the log line below must not claim a backfill that didn't happen.
+          let applied = false;
+          await updateAccountConfig(userId, platform as any, account.account_id, freshConfig => {
+            // Reset on every invocation, not just set-once: a CAS conflict
+            // re-invokes this closure on each retry attempt, and only the
+            // LAST invocation's outcome corresponds to what actually gets
+            // persisted (updateAccountConfig returns as soon as one attempt's
+            // write succeeds). Without the reset, an earlier attempt setting
+            // this true would survive even if that attempt's write then lost
+            // its own conflict and a later, guard-rejecting attempt is the
+            // one that actually lands (Greptile P1).
+            applied = false;
+            if (getMetaAdsScopeState(freshConfig) !== 'missing' || freshConfig.ads_scope_tier) {
+              return { updates: {}, unset: [] };
+            }
+            const storedProbedAt = freshConfig.ads_capability_probed_at;
+            if (typeof storedProbedAt === 'string' && storedProbedAt > probedAt) {
+              return { updates: {}, unset: [] };
+            }
+            applied = true;
+            return { updates: { ads_scope_tier: backfillTier, ads_capability_probed_at: probedAt } };
+          });
+          if (applied) {
+            config.ads_scope_tier = backfillTier;
+            console.log(
+              `[MetaAdsCapabilitySync] Backfilled ads-refusal tier for user ${userId} account ${account.account_id} — was already latched before tier classification shipped`
+            );
+          }
+        }
+      }
+      return { outcome: 'unchanged' };
+    }
 
     // First refusal we have seen for this connection: record the suspicion and
     // stop. Confirmation comes from the next sweep, 12 hours later. One denied
