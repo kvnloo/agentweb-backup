@@ -18786,6 +18786,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         `${entity_type}_${action}`,
         overrideTrackingCheck,
         sessionId,
+        {},
+        // Activating one ad is judged on that ad's own destination, not its siblings'.
+        entity_type === 'AD' ? ad_id : undefined,
       );
       if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }

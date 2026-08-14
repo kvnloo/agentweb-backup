@@ -179,3 +179,48 @@ describe('preflightMetaTrackingGate', () => {
     expect(gate.results).toEqual([]);
   });
 });
+
+describe('destinations a pixel could never live on (ENG-941)', () => {
+  const fetchSpy = jest.fn();
+
+  beforeEach(() => fetchSpy.mockReset());
+
+  it.each([
+    ['whatsapp://send?phone=123'],
+    ['fb-messenger://user/123'],
+    ['tel:+15551234'],
+    ['mailto:sales@example.com'],
+    ['https://apps.apple.com/us/app/thing/id123'],
+    ['https://play.google.com/store/apps/details?id=com.thing'],
+    ['not a url at all'],
+  ])('skips %s instead of blocking on it', async (url) => {
+    const gate = await preflightMetaTrackingGate([url], ['1012387921717047'], { fetchHtml: fetchSpy });
+    expect(gate.ok).toBe(true);
+    expect(gate.results).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('still checks a normal web destination alongside a deep link', async () => {
+    fetchSpy.mockResolvedValue('<html>nothing</html>');
+    const gate = await preflightMetaTrackingGate(
+      ['whatsapp://send?phone=123', 'https://site.example/lp'],
+      ['1012387921717047'],
+      { fetchHtml: fetchSpy },
+    );
+    expect(gate.ok).toBe(false);
+    expect(gate.results.map(r => r.url)).toEqual(['https://site.example/lp']);
+  });
+
+  it('fetches destinations concurrently rather than one after another', async () => {
+    let inFlight = 0, peak = 0;
+    const slow = async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 10));
+      inFlight--;
+      return '<html>nothing</html>';
+    };
+    const urls = Array.from({ length: 10 }, (_, i) => `https://site.example/p${i}`);
+    await preflightMetaTrackingGate(urls, ['1012387921717047'], { fetchHtml: slow });
+    expect(peak).toBeGreaterThan(1);
+  });
+});

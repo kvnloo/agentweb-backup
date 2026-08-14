@@ -212,3 +212,61 @@ describe('server-side activity hint (ENG-941)', () => {
     expect(probe).not.toHaveBeenCalled();
   });
 });
+
+describe('scoping and bypass fixes (ENG-941)', () => {
+  beforeEach(() => {
+    mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+  });
+
+  /*
+   * createAdSet is the odd one out: createCampaign and createAd both apply
+   * `params.status || PAUSED`, but createAdSet only sets status when given, so an omitted
+   * status falls through to Meta's default of ACTIVE. Without this, an ad set created with
+   * no status starts delivering and never meets the gate.
+   */
+  it('treats an AD_SET CREATE with no status as spend-starting', () => {
+    const { isMetaSpendStartingWrite } = require('../services/metaLaunchGate');
+    expect(isMetaSpendStartingWrite('AD_SET', 'CREATE', {})).toBe(true);
+    expect(isMetaSpendStartingWrite('AD_SET', 'CREATE', { name: 'x' })).toBe(true);
+  });
+
+  it('does not gate entities that genuinely default to paused, or updates with no status', () => {
+    const { isMetaSpendStartingWrite } = require('../services/metaLaunchGate');
+    expect(isMetaSpendStartingWrite('CAMPAIGN', 'CREATE', {})).toBe(false);
+    expect(isMetaSpendStartingWrite('AD', 'CREATE', {})).toBe(false);
+    expect(isMetaSpendStartingWrite('AD_SET', 'UPDATE', {})).toBe(false);
+    expect(isMetaSpendStartingWrite('AD_SET', 'CREATE', { status: 'PAUSED' })).toBe(false);
+  });
+
+  it('blocks rather than scanning the whole account when no campaign is identified', async () => {
+    const out = await _runMetaTrackingGateForTest(creds, undefined, 'AD_SET_UPDATE', false, 'sess-1');
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('no campaign was identified');
+    expect(mockListAds).not.toHaveBeenCalled();
+  });
+
+  it('still honours an override when no campaign is identified', async () => {
+    const out = await _runMetaTrackingGateForTest(creds, undefined, 'AD_SET_UPDATE', true, 'sess-1');
+    expect(out.proceed).toBe(true);
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
+  });
+
+  it('judges a single ad on its own destination, not its siblings', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'ad-good', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/good'] },
+      { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
+    ]);
+    await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-good');
+    expect(mockPreflight).toHaveBeenCalledWith(['https://site.example/good'], [PIXEL]);
+  });
+
+  it('checks the whole campaign when no single ad is named', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'ad-good', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/good'] },
+      { adId: 'ad-bad', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/bad'] },
+    ]);
+    await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_SET_UPDATE', false, 'sess-1');
+    const urls = mockPreflight.mock.calls[0][0];
+    expect(urls).toEqual(['https://site.example/good', 'https://site.example/bad']);
+  });
+});

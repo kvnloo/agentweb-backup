@@ -84,6 +84,39 @@ export function detectMetaPixels(html: string): string[] {
   return [...found];
 }
 
+/** How many destinations to fetch at once. Bounded: fast enough for a launch, polite to the site. */
+const FETCH_CONCURRENCY = 5;
+
+/**
+ * Destinations a browser pixel can never live on, so blocking them would be a false block.
+ *
+ * A Meta campaign can point at a deep link or an app store listing, where measurement runs
+ * through the Meta SDK or app events rather than a page pixel. Fetching `whatsapp://…` is
+ * meaningless, and an App Store page is someone else's HTML we could never instrument.
+ * These are skipped — not passed as measured, simply not treated as web destinations this
+ * gate can speak about. Campaigns whose ONLY destinations are these end up with nothing to
+ * check, which is the same "nothing serving" case the gate already lets through.
+ */
+function isUnmeasurableByDesign(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return true; // not a URL at all — nothing to fetch
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return true;
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  return APP_STORE_HOSTS.has(host);
+}
+
+/** App-store destinations measure through app events, never a page pixel. */
+const APP_STORE_HOSTS = new Set([
+  'apps.apple.com',
+  'itunes.apple.com',
+  'play.google.com',
+  'apps.microsoft.com',
+]);
+
 /** Strip the `PIXEL:` label back to a bare id for comparison against the account's pixels. */
 function pixelIds(mechanisms: string[]): string[] {
   return mechanisms.map(m => m.replace(/^PIXEL:/, ''));
@@ -121,32 +154,45 @@ export async function preflightMetaTrackingGate(
   const fetchHtml = deps.fetchHtml ?? defaultFetchHtml;
   const ownedPixels = new Set((accountPixelIds ?? []).filter(Boolean).map(String));
 
-  const unique = [...new Set((urls ?? []).filter((u): u is string => typeof u === 'string' && u.trim() !== ''))];
+  const unique = [...new Set((urls ?? []).filter((u): u is string => typeof u === 'string' && u.trim() !== ''))]
+    .filter(u => !isUnmeasurableByDesign(u));
 
+  /*
+   * Checked with bounded concurrency rather than one at a time. A campaign with twenty ads
+   * would otherwise mean twenty sequential fetches at a 10s timeout each — minutes of
+   * latency on a launch, which is its own kind of failure. Bounded rather than unbounded so
+   * a large campaign can't open fifty sockets at once against a customer's site.
+   */
   const results: MetaUrlTrackingResult[] = [];
-  for (const url of unique) {
-    try {
-      const html = await fetchHtml(url);
-      const mechanisms = detectMetaPixels(html);
-      const onPage = pixelIds(mechanisms);
-      // Measured requires BOTH: a pixel is installed, and at least one installed pixel
-      // belongs to the account paying for the traffic.
-      const measured = onPage.length > 0 && onPage.some(id => ownedPixels.has(id));
-      results.push({
-        url,
-        status: measured ? 'measured' : 'unmeasured',
-        mechanisms,
-        checkedFor: META_TRACKING_MECHANISMS,
-      });
-    } catch (err: any) {
-      results.push({
-        url,
-        status: 'unverifiable',
-        mechanisms: [],
-        checkedFor: META_TRACKING_MECHANISMS,
-        error: err?.message || String(err),
-      });
-    }
+  for (let i = 0; i < unique.length; i += FETCH_CONCURRENCY) {
+    const batch = unique.slice(i, i + FETCH_CONCURRENCY);
+    const settled = await Promise.all(
+      batch.map(async (url): Promise<MetaUrlTrackingResult> => {
+        try {
+          const html = await fetchHtml(url);
+          const mechanisms = detectMetaPixels(html);
+          const onPage = pixelIds(mechanisms);
+          // Measured requires BOTH: a pixel is installed, and at least one installed pixel
+          // belongs to the account paying for the traffic.
+          const measured = onPage.length > 0 && onPage.some(id => ownedPixels.has(id));
+          return {
+            url,
+            status: measured ? 'measured' : 'unmeasured',
+            mechanisms,
+            checkedFor: META_TRACKING_MECHANISMS,
+          };
+        } catch (err: any) {
+          return {
+            url,
+            status: 'unverifiable',
+            mechanisms: [],
+            checkedFor: META_TRACKING_MECHANISMS,
+            error: err?.message || String(err),
+          };
+        }
+      }),
+    );
+    results.push(...settled);
   }
 
   const blockedUrls = results.filter(r => r.status !== 'measured');

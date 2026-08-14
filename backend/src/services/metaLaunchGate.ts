@@ -108,7 +108,25 @@ export function isMetaSpendStartingWrite(entityType: string, action: string, par
   if (!params || typeof params !== 'object') return false;
   if (!SPEND_ENTITIES.has(entityType)) return false;
   if (!SPEND_ACTIONS.has(action)) return false;
-  return String(params.status ?? '').toUpperCase() === 'ACTIVE';
+
+  const status = String(params.status ?? '').toUpperCase();
+  if (status === 'ACTIVE') return true;
+  if (status) return false; // an explicit non-ACTIVE status starts nothing
+
+  /*
+   * No status given — whether that starts delivery depends on what the layer below does,
+   * and the three entities do NOT agree:
+   *   createCampaign → `params.status || 'PAUSED'`
+   *   createAd       → `params.status || Ad.Status.paused`
+   *   createAdSet    → sets status ONLY if provided, so an omitted status falls through to
+   *                    META's default, which is ACTIVE.
+   * So an ad set created without a status silently starts delivering. Treating a bare
+   * AD_SET CREATE as spend-starting closes that bypass; the other two genuinely default to
+   * paused and must not be gated, or every ordinary draft creation would block.
+   *
+   * UPDATE with no status changes no status, so it can never start delivery.
+   */
+  return entityType === 'AD_SET' && action === 'CREATE';
 }
 
 /**
@@ -126,8 +144,34 @@ export async function runMetaTrackingGate(
   override: boolean,
   sessionId?: string,
   deps: MetaGateDeps = {},
+  adId?: string,
 ): Promise<{ proceed: boolean; blockResult?: any }> {
   const { accountId, accessToken } = creds;
+
+  /*
+   * Without a campaign id there is nothing to scope the check to. `listAdsForUtmAudit`
+   * only applies its campaign filter when one is passed, so an unscoped call returns
+   * EVERY ad in the account — we would fetch dozens of unrelated destinations and block
+   * this launch because some other campaign's page is untracked.
+   *
+   * That is not a verification, so it does not get to pass as one. Same treatment as any
+   * other failure to verify (AC4): block, say precisely why, and leave the override.
+   */
+  if (!campaignId) {
+    const message =
+      `Launch blocked: could not verify Meta tracking because no campaign was identified for this ` +
+      `${action}. Without a campaign the check cannot tell which destinations this launch would send ` +
+      `traffic to. Retry with the campaign id, or use an explicit tracking-check override.`;
+    await record(sessionId, {
+      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      urlResults: [], checkedAt: new Date().toISOString(),
+    });
+    if (override) return { proceed: true };
+    return {
+      proceed: false,
+      blockResult: { success: false, blocked: true, reason: 'tracking_preflight', error: message, trackingCheck: { measured: false, urlResults: [] } },
+    };
+  }
 
   let destinationUrls: string[] = [];
   let pixelIds: string[] = [];
@@ -136,7 +180,14 @@ export async function runMetaTrackingGate(
       metaService.listAdsForUtmAudit(accountId, accessToken, campaignId),
       metaService.listPixels(accountId, accessToken),
     ]);
-    destinationUrls = (ads ?? []).flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
+    /*
+     * Activating ONE ad is judged on that ad's own destination. Checking the whole
+     * campaign would block an ad whose page is fine because a sibling ad's page is not —
+     * punishing someone for a problem they are not currently causing. Ad-set and campaign
+     * level still check the campaign, since either can put several ads live at once.
+     */
+    const scoped = adId ? (ads ?? []).filter((a: any) => String(a?.adId) === String(adId)) : (ads ?? []);
+    destinationUrls = scoped.flatMap((a: any) => a?.destinationUrls ?? []).filter(Boolean);
     pixelIds = (pixels ?? []).map((p: any) => String(p?.id)).filter((id: string) => id && id !== 'undefined');
   } catch (err: any) {
     const message =

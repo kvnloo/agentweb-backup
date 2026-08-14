@@ -82,8 +82,9 @@ describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
     );
 
     // override reached the gate...
+    // Last arg is the ad id, scoped only for AD writes — undefined for a campaign write.
     expect(runMetaTrackingGate).toHaveBeenCalledWith(
-      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', true, 'sess-1',
+      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', true, 'sess-1', {}, undefined,
     );
     // ...and never reached Meta, which would reject an unknown field.
     const paramsSent = manageCampaignsSpy.mock.calls[0][4];
@@ -99,7 +100,9 @@ describe('callMetaMarketingApi — ENG-941 gate wiring', () => {
       'user-1', 'CAMPAIGN', 'UPDATE', ACCOUNT, CAMPAIGN, undefined, undefined, { status: 'ACTIVE', confirm: true }, 'sess-1',
     );
 
-    expect(runMetaTrackingGate).toHaveBeenCalledWith(expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1');
+    expect(runMetaTrackingGate).toHaveBeenCalledWith(
+      expect.anything(), CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1', {}, undefined,
+    );
   });
 
   it('gates an ad set activation on the same path', async () => {
@@ -171,4 +174,18 @@ describe('ENG-600 launch flows — ENG-941 gate wiring', () => {
       expect.anything(), CAMPAIGN, 'TARGETED_AUDIENCE_LAUNCH', true, 'sess-1',
     );
   });
+});
+
+it('scopes an AD activation to that ad, so a sibling\'s untracked page cannot block it', async () => {
+  (isMetaSpendStartingWrite as jest.Mock).mockReturnValue(true);
+  (runMetaTrackingGate as jest.Mock).mockResolvedValue({ proceed: true });
+  jest.spyOn(service as any, 'manageMetaAdsAds').mockResolvedValue({ success: true });
+
+  await service.callMetaMarketingApi(
+    'user-1', 'AD', 'UPDATE', ACCOUNT, CAMPAIGN, 'adset-1', 'ad-42', { status: 'ACTIVE', confirm: true }, 'sess-1',
+  );
+
+  expect(runMetaTrackingGate).toHaveBeenCalledWith(
+    expect.anything(), CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-42',
+  );
 });
