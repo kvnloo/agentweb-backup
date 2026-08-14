@@ -88,12 +88,44 @@ export const META_TRACKING_MECHANISMS: string[] = [
  */
 export function stripInertJavaScript(src: string): string {
   const isInert = (body: string) => /fbq\s*\(/i.test(body) || /facebook\.com\/tr\?id=/i.test(body);
+  /*
+   * A `/` starts a regex literal only where an expression may begin; after a value it is
+   * division. Deciding on the previous significant character keeps `total / 2` and
+   * `(a + b) / 2` as arithmetic — treating those as regexes would swallow live code up to
+   * the next slash, which is how a scrubber starts causing false blocks.
+   */
+  const REGEX_START_AFTER = new Set(['', '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '~', '^', '<', '>', '\n']);
+  let prevSignificant = '';
   let out = '';
   let i = 0;
   while (i < src.length) {
     const c = src[i];
+    if (c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*' && REGEX_START_AFTER.has(prevSignificant)) {
+      // A regex literal is real code, but a PATTERN never initializes a pixel — matching
+      // `fbq('init', …)` is in fact what a consent-manager or a scanner does. Dropped
+      // wholesale rather than inspected: there is no case where keeping one adds signal.
+      let j = i + 1;
+      let inClass = false;
+      let terminated = false;
+      while (j < src.length && src[j] !== '\n') {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '[') inClass = true;
+        else if (src[j] === ']') inClass = false;
+        else if (src[j] === '/' && !inClass) { terminated = true; break; }
+        j++;
+      }
+      if (terminated) {
+        out += ' ';
+        prevSignificant = ' ';
+        i = j + 1;
+        continue;
+      }
+      // Unterminated on this line — not a regex after all; fall through and treat as a
+      // plain character rather than swallowing the rest of the file.
+    }
     if (c === '/' && src[i + 1] === '/') {
       while (i < src.length && src[i] !== '\n') i++;
+      prevSignificant = '\n';
       continue;
     }
     if (c === '/' && src[i + 1] === '*') {
@@ -117,10 +149,13 @@ export function stripInertJavaScript(src: string): string {
       }
       const closed = j < src.length && src[j] === c;
       out += isInert(body) ? ' ' : c + body + (closed ? c : '');
+      // A string is a VALUE, so a `/` after it is division, never a regex.
+      prevSignificant = c;
       i = closed ? j + 1 : j;
       continue;
     }
     out += c;
+    if (c === '\n' || !/\s/.test(c)) prevSignificant = c;
     i++;
   }
   return out;
@@ -147,7 +182,13 @@ export function detectMetaPixels(html: string): string[] {
    */
   html = html
     .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<(code|pre|textarea)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    /*
+     * `<template>` joins code/pre/textarea for a different reason worth stating: its
+     * contents ARE parsed as markup, but they are inert until cloned — no image inside one
+     * is ever requested, and no script inside one ever runs. A component library shipping a
+     * pixel snippet in a template would otherwise read as an install on every page.
+     */
+    .replace(/<(code|pre|textarea|template)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
     // Escaped script blocks: strip the WHOLE block, not just its escaped tags. Removing only
     // `&lt;script&gt;` leaves the fbq call between them looking like a live install, which is
     // precisely how a docs page explaining pixel setup would read as measured.

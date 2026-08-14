@@ -290,10 +290,15 @@ describe('Greptile findings (ENG-941)', () => {
     })).toEqual(['https://a/3', 'https://a/4']);
   });
 
-  it('collects nothing for updates or unrelated entities', () => {
-    expect(collectPendingDestinations('AD', 'UPDATE', { link_url: 'https://a/1' })).toEqual([]);
+  /*
+   * This originally asserted AD UPDATE collects nothing, which encoded the round-5 bug:
+   * an update carrying creative content swaps in a NEW creative, so its inline destination
+   * is exactly what must be checked. See 'inline creative swap on AD UPDATE' below.
+   */
+  it('collects nothing for unrelated entities or empty params', () => {
     expect(collectPendingDestinations('CAMPAIGN', 'CREATE', { link_url: 'https://a/1' })).toEqual([]);
     expect(collectPendingDestinations('AD', 'CREATE', null)).toEqual([]);
+    expect(collectPendingDestinations('AD', 'DELETE', { link_url: 'https://a/1' })).toEqual([]);
   });
 
   it('checks a newly created ad\'s own destination, not just the existing campaign ads', async () => {
@@ -416,5 +421,37 @@ describe('inline creative destination extraction (ENG-941)', () => {
     expect(collectPendingDestinations('AD', 'CREATE', {
       creative: { image_url: 'https://cdn/x.png', thumbnail_url: 'https://cdn/t.png', video_id: '123' },
     })).toEqual([]);
+  });
+});
+
+/*
+ * Greptile P1, round 5 ("Creative swap checks old destination"). AD UPDATE can carry the
+ * new destination inline (link_url / a creative object), not only as a creative_id — and
+ * the collector only ran for CREATE, so the gate checked the ad list's OLD URL while the
+ * update was about to build and activate a replacement creative pointing somewhere else.
+ */
+describe('inline creative swap on AD UPDATE (ENG-941)', () => {
+  const { collectPendingDestinations } = require('../services/metaLaunchGate');
+
+  it('collects an inline destination supplied on an AD UPDATE', () => {
+    expect(collectPendingDestinations('AD', 'UPDATE', { link_url: 'https://a/new' })).toEqual(['https://a/new']);
+    expect(collectPendingDestinations('AD', 'UPDATE', {
+      creative: { object_story_spec: { link_data: { link: 'https://a/new2' } } },
+    })).toEqual(['https://a/new2']);
+  });
+
+  it('still collects nothing for entities that carry no creative', () => {
+    expect(collectPendingDestinations('CAMPAIGN', 'UPDATE', { link_url: 'https://a/1' })).toEqual([]);
+    expect(collectPendingDestinations('AD_SET', 'UPDATE', { link_url: 'https://a/1' })).toEqual([]);
+  });
+
+  it('checks the inline new destination rather than the ad\'s current one', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'ad-42', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/old'] },
+    ]);
+    await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_UPDATE', false, 'sess-1', {}, 'ad-42', ['https://site.example/new'],
+    );
+    expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
   });
 });

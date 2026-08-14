@@ -384,3 +384,36 @@ describe('detectMetaPixels — the noscript fallback must be a real request', ()
     expect(detectMetaPixels(`<img width=1 src=https://www.facebook.com/tr?id=${PIXEL} />`)).toEqual([`PIXEL:${PIXEL}`]);
   });
 });
+
+/*
+ * Greptile P1, round 5. Two more inert containers the scanner passed through:
+ * a regex literal (real code, but a pattern is never an initialization), and a
+ * <template> element, whose contents are parsed but never rendered or requested.
+ */
+describe('detectMetaPixels — regex literals and inert containers', () => {
+  it('ignores an fbq init that only appears inside a regex literal', () => {
+    expect(detectMetaPixels(
+      // Unescaped parens: a valid regex with capture groups, and the exact text the
+      // matcher looks for. The escaped form would pass trivially and prove nothing.
+      `<script>var re = /fbq('init','${PIXEL}')/; if (re.test(src)) report();</script>`,
+    )).toEqual([]);
+  });
+
+  it('does not mistake division for a regex and swallow a real install', () => {
+    expect(detectMetaPixels(
+      `<script>var half = total / 2; var r = (a + b) / 2; fbq('init', '${PIXEL}');</script>`,
+    )).toEqual([`PIXEL:${PIXEL}`]);
+  });
+
+  it('ignores a tracking beacon inside a <template> — parsed, never requested', () => {
+    expect(detectMetaPixels(
+      `<template><img height="1" width="1" src="https://www.facebook.com/tr?id=${PIXEL}&ev=PageView"/></template>`,
+    )).toEqual([]);
+  });
+
+  it('ignores an fbq init inside a <template>', () => {
+    expect(detectMetaPixels(
+      `<template><script>fbq('init', '${PIXEL}');</script></template>`,
+    )).toEqual([]);
+  });
+});

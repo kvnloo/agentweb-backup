@@ -169,7 +169,16 @@ function extractDestinationUrls(node: any, depth = 0): string[] {
 }
 
 export function collectPendingDestinations(entityType: string, action: string, params: any): string[] {
-  if (action !== 'CREATE' || !params || typeof params !== 'object') return [];
+  if (!params || typeof params !== 'object') return [];
+  if (action !== 'CREATE' && action !== 'UPDATE') return [];
+  /*
+   * UPDATE is included for AD because an ad update carrying creative content (`link_url`,
+   * a creative object) makes Meta build and swap in a NEW creative — so the ad list still
+   * holds the destination that is about to be replaced. Checking that one answers a
+   * question nobody asked. AD_SET carries no creative, so only its CREATE can introduce a
+   * destination; campaigns never carry one at all.
+   */
+  if (entityType === 'AD_SET' && action !== 'CREATE') return [];
   if (entityType !== 'AD' && entityType !== 'AD_SET') return [];
 
   const out: string[] = [];
