@@ -2697,6 +2697,11 @@ export class MetaService {
        *  conversion type — e.g. calendlyWebhook.ts sending 'Schedule' for a booking,
        *  per ENG-524's PRD and matching ENG-522's sendScheduleEvent — pass it explicitly. */
       eventName?: string;
+      /** ENG-926 §C: Meta's `custom_data`, emitted only when present so every existing
+       *  caller's payload is byte-identical to what it was before this field existed.
+       *  `value`/`currency` are what make a closed-won `Purchase` usable for Meta's
+       *  value-based bidding — without them the event counts but carries no revenue. */
+      customData?: { value?: number; currency?: string };
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2731,6 +2736,12 @@ export class MetaService {
           ? (event.eventTimeSeconds as number)
           : Math.floor(Date.now() / 1000);
 
+      // Only build custom_data when there is something to put in it — an empty object
+      // would still be a payload change for every existing caller.
+      const customData: Record<string, any> = {};
+      if (typeof event.customData?.value === 'number') customData.value = event.customData.value;
+      if (event.customData?.currency) customData.currency = event.customData.currency;
+
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
       const body = {
@@ -2743,6 +2754,7 @@ export class MetaService {
             action_source: 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,
+            ...(Object.keys(customData).length > 0 ? { custom_data: customData } : {}),
           },
         ],
       };
