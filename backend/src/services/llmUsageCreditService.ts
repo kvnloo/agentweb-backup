@@ -1,4 +1,11 @@
+import AWS from 'aws-sdk';
 import { userDb, type User } from './db';
+import { paymentHistoryDb } from './paymentHistoryDb';
+
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+const USERS_TABLE = `${TABLE_PREFIX}AW-Users`;
+const PAYMENT_HISTORY_TABLE = `${TABLE_PREFIX}AW-PaymentHistory`;
+const docClient = new AWS.DynamoDB.DocumentClient();
 
 export type LlmUsageCreditSource = 'purchase' | 'migration' | 'admin';
 
@@ -160,6 +167,17 @@ export async function grantMonthlyLlmUsageCredit(input: {
   if (!Number.isInteger(amountMicroUsd) || amountMicroUsd <= 0) {
     throw new Error('amountMicroUsd must be a positive integer');
   }
+  // Admin grants must be whole-cent multiples so the payment-history `amount`
+  // (which is denominated in cents everywhere else in the codebase) can
+  // represent them faithfully. Sub-cent admin credits have no product use
+  // case today — the admin dialog defaults to a whole-dollar prefill — and
+  // allowing them would force the audit row to either round to $0 (loses
+  // audit) or up to 1c (overstates). Migration and purchase sources
+  // legitimately carry sub-cent amounts (raw provider spend, fractional
+  // cents) and are unaffected.
+  if (input.source === 'admin' && amountMicroUsd % 10_000 !== 0) {
+    throw new Error('admin grants must be whole-cent multiples (amountMicroUsd divisible by 10_000)');
+  }
 
   const billingUserId = input.billingUserId;
   const month = getCurrentUsageMonth(input.now);
@@ -240,14 +258,107 @@ export async function grantMonthlyLlmUsageCredit(input: {
         };
 
     try {
-      await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      if (input.source === 'admin') {
+        // AC7 audit: admin credits are an out-of-band judgment call and must
+        // carry an immutable audit record with actor/reason/before-after
+        // balance. Ledger commit and audit write go through DynamoDB
+        // TransactWriteItems so a partial success is impossible — either both
+        // land or neither does. Doing the audit as a follow-up call would
+        // permanently orphan grants whenever the audit write fails (retry
+        // short-circuits on the persisted grantId and never re-attempts the
+        // audit). Stripe purchases and rollout migrations don't need this
+        // treatment: they carry their own audit trails (Stripe events, the
+        // rollout script log).
+        const beforeAllowance = allowanceBalanceFromLedger(current);
+        const afterAllowance = allowanceBalanceFromLedger(next);
+        await docClient.transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: USERS_TABLE,
+                Key: { email: user.email },
+                UpdateExpression: 'SET #creditLedger = :next',
+                ConditionExpression: condition.expression,
+                ExpressionAttributeNames: {
+                  '#creditLedger': 'llmUsageCredits',
+                  ...(condition.names || {}),
+                },
+                ExpressionAttributeValues: {
+                  ':next': next,
+                  ...(condition.values || {}),
+                },
+              },
+            },
+            {
+              Put: {
+                TableName: PAYMENT_HISTORY_TABLE,
+                Item: {
+                  userId: billingUserId,
+                  timestamp: grantedAt,
+                  eventType: 'admin_credit_grant',
+                  // Payment-history amount is stored in cents everywhere else.
+                  // Admin grants are validated as whole-cent multiples above,
+                  // so this division is exact — no rounding tradeoff. Exact
+                  // micro-USD stays in metadata for downstream precision.
+                  amount: amountMicroUsd / 10_000,
+                  currency: 'usd',
+                  status: 'granted',
+                  metadata: {
+                    grantId: input.grantId,
+                    ...(input.grantedBy?.trim() ? { grantedBy: input.grantedBy.trim() } : {}),
+                    ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+                    amountMicroUsd,
+                    beforeAllowanceMicroUsd: beforeAllowance,
+                    afterAllowanceMicroUsd: afterAllowance,
+                  },
+                },
+              },
+            },
+          ],
+        }).promise();
+      } else {
+        await userDb.updateUser(billingUserId, { llmUsageCredits: next }, { condition });
+      }
       return { granted: true, billingUserId, ledger: next };
     } catch (error) {
-      if (isConditionalFailure(error)) continue;
+      if (isTransactionalConditionalFailure(error) || isConditionalFailure(error)) continue;
       throw error;
     }
   }
   throw new Error(`Concurrent usage-credit updates did not settle for ${billingUserId}`);
+}
+
+/**
+ * A TransactWriteItems that fails because ONE of its condition checks did not
+ * hold surfaces as `TransactionCanceledException` with `CancellationReasons[i]
+ * .Code === 'ConditionalCheckFailed'`. `TransactionConflictException` (and
+ * the `TransactionConflict` cancellation reason) is the sibling case where
+ * another transaction is currently modifying the same item — also retryable
+ * by rebuilding from the fresh ledger. Retry treats all of them identically
+ * to a plain conditional failure.
+ */
+function isTransactionalConditionalFailure(error: any): boolean {
+  if (error?.code === 'TransactionConflictException') return true;
+  if (error?.code !== 'TransactionCanceledException') return false;
+  const reasons = error?.CancellationReasons || [];
+  return reasons.some(
+    (r: any) => r?.Code === 'ConditionalCheckFailed' || r?.Code === 'TransactionConflict',
+  );
+}
+
+/**
+ * Sum of extra allowance carried by a ledger — purchased net of reversals,
+ * plus admin grants. Excludes migration offset, which reduces raw usage rather
+ * than extending the ceiling and would double-count if added here.
+ */
+function allowanceBalanceFromLedger(ledger: MonthlyLlmUsageCredits): number {
+  const purchasedNet = Math.max(
+    0,
+    Math.round(ledger.totalPurchasedMicroUsd || 0) -
+      Math.round(ledger.totalPurchasedReversedMicroUsd || 0),
+  );
+  const admin = Math.max(0, Math.round(ledger.totalAdminGrantedMicroUsd || 0));
+  return purchasedNet + admin;
 }
 
 /**

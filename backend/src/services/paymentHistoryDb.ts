@@ -13,6 +13,7 @@ export type PaymentEventType =
   | 'payment_succeeded'
   | 'payment_failed'
   | 'refund'
+  | 'admin_credit_grant'
   | 'subscription_created'
   | 'subscription_updated'
   | 'subscription_canceled'
