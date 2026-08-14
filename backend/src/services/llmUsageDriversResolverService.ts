@@ -101,6 +101,182 @@ function resolveCycle(today: string): { cycleStartDate: string; cycleResetDate: 
   };
 }
 
+/**
+ * Reprice a ledger per DATE under a set of switches, returning the daily totals
+ * the forecast should see.
+ *
+ * Per-date rather than a share of the cycle-wide saving: model rates scale
+ * differently for input-family and output tokens, so a day of mostly output
+ * saves a different fraction than a day of mostly input at identical cost, and
+ * the forecast independently evaluates a trailing-seven window — misallocating
+ * savings across dates moves them in or out of that window and changes the
+ * answer.
+ *
+ * Multiple switches compose safely because `estimateModelSavings` filters rows
+ * by `fromModel`: two selections with different sources reprice disjoint rows.
+ * Two selections with the SAME source would not, which is why callers must
+ * de-duplicate before calling.
+ */
+function counterfactualDaily(
+  ledger: AttributionRow[],
+  observedByDate: Map<string, number>,
+  selections: readonly RunwayPreviewSelection[],
+): { date: string; costMicroUsd: number }[] {
+  const rowsByDate = new Map<string, AttributionRow[]>();
+  for (const r of ledger) {
+    const list = rowsByDate.get(r.date);
+    if (list) list.push(r); else rowsByDate.set(r.date, [r]);
+  }
+  return [...observedByDate.entries()].map(([date, cost]) => {
+    const dayRows = rowsByDate.get(date) || [];
+    let saving = 0;
+    for (const sel of selections) {
+      const dayEst = estimateModelSavings(dayRows, sel);
+      // No spend for that driver on this date leaves the day untouched.
+      if (dayEst) saving += dayEst.estimatedSavingsMicroUsd;
+    }
+    return { date, costMicroUsd: Math.max(0, cost - saving) };
+  });
+}
+
+export interface RunwayPreviewSelection {
+  fromModel: string;
+  toModel: string;
+}
+
+export interface RejectedSelection extends RunwayPreviewSelection {
+  /** `duplicate_from_model` | `not_estimable` */
+  reason: string;
+}
+
+/**
+ * The combined effect of a set of proposed switches, in DAYS, persisting nothing.
+ *
+ * ENG-1217 AC2 needs the projected exhaustion date to move as a customer
+ * previews, and AC6 needs several previews inspected as one combined,
+ * non-duplicated impact. This cannot be done by summing the per-recommendation
+ * figures from `/usage-drivers`: each of those is measured against the SAME
+ * baseline, and `computeUsageRunway` takes the LARGER of the cycle-to-date and
+ * trailing-seven burn rates, so the forecast is non-linear and two gains do not
+ * add. The combined case is therefore re-forecast from a counterfactual ledger
+ * with every accepted selection applied at once.
+ *
+ * Nothing is written. `persisted: false` is part of the contract, not a comment.
+ */
+export interface RunwayPreview {
+  billingUserId: string;
+  available: boolean;
+  baselineDaysRemaining: number | null;
+  projectedDaysRemaining: number | null;
+  estimatedDaysRecovered: number | null;
+  projectedExhaustionDate: string | null;
+  applied: RunwayPreviewSelection[];
+  rejected: RejectedSelection[];
+  isEstimate: true;
+  persisted: false;
+}
+
+export async function previewUsageRunway(
+  userId: string,
+  selections: readonly RunwayPreviewSelection[],
+  options: { today?: string } = {},
+): Promise<RunwayPreview> {
+  const today = options.today || utcDay(new Date());
+  const usage = await getEffectiveLlmUsagePolicy(userId);
+
+  const empty = (billingUserId: string): RunwayPreview => ({
+    billingUserId,
+    available: false,
+    baselineDaysRemaining: null,
+    projectedDaysRemaining: null,
+    estimatedDaysRecovered: null,
+    projectedExhaustionDate: null,
+    applied: [],
+    rejected: [],
+    isEstimate: true,
+    persisted: false,
+  });
+
+  if (!usage.policy) return empty(usage.billingUserId);
+
+  const { cycleStartDate, cycleResetDate } = resolveCycle(today);
+  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
+  const ledger: AttributionRow[] = rows.map((r) => ({
+    date: r.date,
+    model: r.model,
+    feature: r.feature,
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    cacheReadTokens: r.cacheReadTokens,
+    cacheWriteTokens: r.cacheWriteTokens,
+    costMicroUsd: r.costMicroUsd || 0,
+    callCount: r.callCount,
+  }));
+
+  const observedByDate = new Map<string, number>();
+  for (const r of ledger) {
+    observedByDate.set(r.date, (observedByDate.get(r.date) || 0) + r.costMicroUsd);
+  }
+
+  const forecastInput = {
+    costUsedMicroUsd: usage.costUsedMicroUsd,
+    hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    cycleStartDate,
+    cycleResetDate,
+    today,
+  };
+  const baseline = computeUsageRunway({
+    ...forecastInput,
+    dailyCostMicroUsd: [...observedByDate.entries()].map(([date, costMicroUsd]) => ({ date, costMicroUsd })),
+  });
+
+  // A driver can only be switched once. Applying two selections for the same
+  // source would reprice the same rows twice and claim a saving the customer
+  // cannot actually get — the double-count AC6 exists to prevent.
+  const applied: RunwayPreviewSelection[] = [];
+  const rejected: RejectedSelection[] = [];
+  const seenFrom = new Set<string>();
+  for (const sel of selections) {
+    if (seenFrom.has(sel.fromModel)) {
+      rejected.push({ ...sel, reason: "duplicate_from_model" });
+      continue;
+    }
+    // Unpriced or absent from the ledger: refuse it visibly rather than drop it,
+    // so the UI can say why a preview did nothing instead of appearing broken.
+    if (!estimateModelSavings(ledger, sel)) {
+      rejected.push({ ...sel, reason: "not_estimable" });
+      continue;
+    }
+    seenFrom.add(sel.fromModel);
+    applied.push({ fromModel: sel.fromModel, toModel: sel.toModel });
+  }
+
+  const projected = applied.length
+    ? computeUsageRunway({
+        ...forecastInput,
+        dailyCostMicroUsd: counterfactualDaily(ledger, observedByDate, applied),
+      })
+    : baseline;
+
+  const estimatedDaysRecovered =
+    baseline.estimatedDaysRemaining === null || projected.estimatedDaysRemaining === null
+      ? null
+      : Math.max(0, projected.estimatedDaysRemaining - baseline.estimatedDaysRemaining);
+
+  return {
+    billingUserId: usage.billingUserId,
+    available: true,
+    baselineDaysRemaining: baseline.estimatedDaysRemaining,
+    projectedDaysRemaining: projected.estimatedDaysRemaining,
+    estimatedDaysRecovered,
+    projectedExhaustionDate: projected.estimatedExhaustionDate,
+    applied,
+    rejected,
+    isEstimate: true,
+    persisted: false,
+  };
+}
+
 export async function resolveUsageDrivers(
   userId: string,
   options: { today?: string } = {},
@@ -190,24 +366,14 @@ export async function resolveUsageDrivers(
       // in or out of that window and moves the result — measured at 17 days of
       // error on a realistic 10-day ledger, on a number the customer is asked to
       // act on.
-      const rowsByDate = new Map<string, AttributionRow[]>();
-      for (const r of ledger) {
-        const list = rowsByDate.get(r.date);
-        if (list) list.push(r); else rowsByDate.set(r.date, [r]);
-      }
-      const counterfactualDaily = [...observedByDate.entries()].map(([date, cost]) => {
-        const dayEst = estimateModelSavings(rowsByDate.get(date) || [], {
-          fromModel: driver.key,
-          toModel: candidate,
-        });
-        // No spend for this driver on this date leaves the day untouched.
-        const saving = dayEst ? dayEst.estimatedSavingsMicroUsd : 0;
-        return { date, costMicroUsd: Math.max(0, cost - saving) };
-      });
+      // Same helper the combined preview uses, so a single-switch figure and the
+      // combined one can never be computed on different bases.
       const projected = computeUsageRunway({
         costUsedMicroUsd: usage.costUsedMicroUsd,
         hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
-        dailyCostMicroUsd: counterfactualDaily,
+        dailyCostMicroUsd: counterfactualDaily(ledger, observedByDate, [
+          { fromModel: driver.key, toModel: candidate },
+        ]),
         cycleStartDate,
         cycleResetDate,
         today,

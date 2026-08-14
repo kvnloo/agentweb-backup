@@ -4,7 +4,7 @@ import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { toCustomerRunway } from '../services/llmUsageForecastService';
-import { resolveUsageDrivers, toCustomerDrivers } from '../services/llmUsageDriversResolverService';
+import { resolveUsageDrivers, toCustomerDrivers, previewUsageRunway } from '../services/llmUsageDriversResolverService';
 
 const router = express.Router();
 
@@ -75,6 +75,47 @@ router.get('/usage-drivers', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error getting usage drivers:', error);
     res.status(500).json({ error: 'Failed to get usage drivers' });
+  }
+});
+
+/**
+ * ENG-1217 AC2/AC6 — combined, non-persisted preview of a set of switches.
+ *
+ * POST, not GET, because the selection set is the input and it is unbounded —
+ * but this endpoint WRITES NOTHING. The response carries `persisted: false` as
+ * part of its contract: previewing must never change a model (AC2), and a
+ * customer inspecting several options must see their combined, non-duplicated
+ * impact before any confirmation (AC6).
+ *
+ * The combination cannot be done client-side by summing `/usage-drivers`: each
+ * figure there is measured against the same baseline, and the forecast takes the
+ * larger of the cycle-to-date and trailing-seven burn rates, so it is non-linear
+ * and two gains do not add. Hence a server-side re-forecast.
+ *
+ * Everything returned is in DAYS. No internal dollars cross this boundary.
+ */
+router.post('/usage-runway/preview', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+    const raw = (req.body || {}).selections;
+    if (raw !== undefined && !Array.isArray(raw)) {
+      return res.status(400).json({ error: '`selections` must be an array' });
+    }
+    // Bounded so a caller cannot turn one request into an unbounded number of
+    // repricing passes over the cycle's ledger.
+    const list = (raw || []).slice(0, 20);
+    const selections = list
+      .filter((s: any) => s && typeof s.fromModel === 'string' && typeof s.toModel === 'string')
+      .map((s: any) => ({ fromModel: s.fromModel.trim(), toModel: s.toModel.trim() }));
+
+    const preview = await previewUsageRunway(userId, selections);
+    res.json(preview);
+  } catch (error) {
+    console.error('Error previewing usage runway:', error);
+    res.status(500).json({ error: 'Failed to preview usage runway' });
   }
 });
 

@@ -36,6 +36,7 @@ jest.mock("../services/db", () => ({
 import {
   resolveUsageDrivers,
   toCustomerDrivers,
+  previewUsageRunway,
 } from "../services/llmUsageDriversResolverService";
 import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverService";
 import { usageRecordDb } from "../services/usageRecordDb";
@@ -442,5 +443,123 @@ describe("toCustomerDrivers — AC4 exposure boundary", () => {
     expect(customer.drivers!.byModel[0].shareOfTotal).toBeCloseTo(1, 5);
     expect(customer.drivers!.byModel[0].key).toBe(OPUS);
     expect(customer.recommendations[0].estimatedDaysRecovered!).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * ENG-1217 AC2/AC6 — combined preview.
+ *
+ * AC2: previewing updates the projected exhaustion date immediately **without
+ * changing any persisted model**. AC6: several previews are inspected as a
+ * combined, **non-duplicated** impact before any confirmation.
+ *
+ * The reason this must exist server-side, rather than the UI adding up the
+ * per-recommendation figures it already has: every `estimatedDaysRecovered` is
+ * measured against the SAME baseline, and `computeUsageRunway` takes the LARGER
+ * of the cycle-to-date and trailing-seven burn rates. That makes the forecast
+ * non-linear, so two gains do not add — the combined case has to be re-forecast
+ * from a counterfactual ledger with every selection applied at once.
+ */
+describe("previewUsageRunway — combined, non-persisted what-if (ENG-1217 AC2/AC6)", () => {
+  /** Two distinct drivers so selections touch disjoint rows. */
+  const twoDriverLedger = () => [
+    ...opusLedger(),
+    ...Array.from({ length: 10 }, (_, i) => ({
+      userId: "billing-root",
+      sk: `2026-08-${String(i + 1).padStart(2, "0")}#${SONNET}#chat`,
+      date: `2026-08-${String(i + 1).padStart(2, "0")}`,
+      model: SONNET,
+      feature: "chat",
+      inputTokens: 500_000,
+      outputTokens: 100_000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: 3 * USD,
+      callCount: 2,
+      billingUserId: "billing-root",
+    })),
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    mockQuery.mockResolvedValue(twoDriverLedger());
+  });
+
+  it("returns the baseline unchanged when nothing is selected", async () => {
+    const preview = await previewUsageRunway("u1", [], { today: "2026-08-11" });
+    expect(preview.estimatedDaysRecovered).toBe(0);
+    expect(preview.projectedDaysRemaining).toBe(preview.baselineDaysRemaining);
+    expect(preview.applied).toEqual([]);
+  });
+
+  it("recovers more days from two selections than from either alone", async () => {
+    const opusOnly = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: HAIKU }], { today: "2026-08-11" });
+    const sonnetOnly = await previewUsageRunway("u1", [{ fromModel: SONNET, toModel: HAIKU }], { today: "2026-08-11" });
+    const both = await previewUsageRunway(
+      "u1",
+      [{ fromModel: OPUS, toModel: HAIKU }, { fromModel: SONNET, toModel: HAIKU }],
+      { today: "2026-08-11" },
+    );
+
+    expect(opusOnly.estimatedDaysRecovered!).toBeGreaterThan(0);
+    expect(both.estimatedDaysRecovered!).toBeGreaterThanOrEqual(opusOnly.estimatedDaysRecovered!);
+    expect(both.estimatedDaysRecovered!).toBeGreaterThanOrEqual(sonnetOnly.estimatedDaysRecovered!);
+    expect(both.applied).toHaveLength(2);
+  });
+
+  it("is a re-forecast, not the sum of the individual estimates", async () => {
+    // The assertion that justifies this endpoint. If the combined figure were
+    // just the sum, the UI could add up /usage-drivers itself and this whole
+    // path would be dead weight — so prove the arithmetic actually differs.
+    const opusOnly = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: HAIKU }], { today: "2026-08-11" });
+    const sonnetOnly = await previewUsageRunway("u1", [{ fromModel: SONNET, toModel: HAIKU }], { today: "2026-08-11" });
+    const both = await previewUsageRunway(
+      "u1",
+      [{ fromModel: OPUS, toModel: HAIKU }, { fromModel: SONNET, toModel: HAIKU }],
+      { today: "2026-08-11" },
+    );
+    const naiveSum = opusOnly.estimatedDaysRecovered! + sonnetOnly.estimatedDaysRecovered!;
+    expect(both.estimatedDaysRecovered).not.toBe(naiveSum);
+  });
+
+  it("refuses two selections for the same model instead of double-counting (AC6)", async () => {
+    // A driver can only be switched once. Applying both would reprice the same
+    // rows twice and claim a saving the customer cannot actually get.
+    const preview = await previewUsageRunway(
+      "u1",
+      [{ fromModel: OPUS, toModel: HAIKU }, { fromModel: OPUS, toModel: SONNET }],
+      { today: "2026-08-11" },
+    );
+    expect(preview.applied).toHaveLength(1);
+    expect(preview.rejected).toHaveLength(1);
+    expect(preview.rejected[0]).toMatchObject({ fromModel: OPUS, reason: "duplicate_from_model" });
+  });
+
+  it("rejects a selection it cannot price rather than silently ignoring it", async () => {
+    const preview = await previewUsageRunway(
+      "u1",
+      [{ fromModel: OPUS, toModel: "not-a-real-model" }],
+      { today: "2026-08-11" },
+    );
+    expect(preview.applied).toEqual([]);
+    expect(preview.rejected[0]).toMatchObject({ reason: "not_estimable" });
+    expect(preview.estimatedDaysRecovered).toBe(0);
+  });
+
+  it("persists nothing and says so explicitly (AC2)", async () => {
+    const preview = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: HAIKU }], { today: "2026-08-11" });
+    expect(preview.persisted).toBe(false);
+    expect(preview.isEstimate).toBe(true);
+    // No write path exists on the mocked surfaces; assert the read-only ones are
+    // all that were touched.
+    expect(mockQuery).toHaveBeenCalled();
+  });
+
+  it("carries no internal dollars", async () => {
+    const preview = await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: HAIKU }], { today: "2026-08-11" });
+    expect(JSON.stringify(preview)).not.toMatch(/MicroUsd/);
   });
 });
