@@ -93,7 +93,7 @@ export interface CostAttribution {
 }
 
 /** Group key for a `feature`: the segment before any `:` qualifier. */
-function normaliseFeature(feature: string): string {
+export function normaliseFeature(feature: string): string {
   return (feature || "").split(":")[0].trim();
 }
 
