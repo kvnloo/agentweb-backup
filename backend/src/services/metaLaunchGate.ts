@@ -30,6 +30,64 @@ export interface MetaGateCredentials {
   accessToken: string;
 }
 
+export interface MetaGateDeps {
+  /**
+   * Does this pixel show recent activity in Meta's own stats? Injectable for tests.
+   * Used ONLY to explain a block, never to lift one — see serverSideHint below.
+   */
+  pixelHasRecentActivity?: (pixelId: string, accessToken: string) => Promise<boolean>;
+}
+
+/** How far back counts as "recent" when explaining a block. */
+const ACTIVITY_WINDOW_DAYS = 7;
+
+/* istanbul ignore next — network boundary; tests inject pixelHasRecentActivity. */
+async function defaultPixelHasRecentActivity(pixelId: string, accessToken: string): Promise<boolean> {
+  const axios = (await import('axios')).default;
+  const apiVersion = process.env.META_API_VERSION || 'v25.0';
+  const since = Math.floor(Date.now() / 1000) - ACTIVITY_WINDOW_DAYS * 86400;
+  const url =
+    `https://graph.facebook.com/${apiVersion}/${pixelId}/stats` +
+    `?aggregation=event&start_time=${since}&access_token=${encodeURIComponent(accessToken)}`;
+  const res = await axios.get<{ data?: unknown[] }>(url, { timeout: 10_000 });
+  return Array.isArray(res.data?.data) && res.data.data.length > 0;
+}
+
+/**
+ * Build the "your pixel IS receiving events" sentence appended to a block.
+ *
+ * Deliberately explanatory only. `/stats` is ACCOUNT-pixel-level, not destination-level:
+ * a customer with one instrumented page and one dark lander would show activity that says
+ * nothing about the destination being launched at. Letting that lift a block would wave
+ * through RankAI's exact incident (~$5.2k spent, zero conversion signal on the lander while
+ * the account itself was not inert). So it sharpens the message and points at the override,
+ * and never changes the verdict.
+ *
+ * Also note `last_fired_time` is NOT usable here: verified 2026-08-14 that it tracks browser
+ * fires only and does not move for Conversions API events, while `/stats` does capture them.
+ */
+async function serverSideHint(
+  pixelIds: string[],
+  accessToken: string,
+  deps: MetaGateDeps,
+): Promise<string> {
+  const probe = deps.pixelHasRecentActivity ?? defaultPixelHasRecentActivity;
+  for (const pixelId of pixelIds) {
+    try {
+      if (await probe(pixelId, accessToken)) {
+        return (
+          `\nNote: this account's pixel ${pixelId} IS receiving events server-side within the last ` +
+          `${ACTIVITY_WINDOW_DAYS} days. If this destination is measured through the Conversions API rather than a ` +
+          `browser pixel, this check cannot see it — relaunch with an explicit tracking-check override.`
+        );
+      }
+    } catch {
+      // Best-effort explanation only. Never let it fail, and never let it pass a launch.
+    }
+  }
+  return '';
+}
+
 export interface MetaMeasurementCheckRecord {
   accountId: string;
   campaignId?: string;
@@ -67,6 +125,7 @@ export async function runMetaTrackingGate(
   action: string,
   override: boolean,
   sessionId?: string,
+  deps: MetaGateDeps = {},
 ): Promise<{ proceed: boolean; blockResult?: any }> {
   const { accountId, accessToken } = creds;
 
@@ -111,13 +170,14 @@ export async function runMetaTrackingGate(
     return { proceed: true };
   }
   await record(sessionId, { accountId, campaignId, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString() });
+  const hint = await serverSideHint(pixelIds, accessToken, deps);
   return {
     proceed: false,
     blockResult: {
       success: false,
       blocked: true,
       reason: 'tracking_preflight',
-      error: gate.message,
+      error: gate.message + hint,
       trackingCheck: { measured: false, urlResults },
     },
   };

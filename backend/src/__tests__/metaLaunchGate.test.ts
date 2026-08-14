@@ -158,3 +158,57 @@ describe('isMetaSpendStartingWrite (ENG-941)', () => {
     expect(isMetaSpendStartingWrite('CAMPAIGN', 'UPDATE', undefined as any)).toBe(false);
   });
 });
+
+/**
+ * ENG-941: /stats explains a block, it never lifts one. The distinction matters —
+ * /stats is account-pixel-level, so treating activity as a pass would wave through a
+ * customer with one instrumented page and one dark lander, i.e. RankAI's incident.
+ */
+describe('server-side activity hint (ENG-941)', () => {
+  beforeEach(() => {
+    mockPreflight.mockResolvedValue({
+      ok: false,
+      results: [{ url: 'https://site.example/lp', status: 'unmeasured', mechanisms: [], checkedFor: [] }],
+      blockedUrls: [{ url: 'https://site.example/lp', status: 'unmeasured', mechanisms: [], checkedFor: [] }],
+      message: 'Launch blocked: no pixel.',
+    });
+  });
+
+  it('still blocks when the account pixel is active, and says so in the message', async () => {
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1', {
+      pixelHasRecentActivity: async () => true,
+    });
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('IS receiving events server-side');
+    expect(out.blockResult.error).toContain(PIXEL);
+    expect(out.blockResult.error).toContain('override');
+  });
+
+  it('adds no hint when the account pixel shows no recent activity', async () => {
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1', {
+      pixelHasRecentActivity: async () => false,
+    });
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).not.toContain('IS receiving events server-side');
+  });
+
+  it('ignores a stats lookup failure rather than breaking or passing the launch', async () => {
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1', {
+      pixelHasRecentActivity: async () => {
+        throw new Error('stats 500');
+      },
+    });
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('Launch blocked');
+  });
+
+  it('never consults stats when the gate passes', async () => {
+    mockPreflight.mockResolvedValue({ ok: true, results: [], blockedUrls: [], message: '' });
+    const probe = jest.fn();
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'UPDATE', false, 'sess-1', {
+      pixelHasRecentActivity: probe as any,
+    });
+    expect(out.proceed).toBe(true);
+    expect(probe).not.toHaveBeenCalled();
+  });
+});
