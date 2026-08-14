@@ -195,6 +195,47 @@ describe("resolveUsageDrivers", () => {
     expect(pick(split)).toBe(pick(single));
   });
 
+  it("reprices each date from its own token mix, not a share of the cycle saving", async () => {
+    // Savings are NOT proportional to cost. Opus is 5:25 in:out, Flash Lite is
+    // 0.25:1.5 — so an all-output day saves a different fraction than an
+    // all-input day at identical cost. The forecast independently evaluates a
+    // trailing-seven window, so putting the saving on the wrong dates moves it
+    // in or out of that window and changes the customer-visible answer.
+    //
+    // Here: 3 all-input days first, then 7 all-output days, each $5.
+    //   per-date repricing -> input days $0.25, output days $0.30
+    //                         cycle 0.285, trailing-7 0.300 -> forecast 0.300
+    //   cost-share (wrong)  -> uniform 0.285 in both windows  -> forecast 0.285
+    // A uniform split hides the fact that the expensive-to-reprice days are the
+    // RECENT ones, which is exactly what trailing-seven exists to notice.
+    const FLASH = "gemini-3.1-flash-lite";
+    mockModels.mockResolvedValue([OPUS, FLASH]);
+    mockPolicy.mockResolvedValue(policyFor({
+      policy: { ...policyFor().policy, optimizedModelIds: [FLASH], optimizedDefaultModel: FLASH },
+    }));
+    const mk = (day: number, allInput: boolean) => ({
+      userId: "billing-root",
+      sk: `2026-08-${String(day).padStart(2, "0")}#${OPUS}#agent_task`,
+      date: `2026-08-${String(day).padStart(2, "0")}`,
+      model: OPUS, feature: "agent_task",
+      inputTokens: allInput ? 1_000_000 : 0,
+      outputTokens: allInput ? 0 : 200_000,
+      cacheReadTokens: 0, cacheWriteTokens: 0,
+      costMicroUsd: 5 * USD, callCount: 1, billingUserId: "billing-root",
+    });
+    mockQuery.mockResolvedValue([
+      ...[1, 2, 3].map((d) => mk(d, true)),
+      ...[4, 5, 6, 7, 8, 9, 10].map((d) => mk(d, false)),
+    ]);
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const rec = recommendations.find((r) => r.toModel === FLASH)!;
+    // Baseline burn is a flat $5/day -> 20 days on $100 remaining.
+    // Correct projection uses forecast 0.300 -> 333 days -> 313 recovered.
+    // The cost-share bug would give forecast 0.285 -> 350 -> 330 recovered.
+    expect(rec.estimatedDaysRecovered).toBe(313);
+  });
+
   it("still reports drivers when no forecast is possible, just without day counts", async () => {
     // Day one of a cycle: spend exists but no complete day, so the runway
     // withholds a forecast. Drivers are still true and useful.

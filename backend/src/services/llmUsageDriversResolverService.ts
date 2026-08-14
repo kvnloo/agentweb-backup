@@ -134,22 +134,32 @@ export async function resolveUsageDrivers(
 
       // Re-run the SAME forecast with this driver's spend repriced, so the days
       // figure is computed on an identical basis to the runway beside it.
-      const savingByDate = new Map<string, number>();
+      //
+      // Each date is repriced from ITS OWN token mix rather than by taking a
+      // share of the cycle-wide saving. Savings are not proportional to cost:
+      // model rates scale differently for input-family and output tokens (Opus
+      // 5:25 vs Flash Lite 0.25:1.5), so a day of mostly output saves a
+      // different fraction than a day of mostly input at identical cost.
+      //
+      // That matters because the forecast independently evaluates a
+      // trailing-seven window, so misallocating savings across dates lands them
+      // in or out of that window and moves the result — measured at 17 days of
+      // error on a realistic 10-day ledger, on a number the customer is asked to
+      // act on.
+      const rowsByDate = new Map<string, AttributionRow[]>();
       for (const r of ledger) {
-        if (r.model !== driver.key) continue;
-        const share = est.observedCostMicroUsd > 0 ? r.costMicroUsd / est.observedCostMicroUsd : 0;
-        savingByDate.set(r.date, (savingByDate.get(r.date) || 0) + est.estimatedSavingsMicroUsd * share);
+        const list = rowsByDate.get(r.date);
+        if (list) list.push(r); else rowsByDate.set(r.date, [r]);
       }
-      // Subtract from a per-DATE total, not per row. The ledger is keyed
-      // date#model#feature, so a busy day is many rows; deducting the whole
-      // day's saving from each of them subtracts it several times over,
-      // understating counterfactual burn and inflating the days figure the
-      // customer is being asked to act on. In the worst case every row floors at
-      // zero and the forecast disappears entirely.
-      const counterfactualDaily = [...observedByDate.entries()].map(([date, cost]) => ({
-        date,
-        costMicroUsd: Math.max(0, cost - (savingByDate.get(date) || 0)),
-      }));
+      const counterfactualDaily = [...observedByDate.entries()].map(([date, cost]) => {
+        const dayEst = estimateModelSavings(rowsByDate.get(date) || [], {
+          fromModel: driver.key,
+          toModel: candidate,
+        });
+        // No spend for this driver on this date leaves the day untouched.
+        const saving = dayEst ? dayEst.estimatedSavingsMicroUsd : 0;
+        return { date, costMicroUsd: Math.max(0, cost - saving) };
+      });
       const projected = computeUsageRunway({
         costUsedMicroUsd: usage.costUsedMicroUsd,
         hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
