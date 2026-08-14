@@ -525,3 +525,44 @@ describe('destination aliases on AD writes (ENG-941)', () => {
     expect(collectPendingDestinations('CAMPAIGN', 'CREATE', { url: 'https://a/1' })).toEqual([]);
   });
 });
+
+/*
+ * Greptile P1, round 11 ("Copied ads use wrong campaign scope"). When the gate is scoped to
+ * ONE named ad, that ad is looked up in the campaign-filtered list — so a stale or wrong
+ * campaign id (a COPY_AD into an ad set in another campaign, most obviously) leaves the
+ * scoped list empty. That was read as "nothing serving yet" and passed, when the truth is
+ * the destination was never found: an inability to verify, not an absence of risk.
+ */
+describe('named-ad scoping must not silently pass (ENG-941)', () => {
+  it('blocks when the named ad is not in the campaign being checked', async () => {
+    mockListAds.mockResolvedValue([
+      { adId: 'someone-else', campaignId: CAMPAIGN, destinationUrls: ['https://site.example/other'] },
+    ]);
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42');
+    expect(out.proceed).toBe(false);
+    expect(out.blockResult.error).toContain('ad-42');
+    expect(mockPreflight).not.toHaveBeenCalled();
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked' }));
+  });
+
+  it('proceeds when the copy carries its own destination, which is what will serve', async () => {
+    mockListAds.mockResolvedValue([]);
+    await _runMetaTrackingGateForTest(
+      creds, CAMPAIGN, 'AD_COPY_AD', false, 'sess-1', {}, 'ad-42', ['https://site.example/new'],
+    );
+    expect(mockPreflight.mock.calls[0][0]).toEqual(['https://site.example/new']);
+  });
+
+  it('still lets a campaign with nothing serving through when no single ad was named', async () => {
+    mockListAds.mockResolvedValue([]);
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'CAMPAIGN_UPDATE', false, 'sess-1');
+    expect(out.proceed).toBe(true);
+  });
+
+  it('honours an explicit override when the named ad cannot be found', async () => {
+    mockListAds.mockResolvedValue([]);
+    const out = await _runMetaTrackingGateForTest(creds, CAMPAIGN, 'AD_COPY_AD', true, 'sess-1', {}, 'ad-42');
+    expect(out.proceed).toBe(true);
+    expect(mockRecord).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden' }));
+  });
+});

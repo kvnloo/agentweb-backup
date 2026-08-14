@@ -261,7 +261,10 @@ export function detectMetaPixels(html: string): string[] {
    * still be counted there after being correctly discarded here.
    */
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (_full, attrs: string, body: string) => {
-    const type = /type\s*=\s*['"]([^'"]+)['"]/i.exec(attrs || '')?.[1]?.toLowerCase();
+    // All three attribute-value forms, not just the quoted one: `<script type=text/template>`
+    // is valid HTML, and matching only quoted values read it as executable.
+    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs || '');
+    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3])?.toLowerCase();
     if (type && !isExecutableScriptType(type)) return '<script></script>';
     const live = stripInertJavaScript(body);
     executable.push(live);

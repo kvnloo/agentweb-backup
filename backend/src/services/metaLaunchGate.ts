@@ -439,8 +439,32 @@ export async function runMetaTrackingGate(
     };
   }
 
-  // A campaign with nothing serving yet (e.g. created before its ads exist) has no
-  // destination to measure. Same call ENG-335 makes for a campaign with no final URLs.
+  /*
+   * A campaign with nothing serving yet (e.g. created before its ads exist) has no
+   * destination to measure. Same call ENG-335 makes for a campaign with no final URLs.
+   *
+   * But that reasoning only holds when the check was campaign-wide. If ONE ad was named and
+   * it is not in the campaign-filtered list — a COPY_AD into an ad set in another campaign,
+   * or simply a stale campaign id — then the destination was not found rather than absent.
+   * Passing there would be inferring safety from a lookup that failed, which is the exact
+   * move AC4 forbids everywhere else in this gate.
+   */
+  if (adId && destinationUrls.length === 0) {
+    const message =
+      `Launch blocked: could not verify Meta tracking because ad ${adId} was not found in campaign ` +
+      `${campaignId}. The ad this launch would activate may belong to a different campaign, so the ` +
+      `check cannot tell where it sends people. Retry with the campaign that actually contains the ad, ` +
+      `supply the destination on the request, or use an explicit tracking-check override.`;
+    await record(sessionId, {
+      accountId, campaignId, action, outcome: override ? 'overridden' : 'blocked',
+      urlResults: [], checkedAt: new Date().toISOString(),
+    });
+    if (override) return { proceed: true };
+    return {
+      proceed: false,
+      blockResult: { success: false, blocked: true, reason: 'tracking_preflight', error: message, trackingCheck: { measured: false, urlResults: [] } },
+    };
+  }
   if (destinationUrls.length === 0) return { proceed: true };
 
   const gate = await preflightMetaTrackingGate(destinationUrls, pixelIds);

@@ -553,3 +553,22 @@ describe('detectMetaPixels — script types and style blocks', () => {
     )).toEqual([]);
   });
 });
+
+/*
+ * Greptile P1, round 11. The type parser required quotes, so `<script type=text/template>`
+ * — valid HTML — read as executable. Same lesson as the <img> src fix: attribute values come
+ * in three forms and matching only one of them is a hole, not a simplification.
+ */
+describe('detectMetaPixels — unquoted script type attributes', () => {
+  it('ignores an unquoted non-executable type', () => {
+    expect(detectMetaPixels(`<script type=text/template>fbq('init', '${PIXEL}');</script>`)).toEqual([]);
+  });
+
+  it('ignores a single-quoted non-executable type', () => {
+    expect(detectMetaPixels(`<script type='text/x-handlebars'>fbq('init', '${PIXEL}');</script>`)).toEqual([]);
+  });
+
+  it('still executes an unquoted executable type', () => {
+    expect(detectMetaPixels(`<script type=text/javascript>fbq('init', '${PIXEL}');</script>`)).toEqual([`PIXEL:${PIXEL}`]);
+  });
+});
