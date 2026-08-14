@@ -41,6 +41,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -4077,7 +4078,11 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-1210 AC6: stamp scheduled-vs-interactive provenance at metering
+            // time. The ledger row is keyed `date#model#feature` and aggregates
+            // sessionId away, so `feature` is the only dimension that survives to
+            // answer "what is my scheduled work costing me".
+            usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn
           });
@@ -4153,7 +4158,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // Same provenance as the primary call this retries — a backup-model
+                // retry of a scheduled run is still scheduled spend.
+                usageContext: { userId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
               }), synthesisRetryDeadlineMs);

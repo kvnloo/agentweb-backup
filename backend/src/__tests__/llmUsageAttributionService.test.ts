@@ -16,6 +16,7 @@
 import {
   attributeCosts,
   estimateModelSavings,
+  meteringFeature,
   type AttributionRow,
 } from "../services/llmUsageAttributionService";
 
@@ -99,9 +100,9 @@ describe("attributeCosts — grouping (ENG-1213 AC1)", () => {
       .toBe(14 * USD);
   });
 
-  it("reports the scheduled-vs-interactive split as unavailable, not as zero", () => {
+  it("reports the scheduled-vs-interactive split as unavailable for untagged rows, not as zero", () => {
     const result = attributeCosts([row()]);
-    // Reporting 0% scheduled would be a lie; the ledger simply cannot say.
+    // Reporting 0% scheduled would be a lie; an untagged ledger cannot say.
     expect(result.bySource).toBeNull();
     expect(result.unavailableGroupings).toContain("scheduled_vs_interactive");
   });
@@ -120,6 +121,103 @@ describe("attributeCosts — grouping (ENG-1213 AC1)", () => {
     expect(result.totalCostMicroUsd).toBe(0);
     expect(result.byModel).toEqual([]);
     expect(result.reconciles).toBe(true);
+  });
+});
+
+/**
+ * ENG-1210 / ENG-1213 — the scheduled-vs-interactive split, tagged going forward.
+ *
+ * Harsha's 2026-08-14 direction: "show an honest unattributed remainder, then add
+ * the metering tag going forward rather than inventing a reconstruction." So the
+ * write path stamps provenance onto `feature`, and this layer reports the split
+ * for rows that carry it while naming the legacy rows that cannot.
+ *
+ * The tag rides on the EXISTING `:` qualifier convention — production already
+ * carries `x-account:1340767380` and `content_gen:streaming-no-usage`, and
+ * `normaliseFeature` already reduces those to their base. That is what makes this
+ * additive: `byFeature` still groups `agent_task:scheduled` under `agent_task`,
+ * so no existing grouping moves.
+ */
+describe("meteringFeature — provenance tag written at metering time", () => {
+  it("tags a scheduled session so the split is answerable later", () => {
+    expect(meteringFeature("agent_task", "scheduled")).toBe("agent_task:scheduled");
+  });
+
+  it("tags every non-scheduled session type as interactive", () => {
+    for (const t of ["regular", "predefined-work-plan", "image-generation", "interactive_share"]) {
+      expect(meteringFeature("agent_task", t)).toBe("agent_task:interactive");
+    }
+  });
+
+  it("leaves the feature untagged when provenance is genuinely unknown", () => {
+    // Guessing "interactive" from a missing sessionType would manufacture exactly
+    // the false precision the honest-remainder rule exists to prevent.
+    expect(meteringFeature("agent_task", undefined)).toBe("agent_task");
+    expect(meteringFeature("agent_task", null)).toBe("agent_task");
+    expect(meteringFeature("agent_task", "")).toBe("agent_task");
+  });
+
+  it("never double-tags a feature that already carries a qualifier", () => {
+    expect(meteringFeature("agent_task:scheduled", "scheduled")).toBe("agent_task:scheduled");
+    expect(meteringFeature("x-account:1340767380", "regular")).toBe("x-account:1340767380");
+  });
+});
+
+describe("attributeCosts — scheduled vs interactive (ENG-1210 AC6)", () => {
+  it("splits tagged rows by source", () => {
+    const result = attributeCosts([
+      row({ feature: "agent_task:scheduled", costMicroUsd: 70 * USD, callCount: 7 }),
+      row({ feature: "agent_task:interactive", costMicroUsd: 30 * USD, callCount: 3 }),
+    ]);
+    expect(result.bySource!.map((d) => d.key)).toEqual(["scheduled", "interactive"]);
+    expect(result.bySource![0].costMicroUsd).toBe(70 * USD);
+    expect(result.bySource![0].shareOfTotal).toBeCloseTo(0.7, 5);
+    expect(result.bySource![0].callCount).toBe(7);
+    // The split is now available, so it must stop being advertised as unavailable.
+    expect(result.unavailableGroupings).not.toContain("scheduled_vs_interactive");
+  });
+
+  it("still groups a tagged feature under its base feature, so nothing fragments", () => {
+    // The whole reason the tag is safe to add mid-cycle.
+    const result = attributeCosts([
+      row({ feature: "agent_task:scheduled", costMicroUsd: 70 * USD }),
+      row({ feature: "agent_task:interactive", costMicroUsd: 30 * USD }),
+    ]);
+    expect(result.byFeature.map((d) => d.key)).toEqual(["agent_task"]);
+    expect(result.byFeature[0].costMicroUsd).toBe(100 * USD);
+  });
+
+  it("names untagged legacy spend as a remainder instead of assigning it", () => {
+    // The mixed cycle: rows written before the tag shipped sit alongside tagged
+    // ones. Folding them into "interactive" would silently overstate it.
+    const result = attributeCosts([
+      row({ feature: "agent_task:scheduled", costMicroUsd: 60 * USD }),
+      row({ feature: "agent_task", costMicroUsd: 40 * USD }),
+    ]);
+    expect(result.bySource!.map((d) => d.key)).toEqual(["scheduled"]);
+    expect(result.bySource![0].costMicroUsd).toBe(60 * USD);
+    expect(result.sourceUnattributedMicroUsd).toBe(40 * USD);
+    // Parts still sum to the whole.
+    expect(result.bySource!.reduce((s, d) => s + d.costMicroUsd, 0) + result.sourceUnattributedMicroUsd)
+      .toBe(result.totalCostMicroUsd);
+  });
+
+  it("withholds the split entirely when no row carries the tag", () => {
+    const result = attributeCosts([row({ feature: "agent_task", costMicroUsd: 10 * USD })]);
+    expect(result.bySource).toBeNull();
+    expect(result.sourceUnattributedMicroUsd).toBe(10 * USD);
+    expect(result.unavailableGroupings).toContain("scheduled_vs_interactive");
+  });
+
+  it("does not mistake an ordinary feature qualifier for a source tag", () => {
+    // `x-account:1340767380` is a social account id, not provenance. Reading any
+    // qualifier as a source would invent a source named after an account.
+    const result = attributeCosts([
+      row({ feature: "x-account:1340767380", costMicroUsd: 10 * USD }),
+      row({ feature: "content_gen:streaming-no-usage", costMicroUsd: 5 * USD }),
+    ]);
+    expect(result.bySource).toBeNull();
+    expect(result.sourceUnattributedMicroUsd).toBe(15 * USD);
   });
 });
 

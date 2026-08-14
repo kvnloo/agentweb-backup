@@ -10,16 +10,22 @@
  *
  * `AW-UsageRecords` is keyed `userId` / `date#model#feature`, so grouping by
  * **model** and by **feature** is exact. AC1 also asks for a
- * scheduled-vs-interactive split, and that is **not answerable from this table**:
+ * scheduled-vs-interactive split, which the table originally could not answer:
  * `meterUserUsage` receives a `sessionId` but the row aggregates it away, and
- * `agentModeService` stamps `feature: 'agent_task'` for both scheduled and
+ * `agentModeService` stamped `feature: 'agent_task'` for both scheduled and
  * interactive agent runs — a bucket holding ~95% of all recorded spend.
  *
- * AC2 permits "an explicit unattributed remainder", so that split is reported as
- * *unavailable* rather than silently returned as zero. Reporting "0% scheduled"
- * would be a false statement about a customer's own usage. Making it answerable
- * is a metering write-path change (emit `agent_task:scheduled`), deliberately
- * kept out of this read-only layer.
+ * Per Harsha's 2026-08-14 direction, that is now fixed **forward** rather than
+ * reconstructed: `meteringFeature` stamps provenance at write time, and this
+ * layer reports the split for rows that carry it alongside an explicit remainder
+ * for rows that predate it (AC2 permits exactly that remainder). History is never
+ * back-filled by inference — a guess about which past rows were scheduled would
+ * be indistinguishable, to the customer, from a measurement.
+ *
+ * So `bySource` is null only while NO row is tagged, and becomes available the
+ * moment one is. Reporting "0% scheduled" for an untagged ledger would be a false
+ * statement about a customer's own usage; reporting a partial split plus a named
+ * remainder is a true one.
  *
  * ## Feature normalisation
  *
@@ -51,12 +57,27 @@ export interface CostDriver {
   callCount: number;
 }
 
+export type UsageSource = "scheduled" | "interactive";
+
+/**
+ * The only qualifiers that denote provenance. Everything else after a `:` is an
+ * ordinary feature qualifier — `x-account:1340767380` is a social account id, and
+ * reading any qualifier as a source would invent a source named after an account.
+ */
+const SOURCE_TAGS: readonly string[] = ["scheduled", "interactive"];
+
 export interface CostAttribution {
   totalCostMicroUsd: number;
   byModel: CostDriver[];
   byFeature: CostDriver[];
-  /** null — the ledger cannot separate scheduled from interactive. See module docs. */
-  bySource: null;
+  /**
+   * Scheduled vs interactive, for rows written since the metering tag shipped.
+   * null while NO row carries the tag — an untagged ledger genuinely cannot say,
+   * and reporting "0% scheduled" would be a false statement about real usage.
+   */
+  bySource: CostDriver[] | null;
+  /** Cost whose provenance predates the tag. Stated, never folded into a source. */
+  sourceUnattributedMicroUsd: number;
   /** Named groupings this data set cannot support, so callers state it rather than imply zero. */
   unavailableGroupings: string[];
   /** Cost that could not be attributed (missing model/feature). Never silently dropped. */
@@ -67,6 +88,42 @@ export interface CostAttribution {
 /** Group key for a `feature`: the segment before any `:` qualifier. */
 function normaliseFeature(feature: string): string {
   return (feature || "").split(":")[0].trim();
+}
+
+/** The provenance a `feature` carries, or null for rows written before the tag. */
+function sourceOf(feature: string): UsageSource | null {
+  const qualifier = (feature || "").split(":")[1]?.trim();
+  return qualifier && SOURCE_TAGS.includes(qualifier) ? (qualifier as UsageSource) : null;
+}
+
+/**
+ * Stamp scheduled-vs-interactive provenance onto a `feature` at metering time.
+ *
+ * ENG-1210 AC6 needs spend attributed to actionable sources, and the ledger is
+ * keyed `date#model#feature` — a sessionId reaches the recorder but is aggregated
+ * away, so provenance has to live in a dimension the key keeps. Harsha's
+ * 2026-08-14 direction was to tag going forward rather than reconstruct history,
+ * so this writes the tag and the read layer reports an honest remainder for rows
+ * that predate it.
+ *
+ * It rides the existing `:` qualifier convention, which is what makes it safe to
+ * turn on mid-cycle: `normaliseFeature` already collapses `agent_task:scheduled`
+ * to `agent_task`, so every existing feature grouping is unmoved and only the new
+ * `bySource` grouping reads the qualifier.
+ *
+ * An unknown sessionType is left UNTAGGED rather than assumed interactive.
+ * Defaulting would manufacture exactly the false precision AC5 forbids — and it
+ * would do so in the direction that flatters us, by making unexplained spend look
+ * like something the customer chose to run.
+ */
+export function meteringFeature(base: string, sessionType?: string | null): string {
+  const feature = (base || "").trim();
+  // A feature that already carries a qualifier keeps it: either it is already
+  // tagged, or it is a dimension like `x-account:<id>` that must not be rewritten.
+  if (!feature || feature.includes(":")) return feature;
+  const type = (sessionType || "").trim();
+  if (!type) return feature;
+  return `${feature}:${type === "scheduled" ? "scheduled" : "interactive"}`;
 }
 
 function toDrivers(totals: Map<string, { cost: number; calls: number }>, grandTotal: number): CostDriver[] {
@@ -85,13 +142,25 @@ function toDrivers(totals: Map<string, { cost: number; calls: number }>, grandTo
 export function attributeCosts(rows: AttributionRow[]): CostAttribution {
   const byModel = new Map<string, { cost: number; calls: number }>();
   const byFeature = new Map<string, { cost: number; calls: number }>();
+  const bySource = new Map<string, { cost: number; calls: number }>();
   let total = 0;
   let unattributed = 0;
+  let sourceUnattributed = 0;
 
   for (const row of rows) {
     const cost = Math.max(0, row.costMicroUsd || 0);
     const calls = row.callCount || 0;
     total += cost;
+
+    // Provenance is independent of whether the row can be attributed by
+    // model/feature, so it is read before the placement check below.
+    const source = sourceOf(row.feature);
+    if (source) {
+      const s = bySource.get(source) || { cost: 0, calls: 0 };
+      bySource.set(source, { cost: s.cost + cost, calls: s.calls + calls });
+    } else {
+      sourceUnattributed += cost;
+    }
 
     const model = (row.model || "").trim();
     const feature = normaliseFeature(row.feature);
@@ -112,12 +181,18 @@ export function attributeCosts(rows: AttributionRow[]): CostAttribution {
 
   const attributed = [...byModel.values()].reduce((s, v) => s + v.cost, 0);
 
+  // Available the moment ANY row carries the tag. A cycle that straddles the
+  // cutover reports the split it can prove plus the remainder it cannot, rather
+  // than suppressing a real answer until the whole cycle is tagged.
+  const sourceAvailable = bySource.size > 0;
+
   return {
     totalCostMicroUsd: total,
     byModel: toDrivers(byModel, total),
     byFeature: toDrivers(byFeature, total),
-    bySource: null,
-    unavailableGroupings: ["scheduled_vs_interactive"],
+    bySource: sourceAvailable ? toDrivers(bySource, total) : null,
+    sourceUnattributedMicroUsd: sourceUnattributed,
+    unavailableGroupings: sourceAvailable ? [] : ["scheduled_vs_interactive"],
     unattributedMicroUsd: unattributed,
     reconciles: attributed + unattributed === total,
   };
