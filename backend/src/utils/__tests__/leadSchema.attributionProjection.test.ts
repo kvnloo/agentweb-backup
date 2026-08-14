@@ -40,6 +40,21 @@ describe('projectLeadAttribution (ENG-1175)', () => {
       expect(projectLeadAttribution({ lastTouch: { 0: 'x', legacyBlob: true } })).not.toHaveProperty('lastTouch');
     });
 
+    it.each([
+      ['a null value', { timestamp: null }],
+      ['an empty string', { landingUrl: '' }],
+      ['a whitespace-only string', { referrer: '   ' }],
+      ['an empty nested map', { clickIds: {} }],
+      ['a nested map of empty values', { utm: { source: '', medium: null } }],
+      ['a nested map that is not an object', { utm: 'source=google' }],
+      ['recognised keys all empty', { timestamp: '', landingUrl: '', clickIds: {} }],
+    ])('omits a touch whose only recognised key holds %s', (_label, touch) => {
+      // A recognised KEY is not attribution; a recognised key with a real VALUE
+      // is. `{ timestamp: null }` carries exactly as much information as `{}`,
+      // and promoting it would report that capture ran on a blob holding nothing.
+      expect(projectLeadAttribution({ firstTouch: touch })).not.toHaveProperty('firstTouch');
+    });
+
     it('keeps a touch carrying any single recognised key', () => {
       // The capture middleware always writes timestamp + landingUrl, but a
       // touch narrowed to just one real field is still real data, not corruption.

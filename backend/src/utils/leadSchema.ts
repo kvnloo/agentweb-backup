@@ -419,28 +419,49 @@ export function pruneClickIds(raw: unknown): Record<string, string> | undefined 
 /**
  * The keys `normalizeAttribution` can actually produce. See AttributionTouch.
  */
-const TOUCH_KEYS = ['timestamp', 'utm', 'clickIds', 'referrer', 'landingUrl', 'sessionId'] as const;
+const TOUCH_SCALAR_KEYS = ['timestamp', 'referrer', 'landingUrl', 'sessionId'] as const;
+const TOUCH_MAP_KEYS = ['utm', 'clickIds'] as const;
+
+/** A nested map counts only if it holds at least one non-empty string value. */
+function hasMeaningfulMap(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.values(value as Record<string, unknown>)
+    .some((v) => typeof v === 'string' && v.trim() !== '');
+}
 
 /**
  * A stored blob is usable only if it is a plain object carrying at least one
- * key attribution could have written.
+ * key attribution could have written, holding a value that actually says
+ * something.
  *
- * Being a non-empty object is NOT sufficient. A legacy or corrupt row such as
- * `{ legacyBlob: true }` would otherwise be promoted to a valid `firstTouch`,
- * and every consumer that reads presence-as-capture would report that capture
- * ran on a record where nothing was captured. That is the same class of wrong
- * answer as an empty object, arriving by a different route — and the warning on
- * `firstTouch` above explains why "did capture run?" is a question people
- * actually ask of this field.
+ * Two things are deliberately NOT sufficient.
  *
- * One recognised key is enough. The capture middleware always writes
+ * Being a non-empty object: a legacy row such as `{ legacyBlob: true }` would
+ * otherwise be promoted to a valid `firstTouch`.
+ *
+ * Carrying a recognised KEY: `{ timestamp: null }`, `{ landingUrl: '' }` and
+ * `{ clickIds: {} }` hold exactly as much attribution as `{}` does. A key is
+ * not evidence; a key with a real value is.
+ *
+ * Both routes end in the same wrong answer — every consumer that reads
+ * presence-as-capture reports that capture ran on a record where nothing was
+ * captured. The warning on `firstTouch` above explains why "did capture run?"
+ * is a question people genuinely ask of this field, which is what makes a
+ * false positive here expensive rather than untidy.
+ *
+ * One meaningful key is enough. The capture middleware always writes
  * `timestamp` + `landingUrl`, but a touch narrowed to a single real field is
  * still real data rather than corruption, and discarding it would lose
  * attribution we genuinely hold.
  */
 function usableTouch(raw: unknown): AttributionTouch | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  if (!TOUCH_KEYS.some((key) => (raw as Record<string, unknown>)[key] !== undefined)) return undefined;
+  const touch = raw as Record<string, unknown>;
+  const hasScalar = TOUCH_SCALAR_KEYS.some(
+    (key) => typeof touch[key] === 'string' && (touch[key] as string).trim() !== '',
+  );
+  const hasMap = TOUCH_MAP_KEYS.some((key) => hasMeaningfulMap(touch[key]));
+  if (!hasScalar && !hasMap) return undefined;
   // Deep copy: the response must not alias the record the rest of the request
   // is still reading, and must not be mutable back into it.
   return JSON.parse(JSON.stringify(raw)) as AttributionTouch;
