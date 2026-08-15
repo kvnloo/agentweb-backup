@@ -196,7 +196,14 @@ export async function buildAlertContext(
      *  a capped subset is a claim about pixels nobody looked at. */
     const sawEveryPixel = fired.length === candidates.length;
     const linkTarget = preferred ?? fired[0];
-    if (linkTarget?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(linkTarget.id);
+    if (linkTarget?.id) {
+      // The uncertainty rides on the VALUE, beside the link an operator is about to click,
+      // rather than only in prose further down. It stays one stable key so consumers do
+      // not have to know about two.
+      context['Meta Events Manager'] =
+        metaDeepLinks.eventsManager(linkTarget.id) +
+        (preferred ? '' : '  ⚠ UNCONFIRMED dataset — this pixel was chosen by recent browser activity, not by configuration');
+    }
 
     // Say so when the ranking is a HEURISTIC rather than the configured pixel.
     //
@@ -220,9 +227,14 @@ export async function buildAlertContext(
 
     const sections: string[] = [];
     let anySupplied = false;
+    // Counts pixels whose match keys were actually READ. A lookup that fails or times out
+    // leaves a pixel unexamined, and an unexamined pixel cannot support an absolute claim
+    // any more than an omitted one can (Greptile, sixth pass on #2415).
+    let diagnosedCount = 0;
     for (const pixel of fired) {
       const matchKeys = await attempt(`match keys for ${pixel.id}`, () => deps.getMatchKeys(pixel.id));
       if (!matchKeys || Object.keys(matchKeys).length === 0) continue;
+      diagnosedCount++;
       sections.push(
         `pixel ${pixel.id}${pixel.name ? ` (${pixel.name})` : ''}` +
         (pixel.id === preferredPixelId ? ' [configured attribution pixel]' : '') + ':\n' +
@@ -246,7 +258,25 @@ export async function buildAlertContext(
       //
       // This is the same discipline as §F's own third state: a partial view produces a
       // qualified statement, never a confident one (Greptile, fifth pass on #2415).
-      const completeView = sawEveryPixel && !!preferred;
+      // Complete means: the configured pixel was identified, every candidate was selected,
+      // AND every selected pixel was successfully read. Selection alone is not examination.
+      const completeView = sawEveryPixel && !!preferred && diagnosedCount === candidates.length;
+
+      // Name the ACTUAL limitations rather than guessing one. They are independent and can
+      // co-occur: the configured pixel may be unconfirmed, the cap may have truncated the
+      // set, and a lookup may have failed — each undermines the claim differently, and a
+      // reader deciding how far to trust this needs to know which applies.
+      const limits: string[] = [];
+      if (!preferred) {
+        limits.push('the configured attribution pixel could not be confirmed, so these may not be the pixels the ads attribute through');
+      }
+      if (!sawEveryPixel) {
+        limits.push(`only the ${fired.length} most recent of ${candidates.length} pixels were selected`);
+      }
+      if (diagnosedCount < fired.length) {
+        limits.push(`only ${diagnosedCount} of ${candidates.length} pixels were examined — the rest could not be read`);
+      }
+
       const noIdentityNote = anySupplied
         ? ''
         : completeView
@@ -256,11 +286,7 @@ export async function buildAlertContext(
             'pixel still counts the event.'
           : '\nNone of the pixels shown above received identity we supplied — only Meta\'s ' +
             'own browser cookies, which cannot tie a conversion to an ad click. NOT an ' +
-            'account-wide conclusion: ' +
-            (sawEveryPixel
-              ? 'the configured attribution pixel could not be confirmed, so these may not be ' +
-                'the pixels the ads attribute through.'
-              : `only ${fired.length} of ${candidates.length} pixels were examined.`);
+            `account-wide conclusion: ${limits.join('; ')}.`;
       context['Meta Match Keys'] = sections.join('\n') + noIdentityNote;
     }
   }

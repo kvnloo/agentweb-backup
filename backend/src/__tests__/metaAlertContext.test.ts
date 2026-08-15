@@ -139,7 +139,11 @@ describe('buildAlertContext — why is nothing attributed', () => {
       getMatchKeys: jest.fn().mockResolvedValue({ Lead: { fr_cookie: 1 } }),
     } as any);
 
-    expect(String(ctx['Meta Match Keys'])).toContain(`${MAX_PIXELS_DIAGNOSED} of ${many.length}`);
+    // Asserting the shape, not a hand-computed count: the candidate set excludes the
+    // preferred pixel from the recency list, so the total is easy to get wrong by one.
+    expect(String(ctx['Meta Match Keys'])).toMatch(
+      new RegExp(`only the ${MAX_PIXELS_DIAGNOSED} most recent of \\d+ pixels were selected`),
+    );
   });
 
   it('does not raise that flag when we DID supply identity', async () => {
@@ -477,5 +481,54 @@ describe('buildAlertContext — never let a heuristic pass as a diagnosis', () =
     } as any);
 
     expect(ctx).not.toHaveProperty('Pixel Selection');
+  });
+});
+
+describe('buildAlertContext — an unexamined pixel is not a clean one', () => {
+  it('does not make the absolute claim when a match-key lookup failed', async () => {
+    // Selection is not examination. If the configured pixel's lookup fails while another
+    // returns only Meta cookies, concluding "no identity reached Meta" asserts something
+    // about a pixel nobody managed to read.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-capi'),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-capi', last_fired_time: '2026-08-14T00:00:00-0400' },
+        { id: 'px-b', last_fired_time: '2026-08-13T00:00:00-0400' },
+      ]),
+      getMatchKeys: jest.fn(async (id: string) => {
+        if (id === 'px-capi') throw new Error('graph 500');
+        return { Lead: { fr_cookie: 3 } };
+      }),
+    } as any);
+
+    expect(String(ctx['Meta Match Keys'])).toMatch(/not an account-wide conclusion/i);
+    expect(String(ctx['Meta Match Keys'])).toContain('only 1 of 2 pixels were examined');
+  });
+
+  it('labels the Events Manager link as unconfirmed when selection was a heuristic', async () => {
+    // The operator clicks before reading the prose, so the uncertainty belongs in the key.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue(undefined),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-b', last_fired_time: '2026-08-13T00:00:00-0400' },
+      ]),
+    } as any);
+
+    expect(String(ctx['Meta Events Manager'])).toMatch(/UNCONFIRMED dataset/);
+  });
+
+  it('uses the plain label when the configured pixel IS confirmed', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-b'),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-b', last_fired_time: '2026-08-13T00:00:00-0400' },
+      ]),
+    } as any);
+
+    expect(ctx['Meta Events Manager']).toBeDefined();
+    expect(String(ctx['Meta Events Manager'])).not.toMatch(/UNCONFIRMED/);
   });
 });
