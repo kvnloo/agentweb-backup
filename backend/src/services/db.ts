@@ -6861,12 +6861,16 @@ export const crmDb = {
       // write that has already succeeded above, so nothing here is awaited or rethrown.
       const previousStatus = existingLeadForGuard?.status ?? null;
       const nextStatus = (result.Attributes as any)?.status ?? null;
-      if (
-        !updates.suppressConversionRelay &&
-        updates.status !== undefined &&
-        nextStatus &&
-        String(previousStatus ?? '') !== String(nextStatus)
-      ) {
+      const isRealTransition =
+        updates.status !== undefined && !!nextStatus && String(previousStatus ?? '') !== String(nextStatus);
+      // A conversion the queue could not accept was recorded on the lead itself
+      // (metaConversionPending). Nothing scans for those — a sweep over every lead is §F's
+      // job, not something to do on a write path — so they are consumed opportunistically:
+      // the next time anything touches this lead, retry it. That costs nothing on the
+      // overwhelming majority of updates, where the field is simply absent (Greptile on
+      // #2412: a marker nothing consumes is not recovery, it is just a note).
+      const owesConversion = !!(result.Attributes as any)?.metaConversionPending;
+      if (!updates.suppressConversionRelay && (isRealTransition || owesConversion)) {
         void (async () => {
           try {
             const { dispatchLeadStatusConversion } = await import('./metaConversionRelay');
@@ -6881,6 +6885,12 @@ export const crmDb = {
               lead: result.Attributes as any,
               previousStatus,
               statusConfig: (list as any).statusConfig,
+              // On a retry of an owed conversion the lead's CURRENT status may no longer be
+              // the one that earned it, so the recorded kind wins — same reasoning as the
+              // queued payload's kind.
+              ...(isRealTransition
+                ? {}
+                : { conversionKind: (result.Attributes as any).metaConversionPending }),
             });
           } catch (relayError: any) {
             console.error(

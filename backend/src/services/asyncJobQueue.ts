@@ -190,6 +190,29 @@ export async function clearFailedJob(source: string, dedupeKey: string): Promise
   }
 }
 
+/**
+ * Remove a job row outright.
+ *
+ * For a source whose dedupe key is derived from durable business state, "completed" is not a
+ * harmless terminal state — the row keeps rejecting every later enqueue for that same key
+ * forever. That is correct only if the work can never legitimately need doing again. Where a
+ * job finished WITHOUT doing the work (skipped because a customer had not opted in yet, or
+ * no pixel was connected at the time), the row would permanently suppress the conversion the
+ * moment the customer fixed the very thing that caused the skip (Greptile on #2412).
+ *
+ * Callers that guarantee once-only semantics by their own means — ENG-926 §C records sends
+ * on the lead itself — should delete rather than complete, so the queue never becomes a
+ * second, weaker source of truth that outlives the real one.
+ */
+export async function deleteJob(source: string, dedupeKey: string): Promise<void> {
+  const id = jobId(source, dedupeKey);
+  try {
+    await dynamodb.delete({ TableName: TABLE_NAME, Key: { id } }).promise();
+  } catch (error: any) {
+    console.warn(`[AsyncJobQueue] deleteJob failed for ${id}:`, error?.message ?? error);
+  }
+}
+
 export async function markJobComplete(source: string, dedupeKey: string): Promise<void> {
   const id = jobId(source, dedupeKey);
   const writeCompleted = () =>

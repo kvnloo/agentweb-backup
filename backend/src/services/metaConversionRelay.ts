@@ -614,7 +614,7 @@ async function runInlineFallback(
 }
 
 export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<void> {
-  const { enqueueJob, markJobComplete, markJobFailed, startHeartbeat, clearFailedJob } = await import('./asyncJobQueue');
+  const { enqueueJob, markJobFailed, startHeartbeat, clearFailedJob, deleteJob } = await import('./asyncJobQueue');
 
   const leadId = ctx.lead?.leadId;
   if (!leadId) return;
@@ -670,7 +670,14 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   const stopHeartbeat = startHeartbeat(RELAY_QUEUE_SOURCE, dedupeKey);
   try {
     await processConversionRelayJob(payload);
-    await markJobComplete(RELAY_QUEUE_SOURCE, dedupeKey);
+    // Deleted, not completed. The dedupe key is derived from durable business state, so a
+    // lingering 'completed' row rejects every later enqueue for this lead+conversion —
+    // including the legitimate retry after a customer opts in, or connects the pixel that
+    // was missing when we first skipped. Fire-once does not depend on this row: it is
+    // guaranteed by metaConversionsSent on the lead, which is written only on a real send.
+    // Letting the queue also claim that job made it a second, weaker source of truth that
+    // outlived the real one (Greptile on #2412).
+    await deleteJob(RELAY_QUEUE_SOURCE, dedupeKey);
   } catch (error) {
     await markJobFailed(RELAY_QUEUE_SOURCE, dedupeKey, error);
   } finally {

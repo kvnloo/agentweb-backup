@@ -13,6 +13,7 @@
 
 const enqueueJob = jest.fn();
 const markJobComplete = jest.fn().mockResolvedValue(undefined);
+const deleteJob = jest.fn().mockResolvedValue(undefined);
 const markJobFailed = jest.fn().mockResolvedValue(undefined);
 const startHeartbeat: jest.Mock = jest.fn(() => jest.fn());
 const registerProcessor = jest.fn();
@@ -21,6 +22,7 @@ const clearFailedJob = jest.fn().mockResolvedValue(false);
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => enqueueJob(...a),
   markJobComplete: (...a: any[]) => markJobComplete(...a),
+  deleteJob: (...a: any[]) => deleteJob(...a),
   markJobFailed: (...a: any[]) => markJobFailed(...a),
   startHeartbeat: (...a: any[]) => startHeartbeat(...a),
   registerProcessor: (...a: any[]) => registerProcessor(...a),
@@ -238,7 +240,35 @@ describe('dispatchLeadStatusConversion — completion vs retry', () => {
     await dispatchLeadStatusConversion(ctx());
 
     expect(markJobFailed).toHaveBeenCalledTimes(1);
+    expect(deleteJob).not.toHaveBeenCalled();
+  });
+
+  it('DELETES the row on a terminal outcome rather than completing it', async () => {
+    // A lingering 'completed' row rejects every later enqueue for this lead+conversion,
+    // including the legitimate retry after a customer opts in or connects the pixel that was
+    // missing when we skipped. Fire-once lives on the lead (metaConversionsSent), not here,
+    // so the queue must not become a second source of truth that outlives the real one.
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(deleteJob).toHaveBeenCalledWith('meta_conversion_relay', 'list-1:lead-1:won');
     expect(markJobComplete).not.toHaveBeenCalled();
+  });
+
+  it('lets a conversion through after a config-related skip is fixed', async () => {
+    // First pass: not opted in -> terminal skip -> row deleted, nothing suppressed.
+    await dispatchLeadStatusConversion(ctx());
+    expect(deleteJob).toHaveBeenCalled();
+
+    // Second pass, after the customer opts in: the enqueue is free to take again because no
+    // completed row is sitting on the key.
+    jest.clearAllMocks();
+    enqueueJob.mockResolvedValue('enqueued');
+    getLeadById.mockResolvedValue(LEAD);
+    getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', statusConfig: STATUS_CONFIG });
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(enqueueJob).toHaveBeenCalled();
   });
 
   it('releases the heartbeat even when the attempt fails', async () => {
