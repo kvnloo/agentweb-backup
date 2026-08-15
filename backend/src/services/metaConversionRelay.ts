@@ -427,7 +427,7 @@ export function registerConversionRelayProcessor(): void {
  * fire-once property `metaConversionsSent` gives, enforced a second time at the queue.
  */
 export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<void> {
-  const { enqueueJob, markJobComplete, markJobFailed, startHeartbeat } = await import('./asyncJobQueue');
+  const { enqueueJob, markJobComplete, markJobFailed, startHeartbeat, clearFailedJob } = await import('./asyncJobQueue');
 
   const leadId = ctx.lead?.leadId;
   if (!leadId) return;
@@ -444,10 +444,19 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     userId: ctx.userId,
   };
 
-  const enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
+  let enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
   if (enqueued === 'duplicate') {
-    // Already queued or already handled for this exact conversion.
-    return;
+    // Normally correct: this conversion is already queued, in flight, or done. But the key
+    // is derived from durable business state, so a job that exhausted its attempts would
+    // otherwise make this lead+event permanently unreachable — every later genuine
+    // transition rejected as a duplicate, even once Meta has recovered (Greptile P1 on
+    // #2412). Clearing is conditional on the terminal `failed` state, so a live or
+    // completed job is never touched, and `metaConversionsSent` still guarantees fire-once
+    // if the event did in fact land.
+    const cleared = await clearFailedJob(RELAY_QUEUE_SOURCE, dedupeKey);
+    if (!cleared) return;
+    enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
+    if (enqueued !== 'enqueued') return;
   }
   if (enqueued === 'unavailable') {
     // The queue table is unreachable. Fall back to a best-effort inline send rather than

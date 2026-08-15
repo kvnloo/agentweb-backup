@@ -16,6 +16,7 @@ const markJobComplete = jest.fn().mockResolvedValue(undefined);
 const markJobFailed = jest.fn().mockResolvedValue(undefined);
 const startHeartbeat: jest.Mock = jest.fn(() => jest.fn());
 const registerProcessor = jest.fn();
+const clearFailedJob = jest.fn().mockResolvedValue(false);
 
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => enqueueJob(...a),
@@ -23,6 +24,7 @@ jest.mock('../services/asyncJobQueue', () => ({
   markJobFailed: (...a: any[]) => markJobFailed(...a),
   startHeartbeat: (...a: any[]) => startHeartbeat(...a),
   registerProcessor: (...a: any[]) => registerProcessor(...a),
+  clearFailedJob: (...a: any[]) => clearFailedJob(...a),
 }));
 
 const getLeadById = jest.fn();
@@ -54,6 +56,7 @@ const LEAD = { leadId: 'lead-1', listId: 'list-1', email: 'a@b.com', status: 'wo
 beforeEach(() => {
   jest.clearAllMocks();
   enqueueJob.mockResolvedValue('enqueued');
+  clearFailedJob.mockResolvedValue(false);
   getLeadById.mockResolvedValue(LEAD);
   getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', statusConfig: STATUS_CONFIG });
 });
@@ -86,13 +89,37 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(enqueueJob).not.toHaveBeenCalled();
   });
 
-  it('does nothing further when the job is already queued', async () => {
+  it('does nothing further when the job is genuinely still live', async () => {
     enqueueJob.mockResolvedValue('duplicate');
+    clearFailedJob.mockResolvedValue(false); // pending / processing / completed
 
     await dispatchLeadStatusConversion(ctx());
 
     expect(getLeadById).not.toHaveBeenCalled();
     expect(markJobComplete).not.toHaveBeenCalled();
+  });
+
+  it('recovers a terminally-failed job so a later transition is not blocked forever', async () => {
+    // The dedupe key comes from durable business state, so without this a job that
+    // exhausted its attempts makes that lead+event permanently unreachable — every later
+    // genuine transition rejected as a duplicate even after Meta recovers.
+    enqueueJob.mockResolvedValueOnce('duplicate').mockResolvedValueOnce('enqueued');
+    clearFailedJob.mockResolvedValue(true);
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(clearFailedJob).toHaveBeenCalledWith('meta_conversion_relay', 'list-1:lead-1:Purchase');
+    expect(enqueueJob).toHaveBeenCalledTimes(2);
+    expect(getLeadById).toHaveBeenCalled();
+  });
+
+  it('gives up if the re-enqueue after clearing still does not take', async () => {
+    enqueueJob.mockResolvedValue('duplicate');
+    clearFailedJob.mockResolvedValue(true);
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(getLeadById).not.toHaveBeenCalled();
   });
 
   it('still attempts an inline send when the queue table is unreachable', async () => {

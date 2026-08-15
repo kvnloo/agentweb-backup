@@ -153,6 +153,43 @@ export async function enqueueJob(
   }
 }
 
+/**
+ * Delete a job row ONLY if it is in the terminal `failed` state. Returns whether it did.
+ *
+ * A dedupe key is normally permanent on purpose — that is what makes an enqueue idempotent.
+ * But a key derived from durable business state (ENG-926 §C keys on list + lead + Meta event,
+ * so a repeat transition collapses onto the same job) turns "terminally failed" into
+ * "permanently unreachable": once attempts are exhausted, every later genuine attempt is
+ * rejected as a duplicate, even hours later when the external dependency has recovered
+ * (Greptile P1 on #2412).
+ *
+ * Deliberately conditional on `status = failed`, so a pending, processing or completed job
+ * is never disturbed — in particular this can never resurrect work that already succeeded,
+ * and can never race a live processor.
+ */
+export async function clearFailedJob(source: string, dedupeKey: string): Promise<boolean> {
+  const id = jobId(source, dedupeKey);
+  try {
+    await dynamodb
+      .delete({
+        TableName: TABLE_NAME,
+        Key: { id },
+        ConditionExpression: '#status = :failed',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':failed': 'failed' },
+      })
+      .promise();
+    console.log(`[AsyncJobQueue] cleared terminally-failed job ${id} so it can be retried`);
+    return true;
+  } catch (error: any) {
+    // The condition failing is the normal case: the job is still pending/processing, or it
+    // completed. Not an error, and not something to retry.
+    if (error?.code === 'ConditionalCheckFailedException') return false;
+    console.warn(`[AsyncJobQueue] clearFailedJob failed for ${id}:`, error?.message ?? error);
+    return false;
+  }
+}
+
 export async function markJobComplete(source: string, dedupeKey: string): Promise<void> {
   const id = jobId(source, dedupeKey);
   const writeCompleted = () =>
