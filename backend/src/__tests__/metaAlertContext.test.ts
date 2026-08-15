@@ -295,19 +295,36 @@ describe('buildAlertContext — pixel diagnostics must not misroute', () => {
     expect(String(ctx['Meta Match Keys'])).not.toMatch(/no identity we supplied/i);
   });
 
-  it('skips pixels that have never fired — they have nothing to report', async () => {
+  it('examines a pixel with NO last_fired_time — that field ignores CAPI', async () => {
+    // This reverses an earlier assumption in this file. `last_fired_time` reflects browser
+    // activity only (§10, ENG-941), so a pixel receiving nothing but server-side
+    // conversions looks unfired while being the one that matters. Skipping it left a
+    // CAPI-only dataset unexamined AND uncounted, so completeness looked satisfied.
     const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 1 } });
     await buildAlertContext(owner, 'acct1', days, {
       ...deps(),
       getPixels: jest.fn().mockResolvedValue([
         { id: 'px-live', last_fired_time: '2026-08-14T19:59:40-0400' },
-        { id: 'px-dead' },
+        { id: 'px-capi-only' },
       ]),
       getMatchKeys,
     } as any);
 
-    expect(getMatchKeys).toHaveBeenCalledTimes(1);
-    expect(getMatchKeys).toHaveBeenCalledWith('px-live');
+    expect(getMatchKeys.mock.calls.map((c) => c[0]).sort()).toEqual(['px-capi-only', 'px-live']);
+  });
+
+  it('counts a pixel with no events as EXAMINED, not as unexamined', async () => {
+    // A lookup that succeeded and returned nothing is evidence. Only a failure or timeout
+    // leaves a pixel unexamined, and only that can undermine an absolute claim.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-a'),
+      getPixels: jest.fn().mockResolvedValue([{ id: 'px-a' }, { id: 'px-b' }]),
+      getMatchKeys: jest.fn(async (id: string) => (id === 'px-a' ? { Lead: { fr_cookie: 2 } } : {})),
+    } as any);
+
+    expect(String(ctx['Meta Match Keys'])).toMatch(/NO IDENTITY WE SUPPLIED/);
+    expect(String(ctx['Meta Match Keys'])).not.toMatch(/not an account-wide conclusion/i);
   });
 
   it('caps how many pixels it will diagnose', async () => {

@@ -165,36 +165,29 @@ export async function buildAlertContext(
     // wrong diagnosis, which is worse than no diagnosis at all. A pixel that has NEVER
     // fired is skipped: it has nothing to report.
     // Selection order: the CONFIGURED attribution pixel first, then the rest by recency.
-    //
-    // Recency alone is not safe. `last_fired_time` IGNORES CAPI events — established in
-    // §10 during ENG-941 — so a pixel receiving only server-side conversions can look
-    // stale, or unfired entirely, while being precisely the one the ads attribute through.
-    // Ranking on it alone can drop that pixel from the capped set, link Events Manager at
-    // an unrelated browser pixel, and then falsely announce that no supplied identity
-    // reached Meta (Greptile, third pass on #2415).
-    //
-    // The preferred pixel is therefore always diagnosed, never cut by the cap, and is what
-    // the Events Manager link points at. Sorting happens BEFORE the cap so the survivors
-    // are the most recent, not merely the first Meta happened to return.
+    // `last_fired_time` IGNORES CAPI (§10, ENG-941), so the configured pixel is preferred
+    // over any recency signal and is never cut by the cap.
     const preferredPixelId = await attempt('configured pixel', async () =>
       deps.getPreferredPixelId ? deps.getPreferredPixelId() : undefined,
     );
 
-    const byRecency = pixels
-      .filter((p) => p?.id && p.last_fired_time && p.id !== preferredPixelId)
-      .sort((a, b) => String(b.last_fired_time).localeCompare(String(a.last_fired_time)));
+    // EVERY pixel on the account is a candidate — not only those with a `last_fired_time`.
+    //
+    // That field ignores CAPI, so a pixel receiving nothing but server-side conversions
+    // looks unfired while being exactly the one that matters. Filtering candidacy on it
+    // meant such a pixel was never examined AND never counted as missing, so completeness
+    // looked satisfied while a CAPI-only dataset went unlooked-at (Greptile, seventh pass
+    // on #2415). Recency now decides ORDER only, never eligibility.
+    const others = pixels
+      .filter((p) => p?.id && p.id !== preferredPixelId)
+      .sort((a, b) => String(b.last_fired_time || '').localeCompare(String(a.last_fired_time || '')));
 
-    // Included even if it has never "fired" by Meta's browser-only measure — that is the
-    // whole point of preferring it.
-    const preferred = preferredPixelId
-      ? pixels.find((p) => p?.id === preferredPixelId)
-      : undefined;
+    const preferred = preferredPixelId ? pixels.find((p) => p?.id === preferredPixelId) : undefined;
 
-    const candidates = [...(preferred ? [preferred] : []), ...byRecency];
+    const candidates = [...(preferred ? [preferred] : []), ...others];
     const fired = candidates.slice(0, MAX_PIXELS_DIAGNOSED);
-    /** True only when every candidate pixel was diagnosed. An account-wide claim made from
-     *  a capped subset is a claim about pixels nobody looked at. */
     const sawEveryPixel = fired.length === candidates.length;
+
     const linkTarget = preferred ?? fired[0];
     if (linkTarget?.id) {
       // The uncertainty rides on the VALUE, beside the link an operator is about to click,
@@ -206,21 +199,13 @@ export async function buildAlertContext(
     }
 
     // Say so when the ranking is a HEURISTIC rather than the configured pixel.
-    //
-    // `resolveMetaPixelWithDefault` returns the OWNER's default pixel, and an owner with
-    // several connected ad accounts may have that default sitting on a different account
-    // from the one alerting. That id is then correctly discarded — it is not on this
-    // account — but the diagnosis quietly reverts to "most recently fired", which ignores
-    // CAPI. Falling back is the right behaviour; doing it silently is not, because the
-    // reader cannot tell a confirmed diagnosis from a guess (Greptile, fourth pass on
-    // #2415).
     if (!preferred && fired.length > 0) {
       context['Pixel Selection'] =
         (preferredPixelId
           ? `This account's configured pixel could not be determined — the owner's default ` +
             `(${preferredPixelId}) belongs to a different ad account. `
           : `This account's configured pixel could not be determined. `) +
-        'The pixels below are ranked by most recent browser activity, which IGNORES ' +
+        'The pixels below are ordered by most recent browser activity, which IGNORES ' +
         'CAPI events — a pixel taking only server-side conversions can look stale here. ' +
         'Confirm the dataset in Events Manager before concluding anything from the match keys.';
     }
@@ -233,8 +218,12 @@ export async function buildAlertContext(
     let diagnosedCount = 0;
     for (const pixel of fired) {
       const matchKeys = await attempt(`match keys for ${pixel.id}`, () => deps.getMatchKeys(pixel.id));
-      if (!matchKeys || Object.keys(matchKeys).length === 0) continue;
+      // A lookup that SUCCEEDED and returned nothing is still an examination — that pixel
+      // genuinely has no events. Only a failure or timeout leaves it unexamined, and only
+      // that can undermine an absolute claim.
+      if (matchKeys === undefined) continue;
       diagnosedCount++;
+      if (Object.keys(matchKeys).length === 0) continue;
       sections.push(
         `pixel ${pixel.id}${pixel.name ? ` (${pixel.name})` : ''}` +
         (pixel.id === preferredPixelId ? ' [configured attribution pixel]' : '') + ':\n' +
