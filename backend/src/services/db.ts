@@ -4,6 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
+import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
@@ -6877,16 +6878,10 @@ export const crmDb = {
       // the next time anything touches this lead, retry it. That costs nothing on the
       // overwhelming majority of updates, where the field is simply absent (Greptile on
       // #2412: a marker nothing consumes is not recovery, it is just a note).
-      // A DynamoDB string set surfaces as { values: [...] } through the DocumentClient; an
-      // older row may still carry the scalar this field started as.
-      const pendingRaw = (result.Attributes as any)?.metaConversionPending;
-      const owedKinds: string[] = Array.isArray(pendingRaw?.values)
-        ? pendingRaw.values
-        : Array.isArray(pendingRaw)
-          ? pendingRaw
-          : typeof pendingRaw === 'string' && pendingRaw
-            ? [pendingRaw]
-            : [];
+      // Shared with the reconciliation sweep — see utils/metaConversionPending. Two copies
+      // of "what shape is this field" is how one reader ends up silently skipping rows the
+      // other picks up.
+      const owedKinds = parsePendingKinds((result.Attributes as any)?.metaConversionPending);
       if (!updates.suppressConversionRelay && (isRealTransition || owedKinds.length > 0)) {
         void (async () => {
           try {
