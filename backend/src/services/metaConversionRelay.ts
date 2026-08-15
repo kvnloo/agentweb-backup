@@ -557,6 +557,44 @@ export function registerConversionRelayProcessor(): void {
  * transition collapses onto the same job instead of queueing a second conversion — the same
  * fire-once property `metaConversionsSent` gives, enforced a second time at the queue.
  */
+const INLINE_FALLBACK_ATTEMPTS = 3;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Last resort when no durable record can be written. Retries in-process a bounded number of
+ * times, because without the queue there is nowhere to record a retry for later — a single
+ * attempt would turn one unlucky moment (a Meta blip during a queue outage) into a
+ * permanently lost conversion.
+ *
+ * This cannot survive a process restart, and nothing can while the queue is unreachable.
+ * What it must not do is fail quietly: a conversion nobody knows was lost is the exact
+ * problem this card exists to fix, so the give-up path says so explicitly.
+ */
+async function runInlineFallback(ctx: RelayContext, dedupeKey: string): Promise<void> {
+  console.warn(
+    `[CAPI Relay] no durable record possible for ${dedupeKey} — falling back to ` +
+    `${INLINE_FALLBACK_ATTEMPTS} in-process attempts`,
+  );
+
+  let last = '';
+  for (let attempt = 1; attempt <= INLINE_FALLBACK_ATTEMPTS; attempt++) {
+    const result = await relayLeadStatusEvent(ctx);
+
+    if ('sent' in result) return;
+    // A terminal skip (opted out, already sent, not enabled) is a correct outcome, not
+    // something to hammer.
+    if ('skipped' in result && !result.retryable) return;
+
+    last = 'failed' in result ? result.error : (result as any).reason;
+    if (attempt < INLINE_FALLBACK_ATTEMPTS) await sleep(250 * attempt);
+  }
+
+  console.error(
+    `[CAPI Relay] inline fallback exhausted for ${dedupeKey} and no retry can be recorded — ` +
+    `this conversion is LOST: ${last}`,
+  );
+}
+
 export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<void> {
   const { enqueueJob, markJobComplete, markJobFailed, startHeartbeat, clearFailedJob } = await import('./asyncJobQueue');
 
@@ -577,6 +615,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   };
 
   let enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
+
   if (enqueued === 'duplicate') {
     // Normally correct: this conversion is already queued, in flight, or done. But the key
     // is derived from durable business state, so a job that exhausted its attempts would
@@ -587,34 +626,26 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     // if the event did in fact land.
     const cleared = await clearFailedJob(RELAY_QUEUE_SOURCE, dedupeKey);
     if (!cleared) return;
+
     enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
-    if (enqueued !== 'enqueued') return;
+    // Another dispatcher recreated the row between our delete and our write; it owns the
+    // work now, and doing it here too would just race it.
+    if (enqueued === 'duplicate') return;
   }
+
   if (enqueued === 'unavailable') {
-    // One retry first: a transient write blip is a different thing from the table genuinely
-    // being unreachable, and this is the last chance at a durable record (same reasoning as
-    // the Calendly path's enqueue retry).
+    // One retry: a transient write blip is a different thing from the table being
+    // unreachable, and this is the last chance at a durable record (same reasoning as the
+    // Calendly path's enqueue retry).
     enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
   }
-  if (enqueued === 'unavailable') {
-    // No durable record is possible, so this is the only attempt this conversion will get.
-    // Its outcome is reported rather than discarded — an unremarked failure here is a
-    // conversion nobody will ever know was lost, which is the whole problem this card exists
-    // to fix. There is deliberately no further retry: without the queue there is nowhere to
-    // record one, and a loop here would block the caller.
-    console.warn(`[CAPI Relay] queue unavailable for ${dedupeKey} — single inline attempt, no retry possible`);
-    const result = await relayLeadStatusEvent(ctx);
-    if ('failed' in result) {
-      console.error(
-        `[CAPI Relay] inline fallback FAILED for ${dedupeKey} and cannot be retried — ` +
-        `this conversion is lost: ${result.error}`,
-      );
-    } else if ('skipped' in result && result.retryable) {
-      console.error(
-        `[CAPI Relay] inline fallback deferred for ${dedupeKey} but the queue is unavailable — ` +
-        `this conversion is lost: ${result.reason}`,
-      );
-    }
+
+  if (enqueued !== 'enqueued') {
+    // No durable record exists. Critically this also covers the path where the clear above
+    // succeeded and the replacement write did not — an earlier version returned here, having
+    // deleted the only record of the conversion and done nothing with it, which is strictly
+    // worse than the terminal failure it was trying to recover (Greptile on #2412).
+    await runInlineFallback(ctx, dedupeKey);
     return;
   }
 

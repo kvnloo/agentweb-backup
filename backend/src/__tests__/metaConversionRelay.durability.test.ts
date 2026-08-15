@@ -127,13 +127,28 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(getLeadById).toHaveBeenCalled();
   });
 
-  it('gives up if the re-enqueue after clearing still does not take', async () => {
+  it('stands down if another dispatcher recreated the job while we were clearing it', async () => {
     enqueueJob.mockResolvedValue('duplicate');
     clearFailedJob.mockResolvedValue(true);
 
     await dispatchLeadStatusConversion(ctx());
 
+    // That other dispatcher owns the work; doing it here too would just race it.
     expect(getLeadById).not.toHaveBeenCalled();
+  });
+
+  it('never exits having DELETED the only record without attempting the conversion', async () => {
+    // The dangerous shape: clearFailedJob removes the terminal row, the replacement write
+    // fails, and an earlier version returned right there — strictly worse than the terminal
+    // failure it was recovering, because now nothing records the conversion at all.
+    enqueueJob.mockResolvedValueOnce('duplicate').mockResolvedValue('unavailable');
+    clearFailedJob.mockResolvedValue(true);
+    getUserById.mockResolvedValue(null); // terminal skip, so the fallback stops after one go
+
+    await dispatchLeadStatusConversion(ctx());
+
+    // It reached the relay rather than returning silently after the delete.
+    expect(getUserById).toHaveBeenCalled();
   });
 
   it('retries the enqueue once before giving up on a durable record', async () => {
@@ -156,18 +171,35 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(markJobComplete).not.toHaveBeenCalled();
   });
 
-  it('reports an inline fallback failure loudly — a lost conversion must never be silent', async () => {
+  it('retries in-process during a queue outage rather than taking one unlucky shot', async () => {
+    // Without the queue there is nowhere to record a retry for later, so a single attempt
+    // would turn one Meta blip during an outage into a permanently lost conversion.
     enqueueJob.mockResolvedValue('unavailable');
-    // relayLeadStatusEvent catches everything and returns { failed }, so throwing from the
-    // owner lookup is what drives the inline path to a genuine failure.
+    getUserById.mockRejectedValue(new Error('DynamoDB down'));
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(getUserById.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('stops retrying immediately on a TERMINAL skip — a correct outcome is not hammered', async () => {
+    enqueueJob.mockResolvedValue('unavailable');
+    getUserById.mockResolvedValue(null); // owner missing => terminal skip
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(getUserById).toHaveBeenCalledTimes(1);
+  });
+
+  it('says so explicitly when a conversion is lost — never silently', async () => {
+    enqueueJob.mockResolvedValue('unavailable');
     getUserById.mockRejectedValue(new Error('DynamoDB down'));
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     await dispatchLeadStatusConversion(ctx());
 
     const said = errSpy.mock.calls.map((c) => String(c[0])).join(' ');
-    expect(said).toContain('cannot be retried');
-    expect(said).toContain('lost');
+    expect(said).toContain('LOST');
     errSpy.mockRestore();
   });
 });
