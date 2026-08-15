@@ -6217,7 +6217,21 @@ export const crmDb = {
     }
   },
 
-  async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
+  async appendMetaConversionSent(
+    listId: string,
+    leadId: string,
+    eventName: string,
+    /** Which Meta pixel this conversion was actually sent to (ENG-926 §F). Without it the
+     *  divergence check compares every logged send against whichever pixel resolves today,
+     *  so a customer who connects a second ad account has their history compared against a
+     *  pixel it never went to. Optional because rows written before this existed have none. */
+    pixelId?: string,
+  ): Promise<void> {
+    // Built once and shared by both write paths below. `pixel` is omitted entirely when
+    // unknown — DynamoDB rejects an undefined value inside a map, and absent is also
+    // exactly what a pre-existing row looks like.
+    const logEntry: Record<string, string> = { kind: eventName, at: new Date().toISOString() };
+    if (pixelId) logEntry.pixel = pixelId;
     try {
       await dynamodb
         .update({
@@ -6258,7 +6272,7 @@ export const crmDb = {
             ':empty': [],
             ':new': [eventName],
             ':event': eventName,
-            ':logEntry': [{ kind: eventName, at: new Date().toISOString() }],
+            ':logEntry': [logEntry],
             ':kinds': dynamodb.createSet([eventName]),
           },
         })
@@ -6307,7 +6321,7 @@ export const crmDb = {
                 ':empty': [],
                 ':new': [eventName],
                 ':event': eventName,
-                ':logEntry': [{ kind: eventName, at: new Date().toISOString() }],
+                ':logEntry': [logEntry],
                 ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
               },
             })

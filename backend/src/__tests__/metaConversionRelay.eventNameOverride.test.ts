@@ -258,7 +258,7 @@ describe('relayLeadStatusEvent — the override actually reaches the wire', () =
   it('records the conversion KIND, not the renamed event, so a rename cannot re-fire it', async () => {
     const deps = depsFor(ownerWith([adAccount('acct1', { won: 'CRMPurchase' })]));
     await relay(deps);
-    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
+    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'won', 'px1');
   });
 
   it('uses the no-value slot when the deal value cannot be stated', async () => {

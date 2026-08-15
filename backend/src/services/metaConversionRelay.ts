@@ -376,7 +376,7 @@ export interface RelayDeps {
   ) => Promise<{ success: true; fbtraceId?: string; usage?: any } | { success: false; error: string; usage?: any }>;
   /** Atomic single-event append. Takes ONE event, not the whole array: handing it a list
    *  would reintroduce the read-modify-write race it exists to remove. */
-  recordSent: (listId: string, leadId: string, eventName: string) => Promise<void>;
+  recordSent: (listId: string, leadId: string, conversionKind: string, pixelId?: string) => Promise<void>;
   /** Release a pending marker whose conversion is settled and will never be sent. */
   clearPending?: (listId: string, leadId: string, conversionKind: string) => Promise<void>;
   shouldAttemptSend: (listId: string) => boolean;
@@ -436,7 +436,8 @@ async function defaultDeps(): Promise<RelayDeps> {
       return { ...creds, currency };
     },
     sendEvent: (pixelId, accessToken, event) => metaService.sendCapiLeadEvent(pixelId, accessToken, event as any),
-    recordSent: (listId, leadId, eventName) => crmDb.appendMetaConversionSent(listId, leadId, eventName),
+    recordSent: (listId, leadId, conversionKind, pixelId) =>
+      crmDb.appendMetaConversionSent(listId, leadId, conversionKind, pixelId),
     clearPending: (listId, leadId, kind) => crmDb.clearConversionRelayPending(listId, leadId, kind),
     shouldAttemptSend: shouldAttemptCapiSend,
     isAccountPaused: isCapiAccountPaused,
@@ -657,7 +658,9 @@ export async function relayLeadStatusEvent(
     );
 
     try {
-      await d.recordSent(listId, leadId, mapped.conversionKind);
+      // The pixel is recorded alongside the kind so §F's divergence check can tell a send
+      // that went to THIS pixel from one that went to a different account's.
+      await d.recordSent(listId, leadId, mapped.conversionKind, resolution.pixelId);
     } catch (error: any) {
       // The send already happened and Meta has it. Losing the bookkeeping write means a
       // later transition could re-attempt — which the deterministic event_id makes safe,

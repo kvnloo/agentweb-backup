@@ -400,7 +400,9 @@ describe('relayLeadStatusEvent — sending', () => {
   it('records the event on the lead so it can never fire twice', async () => {
     const deps = makeDeps();
     await relayLeadStatusEvent(ctx(), deps);
-    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
+    // The KIND, plus the pixel it was sent to (ENG-926 §F needs the destination so a
+    // divergence check never compares history against an account it never reached).
+    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'won', 'px1');
   });
 });
 

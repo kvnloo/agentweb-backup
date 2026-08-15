@@ -368,6 +368,28 @@ describe('appendMetaConversionSent — recording WHEN, for §F', () => {
     expect(entry.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
   });
 
+  it('records WHICH pixel the conversion was sent to', async () => {
+    // Without the destination the divergence check compares every logged send against
+    // whichever pixel resolves today. A customer who connects a second ad account, or
+    // changes which one is default, silently has their history compared against a pixel it
+    // never went to (Greptile on #2413).
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won', '1012387921717047');
+
+    const [entry] = leadUpdateParams().ExpressionAttributeValues[':logEntry'];
+    expect(entry.pixel).toBe('1012387921717047');
+  });
+
+  it('omits the pixel rather than writing undefined when none was supplied', async () => {
+    // DynamoDB rejects an undefined attribute value inside a map, so an omitted pixel has
+    // to be genuinely absent — and absent is also what every row written before this
+    // change looks like.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const [entry] = leadUpdateParams().ExpressionAttributeValues[':logEntry'];
+    expect(entry).not.toHaveProperty('pixel');
+    expect(entry.kind).toBe('won');
+  });
+
   it('still does not touch updatedAt', async () => {
     // Re-asserted here rather than trusted: the §F addition edits this exact expression,
     // and updatedAt is a GSI range key whose write throws on legacy rows.
@@ -395,7 +417,7 @@ describe('appendMetaConversionSent — recording WHEN, for §F', () => {
     updatePromiseMock.mockRejectedValueOnce(err);
     getPromiseMock.mockResolvedValueOnce({ Item: { metaConversionPending: 'qualified' } });
 
-    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won', 'px-recovery');
 
     const leadUpdates = updateSpy.mock.calls
       .map((c) => c[0])
@@ -404,6 +426,7 @@ describe('appendMetaConversionSent — recording WHEN, for §F', () => {
 
     expect(recovery.UpdateExpression).toContain('list_append(if_not_exists(#log, :empty), :logEntry)');
     expect(recovery.ExpressionAttributeValues[':logEntry'][0].kind).toBe('won');
+    expect(recovery.ExpressionAttributeValues[':logEntry'][0].pixel).toBe('px-recovery');
     // The survivor rewrite must still be intact — the whole reason this path exists.
     expect(recovery.ExpressionAttributeValues[':survivors']).toEqual({
       values: ['qualified'],
