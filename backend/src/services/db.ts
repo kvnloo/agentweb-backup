@@ -6178,15 +6178,32 @@ export const crmDb = {
       // (Greptile P1 on #2412).
       if (error?.code === 'ValidationException') {
         try {
+          // Read first. A blanket REMOVE would drop the WHOLE attribute, so a lead owing a
+          // `qualified` would lose it the moment an unrelated `won` succeeded — erasing a
+          // conversion that had never been sent (Greptile P1 on #2412). Only the kind just
+          // sent may go; anything else owed is rewritten in the correct set shape, which
+          // also repairs the row for every future write.
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== eventName);
+
           await dynamodb
             .update({
               TableName: `${TABLE_PREFIX}AW-Leads`,
               Key: { listId, leadId },
-              UpdateExpression:
-                'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
+              UpdateExpression: survivors.length > 0
+                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), metaConversionPending = :survivors'
+                : 'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
               ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
               ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
-              ExpressionAttributeValues: { ':empty': [], ':new': [eventName], ':event': eventName },
+              ExpressionAttributeValues: {
+                ':empty': [],
+                ':new': [eventName],
+                ':event': eventName,
+                ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
+              },
             })
             .promise();
           return;

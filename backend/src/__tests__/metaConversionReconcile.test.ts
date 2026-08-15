@@ -266,14 +266,34 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     expect(summary.noops).toBe(0);
   });
 
-  it('still stops on the separate failure ceiling, so failures are not unbounded either', async () => {
-    const many = Array.from({ length: 800 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
+  it('a long failing PREFIX never blocks the leads behind it', async () => {
+    // The starvation shape in full: 800 persistently failing leads ahead of a good one. Any
+    // ceiling failures alone can reach would stop here every sweep — and since the sweep has
+    // no persistent cursor it restarts at the same prefix each tick, so the good lead would
+    // never be attempted at all.
+    const failing = Array.from({ length: 800 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
+    const good = leadWithPending('good-1', { values: ['won'] });
+    getLeadsByListId.mockResolvedValue({ items: [...failing, good], lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'processed',
+    );
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.failed).toBe(800);
+    expect(summary.dispatched).toBe(1);
+    const attempted = dispatchLeadStatusConversion.mock.calls.map((c) => c[0].lead.leadId);
+    expect(attempted).toContain('good-1');
+  });
+
+  it('still has an absolute runaway guard on total attempts', async () => {
+    const many = Array.from({ length: 2500 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
     getLeadsByListId.mockResolvedValue({ items: many, lastEvaluatedKey: undefined });
     dispatchLeadStatusConversion.mockRejectedValue(new Error('Meta down'));
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
 
-    expect(summary.failed).toBeLessThan(800);
+    expect(summary.failed).toBeLessThan(2500);
     expect(summary.cappedOut).toBe(true);
   });
 });

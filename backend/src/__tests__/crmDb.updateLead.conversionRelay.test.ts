@@ -220,6 +220,32 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(params.ExpressionAttributeValues[':kinds']).toEqual({ values: ['won'], type: 'String' });
   });
 
+  it('recovery keeps an UNRELATED owed conversion instead of erasing it', async () => {
+    // Scalar marker owes 'qualified'; a 'won' just succeeded. A blanket REMOVE would drop
+    // the qualified that was never sent.
+    const err: any = new Error('type mismatch');
+    err.code = 'ValidationException';
+    updatePromiseMock.mockRejectedValueOnce(err).mockResolvedValue({});
+    getPromiseMock.mockImplementation(async (params: any) =>
+      String(params?.TableName).endsWith('AW-LeadLists')
+        ? { Item: leadListRow }
+        : { Item: { ...EXISTING_LEAD, metaConversionPending: 'qualified' } },
+    );
+
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const leadWrites = updateSpy.mock.calls
+      .map((c) => c[0])
+      .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'));
+    const recovery = leadWrites[leadWrites.length - 1];
+    expect(recovery.UpdateExpression).toContain('metaConversionPending = :survivors');
+    expect(recovery.UpdateExpression).not.toContain('REMOVE metaConversionPending');
+    expect(recovery.ExpressionAttributeValues[':survivors']).toEqual({
+      values: ['qualified'],
+      type: 'String',
+    });
+  });
+
   it('recovers when a lead still carries the legacy SCALAR marker (set ops would reject)', async () => {
     // DynamoDB rejects the whole update with ValidationException if ADD/DELETE hit a scalar
     // attribute. Left unhandled, the send goes unrecorded and reconciliation re-dispatches
@@ -227,13 +253,18 @@ describe('updateLead → conversion relay dispatch', () => {
     const err: any = new Error('type mismatch');
     err.code = 'ValidationException';
     updatePromiseMock.mockRejectedValueOnce(err).mockResolvedValue({});
+    getPromiseMock.mockImplementation(async (params: any) =>
+      String(params?.TableName).endsWith('AW-LeadLists')
+        ? { Item: leadListRow }
+        : { Item: { ...EXISTING_LEAD, metaConversionPending: 'won' } },
+    );
 
     await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
 
     const leadWrites = updateSpy.mock.calls
       .map((c) => c[0])
       .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'));
-    // Second attempt drops the set DELETE and uses REMOVE, which works on any type.
+    // Nothing else owed, so the attribute goes entirely — via REMOVE, which works on any type.
     const recovery = leadWrites[leadWrites.length - 1];
     expect(recovery.UpdateExpression).toContain('REMOVE metaConversionPending');
     expect(recovery.UpdateExpression).not.toContain('DELETE metaConversionPending');

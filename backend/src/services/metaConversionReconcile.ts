@@ -19,9 +19,9 @@
  *
  *   - Work is capped per user per sweep. A large backlog must not turn one cron tick into
  *     thousands of Meta calls; whatever is left is picked up 12 hours later, which is well
- *     inside Meta's 7-day attribution window. Successes and failures have SEPARATE ceilings,
- *     so a cluster of persistently failing leads cannot consume the budget and hide every
- *     lead behind it — see MAX_DISPATCHES_PER_USER.
+ *     inside Meta's 7-day attribution window. Only successful work is budgeted: failures do
+ *     not stop the scan, because a sweep with no persistent cursor restarts at the same
+ *     failing prefix every tick and would never reach the leads behind it.
  */
 
 import { parsePendingKinds } from '../utils/metaConversionPending';
@@ -40,10 +40,19 @@ const TAG = '[CAPI Reconcile]';
  *  the marker survives; it must not also become a reason to stop looking. */
 const MAX_DISPATCHES_PER_USER = 200;
 
-/** Separate, generous runaway guard. Failures cost a Meta call each, so they cannot be
- *  unbounded either — but this is high enough that a bad cluster does not hide the leads
- *  behind it. */
-const MAX_FAILURES_PER_USER = 500;
+/** Absolute runaway guard on ATTEMPTS, successes and failures together.
+ *
+ *  There is deliberately no separate failure ceiling. Any ceiling that failures alone can
+ *  reach becomes a starvation mechanism: the sweep has no persistent cursor, so it restarts
+ *  from the beginning every tick, hits the same failing prefix, stops, and never reaches the
+ *  leads behind them — indefinitely, and well past Meta's attribution window (Greptile P1 on
+ *  #2412). Failures no longer stop the sweep; they are attempted and logged, and the scan
+ *  keeps going.
+ *
+ *  This guard is set far above any plausible backlog, since markers only exist at all after
+ *  a queue outage. Reaching it means something is genuinely wrong, which is why it logs
+ *  loudly rather than passing quietly. */
+const MAX_ATTEMPTS_PER_USER = 2000;
 
 /** Page size for walking a list's leads. */
 const LEAD_PAGE_SIZE = 200;
@@ -110,10 +119,11 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
         summary.pendingFound++;
 
         for (const kind of owed) {
-          // Only successful work counts against the dispatch budget — see the constant.
+          // Successful work is budgeted; failures are not a reason to stop looking, only
+          // the absolute runaway guard is.
           if (
             summary.dispatched >= MAX_DISPATCHES_PER_USER ||
-            summary.failed >= MAX_FAILURES_PER_USER
+            summary.dispatched + summary.failed >= MAX_ATTEMPTS_PER_USER
           ) {
             summary.cappedOut = true;
             break;
@@ -159,7 +169,7 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
       `${summary.dispatched} re-dispatched, ${summary.failed} failed, ${summary.noops} already queued` +
       (summary.cappedOut
         ? `, stopped at a per-sweep ceiling (${summary.dispatched}/${MAX_DISPATCHES_PER_USER} sent, ` +
-          `${summary.failed}/${MAX_FAILURES_PER_USER} failed) — remainder next sweep`
+          `${summary.dispatched + summary.failed}/${MAX_ATTEMPTS_PER_USER} attempts) — remainder next sweep`
         : ''),
     );
   }
