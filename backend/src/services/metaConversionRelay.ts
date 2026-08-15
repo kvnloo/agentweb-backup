@@ -48,6 +48,12 @@ export interface LeadStatusConfigEntry {
  *  pollute a name Meta's models already hold priors on. */
 export const META_PURCHASE_EVENT = 'Purchase';
 export const META_QUALIFIED_EVENT = 'QualifiedLead';
+/** Closed-won whose value we cannot state. Meta REJECTS a Purchase with no currency —
+ *  "Missing Currency for Purchase Event", verified against Graph v25 — so a deal with no
+ *  usable currency cannot be a Purchase at all. A custom event carries the conversion
+ *  honestly: Meta learns this lead closed, and no revenue figure is invented. Custom events
+ *  have no required custom_data, also verified. */
+export const META_WON_NO_VALUE_EVENT = 'CRMWonDeal';
 
 /** Mirrors the platform default in db.ts's createLeadList, for lists created before
  *  statusConfig existed (or created without one). Kept in sync deliberately: a list with
@@ -80,10 +86,19 @@ const normalize = (value: unknown): string =>
  * QualifiedLead. That is the safe direction to fail — the alternative is guessing at
  * which mid-funnel status means MQL and firing conversions the customer never asked for.
  */
+export type ConversionKind = 'won' | 'qualified';
+
+/**
+ * `conversionKind` is the stable identity of the conversion; the Meta event NAME is chosen
+ * later, because a closed-won becomes either `Purchase` or `CRMWonDeal` depending on whether
+ * its value can be stated. Fire-once keys off the kind, never the name — otherwise a deal
+ * that fired `CRMWonDeal` while its currency was missing would fire `Purchase` all over
+ * again once someone filled the currency in, double-counting one deal under two names.
+ */
 export function mapStatusToMetaEvent(
   statusConfig: LeadStatusConfigEntry[] | undefined | null,
   status: string | undefined | null,
-): { eventName: string; isValueEvent: boolean } | null {
+): { conversionKind: ConversionKind; isValueEvent: boolean } | null {
   const wanted = normalize(status);
   if (!wanted) return null;
 
@@ -92,12 +107,21 @@ export function mapStatusToMetaEvent(
   if (!entry) return null;
 
   if (entry.type === 'won') {
-    return { eventName: META_PURCHASE_EVENT, isValueEvent: true };
+    return { conversionKind: 'won', isValueEvent: true };
   }
   if (normalize(entry.value) === 'qualified' || normalize(entry.label) === 'qualified') {
-    return { eventName: META_QUALIFIED_EVENT, isValueEvent: false };
+    return { conversionKind: 'qualified', isValueEvent: false };
   }
   return null;
+}
+
+/** The Meta event name for a conversion, given whether its value could be stated. */
+export function resolveEventName(
+  conversionKind: ConversionKind,
+  hasValue: boolean,
+): string {
+  if (conversionKind !== 'won') return META_QUALIFIED_EVENT;
+  return hasValue ? META_PURCHASE_EVENT : META_WON_NO_VALUE_EVENT;
 }
 
 /**
@@ -318,8 +342,9 @@ export async function relayLeadStatusEvent(
     }
 
     const alreadySent: string[] = Array.isArray(lead.metaConversionsSent) ? lead.metaConversionsSent : [];
-    if (alreadySent.includes(mapped.eventName)) {
-      return skip(`${mapped.eventName} already sent for this lead`, true);
+    // Keyed on the conversion KIND, not the emitted event name — see mapStatusToMetaEvent.
+    if (alreadySent.includes(mapped.conversionKind)) {
+      return skip(`${mapped.conversionKind} conversion already sent for this lead`, true);
     }
 
     if (!d.shouldAttemptSend(listId)) {
@@ -371,7 +396,12 @@ export async function relayLeadStatusEvent(
     // guess — see buildConversionValue.
     const customData = mapped.isValueEvent ? buildConversionValue(lead, listId) : undefined;
 
-    const eventId = buildRelayEventId(leadId, mapped.eventName);
+    // Meta REJECTS a Purchase carrying no currency ("Missing Currency for Purchase Event"),
+    // so a won deal whose value we cannot state is sent under a custom event name instead
+    // of being lost to a rejection. Verified against Graph v25, not inferred.
+    const eventName = resolveEventName(mapped.conversionKind, customData !== undefined);
+
+    const eventId = buildRelayEventId(leadId, mapped.conversionKind);
     const result = await d.sendEvent(resolution.pixelId, creds.accessToken, {
       eventId,
       email: lead.email,
@@ -386,7 +416,7 @@ export async function relayLeadStatusEvent(
       fbp: typeof lead.metaFbp === 'string' && lead.metaFbp ? lead.metaFbp : undefined,
       fbc: buildFbcFromFirstTouch(lead.firstTouch),
       sourceUrl: lead.firstTouch?.landingUrl,
-      eventName: mapped.eventName,
+      eventName,
       // A CRM status change is not a website event — nobody was on a page. Meta validates
       // this field (a bogus value is rejected outright), and 'system_generated' is its
       // documented value for a conversion recorded by a system rather than a browser.
@@ -401,28 +431,28 @@ export async function relayLeadStatusEvent(
       // exact gap Greptile caught on the Calendly path (#2291) where a swallowed failure
       // marked the job complete and lost the event permanently.
       console.error(
-        `[CAPI Relay] ${mapped.eventName} failed for lead ${leadId} (list ${listId}): ${result.error}`,
+        `[CAPI Relay] ${eventName} failed for lead ${leadId} (list ${listId}): ${result.error}`,
       );
       return { failed: true, error: result.error };
     }
 
     console.log(
-      `[CAPI Relay] ${mapped.eventName} sent for lead ${leadId} (list ${listId}, ` +
+      `[CAPI Relay] ${eventName} sent for lead ${leadId} (list ${listId}, ` +
       `pixel ${resolution.pixelId}, fbtrace_id=${result.fbtraceId ?? 'n/a'})`,
     );
 
     try {
-      await d.recordSent(listId, leadId, mapped.eventName);
+      await d.recordSent(listId, leadId, mapped.conversionKind);
     } catch (error: any) {
       // The send already happened and Meta has it. Losing the bookkeeping write means a
       // later transition could re-attempt — which the deterministic event_id makes safe,
       // so this is logged, not escalated.
       console.error(
-        `[CAPI Relay] ${mapped.eventName} sent for lead ${leadId} but recording it failed: ${error?.message}`,
+        `[CAPI Relay] ${eventName} sent for lead ${leadId} but recording it failed: ${error?.message}`,
       );
     }
 
-    return { sent: true, eventName: mapped.eventName, eventId };
+    return { sent: true, eventName, eventId };
   } catch (error: any) {
     console.error(`[CAPI Relay] threw for lead ${leadId} (list ${listId}): ${error?.message}`);
     return { failed: true, error: error?.message || 'Unknown error relaying conversion' };
@@ -510,7 +540,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
   if (!mapped) return;
 
-  const dedupeKey = `${ctx.listId}:${leadId}:${mapped.eventName}`;
+  const dedupeKey = `${ctx.listId}:${leadId}:${mapped.conversionKind}`;
   const payload: ConversionRelayJobPayload = {
     listId: ctx.listId,
     leadId,

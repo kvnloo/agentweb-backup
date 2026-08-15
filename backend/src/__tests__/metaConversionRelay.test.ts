@@ -19,6 +19,7 @@ import {
   buildFbcFromFirstTouch,
   buildConversionValue,
   isConversionRelayEnabled,
+  resolveEventName,
   relayLeadStatusEvent,
   RelayDeps,
 } from '../services/metaConversionRelay';
@@ -84,7 +85,7 @@ const ctx = (overrides: Record<string, any> = {}) => ({
 describe('mapStatusToMetaEvent', () => {
   it('maps a won-type status to Purchase as a value event', () => {
     expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'won')).toEqual({
-      eventName: 'Purchase',
+      conversionKind: 'won',
       isValueEvent: true,
     });
   });
@@ -93,7 +94,7 @@ describe('mapStatusToMetaEvent', () => {
     // Deliberately custom: Meta has no standard event that honestly means MQL, and
     // reusing SubmitApplication would pollute a name Meta's models hold priors on.
     expect(mapStatusToMetaEvent(LEAD_STATUS_CONFIG, 'qualified')).toEqual({
-      eventName: 'QualifiedLead',
+      conversionKind: 'qualified',
       isValueEvent: false,
     });
   });
@@ -103,7 +104,7 @@ describe('mapStatusToMetaEvent', () => {
       { value: 'deal_closed', label: 'Deal Closed!', color: 'green', type: 'won' as const },
     ];
     expect(mapStatusToMetaEvent(renamed, 'deal_closed')).toEqual({
-      eventName: 'Purchase',
+      conversionKind: 'won',
       isValueEvent: true,
     });
   });
@@ -115,7 +116,7 @@ describe('mapStatusToMetaEvent', () => {
 
   it('falls back to the platform default status config when a list has none', () => {
     expect(mapStatusToMetaEvent(undefined, 'won')).toEqual({
-      eventName: 'Purchase',
+      conversionKind: 'won',
       isValueEvent: true,
     });
   });
@@ -132,7 +133,7 @@ describe('buildRelayEventId', () => {
 
   it('differs across leads and across events', () => {
     expect(buildRelayEventId('lead-1', 'Purchase')).not.toBe(buildRelayEventId('lead-2', 'Purchase'));
-    expect(buildRelayEventId('lead-1', 'Purchase')).not.toBe(buildRelayEventId('lead-1', 'QualifiedLead'));
+    expect(buildRelayEventId('lead-1', 'won')).not.toBe(buildRelayEventId('lead-1', 'qualified'));
   });
 
   it('carries NO timestamp — a timestamped id would defeat Meta-side dedup on a retry', () => {
@@ -247,6 +248,38 @@ describe('buildConversionValue — never guess a denomination', () => {
   });
 });
 
+
+describe('resolveEventName — Purchase only when we can state the value', () => {
+  it('is Purchase for a won deal with a stated value', () => {
+    expect(resolveEventName('won', true)).toBe('Purchase');
+  });
+
+  it('is a custom event for a won deal with no stateable value', () => {
+    // Not a cosmetic choice: Meta rejects a currency-less Purchase, so this is the
+    // difference between recording the conversion and losing it.
+    expect(resolveEventName('won', false)).toBe('CRMWonDeal');
+  });
+
+  it('is QualifiedLead regardless of value', () => {
+    expect(resolveEventName('qualified', false)).toBe('QualifiedLead');
+    expect(resolveEventName('qualified', true)).toBe('QualifiedLead');
+  });
+});
+
+describe('fire-once is keyed on the conversion, not the event name', () => {
+  it('does not re-fire a won deal as Purchase after it went out as CRMWonDeal', async () => {
+    // Otherwise filling in a currency later would double-count one deal under two names.
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ metaConversionsSent: ['won'], dealCurrency: 'USD' }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+  });
+});
+
 describe('relayLeadStatusEvent — sending', () => {
   it('reconstructs fbc from the lead first touch and sends the landing URL', async () => {
     const deps = makeDeps();
@@ -295,14 +328,17 @@ describe('relayLeadStatusEvent — sending', () => {
     expect(event.actionSource).toBe('system_generated');
   });
 
-  it('sends Purchase with NO value when the lead names no currency', async () => {
+  it('sends a CUSTOM event, not Purchase, when the value cannot be stated', async () => {
+    // Meta rejects a Purchase with no currency outright ("Missing Currency for Purchase
+    // Event", verified against Graph v25), so omitting the value while keeping the name
+    // would lose the conversion entirely rather than merely lose its amount.
     const deps = makeDeps();
     const result = await relayLeadStatusEvent(
       ctx({ lead: makeLead({ dealValue: 5000, dealCurrency: undefined }) }),
       deps,
     );
 
-    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
+    expect(result).toMatchObject({ sent: true, eventName: 'CRMWonDeal' });
     const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
     expect(event.customData).toBeUndefined();
   });
@@ -363,7 +399,7 @@ describe('relayLeadStatusEvent — sending', () => {
   it('records the event on the lead so it can never fire twice', async () => {
     const deps = makeDeps();
     await relayLeadStatusEvent(ctx(), deps);
-    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'Purchase');
+    expect(deps.recordSent).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
   });
 });
 
@@ -371,7 +407,7 @@ describe('relayLeadStatusEvent — fire-once', () => {
   it('does not re-send when the event is already in metaConversionsSent', async () => {
     const deps = makeDeps();
     const result = await relayLeadStatusEvent(
-      ctx({ lead: makeLead({ metaConversionsSent: ['Purchase'] }) }),
+      ctx({ lead: makeLead({ metaConversionsSent: ['won'] }) }),
       deps,
     );
 
@@ -407,7 +443,7 @@ describe('relayLeadStatusEvent — fire-once', () => {
   it('allows QualifiedLead and Purchase on the same lead — different events, both real', async () => {
     const deps = makeDeps();
     const result = await relayLeadStatusEvent(
-      ctx({ lead: makeLead({ status: 'won', metaConversionsSent: ['QualifiedLead'] }) }),
+      ctx({ lead: makeLead({ status: 'won', metaConversionsSent: ['qualified'] }) }),
       deps,
     );
     expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
@@ -559,7 +595,7 @@ describe('relayLeadStatusEvent — a suppressed conversion is never silent', () 
 
   it('logs when a fire-once skip suppresses a real conversion', async () => {
     await relayLeadStatusEvent(
-      ctx({ lead: makeLead({ metaConversionsSent: ['Purchase'] }) }),
+      ctx({ lead: makeLead({ metaConversionsSent: ['won'] }) }),
       makeDeps(),
     );
 

@@ -70,13 +70,16 @@ const ctx = (overrides: Record<string, any> = {}) => ({
 });
 
 describe('dispatchLeadStatusConversion — queueing', () => {
-  it('enqueues under a key that is stable per (list, lead, event), not per attempt', async () => {
+  it('enqueues under a key stable per (list, lead, CONVERSION KIND), not per attempt or event name', async () => {
     await dispatchLeadStatusConversion(ctx());
 
     expect(enqueueJob).toHaveBeenCalledTimes(1);
     const [source, dedupeKey, payload, options] = enqueueJob.mock.calls[0];
     expect(source).toBe(RELAY_QUEUE_SOURCE);
-    expect(dedupeKey).toBe('list-1:lead-1:Purchase');
+    // Keyed on the kind, not the emitted name: a won deal can go out as Purchase or as
+    // CRMWonDeal depending on whether its value is stateable, and both are the same
+    // conversion — keying on the name would let one deal queue twice.
+    expect(dedupeKey).toBe('list-1:lead-1:won');
     expect(payload).toEqual({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' });
     expect(options).toEqual({ claimImmediately: true });
   });
@@ -108,7 +111,7 @@ describe('dispatchLeadStatusConversion — queueing', () => {
 
     await dispatchLeadStatusConversion(ctx());
 
-    expect(clearFailedJob).toHaveBeenCalledWith('meta_conversion_relay', 'list-1:lead-1:Purchase');
+    expect(clearFailedJob).toHaveBeenCalledWith('meta_conversion_relay', 'list-1:lead-1:won');
     expect(enqueueJob).toHaveBeenCalledTimes(2);
     expect(getLeadById).toHaveBeenCalled();
   });
