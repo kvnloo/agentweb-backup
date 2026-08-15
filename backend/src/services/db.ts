@@ -5042,6 +5042,10 @@ export const crmDb = {
       engagedOnly?: boolean;
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      /** ENG-926 §F — which status means "qualified" for the Meta conversion relay.
+       *  `{ qualifiedStatus: null }` turns QualifiedLead off for this list; omitting the
+       *  field entirely leaves the relay matching by name, as it did before. */
+      conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: 'sales' | 'customers';
       syncConfig?: {
         platform: 'hubspot' | 'attio';
@@ -5171,6 +5175,18 @@ export const crmDb = {
         expressionAttributeNames['#lastImportMapping'] = 'lastImportMapping';
         updateExpressions.push('#lastImportMapping = :lastImportMapping');
         expressionAttributeValues[':lastImportMapping'] = updates.lastImportMapping;
+      }
+
+      // Field-by-field, like every other key here — a field absent from this function is
+      // silently dropped with every test still passing, which is exactly how §C's metaFbp
+      // shipped doing nothing.
+      if (updates.conversionMapping !== undefined) {
+        // A stored `null` returns the list to matching by name, which is a different
+        // statement from `{ qualifiedStatus: null }` — that turns the conversion off.
+        // Both round-trip correctly, so the write needs no special case for either.
+        expressionAttributeNames['#conversionMapping'] = 'conversionMapping';
+        updateExpressions.push('#conversionMapping = :conversionMapping');
+        expressionAttributeValues[':conversionMapping'] = updates.conversionMapping;
       }
 
       if (updates.statusConfig !== undefined) {
@@ -7042,6 +7058,7 @@ export const crmDb = {
                 lead: result.Attributes as any,
                 previousStatus,
                 statusConfig: (list as any).statusConfig,
+                conversionMapping: (list as any).conversionMapping,
                 // On a retry of an owed conversion the lead's CURRENT status may no longer
                 // be the one that earned it, so the recorded kind wins — same reasoning as
                 // the queued payload's kind. `undefined` means "use the live transition".

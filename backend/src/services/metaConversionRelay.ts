@@ -81,12 +81,32 @@ const normalize = (value: unknown): string =>
  * stop relaying revenue the moment someone edits a label.
  *
  * `qualified` has no such type to key off (it is `active`, like every other mid-funnel
- * status), so it IS matched by name against value and label. Accepted limitation, stated
- * plainly: a customer who renames "Qualified" to something else stops emitting
- * QualifiedLead. That is the safe direction to fail — the alternative is guessing at
- * which mid-funnel status means MQL and firing conversions the customer never asked for.
+ * status). It is matched by name against value and label by DEFAULT, and a list may
+ * override that with a `ConversionMapping` — which is how a customer who calls it "SQL"
+ * keeps emitting QualifiedLead. Without an override the name match still applies, because
+ * the alternative is guessing which mid-funnel status means MQL and firing conversions
+ * nobody asked for.
  */
 export type ConversionKind = 'won' | 'qualified';
+
+/**
+ * Per-list override for which CRM status means "qualified" (ENG-926 §F).
+ *
+ * §C shipped matching `qualified` by name and recorded the limitation openly: renaming
+ * the status silently stops the conversion. "Silently" is the part worth fixing — this
+ * card exists because of a failure nobody could see.
+ *
+ * Only `qualified` is configurable. Won resolves by the status entry's `type`, which a
+ * customer cannot rename out from under it, so it needs no mapping.
+ *
+ * Three distinct states, deliberately:
+ *   - absent / `{}`          — nothing configured; match by name, as §C does today
+ *   - `{ qualifiedStatus: 'sql' }` — that status, and ONLY that status, is qualified
+ *   - `{ qualifiedStatus: null }`  — QualifiedLead is off for this list entirely
+ */
+export interface ConversionMapping {
+  qualifiedStatus?: string | null;
+}
 
 /**
  * `conversionKind` is the stable identity of the conversion; the Meta event NAME is chosen
@@ -98,6 +118,7 @@ export type ConversionKind = 'won' | 'qualified';
 export function mapStatusToMetaEvent(
   statusConfig: LeadStatusConfigEntry[] | undefined | null,
   status: string | undefined | null,
+  conversionMapping?: ConversionMapping | null,
 ): { conversionKind: ConversionKind; isValueEvent: boolean } | null {
   const wanted = normalize(status);
   if (!wanted) return null;
@@ -106,9 +127,31 @@ export function mapStatusToMetaEvent(
   const entry = config.find((e) => normalize(e.value) === wanted);
   if (!entry) return null;
 
+  // Checked first, and unconditionally. A won-typed status is a closed deal whatever else
+  // it has been configured as, and resolving toward the event that carries revenue is the
+  // only deterministic answer to a contradictory configuration.
   if (entry.type === 'won') {
     return { conversionKind: 'won', isValueEvent: true };
   }
+
+  // An explicit `null` means the customer turned QualifiedLead off. That is a different
+  // statement from leaving it unset, which still means "guess by name" — so the two must
+  // not collapse into the same branch.
+  if (conversionMapping && 'qualifiedStatus' in conversionMapping && conversionMapping.qualifiedStatus === null) {
+    return null;
+  }
+
+  const configured = normalize(conversionMapping?.qualifiedStatus);
+  if (configured) {
+    // Authoritative once set: the name match no longer applies. Leaving it as a fallback
+    // would emit QualifiedLead for TWO statuses — the chosen one and any that happens to
+    // be called "qualified" — a conversion the customer never asked for, on a relay whose
+    // entire premise is not sending those.
+    return normalize(entry.value) === configured || normalize(entry.label) === configured
+      ? { conversionKind: 'qualified', isValueEvent: false }
+      : null;
+  }
+
   if (normalize(entry.value) === 'qualified' || normalize(entry.label) === 'qualified') {
     return { conversionKind: 'qualified', isValueEvent: false };
   }
@@ -221,6 +264,10 @@ export interface RelayContext {
   lead: Record<string, any>;
   previousStatus?: string | null;
   statusConfig?: LeadStatusConfigEntry[] | null;
+  /** The list's per-list conversion mapping, if it has one. Threaded alongside
+   *  statusConfig at every call site because they answer the same question together:
+   *  which status means what. */
+  conversionMapping?: ConversionMapping | null;
   /** The conversion recorded when the transition actually happened, carried through the
    *  queue so a retry honours THAT rather than re-deriving one from whatever the lead's
    *  status says now. Absent on the first, inline attempt, where current state is the
@@ -316,7 +363,7 @@ export async function relayLeadStatusEvent(
   // the current status maps to. Used only to release a marker on a settled skip.
   const ctxKindForClear =
     ctx.conversionKind ??
-    mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead?.status)?.conversionKind ??
+    mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead?.status, ctx.conversionMapping)?.conversionKind ??
     '';
 
   // A skip that reaches here AFTER the status mapped to a real conversion event is worth
@@ -357,7 +404,7 @@ export async function relayLeadStatusEvent(
     // on the inline first attempt, where they are the same thing.
     const mapped = ctx.conversionKind
       ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
-      : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
+      : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status, ctx.conversionMapping);
     if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false, false, true);
 
     // §B's opt-out, honored here rather than waiting for the consent field: contactStatus
@@ -543,6 +590,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
     userId: payload.userId,
     lead,
     statusConfig: (list as any)?.statusConfig,
+    conversionMapping: (list as any)?.conversionMapping,
     conversionKind: payload.conversionKind,
   });
 
@@ -680,7 +728,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
   // table free of a row for every `new -> contacted` in the product.
   const mapped = ctx.conversionKind
     ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
-    : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
+    : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status, ctx.conversionMapping);
   if (!mapped) return 'noop';
 
   const dedupeKey = `${ctx.listId}:${leadId}:${mapped.conversionKind}`;

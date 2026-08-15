@@ -1365,7 +1365,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, linkedInAccountId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, linkedInAccountId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, conversionMapping, listType } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1394,6 +1394,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       icpsOnly?: boolean;
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: 'sales' | 'customers';
     } = {};
     if (name !== undefined) {
@@ -1529,6 +1530,42 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         }
       }
       updates.statusConfig = statusConfig;
+    }
+
+    // ENG-926 §F — which status means "qualified" for the Meta conversion relay.
+    // Three accepted shapes, and the difference between them is the whole point:
+    //   null                          → clear the override; relay matches by name again
+    //   { qualifiedStatus: null }     → QualifiedLead off for this list
+    //   { qualifiedStatus: 'sql' }    → that status, and only that one, is qualified
+    if (conversionMapping !== undefined) {
+      if (conversionMapping !== null) {
+        if (typeof conversionMapping !== 'object' || Array.isArray(conversionMapping)) {
+          return res.status(400).json({ message: 'conversionMapping must be an object or null' });
+        }
+        const qualified = (conversionMapping as any).qualifiedStatus;
+        if (qualified !== undefined && qualified !== null && typeof qualified !== 'string') {
+          return res.status(400).json({ message: 'conversionMapping.qualifiedStatus must be a string or null' });
+        }
+        if (typeof qualified === 'string' && qualified.trim()) {
+          // Reject a status this list does not have, rather than accepting a mapping that
+          // silently matches nothing. A relay that quietly stops emitting is the failure
+          // this whole card is about.
+          const known = Array.isArray(updates.statusConfig) ? updates.statusConfig : list.statusConfig;
+          const normalize = (v: any) =>
+            typeof v === 'string' ? v.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
+          const target = normalize(qualified);
+          const exists =
+            !Array.isArray(known) ||
+            known.length === 0 ||
+            known.some((e: any) => normalize(e?.value) === target || normalize(e?.label) === target);
+          if (!exists) {
+            return res.status(400).json({
+              message: `conversionMapping.qualifiedStatus "${qualified}" is not a status on this list`,
+            });
+          }
+        }
+      }
+      updates.conversionMapping = conversionMapping;
     }
 
     if (listType !== undefined) {
