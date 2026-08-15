@@ -158,22 +158,123 @@ export function mapStatusToMetaEvent(
   return null;
 }
 
+/**
+ * Per-ad-account override of the emitted Meta event names (ENG-926 §F).
+ *
+ * §C hardcodes `Purchase` for a closed-won. A customer whose store pixel already uses
+ * `Purchase` for e-commerce orders gets CRM deals blended into the event their campaign
+ * optimisation reads, with no way to separate them afterwards. The relay is opt-in, so
+ * that is consented rather than imposed — but consenting to it should not be the only
+ * option available.
+ *
+ * Renaming is safe against double-counting, and not by luck: fire-once reads
+ * `metaConversionsSent`, which stores the conversion KIND, and `buildRelayEventId` is
+ * called with the kind as well. Neither depends on the emitted name, so a lead that fired
+ * `Purchase` cannot fire again under a new name.
+ *
+ * The three slots are independent because they are three different events to Meta, and
+ * one of them structurally cannot carry a value.
+ */
+export interface ConversionEventNames {
+  /** Closed-won whose value can be stated. Default `Purchase`. */
+  won?: string | null;
+  /** Closed-won whose value cannot be stated. Default `CRMWonDeal`. */
+  wonNoValue?: string | null;
+  /** Qualified lead. Default `QualifiedLead`. */
+  qualified?: string | null;
+}
+
+const EVENT_NAME_SLOTS: Array<keyof ConversionEventNames> = ['won', 'wonNoValue', 'qualified'];
+
+/** Meta accepts letters, digits and underscores in a custom event name. Anything else is
+ *  rejected at send time, which would turn a configuration typo into silently dropped
+ *  conversions — so it is refused when set instead. */
+const EVENT_NAME_PATTERN = /^[A-Za-z0-9_]{1,50}$/;
+
+/** A usable override, or undefined when the slot is unset, blank, or not a string. */
+function overrideFor(
+  overrides: ConversionEventNames | null | undefined,
+  slot: keyof ConversionEventNames,
+): string | undefined {
+  const value = overrides?.[slot];
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 /** The Meta event name for a conversion, given whether its value could be stated. */
 export function resolveEventName(
   conversionKind: ConversionKind,
   hasValue: boolean,
+  overrides?: ConversionEventNames | null,
 ): string {
-  if (conversionKind !== 'won') return META_QUALIFIED_EVENT;
-  return hasValue ? META_PURCHASE_EVENT : META_WON_NO_VALUE_EVENT;
+  if (conversionKind !== 'won') {
+    return overrideFor(overrides, 'qualified') ?? META_QUALIFIED_EVENT;
+  }
+  return hasValue
+    ? overrideFor(overrides, 'won') ?? META_PURCHASE_EVENT
+    : overrideFor(overrides, 'wonNoValue') ?? META_WON_NO_VALUE_EVENT;
 }
 
 /**
- * Deterministic per (lead, event). Deliberately carries no timestamp and no nonce: a retry
- * — whether ours or a duplicate transition — must produce the SAME id so Meta collapses it
- * under §E's dedup contract rather than counting it twice.
+ * Validate an override configuration before it is stored.
+ *
+ * Refusing a bad name here rather than at send time is the whole point: a rejected event
+ * is a lost conversion recorded only in a log, which is the class of silent failure this
+ * card exists to end.
  */
-export function buildRelayEventId(leadId: string, eventName: string): string {
-  return crypto.createHash('sha256').update(`${leadId}:${eventName}`).digest('hex');
+export function validateEventNameOverrides(
+  overrides: unknown,
+): { valid: true } | { valid: false; error: string } {
+  if (overrides === undefined || overrides === null) return { valid: true };
+  if (typeof overrides !== 'object' || Array.isArray(overrides)) {
+    return { valid: false, error: 'eventNames must be an object' };
+  }
+
+  for (const key of Object.keys(overrides as Record<string, unknown>)) {
+    // A typo'd slot would otherwise be stored, do nothing, and read as configured.
+    if (!EVENT_NAME_SLOTS.includes(key as keyof ConversionEventNames)) {
+      return { valid: false, error: `unknown event name slot "${key}"` };
+    }
+  }
+
+  for (const slot of EVENT_NAME_SLOTS) {
+    const value = (overrides as ConversionEventNames)[slot];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string' || !EVENT_NAME_PATTERN.test(value.trim())) {
+      return {
+        valid: false,
+        error: `eventNames.${slot} must be 1-50 characters of letters, digits or underscores`,
+      };
+    }
+    // Meta REJECTS a Purchase carrying no currency — established in §C by live probe
+    // (error_subcode 2804010), not read from documentation. These two slots are used
+    // precisely when no value can be stated, so naming either of them Purchase would drop
+    // every conversion they carry.
+    if (slot !== 'won' && value.trim() === META_PURCHASE_EVENT) {
+      return {
+        valid: false,
+        error:
+          `eventNames.${slot} cannot be "${META_PURCHASE_EVENT}": Meta requires value and ` +
+          `currency on a Purchase, and this event is used when no value can be stated`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Deterministic per (lead, conversion kind). Deliberately carries no timestamp and no
+ * nonce: a retry — whether ours or a duplicate transition — must produce the SAME id so
+ * Meta collapses it under §E's dedup contract rather than counting it twice.
+ *
+ * Keyed on the KIND rather than the emitted event name, which is also what makes the
+ * per-account name override safe: renaming the event cannot change the identity of a
+ * conversion that has already been sent.
+ */
+export function buildRelayEventId(leadId: string, conversionKind: string): string {
+  return crypto.createHash('sha256').update(`${leadId}:${conversionKind}`).digest('hex');
 }
 
 /**
@@ -216,6 +317,31 @@ export function buildFbcFromFirstTouch(firstTouch: any): string | undefined {
  *
  * Anything else, including a missing field, means off.
  */
+/**
+ * The event-name overrides configured on ONE specific ad account.
+ *
+ * Scoped to the resolved account deliberately. A customer can connect several ad accounts
+ * — the production account this was built against has two — and reading the first
+ * connection's configuration while sending to a different account's pixel is exactly the
+ * multi-account defect ENG-1141 was filed for.
+ *
+ * Returns undefined when nothing is configured, which leaves every §C default in place.
+ */
+export function getEventNameOverrides(
+  owner: any,
+  adAccountId: string,
+): ConversionEventNames | undefined {
+  const accounts = Array.isArray(owner?.connected_accounts) ? owner.connected_accounts : [];
+  const account = accounts.find(
+    (acc: any) =>
+      (acc?.platform === 'meta' || acc?.platform === 'facebook') &&
+      acc?.config?.account_type === 'ad_account' &&
+      String(acc?.account_id) === String(adAccountId),
+  );
+  const names = account?.config?.crmConversionEventNames;
+  return names && typeof names === 'object' && !Array.isArray(names) ? names : undefined;
+}
+
 export function isConversionRelayEnabled(owner: any): boolean {
   if (process.env.META_CONVERSION_RELAY_ENABLED === 'true') return true;
 
@@ -479,7 +605,16 @@ export async function relayLeadStatusEvent(
     // Meta REJECTS a Purchase carrying no currency ("Missing Currency for Purchase Event"),
     // so a won deal whose value we cannot state is sent under a custom event name instead
     // of being lost to a rejection. Verified against Graph v25, not inferred.
-    const eventName = resolveEventName(mapped.conversionKind, customData !== undefined);
+    //
+    // Names are read from the account the pixel actually RESOLVED to, not from whichever
+    // Meta connection happens to be first. A customer with two ad accounts may run a store
+    // pixel on one and CRM conversions on the other, and applying one account's naming to
+    // the other's events is the multi-account bug ENG-1141 already fixed once elsewhere.
+    const eventName = resolveEventName(
+      mapped.conversionKind,
+      customData !== undefined,
+      getEventNameOverrides(owner, resolution.accountId),
+    );
 
     const eventId = buildRelayEventId(leadId, mapped.conversionKind);
     const result = await d.sendEvent(resolution.pixelId, creds.accessToken, {
