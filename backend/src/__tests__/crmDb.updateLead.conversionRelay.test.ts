@@ -271,6 +271,30 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(recovery.UpdateExpression).toContain('list_append');
   });
 
+  it('pending-marker recovery UNIONS with what the scalar already owed', async () => {
+    // Scalar owes 'qualified'; a 'won' becomes owed too. Repairing by dropping and adding
+    // only the new kind would discard the qualified that was never sent.
+    const err: any = new Error('type mismatch');
+    err.code = 'ValidationException';
+    updatePromiseMock.mockRejectedValueOnce(err).mockResolvedValue({});
+    getPromiseMock.mockImplementation(async (params: any) =>
+      String(params?.TableName).endsWith('AW-LeadLists')
+        ? { Item: leadListRow }
+        : { Item: { ...EXISTING_LEAD, metaConversionPending: 'qualified' } },
+    );
+
+    await crmDb.markConversionRelayPending('list-1', 'lead-1', 'won');
+
+    const leadWrites = updateSpy.mock.calls
+      .map((c) => c[0])
+      .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'));
+    const repair = leadWrites[leadWrites.length - 1];
+    expect(repair.UpdateExpression).toBe('SET metaConversionPending = :kinds');
+    expect(new Set(repair.ExpressionAttributeValues[':kinds'].values)).toEqual(
+      new Set(['qualified', 'won']),
+    );
+  });
+
   it('recovers the pending-marker write against a legacy scalar too', async () => {
     const err: any = new Error('type mismatch');
     err.code = 'ValidationException';
@@ -282,9 +306,9 @@ describe('updateLead → conversion relay dispatch', () => {
       .map((c) => c[0])
       .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'))
       .map((p) => p.UpdateExpression);
-    // Drops the bad-shaped attribute, then redoes the ADD.
-    expect(exprs).toContain('REMOVE metaConversionPending');
-    expect(exprs.filter((e) => e === 'ADD metaConversionPending :kinds').length).toBeGreaterThanOrEqual(2);
+    // First attempt is the set ADD; the repair rewrites the attribute in the correct shape.
+    expect(exprs).toContain('ADD metaConversionPending :kinds');
+    expect(exprs).toContain('SET metaConversionPending = :kinds');
   });
 
   it('adds to the pending set rather than overwriting it', async () => {

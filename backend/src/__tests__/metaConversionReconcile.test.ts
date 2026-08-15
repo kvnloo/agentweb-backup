@@ -286,14 +286,31 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     expect(attempted).toContain('good-1');
   });
 
-  it('still has an absolute runaway guard on total attempts', async () => {
-    const many = Array.from({ length: 2500 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
-    getLeadsByListId.mockResolvedValue({ items: many, lastEvaluatedKey: undefined });
-    dispatchLeadStatusConversion.mockRejectedValue(new Error('Meta down'));
+  it('steps over ANY number of failures to reach the lead behind them', async () => {
+    // No ceiling failures can reach, at any size. Every finite one was starvation with a
+    // different number on it, because the sweep restarts from the beginning each tick.
+    const failing = Array.from({ length: 2500 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
+    const good = leadWithPending('good-1', { values: ['won'] });
+    getLeadsByListId.mockResolvedValue({ items: [...failing, good], lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'processed',
+    );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
 
-    expect(summary.failed).toBeLessThan(2500);
+    expect(summary.failed).toBe(2500);
+    expect(summary.dispatched).toBe(1);
+    expect(summary.cappedOut).toBe(false);
+  });
+
+  it('still budgets SUCCESSFUL sends per sweep', async () => {
+    const many = Array.from({ length: 500 }, (_, i) => leadWithPending(`ok-${i}`, { values: ['won'] }));
+    getLeadsByListId.mockResolvedValue({ items: many, lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockResolvedValue('processed');
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.dispatched).toBeLessThan(500);
     expect(summary.cappedOut).toBe(true);
   });
 });

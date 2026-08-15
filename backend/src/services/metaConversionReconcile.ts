@@ -40,19 +40,19 @@ const TAG = '[CAPI Reconcile]';
  *  the marker survives; it must not also become a reason to stop looking. */
 const MAX_DISPATCHES_PER_USER = 200;
 
-/** Absolute runaway guard on ATTEMPTS, successes and failures together.
+/* No failure or attempt ceiling exists, deliberately.
  *
- *  There is deliberately no separate failure ceiling. Any ceiling that failures alone can
- *  reach becomes a starvation mechanism: the sweep has no persistent cursor, so it restarts
- *  from the beginning every tick, hits the same failing prefix, stops, and never reaches the
- *  leads behind them — indefinitely, and well past Meta's attribution window (Greptile P1 on
- *  #2412). Failures no longer stop the sweep; they are attempted and logged, and the scan
- *  keeps going.
+ * Any ceiling that failures can reach on their own is a starvation mechanism here: this
+ * sweep has no persistent cursor, so it restarts from the beginning every tick, hits the
+ * same failing prefix, stops, and never reaches the leads behind it — indefinitely, and well
+ * past Meta's attribution window (Greptile P1 on #2412, twice: once at 500 and again at
+ * 2,000, because the number was never the problem).
  *
- *  This guard is set far above any plausible backlog, since markers only exist at all after
- *  a queue outage. Reaching it means something is genuinely wrong, which is why it logs
- *  loudly rather than passing quietly. */
-const MAX_ATTEMPTS_PER_USER = 2000;
+ * Failures are attempted, logged, and stepped over. The work is still bounded — by the
+ * number of leads actually carrying a marker, which only exist after a queue outage — and
+ * successful sends remain capped by MAX_DISPATCHES_PER_USER, so a healthy backlog is still
+ * spread across sweeps. What is no longer bounded is how many FAILURES the sweep will step
+ * over to reach a lead behind them, which is the whole point. */
 
 /** Page size for walking a list's leads. */
 const LEAD_PAGE_SIZE = 200;
@@ -119,12 +119,8 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
         summary.pendingFound++;
 
         for (const kind of owed) {
-          // Successful work is budgeted; failures are not a reason to stop looking, only
-          // the absolute runaway guard is.
-          if (
-            summary.dispatched >= MAX_DISPATCHES_PER_USER ||
-            summary.dispatched + summary.failed >= MAX_ATTEMPTS_PER_USER
-          ) {
+          // Successful work is budgeted. Failures are never a reason to stop looking.
+          if (summary.dispatched >= MAX_DISPATCHES_PER_USER) {
             summary.cappedOut = true;
             break;
           }
@@ -168,8 +164,7 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
       `${TAG} user ${user.userId}: ${summary.pendingFound} lead(s) owed a conversion — ` +
       `${summary.dispatched} re-dispatched, ${summary.failed} failed, ${summary.noops} already queued` +
       (summary.cappedOut
-        ? `, stopped at a per-sweep ceiling (${summary.dispatched}/${MAX_DISPATCHES_PER_USER} sent, ` +
-          `${summary.dispatched + summary.failed}/${MAX_ATTEMPTS_PER_USER} attempts) — remainder next sweep`
+        ? `, reached the per-sweep send budget (${summary.dispatched}/${MAX_DISPATCHES_PER_USER}) — remainder next sweep`
         : ''),
     );
   }

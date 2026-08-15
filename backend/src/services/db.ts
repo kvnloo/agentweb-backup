@@ -6112,14 +6112,26 @@ export const crmDb = {
         await addKind();
       } catch (error: any) {
         if (error?.code !== 'ValidationException') throw error;
+
+        // Read before repairing. Dropping the attribute and adding only the new kind would
+        // discard whatever the scalar already owed — so a lead owing a `qualified` would
+        // lose it the moment a `won` became owed too, which is the marker destroying the
+        // very record it exists to keep (Greptile P1 on #2412, the same mistake as
+        // appendMetaConversionSent's recovery, one function over). Union, then write.
+        const current = await dynamodb
+          .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+          .promise();
+        const merged = new Set(parsePendingKinds((current.Item as any)?.metaConversionPending));
+        merged.add(conversionKind);
+
         await dynamodb
           .update({
             TableName: `${TABLE_PREFIX}AW-Leads`,
             Key: { listId, leadId },
-            UpdateExpression: 'REMOVE metaConversionPending',
+            UpdateExpression: 'SET metaConversionPending = :kinds',
+            ExpressionAttributeValues: { ':kinds': dynamodb.createSet([...merged]) },
           })
           .promise();
-        await addKind();
       }
       console.warn(
         `[CRM] lead ${leadId} marked as owing a "${conversionKind}" Meta conversion — ` +
