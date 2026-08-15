@@ -12,6 +12,7 @@ export type LlmChargeAuditEvent = {
   billingUserId: string; eventId: string; occurredAt: string; actingUserId: string;
   tokens: number; costMicroUsd: number; model?: string; provider?: string; feature?: string;
   sessionId?: string;
+  counterAppliedAt?: string;
 };
 
 export async function recordLlmChargeEvent(event: LlmChargeAuditEvent): Promise<boolean> {
@@ -36,5 +37,14 @@ export async function listLlmChargeEvents(billingUserId: string, start: string, 
     ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
     ScanIndexForward: false,
   }).promise();
-  return (result.Items || []) as LlmChargeAuditEvent[];
+  return ((result.Items || []) as LlmChargeAuditEvent[]).filter((event) => !!event.counterAppliedAt);
+}
+
+export async function markLlmChargeApplied(billingUserId: string, eventId: string): Promise<void> {
+  await db().update({
+    TableName: LLM_CHARGE_EVENTS_TABLE,
+    Key: { billingUserId, eventId },
+    UpdateExpression: 'SET counterAppliedAt = :now',
+    ExpressionAttributeValues: { ':now': new Date().toISOString() },
+  }).promise();
 }

@@ -4,7 +4,7 @@ import { inheritsOrgBilling } from "./orgAuthz";
 import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
-import { recordLlmChargeEvent } from './llmChargeAuditDb';
+import { markLlmChargeApplied, recordLlmChargeEvent } from './llmChargeAuditDb';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -374,6 +374,7 @@ export async function incrementUserTokenUsage(
         );
       }
     }
+    await markLlmChargeApplied(billingUserId, eventId);
   } catch (error) {
     // Don't block message flow on usage tracking failures
     console.error(`[tokenUsageService] Failed to increment usage for ${userId}:`, error);
