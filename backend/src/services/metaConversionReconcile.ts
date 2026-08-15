@@ -134,6 +134,7 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
               // authoritative.
               conversionKind: kind as ConversionKind,
               statusConfig: list.statusConfig,
+              conversionMapping: list.conversionMapping,
             });
 
             // The budget exists to bound Meta calls, so only an actual SEND spends it.

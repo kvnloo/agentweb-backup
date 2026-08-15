@@ -337,3 +337,100 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(relaySpy).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * ENG-926 §F — when a conversion was relayed, not merely that it was.
+ *
+ * `metaConversionsSent` records the KIND with no timestamp, so "how many CRM conversions
+ * did we send Meta last Tuesday" is unanswerable from it — which is exactly the number
+ * §F's divergence check has to compare against Meta's own count. `closedDate` does not
+ * fill the gap: dealDb auto-sets it on a DEAL stage change, and the lead status path never
+ * writes it.
+ *
+ * A separate append-only list rather than a map keyed by kind, deliberately. DynamoDB
+ * rejects an update whose document paths overlap, so `SET #x = if_not_exists(#x, :empty)`
+ * cannot be combined with `SET #x.#kind = :ts` in one statement — the alternatives are a
+ * read-modify-write (racy, and the defect Greptile filed twice on #2412) or a second round
+ * trip. list_append with if_not_exists is atomic, is already the proven idiom in this
+ * function, and cannot collide with a legacy shape because nothing has ever written this
+ * attribute. Fire-once bounds it at one entry per kind per lead.
+ */
+describe('appendMetaConversionSent — recording WHEN, for §F', () => {
+  it('appends a timestamped entry alongside the kind, atomically', async () => {
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toContain('list_append(if_not_exists(#log, :empty), :logEntry)');
+    expect(params.ExpressionAttributeNames['#log']).toBe('metaConversionsSentLog');
+
+    const [entry] = params.ExpressionAttributeValues[':logEntry'];
+    expect(entry.kind).toBe('won');
+    expect(entry.at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  });
+
+  it('records WHICH pixel the conversion was sent to', async () => {
+    // Without the destination the divergence check compares every logged send against
+    // whichever pixel resolves today. A customer who connects a second ad account, or
+    // changes which one is default, silently has their history compared against a pixel it
+    // never went to (Greptile on #2413).
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won', '1012387921717047');
+
+    const [entry] = leadUpdateParams().ExpressionAttributeValues[':logEntry'];
+    expect(entry.pixel).toBe('1012387921717047');
+  });
+
+  it('omits the pixel rather than writing undefined when none was supplied', async () => {
+    // DynamoDB rejects an undefined attribute value inside a map, so an omitted pixel has
+    // to be genuinely absent — and absent is also what every row written before this
+    // change looks like.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const [entry] = leadUpdateParams().ExpressionAttributeValues[':logEntry'];
+    expect(entry).not.toHaveProperty('pixel');
+    expect(entry.kind).toBe('won');
+  });
+
+  it('still does not touch updatedAt', async () => {
+    // Re-asserted here rather than trusted: the §F addition edits this exact expression,
+    // and updatedAt is a GSI range key whose write throws on legacy rows.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).not.toContain('updatedAt');
+  });
+
+  it('leaves the fire-once guard exactly as it was', async () => {
+    // The log is additional bookkeeping. If it changed what the condition guards, a lead
+    // could relay the same conversion twice.
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const params = leadUpdateParams();
+    expect(params.ConditionExpression).toBe('attribute_not_exists(#m) OR NOT contains(#m, :event)');
+    expect(params.ExpressionAttributeValues[':event']).toBe('won');
+  });
+
+  it('records the timestamp on the scalar-recovery path too', async () => {
+    // A row that needed self-healing must not silently lose its history — that row is
+    // precisely the one whose accounting is already suspect.
+    const err: any = new Error('type mismatch');
+    err.code = 'ValidationException';
+    updatePromiseMock.mockRejectedValueOnce(err);
+    getPromiseMock.mockResolvedValueOnce({ Item: { metaConversionPending: 'qualified' } });
+
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won', 'px-recovery');
+
+    const leadUpdates = updateSpy.mock.calls
+      .map((c) => c[0])
+      .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'));
+    const recovery = leadUpdates[leadUpdates.length - 1];
+
+    expect(recovery.UpdateExpression).toContain('list_append(if_not_exists(#log, :empty), :logEntry)');
+    expect(recovery.ExpressionAttributeValues[':logEntry'][0].kind).toBe('won');
+    expect(recovery.ExpressionAttributeValues[':logEntry'][0].pixel).toBe('px-recovery');
+    // The survivor rewrite must still be intact — the whole reason this path exists.
+    expect(recovery.ExpressionAttributeValues[':survivors']).toEqual({
+      values: ['qualified'],
+      type: 'String',
+    });
+  });
+});

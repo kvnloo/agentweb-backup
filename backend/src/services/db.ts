@@ -5042,6 +5042,10 @@ export const crmDb = {
       engagedOnly?: boolean;
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      /** ENG-926 §F — which status means "qualified" for the Meta conversion relay.
+       *  `{ qualifiedStatus: null }` turns QualifiedLead off for this list; omitting the
+       *  field entirely leaves the relay matching by name, as it did before. */
+      conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: 'sales' | 'customers';
       syncConfig?: {
         platform: 'hubspot' | 'attio';
@@ -5171,6 +5175,18 @@ export const crmDb = {
         expressionAttributeNames['#lastImportMapping'] = 'lastImportMapping';
         updateExpressions.push('#lastImportMapping = :lastImportMapping');
         expressionAttributeValues[':lastImportMapping'] = updates.lastImportMapping;
+      }
+
+      // Field-by-field, like every other key here — a field absent from this function is
+      // silently dropped with every test still passing, which is exactly how §C's metaFbp
+      // shipped doing nothing.
+      if (updates.conversionMapping !== undefined) {
+        // A stored `null` returns the list to matching by name, which is a different
+        // statement from `{ qualifiedStatus: null }` — that turns the conversion off.
+        // Both round-trip correctly, so the write needs no special case for either.
+        expressionAttributeNames['#conversionMapping'] = 'conversionMapping';
+        updateExpressions.push('#conversionMapping = :conversionMapping');
+        expressionAttributeValues[':conversionMapping'] = updates.conversionMapping;
       }
 
       if (updates.statusConfig !== undefined) {
@@ -6201,7 +6217,21 @@ export const crmDb = {
     }
   },
 
-  async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
+  async appendMetaConversionSent(
+    listId: string,
+    leadId: string,
+    eventName: string,
+    /** Which Meta pixel this conversion was actually sent to (ENG-926 §F). Without it the
+     *  divergence check compares every logged send against whichever pixel resolves today,
+     *  so a customer who connects a second ad account has their history compared against a
+     *  pixel it never went to. Optional because rows written before this existed have none. */
+    pixelId?: string,
+  ): Promise<void> {
+    // Built once and shared by both write paths below. `pixel` is omitted entirely when
+    // unknown — DynamoDB rejects an undefined value inside a map, and absent is also
+    // exactly what a pre-existing row looks like.
+    const logEntry: Record<string, string> = { kind: eventName, at: new Date().toISOString() };
+    if (pixelId) logEntry.pixel = pixelId;
     try {
       await dynamodb
         .update({
@@ -6222,14 +6252,27 @@ export const crmDb = {
           // whole marker wiped an unrelated owed conversion — a successful `won` erased an
           // outstanding `qualified` that had never been sent (Greptile on #2412). DELETE on
           // a set removes just that member, and drops the attribute when it empties.
+          //
+          // The timestamped log (ENG-926 §F) rides the SAME write, so a recorded send and
+          // its timestamp can never disagree. `metaConversionsSent` carries no time, which
+          // makes "how many conversions did we relay last Tuesday" unanswerable — the
+          // exact number §F's divergence check compares against Meta's own count.
+          // An append-only list, not a map keyed by kind: DynamoDB rejects overlapping
+          // document paths, so `SET #x = if_not_exists(#x, :empty)` cannot be combined
+          // with `SET #x.#kind = :ts`, and the alternatives are a read-modify-write (racy —
+          // the defect Greptile filed twice on #2412) or a second round trip. Fire-once
+          // bounds this at one entry per kind per lead.
           UpdateExpression:
-            'SET #m = list_append(if_not_exists(#m, :empty), :new) DELETE metaConversionPending :kinds',
+            'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+            '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+            'DELETE metaConversionPending :kinds',
           ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
-          ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+          ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
           ExpressionAttributeValues: {
             ':empty': [],
             ':new': [eventName],
             ':event': eventName,
+            ':logEntry': [logEntry],
             ':kinds': dynamodb.createSet([eventName]),
           },
         })
@@ -6262,15 +6305,23 @@ export const crmDb = {
             .update({
               TableName: `${TABLE_PREFIX}AW-Leads`,
               Key: { listId, leadId },
+              // The §F log is written here too. A row that needed self-healing is exactly
+              // the one whose accounting is already suspect, so it is the last place to
+              // silently drop its history.
               UpdateExpression: survivors.length > 0
-                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), metaConversionPending = :survivors'
-                : 'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
+                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry), ' +
+                  'metaConversionPending = :survivors'
+                : 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+                  'REMOVE metaConversionPending',
               ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
-              ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+              ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
               ExpressionAttributeValues: {
                 ':empty': [],
                 ':new': [eventName],
                 ':event': eventName,
+                ':logEntry': [logEntry],
                 ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
               },
             })
@@ -7042,6 +7093,7 @@ export const crmDb = {
                 lead: result.Attributes as any,
                 previousStatus,
                 statusConfig: (list as any).statusConfig,
+                conversionMapping: (list as any).conversionMapping,
                 // On a retry of an owed conversion the lead's CURRENT status may no longer
                 // be the one that earned it, so the recorded kind wins — same reasoning as
                 // the queued payload's kind. `undefined` means "use the live transition".

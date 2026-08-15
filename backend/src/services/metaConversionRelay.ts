@@ -81,12 +81,32 @@ const normalize = (value: unknown): string =>
  * stop relaying revenue the moment someone edits a label.
  *
  * `qualified` has no such type to key off (it is `active`, like every other mid-funnel
- * status), so it IS matched by name against value and label. Accepted limitation, stated
- * plainly: a customer who renames "Qualified" to something else stops emitting
- * QualifiedLead. That is the safe direction to fail — the alternative is guessing at
- * which mid-funnel status means MQL and firing conversions the customer never asked for.
+ * status). It is matched by name against value and label by DEFAULT, and a list may
+ * override that with a `ConversionMapping` — which is how a customer who calls it "SQL"
+ * keeps emitting QualifiedLead. Without an override the name match still applies, because
+ * the alternative is guessing which mid-funnel status means MQL and firing conversions
+ * nobody asked for.
  */
 export type ConversionKind = 'won' | 'qualified';
+
+/**
+ * Per-list override for which CRM status means "qualified" (ENG-926 §F).
+ *
+ * §C shipped matching `qualified` by name and recorded the limitation openly: renaming
+ * the status silently stops the conversion. "Silently" is the part worth fixing — this
+ * card exists because of a failure nobody could see.
+ *
+ * Only `qualified` is configurable. Won resolves by the status entry's `type`, which a
+ * customer cannot rename out from under it, so it needs no mapping.
+ *
+ * Three distinct states, deliberately:
+ *   - absent / `{}`          — nothing configured; match by name, as §C does today
+ *   - `{ qualifiedStatus: 'sql' }` — that status, and ONLY that status, is qualified
+ *   - `{ qualifiedStatus: null }`  — QualifiedLead is off for this list entirely
+ */
+export interface ConversionMapping {
+  qualifiedStatus?: string | null;
+}
 
 /**
  * `conversionKind` is the stable identity of the conversion; the Meta event NAME is chosen
@@ -98,6 +118,7 @@ export type ConversionKind = 'won' | 'qualified';
 export function mapStatusToMetaEvent(
   statusConfig: LeadStatusConfigEntry[] | undefined | null,
   status: string | undefined | null,
+  conversionMapping?: ConversionMapping | null,
 ): { conversionKind: ConversionKind; isValueEvent: boolean } | null {
   const wanted = normalize(status);
   if (!wanted) return null;
@@ -106,31 +127,154 @@ export function mapStatusToMetaEvent(
   const entry = config.find((e) => normalize(e.value) === wanted);
   if (!entry) return null;
 
+  // Checked first, and unconditionally. A won-typed status is a closed deal whatever else
+  // it has been configured as, and resolving toward the event that carries revenue is the
+  // only deterministic answer to a contradictory configuration.
   if (entry.type === 'won') {
     return { conversionKind: 'won', isValueEvent: true };
   }
+
+  // An explicit `null` means the customer turned QualifiedLead off. That is a different
+  // statement from leaving it unset, which still means "guess by name" — so the two must
+  // not collapse into the same branch.
+  if (conversionMapping && 'qualifiedStatus' in conversionMapping && conversionMapping.qualifiedStatus === null) {
+    return null;
+  }
+
+  const configured = normalize(conversionMapping?.qualifiedStatus);
+  if (configured) {
+    // Authoritative once set: the name match no longer applies. Leaving it as a fallback
+    // would emit QualifiedLead for TWO statuses — the chosen one and any that happens to
+    // be called "qualified" — a conversion the customer never asked for, on a relay whose
+    // entire premise is not sending those.
+    return normalize(entry.value) === configured || normalize(entry.label) === configured
+      ? { conversionKind: 'qualified', isValueEvent: false }
+      : null;
+  }
+
   if (normalize(entry.value) === 'qualified' || normalize(entry.label) === 'qualified') {
     return { conversionKind: 'qualified', isValueEvent: false };
   }
   return null;
 }
 
+/**
+ * Per-ad-account override of the emitted Meta event names (ENG-926 §F).
+ *
+ * §C hardcodes `Purchase` for a closed-won. A customer whose store pixel already uses
+ * `Purchase` for e-commerce orders gets CRM deals blended into the event their campaign
+ * optimisation reads, with no way to separate them afterwards. The relay is opt-in, so
+ * that is consented rather than imposed — but consenting to it should not be the only
+ * option available.
+ *
+ * Renaming is safe against double-counting, and not by luck: fire-once reads
+ * `metaConversionsSent`, which stores the conversion KIND, and `buildRelayEventId` is
+ * called with the kind as well. Neither depends on the emitted name, so a lead that fired
+ * `Purchase` cannot fire again under a new name.
+ *
+ * The three slots are independent because they are three different events to Meta, and
+ * one of them structurally cannot carry a value.
+ */
+export interface ConversionEventNames {
+  /** Closed-won whose value can be stated. Default `Purchase`. */
+  won?: string | null;
+  /** Closed-won whose value cannot be stated. Default `CRMWonDeal`. */
+  wonNoValue?: string | null;
+  /** Qualified lead. Default `QualifiedLead`. */
+  qualified?: string | null;
+}
+
+const EVENT_NAME_SLOTS: Array<keyof ConversionEventNames> = ['won', 'wonNoValue', 'qualified'];
+
+/** Meta accepts letters, digits and underscores in a custom event name. Anything else is
+ *  rejected at send time, which would turn a configuration typo into silently dropped
+ *  conversions — so it is refused when set instead. */
+const EVENT_NAME_PATTERN = /^[A-Za-z0-9_]{1,50}$/;
+
+/** A usable override, or undefined when the slot is unset, blank, or not a string. */
+function overrideFor(
+  overrides: ConversionEventNames | null | undefined,
+  slot: keyof ConversionEventNames,
+): string | undefined {
+  const value = overrides?.[slot];
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 /** The Meta event name for a conversion, given whether its value could be stated. */
 export function resolveEventName(
   conversionKind: ConversionKind,
   hasValue: boolean,
+  overrides?: ConversionEventNames | null,
 ): string {
-  if (conversionKind !== 'won') return META_QUALIFIED_EVENT;
-  return hasValue ? META_PURCHASE_EVENT : META_WON_NO_VALUE_EVENT;
+  if (conversionKind !== 'won') {
+    return overrideFor(overrides, 'qualified') ?? META_QUALIFIED_EVENT;
+  }
+  return hasValue
+    ? overrideFor(overrides, 'won') ?? META_PURCHASE_EVENT
+    : overrideFor(overrides, 'wonNoValue') ?? META_WON_NO_VALUE_EVENT;
 }
 
 /**
- * Deterministic per (lead, event). Deliberately carries no timestamp and no nonce: a retry
- * — whether ours or a duplicate transition — must produce the SAME id so Meta collapses it
- * under §E's dedup contract rather than counting it twice.
+ * Validate an override configuration before it is stored.
+ *
+ * Refusing a bad name here rather than at send time is the whole point: a rejected event
+ * is a lost conversion recorded only in a log, which is the class of silent failure this
+ * card exists to end.
  */
-export function buildRelayEventId(leadId: string, eventName: string): string {
-  return crypto.createHash('sha256').update(`${leadId}:${eventName}`).digest('hex');
+export function validateEventNameOverrides(
+  overrides: unknown,
+): { valid: true } | { valid: false; error: string } {
+  if (overrides === undefined || overrides === null) return { valid: true };
+  if (typeof overrides !== 'object' || Array.isArray(overrides)) {
+    return { valid: false, error: 'eventNames must be an object' };
+  }
+
+  for (const key of Object.keys(overrides as Record<string, unknown>)) {
+    // A typo'd slot would otherwise be stored, do nothing, and read as configured.
+    if (!EVENT_NAME_SLOTS.includes(key as keyof ConversionEventNames)) {
+      return { valid: false, error: `unknown event name slot "${key}"` };
+    }
+  }
+
+  for (const slot of EVENT_NAME_SLOTS) {
+    const value = (overrides as ConversionEventNames)[slot];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string' || !EVENT_NAME_PATTERN.test(value.trim())) {
+      return {
+        valid: false,
+        error: `eventNames.${slot} must be 1-50 characters of letters, digits or underscores`,
+      };
+    }
+    // Meta REJECTS a Purchase carrying no currency — established in §C by live probe
+    // (error_subcode 2804010), not read from documentation. These two slots are used
+    // precisely when no value can be stated, so naming either of them Purchase would drop
+    // every conversion they carry.
+    if (slot !== 'won' && value.trim() === META_PURCHASE_EVENT) {
+      return {
+        valid: false,
+        error:
+          `eventNames.${slot} cannot be "${META_PURCHASE_EVENT}": Meta requires value and ` +
+          `currency on a Purchase, and this event is used when no value can be stated`,
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Deterministic per (lead, conversion kind). Deliberately carries no timestamp and no
+ * nonce: a retry — whether ours or a duplicate transition — must produce the SAME id so
+ * Meta collapses it under §E's dedup contract rather than counting it twice.
+ *
+ * Keyed on the KIND rather than the emitted event name, which is also what makes the
+ * per-account name override safe: renaming the event cannot change the identity of a
+ * conversion that has already been sent.
+ */
+export function buildRelayEventId(leadId: string, conversionKind: string): string {
+  return crypto.createHash('sha256').update(`${leadId}:${conversionKind}`).digest('hex');
 }
 
 /**
@@ -173,6 +317,31 @@ export function buildFbcFromFirstTouch(firstTouch: any): string | undefined {
  *
  * Anything else, including a missing field, means off.
  */
+/**
+ * The event-name overrides configured on ONE specific ad account.
+ *
+ * Scoped to the resolved account deliberately. A customer can connect several ad accounts
+ * — the production account this was built against has two — and reading the first
+ * connection's configuration while sending to a different account's pixel is exactly the
+ * multi-account defect ENG-1141 was filed for.
+ *
+ * Returns undefined when nothing is configured, which leaves every §C default in place.
+ */
+export function getEventNameOverrides(
+  owner: any,
+  adAccountId: string,
+): ConversionEventNames | undefined {
+  const accounts = Array.isArray(owner?.connected_accounts) ? owner.connected_accounts : [];
+  const account = accounts.find(
+    (acc: any) =>
+      (acc?.platform === 'meta' || acc?.platform === 'facebook') &&
+      acc?.config?.account_type === 'ad_account' &&
+      String(acc?.account_id) === String(adAccountId),
+  );
+  const names = account?.config?.crmConversionEventNames;
+  return names && typeof names === 'object' && !Array.isArray(names) ? names : undefined;
+}
+
 export function isConversionRelayEnabled(owner: any): boolean {
   if (process.env.META_CONVERSION_RELAY_ENABLED === 'true') return true;
 
@@ -207,7 +376,7 @@ export interface RelayDeps {
   ) => Promise<{ success: true; fbtraceId?: string; usage?: any } | { success: false; error: string; usage?: any }>;
   /** Atomic single-event append. Takes ONE event, not the whole array: handing it a list
    *  would reintroduce the read-modify-write race it exists to remove. */
-  recordSent: (listId: string, leadId: string, eventName: string) => Promise<void>;
+  recordSent: (listId: string, leadId: string, conversionKind: string, pixelId?: string) => Promise<void>;
   /** Release a pending marker whose conversion is settled and will never be sent. */
   clearPending?: (listId: string, leadId: string, conversionKind: string) => Promise<void>;
   shouldAttemptSend: (listId: string) => boolean;
@@ -221,6 +390,10 @@ export interface RelayContext {
   lead: Record<string, any>;
   previousStatus?: string | null;
   statusConfig?: LeadStatusConfigEntry[] | null;
+  /** The list's per-list conversion mapping, if it has one. Threaded alongside
+   *  statusConfig at every call site because they answer the same question together:
+   *  which status means what. */
+  conversionMapping?: ConversionMapping | null;
   /** The conversion recorded when the transition actually happened, carried through the
    *  queue so a retry honours THAT rather than re-deriving one from whatever the lead's
    *  status says now. Absent on the first, inline attempt, where current state is the
@@ -263,7 +436,8 @@ async function defaultDeps(): Promise<RelayDeps> {
       return { ...creds, currency };
     },
     sendEvent: (pixelId, accessToken, event) => metaService.sendCapiLeadEvent(pixelId, accessToken, event as any),
-    recordSent: (listId, leadId, eventName) => crmDb.appendMetaConversionSent(listId, leadId, eventName),
+    recordSent: (listId, leadId, conversionKind, pixelId) =>
+      crmDb.appendMetaConversionSent(listId, leadId, conversionKind, pixelId),
     clearPending: (listId, leadId, kind) => crmDb.clearConversionRelayPending(listId, leadId, kind),
     shouldAttemptSend: shouldAttemptCapiSend,
     isAccountPaused: isCapiAccountPaused,
@@ -316,7 +490,7 @@ export async function relayLeadStatusEvent(
   // the current status maps to. Used only to release a marker on a settled skip.
   const ctxKindForClear =
     ctx.conversionKind ??
-    mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead?.status)?.conversionKind ??
+    mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead?.status, ctx.conversionMapping)?.conversionKind ??
     '';
 
   // A skip that reaches here AFTER the status mapped to a real conversion event is worth
@@ -357,7 +531,7 @@ export async function relayLeadStatusEvent(
     // on the inline first attempt, where they are the same thing.
     const mapped = ctx.conversionKind
       ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
-      : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
+      : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status, ctx.conversionMapping);
     if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false, false, true);
 
     // §B's opt-out, honored here rather than waiting for the consent field: contactStatus
@@ -432,7 +606,16 @@ export async function relayLeadStatusEvent(
     // Meta REJECTS a Purchase carrying no currency ("Missing Currency for Purchase Event"),
     // so a won deal whose value we cannot state is sent under a custom event name instead
     // of being lost to a rejection. Verified against Graph v25, not inferred.
-    const eventName = resolveEventName(mapped.conversionKind, customData !== undefined);
+    //
+    // Names are read from the account the pixel actually RESOLVED to, not from whichever
+    // Meta connection happens to be first. A customer with two ad accounts may run a store
+    // pixel on one and CRM conversions on the other, and applying one account's naming to
+    // the other's events is the multi-account bug ENG-1141 already fixed once elsewhere.
+    const eventName = resolveEventName(
+      mapped.conversionKind,
+      customData !== undefined,
+      getEventNameOverrides(owner, resolution.accountId),
+    );
 
     const eventId = buildRelayEventId(leadId, mapped.conversionKind);
     const result = await d.sendEvent(resolution.pixelId, creds.accessToken, {
@@ -475,7 +658,9 @@ export async function relayLeadStatusEvent(
     );
 
     try {
-      await d.recordSent(listId, leadId, mapped.conversionKind);
+      // The pixel is recorded alongside the kind so §F's divergence check can tell a send
+      // that went to THIS pixel from one that went to a different account's.
+      await d.recordSent(listId, leadId, mapped.conversionKind, resolution.pixelId);
     } catch (error: any) {
       // The send already happened and Meta has it. Losing the bookkeeping write means a
       // later transition could re-attempt — which the deterministic event_id makes safe,
@@ -543,6 +728,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
     userId: payload.userId,
     lead,
     statusConfig: (list as any)?.statusConfig,
+    conversionMapping: (list as any)?.conversionMapping,
     conversionKind: payload.conversionKind,
   });
 
@@ -680,7 +866,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
   // table free of a row for every `new -> contacted` in the product.
   const mapped = ctx.conversionKind
     ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
-    : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
+    : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status, ctx.conversionMapping);
   if (!mapped) return 'noop';
 
   const dedupeKey = `${ctx.listId}:${leadId}:${mapped.conversionKind}`;
