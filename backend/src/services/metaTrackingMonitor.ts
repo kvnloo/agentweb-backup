@@ -183,3 +183,82 @@ export function countAttributedConversions(actions: any[] | undefined | null): A
 
   return { conversions, unrecognized };
 }
+
+/**
+ * How many CONSECUTIVE spending days with no attributed conversion constitute a blackout.
+ *
+ * Three, not one: a single quiet day is ordinary variance on a small account, and an alert
+ * that fires on variance gets muted. Three days of real spend with nothing back is not
+ * variance. Every.io ran 24 such days; RankAI's entire tracked lifetime was one.
+ */
+export const BLACKOUT_CONSECUTIVE_DAYS = 3;
+
+export interface AdAccountDay {
+  date: string;
+  spend: number;
+  conversions: number;
+  unrecognized: string[];
+}
+
+export type AdAccountVerdict = {
+  /**
+   * `idle` — nothing was spent, so there is nothing to conclude. Distinct from `ok` on
+   *   purpose: most accounts are dormant, and a dormant account is neither healthy nor
+   *   broken. Reporting it as `ok` would let a paused campaign read as a passing check.
+   * `ok` — spend produced conversions.
+   * `blackout` — sustained spend, nothing back. This is AC4.
+   * `unclassifiable` — sustained spend, nothing back, BUT unknown action types were seen
+   *   on the same days, so the zero may be our vocabulary rather than their tracking.
+   */
+  status: 'idle' | 'ok' | 'blackout' | 'unclassifiable';
+  consecutiveBlackoutDays: number;
+  spendInBlackout: number;
+  unrecognized: string[];
+};
+
+/**
+ * Decide whether a run of daily rows is a blackout.
+ *
+ * Two rules that look like details and are not:
+ *
+ * Zero-spend days are EXCLUDED from the evidence rather than counted as blackout days. A
+ * paused campaign spends nothing and converts nothing; counting that would alert on every
+ * dormant account, which today is nearly all of them, and the alert would be muted before
+ * it ever caught a real one.
+ *
+ * Zero-spend days also do not BREAK a streak. An outage that happens to span a weekend
+ * pause is still one outage, and letting the pause reset the counter would hide exactly
+ * the long-running failures this exists to find.
+ *
+ * The streak is measured from the most recent day backwards. A gap earlier in the window
+ * is history that may already be fixed; re-alerting on it every day forever is how an
+ * alert channel becomes noise.
+ */
+export function evaluateAdAccountDays(days: AdAccountDay[]): AdAccountVerdict {
+  const spendingDays = (Array.isArray(days) ? days : []).filter((d) => Number(d?.spend) > 0);
+  if (spendingDays.length === 0) {
+    return { status: 'idle', consecutiveBlackoutDays: 0, spendInBlackout: 0, unrecognized: [] };
+  }
+
+  const streak: AdAccountDay[] = [];
+  for (let i = spendingDays.length - 1; i >= 0; i--) {
+    if (spendingDays[i].conversions !== 0) break;
+    streak.push(spendingDays[i]);
+  }
+
+  if (streak.length < BLACKOUT_CONSECUTIVE_DAYS) {
+    return { status: 'ok', consecutiveBlackoutDays: streak.length, spendInBlackout: 0, unrecognized: [] };
+  }
+
+  const spendInBlackout = streak.reduce((sum, d) => sum + Number(d.spend || 0), 0);
+  // Only the days being used as EVIDENCE can cast doubt on the verdict. An unknown action
+  // type on a healthy day earlier in the window says nothing about this streak.
+  const unrecognized = [...new Set(streak.flatMap((d) => d.unrecognized || []))];
+
+  return {
+    status: unrecognized.length > 0 ? 'unclassifiable' : 'blackout',
+    consecutiveBlackoutDays: streak.length,
+    spendInBlackout,
+    unrecognized,
+  };
+}
