@@ -12,6 +12,11 @@ jest.mock('../../services/metaTrackingMonitor', () => ({
   monitorUserTracking: (...a: any[]) => monitorUserTracking(...a),
 }));
 
+const checkConversionDivergenceForUser = jest.fn();
+jest.mock('../../services/metaConversionDivergence', () => ({
+  checkConversionDivergenceForUser: (...a: any[]) => checkConversionDivergenceForUser(...a),
+}));
+
 const getAllUsers = jest.fn();
 jest.mock('../../services/db', () => ({
   userDb: { getAllUsers: (...a: any[]) => getAllUsers(...a) },
@@ -34,6 +39,7 @@ const summary = (over: any = {}) => ({
 beforeEach(() => {
   jest.clearAllMocks();
   monitorUserTracking.mockResolvedValue(summary());
+  checkConversionDivergenceForUser.mockResolvedValue({ status: 'skipped' });
 });
 
 describe('metaTrackingMonitorCron', () => {
@@ -92,5 +98,49 @@ describe('metaTrackingMonitorCron', () => {
     const result = await runMetaTrackingMonitor();
     expect(result.usersScanned).toBe(0);
     expect(monitorUserTracking).not.toHaveBeenCalled();
+  });
+});
+
+describe('metaTrackingMonitorCron — the divergence half', () => {
+  it('runs the divergence check for every user too', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+
+    await runMetaTrackingMonitor();
+
+    expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('counts only accounts whose relayed conversions are not arriving', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }, { userId: 'u3' }]);
+    checkConversionDivergenceForUser
+      .mockResolvedValueOnce({ status: 'not-arriving', crmSent: 5, metaSeen: 0 })
+      .mockResolvedValueOnce({ status: 'ok', crmSent: 5, metaSeen: 5 })
+      .mockResolvedValueOnce({ status: 'skipped' });
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.conversionDivergences).toBe(1);
+  });
+
+  it('keeps the two checks independent — one failing must not suppress the other', async () => {
+    // They answer different questions. A divergence check that throws must not make an
+    // account with real spend and zero conversions go unexamined.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    checkConversionDivergenceForUser.mockRejectedValue(new Error('boom'));
+    monitorUserTracking.mockResolvedValue(summary({ blackouts: 1 }));
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.blackouts).toBe(1);
+    expect(result.usersScanned).toBe(1);
+  });
+
+  it('still runs the divergence check when the spend sweep threw', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockRejectedValue(new Error('boom'));
+
+    await runMetaTrackingMonitor();
+
+    expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(1);
   });
 });
