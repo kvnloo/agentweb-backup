@@ -107,8 +107,17 @@ export async function computeClickIdCoverage(
   }
 
   for (const list of leadLists) {
+    // Everything this list contributes is buffered until it has been read IN FULL.
+    //
+    // A list that fails on page 2 has already yielded page 1, and folding those leads
+    // straight into the running totals leaves an undercounted list inside a number that
+    // reads as complete — while the list itself is separately reported as unreadable. The
+    // daily buckets and the undated tally are separate accumulators and would each carry
+    // the same partial data, so all three are buffered together (Greptile on #2413).
     let listLeads = 0;
     let listWith = 0;
+    let listUndated = 0;
+    const listDaily = new Map<string, { leads: number; withClickId: number }>();
     let startKey: any = undefined;
     let failed = false;
 
@@ -127,28 +136,36 @@ export async function computeClickIdCoverage(
       for (const lead of (page?.items || []) as any[]) {
         const created = Date.parse(lead?.createdAt ?? '');
         if (!Number.isFinite(created)) {
-          undated++;
+          listUndated++;
           continue;
         }
         if (created < cutoff) continue;
 
         const covered = hasClickId(lead);
         const day = new Date(created).toISOString().slice(0, 10);
-        const bucket = daily.get(day) || { leads: 0, withClickId: 0 };
+        const bucket = listDaily.get(day) || { leads: 0, withClickId: 0 };
         bucket.leads++;
         if (covered) bucket.withClickId++;
-        daily.set(day, bucket);
+        listDaily.set(day, bucket);
 
         listLeads++;
         if (covered) listWith++;
-        totalLeads++;
-        if (covered) totalWith++;
       }
 
       startKey = page?.lastEvaluatedKey;
     } while (startKey);
 
+    // Commit only a list that was read end to end.
     if (!failed) {
+      for (const [day, bucket] of listDaily) {
+        const running = daily.get(day) || { leads: 0, withClickId: 0 };
+        running.leads += bucket.leads;
+        running.withClickId += bucket.withClickId;
+        daily.set(day, running);
+      }
+      totalLeads += listLeads;
+      totalWith += listWith;
+      undated += listUndated;
       lists.push({ listId: list.listId, name: list.name, ...finalize(listLeads, listWith) });
     }
   }

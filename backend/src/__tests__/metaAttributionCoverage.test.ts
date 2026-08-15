@@ -177,6 +177,68 @@ describe('computeClickIdCoverage — resilience', () => {
     expect(result.unreadableLists).toEqual(['L1']);
   });
 
+  it('discards a list that failed MID-pagination, rather than keeping its first page', async () => {
+    // The failure that matters: page 1 succeeds and page 2 throws. Counting page 1 puts a
+    // partial, undercounted list into the totals and the daily trend while the list itself
+    // is reported unreadable — a number that looks complete and is not. Greptile on #2413.
+    const getLeads = jest.fn(async (listId: string, _limit: number, startKey: any) => {
+      if (listId === 'L1') {
+        if (!startKey) {
+          return { items: [lead('2026-08-14T10:00:00Z', { fbclid: 'a' })], lastEvaluatedKey: { k: 1 } };
+        }
+        throw new Error('dynamo down on page 2');
+      }
+      return { items: [lead('2026-08-14T10:00:00Z')], lastEvaluatedKey: null };
+    });
+
+    const result = await computeClickIdCoverage('u1', 30, {
+      getLeadLists: jest.fn().mockResolvedValue([{ listId: 'L1' }, { listId: 'L2' }]),
+      getLeads,
+      now: Date.parse('2026-08-15T12:00:00Z'),
+    } as any);
+
+    // Only L2's single lead survives. L1's first page must not be in ANY total.
+    expect(result.totals.leads).toBe(1);
+    expect(result.totals.withClickId).toBe(0);
+    expect(result.unreadableLists).toEqual(['L1']);
+    expect(result.lists.map((l: any) => l.listId)).toEqual(['L2']);
+  });
+
+  it('keeps a partially-read list out of the daily trend too', async () => {
+    // The daily buckets are a separate accumulator from the totals, so they need the same
+    // treatment — a trend line built from half a list is its own wrong answer.
+    const getLeads = jest.fn(async (_listId: string, _limit: number, startKey: any) => {
+      if (!startKey) {
+        return { items: [lead('2026-08-14T10:00:00Z', { fbclid: 'a' })], lastEvaluatedKey: { k: 1 } };
+      }
+      throw new Error('dynamo down on page 2');
+    });
+
+    const result = await computeClickIdCoverage('u1', 30, {
+      getLeadLists: jest.fn().mockResolvedValue([{ listId: 'L1' }]),
+      getLeads,
+      now: Date.parse('2026-08-15T12:00:00Z'),
+    } as any);
+
+    expect(result.daily).toEqual([]);
+    expect(result.totals.leads).toBe(0);
+  });
+
+  it('does not let a partially-read list inflate the undated count either', async () => {
+    const getLeads = jest.fn(async (_listId: string, _limit: number, startKey: any) => {
+      if (!startKey) return { items: [{ leadId: 'no-date' }], lastEvaluatedKey: { k: 1 } };
+      throw new Error('boom');
+    });
+
+    const result = await computeClickIdCoverage('u1', 30, {
+      getLeadLists: jest.fn().mockResolvedValue([{ listId: 'L1' }]),
+      getLeads,
+      now: Date.parse('2026-08-15T12:00:00Z'),
+    } as any);
+
+    expect(result.totals.undated).toBe(0);
+  });
+
   it('returns an empty result when the user has no lists', async () => {
     const result = await computeClickIdCoverage('u1', 30, deps([], {}) as any);
     expect(result.totals.leads).toBe(0);
