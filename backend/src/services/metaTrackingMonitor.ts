@@ -184,6 +184,97 @@ export function countAttributedConversions(actions: any[] | undefined | null): A
   return { conversions, unrecognized };
 }
 
+export interface MonitorFetchDeps {
+  fetchImpl: typeof fetch;
+}
+
+export type AdAccountActivity = {
+  /**
+   * `token_error` exists as a separate status for a specific reason: an expired token
+   * returns no rows, and no rows is indistinguishable from a dormant account. A monitor
+   * that swallowed it would report healthy silence for an account it can no longer see —
+   * rebuilding the exact failure the card exists to prevent, inside the fix for it.
+   * Not hypothetical: one production ad account carried a dead token the day this shipped.
+   */
+  status: 'ok' | 'token_error' | 'fetch_error';
+  days: AdAccountDay[];
+  error?: string;
+};
+
+/**
+ * One day of daily-granularity insights for an ad account.
+ *
+ * `time_increment=1` and an explicit `actions` field are BOTH required and neither is the
+ * default. `metaService.getInsights` requests neither, which is why
+ * `businessFunnelService`'s lead count reads `row.actions` that never arrives and is
+ * therefore structurally always zero. That omission is silent — the call succeeds, the
+ * number is simply always 0 — which is why the request shape is pinned by a test.
+ */
+export async function fetchDailyAdAccountActivity(
+  adAccountId: string,
+  accessToken: string,
+  days: number,
+  deps?: MonitorFetchDeps,
+): Promise<AdAccountActivity> {
+  const fetchImpl = deps?.fetchImpl ?? fetch;
+  const apiVersion = process.env.META_API_VERSION || 'v25.0';
+  const params = new URLSearchParams({
+    fields: 'spend,actions,date_start',
+    level: 'account',
+    time_increment: '1',
+    date_preset: dayWindowToPreset(days),
+  });
+  // The token goes in a header-shaped query param only at call time and is never part of
+  // the string retained for logging: this URL reaches error logs on failure, and a
+  // credential in a log is a leak that outlives the incident.
+  const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?${params}`;
+
+  try {
+    const response = await fetchImpl(`${url}&access_token=${encodeURIComponent(accessToken)}`);
+    const body: any = await response.json();
+
+    if (!response.ok || body?.error) {
+      const error = body?.error || {};
+      // Code 190 is Meta's "this token is no longer usable" — expired, revoked, or
+      // invalidated by a password change. Every other OAuthException (17 is the user
+      // request limit) is transient and resolves without anyone re-authorising, so
+      // reporting it as a dead token would send a human to fix nothing.
+      const isDeadToken = error?.code === 190;
+      return {
+        status: isDeadToken ? 'token_error' : 'fetch_error',
+        days: [],
+        error: typeof error?.message === 'string' ? error.message : `HTTP ${response.status}`,
+      };
+    }
+
+    const rows: any[] = Array.isArray(body?.data) ? body.data : [];
+    return {
+      status: 'ok',
+      days: rows.map((row) => {
+        const counted = countAttributedConversions(row?.actions);
+        return {
+          date: String(row?.date_start ?? ''),
+          spend: Number.parseFloat(row?.spend ?? '0') || 0,
+          conversions: counted.conversions,
+          unrecognized: counted.unrecognized,
+        };
+      }),
+    };
+  } catch (error: any) {
+    // A network failure must never abort the sweep — the next account still needs checking.
+    return { status: 'fetch_error', days: [], error: error?.message || 'request failed' };
+  }
+}
+
+/** Meta accepts only a fixed set of presets; map the requested window onto the smallest
+ *  one that covers it rather than computing explicit dates, which drift across timezones. */
+function dayWindowToPreset(days: number): string {
+  if (days <= 7) return 'last_7d';
+  if (days <= 14) return 'last_14d';
+  if (days <= 30) return 'last_30d';
+  return 'last_90d';
+}
+
 /**
  * How many CONSECUTIVE spending days with no attributed conversion constitute a blackout.
  *
