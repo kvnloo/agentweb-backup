@@ -220,6 +220,42 @@ describe('updateLead → conversion relay dispatch', () => {
     expect(params.ExpressionAttributeValues[':kinds']).toEqual({ values: ['won'], type: 'String' });
   });
 
+  it('recovers when a lead still carries the legacy SCALAR marker (set ops would reject)', async () => {
+    // DynamoDB rejects the whole update with ValidationException if ADD/DELETE hit a scalar
+    // attribute. Left unhandled, the send goes unrecorded and reconciliation re-dispatches
+    // the same conversion forever.
+    const err: any = new Error('type mismatch');
+    err.code = 'ValidationException';
+    updatePromiseMock.mockRejectedValueOnce(err).mockResolvedValue({});
+
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const leadWrites = updateSpy.mock.calls
+      .map((c) => c[0])
+      .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'));
+    // Second attempt drops the set DELETE and uses REMOVE, which works on any type.
+    const recovery = leadWrites[leadWrites.length - 1];
+    expect(recovery.UpdateExpression).toContain('REMOVE metaConversionPending');
+    expect(recovery.UpdateExpression).not.toContain('DELETE metaConversionPending');
+    expect(recovery.UpdateExpression).toContain('list_append');
+  });
+
+  it('recovers the pending-marker write against a legacy scalar too', async () => {
+    const err: any = new Error('type mismatch');
+    err.code = 'ValidationException';
+    updatePromiseMock.mockRejectedValueOnce(err).mockResolvedValue({});
+
+    await crmDb.markConversionRelayPending('list-1', 'lead-1', 'won');
+
+    const exprs = updateSpy.mock.calls
+      .map((c) => c[0])
+      .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-Leads'))
+      .map((p) => p.UpdateExpression);
+    // Drops the bad-shaped attribute, then redoes the ADD.
+    expect(exprs).toContain('REMOVE metaConversionPending');
+    expect(exprs.filter((e) => e === 'ADD metaConversionPending :kinds').length).toBeGreaterThanOrEqual(2);
+  });
+
   it('adds to the pending set rather than overwriting it', async () => {
     await crmDb.markConversionRelayPending('list-1', 'lead-1', 'qualified');
 

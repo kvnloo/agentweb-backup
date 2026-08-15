@@ -520,18 +520,38 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
   try {
     const payload = JSON.parse(job.payload);
     await processor(payload);
-    if (deleteOnCompleteSources.has(job.source)) {
-      await dynamodb.delete({ TableName: TABLE_NAME, Key: { id: job.id } }).promise();
-    } else {
-      await dynamodb
-        .update({
-          TableName: TABLE_NAME,
-          Key: { id: job.id },
-          UpdateExpression: 'SET #status = :completed, updatedAt = :now',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
-        })
-        .promise();
+
+    // Bookkeeping, NOT processing. It sits outside the failure path deliberately: the work
+    // is already done by this point, so letting a failed status write count as a processing
+    // failure would increment attempts and rewrite completed work as pending or failed —
+    // eventually exhausting the attempt budget and re-running side effects that already
+    // happened (Greptile P1 on #2412). One retry, then log; a stuck row is recovered by
+    // stale reclamation, whereas a mis-counted attempt is not recoverable at all.
+    const writeTerminalState = () =>
+      deleteOnCompleteSources.has(job.source)
+        ? dynamodb.delete({ TableName: TABLE_NAME, Key: { id: job.id } }).promise()
+        : dynamodb
+            .update({
+              TableName: TABLE_NAME,
+              Key: { id: job.id },
+              UpdateExpression: 'SET #status = :completed, updatedAt = :now',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
+            })
+            .promise();
+    try {
+      await writeTerminalState();
+    } catch (firstError: any) {
+      try {
+        await writeTerminalState();
+      } catch (secondError: any) {
+        console.error(
+          `[AsyncJobQueue] job ${job.id} PROCESSED successfully but its terminal write failed ` +
+          `twice — the row stays claimed until stale reclamation; it must NOT be counted as a ` +
+          `processing failure:`,
+          secondError?.message ?? secondError,
+        );
+      }
     }
   } catch (error: any) {
     const attempts = (job.attempts ?? 0) + 1;

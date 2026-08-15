@@ -6086,8 +6086,13 @@ export const crmDb = {
    * makes sure the fact is not lost.
    */
   async markConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
-    try {
-      await dynamodb
+    // ADD/DELETE are set operations, and DynamoDB rejects the WHOLE update with a
+    // ValidationException if the stored attribute is a scalar string — the shape this field
+    // had in an earlier commit of this branch. Reads tolerate that shape, so writes must
+    // too, or a lead carrying it can never record or clear an owed conversion (Greptile P1
+    // on #2412). Recovery is to drop the bad-shaped attribute and redo the write.
+    const addKind = () =>
+      dynamodb
         .update({
           TableName: `${TABLE_PREFIX}AW-Leads`,
           Key: { listId, leadId },
@@ -6101,6 +6106,21 @@ export const crmDb = {
           ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
         })
         .promise();
+
+    try {
+      try {
+        await addKind();
+      } catch (error: any) {
+        if (error?.code !== 'ValidationException') throw error;
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Leads`,
+            Key: { listId, leadId },
+            UpdateExpression: 'REMOVE metaConversionPending',
+          })
+          .promise();
+        await addKind();
+      }
       console.warn(
         `[CRM] lead ${leadId} marked as owing a "${conversionKind}" Meta conversion — ` +
         `the queue was unavailable, so this is the durable record of it`,
@@ -6150,6 +6170,35 @@ export const crmDb = {
       // a failure. Anything else is worth surfacing, but never worth throwing into a relay
       // whose Meta send has already succeeded.
       if (error?.code === 'ConditionalCheckFailedException') return;
+
+      // Same set-vs-scalar hazard as markConversionRelayPending: a lead still carrying the
+      // scalar shape makes the DELETE clause reject the ENTIRE update, so the send would go
+      // unrecorded and reconciliation would dispatch it again and again. Retry recording the
+      // send while clearing the bad-shaped marker with REMOVE, which works on any type
+      // (Greptile P1 on #2412).
+      if (error?.code === 'ValidationException') {
+        try {
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              UpdateExpression:
+                'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
+              ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+              ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+              ExpressionAttributeValues: { ':empty': [], ':new': [eventName], ':event': eventName },
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          if (retryError?.code === 'ConditionalCheckFailedException') return;
+          console.error(
+            `[CRM] appendMetaConversionSent recovery failed for lead ${leadId} (${eventName}): ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+
       console.error(
         `[CRM] appendMetaConversionSent failed for lead ${leadId} (${eventName}): ${error?.message}`,
       );
