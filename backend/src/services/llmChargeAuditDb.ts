@@ -4,7 +4,7 @@
  */
 import AWS from "aws-sdk";
 
-const TABLE_NAME = `${process.env.NODE_ENV === "development" ? "Dev-" : ""}AW-LlmChargeEvents`;
+export const LLM_CHARGE_EVENTS_TABLE = `${process.env.NODE_ENV === "development" ? "Dev-" : ""}AW-LlmChargeEvents`;
 let client: AWS.DynamoDB.DocumentClient | null = null;
 const db = () => (client ||= new AWS.DynamoDB.DocumentClient());
 
@@ -17,7 +17,7 @@ export type LlmChargeAuditEvent = {
 export async function recordLlmChargeEvent(event: LlmChargeAuditEvent): Promise<boolean> {
   try {
     await db().put({
-      TableName: TABLE_NAME,
+      TableName: LLM_CHARGE_EVENTS_TABLE,
       Item: { ...event, ttl: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60 },
       // Retries are harmless: the counter caller must not apply a second charge.
       ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
@@ -31,7 +31,7 @@ export async function recordLlmChargeEvent(event: LlmChargeAuditEvent): Promise<
 
 export async function listLlmChargeEvents(billingUserId: string, start: string, end: string): Promise<LlmChargeAuditEvent[]> {
   const result = await db().query({
-    TableName: TABLE_NAME,
+    TableName: LLM_CHARGE_EVENTS_TABLE,
     KeyConditionExpression: "billingUserId = :user AND eventId BETWEEN :start AND :end",
     ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
     ScanIndexForward: false,

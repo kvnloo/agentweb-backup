@@ -22,8 +22,21 @@ import { LOOP_LEARNING_TABLE } from '../loops/core/learning/dynamoLearningStore'
 import { LOOP_DISPATCHES_TABLE } from './loopDispatchTracker';
 import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboardingMetricsService';
 import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './contactEventsDb';
+import { LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
+  {
+    TableName: LLM_CHARGE_EVENTS_TABLE,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  },
   {
     TableName: LOOP_EVENTS_TABLE,
     AttributeDefinitions: [
