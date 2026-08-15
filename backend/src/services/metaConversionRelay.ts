@@ -570,7 +570,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * What it must not do is fail quietly: a conversion nobody knows was lost is the exact
  * problem this card exists to fix, so the give-up path says so explicitly.
  */
-async function runInlineFallback(ctx: RelayContext, dedupeKey: string): Promise<void> {
+async function runInlineFallback(
+  ctx: RelayContext,
+  dedupeKey: string,
+  kind: ConversionKind,
+): Promise<void> {
   console.warn(
     `[CAPI Relay] no durable record possible for ${dedupeKey} — falling back to ` +
     `${INLINE_FALLBACK_ATTEMPTS} in-process attempts`,
@@ -589,9 +593,23 @@ async function runInlineFallback(ctx: RelayContext, dedupeKey: string): Promise<
     if (attempt < INLINE_FALLBACK_ATTEMPTS) await sleep(250 * attempt);
   }
 
+  // Nothing durable exists in the queue, so leave the record where we know writes work: on
+  // the lead itself. The status update that triggered this just succeeded against that
+  // table, so it is the one place still demonstrably reachable. This is what turns
+  // "exhausted and gone" into "exhausted and recoverable" (Greptile on #2412) — §F's
+  // reconciliation sweep consumes these, and appendMetaConversionSent clears them.
+  try {
+    const { crmDb } = await import('./db');
+    await crmDb.markConversionRelayPending(ctx.listId, ctx.lead.leadId, kind);
+  } catch (error: any) {
+    console.error(
+      `[CAPI Relay] could not even record ${dedupeKey} as pending: ${error?.message}`,
+    );
+  }
+
   console.error(
-    `[CAPI Relay] inline fallback exhausted for ${dedupeKey} and no retry can be recorded — ` +
-    `this conversion is LOST: ${last}`,
+    `[CAPI Relay] inline fallback exhausted for ${dedupeKey}; the conversion is recorded as ` +
+    `PENDING on the lead for reconciliation rather than lost: ${last}`,
   );
 }
 
@@ -645,7 +663,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     // succeeded and the replacement write did not — an earlier version returned here, having
     // deleted the only record of the conversion and done nothing with it, which is strictly
     // worse than the terminal failure it was trying to recover (Greptile on #2412).
-    await runInlineFallback(ctx, dedupeKey);
+    await runInlineFallback(ctx, dedupeKey, mapped.conversionKind);
     return;
   }
 

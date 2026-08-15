@@ -34,12 +34,14 @@ const updateLead = jest.fn().mockResolvedValue({});
 // which reaches userDb.getUserById — NOT crmDb.getLeadById — so only this handle can make
 // that path fail. Getting that wrong made an earlier version of the test assert nothing.
 const getUserById = jest.fn().mockResolvedValue(null);
+const markConversionRelayPending = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...a: any[]) => getLeadById(...a),
     getLeadListById: (...a: any[]) => getLeadListById(...a),
     updateLead: (...a: any[]) => updateLead(...a),
     appendMetaConversionSent: jest.fn().mockResolvedValue(undefined),
+    markConversionRelayPending: (...a: any[]) => markConversionRelayPending(...a),
   },
   userDb: { getUserById: (...a: any[]) => getUserById(...a) },
 }));
@@ -63,6 +65,7 @@ beforeEach(() => {
   enqueueJob.mockResolvedValue('enqueued');
   clearFailedJob.mockResolvedValue(false);
   getUserById.mockResolvedValue(null);
+  markConversionRelayPending.mockResolvedValue(undefined);
   getLeadById.mockResolvedValue(LEAD);
   getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', statusConfig: STATUS_CONFIG });
 });
@@ -143,7 +146,8 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     // failure it was recovering, because now nothing records the conversion at all.
     enqueueJob.mockResolvedValueOnce('duplicate').mockResolvedValue('unavailable');
     clearFailedJob.mockResolvedValue(true);
-    getUserById.mockResolvedValue(null); // terminal skip, so the fallback stops after one go
+    getUserById.mockResolvedValue(null);
+  markConversionRelayPending.mockResolvedValue(undefined); // terminal skip, so the fallback stops after one go
 
     await dispatchLeadStatusConversion(ctx());
 
@@ -184,14 +188,37 @@ describe('dispatchLeadStatusConversion — queueing', () => {
 
   it('stops retrying immediately on a TERMINAL skip — a correct outcome is not hammered', async () => {
     enqueueJob.mockResolvedValue('unavailable');
-    getUserById.mockResolvedValue(null); // owner missing => terminal skip
+    getUserById.mockResolvedValue(null);
+  markConversionRelayPending.mockResolvedValue(undefined); // owner missing => terminal skip
 
     await dispatchLeadStatusConversion(ctx());
 
     expect(getUserById).toHaveBeenCalledTimes(1);
   });
 
-  it('says so explicitly when a conversion is lost — never silently', async () => {
+  it('leaves recoverable work on the LEAD when the queue cannot hold it', async () => {
+    // The queue is the durable store; when it is unreachable the conversion would simply be
+    // gone once the in-process attempts run out. The leads table is demonstrably writable —
+    // the status update that triggered all this just succeeded against it — so the owed
+    // conversion is recorded there for §F's sweep instead of being lost.
+    enqueueJob.mockResolvedValue('unavailable');
+    getUserById.mockRejectedValue(new Error('DynamoDB down'));
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(markConversionRelayPending).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
+  });
+
+  it('does not mark pending when the inline fallback actually succeeded', async () => {
+    enqueueJob.mockResolvedValue('unavailable');
+    getUserById.mockResolvedValue(null); // terminal skip — a correct outcome, nothing owed
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(markConversionRelayPending).not.toHaveBeenCalled();
+  });
+
+  it('says so explicitly rather than silently, and calls it pending not lost', async () => {
     enqueueJob.mockResolvedValue('unavailable');
     getUserById.mockRejectedValue(new Error('DynamoDB down'));
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -199,7 +226,7 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     await dispatchLeadStatusConversion(ctx());
 
     const said = errSpy.mock.calls.map((c) => String(c[0])).join(' ');
-    expect(said).toContain('LOST');
+    expect(said).toContain('PENDING');
     errSpy.mockRestore();
   });
 });

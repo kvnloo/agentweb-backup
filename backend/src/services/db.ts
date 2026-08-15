@@ -6071,6 +6071,42 @@ export const crmDb = {
    * idempotent: concurrent relays for different events both survive, and a repeat of the
    * same event is refused by the condition rather than duplicated into the list.
    */
+  /**
+   * ENG-926 §C: record that a conversion is owed to Meta but could not be queued.
+   *
+   * The relay's durable retry lives in the async job table. When THAT table is unreachable,
+   * the in-process fallback is all there is, and once it is exhausted the conversion would
+   * simply be gone — "no recoverable work left behind" (Greptile on #2412). This writes the
+   * owed conversion onto the lead instead, in a table we know is writable because the status
+   * update that triggered all of this just succeeded against it.
+   *
+   * Cleared automatically by appendMetaConversionSent when the conversion eventually lands.
+   * Consuming these markers is the reconciliation sweep's job (§F); this side of it just
+   * makes sure the fact is not lost.
+   */
+  async markConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Same reasoning as appendMetaConversionSent: no updatedAt. It is a GSI range key,
+          // and this is bookkeeping, not a user edit.
+          UpdateExpression: 'SET metaConversionPending = :kind',
+          ExpressionAttributeValues: { ':kind': conversionKind },
+        })
+        .promise();
+      console.warn(
+        `[CRM] lead ${leadId} marked as owing a "${conversionKind}" Meta conversion — ` +
+        `the queue was unavailable, so this is the durable record of it`,
+      );
+    } catch (error: any) {
+      console.error(
+        `[CRM] markConversionRelayPending failed for lead ${leadId}: ${error?.message}`,
+      );
+    }
+  },
+
   async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
     try {
       await dynamodb
@@ -6088,7 +6124,9 @@ export const crmDb = {
           // Behaviour: this is internal bookkeeping, not a user edit. Bumping updatedAt
           // would reorder the customer's CRM list under an updatedAt sort and mark leads as
           // recently-touched because a Meta event fired, which is not something they did.
-          UpdateExpression: 'SET #m = list_append(if_not_exists(#m, :empty), :new)',
+          // Clearing the pending marker in the SAME write that records the send: two
+          // writes could leave a lead marked pending for a conversion that already went.
+          UpdateExpression: 'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
           ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
           ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
           ExpressionAttributeValues: {
