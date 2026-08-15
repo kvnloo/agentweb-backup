@@ -6238,14 +6238,27 @@ export const crmDb = {
           // whole marker wiped an unrelated owed conversion — a successful `won` erased an
           // outstanding `qualified` that had never been sent (Greptile on #2412). DELETE on
           // a set removes just that member, and drops the attribute when it empties.
+          //
+          // The timestamped log (ENG-926 §F) rides the SAME write, so a recorded send and
+          // its timestamp can never disagree. `metaConversionsSent` carries no time, which
+          // makes "how many conversions did we relay last Tuesday" unanswerable — the
+          // exact number §F's divergence check compares against Meta's own count.
+          // An append-only list, not a map keyed by kind: DynamoDB rejects overlapping
+          // document paths, so `SET #x = if_not_exists(#x, :empty)` cannot be combined
+          // with `SET #x.#kind = :ts`, and the alternatives are a read-modify-write (racy —
+          // the defect Greptile filed twice on #2412) or a second round trip. Fire-once
+          // bounds this at one entry per kind per lead.
           UpdateExpression:
-            'SET #m = list_append(if_not_exists(#m, :empty), :new) DELETE metaConversionPending :kinds',
+            'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+            '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+            'DELETE metaConversionPending :kinds',
           ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
-          ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+          ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
           ExpressionAttributeValues: {
             ':empty': [],
             ':new': [eventName],
             ':event': eventName,
+            ':logEntry': [{ kind: eventName, at: new Date().toISOString() }],
             ':kinds': dynamodb.createSet([eventName]),
           },
         })
@@ -6278,15 +6291,23 @@ export const crmDb = {
             .update({
               TableName: `${TABLE_PREFIX}AW-Leads`,
               Key: { listId, leadId },
+              // The §F log is written here too. A row that needed self-healing is exactly
+              // the one whose accounting is already suspect, so it is the last place to
+              // silently drop its history.
               UpdateExpression: survivors.length > 0
-                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), metaConversionPending = :survivors'
-                : 'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
+                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry), ' +
+                  'metaConversionPending = :survivors'
+                : 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+                  'REMOVE metaConversionPending',
               ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
-              ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+              ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
               ExpressionAttributeValues: {
                 ':empty': [],
                 ':new': [eventName],
                 ':event': eventName,
+                ':logEntry': [{ kind: eventName, at: new Date().toISOString() }],
                 ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
               },
             })
