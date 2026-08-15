@@ -194,6 +194,26 @@ export async function buildAlertContext(
     const linkTarget = preferred ?? fired[0];
     if (linkTarget?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(linkTarget.id);
 
+    // Say so when the ranking is a HEURISTIC rather than the configured pixel.
+    //
+    // `resolveMetaPixelWithDefault` returns the OWNER's default pixel, and an owner with
+    // several connected ad accounts may have that default sitting on a different account
+    // from the one alerting. That id is then correctly discarded — it is not on this
+    // account — but the diagnosis quietly reverts to "most recently fired", which ignores
+    // CAPI. Falling back is the right behaviour; doing it silently is not, because the
+    // reader cannot tell a confirmed diagnosis from a guess (Greptile, fourth pass on
+    // #2415).
+    if (!preferred && fired.length > 0) {
+      context['Pixel Selection'] =
+        (preferredPixelId
+          ? `This account's configured pixel could not be determined — the owner's default ` +
+            `(${preferredPixelId}) belongs to a different ad account. `
+          : `This account's configured pixel could not be determined. `) +
+        'The pixels below are ranked by most recent browser activity, which IGNORES ' +
+        'CAPI events — a pixel taking only server-side conversions can look stale here. ' +
+        'Confirm the dataset in Events Manager before concluding anything from the match keys.';
+    }
+
     const sections: string[] = [];
     let anySupplied = false;
     for (const pixel of fired) {

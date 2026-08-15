@@ -396,3 +396,46 @@ describe('buildAlertContext — the configured pixel wins over recency', () => {
     expect(ctx['Meta Events Manager']).toBeDefined();
   });
 });
+
+describe('buildAlertContext — never let a heuristic pass as a diagnosis', () => {
+  const twoPixels = [
+    { id: 'px-a', last_fired_time: '2026-01-01T00:00:00-0400' },
+    { id: 'px-b', last_fired_time: '2026-08-14T19:59:40-0400' },
+  ];
+
+  it('flags when the owner default belongs to a DIFFERENT ad account', async () => {
+    // resolveMetaPixelWithDefault returns the owner's default. An owner with several
+    // connected accounts can have that default on another account entirely; discarding it
+    // is right, doing so silently is not.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-on-another-account'),
+      getPixels: jest.fn().mockResolvedValue(twoPixels),
+    } as any);
+
+    expect(String(ctx['Pixel Selection'])).toContain('px-on-another-account');
+    expect(String(ctx['Pixel Selection'])).toMatch(/different ad account/i);
+    expect(String(ctx['Pixel Selection'])).toMatch(/ignores\s+CAPI/i);
+  });
+
+  it('flags when no configured pixel resolves at all', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue(undefined),
+      getPixels: jest.fn().mockResolvedValue(twoPixels),
+    } as any);
+
+    expect(String(ctx['Pixel Selection'])).toMatch(/could not be determined/i);
+  });
+
+  it('stays quiet when the configured pixel IS on this account', async () => {
+    // Nothing to caveat: the diagnosis is confirmed rather than inferred.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-b'),
+      getPixels: jest.fn().mockResolvedValue(twoPixels),
+    } as any);
+
+    expect(ctx).not.toHaveProperty('Pixel Selection');
+  });
+});
