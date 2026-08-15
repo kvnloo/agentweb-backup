@@ -208,6 +208,8 @@ export interface RelayDeps {
   /** Atomic single-event append. Takes ONE event, not the whole array: handing it a list
    *  would reintroduce the read-modify-write race it exists to remove. */
   recordSent: (listId: string, leadId: string, eventName: string) => Promise<void>;
+  /** Release a pending marker whose conversion is settled and will never be sent. */
+  clearPending?: (listId: string, leadId: string, conversionKind: string) => Promise<void>;
   shouldAttemptSend: (listId: string) => boolean;
   isAccountPaused: (accountId: string) => boolean;
   recordUsage?: (accountId: string, usage?: any) => void;
@@ -233,7 +235,7 @@ export type RelayResult =
    *  budget is exhausted, or Meta has throttled this ad account. Collapsing the two is how
    *  a throttled Purchase gets silently dropped forever: the status never changes again,
    *  so nothing ever re-dispatches it (Greptile P1 on #2412). */
-  | { skipped: true; reason: string; retryable: boolean }
+  | { skipped: true; reason: string; retryable: boolean; settled?: boolean }
   | { failed: true; error: string };
 
 /** Lazily-bound production dependencies. Every Meta import is dynamic: this module is
@@ -262,6 +264,7 @@ async function defaultDeps(): Promise<RelayDeps> {
     },
     sendEvent: (pixelId, accessToken, event) => metaService.sendCapiLeadEvent(pixelId, accessToken, event as any),
     recordSent: (listId, leadId, eventName) => crmDb.appendMetaConversionSent(listId, leadId, eventName),
+    clearPending: (listId, leadId, kind) => crmDb.clearConversionRelayPending(listId, leadId, kind),
     shouldAttemptSend: shouldAttemptCapiSend,
     isAccountPaused: isCapiAccountPaused,
     recordUsage: recordCapiUsage,
@@ -309,6 +312,12 @@ export async function relayLeadStatusEvent(
   const d = deps ?? (await defaultDeps());
   const { listId, userId, lead } = ctx;
   const leadId = lead?.leadId;
+  // Whatever kind this call is about — the queued/marker one when supplied, else whatever
+  // the current status maps to. Used only to release a marker on a settled skip.
+  const ctxKindForClear =
+    ctx.conversionKind ??
+    mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead?.status)?.conversionKind ??
+    '';
 
   // A skip that reaches here AFTER the status mapped to a real conversion event is worth
   // saying out loud. This card exists because a tracking failure was "silent by
@@ -316,14 +325,28 @@ export async function relayLeadStatusEvent(
   // and it also makes the suppression untestable from outside (no log line is
   // indistinguishable from the relay never running). Transitions that never mapped to an
   // event at all stay quiet: every lead moving new -> contacted would otherwise be noise.
-  const skip = (reason: string, mapped: boolean, retryable = false): RelayResult => {
+  /** `settled` marks a skip that resolves the conversion for good — the lead opted out, the
+   *  event already went, it was never a conversion. Those must release any pending marker,
+   *  or the marker outlives its own reason: the sweep re-finds that lead every tick forever,
+   *  spending budget on a conversion that will never be sent and starving the leads behind
+   *  it (Greptile P1 on #2412). A skip that is merely NOT-YET (not enabled, no pixel,
+   *  throttled) keeps its marker, because it genuinely is still owed. */
+  const skip = (
+    reason: string,
+    mapped: boolean,
+    retryable = false,
+    settled = false,
+  ): RelayResult => {
     if (mapped) {
       console.log(
         `[CAPI Relay] skipped for lead ${leadId} (list ${listId}): ${reason}` +
         (retryable ? ' — will retry' : ''),
       );
     }
-    return { skipped: true, reason, retryable };
+    if (settled && leadId) {
+      void d.clearPending?.(listId, leadId, ctxKindForClear).catch(() => {});
+    }
+    return { skipped: true, reason, retryable, settled };
   };
 
   try {
@@ -335,26 +358,26 @@ export async function relayLeadStatusEvent(
     const mapped = ctx.conversionKind
       ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
       : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
-    if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false);
+    if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false, false, true);
 
     // §B's opt-out, honored here rather than waiting for the consent field: contactStatus
     // already carries a lead's explicit decline, and firing a CAPI conversion for someone
     // who opted out is the compliance problem the card names.
     const contactStatus = normalize(lead.contactStatus);
     if (contactStatus === 'unsubscribed' || contactStatus === 'do_not_contact') {
-      return skip(`lead opted out (contactStatus=${lead.contactStatus})`, true);
+      return skip(`lead opted out (contactStatus=${lead.contactStatus})`, true, false, true);
     }
 
     // Never pollute a real ad account with the automated smoke test's synthetic lead —
     // same guard the form-submission path applies (routes/webhooks.ts).
     if (isSmokeTestEmail(lead.email)) {
-      return skip('smoke-test lead', true);
+      return skip('smoke-test lead', true, false, true);
     }
 
     const alreadySent: string[] = Array.isArray(lead.metaConversionsSent) ? lead.metaConversionsSent : [];
     // Keyed on the conversion KIND, not the emitted event name — see mapStatusToMetaEvent.
     if (alreadySent.includes(mapped.conversionKind)) {
-      return skip(`${mapped.conversionKind} conversion already sent for this lead`, true);
+      return skip(`${mapped.conversionKind} conversion already sent for this lead`, true, false, true);
     }
 
     if (!d.shouldAttemptSend(listId)) {
@@ -506,12 +529,12 @@ export interface ConversionRelayJobPayload {
  * over-send is guarded twice — by metaConversionsSent and by Meta's own dedup on a
  * deterministic event_id. The asymmetry decides it.
  */
-export async function processConversionRelayJob(payload: ConversionRelayJobPayload): Promise<void> {
+export async function processConversionRelayJob(payload: ConversionRelayJobPayload): Promise<boolean> {
   const { crmDb } = await import('./db');
   const lead = await crmDb.getLeadById(payload.listId, payload.leadId);
   if (!lead) {
     console.log(`[CAPI Relay] lead ${payload.leadId} no longer exists — dropping queued conversion`);
-    return;
+    return false;
   }
   const list = await crmDb.getLeadListById(payload.listId);
 
@@ -530,6 +553,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
   if ('skipped' in result && result.retryable) {
     throw new Error(result.reason);
   }
+  return 'sent' in result;
 }
 
 /** Registered at boot (imported for its side effect from app.ts). The poller warns and
@@ -631,7 +655,10 @@ export type DispatchOutcome =
   | 'noop'
   /** A live or freshly-created job elsewhere owns it — real progress, but not ours. */
   | 'already-queued'
-  /** We processed it inline (sent, terminally skipped, or failed and left retryable). */
+  /** We processed it inline and a conversion actually reached Meta. */
+  | 'sent'
+  /** We processed it inline and nothing was sent — settled or not-yet. Real progress, but
+   *  it must not consume a send budget, or a prefix of such leads blocks every sweep. */
   | 'processed'
   /** No durable record was possible; the inline fallback ran. */
   | 'fallback';
@@ -711,8 +738,9 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
   }
 
   const stopHeartbeat = startHeartbeat(RELAY_QUEUE_SOURCE, dedupeKey);
+  let sent = false;
   try {
-    await processConversionRelayJob(payload);
+    sent = await processConversionRelayJob(payload);
     // Deleted, not completed. The dedupe key is derived from durable business state, so a
     // lingering 'completed' row rejects every later enqueue for this lead+conversion —
     // including the legitimate retry after a customer opts in, or connects the pixel that
@@ -726,5 +754,5 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<D
   } finally {
     stopHeartbeat();
   }
-  return 'processed';
+  return sent ? 'sent' : 'processed';
 }

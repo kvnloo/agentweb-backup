@@ -322,8 +322,10 @@ describe('processConversionRelayJob — a retry re-reads state, it does not repl
   it('drops the job when the lead has since been deleted', async () => {
     getLeadById.mockResolvedValue(null);
 
+    // Returns whether a conversion actually reached Meta — false here, and no throw, so the
+    // queue treats the job as finished rather than retrying a lead that no longer exists.
     await expect(processConversionRelayJob({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' }))
-      .resolves.toBeUndefined();
+      .resolves.toBe(false);
   });
 
   it('re-reads the lead for current state (opt-out, already-sent, contact details)', async () => {
@@ -363,7 +365,7 @@ describe('processConversionRelayJob — a retry re-reads state, it does not repl
     // userDb.getUserById is mocked to null → relay skips as "owner not found", terminal.
     await expect(
       processConversionRelayJob({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 });
 

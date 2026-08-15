@@ -11,7 +11,7 @@
  * costs nothing at all for the customers who have not opted in — which today is all of them.
  */
 
-const dispatchLeadStatusConversion = jest.fn().mockResolvedValue('processed');
+const dispatchLeadStatusConversion = jest.fn().mockResolvedValue('sent');
 jest.mock('../services/metaConversionRelay', () => {
   const actual = jest.requireActual('../services/metaConversionRelay');
   return {
@@ -221,7 +221,7 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
 
     // Every 'bad-' lead fails; the one behind them succeeds.
     dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
-      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta rejected')) : 'processed',
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta rejected')) : 'sent',
     );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
@@ -241,7 +241,7 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     const good = leadWithPending('good-1', { values: ['won'] });
     getLeadsByListId.mockResolvedValue({ items: [...owned, good], lastEvaluatedKey: undefined });
     dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
-      String(ctx.lead.leadId).startsWith('owned-') ? 'already-queued' : 'processed',
+      String(ctx.lead.leadId).startsWith('owned-') ? 'already-queued' : 'sent',
     );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
@@ -275,7 +275,7 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     const good = leadWithPending('good-1', { values: ['won'] });
     getLeadsByListId.mockResolvedValue({ items: [...failing, good], lastEvaluatedKey: undefined });
     dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
-      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'processed',
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'sent',
     );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
@@ -293,7 +293,7 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     const good = leadWithPending('good-1', { values: ['won'] });
     getLeadsByListId.mockResolvedValue({ items: [...failing, good], lastEvaluatedKey: undefined });
     dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
-      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'processed',
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta down')) : 'sent',
     );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
@@ -303,10 +303,27 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     expect(summary.cappedOut).toBe(false);
   });
 
+  it('a prefix of leads that never SEND does not exhaust the budget', async () => {
+    // e.g. leads that opted out after their markers were written: dispatch processes them
+    // but nothing reaches Meta. Counting those as sends let them block every sweep.
+    const nonSending = Array.from({ length: 400 }, (_, i) => leadWithPending(`settled-${i}`, { values: ['won'] }));
+    const good = leadWithPending('good-1', { values: ['won'] });
+    getLeadsByListId.mockResolvedValue({ items: [...nonSending, good], lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
+      String(ctx.lead.leadId).startsWith('settled-') ? 'processed' : 'sent',
+    );
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.dispatched).toBe(1);
+    expect(summary.noops).toBe(400);
+    expect(summary.cappedOut).toBe(false);
+  });
+
   it('still budgets SUCCESSFUL sends per sweep', async () => {
     const many = Array.from({ length: 500 }, (_, i) => leadWithPending(`ok-${i}`, { values: ['won'] }));
     getLeadsByListId.mockResolvedValue({ items: many, lastEvaluatedKey: undefined });
-    dispatchLeadStatusConversion.mockResolvedValue('processed');
+    dispatchLeadStatusConversion.mockResolvedValue('sent');
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
 

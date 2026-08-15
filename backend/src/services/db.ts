@@ -6144,6 +6144,63 @@ export const crmDb = {
     }
   },
 
+  /**
+   * ENG-926 §C: release one owed conversion without recording a send.
+   *
+   * For a marker whose conversion is settled rather than sent — the lead opted out, the
+   * event already went, the status was never a conversion. Leaving it would outlive its own
+   * reason: reconciliation re-finds that lead on every sweep forever, spending budget on a
+   * conversion that will never be sent and starving the leads behind it (Greptile P1 on
+   * #2412).
+   *
+   * Tolerates the scalar shape the field started as, for the same reason its siblings do: a
+   * set DELETE against a scalar rejects the whole update.
+   */
+  async clearConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    if (!conversionKind) return;
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'DELETE metaConversionPending :kinds',
+          ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ValidationException') {
+        try {
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== conversionKind);
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              UpdateExpression: survivors.length > 0
+                ? 'SET metaConversionPending = :survivors'
+                : 'REMOVE metaConversionPending',
+              ...(survivors.length > 0
+                ? { ExpressionAttributeValues: { ':survivors': dynamodb.createSet(survivors) } }
+                : {}),
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          console.error(
+            `[CRM] clearConversionRelayPending recovery failed for lead ${leadId}: ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+      console.error(
+        `[CRM] clearConversionRelayPending failed for lead ${leadId} (${conversionKind}): ${error?.message}`,
+      );
+    }
+  },
+
   async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
     try {
       await dynamodb

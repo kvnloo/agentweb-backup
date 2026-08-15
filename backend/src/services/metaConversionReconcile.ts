@@ -136,11 +136,13 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
               statusConfig: list.statusConfig,
             });
 
-            // Only real work counts against the budget. A marker whose conversion is already
-            // owned by a live job costs nothing and leaves the marker in place to be
-            // re-found, so counting it would let a cluster of such rows exhaust the sweep
-            // every tick and starve everything behind them (Greptile P1 on #2412).
-            if (outcome === 'processed' || outcome === 'fallback') {
+            // The budget exists to bound Meta calls, so only an actual SEND spends it.
+            // Counting a non-send let a prefix of leads that never send — already owned by a
+            // live job, or settled because the lead opted out after its marker was written —
+            // exhaust the sweep every tick and starve everything behind them (Greptile P1 on
+            // #2412, twice). A settled skip also releases its marker inside the relay, so
+            // those leads stop being re-found at all.
+            if (outcome === 'sent' || outcome === 'fallback') {
               summary.dispatched++;
             } else {
               summary.noops++;

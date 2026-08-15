@@ -53,6 +53,7 @@ function makeDeps(overrides: Partial<RelayDeps> = {}): RelayDeps {
       .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct', currency: 'USD' }),
     sendEvent: jest.fn().mockResolvedValue({ success: true, fbtraceId: 'trace1' }),
     recordSent: jest.fn().mockResolvedValue(undefined),
+    clearPending: jest.fn().mockResolvedValue(undefined),
     shouldAttemptSend: jest.fn().mockReturnValue(true),
     isAccountPaused: jest.fn().mockReturnValue(false),
     ...overrides,
@@ -618,6 +619,34 @@ describe('relayLeadStatusEvent — a suppressed conversion is never silent', () 
     );
 
     expect(skipLines()).toHaveLength(0);
+  });
+});
+
+describe('relayLeadStatusEvent — a settled conversion releases its marker', () => {
+  // Otherwise the marker outlives its own reason: reconciliation re-finds that lead every
+  // sweep forever for a conversion that will never be sent.
+  it('releases the marker when the lead has opted out', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ contactStatus: 'unsubscribed' }) }), deps);
+
+    expect(deps.clearPending).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
+  });
+
+  it('releases the marker when the event already went', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ metaConversionsSent: ['won'] }) }), deps);
+
+    expect(deps.clearPending).toHaveBeenCalledWith('list-1', 'lead-1', 'won');
+  });
+
+  it('KEEPS the marker when the conversion is merely not-yet sendable', async () => {
+    // Not enabled, no pixel, throttled: still genuinely owed, so the marker must survive.
+    const deps = makeDeps({
+      resolvePixel: jest.fn().mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' }),
+    });
+    await relayLeadStatusEvent(ctx(), deps);
+
+    expect(deps.clearPending).not.toHaveBeenCalled();
   });
 });
 
