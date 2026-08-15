@@ -315,3 +315,84 @@ describe('buildAlertContext — pixel diagnostics must not misroute', () => {
     expect(diagnosed).toHaveLength(MAX_PIXELS_DIAGNOSED);
   });
 });
+
+describe('buildAlertContext — the configured pixel wins over recency', () => {
+  // last_fired_time IGNORES CAPI (§10, ENG-941). A pixel taking only server-side
+  // conversions can look stale or unfired while being the one the ads attribute through.
+  const capiPixel = { id: 'px-capi', name: 'Attribution pixel' };
+  const browserPixel = { id: 'px-browser', name: 'Old site pixel', last_fired_time: '2026-08-14T19:59:40-0400' };
+
+  it('diagnoses the configured pixel even when Meta reports it as never fired', async () => {
+    const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 5 } });
+    await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-capi'),
+      getPixels: jest.fn().mockResolvedValue([browserPixel, capiPixel]),
+      getMatchKeys,
+    } as any);
+
+    expect(getMatchKeys.mock.calls.map((c) => c[0])).toContain('px-capi');
+  });
+
+  it('links Events Manager at the configured pixel, not the most recently fired one', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-capi'),
+      getPixels: jest.fn().mockResolvedValue([browserPixel, capiPixel]),
+    } as any);
+
+    expect(String(ctx['Meta Events Manager'])).toContain('px-capi');
+  });
+
+  it('labels which pixel is the configured one', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-capi'),
+      getPixels: jest.fn().mockResolvedValue([browserPixel, capiPixel]),
+      getMatchKeys: jest.fn().mockResolvedValue({ Lead: { email: 5 } }),
+    } as any);
+
+    expect(String(ctx['Meta Match Keys'])).toMatch(/px-capi.*configured attribution pixel/s);
+  });
+
+  it('never drops the configured pixel to the cap', async () => {
+    const many = Array.from({ length: MAX_PIXELS_DIAGNOSED + 3 }, (_, i) => ({
+      id: `px${i}`,
+      last_fired_time: `2026-08-1${i}T00:00:00-0400`,
+    }));
+    const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 1 } });
+    await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-capi'),
+      getPixels: jest.fn().mockResolvedValue([...many, capiPixel]),
+      getMatchKeys,
+    } as any);
+
+    const diagnosed = getMatchKeys.mock.calls.map((c) => c[0]);
+    expect(diagnosed).toContain('px-capi');
+    expect(diagnosed).toHaveLength(MAX_PIXELS_DIAGNOSED);
+  });
+
+  it('falls back to recency when no configured pixel can be resolved', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue(undefined),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-old', last_fired_time: '2026-01-01T00:00:00-0400' },
+        { id: 'px-new', last_fired_time: '2026-08-14T19:59:40-0400' },
+      ]),
+    } as any);
+
+    expect(String(ctx['Meta Events Manager'])).toContain('px-new');
+  });
+
+  it('still works when the resolver itself fails', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockRejectedValue(new Error('graph down')),
+    } as any);
+
+    expect(ctx['Ad Account']).toBe('acct1');
+    expect(ctx['Meta Events Manager']).toBeDefined();
+  });
+});

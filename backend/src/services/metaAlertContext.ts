@@ -53,6 +53,11 @@ export const metaDeepLinks = {
 };
 
 export interface AlertContextDeps {
+  /** The pixel this account's conversions are actually configured to go to, when it can be
+   *  resolved. Preferred over recency because `last_fired_time` IGNORES CAPI events (§10,
+   *  established during ENG-941): a pixel receiving only server-side conversions can look
+   *  stale or unfired while being the one that matters. */
+  getPreferredPixelId?: () => Promise<string | undefined>;
   /** Click-ID coverage for this customer. Reuses §F's own AC5 computation. */
   getCoverage: (userId: string) => Promise<any>;
   /** Pixels attached to the ad account, with `last_fired_time` when Meta reports one. */
@@ -159,16 +164,35 @@ export async function buildAlertContext(
     // carrying an old site pixel alongside the campaign's, that produces a confidently
     // wrong diagnosis, which is worse than no diagnosis at all. A pixel that has NEVER
     // fired is skipped: it has nothing to report.
-    // Sorted BEFORE the cap, not after. Slicing first meant the cap could discard the
-    // most recently fired pixel and then link Events Manager at whichever survived —
-    // pointing the reader at the wrong dataset on exactly the messy accounts where the
-    // diagnosis matters most (Greptile, second pass on #2415).
-    const fired = pixels
-      .filter((p) => p?.id && p.last_fired_time)
-      .sort((a, b) => String(b.last_fired_time).localeCompare(String(a.last_fired_time)))
-      .slice(0, MAX_PIXELS_DIAGNOSED);
-    const mostRecent = fired[0];
-    if (mostRecent?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(mostRecent.id);
+    // Selection order: the CONFIGURED attribution pixel first, then the rest by recency.
+    //
+    // Recency alone is not safe. `last_fired_time` IGNORES CAPI events — established in
+    // §10 during ENG-941 — so a pixel receiving only server-side conversions can look
+    // stale, or unfired entirely, while being precisely the one the ads attribute through.
+    // Ranking on it alone can drop that pixel from the capped set, link Events Manager at
+    // an unrelated browser pixel, and then falsely announce that no supplied identity
+    // reached Meta (Greptile, third pass on #2415).
+    //
+    // The preferred pixel is therefore always diagnosed, never cut by the cap, and is what
+    // the Events Manager link points at. Sorting happens BEFORE the cap so the survivors
+    // are the most recent, not merely the first Meta happened to return.
+    const preferredPixelId = await attempt('configured pixel', async () =>
+      deps.getPreferredPixelId ? deps.getPreferredPixelId() : undefined,
+    );
+
+    const byRecency = pixels
+      .filter((p) => p?.id && p.last_fired_time && p.id !== preferredPixelId)
+      .sort((a, b) => String(b.last_fired_time).localeCompare(String(a.last_fired_time)));
+
+    // Included even if it has never "fired" by Meta's browser-only measure — that is the
+    // whole point of preferring it.
+    const preferred = preferredPixelId
+      ? pixels.find((p) => p?.id === preferredPixelId)
+      : undefined;
+
+    const fired = [...(preferred ? [preferred] : []), ...byRecency].slice(0, MAX_PIXELS_DIAGNOSED);
+    const linkTarget = preferred ?? fired[0];
+    if (linkTarget?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(linkTarget.id);
 
     const sections: string[] = [];
     let anySupplied = false;
@@ -176,7 +200,8 @@ export async function buildAlertContext(
       const matchKeys = await attempt(`match keys for ${pixel.id}`, () => deps.getMatchKeys(pixel.id));
       if (!matchKeys || Object.keys(matchKeys).length === 0) continue;
       sections.push(
-        `pixel ${pixel.id}${pixel.name ? ` (${pixel.name})` : ''}:\n` +
+        `pixel ${pixel.id}${pixel.name ? ` (${pixel.name})` : ''}` +
+        (pixel.id === preferredPixelId ? ' [configured attribution pixel]' : '') + ':\n' +
         Object.entries(matchKeys)
           .map(([event, keys]) =>
             `  ${event}: ${Object.entries(keys).map(([k, n]) => `${k}=${n}`).join(', ')}`)
@@ -224,6 +249,13 @@ export async function buildAlertContextForAccount(
   };
 
   return buildAlertContext(owner, adAccountId, days, {
+    // The SAME resolver the relay sends through, so the pixel diagnosed is the pixel
+    // conversions actually target.
+    getPreferredPixelId: async () => {
+      const { metaService } = await import('./metaService');
+      const resolved: any = await metaService.resolveMetaPixelWithDefault(owner, owner?.userId, undefined);
+      return resolved && !('unresolved' in resolved) ? resolved.pixelId : undefined;
+    },
     getCoverage: async (userId: string) => {
       const { computeClickIdCoverageForUser } = await import('./metaAttributionCoverage');
       return computeClickIdCoverageForUser(userId, 30);
