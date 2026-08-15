@@ -159,10 +159,15 @@ export async function buildAlertContext(
     // carrying an old site pixel alongside the campaign's, that produces a confidently
     // wrong diagnosis, which is worse than no diagnosis at all. A pixel that has NEVER
     // fired is skipped: it has nothing to report.
-    const fired = pixels.filter((p) => p?.id && p.last_fired_time).slice(0, MAX_PIXELS_DIAGNOSED);
-    const mostRecent = [...fired].sort((a, b) =>
-      String(b.last_fired_time).localeCompare(String(a.last_fired_time)),
-    )[0];
+    // Sorted BEFORE the cap, not after. Slicing first meant the cap could discard the
+    // most recently fired pixel and then link Events Manager at whichever survived —
+    // pointing the reader at the wrong dataset on exactly the messy accounts where the
+    // diagnosis matters most (Greptile, second pass on #2415).
+    const fired = pixels
+      .filter((p) => p?.id && p.last_fired_time)
+      .sort((a, b) => String(b.last_fired_time).localeCompare(String(a.last_fired_time)))
+      .slice(0, MAX_PIXELS_DIAGNOSED);
+    const mostRecent = fired[0];
     if (mostRecent?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(mostRecent.id);
 
     const sections: string[] = [];

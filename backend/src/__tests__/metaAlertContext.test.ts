@@ -291,4 +291,27 @@ describe('buildAlertContext — pixel diagnostics must not misroute', () => {
     } as any);
     expect(String(ctx['Meta Events Manager'])).toContain('px-live');
   });
+
+  it('keeps the MOST RECENT pixels when capping, and links the newest of all', async () => {
+    // Capping before sorting could discard the newest pixel and then link Events Manager
+    // at a survivor — wrong dataset, on exactly the messy accounts where it matters.
+    const pixels = [
+      { id: 'px-oldest', last_fired_time: '2026-01-01T00:00:00-0400' },
+      { id: 'px-old', last_fired_time: '2026-02-01T00:00:00-0400' },
+      { id: 'px-older', last_fired_time: '2026-03-01T00:00:00-0400' },
+      { id: 'px-newest', last_fired_time: '2026-08-14T19:59:40-0400' },
+    ];
+    const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 1 } });
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue(pixels),
+      getMatchKeys,
+    } as any);
+
+    expect(String(ctx['Meta Events Manager'])).toContain('px-newest');
+    const diagnosed = getMatchKeys.mock.calls.map((c) => c[0]);
+    expect(diagnosed).toContain('px-newest');
+    expect(diagnosed).not.toContain('px-oldest');
+    expect(diagnosed).toHaveLength(MAX_PIXELS_DIAGNOSED);
+  });
 });
