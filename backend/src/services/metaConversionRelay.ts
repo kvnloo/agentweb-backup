@@ -619,11 +619,28 @@ async function runInlineFallback(
   );
 }
 
-export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<void> {
+/**
+ * What a dispatch actually did. The reconciliation sweep budgets on real work, so it has to
+ * be able to tell an attempt apart from a no-op: counting "another worker already owns this"
+ * as work let 200 such rows exhaust the sweep's budget every tick and starve everything
+ * behind them, since a no-op also leaves the marker in place to be re-found (Greptile P1 on
+ * #2412).
+ */
+export type DispatchOutcome =
+  /** Not a conversion, or nothing to do. */
+  | 'noop'
+  /** A live or freshly-created job elsewhere owns it — real progress, but not ours. */
+  | 'already-queued'
+  /** We processed it inline (sent, terminally skipped, or failed and left retryable). */
+  | 'processed'
+  /** No durable record was possible; the inline fallback ran. */
+  | 'fallback';
+
+export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<DispatchOutcome> {
   const { enqueueJob, markJobFailed, startHeartbeat, clearFailedJob, deleteJob } = await import('./asyncJobQueue');
 
   const leadId = ctx.lead?.leadId;
-  if (!leadId) return;
+  if (!leadId) return 'noop';
 
   // An explicitly supplied kind is authoritative — it comes either from a queued job or from
   // a `metaConversionPending` marker, and in both cases the lead's CURRENT status may have
@@ -637,7 +654,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   const mapped = ctx.conversionKind
     ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
     : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
-  if (!mapped) return;
+  if (!mapped) return 'noop';
 
   const dedupeKey = `${ctx.listId}:${leadId}:${mapped.conversionKind}`;
   const payload: ConversionRelayJobPayload = {
@@ -658,12 +675,23 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     // completed job is never touched, and `metaConversionsSent` still guarantees fire-once
     // if the event did in fact land.
     const cleared = await clearFailedJob(RELAY_QUEUE_SOURCE, dedupeKey);
-    if (!cleared) return;
+
+    // A live or completed row means someone else owns this conversion — stand down.
+    if (cleared === 'not-failed') return 'already-queued';
+
+    // An ERROR is not that. We could not tell whether the row was terminal, so giving up
+    // here would abandon the conversion over a transient DynamoDB blip, with no retry, no
+    // fallback and no marker. Fall through to the fallback, which at minimum records that
+    // this conversion is still owed (Greptile P1 on #2412).
+    if (cleared === 'error') {
+      await runInlineFallback(ctx, dedupeKey, mapped.conversionKind);
+      return 'fallback';
+    }
 
     enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
     // Another dispatcher recreated the row between our delete and our write; it owns the
     // work now, and doing it here too would just race it.
-    if (enqueued === 'duplicate') return;
+    if (enqueued === 'duplicate') return 'already-queued';
   }
 
   if (enqueued === 'unavailable') {
@@ -679,7 +707,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     // deleted the only record of the conversion and done nothing with it, which is strictly
     // worse than the terminal failure it was trying to recover (Greptile on #2412).
     await runInlineFallback(ctx, dedupeKey, mapped.conversionKind);
-    return;
+    return 'fallback';
   }
 
   const stopHeartbeat = startHeartbeat(RELAY_QUEUE_SOURCE, dedupeKey);
@@ -698,4 +726,5 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   } finally {
     stopHeartbeat();
   }
+  return 'processed';
 }

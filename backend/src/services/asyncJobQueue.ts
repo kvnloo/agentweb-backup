@@ -167,7 +167,16 @@ export async function enqueueJob(
  * is never disturbed — in particular this can never resurrect work that already succeeded,
  * and can never race a live processor.
  */
-export async function clearFailedJob(source: string, dedupeKey: string): Promise<boolean> {
+/** `not-failed` means the row is genuinely live or completed — stand down, someone else owns
+ *  it. `error` means we could not tell: a caller that treats the two alike gives up on a
+ *  conversion for a transient DynamoDB blip exactly as if another worker had it, with no
+ *  retry, no fallback and no marker (Greptile P1 on #2412). */
+export type ClearFailedJobResult = 'cleared' | 'not-failed' | 'error';
+
+export async function clearFailedJob(
+  source: string,
+  dedupeKey: string,
+): Promise<ClearFailedJobResult> {
   const id = jobId(source, dedupeKey);
   try {
     await dynamodb
@@ -180,13 +189,13 @@ export async function clearFailedJob(source: string, dedupeKey: string): Promise
       })
       .promise();
     console.log(`[AsyncJobQueue] cleared terminally-failed job ${id} so it can be retried`);
-    return true;
+    return 'cleared';
   } catch (error: any) {
     // The condition failing is the normal case: the job is still pending/processing, or it
     // completed. Not an error, and not something to retry.
-    if (error?.code === 'ConditionalCheckFailedException') return false;
-    console.warn(`[AsyncJobQueue] clearFailedJob failed for ${id}:`, error?.message ?? error);
-    return false;
+    if (error?.code === 'ConditionalCheckFailedException') return 'not-failed';
+    console.warn(`[AsyncJobQueue] clearFailedJob errored for ${id}:`, error?.message ?? error);
+    return 'error';
   }
 }
 

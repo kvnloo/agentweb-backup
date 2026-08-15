@@ -11,7 +11,7 @@
  * costs nothing at all for the customers who have not opted in — which today is all of them.
  */
 
-const dispatchLeadStatusConversion = jest.fn().mockResolvedValue(undefined);
+const dispatchLeadStatusConversion = jest.fn().mockResolvedValue('processed');
 jest.mock('../services/metaConversionRelay', () => {
   const actual = jest.requireActual('../services/metaConversionRelay');
   return {
@@ -221,7 +221,7 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
 
     // Every 'bad-' lead fails; the one behind them succeeds.
     dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
-      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta rejected')) : undefined,
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta rejected')) : 'processed',
     );
 
     const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
@@ -231,6 +231,39 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     expect(summary.dispatched).toBe(1);
     const attempted = dispatchLeadStatusConversion.mock.calls.map((c) => c[0].lead.leadId);
     expect(attempted).toContain('good-1');
+  });
+
+  it('a marker already owned by a live job costs no budget — later leads still get through', async () => {
+    // dispatch returns 'already-queued' when another worker owns that conversion: nothing is
+    // sent and the marker stays put to be re-found. Counting those as work let a cluster of
+    // them exhaust the sweep every tick and starve everything behind them.
+    const owned = Array.from({ length: 300 }, (_, i) => leadWithPending(`owned-${i}`, { values: ['won'] }));
+    const good = leadWithPending('good-1', { values: ['won'] });
+    getLeadsByListId.mockResolvedValue({ items: [...owned, good], lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
+      String(ctx.lead.leadId).startsWith('owned-') ? 'already-queued' : 'processed',
+    );
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.noops).toBe(300);
+    expect(summary.dispatched).toBe(1);
+    expect(summary.cappedOut).toBe(false);
+    const attempted = dispatchLeadStatusConversion.mock.calls.map((c) => c[0].lead.leadId);
+    expect(attempted).toContain('good-1');
+  });
+
+  it('counts an inline fallback as real work — it did attempt the send', async () => {
+    getLeadsByListId.mockResolvedValue({
+      items: [leadWithPending('lead-1', { values: ['won'] })],
+      lastEvaluatedKey: undefined,
+    });
+    dispatchLeadStatusConversion.mockResolvedValue('fallback');
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.dispatched).toBe(1);
+    expect(summary.noops).toBe(0);
   });
 
   it('still stops on the separate failure ceiling, so failures are not unbounded either', async () => {

@@ -17,7 +17,7 @@ const deleteJob = jest.fn().mockResolvedValue(undefined);
 const markJobFailed = jest.fn().mockResolvedValue(undefined);
 const startHeartbeat: jest.Mock = jest.fn(() => jest.fn());
 const registerProcessor = jest.fn();
-const clearFailedJob = jest.fn().mockResolvedValue(false);
+const clearFailedJob = jest.fn().mockResolvedValue('not-failed');
 
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => enqueueJob(...a),
@@ -65,7 +65,7 @@ const LEAD = { leadId: 'lead-1', listId: 'list-1', email: 'a@b.com', status: 'wo
 beforeEach(() => {
   jest.clearAllMocks();
   enqueueJob.mockResolvedValue('enqueued');
-  clearFailedJob.mockResolvedValue(false);
+  clearFailedJob.mockResolvedValue('not-failed');
   getUserById.mockResolvedValue(null);
   markConversionRelayPending.mockResolvedValue(undefined);
   getLeadById.mockResolvedValue(LEAD);
@@ -122,7 +122,7 @@ describe('dispatchLeadStatusConversion — queueing', () => {
 
   it('does nothing further when the job is genuinely still live', async () => {
     enqueueJob.mockResolvedValue('duplicate');
-    clearFailedJob.mockResolvedValue(false); // pending / processing / completed
+    clearFailedJob.mockResolvedValue('not-failed'); // pending / processing / completed
 
     await dispatchLeadStatusConversion(ctx());
 
@@ -135,7 +135,7 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     // exhausted its attempts makes that lead+event permanently unreachable — every later
     // genuine transition rejected as a duplicate even after Meta recovers.
     enqueueJob.mockResolvedValueOnce('duplicate').mockResolvedValueOnce('enqueued');
-    clearFailedJob.mockResolvedValue(true);
+    clearFailedJob.mockResolvedValue('cleared');
 
     await dispatchLeadStatusConversion(ctx());
 
@@ -146,7 +146,7 @@ describe('dispatchLeadStatusConversion — queueing', () => {
 
   it('stands down if another dispatcher recreated the job while we were clearing it', async () => {
     enqueueJob.mockResolvedValue('duplicate');
-    clearFailedJob.mockResolvedValue(true);
+    clearFailedJob.mockResolvedValue('cleared');
 
     await dispatchLeadStatusConversion(ctx());
 
@@ -154,12 +154,36 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(getLeadById).not.toHaveBeenCalled();
   });
 
+  it('does NOT abandon the conversion when the cleanup itself errors', async () => {
+    // 'error' means we could not tell whether the row was terminal. Treating that like a
+    // live job — as an earlier boolean return did — gave up on the conversion over a
+    // transient DynamoDB blip, with no retry, no fallback and no marker.
+    enqueueJob.mockResolvedValue('duplicate');
+    clearFailedJob.mockResolvedValue('error');
+    getUserById.mockResolvedValue(null); // terminal skip inside the fallback
+
+    const outcome = await dispatchLeadStatusConversion(ctx());
+
+    expect(outcome).toBe('fallback');
+    expect(getUserById).toHaveBeenCalled(); // it really did attempt the relay
+  });
+
+  it('stands down without attempting when the row is genuinely live', async () => {
+    enqueueJob.mockResolvedValue('duplicate');
+    clearFailedJob.mockResolvedValue('not-failed');
+
+    const outcome = await dispatchLeadStatusConversion(ctx());
+
+    expect(outcome).toBe('already-queued');
+    expect(getUserById).not.toHaveBeenCalled();
+  });
+
   it('never exits having DELETED the only record without attempting the conversion', async () => {
     // The dangerous shape: clearFailedJob removes the terminal row, the replacement write
     // fails, and an earlier version returned right there — strictly worse than the terminal
     // failure it was recovering, because now nothing records the conversion at all.
     enqueueJob.mockResolvedValueOnce('duplicate').mockResolvedValue('unavailable');
-    clearFailedJob.mockResolvedValue(true);
+    clearFailedJob.mockResolvedValue('cleared');
     getUserById.mockResolvedValue(null);
   markConversionRelayPending.mockResolvedValue(undefined); // terminal skip, so the fallback stops after one go
 

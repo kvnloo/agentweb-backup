@@ -53,6 +53,8 @@ export interface ReconcileSummary {
   pendingFound: number;
   dispatched: number;
   failed: number;
+  /** Markers whose conversion was already owned by a live job — no work, no budget spent. */
+  noops: number;
   /** True when a per-sweep ceiling stopped us early — the rest waits for the next tick. */
   cappedOut: boolean;
 }
@@ -62,6 +64,7 @@ const emptySummary = (): ReconcileSummary => ({
   pendingFound: 0,
   dispatched: 0,
   failed: 0,
+  noops: 0,
   cappedOut: false,
 });
 
@@ -116,7 +119,7 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
             break;
           }
           try {
-            await dispatchLeadStatusConversion({
+            const outcome = await dispatchLeadStatusConversion({
               listId: list.listId,
               userId: user.userId,
               lead,
@@ -126,7 +129,16 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
               conversionKind: kind as ConversionKind,
               statusConfig: list.statusConfig,
             });
-            summary.dispatched++;
+
+            // Only real work counts against the budget. A marker whose conversion is already
+            // owned by a live job costs nothing and leaves the marker in place to be
+            // re-found, so counting it would let a cluster of such rows exhaust the sweep
+            // every tick and starve everything behind them (Greptile P1 on #2412).
+            if (outcome === 'processed' || outcome === 'fallback') {
+              summary.dispatched++;
+            } else {
+              summary.noops++;
+            }
           } catch (error: any) {
             summary.failed++;
             console.error(
@@ -144,7 +156,7 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
   if (summary.pendingFound > 0) {
     console.log(
       `${TAG} user ${user.userId}: ${summary.pendingFound} lead(s) owed a conversion — ` +
-      `${summary.dispatched} re-dispatched, ${summary.failed} failed` +
+      `${summary.dispatched} re-dispatched, ${summary.failed} failed, ${summary.noops} already queued` +
       (summary.cappedOut
         ? `, stopped at a per-sweep ceiling (${summary.dispatched}/${MAX_DISPATCHES_PER_USER} sent, ` +
           `${summary.failed}/${MAX_FAILURES_PER_USER} failed) — remainder next sweep`
