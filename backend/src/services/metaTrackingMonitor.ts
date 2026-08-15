@@ -551,6 +551,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     }
 
     summary.blackouts++;
+
+    // Enrichment is deliberately gathered HERE — only for an account that is actually
+    // alerting — rather than for every account on every sweep. It costs a lead walk and
+    // two Graph calls, which is trivial once a day for a handful of broken accounts and
+    // wasteful across a healthy fleet. It is also best-effort: buildAlertContext swallows
+    // its own failures, so a lookup problem drops a field and never the alert.
+    const enriched = await buildAccountAlertContext(user, adAccountId, accessToken, activity.days);
+
     await raise(
       alertTransport,
       `${BLACKOUT_ALERT_CLASS}:${adAccountId}`,
@@ -569,17 +577,36 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       {
         'Alert Class': BLACKOUT_ALERT_CLASS,
         'Alert Priority': 'high',
-        'Ad Account': adAccountId,
-        'Owner User Id': user?.userId,
-        'Owner Email': user?.email,
         'Consecutive Days': verdict.consecutiveBlackoutDays,
         'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
+        // Identity, click-ID coverage, the account's pixels and Meta's match keys. The
+        // first real alert of this kind took ~10 API calls to interpret; all of it was
+        // available at the moment it fired.
+        ...enriched,
       },
     );
   }
 
   summary.unrecognizedActionTypes = [...unknownTypes];
   return summary;
+}
+
+/** Best-effort enrichment for an alerting account. Isolated behind its own try/catch as
+ *  well as the builder's, because nothing about a richer ticket is worth risking the
+ *  ticket itself. */
+async function buildAccountAlertContext(
+  user: any,
+  adAccountId: string,
+  accessToken: string,
+  days: AdAccountDay[],
+): Promise<Record<string, any>> {
+  try {
+    const { buildAlertContextForAccount } = await import('./metaAlertContext');
+    return await buildAlertContextForAccount(user, adAccountId, accessToken, days);
+  } catch (error: any) {
+    console.warn(`${TAG} alert enrichment failed for ${adAccountId}: ${error?.message}`);
+    return { 'Ad Account': adAccountId, 'Owner User Id': user?.userId, 'Owner Email': user?.email };
+  }
 }
 
 /** Send an alert unless one for this key already went out inside the window. A transport
