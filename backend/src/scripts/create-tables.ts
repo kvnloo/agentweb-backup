@@ -1865,6 +1865,19 @@ const createUsageRecordsTable = async () => {
   }
 };
 
+// Append-only, per-charge LLM audit evidence. The eventId begins with its ISO
+// timestamp so a billing subject's charges are queryable in chronological order.
+const createLlmChargeEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LlmChargeEvents`,
+    AttributeDefinitions: [{ AttributeName: 'billingUserId', AttributeType: 'S' }, { AttributeName: 'eventId', AttributeType: 'S' }],
+    KeySchema: [{ AttributeName: 'billingUserId', KeyType: 'HASH' }, { AttributeName: 'eventId', KeyType: 'RANGE' }],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
 // Create Agent Runs table (run-survival core — durable run records +
 // idempotency submit-locks; see services/agentMode/runStore.ts). Single pk
 // hash key with two item kinds: run#<runId>, idem#<key>.
@@ -2402,6 +2415,7 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createMcpSessionsTable();
     await createUsageRecordsTable();
+    await createLlmChargeEventsTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();

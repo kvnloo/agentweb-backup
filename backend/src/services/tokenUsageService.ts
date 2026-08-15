@@ -3,6 +3,8 @@ import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscripti
 import { inheritsOrgBilling } from "./orgAuthz";
 import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
+import { randomUUID } from 'crypto';
+import { recordLlmChargeEvent } from './llmChargeAuditDb';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -294,7 +296,8 @@ export function deriveBlockedByCost(status: {
 export async function incrementUserTokenUsage(
   userId: string,
   tokens: number,
-  cost: number
+  cost: number,
+  audit?: { eventId?: string; model?: string; provider?: string; feature?: string; sessionId?: string }
 ): Promise<void> {
   if (tokens <= 0 && cost <= 0) return;
 
@@ -302,6 +305,17 @@ export async function incrementUserTokenUsage(
 
   try {
     const billingUserId = await resolveBillingUserId(userId);
+    // Persist the evidence before changing the counter. A failed evidence write
+    // therefore fails open (no surprise charge), while a retry with the same
+    // event id is a no-op rather than a duplicate counter increment.
+    const occurredAt = new Date().toISOString();
+    const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
+    const isNewCharge = await recordLlmChargeEvent({
+      billingUserId, eventId, occurredAt, actingUserId: userId,
+      tokens: Math.max(0, Math.round(tokens)), costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
+      model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
+    });
+    if (!isNewCharge) return;
     // Try to read current user to check if we need a month reset
     const user = await userDb.getUserById(billingUserId);
     if (!user) return;

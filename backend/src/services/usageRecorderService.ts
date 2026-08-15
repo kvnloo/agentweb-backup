@@ -246,7 +246,12 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
 
   // Lazy-required (see import-site note) to keep this module's static load graph light.
   const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
-  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd).catch((err: unknown) =>
+  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
+    model: ctx.model,
+    provider: ctx.provider,
+    feature: ctx.feature,
+    sessionId: ctx.sessionId,
+  }).catch((err: unknown) =>
     console.error(
       "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
       err instanceof Error ? err.message : err
