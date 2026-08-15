@@ -206,10 +206,26 @@ export async function clearFailedJob(source: string, dedupeKey: string): Promise
  */
 export async function deleteJob(source: string, dedupeKey: string): Promise<void> {
   const id = jobId(source, dedupeKey);
+  const remove = () => dynamodb.delete({ TableName: TABLE_NAME, Key: { id } }).promise();
+
   try {
-    await dynamodb.delete({ TableName: TABLE_NAME, Key: { id } }).promise();
-  } catch (error: any) {
-    console.warn(`[AsyncJobQueue] deleteJob failed for ${id}:`, error?.message ?? error);
+    await remove();
+  } catch (firstError: any) {
+    // One immediate retry before giving up, matching every sibling write here
+    // (markJobComplete, markJobFailed, updateJobPayload). Losing this one is worse than
+    // losing those: the row is left occupying a dedupe key derived from durable business
+    // state, so every later enqueue for that key is rejected as a duplicate and the
+    // conversion is suppressed permanently — including after the customer fixes whatever
+    // caused the skip (Greptile P1 on #2412).
+    try {
+      await remove();
+    } catch (secondError: any) {
+      console.error(
+        `[AsyncJobQueue] deleteJob failed twice for ${id} — the row may block later work ` +
+        `for this key until stale reclamation clears it:`,
+        secondError?.message ?? secondError,
+      );
+    }
   }
 }
 
@@ -415,6 +431,12 @@ export function startHeartbeat(source: string, dedupeKey: string): () => void {
 
 type JobProcessor = (payload: any) => Promise<void>;
 const processors = new Map<string, JobProcessor>();
+/** Sources whose dedupe key is derived from durable business state. For these a finished job
+ *  must be REMOVED, not marked 'completed': the key is reused by design, and a lingering
+ *  terminal row rejects every later enqueue for it. The inline dispatch path already deletes;
+ *  without this the poller path would quietly re-introduce the blocking row it avoids
+ *  (Greptile P1 on #2412). */
+const deleteOnCompleteSources = new Set<string>();
 const maxAttemptsBySource = new Map<string, number>();
 
 /** Populated once per process at module-load time by each integration — mirrors how
@@ -431,10 +453,17 @@ const maxAttemptsBySource = new Map<string, number>();
  *  failure mode is "the outage/expired-token will eventually clear" rather than
  *  "a human needs to intervene" — it just keeps retrying instead of ever going
  *  terminally inert. */
-export function registerProcessor(source: string, handler: JobProcessor, options?: { maxAttempts?: number }): void {
+export function registerProcessor(
+  source: string,
+  handler: JobProcessor,
+  options?: { maxAttempts?: number; deleteOnComplete?: boolean },
+): void {
   processors.set(source, handler);
   if (options?.maxAttempts !== undefined) {
     maxAttemptsBySource.set(source, options.maxAttempts);
+  }
+  if (options?.deleteOnComplete) {
+    deleteOnCompleteSources.add(source);
   }
 }
 
@@ -482,15 +511,19 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
   try {
     const payload = JSON.parse(job.payload);
     await processor(payload);
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id: job.id },
-        UpdateExpression: 'SET #status = :completed, updatedAt = :now',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
-      })
-      .promise();
+    if (deleteOnCompleteSources.has(job.source)) {
+      await dynamodb.delete({ TableName: TABLE_NAME, Key: { id: job.id } }).promise();
+    } else {
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id: job.id },
+          UpdateExpression: 'SET #status = :completed, updatedAt = :now',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
+        })
+        .promise();
+    }
   } catch (error: any) {
     const attempts = (job.attempts ?? 0) + 1;
     const maxAttempts = maxAttemptsBySource.get(job.source) ?? MAX_ATTEMPTS;

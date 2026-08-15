@@ -209,4 +209,38 @@ describe('reconcilePendingConversionsForUser — never lets one bad row kill the
     expect(summary.dispatched).toBeLessThan(500);
     expect(summary.cappedOut).toBe(true);
   });
+
+  it('failures do NOT consume the dispatch budget — later leads still get their turn', async () => {
+    // The starvation shape: a cluster of persistently failing leads sits at the front of the
+    // scan. If failures counted against the cap they would eat it every sweep, stop
+    // pagination, and the leads behind them would never be attempted at all — permanently,
+    // since each sweep restarts from the beginning and re-hits the same failures.
+    const failing = Array.from({ length: 300 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
+    const good = leadWithPending('good-1', { values: ['won'] });
+    getLeadsByListId.mockResolvedValue({ items: [...failing, good], lastEvaluatedKey: undefined });
+
+    // Every 'bad-' lead fails; the one behind them succeeds.
+    dispatchLeadStatusConversion.mockImplementation(async (ctx: any) =>
+      String(ctx.lead.leadId).startsWith('bad-') ? Promise.reject(new Error('Meta rejected')) : undefined,
+    );
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.failed).toBe(300);
+    // The lead behind 300 failures was still reached and sent.
+    expect(summary.dispatched).toBe(1);
+    const attempted = dispatchLeadStatusConversion.mock.calls.map((c) => c[0].lead.leadId);
+    expect(attempted).toContain('good-1');
+  });
+
+  it('still stops on the separate failure ceiling, so failures are not unbounded either', async () => {
+    const many = Array.from({ length: 800 }, (_, i) => leadWithPending(`bad-${i}`, { values: ['won'] }));
+    getLeadsByListId.mockResolvedValue({ items: many, lastEvaluatedKey: undefined });
+    dispatchLeadStatusConversion.mockRejectedValue(new Error('Meta down'));
+
+    const summary = await reconcilePendingConversionsForUser(OPTED_IN as any);
+
+    expect(summary.failed).toBeLessThan(800);
+    expect(summary.cappedOut).toBe(true);
+  });
 });

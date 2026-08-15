@@ -19,7 +19,9 @@
  *
  *   - Work is capped per user per sweep. A large backlog must not turn one cron tick into
  *     thousands of Meta calls; whatever is left is picked up 12 hours later, which is well
- *     inside Meta's 7-day attribution window.
+ *     inside Meta's 7-day attribution window. Successes and failures have SEPARATE ceilings,
+ *     so a cluster of persistently failing leads cannot consume the budget and hide every
+ *     lead behind it — see MAX_DISPATCHES_PER_USER.
  */
 
 import { parsePendingKinds } from '../utils/metaConversionPending';
@@ -27,10 +29,21 @@ import { isConversionRelayEnabled, ConversionKind } from './metaConversionRelay'
 
 const TAG = '[CAPI Reconcile]';
 
-/** Ceiling on dispatches per user per sweep. Deliberately modest: this only ever runs after
- *  a queue outage, so a large number here would mean something is badly wrong and hammering
- *  Meta would make it worse. */
+/** Ceiling on SUCCESSFUL dispatches per user per sweep. Deliberately modest: this only ever
+ *  runs after a queue outage, so a large number here would mean something is badly wrong and
+ *  hammering Meta would make it worse.
+ *
+ *  Failures deliberately do NOT count against it. Counting them let a cluster of persistently
+ *  failing leads near the start of the scan consume the whole budget every sweep, stop
+ *  pagination, and starve every later owed conversion — permanently, since each sweep starts
+ *  from the beginning and re-hits the same failures (Greptile P1 on #2412). Failure is what
+ *  the marker survives; it must not also become a reason to stop looking. */
 const MAX_DISPATCHES_PER_USER = 200;
+
+/** Separate, generous runaway guard. Failures cost a Meta call each, so they cannot be
+ *  unbounded either — but this is high enough that a bad cluster does not hide the leads
+ *  behind it. */
+const MAX_FAILURES_PER_USER = 500;
 
 /** Page size for walking a list's leads. */
 const LEAD_PAGE_SIZE = 200;
@@ -40,7 +53,7 @@ export interface ReconcileSummary {
   pendingFound: number;
   dispatched: number;
   failed: number;
-  /** True when the per-sweep cap stopped us early — the rest waits for the next tick. */
+  /** True when a per-sweep ceiling stopped us early — the rest waits for the next tick. */
   cappedOut: boolean;
 }
 
@@ -94,7 +107,11 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
         summary.pendingFound++;
 
         for (const kind of owed) {
-          if (summary.dispatched + summary.failed >= MAX_DISPATCHES_PER_USER) {
+          // Only successful work counts against the dispatch budget — see the constant.
+          if (
+            summary.dispatched >= MAX_DISPATCHES_PER_USER ||
+            summary.failed >= MAX_FAILURES_PER_USER
+          ) {
             summary.cappedOut = true;
             break;
           }
@@ -128,7 +145,10 @@ export async function reconcilePendingConversionsForUser(user: any): Promise<Rec
     console.log(
       `${TAG} user ${user.userId}: ${summary.pendingFound} lead(s) owed a conversion — ` +
       `${summary.dispatched} re-dispatched, ${summary.failed} failed` +
-      (summary.cappedOut ? `, capped at ${MAX_DISPATCHES_PER_USER} (remainder next sweep)` : ''),
+      (summary.cappedOut
+        ? `, stopped at a per-sweep ceiling (${summary.dispatched}/${MAX_DISPATCHES_PER_USER} sent, ` +
+          `${summary.failed}/${MAX_FAILURES_PER_USER} failed) — remainder next sweep`
+        : ''),
     );
   }
 

@@ -546,7 +546,13 @@ export function registerConversionRelayProcessor(): void {
   // ceiling outlasts an ordinary outage. It is not a complete answer — a permanently failed
   // job still needs the reconciliation sweep that belongs to §F — but it removes the common
   // case where a brief outage costs a real conversion.
-  registerProcessor(RELAY_QUEUE_SOURCE, processConversionRelayJob, { maxAttempts: 15 });
+  registerProcessor(RELAY_QUEUE_SOURCE, processConversionRelayJob, {
+    maxAttempts: 15,
+    // This source's dedupe key is (list, lead, conversion) — reused by design whenever the
+    // customer fixes what caused a skip. A finished job must therefore be removed rather
+    // than left as 'completed', on the poller path exactly as on the inline one.
+    deleteOnComplete: true,
+  });
 }
 
 /**

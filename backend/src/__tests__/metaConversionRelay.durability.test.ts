@@ -352,7 +352,10 @@ describe('registerConversionRelayProcessor', () => {
     expect(registerProcessor).toHaveBeenCalledWith(
       RELAY_QUEUE_SOURCE,
       expect.any(Function),
-      { maxAttempts: 15 },
+      // deleteOnComplete: this source's dedupe key is reused by design whenever a customer
+      // fixes what caused a skip, so the POLLER path must delete the finished row too —
+      // otherwise it quietly re-introduces the blocking row the inline path avoids.
+      { maxAttempts: 15, deleteOnComplete: true },
     );
   });
 });
