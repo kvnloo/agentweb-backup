@@ -963,6 +963,179 @@ export async function handleChargeRefunded(charge: any): Promise<void> {
 }
 
 /**
+ * Resolve the charge behind a dispute. Stripe's dispute payloads carry only the
+ * charge *id*, while the credit-purchase metadata we need (billing user, grant
+ * id, purchased capacity) lives on the charge itself, so it has to be fetched.
+ */
+async function retrieveDisputedCharge(dispute: any): Promise<any | null> {
+  const chargeId = typeof dispute.charge === 'string'
+    ? dispute.charge
+    : dispute.charge?.id;
+  if (!chargeId) {
+    console.warn(`[STRIPE] dispute ${dispute.id} carries no charge reference`);
+    return null;
+  }
+  return getStripeOrThrow().charges.retrieve(chargeId);
+}
+
+/**
+ * Handle charge.dispute.created — revoke purchased AgentWeb Credits capacity.
+ *
+ * The revocation happens when the dispute *opens*, not when it resolves: the
+ * funds are already at risk, and a dispute that runs its course would otherwise
+ * leave the customer spending against capacity they have reclaimed the money
+ * for. `reverseMonthlyPurchasedLlmUsageCredit` targets a cumulative reversal
+ * total, so redelivery of this webhook — or a refund that lands on the same
+ * grant — settles at the same figure instead of stacking.
+ */
+export async function handleChargeDisputeCreated(dispute: any): Promise<void> {
+  const charge = await retrieveDisputedCharge(dispute);
+  if (!charge) return;
+
+  const metadata = charge.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') {
+    console.log(
+      `[STRIPE] Dispute ${dispute.id} is not an AgentWeb Credits purchase; no capacity to revoke`
+    );
+    return;
+  }
+
+  const billingUserId = String(metadata.billingUserId || '');
+  const user = billingUserId ? await userDb.getUserById(billingUserId) : null;
+  if (!user) {
+    console.warn(
+      `[STRIPE] No user found for disputed credit purchase. dispute=${dispute.id} billingUserId=${billingUserId}`
+    );
+    return;
+  }
+
+  const amountPaidCents = Number(charge.amount);
+  const amountDisputedCents = Number(dispute.amount);
+  const purchasedMicroUsd = Number(metadata.usageCreditMicroUsd);
+  const topUpGrantId = String(metadata.topUpGrantId || '');
+  if (
+    !topUpGrantId ||
+    !Number.isInteger(amountPaidCents) || amountPaidCents <= 0 ||
+    !Number.isInteger(amountDisputedCents) || amountDisputedCents <= 0 ||
+    !Number.isInteger(purchasedMicroUsd) || purchasedMicroUsd <= 0
+  ) {
+    throw new Error(`Invalid usage top-up dispute metadata for dispute ${dispute.id}`);
+  }
+
+  const targetReversedMicroUsd = Math.min(
+    purchasedMicroUsd,
+    Math.round((purchasedMicroUsd * amountDisputedCents) / amountPaidCents),
+  );
+  const { reverseMonthlyPurchasedLlmUsageCredit } = await import('./llmUsageCreditService');
+  const reversalResult = await reverseMonthlyPurchasedLlmUsageCredit({
+    billingUserId: user.userId,
+    grantId: `stripe:${topUpGrantId}`,
+    reversalId: `dispute:${dispute.id}:${amountDisputedCents}`,
+    targetReversedMicroUsd,
+  });
+
+  // Reversal can no-op when the original grant is not on the current-month
+  // ledger (credits are month-scoped and expire at reset, so a past-month
+  // grant has nothing left to revoke). Retrying does not help — the semantic
+  // condition will persist — so record the *true* outcome in the audit trail
+  // and return success. A later run of the reaper picks these up if we ever
+  // want to compensate customers whose disputed spend crossed months.
+  const revokedMicroUsd = reversalResult.reversed ? targetReversedMicroUsd : 0;
+  const reversalOutcome = reversalResult.reversed
+    ? 'revoked'
+    : 'no_current_month_grant';
+
+  // Atomic idempotency via dedupKey: paymentHistoryDb writes the main row +
+  // a marker on the sentinel dedup partition in a single TransactWriteItems.
+  // A concurrent redelivery races on ConditionalCheckFailed on the marker
+  // and no-ops — no bounded lookback window to slip past. Reversal is
+  // already idempotent via its own reversalId key.
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_opened',
+      amount: amountDisputedCents,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: reversalOutcome === 'revoked' ? 'disputed' : 'disputed_no_action',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeReason: dispute.reason,
+        revokedMicroUsd,
+        reversalOutcome,
+      },
+    },
+    { dedupKey: `dispute:opened:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_opened for ${dispute.id} already recorded — skipped duplicate history`);
+    return;
+  }
+
+  console.log(
+    `[STRIPE] Credit purchase disputed: user ${user.userId}, dispute=${dispute.id}, revoked=${revokedMicroUsd} microUSD (${reversalOutcome})`
+  );
+}
+
+/**
+ * Handle charge.dispute.closed — record the outcome only.
+ *
+ * Winning a dispute deliberately does NOT auto-restore the revoked capacity.
+ * Credits are scoped to a usage month and expire at reset, while disputes
+ * routinely resolve in a later month; re-granting then would deposit a second
+ * month of capacity for a single payment, and there is no way to tell from the
+ * ledger whether the original capacity was already spent. Restoring a won
+ * dispute is therefore an admin one-time-credit decision, made against the
+ * audit trail this record leaves behind.
+ */
+export async function handleChargeDisputeClosed(dispute: any): Promise<void> {
+  const charge = await retrieveDisputedCharge(dispute);
+  if (!charge) return;
+
+  const metadata = charge.metadata || {};
+  if (metadata.purchaseType !== 'llm_usage_top_up') return;
+
+  const billingUserId = String(metadata.billingUserId || '');
+  const user = billingUserId ? await userDb.getUserById(billingUserId) : null;
+  if (!user) {
+    console.warn(
+      `[STRIPE] No user found for closed credit dispute. dispute=${dispute.id} billingUserId=${billingUserId}`
+    );
+    return;
+  }
+
+  // Atomic idempotency via dedupKey (see handleChargeDisputeCreated for the
+  // same rationale — TransactWriteItems marker on the sentinel dedup
+  // partition, no bounded lookback to slip past).
+  const result = await paymentHistoryDb.record(
+    {
+      userId: user.userId,
+      timestamp: new Date().toISOString(),
+      eventType: 'dispute_closed',
+      amount: Number(dispute.amount) || 0,
+      currency: dispute.currency || charge.currency || 'usd',
+      status: dispute.status || 'closed',
+      metadata: {
+        chargeId: charge.id,
+        disputeId: dispute.id,
+        disputeStatus: dispute.status,
+      },
+    },
+    { dedupKey: `dispute:closed:${dispute.id}` },
+  );
+  if (!result.written) {
+    console.log(`[STRIPE] dispute_closed for ${dispute.id} already recorded — skipped duplicate history`);
+    return;
+  }
+
+  console.log(
+    `[STRIPE] Credit dispute closed as "${dispute.status}": user ${user.userId}, dispute=${dispute.id}. ` +
+      'Revoked capacity is not auto-restored; issue an admin one-time credit if the customer should be made whole.'
+  );
+}
+
+/**
  * Handle subscription_schedule lifecycle termination. Clears any cached
  * scheduledChange on the user record regardless of which terminal state the
  * schedule hit: `completed` (phase 2 fired), `released` (user canceled the

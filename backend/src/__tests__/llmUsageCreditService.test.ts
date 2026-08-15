@@ -100,7 +100,9 @@ describe('LLM usage credits', () => {
     expect(result.ledger.grants[0]).toMatchObject({
       source: 'admin', reason: 'GROW-106 founder event', grantedBy: 'admin@agentweb.pro',
     });
-    expect(updateUser).toHaveBeenCalledTimes(1);
+    // Admin path routes ledger + audit through a single TransactWriteItems call
+    // instead of userDb.updateUser (see llmUsageAdminCreditAudit.test.ts).
+    expect(updateUser).not.toHaveBeenCalled();
     getUser.mockRestore();
     updateUser.mockRestore();
   });

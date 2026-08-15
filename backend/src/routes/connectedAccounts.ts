@@ -6,6 +6,7 @@ import { refreshCalendlyAccessToken } from './calendlyAuth';
 import { registerProcessor, updateJobPayload } from '../services/asyncJobQueue';
 import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup, getOrphanedCalendlyWebhook, recordOrphanedCalendlyWebhook } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
+import { describeMetaAdsCapability } from '../utils/metaAdsScope';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
@@ -240,6 +241,11 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       let status: string;
       let expiryMessage: string;
 
+      // Meta ad accounts only, and only when we can prove the answer — the same
+      // annotation the agent's list_connected_accounts tool reports, so the model
+      // and the account owner can never be told two different things (ENG-1158).
+      const adsCapability = describeMetaAdsCapability(acc as any);
+
       if (acc.platform === 'unipile') {
         // Unipile manages credentials; use the real status from their API
         const unipileStatus = unipileStatusMap.get(acc.account_id) || 'OK';
@@ -259,6 +265,14 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // reconnect prompt instead of a misleading "Connected" badge.
         status = 'disconnected';
         expiryMessage = 'Reconnect required — X revoked the token';
+      } else if (adsCapability.ads_capable === false) {
+        // The token is valid and unexpired, but the Meta account never granted (or
+        // has since lost) ads_read/ads_management, so this ad account cannot serve
+        // the only thing it exists for. Reporting it as "Connected" is what let a
+        // multi-day zero-data reporting outage go unnoticed (ENG-1158) — surface it
+        // as needing reconnection so the row shows the Reconnect action.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — Meta Ads permission not granted';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.
@@ -296,6 +310,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // Calendly only: which lead list bookings land in — explicitly chosen or
         // auto-resolved server-side on first booking (ENG-524 CRM-forward).
         booking_lead_list_id: acc.platform === 'calendly' ? (acc.config as any).booking_lead_list_id : undefined,
+        // Meta ad accounts only: whether this connection can actually read ads
+        // data, plus the actionable reason when it cannot. Absent entirely for
+        // every other account, and for Meta records whose grant we cannot prove.
+        ...adsCapability,
         // Calendly only (ENG-1141): which Meta pixel/ad account bookings attribute to —
         // explicitly chosen, or undefined until the customer picks one (the frontend
         // defaults the picker's display to the first connected account/pixel, matching
@@ -528,6 +546,95 @@ router.patch('/connected-accounts/calendly/:accountId/attribution', authenticate
     }
     console.error('Update Calendly attribution error:', error);
     res.status(500).json({ error: 'Failed to update Calendly attribution' });
+  }
+});
+
+/**
+ * ENG-926 §C follow-up — the CRM → Meta conversion relay's per-ad-account settings.
+ *
+ * Two things live here, both previously unreachable without a hand-written DynamoDB row:
+ *
+ *   `enabled` — the relay's opt-in. §C shipped default-OFF deliberately (turning it on for
+ *   everyone would start writing deal values into the same event stream their campaign
+ *   optimisation reads, with nobody having asked), but shipped with no way to turn it ON
+ *   either. Editing a customer's production record by hand to activate a feature is not a
+ *   mechanism, it is a hazard.
+ *
+ *   `eventNames` — which Meta event each conversion is emitted as. A customer whose store
+ *   pixel already uses `Purchase` needs CRM deals under a different name, or the two are
+ *   blended with no way to separate them afterwards.
+ *
+ * Per ad account, not per user: a customer may run a store pixel on one account and CRM
+ * conversions on another, and the relay reads these from the account its pixel resolved to.
+ */
+router.patch('/connected-accounts/meta/:accountId/conversion-relay', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { enabled, eventNames } = req.body ?? {};
+
+  if (enabled === undefined && eventNames === undefined) {
+    return res.status(400).json({ error: 'nothing to update: pass enabled and/or eventNames' });
+  }
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+
+  const { validateEventNameOverrides } = await import('../services/metaConversionRelay');
+  const validation = validateEventNameOverrides(eventNames);
+  if (!validation.valid) {
+    // Refused here rather than at send time. A name Meta rejects becomes a lost conversion
+    // recorded only in a log, which is the silent failure this whole card exists to end.
+    return res.status(400).json({ error: validation.error });
+  }
+
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Resolve against the caller's OWN connections, so this can never touch an account
+    // they do not hold, and so the stored `platform` value is used verbatim rather than
+    // assumed — production carries only 'meta' today, but three other modules still accept
+    // a legacy 'facebook', and updateAccountConfig matches on platform AND id.
+    const accounts = Array.isArray((user as any).connected_accounts) ? (user as any).connected_accounts : [];
+    const account = accounts.find(
+      (acc: any) =>
+        (acc?.platform === 'meta' || acc?.platform === 'facebook') &&
+        acc?.config?.account_type === 'ad_account' &&
+        String(acc?.account_id) === String(accountId),
+    );
+    if (!account) {
+      return res.status(404).json({ error: `No Meta ad account with id "${accountId}" connected` });
+    }
+
+    const patch: Record<string, any> = {};
+    if (enabled !== undefined) patch.crmConversionRelayEnabled = enabled;
+    // `null` clears the override back to §C's defaults, which is why it is an unset rather
+    // than a stored null. An object replaces the previous one wholesale, so a slot omitted
+    // from the new object genuinely returns to its default instead of lingering.
+    if (eventNames !== undefined && eventNames !== null) {
+      patch.crmConversionEventNames = eventNames;
+    }
+
+    await updateAccountConfig(
+      userId,
+      account.platform,
+      accountId,
+      patch,
+      eventNames === null ? { unset: ['crmConversionEventNames'] } : undefined,
+    );
+
+    return res.json({
+      success: true,
+      accountId,
+      ...(enabled !== undefined ? { crmConversionRelayEnabled: enabled } : {}),
+      ...(eventNames !== undefined ? { crmConversionEventNames: eventNames } : {}),
+    });
+  } catch (error: any) {
+    if (typeof error?.message === 'string' && error.message.includes('No meta account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update Meta conversion relay settings error:', error);
+    return res.status(500).json({ error: 'Failed to update conversion relay settings' });
   }
 });
 

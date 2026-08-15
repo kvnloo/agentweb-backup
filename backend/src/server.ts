@@ -757,6 +757,27 @@ createTestAccount().then(async () => {
         console.error('[metaTokenRefreshCron] Failed to initialize:', error);
       }
 
+      // Meta Tracking Integrity Monitor (ENG-926 §F) — runs daily.
+      // Watches every connected Meta ad account for an account that is spending while
+      // Meta attributes it no conversions at all, and for stored credentials Meta has
+      // stopped accepting. Both failures are SILENT by nature — nothing errors, leads
+      // simply stop arriving — so only a clock can notice them. RankAI's tracking was
+      // reported fixed three times without an end-to-end check and nobody caught it.
+      try {
+        const { runMetaTrackingMonitor } = await import('./cron/metaTrackingMonitorCron');
+        const TRACKING_MONITOR_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
+          .catch(e => console.error('[metaTrackingMonitorCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
+            .catch(e => console.error('[metaTrackingMonitorCron] Error:', e));
+        }, TRACKING_MONITOR_INTERVAL_MS);
+        console.log('[metaTrackingMonitorCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
+      }
+
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
       // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
       // mailbox send (Graph produces no Resend webhooks), so this polls each connected

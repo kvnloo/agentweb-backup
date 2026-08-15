@@ -41,6 +41,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
 import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
@@ -303,6 +304,14 @@ import {
   validateNegativeCampaignCriteria,
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
+import {
+  isMetaSpendStartingWrite,
+  runMetaTrackingGate,
+  collectPendingDestinations,
+  collectPendingCreativeIds,
+  computeTrackingOverrideDigest,
+  trackingOverrideTokenMatches,
+} from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
@@ -345,6 +354,7 @@ import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import type { LeadImportRowOutcome } from '../utils/leadSchema';
+import { LEAD_STANDARD_FILTER_FIELDS, projectLeadAttribution } from '../utils/leadSchema';
 
 type MetaApiResult = {
   success: boolean;
@@ -3331,6 +3341,7 @@ export class AgentModeService {
     // batch in the controller can persist only the un-checkpointed tail.
     let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
+    const runEmitter = new RunEmitter(agentRuntimeRunId, () => {}, onProgress);
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,
@@ -3990,7 +4001,7 @@ export class AgentModeService {
         await flushCheckpoint();
 
         if (onProgress) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'thinking',
             toolCalls: iteration === 1 ? [] : toolCalls.slice()
@@ -4136,7 +4147,7 @@ export class AgentModeService {
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
               if (onProgress) {
-                onProgress({
+                runEmitter.emitLegacy({
                   iteration,
                   status: 'switching_model',
                   toolCalls: toolCalls.slice(),
@@ -4430,7 +4441,7 @@ export class AgentModeService {
 
           // Send progress update: final response ready
           if (onProgress) {
-            onProgress({
+            runEmitter.emitLegacy({
               iteration,
               status: 'complete',
               toolCalls: toolCalls.slice()
@@ -4457,7 +4468,7 @@ export class AgentModeService {
                   suggestedReplies: suggestions,
                 };
                 if (onProgress) {
-                  onProgress({ iteration, status: 'suggestions', suggestions });
+                  runEmitter.emitLegacy({ iteration, status: 'suggestions', suggestions });
                 }
               }
             } catch {
@@ -4478,7 +4489,7 @@ export class AgentModeService {
         // once cancelled, emitting executing_tools would re-open the optimistic
         // "Generating image..." panel on a turn the user was already told had failed.
         if (onProgress && !isCancelled?.()) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'executing_tools',
             toolCalls: toolCalls.slice(),
@@ -4580,7 +4591,7 @@ export class AgentModeService {
         // would otherwise emit tool_executed with a real imageUrl — surfacing a SECOND
         // image on a turn the user already retried.
         if (onProgress && !isCancelled?.()) {
-          onProgress({
+          runEmitter.emitLegacy({
             iteration,
             status: 'tool_executed',
             toolCalls: toolCalls.slice(toolCallsLengthBeforeIteration),
@@ -4629,7 +4640,7 @@ export class AgentModeService {
             metadata: { timestamp: new Date().toISOString(), awaitingUserConfirmation: true }
           });
           if (onProgress) {
-            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+            runEmitter.emitLegacy({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
           }
           break;
         }
@@ -11183,7 +11194,11 @@ export class AgentModeService {
           icpMatch: lead.icpMatch?.isMatch || false,
           icpScore: lead.icpMatch?.score || null,
           engagementCount: lead.engagementCount || 0,
-          isEngaged: lead.isEngaged || false
+          isEngaged: lead.isEngaged || false,
+          // ENG-1175 AC2 — the list path returns the same attribution shape as
+          // the detail path. Spread last so it can only add keys, never shadow
+          // an existing one; absent attribution adds nothing at all.
+          ...projectLeadAttribution(lead),
         })),
         matchCount: matchingLeads.length,
         listName: list.name,
@@ -11200,7 +11215,11 @@ export class AgentModeService {
     lead: any,
     filters: Array<{ field: string; operator: string; value?: any }>,
     searchQuery: string,
-    standardFields: string[],
+    // readonly: callers pass the shared LEAD_STANDARD_FILTER_FIELDS constant
+    // (ENG-1218), which must not be mutable through this parameter — a callee
+    // reordering or trimming it would silently change how the OTHER resolver
+    // behaves, which is the class of bug this constant exists to end.
+    standardFields: readonly string[],
   ): boolean {
     if (searchQuery) {
       const fields = [
@@ -11380,7 +11399,21 @@ export class AgentModeService {
       }
 
       const searchQuery = (options?.search || '').trim().toLowerCase();
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
+      // `clickIds` is the denormalized top-level attribution field (ENG-1176).
+      // It has to be listed here or the resolver falls through to
+      // `lead.customFields.clickIds` and answers "0% of your leads carry a click
+      // ID" — indistinguishable from a broken tag, and wrong. The dot form
+      // (`clickIds.gclid`) resolves on its own and never had this problem.
+      //
+      // NOTE: `utmSource` / `utmMedium` have the same latent bug and are
+      // deliberately NOT fixed here — promoting them changes how an existing
+      // filter behaves for anyone with a same-named custom field, which is a
+      // separate seam. Tracked on ENG-1175.
+      // ENG-1218: shared with the other filter resolver. A field missing here
+      // does not error — it resolves to customFields[field], so `is_empty`
+      // matches EVERY lead. On the destructive path that is data loss behind a
+      // confirm gate whose preview looks correct.
+      const standardFields = LEAD_STANDARD_FILTER_FIELDS as readonly string[];
       const matchingLeads: Array<{ lead: any; listId: string; listName: string }> = [];
 
       let stopIdx = -1;
@@ -11469,6 +11502,12 @@ export class AgentModeService {
             isEngaged: entry.lead.isEngaged || false,
             customFields: entry.lead.customFields || {},
             ...(sanitizedEnrichmentMetadata ? { enrichmentMetadata: sanitizedEnrichmentMetadata } : {}),
+            // ENG-1175. This is the call both launch gates make to answer "did
+            // the gclid survive to the stored row?" — Google Pre-Launch Gate
+            // step 6.6 and the Meta gate's T11. Without these fields the gate
+            // reads a lead with no attribution in it and reports a BLOCK on a
+            // correctly-attributed lead.
+            ...projectLeadAttribution(entry.lead),
           };
         }),
         matchCount: matchingLeads.length,
@@ -11630,7 +11669,11 @@ export class AgentModeService {
           messageDraft: lead.messageDraft || null,
           selectedSenderId: lead.selectedSenderId || null,
           createdAt: lead.createdAt,
-          updatedAt: lead.updatedAt
+          updatedAt: lead.updatedAt,
+          // ENG-1175 AC1 — firstTouch when one exists, the field omitted
+          // entirely when it does not. Never an empty object: that would report
+          // "capture ran and found nothing" for a lead capture never touched.
+          ...projectLeadAttribution(lead),
         },
         engagementSummary: {
           total: engagementCount.total,
@@ -12075,7 +12118,18 @@ export class AgentModeService {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion to identify leads to delete' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency', 'createdAt', 'updatedAt'];
+      // Must stay in step with the searchLeads resolver — this path is the
+      // destructive one, so a field it fails to resolve does not merely return a
+      // wrong answer, it selects the wrong rows for deletion. `clickIds` falling
+      // through to `customFields.clickIds` (undefined on essentially every lead)
+      // made `is_empty` match EVERYTHING, so "delete the leads with no click ID"
+      // selected the attributed leads too. The two-phase confirm gate was the
+      // only thing between that and data loss, and its preview looked correct.
+      // ENG-1218: shared with the other filter resolver. A field missing here
+      // does not error — it resolves to customFields[field], so `is_empty`
+      // matches EVERY lead. On the destructive path that is data loss behind a
+      // confirm gate whose preview looks correct.
+      const standardFields = LEAD_STANDARD_FILTER_FIELDS as readonly string[];
 
       // Helper function to check if a lead matches all filters
       const leadMatchesFilters = (lead: any): boolean => {
@@ -15467,23 +15521,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (connection?.account_id && connection?.platform) {
       try {
-        const previous: unknown = connection.config?.granted_scopes;
-        const retained = (Array.isArray(previous) ? previous : [])
-          .filter((s: unknown) => typeof s === 'string')
-          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+        // Which of the two independent grants is actually missing (ENG-1158
+        // follow-up)? Without this, the re-consent message tells an owner who
+        // already granted the app scope to reconnect and re-approve a
+        // permission they already have — for a gap that lives on the ad
+        // account, not the OAuth connection, which reconnecting cannot touch.
+        const tier = await metaService.classifyAdsRefusalTier(connection.config?.access_token);
+        const revokedAt = new Date().toISOString();
 
+        // Function form (Greptile P1 on the sibling call in metaAdsCapabilitySync):
+        // `retained` must come from the config a CAS retry actually just read, not
+        // from `connection.config` captured before this call — otherwise a retry
+        // after a concurrent recovery would re-narrow a grant that had just come
+        // back. `tier` and `revokedAt` stay fixed: both are fresh judgments made
+        // once (a live Meta call, this call's own timestamp), not derived from
+        // local state that can go stale.
+        // The probedAt guard (Greptile P1 follow-up, mirrors the sibling in
+        // metaAdsCapabilitySync.ts): this single read failure is weaker
+        // evidence than the sweep's two-strike confirmation, so if the sweep
+        // already recorded a NEWER probe (e.g. a recovery landing moments
+        // after this failure), that signal wins — do nothing rather than
+        // revoke over a connection just confirmed healthy.
         const { updateAccountConfig } = await import('./connectedAccountsDb');
-        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
-          // Meta just told us authoritatively that no ads scope is granted.
-          // Recording it converts every subsequent attempt into a pre-flight refusal.
-          granted_scopes: retained,
-          ads_scope_revoked_at: new Date().toISOString(),
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, freshConfig => {
+          const storedProbedAt = freshConfig.ads_capability_probed_at;
+          if (typeof storedProbedAt === 'string' && storedProbedAt > revokedAt) {
+            return { updates: {}, unset: [] };
+          }
+
+          const freshPrevious: unknown = freshConfig.granted_scopes;
+          const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
+            .filter((s: unknown) => typeof s === 'string')
+            .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+          return {
+            // Meta just told us authoritatively that no ads scope is granted.
+            // Recording it converts every subsequent attempt into a pre-flight refusal.
+            updates: {
+              granted_scopes: freshRetained,
+              ads_scope_revoked_at: revokedAt,
+              ads_capability_probed_at: revokedAt,
+              ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+            },
+            unset: tier === 'unknown' ? ['ads_scope_tier'] : undefined,
+          };
         });
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
         );
       }
+
+      // Deliberately does NOT notify the owner. The 12-hourly capability sweep
+      // is the single notifier (ENG-1158): it probes every Meta ad account and
+      // alerts on exactly the accounts this path records, so notifying here too
+      // would only buy latency — at the price of two processes racing to email
+      // the same owner for one episode, which no in-process guard can dedupe.
+      // One sender, one process, no cross-process coordination to get wrong.
     }
 
     throw buildMetaAdsScopeError({
@@ -18259,6 +18352,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
     }
 
+    /*
+     * ENG-941: waiving the tracking check is the single most consequential thing that can
+     * ride along in these params, and it was invisible here. Per ENG-388 the override is
+     * user-granted — but "user-granted" means nothing if the confirmation the user approves
+     * never mentions it. Surfaced in the summary so approving a launch cannot silently
+     * approve launching without measurement.
+     */
+    if (params?.override_tracking_check === true) {
+      target.override_tracking_check = true;
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
+
     return { summary: lines.join(' '), target };
   }
 
@@ -18637,7 +18745,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
     // gate-only flag and is stripped before dispatch so it never reaches Meta.
     const confirmed = params.confirm === true;
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+    /*
+     * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
+     * the confirmed execution are two separate calls with separately supplied params, so a
+     * model could preview a plain activation, let the user approve THAT, and then add
+     * `override_tracking_check` to the replay — waiving the measurement check on something
+     * the user was never told would skip it. An override the model can introduce after
+     * approval is not user-granted, whatever the tool description says.
+     *
+     * So the override is bound to the approval: a preview that carries one issues an HMAC
+     * over that exact call, and the override only counts when the replay presents that token
+     * back. No token, a forged token, or a token for different arguments all fall back into
+     * a fresh preview — which discloses the override and issues the matching token, so the
+     * path is a loop rather than a dead end. Nothing changes for a launch that waives
+     * nothing: those never need a token.
+     */
+    const overrideClaimed = (params as any)?.override_tracking_check === true;
+    const overrideDigest = overrideClaimed
+      ? computeTrackingOverrideDigest(getJwtSecret(), {
+          entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+        })
+      : '';
+    const overrideApproved =
+      overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
@@ -18660,13 +18791,77 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          (overrideClaimed
+            ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
+              `WARNING above and approve it explicitly; the replay must additionally carry ` +
+              `params.tracking_override_token exactly as returned here, or the override will not apply.`
+            : ''),
+        // Only issued when an override was actually described in this preview, so it can only
+        // ever approve a waiver the user was shown.
+        ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
         target
       } as any;
     }
     if ('confirm' in params) {
       params = { ...params };
       delete params.confirm;
+    }
+    if ('tracking_override_token' in params) {
+      params = { ...params };
+      delete (params as any).tracking_override_token;
+    }
+
+    /*
+     * ENG-941: deterministic pre-flight tracking gate.
+     *
+     * Placed here, at the shared write path, rather than on the two named launch tools.
+     * This method can flip a campaign, ad set or ad to ACTIVE directly, so a gate that
+     * only guarded those tools could be bypassed by choosing this one instead — and a
+     * safety gate you can route around is not a safety gate.
+     *
+     * `override_tracking_check` is stripped from params before dispatch for the same
+     * reason `confirm` is above: it is our flag, not a Meta field, and must never reach
+     * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
+     * only override path — no portal control — and it is recorded on the run record.
+     *
+     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
+     * so it only runs on a confirmed call. The two ask different questions — that gate
+     * asks "did a human intend this?", this one asks "can it report a conversion?" —
+     * and doing the network checks on an unconfirmed preview would waste them.
+     */
+    // Reaching here with an override means it survived the binding check above, so it is one
+    // the user was shown and approved — never one the model added to the replay.
+    const overrideTrackingCheck = overrideApproved;
+    if (params && typeof params === 'object' && 'override_tracking_check' in params) {
+      params = { ...params };
+      delete (params as any).override_tracking_check;
+    }
+    if (isMetaSpendStartingWrite(entity_type, action, params)) {
+      const gateCreds = await this.getMetaCredentials(userId, account_id);
+      const gate = await runMetaTrackingGate(
+        gateCreds,
+        campaign_id,
+        `${entity_type}_${action}`,
+        overrideTrackingCheck,
+        sessionId,
+        {},
+        // Activating one ad is judged on that ad's own destination, not its siblings'.
+        entity_type === 'AD' ? ad_id : undefined,
+        /*
+         * An ad being CREATED as ACTIVE has no entry in the ad list yet, so its destination
+         * has to come from the request itself or it ships unchecked. Meta carries the
+         * destination on the creative, which is why several shapes are possible here.
+         */
+        collectPendingDestinations(entity_type, action, params),
+        /*
+         * And when the ad references an existing creative by id instead of inlining one —
+         * the documented path — the destination is on that creative, so the gate resolves
+         * it through Graph rather than checking nothing.
+         */
+        collectPendingCreativeIds(entity_type, action, params),
+      );
+      if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
     switch (entity_type) {
@@ -19295,6 +19490,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
       lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
     }
+    /*
+     * ENG-941: the preview_token now covers `override_tracking_check`, so the override
+     * cannot be added after approval — but binding it to an approval that never mentioned
+     * it just moves the hole. The user has to be told what they are waiving, in the text
+     * they actually read, or "user-granted" means nothing. Same wording as the shared write
+     * path's confirmation, deliberately: one sentence for one decision.
+     */
+    if (args?.override_tracking_check === true) {
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
     return lines.join(' ');
   }
 
@@ -19374,6 +19582,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lookalike_country: args.lookalike_country,
       exclude_audience_id: args.exclude_audience_id,
       ad_set_params: args.ad_set_params,
+      /*
+       * ENG-941 (Greptile security P1): the override was NOT part of what the preview token
+       * signed, so it could be added to the confirmed replay without changing the digest —
+       * waiving the tracking check on a launch the user approved without one. Including it
+       * means adding it invalidates the approval and forces a fresh, disclosing preview.
+       */
+      override_tracking_check: args.override_tracking_check === true,
     };
     return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
   }
@@ -19533,6 +19748,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workflow: 'targeted_audience' | 'retargeting',
     source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
   ): Promise<any> {
+      /*
+       * ENG-941: the named ENG-600 launch flows create their ad set directly rather than
+       * going through callMetaMarketingApi, so the gate there does not cover them. Without
+       * this, these two tools are the bypass.
+       *
+       * Ad sets default to PAUSED (metaService: `status: params.status || 'PAUSED'`), so a
+       * launch only starts paid delivery when the caller explicitly asks for ACTIVE — which
+       * is exactly what isMetaSpendStartingWrite tests. Reusing that predicate keeps one
+       * definition of "this spends money" instead of a second, drifting copy.
+       *
+       * Runs after the confirmation step above and before anything is created, so a blocked
+       * launch leaves no audience, lookalike or ad set behind.
+       */
+      if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
+        const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        const gate = await runMetaTrackingGate(
+          gateCreds,
+          args.campaign_id,
+          `${workflow.toUpperCase()}_LAUNCH`,
+          args?.override_tracking_check === true,
+          args?.session_id,
+        );
+        if (!gate.proceed) return gate.blockResult;
+      }
+
       const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
 
       let attachAudienceId = seed.audience!.id;
@@ -30309,17 +30549,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
    */
   private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
-    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
-    if (acc?.config?.account_type !== 'ad_account') return {};
-
-    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
-    const state = getMetaAdsScopeState(acc.config);
-
-    if (state === 'granted') return { ads_capable: true };
-    if (state === 'missing') {
-      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
-    }
-    return {};
+    // Delegates to the shared helper so this payload and the Settings → Connected
+    // accounts payload are provably the same judgement (ENG-1158). They used to be
+    // computed independently, which is how an account could be "degraded" here and
+    // a green "Connected" row in the UI at the same moment.
+    const { describeMetaAdsCapability } = await import('../utils/metaAdsScope');
+    return describeMetaAdsCapability(acc);
   }
 
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
