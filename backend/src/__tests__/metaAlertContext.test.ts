@@ -18,7 +18,12 @@
  * burning money — the whole point of this system is that silence is the enemy.
  */
 
-import { buildAlertContext, metaDeepLinks } from '../services/metaAlertContext';
+import {
+  buildAlertContext,
+  metaDeepLinks,
+  ENRICHMENT_TIMEOUT_MS,
+  MAX_PIXELS_DIAGNOSED,
+} from '../services/metaAlertContext';
 
 const owner = {
   userId: 'u-every',
@@ -168,5 +173,122 @@ describe('metaDeepLinks', () => {
 
   it('builds an events manager link for the pixel', () => {
     expect(metaDeepLinks.eventsManager('456')).toContain('456');
+  });
+});
+
+describe('buildAlertContext — a hang must not stall the sweep', () => {
+  // The try/catch guards against ERRORS. A Graph call that never settles is worse: it
+  // freezes the sequential sweep, so every later account and every later user goes
+  // unchecked while one hung request waits forever. fetch has no default timeout.
+  const hang = () => new Promise(() => {});
+
+  it('gives up on a lookup that never settles and still returns context', async () => {
+    jest.useFakeTimers();
+    const promise = buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getCoverage: jest.fn(hang),
+    } as any);
+    await jest.advanceTimersByTimeAsync(ENRICHMENT_TIMEOUT_MS + 100);
+    const ctx = await promise;
+    jest.useRealTimers();
+
+    expect(ctx['Ad Account']).toBe('acct1');
+    expect(ctx).not.toHaveProperty('Lead Click-ID Coverage');
+  });
+
+  it('still returns when EVERY lookup hangs', async () => {
+    jest.useFakeTimers();
+    const promise = buildAlertContext(owner, 'acct1', days, {
+      getCoverage: jest.fn(hang),
+      getPixels: jest.fn(hang),
+      getMatchKeys: jest.fn(hang),
+    } as any);
+    await jest.advanceTimersByTimeAsync(ENRICHMENT_TIMEOUT_MS * 3 + 100);
+    const ctx = await promise;
+    jest.useRealTimers();
+
+    expect(ctx['Owner Email']).toBe('lyndi@every.io');
+    expect(ctx['Spend By Day']).toContain('2026-08-13');
+  });
+});
+
+describe('buildAlertContext — pixel diagnostics must not misroute', () => {
+  it('reports match keys for EVERY pixel that has fired, naming each', async () => {
+    // Picking "the first pixel with a last_fired_time" attaches match keys and an Events
+    // Manager link from a pixel that may have nothing to do with the ads — a confidently
+    // wrong diagnosis is worse than none. Diagnose them all and label them.
+    const getMatchKeys = jest.fn(async (pixelId: string) =>
+      pixelId === 'px-old' ? { Lead: { fr_cookie: 2 } } : { Lead: { email: 9 } },
+    );
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-old', name: 'Old site pixel', last_fired_time: '2026-01-01T00:00:00-0400' },
+        { id: 'px-live', name: 'Campaign pixel', last_fired_time: '2026-08-14T19:59:40-0400' },
+      ]),
+      getMatchKeys,
+    } as any);
+
+    expect(getMatchKeys).toHaveBeenCalledTimes(2);
+    expect(String(ctx['Meta Match Keys'])).toContain('px-old');
+    expect(String(ctx['Meta Match Keys'])).toContain('px-live');
+  });
+
+  it('does not claim "no identity supplied" when ANY fired pixel received identity', async () => {
+    // The old single-pixel pick could land on a dead pixel and declare a diagnosis that
+    // the live pixel contradicts.
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-old', name: 'Old', last_fired_time: '2026-01-01T00:00:00-0400' },
+        { id: 'px-live', name: 'Live', last_fired_time: '2026-08-14T19:59:40-0400' },
+      ]),
+      getMatchKeys: jest.fn(async (id: string) =>
+        id === 'px-old' ? { Lead: { fr_cookie: 2 } } : { Lead: { email: 9 } },
+      ),
+    } as any);
+
+    expect(String(ctx['Meta Match Keys'])).not.toMatch(/no identity we supplied/i);
+  });
+
+  it('skips pixels that have never fired — they have nothing to report', async () => {
+    const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 1 } });
+    await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-live', last_fired_time: '2026-08-14T19:59:40-0400' },
+        { id: 'px-dead' },
+      ]),
+      getMatchKeys,
+    } as any);
+
+    expect(getMatchKeys).toHaveBeenCalledTimes(1);
+    expect(getMatchKeys).toHaveBeenCalledWith('px-live');
+  });
+
+  it('caps how many pixels it will diagnose', async () => {
+    const many = Array.from({ length: MAX_PIXELS_DIAGNOSED + 4 }, (_, i) => ({
+      id: `px${i}`,
+      last_fired_time: '2026-08-14T19:59:40-0400',
+    }));
+    const getMatchKeys = jest.fn().mockResolvedValue({ Lead: { email: 1 } });
+    await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue(many),
+      getMatchKeys,
+    } as any);
+
+    expect(getMatchKeys).toHaveBeenCalledTimes(MAX_PIXELS_DIAGNOSED);
+  });
+
+  it('links Events Manager for the most recently fired pixel', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-old', last_fired_time: '2026-01-01T00:00:00-0400' },
+        { id: 'px-live', last_fired_time: '2026-08-14T19:59:40-0400' },
+      ]),
+    } as any);
+    expect(String(ctx['Meta Events Manager'])).toContain('px-live');
   });
 });

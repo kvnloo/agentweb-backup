@@ -28,6 +28,21 @@
 
 const TAG = '[Alert Context]';
 
+/**
+ * Per-lookup deadline.
+ *
+ * A try/catch protects against an enrichment that FAILS. It does nothing about one that
+ * never settles — and `fetch` carries no default timeout, while the coverage walk paginates
+ * every lead a customer has. The sweep is sequential, so one hung request would stall not
+ * just this alert but every later account and every later user, silently. That is a worse
+ * outcome than the missing field, and worse than the original un-enriched alert.
+ */
+export const ENRICHMENT_TIMEOUT_MS = 15_000;
+
+/** How many pixels are worth diagnosing on one account. Real accounts carry one or two;
+ *  the cap exists so a misconfigured account cannot turn one alert into a Graph fan-out. */
+export const MAX_PIXELS_DIAGNOSED = 3;
+
 /** Meta's own UI, deep-linked so the ticket is one click from the evidence rather than an
  *  id to copy-paste into a search box. */
 export const metaDeepLinks = {
@@ -59,11 +74,25 @@ const SUPPLIED_MATCH_KEYS = new Set([
 /** Run one enrichment, swallowing failure. A missing field is a smaller loss than a
  *  missing alert, every time. */
 async function attempt<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    return await fn();
+    // Raced against a deadline, not merely caught. A hang is the dangerous case: it stalls
+    // the whole sequential sweep rather than losing one field.
+    return await Promise.race([
+      fn(),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          console.warn(`${TAG} ${label} timed out after ${ENRICHMENT_TIMEOUT_MS}ms — omitting it`);
+          resolve(undefined);
+        }, ENRICHMENT_TIMEOUT_MS);
+      }),
+    ]);
   } catch (error: any) {
     console.warn(`${TAG} could not resolve ${label}: ${error?.message}`);
     return undefined;
+  } finally {
+    // Without this an abandoned timer keeps the event loop alive for its full duration.
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -123,29 +152,47 @@ export async function buildAlertContext(
           'while events land on another, attribution fails completely and silently.'
         : '');
 
-    // Match keys come from whichever pixel is actually receiving events; a pixel that has
-    // never fired has nothing to report.
-    const live = pixels.find((p) => p.last_fired_time) || pixels[0];
-    if (live?.id) {
-      context['Meta Events Manager'] = metaDeepLinks.eventsManager(live.id);
-      const matchKeys = await attempt('match keys', () => deps.getMatchKeys(live.id));
-      if (matchKeys && Object.keys(matchKeys).length > 0) {
-        const lines = Object.entries(matchKeys).map(
-          ([event, keys]) =>
-            `${event}: ${Object.entries(keys).map(([k, n]) => `${k}=${n}`).join(', ')}`,
-        );
-        const anySupplied = Object.values(matchKeys).some((keys) =>
-          Object.keys(keys).some((k) => SUPPLIED_MATCH_KEYS.has(k)),
-        );
-        context['Meta Match Keys'] =
-          lines.join('\n') +
-          (anySupplied
-            ? ''
-            : '\nNO IDENTITY WE SUPPLIED reached Meta on these events — only Meta\'s own ' +
-              'browser cookies. Without fbc/fbp/email an event cannot be tied back to an ad ' +
-              'click, which is why spend can show zero attributed conversions while the ' +
-              'pixel still counts the event.');
+    // Diagnose EVERY pixel that has fired, each labelled with its id.
+    //
+    // Picking one — "the first with a last_fired_time" — attaches match keys and an Events
+    // Manager link from a pixel that may have nothing to do with these ads. On an account
+    // carrying an old site pixel alongside the campaign's, that produces a confidently
+    // wrong diagnosis, which is worse than no diagnosis at all. A pixel that has NEVER
+    // fired is skipped: it has nothing to report.
+    const fired = pixels.filter((p) => p?.id && p.last_fired_time).slice(0, MAX_PIXELS_DIAGNOSED);
+    const mostRecent = [...fired].sort((a, b) =>
+      String(b.last_fired_time).localeCompare(String(a.last_fired_time)),
+    )[0];
+    if (mostRecent?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(mostRecent.id);
+
+    const sections: string[] = [];
+    let anySupplied = false;
+    for (const pixel of fired) {
+      const matchKeys = await attempt(`match keys for ${pixel.id}`, () => deps.getMatchKeys(pixel.id));
+      if (!matchKeys || Object.keys(matchKeys).length === 0) continue;
+      sections.push(
+        `pixel ${pixel.id}${pixel.name ? ` (${pixel.name})` : ''}:\n` +
+        Object.entries(matchKeys)
+          .map(([event, keys]) =>
+            `  ${event}: ${Object.entries(keys).map(([k, n]) => `${k}=${n}`).join(', ')}`)
+          .join('\n'),
+      );
+      if (Object.values(matchKeys).some((keys) => Object.keys(keys).some((k) => SUPPLIED_MATCH_KEYS.has(k)))) {
+        anySupplied = true;
       }
+    }
+
+    if (sections.length > 0) {
+      context['Meta Match Keys'] =
+        sections.join('\n') +
+        // Only claimed when NO fired pixel received identity. Asserting it off one pixel
+        // while another contradicts it would be the same confident-wrong failure.
+        (anySupplied
+          ? ''
+          : '\nNO IDENTITY WE SUPPLIED reached Meta on these events — only Meta\'s own ' +
+            'browser cookies. Without fbc/fbp/email an event cannot be tied back to an ad ' +
+            'click, which is why spend can show zero attributed conversions while the ' +
+            'pixel still counts the event.');
     }
   }
 
