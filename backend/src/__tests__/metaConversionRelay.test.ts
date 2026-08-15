@@ -17,6 +17,8 @@ import {
   mapStatusToMetaEvent,
   buildRelayEventId,
   buildFbcFromFirstTouch,
+  buildConversionValue,
+  isConversionRelayEnabled,
   relayLeadStatusEvent,
   RelayDeps,
 } from '../services/metaConversionRelay';
@@ -28,7 +30,18 @@ const LEAD_STATUS_CONFIG = [
   { value: 'lost', label: 'Lost', color: 'red', type: 'lost' as const },
 ];
 
-const OWNER = { email: 'owner@example.com', connected_accounts: [] };
+/** Opted in — the relay is default-off, so every send-path test needs an owner who has
+ *  actually switched it on. That the DEFAULT is off is asserted separately below. */
+const OWNER = {
+  email: 'owner@example.com',
+  connected_accounts: [
+    {
+      platform: 'meta',
+      account_id: 'acct1',
+      config: { account_type: 'ad_account', access_token: 'tok', crmConversionRelayEnabled: true },
+    },
+  ],
+};
 
 function makeDeps(overrides: Partial<RelayDeps> = {}): RelayDeps {
   return {
@@ -156,6 +169,84 @@ describe('buildFbcFromFirstTouch', () => {
   });
 });
 
+
+describe('isConversionRelayEnabled — off unless someone said yes', () => {
+  const optedIn = (flag: any) => ({
+    connected_accounts: [
+      { platform: 'meta', account_id: 'a', config: { account_type: 'ad_account', crmConversionRelayEnabled: flag } },
+    ],
+  });
+
+  afterEach(() => {
+    delete process.env.META_CONVERSION_RELAY_ENABLED;
+  });
+
+  it('is OFF for an account that has never been asked', () => {
+    // The whole point: merging this must not start sending a single customer's deal values
+    // to Meta without them opting in.
+    expect(isConversionRelayEnabled({ connected_accounts: [] })).toBe(false);
+    expect(isConversionRelayEnabled(optedIn(undefined))).toBe(false);
+    expect(isConversionRelayEnabled(undefined)).toBe(false);
+  });
+
+  it('is OFF for a truthy-but-not-true value rather than coercing', () => {
+    expect(isConversionRelayEnabled(optedIn('yes'))).toBe(false);
+    expect(isConversionRelayEnabled(optedIn(1))).toBe(false);
+  });
+
+  it('is ON for an explicit per-account opt-in', () => {
+    expect(isConversionRelayEnabled(optedIn(true))).toBe(true);
+  });
+
+  it('is ON under the environment override, for test environments', () => {
+    process.env.META_CONVERSION_RELAY_ENABLED = 'true';
+    expect(isConversionRelayEnabled({ connected_accounts: [] })).toBe(true);
+  });
+
+  it('ignores the opt-in on a non-ad-account connection', () => {
+    expect(
+      isConversionRelayEnabled({
+        connected_accounts: [
+          { platform: 'meta', config: { account_type: 'page', crmConversionRelayEnabled: true } },
+        ],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('buildConversionValue — never guess a denomination', () => {
+  it('sends value + currency when the lead states its currency', () => {
+    expect(buildConversionValue({ dealValue: 5000, dealCurrency: 'usd' })).toEqual({
+      value: 5000,
+      currency: 'USD',
+    });
+  });
+
+  it('sends NO value when the currency is missing — a wrong denomination is worse than none', () => {
+    // A 5,000 USD deal reported against an INR ad account is ~80x off, and Meta accepts it
+    // silently. Omitting the value keeps the conversion useful and keeps the number honest.
+    expect(buildConversionValue({ dealValue: 5000 })).toBeUndefined();
+    expect(buildConversionValue({ dealValue: 5000, dealCurrency: '' })).toBeUndefined();
+  });
+
+  it('rejects a malformed currency rather than passing it through', () => {
+    expect(buildConversionValue({ dealValue: 5000, dealCurrency: 'dollars' })).toBeUndefined();
+    expect(buildConversionValue({ dealValue: 5000, dealCurrency: 'US' })).toBeUndefined();
+  });
+
+  it('sends nothing when there is no value at all', () => {
+    expect(buildConversionValue({ dealCurrency: 'USD' })).toBeUndefined();
+    expect(buildConversionValue({ dealValue: Number.NaN, dealCurrency: 'USD' })).toBeUndefined();
+  });
+
+  it('keeps a genuine zero — 0 is an amount, not an absence', () => {
+    expect(buildConversionValue({ dealValue: 0, dealCurrency: 'USD' })).toEqual({
+      value: 0,
+      currency: 'USD',
+    });
+  });
+});
+
 describe('relayLeadStatusEvent — sending', () => {
   it('reconstructs fbc from the lead first touch and sends the landing URL', async () => {
     const deps = makeDeps();
@@ -177,12 +268,43 @@ describe('relayLeadStatusEvent — sending', () => {
     expect(event.sourceUrl).toBe('https://example.com/lp?utm_source=facebook');
   });
 
-  it('never sends fbp — it is a capture-time cookie that is not persisted on the lead', async () => {
+  it('sends the persisted fbp so a conversion weeks later still matches', async () => {
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx({ lead: makeLead({ metaFbp: 'fb.1.1754000000000.987654321' }) }), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.fbp).toBe('fb.1.1754000000000.987654321');
+  });
+
+  it('omits fbp entirely for a lead captured before it was persisted', async () => {
     const deps = makeDeps();
     await relayLeadStatusEvent(ctx(), deps);
 
     const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
     expect(event.fbp).toBeUndefined();
+  });
+
+  it('declares action_source as system_generated, not website', async () => {
+    // A CRM status change is not a browser event. Meta validates this field — a bogus value
+    // is rejected outright — so claiming 'website' is a factual misstatement about where
+    // the conversion happened, not a harmless default.
+    const deps = makeDeps();
+    await relayLeadStatusEvent(ctx(), deps);
+
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.actionSource).toBe('system_generated');
+  });
+
+  it('sends Purchase with NO value when the lead names no currency', async () => {
+    const deps = makeDeps();
+    const result = await relayLeadStatusEvent(
+      ctx({ lead: makeLead({ dealValue: 5000, dealCurrency: undefined }) }),
+      deps,
+    );
+
+    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
+    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
+    expect(event.customData).toBeUndefined();
   });
 
   it('sends Purchase with value and currency from the lead record', async () => {
@@ -197,21 +319,7 @@ describe('relayLeadStatusEvent — sending', () => {
     expect(event.customData).toEqual({ value: 5000, currency: 'USD' });
   });
 
-  it('falls back to the ad account currency when the lead has no dealCurrency', async () => {
-    // Not cosmetic: a non-USD account reported as USD is silently wrong, since Meta
-    // accepts whatever denomination it is handed.
-    const deps = makeDeps({
-      getCredentials: jest
-        .fn()
-        .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct', currency: 'INR' }),
-    });
-    await relayLeadStatusEvent(ctx({ lead: makeLead({ dealCurrency: undefined }) }), deps);
-
-    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
-    expect(event.customData.currency).toBe('INR');
-  });
-
-  it('prefers the deal currency over the account currency when both exist', async () => {
+  it('uses the deal currency verbatim, never the ad account currency', async () => {
     const deps = makeDeps({
       getCredentials: jest
         .fn()
@@ -223,28 +331,15 @@ describe('relayLeadStatusEvent — sending', () => {
     expect(event.customData.currency).toBe('EUR');
   });
 
-  it('falls back to USD only when neither the deal nor the account names a currency', async () => {
+  it('skips entirely when the account has not opted in', async () => {
     const deps = makeDeps({
-      getCredentials: jest
-        .fn()
-        .mockResolvedValue({ accountId: 'acct1', accessToken: 'tok', accountName: 'Acct' }),
+      getUserById: jest.fn().mockResolvedValue({ email: 'x@y.com', connected_accounts: [] }),
     });
-    await relayLeadStatusEvent(ctx({ lead: makeLead({ dealCurrency: undefined }) }), deps);
 
-    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
-    expect(event.customData.currency).toBe('USD');
-  });
-
-  it('still sends Purchase when dealValue is absent — no value, but never a dropped conversion', async () => {
-    const deps = makeDeps();
-    const result = await relayLeadStatusEvent(
-      ctx({ lead: makeLead({ dealValue: undefined, dealCurrency: undefined }) }),
-      deps,
-    );
-
-    expect(result).toMatchObject({ sent: true, eventName: 'Purchase' });
-    const event = (deps.sendEvent as jest.Mock).mock.calls[0][2];
-    expect(event.customData?.value).toBeUndefined();
+    const result = await relayLeadStatusEvent(ctx(), deps);
+    expect(result).toMatchObject({ skipped: true });
+    expect(deps.sendEvent).not.toHaveBeenCalled();
+    expect(deps.resolvePixel).not.toHaveBeenCalled();
   });
 
   it('sends QualifiedLead with no custom_data at all', async () => {

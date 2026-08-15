@@ -359,6 +359,26 @@ describe('sendCapiLeadEvent', () => {
       expect(body.data[0].custom_data.value).toBe(0);
     });
 
+    it('keeps action_source as "website" for existing callers that pass none', async () => {
+      // The form-submission and booking paths are real browser-originated events and must
+      // keep describing themselves that way — this field became configurable for the CRM
+      // relay only, and a silent default change would misreport every existing conversion.
+      await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0].action_source).toBe('website');
+    });
+
+    it('honours an explicit action_source, e.g. system_generated for a CRM conversion', async () => {
+      await metaService.sendCapiLeadEvent('px1', 'tok', {
+        ...baseEvent,
+        actionSource: 'system_generated',
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.data[0].action_source).toBe('system_generated');
+    });
+
     it('omits custom_data when the object is present but empty', async () => {
       await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, customData: {} });
 

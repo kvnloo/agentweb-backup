@@ -131,6 +131,36 @@ export function buildFbcFromFirstTouch(firstTouch: any): string | undefined {
   return `fb.1.${creationMs}.${fbclid}`;
 }
 
+/**
+ * Whether the CRM → Meta relay is switched on for this account.
+ *
+ * DEFAULT OFF, deliberately. Without a gate, merging this turns on a new behaviour for
+ * every customer with Meta connected at once: deal values start flowing to Meta, and
+ * `Purchase` events land in the same stream their existing campaign optimisation reads,
+ * with nobody having asked for either. That is a consent problem, not a code problem, and
+ * no amount of correctness fixes it.
+ *
+ * Two ways to switch on, checked in order:
+ *   - `connected_accounts[].config.crmConversionRelayEnabled` on the owner's Meta ad
+ *     account — the real, per-customer opt-in. The portal control that sets it is a
+ *     follow-up PR; the field is read here so the engine is ready for it.
+ *   - `META_CONVERSION_RELAY_ENABLED=true` — an environment-wide override, so a test
+ *     environment can exercise the path end to end without a portal.
+ *
+ * Anything else, including a missing field, means off.
+ */
+export function isConversionRelayEnabled(owner: any): boolean {
+  if (process.env.META_CONVERSION_RELAY_ENABLED === 'true') return true;
+
+  const accounts = Array.isArray(owner?.connected_accounts) ? owner.connected_accounts : [];
+  return accounts.some(
+    (acc: any) =>
+      (acc?.platform === 'facebook' || acc?.platform === 'meta') &&
+      acc?.config?.account_type === 'ad_account' &&
+      acc?.config?.crmConversionRelayEnabled === true,
+  );
+}
+
 export interface RelayDeps {
   getUserById: (userId: string) => Promise<any>;
   resolvePixel: (
@@ -216,6 +246,33 @@ async function defaultDeps(): Promise<RelayDeps> {
  * customer has no Meta account connected" as a failure would bury the real failures in
  * noise, which is how ENG-926's original incident stayed invisible for three weeks.
  */
+/**
+ * The monetary payload for a value event, or undefined when we cannot state it truthfully.
+ *
+ * Requires an explicit `dealCurrency` on the lead. Inferring one from the ad account is the
+ * tempting shortcut and is exactly how a USD deal gets reported in INR — silently, because
+ * Meta validates the currency CODE but has no way to know the number was denominated in
+ * something else.
+ */
+export function buildConversionValue(
+  lead: Record<string, any>,
+  listId?: string,
+): { value: number; currency: string } | undefined {
+  if (typeof lead?.dealValue !== 'number' || !Number.isFinite(lead.dealValue)) return undefined;
+
+  const currency = typeof lead?.dealCurrency === 'string' ? lead.dealCurrency.trim().toUpperCase() : '';
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    console.log(
+      `[CAPI Relay] lead ${lead?.leadId}${listId ? ` (list ${listId})` : ''} has dealValue ` +
+      `${lead.dealValue} but no valid dealCurrency — sending the conversion WITHOUT a value ` +
+      `rather than guessing a denomination`,
+    );
+    return undefined;
+  }
+
+  return { value: lead.dealValue, currency };
+}
+
 export async function relayLeadStatusEvent(
   ctx: RelayContext,
   deps?: RelayDeps,
@@ -272,6 +329,13 @@ export async function relayLeadStatusEvent(
     const owner = await d.getUserById(userId);
     if (!owner) return skip(`owner ${userId} not found`, true);
 
+    // Checked after the owner is loaded (the opt-in lives on their Meta connection) but
+    // before any Meta call, so a customer who has not opted in never has a single event
+    // computed against their account, let alone sent.
+    if (!isConversionRelayEnabled(owner)) {
+      return skip('CRM conversion relay not enabled for this account', true);
+    }
+
     // NOTE — no surface-level opt-out exists for CRM-sourced conversions yet. ENG-1141's
     // `attributionDisabled` is deliberately per-surface and lives on the CALENDLY
     // connection's config (routes/connectedAccounts.ts's calendly/:id/attribution), so it
@@ -297,12 +361,15 @@ export async function relayLeadStatusEvent(
 
     // Value only rides on the value event. A dealValue on a QualifiedLead would report
     // revenue Meta should not yet attribute.
-    const customData = mapped.isValueEvent
-      ? {
-          ...(typeof lead.dealValue === 'number' ? { value: lead.dealValue } : {}),
-          currency: lead.dealCurrency || creds.currency || 'USD',
-        }
-      : undefined;
+    //
+    // A value is sent ONLY when the lead itself names its currency. Falling back to the ad
+    // account's currency looks reasonable and is quietly dangerous: a deal entered as 5,000
+    // against an INR-denominated account is reported as ₹5,000, ~80x off, and Meta accepts
+    // whatever denomination it is handed without complaint. Nobody would ever notice, and
+    // value-based bidding would optimise against fiction. An event with no value is honest
+    // and still fully usable for conversion optimisation, so omission beats a confident
+    // guess — see buildConversionValue.
+    const customData = mapped.isValueEvent ? buildConversionValue(lead, listId) : undefined;
 
     const eventId = buildRelayEventId(leadId, mapped.eventName);
     const result = await d.sendEvent(resolution.pixelId, creds.accessToken, {
@@ -311,13 +378,19 @@ export async function relayLeadStatusEvent(
       firstName: lead.firstName,
       lastName: lead.lastName,
       phone: lead.phone,
-      // No `fbp`: it is a browser cookie read at capture time (routes/webhooks.ts) and is
-      // never persisted on the lead, so there is nothing truthful to send here. `fbc` IS
-      // recoverable — it is a deterministic encoding of the stored fbclid — and is worth
-      // reconstructing, since a click ID is the single strongest match signal Meta has.
+      // Both of Meta's browser ids, recovered rather than lost. `fbp` is now persisted at
+      // capture (routes/webhooks.ts) because the cookie itself is long gone by the time a
+      // deal closes; `fbc` is reconstructed from the stored fbclid, which is a documented
+      // deterministic encoding. Between them they are the strongest match signals Meta has,
+      // and a conversion sent without either matches on email alone.
+      fbp: typeof lead.metaFbp === 'string' && lead.metaFbp ? lead.metaFbp : undefined,
       fbc: buildFbcFromFirstTouch(lead.firstTouch),
       sourceUrl: lead.firstTouch?.landingUrl,
       eventName: mapped.eventName,
+      // A CRM status change is not a website event — nobody was on a page. Meta validates
+      // this field (a bogus value is rejected outright), and 'system_generated' is its
+      // documented value for a conversion recorded by a system rather than a browser.
+      actionSource: 'system_generated',
       ...(customData ? { customData } : {}),
     });
 

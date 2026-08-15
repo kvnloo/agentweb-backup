@@ -5626,6 +5626,12 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    /** ENG-926 §C: Meta's `_fbp` browser id, captured at form submission. Persisted so a
+     *  conversion relayed weeks later (a deal closing in the CRM) can still be matched —
+     *  the cookie itself is long gone by then. Deliberately NOT stored inside
+     *  firstTouch.clickIds: every visitor has an fbp, including organic ones, so filing it
+     *  under click IDs would make an organic lead read as paid-attributed. */
+    metaFbp?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -5750,6 +5756,9 @@ export const crmDb = {
       }
       if (leadData.dealCurrency) {
         item.dealCurrency = leadData.dealCurrency;
+      }
+      if (leadData.metaFbp) {
+        item.metaFbp = leadData.metaFbp;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;

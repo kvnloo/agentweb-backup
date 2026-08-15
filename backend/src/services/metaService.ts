@@ -2724,6 +2724,16 @@ export class MetaService {
        *  `value`/`currency` are what make a closed-won `Purchase` usable for Meta's
        *  value-based bidding — without them the event counts but carries no revenue. */
       customData?: { value?: number; currency?: string };
+      /** Meta's `action_source`. Defaults to 'website', which is correct for this
+       *  function's original callers (a real form submission, and ENG-522's booking flow)
+       *  and keeps their payloads unchanged.
+       *
+       *  A CRM status change is NOT a website event — nobody was on a page — and claiming
+       *  otherwise misdescribes where the conversion happened. Meta validates this field:
+       *  probed against Graph v25 on 2026-08-14, 'system_generated' and 'website' are both
+       *  accepted while a bogus value is rejected with "Invalid Action Source Parameter",
+       *  so acceptance here is meaningful rather than the API ignoring the field. */
+      actionSource?: string;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2773,7 +2783,7 @@ export class MetaService {
             event_name: event.eventName || 'Lead',
             event_id: event.eventId,
             event_time: eventTime,
-            action_source: 'website',
+            action_source: event.actionSource || 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,
             ...(Object.keys(customData).length > 0 ? { custom_data: customData } : {}),

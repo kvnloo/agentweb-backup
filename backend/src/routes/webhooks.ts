@@ -467,6 +467,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.lastTouch = touch;
     }
 
+    // ENG-926 §C: persist Meta's browser id so a conversion relayed WEEKS later (a deal
+    // closing in the CRM) can still be matched to this person. `fbp` is a first-party
+    // cookie read here at capture time and used immediately for the Lead event; by the
+    // time the deal closes the cookie is long gone, and it is the strongest match signal
+    // that survives nothing else.
+    //
+    // Stored as its own field rather than inside `firstTouch.clickIds`: every visitor gets
+    // an fbp, including organic ones, so filing it under click IDs would make an organic
+    // lead satisfy `attribute_exists(clickIds)` and read as paid-attributed — the exact
+    // failure pruneClickIds's own contract warns about.
+    if (typeof fbp === 'string' && fbp.trim()) {
+      leadData.metaFbp = fbp.trim();
+    }
+
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
     // nested under `customFields`) got a 201 and a visible lead row with the data gone.
