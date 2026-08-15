@@ -6831,4 +6831,43 @@ router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) =>
   }
 });
 
+/**
+ * ENG-926 §F / AC5 — click-ID coverage, per customer and per lead list.
+ *
+ * The acceptance criterion is that this percentage is "queryable per account and trending,
+ * not discovered during a post-mortem". RankAI's was zero of four leads for weeks; the
+ * number existed the whole time and nobody could ask for it.
+ *
+ * Scoped to the caller's own lists. Admins reach a customer's number through delegation,
+ * which already rewrites `req.user` to the target — so no separate admin route is needed
+ * and no cross-tenant read exists here.
+ */
+router.get('/attribution/click-id-coverage', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const rawDays = req.query.days;
+    // Matched strictly rather than parsed leniently: `parseInt('7.5.1')` is 7, so a
+    // lenient parse silently answers a question the caller did not ask.
+    const isWellFormed = rawDays === undefined || /^\d+$/.test(String(rawDays));
+    const days = rawDays === undefined ? 30 : Number(rawDays);
+    // Bounded on purpose: this walks every lead in every list of the caller's, so an
+    // unbounded window is a request to page through the customer's entire CRM.
+    if (!isWellFormed || !Number.isFinite(days) || days < 1 || days > 365) {
+      return res.status(400).json({ message: 'days must be an integer between 1 and 365' });
+    }
+
+    const { computeClickIdCoverageForUser } = await import('../services/metaAttributionCoverage');
+    const coverage = await computeClickIdCoverageForUser(userId, days);
+    return res.json(coverage);
+  } catch (error: any) {
+    console.error('[CRM] click-id coverage failed:', error?.message);
+    return res.status(500).json({ message: 'Failed to compute click ID coverage' });
+  }
+});
+
 export default router;
