@@ -25,6 +25,7 @@ jest.mock('aws-sdk', () => ({
     DocumentClient: jest.fn(() => ({
       get: getSpy,
       update: updateSpy,
+      createSet: (values: string[]) => ({ values, type: 'String' }),
       query: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Items: [] }) })),
       put: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       delete: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
@@ -176,6 +177,55 @@ describe('updateLead → conversion relay dispatch', () => {
       .filter((p) => typeof p?.TableName === 'string' && p.TableName.endsWith('AW-LeadLists'));
     const serialized = JSON.stringify(listUpdates);
     expect(serialized).not.toContain('suppressConversionRelay');
+  });
+
+  it('dispatches BOTH an owed conversion and the live transition, not one or the other', async () => {
+    // A lead can owe a qualified from an earlier queue outage and then legitimately win.
+    // Treating these as alternatives silently dropped the owed one and left its marker.
+    updatePromiseMock.mockResolvedValue({
+      Attributes: {
+        ...EXISTING_LEAD,
+        status: 'won',
+        metaConversionPending: { values: ['qualified'], type: 'String' },
+      },
+    });
+
+    await crmDb.updateLead('list-1', 'lead-1', { status: 'won' });
+    await flush();
+
+    expect(relaySpy).toHaveBeenCalledTimes(2);
+    const kinds = relaySpy.mock.calls.map((c) => c[0].conversionKind);
+    expect(kinds).toContain('qualified');   // the owed one, by recorded kind
+    expect(kinds).toContain(undefined);     // the live transition, derived from status
+  });
+
+  it('reads a legacy scalar pending marker as well as a set', async () => {
+    updatePromiseMock.mockResolvedValue({
+      Attributes: { ...EXISTING_LEAD, status: 'lost', metaConversionPending: 'won' },
+    });
+
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: 'Jane' });
+    await flush();
+
+    expect(relaySpy).toHaveBeenCalledTimes(1);
+    expect(relaySpy.mock.calls[0][0].conversionKind).toBe('won');
+  });
+
+  it('clears ONLY the conversion just sent, never an unrelated owed one', async () => {
+    await crmDb.appendMetaConversionSent('list-1', 'lead-1', 'won');
+
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toContain('DELETE metaConversionPending :kinds');
+    expect(params.UpdateExpression).not.toContain('REMOVE metaConversionPending');
+    expect(params.ExpressionAttributeValues[':kinds']).toEqual({ values: ['won'], type: 'String' });
+  });
+
+  it('adds to the pending set rather than overwriting it', async () => {
+    await crmDb.markConversionRelayPending('list-1', 'lead-1', 'qualified');
+
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toBe('ADD metaConversionPending :kinds');
+    expect(params.ExpressionAttributeValues[':kinds']).toEqual({ values: ['qualified'], type: 'String' });
   });
 
   it('a relay failure never breaks the lead write', async () => {
