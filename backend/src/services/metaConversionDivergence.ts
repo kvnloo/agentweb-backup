@@ -96,14 +96,30 @@ export async function countPixelRelayEvents(
   pixelId: string,
   accessToken: string,
   eventNames: string[],
+  window: { sinceMs: number; untilMs: number },
   deps?: DivergenceFetchDeps,
 ): Promise<number | null> {
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   const wanted = new Set(eventNames);
 
+  // BOTH sides of the comparison must cover the same period. Left unbounded, /stats
+  // returns its own default range while the CRM side is bounded to seven days ending at
+  // the lag boundary — comparing those is meaningless in both directions, able to hide a
+  // real blackout behind older traffic or to invent one outright (Greptile on #2413).
+  //
+  // `start_time`/`end_time`, in unix SECONDS, are the parameters that work. Probed live
+  // against pixel 1012387921717047 on 2026-08-15: they returned 17 hourly buckets across
+  // the requested seven days, whereas `since`/`until` returned the same buckets as passing
+  // nothing at all — silently ignored, indistinguishable from a bogus parameter name.
+  const params = new URLSearchParams({
+    aggregation: 'event',
+    start_time: String(Math.floor(window.sinceMs / 1000)),
+    end_time: String(Math.floor(window.untilMs / 1000)),
+  });
+
   let url =
-    `https://graph.facebook.com/${apiVersion}/${pixelId}/stats?aggregation=event` +
+    `https://graph.facebook.com/${apiVersion}/${pixelId}/stats?${params}` +
     `&access_token=${encodeURIComponent(accessToken)}`;
   let total = 0;
 
@@ -142,7 +158,16 @@ export async function countPixelRelayEvents(
  * `metaConversionsSent` carries no timestamp and therefore cannot answer a question with
  * "last week" in it.
  */
-export function countLoggedRelaysInWindow(lead: any, sinceMs: number, untilMs: number): number {
+export function countLoggedRelaysInWindow(
+  lead: any,
+  sinceMs: number,
+  untilMs: number,
+  /** Only sends that reached THIS pixel count. Both sides of the comparison have to refer
+   *  to the same destination: a customer who connects a second ad account, or changes
+   *  which one resolves by default, would otherwise have history measured against a pixel
+   *  it never reached — reported as a blackout on a perfectly healthy relay. */
+  expectedPixelId?: string,
+): number {
   const log = lead?.metaConversionsSentLog;
   if (!Array.isArray(log)) return 0;
 
@@ -150,7 +175,13 @@ export function countLoggedRelaysInWindow(lead: any, sinceMs: number, untilMs: n
   for (const entry of log) {
     const at = Date.parse(entry?.at ?? '');
     if (!Number.isFinite(at)) continue;
-    if (at >= sinceMs && at < untilMs) count++;
+    if (at < sinceMs || at >= untilMs) continue;
+    // An entry with NO recorded pixel predates the destination being stored. It is counted
+    // rather than dropped: none exist in production (the relay is enabled for nobody), and
+    // dropping them would undercount silently, which is precisely what manufactures a
+    // false blackout.
+    if (expectedPixelId && entry?.pixel && entry.pixel !== expectedPixelId) continue;
+    count++;
   }
   return count;
 }
@@ -186,6 +217,7 @@ export interface DivergenceDeps {
     pixelId: string,
     accessToken: string,
     eventNames: string[],
+    window: { sinceMs: number; untilMs: number },
   ) => Promise<number | null>;
   alertTransport: (subject: string, message: string, context?: Record<string, any>) => Promise<void>;
   now?: number;
@@ -245,7 +277,7 @@ export async function checkUserConversionDivergence(
       do {
         const page = await deps.getLeads(list.listId, LEAD_PAGE_SIZE, startKey);
         for (const lead of (page?.items || []) as any[]) {
-          crmSent += countLoggedRelaysInWindow(lead, sinceMs, untilMs);
+          crmSent += countLoggedRelaysInWindow(lead, sinceMs, untilMs, resolution.pixelId);
         }
         startKey = page?.lastEvaluatedKey;
       } while (startKey);
@@ -273,7 +305,12 @@ export async function checkUserConversionDivergence(
   let metaSeen: number | null;
   try {
     const creds = await deps.getCredentials(user, user.userId, resolution.accountId);
-    metaSeen = await deps.countPixelEvents(resolution.pixelId, creds?.accessToken, eventNames);
+    // Same window object the CRM count above used — not a recomputed one, so the two can
+    // never drift apart.
+    metaSeen = await deps.countPixelEvents(resolution.pixelId, creds?.accessToken, eventNames, {
+      sinceMs,
+      untilMs,
+    });
   } catch (error: any) {
     console.warn(`${TAG} could not read pixel stats for ${user.userId}: ${error?.message}`);
     return { status: 'unknown', crmSent };
@@ -347,8 +384,8 @@ export async function checkConversionDivergenceForUser(user: any): Promise<Diver
     resolvePixel: (owner, userId) => metaService.resolveMetaPixelWithDefault(owner, userId, undefined),
     getCredentials: (owner, userId, accountId) =>
       getMetaAccountCredentials(owner, userId, accountId),
-    countPixelEvents: (pixelId, accessToken, eventNames) =>
-      countPixelRelayEvents(pixelId, accessToken, eventNames),
+    countPixelEvents: (pixelId, accessToken, eventNames, window) =>
+      countPixelRelayEvents(pixelId, accessToken, eventNames, window),
     alertTransport: async (subject, message, context) => {
       const { emailService } = await import('./emailService');
       await emailService.sendOncallAlert(subject, message, context);

@@ -25,6 +25,7 @@ import {
   evaluateDivergence,
   DIVERGENCE_MIN_SAMPLE,
   countPixelRelayEvents,
+  countLoggedRelaysInWindow,
 } from '../services/metaConversionDivergence';
 
 describe('evaluateDivergence', () => {
@@ -66,6 +67,9 @@ describe('evaluateDivergence', () => {
 });
 
 describe('countPixelRelayEvents', () => {
+  /** The window both sides of the comparison must share. */
+  const WINDOW = { sinceMs: Date.parse('2026-08-08T12:00:00Z'), untilMs: Date.parse('2026-08-14T12:00:00Z') };
+
   const statsResponse = (buckets: any[], next?: string) => ({
     ok: true,
     status: 200,
@@ -93,7 +97,7 @@ describe('countPixelRelayEvents', () => {
       ]),
     );
 
-    const total = await countPixelRelayEvents('px1', 'tok', ['Purchase', 'QualifiedLead'], {
+    const total = await countPixelRelayEvents('px1', 'tok', ['Purchase', 'QualifiedLead'], WINDOW, {
       fetchImpl,
     } as any);
 
@@ -108,7 +112,7 @@ describe('countPixelRelayEvents', () => {
       ]),
     );
 
-    const total = await countPixelRelayEvents('px1', 'tok', ['Purchase', 'CRMWonDeal'], {
+    const total = await countPixelRelayEvents('px1', 'tok', ['Purchase', 'CRMWonDeal'], WINDOW, {
       fetchImpl,
     } as any);
 
@@ -122,7 +126,7 @@ describe('countPixelRelayEvents', () => {
       statsResponse([bucket('2026-08-15T02:30:00+0530', [['CRMPurchase', 3]])]),
     );
 
-    expect(await countPixelRelayEvents('px1', 'tok', ['CRMPurchase'], { fetchImpl } as any)).toBe(3);
+    expect(await countPixelRelayEvents('px1', 'tok', ['CRMPurchase'], WINDOW, { fetchImpl } as any)).toBe(3);
   });
 
   it('follows pagination', async () => {
@@ -131,7 +135,7 @@ describe('countPixelRelayEvents', () => {
       .mockResolvedValueOnce(statsResponse([bucket('t1', [['Purchase', 2]])], 'https://next'))
       .mockResolvedValueOnce(statsResponse([bucket('t2', [['Purchase', 3]])]));
 
-    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], { fetchImpl } as any)).toBe(5);
+    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any)).toBe(5);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
@@ -144,23 +148,81 @@ describe('countPixelRelayEvents', () => {
       json: async () => ({ error: { message: 'bad token', code: 190 } }),
     });
 
-    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], { fetchImpl } as any)).toBeNull();
+    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any)).toBeNull();
   });
 
   it('returns null on a thrown network error', async () => {
     const fetchImpl = jest.fn().mockRejectedValue(new Error('ECONNRESET'));
-    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], { fetchImpl } as any)).toBeNull();
+    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any)).toBeNull();
   });
 
   it('treats an empty stats response as zero received, which IS a signal', async () => {
     const fetchImpl = jest.fn().mockResolvedValue(statsResponse([]));
-    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], { fetchImpl } as any)).toBe(0);
+    expect(await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any)).toBe(0);
   });
 
   it('never puts the access token in a value it returns', async () => {
     const fetchImpl = jest.fn().mockResolvedValue(statsResponse([]));
-    await countPixelRelayEvents('px1', 'super-secret', ['Purchase'], { fetchImpl } as any);
+    await countPixelRelayEvents('px1', 'super-secret', ['Purchase'], WINDOW, { fetchImpl } as any);
     expect(fetchImpl.mock.calls[0][0]).toContain('px1');
+  });
+
+  it('bounds the request to the SAME window the CRM side counts', async () => {
+    // Without this the two counts cover different periods: the CRM side is bounded to
+    // seven days ending at the lag boundary while /stats, given no bounds, returns its own
+    // default range. Comparing them is meaningless in both directions — it can hide a real
+    // blackout behind older traffic, or invent one. Greptile caught this on #2413.
+    const fetchImpl = jest.fn().mockResolvedValue(statsResponse([]));
+
+    await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any);
+
+    const url = fetchImpl.mock.calls[0][0] as string;
+    // Seconds, not milliseconds — Meta's stats endpoint takes unix seconds.
+    expect(url).toContain(`start_time=${Math.floor(WINDOW.sinceMs / 1000)}`);
+    expect(url).toContain(`end_time=${Math.floor(WINDOW.untilMs / 1000)}`);
+  });
+
+  it('uses start_time/end_time, never since/until', async () => {
+    // Probed live against pixel 1012387921717047 (2026-08-15): `start_time`/`end_time`
+    // returned 17 hourly buckets across the requested seven days, while `since`/`until`
+    // returned the same 7 buckets as passing no bounds at all — silently ignored, exactly
+    // like a bogus parameter name. Guessing here would have failed without an error.
+    const fetchImpl = jest.fn().mockResolvedValue(statsResponse([]));
+
+    await countPixelRelayEvents('px1', 'tok', ['Purchase'], WINDOW, { fetchImpl } as any);
+
+    const url = fetchImpl.mock.calls[0][0] as string;
+    expect(url).not.toContain('since=');
+    expect(url).not.toContain('until=');
+  });
+});
+
+describe('countLoggedRelaysInWindow — destination scoping', () => {
+  const W = { since: Date.parse('2026-08-08T00:00:00Z'), until: Date.parse('2026-08-14T00:00:00Z') };
+  const entry = (at: string, pixel?: string) => ({ kind: 'won', at, ...(pixel ? { pixel } : {}) });
+  const count = (log: any[], pixel: string) =>
+    countLoggedRelaysInWindow({ metaConversionsSentLog: log }, W.since, W.until, pixel);
+
+  it('counts sends that went to the pixel being compared', () => {
+    expect(count([entry('2026-08-10T00:00:00Z', 'px1'), entry('2026-08-11T00:00:00Z', 'px1')], 'px1')).toBe(2);
+  });
+
+  it('EXCLUDES sends that went to a different pixel', () => {
+    // A customer who connects a second ad account, or changes which is default, would
+    // otherwise have history compared against a pixel it never reached — reported as a
+    // blackout on a perfectly healthy relay (Greptile on #2413).
+    expect(count([entry('2026-08-10T00:00:00Z', 'px-other')], 'px1')).toBe(0);
+  });
+
+  it('counts an entry with no recorded pixel', () => {
+    // Rows written before the destination was recorded. None exist in production — the
+    // relay is enabled for nobody — but dropping them would silently undercount rather
+    // than fail loudly, and undercounting is what produces a false blackout.
+    expect(count([entry('2026-08-10T00:00:00Z')], 'px1')).toBe(1);
+  });
+
+  it('still excludes entries outside the window regardless of pixel', () => {
+    expect(count([entry('2026-01-01T00:00:00Z', 'px1')], 'px1')).toBe(0);
   });
 });
 
