@@ -2475,7 +2475,15 @@ export class MetaService {
   public async resolveMetaPixelForUser(
     user: any,
     userId: string,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2584,7 +2592,15 @@ export class MetaService {
     user: any,
     userId: string,
     stored: { pixelId: string; accountId: string } | undefined,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2641,6 +2657,10 @@ export class MetaService {
       // resolver exists to fix). One account's failure (expired token, Graph error)
       // is skipped, not fatal — the next account still gets a fair try.
       let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      // A caught failure here is a credential refresh or a Graph call going wrong, not a
+      // statement about how this account is configured — so the result is unresolved but
+      // retryable, unlike "every connected account genuinely has zero pixels".
+      let sawTransientFailure = false;
       for (const account of accounts) {
         try {
           const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
@@ -2650,11 +2670,13 @@ export class MetaService {
           }
         } catch (error: any) {
           lastReason = error?.message || lastReason;
+          sawTransientFailure = true;
         }
       }
-      return { unresolved: true, reason: lastReason };
+      return { unresolved: true, reason: lastReason, transient: sawTransientFailure };
     } catch (error: any) {
-      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+      // An unexpected throw out of the resolver itself is likewise not a configuration fact.
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel', transient: true };
     }
   }
 
@@ -2697,6 +2719,21 @@ export class MetaService {
        *  conversion type — e.g. calendlyWebhook.ts sending 'Schedule' for a booking,
        *  per ENG-524's PRD and matching ENG-522's sendScheduleEvent — pass it explicitly. */
       eventName?: string;
+      /** ENG-926 §C: Meta's `custom_data`, emitted only when present so every existing
+       *  caller's payload is byte-identical to what it was before this field existed.
+       *  `value`/`currency` are what make a closed-won `Purchase` usable for Meta's
+       *  value-based bidding — without them the event counts but carries no revenue. */
+      customData?: { value?: number; currency?: string };
+      /** Meta's `action_source`. Defaults to 'website', which is correct for this
+       *  function's original callers (a real form submission, and ENG-522's booking flow)
+       *  and keeps their payloads unchanged.
+       *
+       *  A CRM status change is NOT a website event — nobody was on a page — and claiming
+       *  otherwise misdescribes where the conversion happened. Meta validates this field:
+       *  probed against Graph v25 on 2026-08-14, 'system_generated' and 'website' are both
+       *  accepted while a bogus value is rejected with "Invalid Action Source Parameter",
+       *  so acceptance here is meaningful rather than the API ignoring the field. */
+      actionSource?: string;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2731,6 +2768,12 @@ export class MetaService {
           ? (event.eventTimeSeconds as number)
           : Math.floor(Date.now() / 1000);
 
+      // Only build custom_data when there is something to put in it — an empty object
+      // would still be a payload change for every existing caller.
+      const customData: Record<string, any> = {};
+      if (typeof event.customData?.value === 'number') customData.value = event.customData.value;
+      if (event.customData?.currency) customData.currency = event.customData.currency;
+
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
       const body = {
@@ -2740,9 +2783,10 @@ export class MetaService {
             event_name: event.eventName || 'Lead',
             event_id: event.eventId,
             event_time: eventTime,
-            action_source: 'website',
+            action_source: event.actionSource || 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,
+            ...(Object.keys(customData).length > 0 ? { custom_data: customData } : {}),
           },
         ],
       };

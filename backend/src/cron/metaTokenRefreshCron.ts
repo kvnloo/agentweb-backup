@@ -29,6 +29,7 @@ import { userDb } from '../services/db';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { ensureFreshMetaAdAccountToken, needsMetaRefresh, isMetaAdAccount } from '../services/metaTokenRefresh';
 import { syncMetaAdsCapability } from '../services/metaAdsCapabilitySync';
+import { reconcilePendingConversionsForUser } from '../services/metaConversionReconcile';
 
 const TAG = '[metaTokenRefreshCron]';
 
@@ -42,6 +43,10 @@ export interface MetaTokenRefreshCronSummary {
   adsScopeRevoked: number;
   /** Accounts refused once, recorded as suspected and awaiting confirmation next sweep. */
   adsScopeSuspected: number;
+  /** ENG-926 §C: leads found still owing a Meta conversion after a queue outage. */
+  pendingConversionsFound: number;
+  /** Owed conversions successfully re-dispatched this sweep. */
+  pendingConversionsDispatched: number;
   /** Accounts whose Ads permission came back, un-refusing them. */
   adsScopeRecovered: number;
 }
@@ -61,6 +66,8 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
     adsScopeRevoked: 0,
     adsScopeRecovered: 0,
     adsScopeSuspected: 0,
+    pendingConversionsFound: 0,
+    pendingConversionsDispatched: 0,
   };
 
   let users: any[];
@@ -118,13 +125,31 @@ export async function runMetaTokenRefresh(): Promise<MetaTokenRefreshCronSummary
         console.error(`${TAG} Unexpected error refreshing account ${account.account_id} for user ${user.userId}:`, error);
       }
     }
+
+    // ENG-926 §C: the independent consumer for conversions owed to Meta after a job-queue
+    // outage. Runs here rather than as its own cron because this sweep already enumerates
+    // every user and already exists to reconcile Meta state that otherwise drifts unnoticed.
+    // It returns immediately for any owner who has not enabled the relay — today, everyone —
+    // so it adds no lead queries until someone opts in. Runs after the token work so a
+    // re-dispatch uses a token this sweep may have just refreshed.
+    try {
+      const reconciled = await reconcilePendingConversionsForUser(user);
+      summary.pendingConversionsFound += reconciled.pendingFound;
+      summary.pendingConversionsDispatched += reconciled.dispatched;
+    } catch (error) {
+      // reconcilePendingConversionsForUser does not throw, but a reconciliation must never
+      // cost the rest of this sweep.
+      console.error(`${TAG} Unexpected error reconciling owed conversions for user ${user.userId}:`, error);
+    }
   }
 
   console.log(
     `${TAG} Run complete — users=${summary.scannedUsers} metaAccounts=${summary.metaAccounts} ` +
       `due=${summary.dueForRefresh} refreshed=${summary.refreshed} failed=${summary.failed} ` +
       `adsScopeRevoked=${summary.adsScopeRevoked} adsScopeRecovered=${summary.adsScopeRecovered} ` +
-      `adsScopeSuspected=${summary.adsScopeSuspected}`
+      `adsScopeSuspected=${summary.adsScopeSuspected} ` +
+      `owedConversions=${summary.pendingConversionsFound} ` +
+      `owedDispatched=${summary.pendingConversionsDispatched}`
   );
   return summary;
 }

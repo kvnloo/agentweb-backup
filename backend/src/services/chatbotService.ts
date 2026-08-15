@@ -543,6 +543,17 @@ function keywordBasedChunkRetrieval(
  * Persisted audit of a Google Ads pre-flight tracking check (ENG-335), stored on
  * the chat/run record so a launch's measurement status is durable and auditable.
  */
+/** ENG-941 — Meta counterpart of GoogleAdsMeasurementCheckRecord below. */
+export interface MetaMeasurementCheckRecord {
+  accountId: string;
+  campaignId?: string;
+  action: string;
+  outcome: 'passed' | 'blocked' | 'overridden';
+  /** Per-destination check results (url + status + detected pixels). */
+  urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
+  checkedAt: string;
+}
+
 export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
@@ -930,6 +941,36 @@ export class ChatbotDB {
       }).promise();
     } catch (error) {
       console.error(`Error recording Google Ads measurement check for session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Append a Meta pre-flight tracking check to the session's run record (ENG-941).
+   * Same audit contract as recordGoogleAdsMeasurementCheck above: a launch decision —
+   * passed, blocked, or explicitly overridden — and its per-destination measurement
+   * status must survive, so a later "0 conversions" report can say the campaign was
+   * never measurable instead of presenting a bare zero. Best-effort by design: a
+   * persistence failure must never break the launch flow.
+   */
+  async recordMetaMeasurementCheck(
+    sessionId: string,
+    record: MetaMeasurementCheckRecord
+  ): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression:
+          'SET metaMeasurementChecks = list_append(if_not_exists(metaMeasurementChecks, :empty), :rec), updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':rec': [record],
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error recording Meta measurement check for session ${sessionId}:`, error);
     }
   }
 
