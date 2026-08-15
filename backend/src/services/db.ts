@@ -4,6 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
+import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
@@ -5626,6 +5627,12 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    /** ENG-926 §C: Meta's `_fbp` browser id, captured at form submission. Persisted so a
+     *  conversion relayed weeks later (a deal closing in the CRM) can still be matched —
+     *  the cookie itself is long gone by then. Deliberately NOT stored inside
+     *  firstTouch.clickIds: every visitor has an fbp, including organic ones, so filing it
+     *  under click IDs would make an organic lead read as paid-attributed. */
+    metaFbp?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -5750,6 +5757,9 @@ export const crmDb = {
       }
       if (leadData.dealCurrency) {
         item.dealCurrency = leadData.dealCurrency;
+      }
+      if (leadData.metaFbp) {
+        item.metaFbp = leadData.metaFbp;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;
@@ -6049,6 +6059,239 @@ export const crmDb = {
   },
 
   /**
+   * ENG-926 §C: atomically record that one Meta conversion event has been relayed.
+   *
+   * Deliberately NOT a field on updateLead. Writing the whole array there is a
+   * read-modify-write against a snapshot taken when the relay started, so two conversions
+   * racing on the same lead (a `qualified` and a `won` landing together) each write
+   * `[...their stale list, their event]` and the later write erases the earlier marker —
+   * after which a transition back to that status resends the conversion, leaving only
+   * Meta's own dedup between us and a double-counted deal (Greptile P1 on #2412).
+   *
+   * `list_append` on the stored value plus a `contains` guard makes the append atomic and
+   * idempotent: concurrent relays for different events both survive, and a repeat of the
+   * same event is refused by the condition rather than duplicated into the list.
+   */
+  /**
+   * ENG-926 §C: record that a conversion is owed to Meta but could not be queued.
+   *
+   * The relay's durable retry lives in the async job table. When THAT table is unreachable,
+   * the in-process fallback is all there is, and once it is exhausted the conversion would
+   * simply be gone — "no recoverable work left behind" (Greptile on #2412). This writes the
+   * owed conversion onto the lead instead, in a table we know is writable because the status
+   * update that triggered all of this just succeeded against it.
+   *
+   * Cleared automatically by appendMetaConversionSent when the conversion eventually lands.
+   * Consuming these markers is the reconciliation sweep's job (§F); this side of it just
+   * makes sure the fact is not lost.
+   */
+  async markConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    // ADD/DELETE are set operations, and DynamoDB rejects the WHOLE update with a
+    // ValidationException if the stored attribute is a scalar string — the shape this field
+    // had in an earlier commit of this branch. Reads tolerate that shape, so writes must
+    // too, or a lead carrying it can never record or clear an owed conversion (Greptile P1
+    // on #2412). Recovery is to drop the bad-shaped attribute and redo the write.
+    const addKind = () =>
+      dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Same reasoning as appendMetaConversionSent: no updatedAt. It is a GSI range key,
+          // and this is bookkeeping, not a user edit.
+          // ADD onto a string set, not SET on a scalar. A lead can owe more than one
+          // conversion — a queue outage spanning a `qualified` and then a `won` — and a
+          // scalar silently kept only the last, permanently losing the other (Greptile on
+          // #2412). A set also makes the write naturally idempotent.
+          UpdateExpression: 'ADD metaConversionPending :kinds',
+          ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
+        })
+        .promise();
+
+    try {
+      try {
+        await addKind();
+      } catch (error: any) {
+        if (error?.code !== 'ValidationException') throw error;
+
+        // Read before repairing. Dropping the attribute and adding only the new kind would
+        // discard whatever the scalar already owed — so a lead owing a `qualified` would
+        // lose it the moment a `won` became owed too, which is the marker destroying the
+        // very record it exists to keep (Greptile P1 on #2412, the same mistake as
+        // appendMetaConversionSent's recovery, one function over). Union, then write.
+        const current = await dynamodb
+          .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+          .promise();
+        const merged = new Set(parsePendingKinds((current.Item as any)?.metaConversionPending));
+        merged.add(conversionKind);
+
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Leads`,
+            Key: { listId, leadId },
+            UpdateExpression: 'SET metaConversionPending = :kinds',
+            ExpressionAttributeValues: { ':kinds': dynamodb.createSet([...merged]) },
+          })
+          .promise();
+      }
+      console.warn(
+        `[CRM] lead ${leadId} marked as owing a "${conversionKind}" Meta conversion — ` +
+        `the queue was unavailable, so this is the durable record of it`,
+      );
+    } catch (error: any) {
+      console.error(
+        `[CRM] markConversionRelayPending failed for lead ${leadId}: ${error?.message}`,
+      );
+    }
+  },
+
+  /**
+   * ENG-926 §C: release one owed conversion without recording a send.
+   *
+   * For a marker whose conversion is settled rather than sent — the lead opted out, the
+   * event already went, the status was never a conversion. Leaving it would outlive its own
+   * reason: reconciliation re-finds that lead on every sweep forever, spending budget on a
+   * conversion that will never be sent and starving the leads behind it (Greptile P1 on
+   * #2412).
+   *
+   * Tolerates the scalar shape the field started as, for the same reason its siblings do: a
+   * set DELETE against a scalar rejects the whole update.
+   */
+  async clearConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    if (!conversionKind) return;
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'DELETE metaConversionPending :kinds',
+          ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ValidationException') {
+        try {
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== conversionKind);
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              UpdateExpression: survivors.length > 0
+                ? 'SET metaConversionPending = :survivors'
+                : 'REMOVE metaConversionPending',
+              ...(survivors.length > 0
+                ? { ExpressionAttributeValues: { ':survivors': dynamodb.createSet(survivors) } }
+                : {}),
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          console.error(
+            `[CRM] clearConversionRelayPending recovery failed for lead ${leadId}: ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+      console.error(
+        `[CRM] clearConversionRelayPending failed for lead ${leadId} (${conversionKind}): ${error?.message}`,
+      );
+    }
+  },
+
+  async appendMetaConversionSent(listId: string, leadId: string, eventName: string): Promise<void> {
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Deliberately does NOT touch updatedAt, for two independent reasons.
+          //
+          // Correctness: updatedAt is the range key on the three sparse cross-tenant lookup
+          // GSIs, so writing it forces DynamoDB to re-project the row — and a legacy row
+          // carrying email/linkedin/nameCompanyKey as "" then fails with ValidationException
+          // (the exact hazard updateLead carries self-heal logic for, which this leaner
+          // write does not have).
+          //
+          // Behaviour: this is internal bookkeeping, not a user edit. Bumping updatedAt
+          // would reorder the customer's CRM list under an updatedAt sort and mark leads as
+          // recently-touched because a Meta event fired, which is not something they did.
+          // Clear ONLY the kind just sent, in the SAME write that records it. Removing the
+          // whole marker wiped an unrelated owed conversion — a successful `won` erased an
+          // outstanding `qualified` that had never been sent (Greptile on #2412). DELETE on
+          // a set removes just that member, and drops the attribute when it empties.
+          UpdateExpression:
+            'SET #m = list_append(if_not_exists(#m, :empty), :new) DELETE metaConversionPending :kinds',
+          ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+          ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+          ExpressionAttributeValues: {
+            ':empty': [],
+            ':new': [eventName],
+            ':event': eventName,
+            ':kinds': dynamodb.createSet([eventName]),
+          },
+        })
+        .promise();
+    } catch (error: any) {
+      // The guard firing means this event is already recorded — the desired end state, not
+      // a failure. Anything else is worth surfacing, but never worth throwing into a relay
+      // whose Meta send has already succeeded.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+
+      // Same set-vs-scalar hazard as markConversionRelayPending: a lead still carrying the
+      // scalar shape makes the DELETE clause reject the ENTIRE update, so the send would go
+      // unrecorded and reconciliation would dispatch it again and again. Retry recording the
+      // send while clearing the bad-shaped marker with REMOVE, which works on any type
+      // (Greptile P1 on #2412).
+      if (error?.code === 'ValidationException') {
+        try {
+          // Read first. A blanket REMOVE would drop the WHOLE attribute, so a lead owing a
+          // `qualified` would lose it the moment an unrelated `won` succeeded — erasing a
+          // conversion that had never been sent (Greptile P1 on #2412). Only the kind just
+          // sent may go; anything else owed is rewritten in the correct set shape, which
+          // also repairs the row for every future write.
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== eventName);
+
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              UpdateExpression: survivors.length > 0
+                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), metaConversionPending = :survivors'
+                : 'SET #m = list_append(if_not_exists(#m, :empty), :new) REMOVE metaConversionPending',
+              ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+              ExpressionAttributeNames: { '#m': 'metaConversionsSent' },
+              ExpressionAttributeValues: {
+                ':empty': [],
+                ':new': [eventName],
+                ':event': eventName,
+                ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
+              },
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          if (retryError?.code === 'ConditionalCheckFailedException') return;
+          console.error(
+            `[CRM] appendMetaConversionSent recovery failed for lead ${leadId} (${eventName}): ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+
+      console.error(
+        `[CRM] appendMetaConversionSent failed for lead ${leadId} (${eventName}): ${error?.message}`,
+      );
+    }
+  },
+
+  /**
    * Cross-tenant lookup by email — backs CRM-history Tier 0. Queries the
    * EmailLookupIndex GSI globally (no userId filter) so a sibling lead
    * enriched on ANY user's list is returned. Sort key `updatedAt` means
@@ -6301,6 +6544,12 @@ export const crmDb = {
      *  will do a single consolidated updateFieldNames after bulk writes (avoids
      *  read-modify-write races under parallel workers). */
     skipFieldNamesUpdate?: boolean;
+    /** ENG-926 §C: suppress the CRM → Meta conversion relay for this write. The relay's
+     *  own bookkeeping no longer goes through updateLead (see appendMetaConversionSent),
+     *  so this exists for bulk/backfill paths that move status across many historical
+     *  leads at once — those are not live conversions and must not fan out thousands of
+     *  Purchase events. No such path exists today; this is the seam for the first one. */
+    suppressConversionRelay?: boolean;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -6718,7 +6967,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -6741,6 +6990,70 @@ export const crmDb = {
         const existingFieldNames = (list?.fieldNames as string[]) || [];
         const allFieldNames = [...existingFieldNames, ...fieldNames];
         await this.updateFieldNames(listId, allFieldNames);
+      }
+
+      // ENG-926 §C: relay a real status TRANSITION to Meta as a conversion.
+      //
+      // Hooked here rather than at the ~25 individual updateLead call sites because the
+      // case that matters most is a closed-won arriving from an external-CRM sync, not a
+      // human clicking a dropdown — a per-route hook would miss exactly that. This is the
+      // one chokepoint that already holds both halves of the transition (the pre-read
+      // existingLeadForGuard, and ALL_NEW in `result`).
+      //
+      // Fire-and-forget with a dynamic import: db.ts is a leaf the Meta services import,
+      // so a static import would be circular. A relay failure must never affect the lead
+      // write that has already succeeded above, so nothing here is awaited or rethrown.
+      const previousStatus = existingLeadForGuard?.status ?? null;
+      const nextStatus = (result.Attributes as any)?.status ?? null;
+      const isRealTransition =
+        updates.status !== undefined && !!nextStatus && String(previousStatus ?? '') !== String(nextStatus);
+      // A conversion the queue could not accept was recorded on the lead itself
+      // (metaConversionPending). Nothing scans for those — a sweep over every lead is §F's
+      // job, not something to do on a write path — so they are consumed opportunistically:
+      // the next time anything touches this lead, retry it. That costs nothing on the
+      // overwhelming majority of updates, where the field is simply absent (Greptile on
+      // #2412: a marker nothing consumes is not recovery, it is just a note).
+      // Shared with the reconciliation sweep — see utils/metaConversionPending. Two copies
+      // of "what shape is this field" is how one reader ends up silently skipping rows the
+      // other picks up.
+      const owedKinds = parsePendingKinds((result.Attributes as any)?.metaConversionPending);
+      if (!updates.suppressConversionRelay && (isRealTransition || owedKinds.length > 0)) {
+        void (async () => {
+          try {
+            const { dispatchLeadStatusConversion } = await import('./metaConversionRelay');
+            const list = await this.getLeadListById(listId);
+            if (!list?.userId) return;
+            // Durable: enqueues before processing, so a Meta failure or a rate-limit pause
+            // is retried by the queue poller instead of being lost forever (Greptile P1 on
+            // #2412 — the only other trigger is a status CHANGE, and a won deal stays won).
+            // Every owed conversion gets its own dispatch, PLUS the transition that just
+            // happened. Treating these as alternatives meant a lead that owed a
+            // `qualified` and then legitimately won had the owed one silently dropped —
+            // the transition won the coin toss and the marker stayed put (Greptile on
+            // #2412). Each has its own dedupe key, so they cannot collide.
+            const dispatches: Array<string | undefined> = [
+              ...owedKinds,
+              ...(isRealTransition ? [undefined] : []),
+            ];
+            for (const kind of dispatches) {
+              await dispatchLeadStatusConversion({
+                listId,
+                userId: list.userId as string,
+                lead: result.Attributes as any,
+                previousStatus,
+                statusConfig: (list as any).statusConfig,
+                // On a retry of an owed conversion the lead's CURRENT status may no longer
+                // be the one that earned it, so the recorded kind wins — same reasoning as
+                // the queued payload's kind. `undefined` means "use the live transition".
+                ...(kind ? { conversionKind: kind as any } : {}),
+              });
+            }
+          } catch (relayError: any) {
+            console.error(
+              `[CAPI Relay] dispatch failed for lead ${leadId} (list ${listId}): ${relayError?.message}`,
+            );
+          }
+        })();
       }
 
       return result.Attributes;
