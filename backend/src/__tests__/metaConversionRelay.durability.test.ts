@@ -30,13 +30,18 @@ jest.mock('../services/asyncJobQueue', () => ({
 const getLeadById = jest.fn();
 const getLeadListById = jest.fn();
 const updateLead = jest.fn().mockResolvedValue({});
+// Exposed rather than inlined: the inline-fallback path calls relayLeadStatusEvent directly,
+// which reaches userDb.getUserById — NOT crmDb.getLeadById — so only this handle can make
+// that path fail. Getting that wrong made an earlier version of the test assert nothing.
+const getUserById = jest.fn().mockResolvedValue(null);
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...a: any[]) => getLeadById(...a),
     getLeadListById: (...a: any[]) => getLeadListById(...a),
     updateLead: (...a: any[]) => updateLead(...a),
+    appendMetaConversionSent: jest.fn().mockResolvedValue(undefined),
   },
-  userDb: { getUserById: jest.fn().mockResolvedValue(null) },
+  userDb: { getUserById: (...a: any[]) => getUserById(...a) },
 }));
 
 import {
@@ -57,6 +62,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   enqueueJob.mockResolvedValue('enqueued');
   clearFailedJob.mockResolvedValue(false);
+  getUserById.mockResolvedValue(null);
   getLeadById.mockResolvedValue(LEAD);
   getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', statusConfig: STATUS_CONFIG });
 });
@@ -80,7 +86,12 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     // CRMWonDeal depending on whether its value is stateable, and both are the same
     // conversion — keying on the name would let one deal queue twice.
     expect(dedupeKey).toBe('list-1:lead-1:won');
-    expect(payload).toEqual({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' });
+    expect(payload).toEqual({
+      listId: 'list-1',
+      leadId: 'lead-1',
+      userId: 'user-1',
+      conversionKind: 'won',
+    });
     expect(options).toEqual({ claimImmediately: true });
   });
 
@@ -125,14 +136,39 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(getLeadById).not.toHaveBeenCalled();
   });
 
-  it('still attempts an inline send when the queue table is unreachable', async () => {
-    // Degraded, but not silent: losing the queue must not also lose the conversion.
+  it('retries the enqueue once before giving up on a durable record', async () => {
+    // A transient write blip is a different thing from the table being unreachable, and this
+    // is the last chance to record the conversion anywhere retryable.
+    enqueueJob.mockResolvedValueOnce('unavailable').mockResolvedValueOnce('enqueued');
+
+    await dispatchLeadStatusConversion(ctx());
+
+    expect(enqueueJob).toHaveBeenCalledTimes(2);
+    expect(getLeadById).toHaveBeenCalled();
+  });
+
+  it('still attempts an inline send when the queue stays unreachable', async () => {
     enqueueJob.mockResolvedValue('unavailable');
 
     await dispatchLeadStatusConversion(ctx());
 
     expect(markJobFailed).not.toHaveBeenCalled();
     expect(markJobComplete).not.toHaveBeenCalled();
+  });
+
+  it('reports an inline fallback failure loudly — a lost conversion must never be silent', async () => {
+    enqueueJob.mockResolvedValue('unavailable');
+    // relayLeadStatusEvent catches everything and returns { failed }, so throwing from the
+    // owner lookup is what drives the inline path to a genuine failure.
+    getUserById.mockRejectedValue(new Error('DynamoDB down'));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    await dispatchLeadStatusConversion(ctx());
+
+    const said = errSpy.mock.calls.map((c) => String(c[0])).join(' ');
+    expect(said).toContain('cannot be retried');
+    expect(said).toContain('lost');
+    errSpy.mockRestore();
   });
 });
 
@@ -165,13 +201,36 @@ describe('processConversionRelayJob — a retry re-reads state, it does not repl
       .resolves.toBeUndefined();
   });
 
-  it('re-reads the lead rather than trusting the queued snapshot', async () => {
-    // A retry can run long after the transition: the deal may have reopened, or the lead
-    // may have opted out since. Replaying a stale snapshot would send an event the current
-    // state forbids.
+  it('re-reads the lead for current state (opt-out, already-sent, contact details)', async () => {
     await processConversionRelayJob({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' }).catch(() => {});
 
     expect(getLeadById).toHaveBeenCalledWith('list-1', 'lead-1');
+  });
+
+  it('honours the QUEUED conversion even if the status has since moved', async () => {
+    // The closed-won happened. A later status edit does not un-happen it, and deriving the
+    // conversion from current status would silently omit it forever — the exact failure this
+    // card exists to eliminate. Over-sending is guarded twice (metaConversionsSent, plus
+    // Meta's dedup on a deterministic event_id); omission has no guard at all.
+    getLeadById.mockResolvedValue({ ...LEAD, status: 'lost' });
+
+    await processConversionRelayJob({
+      listId: 'list-1',
+      leadId: 'lead-1',
+      userId: 'user-1',
+      conversionKind: 'won',
+    }).catch(() => {});
+
+    // Reached the owner lookup, i.e. it did not bail out at "not a conversion transition".
+    expect(getLeadListById).toHaveBeenCalled();
+  });
+
+  it('falls back to current status for a job queued before conversionKind existed', async () => {
+    getLeadById.mockResolvedValue({ ...LEAD, status: 'won' });
+
+    await processConversionRelayJob({ listId: 'list-1', leadId: 'lead-1', userId: 'user-1' }).catch(() => {});
+
+    expect(getLeadListById).toHaveBeenCalled();
   });
 
   it('throws on a terminal-looking failure so the queue records an attempt', async () => {
@@ -187,6 +246,12 @@ describe('registerConversionRelayProcessor', () => {
   it('registers at boot so jobs left pending by a restart are not stranded', () => {
     registerConversionRelayProcessor();
 
-    expect(registerProcessor).toHaveBeenCalledWith(RELAY_QUEUE_SOURCE, expect.any(Function));
+    // 15, not the global default of 5: five quick attempts can be consumed by one Meta
+    // incident, after which nothing retries until a human touches the lead again.
+    expect(registerProcessor).toHaveBeenCalledWith(
+      RELAY_QUEUE_SOURCE,
+      expect.any(Function),
+      { maxAttempts: 15 },
+    );
   });
 });

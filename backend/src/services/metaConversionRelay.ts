@@ -219,6 +219,11 @@ export interface RelayContext {
   lead: Record<string, any>;
   previousStatus?: string | null;
   statusConfig?: LeadStatusConfigEntry[] | null;
+  /** The conversion recorded when the transition actually happened, carried through the
+   *  queue so a retry honours THAT rather than re-deriving one from whatever the lead's
+   *  status says now. Absent on the first, inline attempt, where current state is the
+   *  transition. See processConversionRelayJob for why this matters. */
+  conversionKind?: ConversionKind;
 }
 
 export type RelayResult =
@@ -324,7 +329,12 @@ export async function relayLeadStatusEvent(
   try {
     if (!leadId) return { skipped: true, reason: 'lead has no leadId', retryable: false };
 
-    const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
+    // A queued kind is authoritative: the conversion happened when the status changed, and
+    // a later edit does not un-happen it. Only fall back to deriving one from current status
+    // on the inline first attempt, where they are the same thing.
+    const mapped = ctx.conversionKind
+      ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
+      : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, lead.status);
     if (!mapped) return skip(`status "${lead.status}" is not a conversion transition`, false);
 
     // §B's opt-out, honored here rather than waiting for the consent field: contactStatus
@@ -479,12 +489,23 @@ export interface ConversionRelayJobPayload {
   listId: string;
   leadId: string;
   userId: string;
+  /** The conversion as it was at transition time. Older queued jobs predate this field, so
+   *  it is optional and those fall back to deriving from current status. */
+  conversionKind?: ConversionKind;
 }
 
-/** Re-reads the lead and its list rather than trusting the payload. A retry can run minutes
- *  or hours after the transition that queued it: the deal may have been reopened, the lead
- *  may have opted out since, or the event may already have gone via another path. Re-running
- *  the full relay against current state is what makes a retry safe rather than a replay. */
+/**
+ * Re-reads the lead for everything that must reflect CURRENT state — whether they have since
+ * opted out, whether the event already went, their current contact details — while taking the
+ * conversion itself from the QUEUED payload.
+ *
+ * That split is deliberate and was got wrong first time round (Greptile on #2412). Deriving
+ * the conversion from current status looks safer, but it means a retry after a status edit
+ * silently sends nothing and completes the job: the closed-won that genuinely happened is
+ * omitted forever. Omission is the exact failure this card exists to eliminate, whereas an
+ * over-send is guarded twice — by metaConversionsSent and by Meta's own dedup on a
+ * deterministic event_id. The asymmetry decides it.
+ */
 export async function processConversionRelayJob(payload: ConversionRelayJobPayload): Promise<void> {
   const { crmDb } = await import('./db');
   const lead = await crmDb.getLeadById(payload.listId, payload.leadId);
@@ -499,6 +520,7 @@ export async function processConversionRelayJob(payload: ConversionRelayJobPaylo
     userId: payload.userId,
     lead,
     statusConfig: (list as any)?.statusConfig,
+    conversionKind: payload.conversionKind,
   });
 
   // Throwing is how the queue learns to retry — markJobFailed runs in the caller's catch.
@@ -518,7 +540,13 @@ export function registerConversionRelayProcessor(): void {
   // Required lazily to keep this module importable from db.ts without dragging the queue
   // (and its own db dependency) into that import chain.
   const { registerProcessor } = require('./asyncJobQueue');
-  registerProcessor(RELAY_QUEUE_SOURCE, processConversionRelayJob);
+  // 15 rather than the global default of 5, matching calendly_webhook's reasoning: five
+  // quick attempts can be consumed by a single Meta incident, and once they are gone the
+  // conversion needs a human to touch the lead again before anything retries it. A wider
+  // ceiling outlasts an ordinary outage. It is not a complete answer — a permanently failed
+  // job still needs the reconciliation sweep that belongs to §F — but it removes the common
+  // case where a brief outage costs a real conversion.
+  registerProcessor(RELAY_QUEUE_SOURCE, processConversionRelayJob, { maxAttempts: 15 });
 }
 
 /**
@@ -545,6 +573,7 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     listId: ctx.listId,
     leadId,
     userId: ctx.userId,
+    conversionKind: mapped.conversionKind,
   };
 
   let enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
@@ -562,10 +591,30 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
     if (enqueued !== 'enqueued') return;
   }
   if (enqueued === 'unavailable') {
-    // The queue table is unreachable. Fall back to a best-effort inline send rather than
-    // dropping the conversion outright — degraded, but not silent.
-    console.warn(`[CAPI Relay] queue unavailable for ${dedupeKey} — attempting inline send without retry`);
-    await relayLeadStatusEvent(ctx);
+    // One retry first: a transient write blip is a different thing from the table genuinely
+    // being unreachable, and this is the last chance at a durable record (same reasoning as
+    // the Calendly path's enqueue retry).
+    enqueued = await enqueueJob(RELAY_QUEUE_SOURCE, dedupeKey, payload, { claimImmediately: true });
+  }
+  if (enqueued === 'unavailable') {
+    // No durable record is possible, so this is the only attempt this conversion will get.
+    // Its outcome is reported rather than discarded — an unremarked failure here is a
+    // conversion nobody will ever know was lost, which is the whole problem this card exists
+    // to fix. There is deliberately no further retry: without the queue there is nowhere to
+    // record one, and a loop here would block the caller.
+    console.warn(`[CAPI Relay] queue unavailable for ${dedupeKey} — single inline attempt, no retry possible`);
+    const result = await relayLeadStatusEvent(ctx);
+    if ('failed' in result) {
+      console.error(
+        `[CAPI Relay] inline fallback FAILED for ${dedupeKey} and cannot be retried — ` +
+        `this conversion is lost: ${result.error}`,
+      );
+    } else if ('skipped' in result && result.retryable) {
+      console.error(
+        `[CAPI Relay] inline fallback deferred for ${dedupeKey} but the queue is unavailable — ` +
+        `this conversion is lost: ${result.reason}`,
+      );
+    }
     return;
   }
 
