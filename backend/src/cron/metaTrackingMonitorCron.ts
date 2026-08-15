@@ -19,6 +19,7 @@
 
 import { userDb } from '../services/db';
 import { monitorUserTracking } from '../services/metaTrackingMonitor';
+import { checkConversionDivergenceForUser } from '../services/metaConversionDivergence';
 
 const TAG = '[metaTrackingMonitorCron]';
 
@@ -34,6 +35,9 @@ export interface TrackingMonitorCronSummary {
   /** Union across the fleet. One customer with an unusual objective teaches the
    *  classifier for everyone, so these are worth surfacing once per run. */
   unrecognizedActionTypes: string[];
+  /** Customers whose relayed CRM conversions are not reaching Meta at all. Zero today by
+   *  construction — the check only evaluates accounts with the §C relay switched on. */
+  conversionDivergences: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -47,6 +51,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     idle: 0,
     healthy: 0,
     unrecognizedActionTypes: [],
+    conversionDivergences: 0,
   };
 
   let users: any[];
@@ -76,6 +81,16 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       // partway looks identical to a clean run in the logs.
       console.error(`${TAG} sweep failed for user ${user?.userId}: ${error?.message}`);
     }
+
+    // The divergence half (§F's first bullet): what the relay recorded sending against
+    // what Meta says it received. Its own try/catch, because it is a different question
+    // from the spend check and one failing must not suppress the other.
+    try {
+      const divergence = await checkConversionDivergenceForUser(user);
+      if (divergence.status === 'not-arriving') summary.conversionDivergences++;
+    } catch (error: any) {
+      console.error(`${TAG} divergence check failed for user ${user?.userId}: ${error?.message}`);
+    }
   }
 
   summary.unrecognizedActionTypes = [...unknownTypes];
@@ -85,6 +100,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     `${summary.healthy} healthy, ${summary.idle} idle, ${summary.blackouts} blackout, ` +
     `${summary.tokenErrors} token error, ${summary.unclassifiable} unclassifiable, ` +
     `${summary.fetchErrors} unavailable` +
+    (summary.conversionDivergences > 0
+      ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
+      : '') +
     (summary.unrecognizedActionTypes.length
       ? ` — unknown action types seen: ${summary.unrecognizedActionTypes.join(', ')}`
       : ''),
