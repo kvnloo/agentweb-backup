@@ -100,6 +100,18 @@ describe('dispatchLeadStatusConversion — queueing', () => {
     expect(options).toEqual({ claimImmediately: true });
   });
 
+  it('queues an OWED conversion even though the lead has moved to a non-conversion status', async () => {
+    // The pending-marker consumer passes the recorded kind. Deriving from current status
+    // here returned early and never queued anything, so the marker sat on the lead forever
+    // and the consumer added one commit earlier did not actually work.
+    await dispatchLeadStatusConversion(
+      ctx({ lead: { ...LEAD, status: 'lost' }, conversionKind: 'won' }),
+    );
+
+    expect(enqueueJob).toHaveBeenCalledTimes(1);
+    expect(enqueueJob.mock.calls[0][1]).toBe('list-1:lead-1:won');
+  });
+
   it('does not queue anything for a status that is not a conversion', async () => {
     await dispatchLeadStatusConversion(
       ctx({ lead: { ...LEAD, status: 'new' } }),

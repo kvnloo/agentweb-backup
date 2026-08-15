@@ -619,9 +619,18 @@ export async function dispatchLeadStatusConversion(ctx: RelayContext): Promise<v
   const leadId = ctx.lead?.leadId;
   if (!leadId) return;
 
-  // Nothing to queue if this status was never a conversion — keeps the job table free of a
-  // row for every `new -> contacted` in the product.
-  const mapped = mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
+  // An explicitly supplied kind is authoritative — it comes either from a queued job or from
+  // a `metaConversionPending` marker, and in both cases the lead's CURRENT status may have
+  // moved on since the conversion was earned. Deriving from current status here silently
+  // dropped exactly the owed conversions the pending marker exists to rescue, leaving the
+  // marker on the lead forever (Greptile on #2412 — a bug in the commit that added the
+  // marker's consumer, which is why the consumer did not actually work).
+  //
+  // Otherwise: nothing to queue if this status was never a conversion, which keeps the job
+  // table free of a row for every `new -> contacted` in the product.
+  const mapped = ctx.conversionKind
+    ? { conversionKind: ctx.conversionKind, isValueEvent: ctx.conversionKind === 'won' }
+    : mapStatusToMetaEvent(ctx.statusConfig ?? undefined, ctx.lead.status);
   if (!mapped) return;
 
   const dedupeKey = `${ctx.listId}:${leadId}:${mapped.conversionKind}`;
