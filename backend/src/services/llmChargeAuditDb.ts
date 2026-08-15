@@ -31,13 +31,22 @@ export async function recordLlmChargeEvent(event: LlmChargeAuditEvent): Promise<
 }
 
 export async function listLlmChargeEvents(billingUserId: string, start: string, end: string): Promise<LlmChargeAuditEvent[]> {
-  const result = await db().query({
-    TableName: LLM_CHARGE_EVENTS_TABLE,
-    KeyConditionExpression: "billingUserId = :user AND eventId BETWEEN :start AND :end",
-    ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
-    ScanIndexForward: false,
-  }).promise();
-  return ((result.Items || []) as LlmChargeAuditEvent[]).filter((event) => !!event.counterAppliedAt);
+  const items: LlmChargeAuditEvent[] = [];
+  let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+  do {
+    const result = await db().query({
+      TableName: LLM_CHARGE_EVENTS_TABLE,
+      KeyConditionExpression: "billingUserId = :user AND eventId BETWEEN :start AND :end",
+      ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
+      ScanIndexForward: false,
+      ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+    }).promise();
+    items.push(...((result.Items || []) as LlmChargeAuditEvent[]));
+    lastKey = result.LastEvaluatedKey;
+  } while (lastKey);
+
+  return items.filter((event) => !!event.counterAppliedAt);
 }
 
 export async function markLlmChargeApplied(billingUserId: string, eventId: string): Promise<void> {
