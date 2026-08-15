@@ -34,6 +34,8 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+const TAG = '[Tracking Monitor]';
+
 /** Meta's deduplicated conversion rollups. Each is a FAMILY: the bare name plus the
  *  alias spellings Meta reports the same conversion under. Objective determines which
  *  appear, so a customer optimising for registrations and one optimising for leads are
@@ -352,4 +354,249 @@ export function evaluateAdAccountDays(days: AdAccountDay[]): AdAccountVerdict {
     spendInBlackout,
     unrecognized,
   };
+}
+
+// ── Alerting ─────────────────────────────────────────────────────────────────────────
+//
+// Alerts go to ONCALL, not to the customer, and that is a deliberate choice rather than
+// the easy one. Almost every tracking failure traced so far was ours and on our own
+// generated pages: RankAI's lander discarded `utm_*` and `fbclid` at the capture call;
+// hireemma.ai fired eight conversions at a dead PixelFlow endpoint with no `window.fbq`
+// on the site at all. Telling a customer "your tracking is broken" about a bug they
+// cannot reach is noise to them and a lost signal for us.
+//
+// Some causes ARE the customer's — a dead token only they can re-authorise, a Business
+// Manager with no pixel in it. Those deserve a customer-facing surface eventually, and
+// ENG-1192's portal banner is the right home. Not here: this detector has never run
+// against live data, and an unproven alarm shown to customers is how an alarm becomes
+// something people learn to ignore.
+
+/** Stable dedupe classes for the intake gate (ENG-358). Every occurrence carries one, so
+ *  repeat firings cluster onto ONE canonical Linear issue instead of filing a fresh one
+ *  per run — the failure that produced 14 near-identical v0 issues in 5 days. This job
+ *  sees every account every day, so it is the same shape at greater volume. */
+export const BLACKOUT_ALERT_CLASS = 'meta-attribution-blackout';
+export const TOKEN_ALERT_CLASS = 'meta-token-invalid';
+
+/** Re-alert at most once per account per class per day. A blackout that is still open
+ *  tomorrow still matters, so this is a rate limit rather than a one-shot. */
+export const ALERT_REALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export type AlertTransport = (
+  subject: string,
+  message: string,
+  context?: Record<string, any>,
+) => Promise<void>;
+
+/** Default transport: the canonical ops path — oncall email plus an auto-filed tracked
+ *  issue, suppressed outside production by emailService itself. Lazily imported so this
+ *  module's unit tests never pull in the email dependency graph. */
+const defaultAlertTransport: AlertTransport = async (subject, message, context) => {
+  const { emailService } = await import('./emailService');
+  await emailService.sendOncallAlert(subject, message, context);
+};
+
+/** In-memory, per (account, class). A process restart re-alerting once is acceptable and
+ *  is the same trade v0BillingService makes; persisting this would mean a table write per
+ *  account per day to save one duplicate email after a deploy. */
+const lastAlertAtByKey = new Map<string, number>();
+
+export function __resetTrackingAlertStateForTests(): void {
+  lastAlertAtByKey.clear();
+}
+
+function shouldSuppress(key: string, now: number): boolean {
+  const last = lastAlertAtByKey.get(key);
+  if (last !== undefined && now - last < ALERT_REALERT_WINDOW_MS) return true;
+  lastAlertAtByKey.set(key, now);
+  if (lastAlertAtByKey.size > 1000) {
+    for (const [k, ts] of lastAlertAtByKey) {
+      if (now - ts >= ALERT_REALERT_WINDOW_MS) lastAlertAtByKey.delete(k);
+    }
+  }
+  return false;
+}
+
+export interface MonitorDeps {
+  fetchActivity?: (
+    adAccountId: string,
+    accessToken: string,
+    days: number,
+  ) => Promise<AdAccountActivity>;
+  alertTransport?: AlertTransport;
+  now?: number;
+}
+
+export interface MonitorSummary {
+  accountsChecked: number;
+  blackouts: number;
+  tokenErrors: number;
+  fetchErrors: number;
+  unclassifiable: number;
+  idle: number;
+  healthy: number;
+  unrecognizedActionTypes: string[];
+}
+
+/** How many days of history each check reads. Comfortably more than the blackout
+ *  threshold so a streak is visible in full rather than inferred from its tail. */
+export const MONITOR_WINDOW_DAYS = 7;
+
+/**
+ * Check every Meta ad account this user has connected. Never throws: it runs inside a
+ * cron sweep over every user, and one bad account must not abandon the rest.
+ */
+export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promise<MonitorSummary> {
+  const summary: MonitorSummary = {
+    accountsChecked: 0,
+    blackouts: 0,
+    tokenErrors: 0,
+    fetchErrors: 0,
+    unclassifiable: 0,
+    idle: 0,
+    healthy: 0,
+    unrecognizedActionTypes: [],
+  };
+
+  const fetchActivity =
+    deps?.fetchActivity ??
+    ((id: string, token: string, days: number) => fetchDailyAdAccountActivity(id, token, days));
+  const alertTransport = deps?.alertTransport ?? defaultAlertTransport;
+  const now = deps?.now ?? Date.now();
+
+  const accounts = (Array.isArray(user?.connected_accounts) ? user.connected_accounts : []).filter(
+    // 'facebook' is checked alongside 'meta' by three other modules; production carries
+    // zero such rows today (all 21 Meta connections are 'meta'), but matching the wider
+    // predicate costs nothing and avoids this being the one place that disagrees.
+    (acc: any) =>
+      (acc?.platform === 'meta' || acc?.platform === 'facebook') &&
+      acc?.config?.account_type === 'ad_account',
+  );
+
+  const unknownTypes = new Set<string>();
+
+  for (const account of accounts) {
+    const adAccountId = account?.account_id;
+    const accessToken = account?.config?.access_token;
+    // No token is not a monitoring finding — the account was never fully connected.
+    // Calling Meta with `undefined` would return a token error and alert a human about a
+    // connection that does not exist.
+    if (!adAccountId || !accessToken) continue;
+
+    summary.accountsChecked++;
+
+    let activity: AdAccountActivity;
+    try {
+      activity = await fetchActivity(adAccountId, accessToken, MONITOR_WINDOW_DAYS);
+    } catch (error: any) {
+      summary.fetchErrors++;
+      console.error(`${TAG} ${adAccountId}: activity fetch threw — ${error?.message}`);
+      continue;
+    }
+
+    if (activity.status === 'token_error') {
+      summary.tokenErrors++;
+      await raise(
+        alertTransport,
+        `${TOKEN_ALERT_CLASS}:${adAccountId}`,
+        now,
+        `Meta ad account ${adAccountId} cannot be read — token invalid`,
+        [
+          `Meta rejected our stored credentials for ad account ${adAccountId}.`,
+          '',
+          'While this holds, the account is invisible to tracking monitoring: no spend,',
+          'no conversions, and no way to tell a healthy account from a broken one. The',
+          'owner has to re-authorise the Meta connection.',
+          '',
+          `Meta said: ${activity.error}`,
+        ].join('\n'),
+        {
+          'Alert Class': TOKEN_ALERT_CLASS,
+          'Alert Priority': 'high',
+          'Ad Account': adAccountId,
+          'Owner User Id': user?.userId,
+          'Owner Email': user?.email,
+        },
+      );
+      continue;
+    }
+
+    if (activity.status === 'fetch_error') {
+      // Transient by definition — a rate limit or a network blip. Alerting here would
+      // train people to ignore this channel before it ever caught a real blackout.
+      summary.fetchErrors++;
+      console.warn(`${TAG} ${adAccountId}: insights unavailable — ${activity.error}`);
+      continue;
+    }
+
+    const verdict = evaluateAdAccountDays(activity.days);
+    verdict.unrecognized.forEach((t) => unknownTypes.add(t));
+
+    if (verdict.status === 'idle') {
+      summary.idle++;
+      continue;
+    }
+    if (verdict.status === 'ok') {
+      summary.healthy++;
+      continue;
+    }
+    if (verdict.status === 'unclassifiable') {
+      summary.unclassifiable++;
+      console.warn(
+        `${TAG} ${adAccountId}: ${verdict.consecutiveBlackoutDays} spending day(s) with no ` +
+        `recognised conversion, but unknown action types were present — NOT alerting. ` +
+        `Add these if they are conversions: ${verdict.unrecognized.join(', ')}`,
+      );
+      continue;
+    }
+
+    summary.blackouts++;
+    await raise(
+      alertTransport,
+      `${BLACKOUT_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} spent with zero attributed conversions`,
+      [
+        `Ad account ${adAccountId} has spent for ${verdict.consecutiveBlackoutDays} consecutive`,
+        `day(s) and Meta has attributed no conversions at all over that period.`,
+        '',
+        `Spend during the blackout: ${verdict.spendInBlackout.toFixed(2)}`,
+        '',
+        'This is either a genuinely non-converting campaign or a broken tracking path.',
+        'It is worth telling apart quickly: the same pattern ran on a real account for 24',
+        'consecutive days before anyone noticed, and the customer churned.',
+      ].join('\n'),
+      {
+        'Alert Class': BLACKOUT_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Consecutive Days': verdict.consecutiveBlackoutDays,
+        'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
+      },
+    );
+  }
+
+  summary.unrecognizedActionTypes = [...unknownTypes];
+  return summary;
+}
+
+/** Send an alert unless one for this key already went out inside the window. A transport
+ *  failure is logged and swallowed: a broken mail server must not stop the sweep from
+ *  checking the remaining accounts. */
+async function raise(
+  transport: AlertTransport,
+  dedupeKey: string,
+  now: number,
+  subject: string,
+  message: string,
+  context: Record<string, any>,
+): Promise<void> {
+  if (shouldSuppress(dedupeKey, now)) return;
+  try {
+    await transport(subject, message, context);
+  } catch (error: any) {
+    console.error(`${TAG} failed to send alert "${subject}": ${error?.message}`);
+  }
 }
