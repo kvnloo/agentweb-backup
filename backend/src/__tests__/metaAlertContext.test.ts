@@ -96,10 +96,50 @@ describe('buildAlertContext — why is nothing attributed', () => {
     expect(String(ctx['Meta Match Keys'])).toContain('fr_cookie');
   });
 
-  it('says so plainly when the pixel received no customer identity at all', async () => {
-    const ctx = await buildAlertContext(owner, 'acct1', days, deps() as any);
+  it('says so plainly when the pixels received no customer identity', async () => {
     // fr_cookie/c_user_cookie are Meta's OWN browser cookies, not identity we supplied.
-    expect(String(ctx['Meta Match Keys'])).toMatch(/no identity we supplied/i);
+    // Phrased against the pixels actually examined — the unqualified account-wide form is
+    // reserved for a complete, confirmed view and covered separately below.
+    const ctx = await buildAlertContext(owner, 'acct1', days, deps() as any);
+    expect(String(ctx['Meta Match Keys'])).toMatch(/identity we supplied/i);
+    expect(String(ctx['Meta Match Keys'])).toMatch(/cannot tie a conversion to an ad click/i);
+  });
+
+  it('qualifies the no-identity claim when the view was partial', async () => {
+    // deps() resolves no configured pixel, so selection is a heuristic — the absolute
+    // account-wide claim is not defensible from that.
+    const ctx = await buildAlertContext(owner, 'acct1', days, deps() as any);
+    expect(String(ctx['Meta Match Keys'])).toMatch(/not an account-wide conclusion/i);
+  });
+
+  it('makes the absolute claim ONLY on a complete, confirmed view', async () => {
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px-only'),
+      getPixels: jest.fn().mockResolvedValue([
+        { id: 'px-only', last_fired_time: '2026-08-14T19:59:40-0400' },
+      ]),
+      getMatchKeys: jest.fn().mockResolvedValue({ Lead: { fr_cookie: 3 } }),
+    } as any);
+    expect(String(ctx['Meta Match Keys'])).toMatch(/NO IDENTITY WE SUPPLIED/);
+    expect(String(ctx['Meta Match Keys'])).not.toMatch(/not an account-wide conclusion/i);
+  });
+
+  it('says how many pixels were examined when the cap truncated the set', async () => {
+    // An omitted pixel may carry `email`; claiming otherwise would be a claim about a
+    // pixel nobody looked at.
+    const many = Array.from({ length: MAX_PIXELS_DIAGNOSED + 2 }, (_, i) => ({
+      id: `px${i}`,
+      last_fired_time: `2026-08-1${i}T00:00:00-0400`,
+    }));
+    const ctx = await buildAlertContext(owner, 'acct1', days, {
+      ...deps(),
+      getPreferredPixelId: jest.fn().mockResolvedValue('px0'),
+      getPixels: jest.fn().mockResolvedValue(many),
+      getMatchKeys: jest.fn().mockResolvedValue({ Lead: { fr_cookie: 1 } }),
+    } as any);
+
+    expect(String(ctx['Meta Match Keys'])).toContain(`${MAX_PIXELS_DIAGNOSED} of ${many.length}`);
   });
 
   it('does not raise that flag when we DID supply identity', async () => {

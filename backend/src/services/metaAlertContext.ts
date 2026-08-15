@@ -190,7 +190,11 @@ export async function buildAlertContext(
       ? pixels.find((p) => p?.id === preferredPixelId)
       : undefined;
 
-    const fired = [...(preferred ? [preferred] : []), ...byRecency].slice(0, MAX_PIXELS_DIAGNOSED);
+    const candidates = [...(preferred ? [preferred] : []), ...byRecency];
+    const fired = candidates.slice(0, MAX_PIXELS_DIAGNOSED);
+    /** True only when every candidate pixel was diagnosed. An account-wide claim made from
+     *  a capped subset is a claim about pixels nobody looked at. */
+    const sawEveryPixel = fired.length === candidates.length;
     const linkTarget = preferred ?? fired[0];
     if (linkTarget?.id) context['Meta Events Manager'] = metaDeepLinks.eventsManager(linkTarget.id);
 
@@ -233,16 +237,31 @@ export async function buildAlertContext(
     }
 
     if (sections.length > 0) {
-      context['Meta Match Keys'] =
-        sections.join('\n') +
-        // Only claimed when NO fired pixel received identity. Asserting it off one pixel
-        // while another contradicts it would be the same confident-wrong failure.
-        (anySupplied
-          ? ''
-          : '\nNO IDENTITY WE SUPPLIED reached Meta on these events — only Meta\'s own ' +
+      // The absolute claim — "no identity reached Meta on this account" — is only
+      // defensible when the view was complete: every candidate pixel diagnosed, and the
+      // selection confirmed rather than inferred. If the cap truncated the set, an
+      // undiagnosed pixel may well carry `email`; if selection was a heuristic, the pixels
+      // shown may not be the ones the ads attribute through. In either case the finding is
+      // still worth reporting, but scoped to what was actually examined.
+      //
+      // This is the same discipline as §F's own third state: a partial view produces a
+      // qualified statement, never a confident one (Greptile, fifth pass on #2415).
+      const completeView = sawEveryPixel && !!preferred;
+      const noIdentityNote = anySupplied
+        ? ''
+        : completeView
+          ? '\nNO IDENTITY WE SUPPLIED reached Meta on these events — only Meta\'s own ' +
             'browser cookies. Without fbc/fbp/email an event cannot be tied back to an ad ' +
             'click, which is why spend can show zero attributed conversions while the ' +
-            'pixel still counts the event.');
+            'pixel still counts the event.'
+          : '\nNone of the pixels shown above received identity we supplied — only Meta\'s ' +
+            'own browser cookies, which cannot tie a conversion to an ad click. NOT an ' +
+            'account-wide conclusion: ' +
+            (sawEveryPixel
+              ? 'the configured attribution pixel could not be confirmed, so these may not be ' +
+                'the pixels the ads attribute through.'
+              : `only ${fired.length} of ${candidates.length} pixels were examined.`);
+      context['Meta Match Keys'] = sections.join('\n') + noIdentityNote;
     }
   }
 
