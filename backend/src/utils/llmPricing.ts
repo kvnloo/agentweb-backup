@@ -282,7 +282,7 @@ function canonicalModelId(model: string): string {
  */
 export function getModelPrice(model: string): ModelPrice | null {
   const price = MODEL_PRICING[model];
-  if (price) return price;
+  if (price) return assertValidPrice(model, price);
 
   // Normalize provider-returned `response.model` drift (rolling aliases + dated
   // snapshot suffixes) to the canonical registry key before giving up. This is
@@ -292,7 +292,7 @@ export function getModelPrice(model: string): ModelPrice | null {
   const canonical = canonicalModelId(model);
   if (canonical !== model) {
     const canonicalPrice = MODEL_PRICING[canonical];
-    if (canonicalPrice) return canonicalPrice;
+    if (canonicalPrice) return assertValidPrice(canonical, canonicalPrice);
   }
 
   // Image and video models are intentionally NOT token-priced — they are billed
@@ -310,6 +310,36 @@ export function getModelPrice(model: string): ModelPrice | null {
     console.warn(
       `[llmPricing] No price entry for model "${model}" — usage will be recorded with cost 0. ` +
         `Add it to MODEL_PRICING in src/utils/llmPricing.ts.`
+    );
+  }
+  return null;
+}
+
+/**
+ * Reject a registry entry with non-finite or negative rates before it can charge
+ * (or under-charge) a customer. A malformed entry (typo'd digit, NaN from a bad
+ * merge, accidental negative) is treated the same as a missing one: null + a
+ * one-time warning, never a silent bad number reaching the cost gate.
+ */
+function isValidRate(rate: number | undefined): boolean {
+  return rate === undefined || (Number.isFinite(rate) && rate >= 0);
+}
+
+function assertValidPrice(model: string, price: ModelPrice): ModelPrice | null {
+  const valid =
+    Number.isFinite(price.inPerM) &&
+    price.inPerM >= 0 &&
+    Number.isFinite(price.outPerM) &&
+    price.outPerM >= 0 &&
+    isValidRate(price.cacheReadPerM) &&
+    isValidRate(price.cacheWritePerM);
+  if (valid) return price;
+
+  if (!warnedUnknownModels.has(model)) {
+    warnedUnknownModels.add(model);
+    console.warn(
+      `[llmPricing] Invalid price entry for model "${model}" (${JSON.stringify(price)}) — ` +
+        `usage will be recorded with cost 0 instead of a corrupted charge. Fix MODEL_PRICING in src/utils/llmPricing.ts.`
     );
   }
   return null;

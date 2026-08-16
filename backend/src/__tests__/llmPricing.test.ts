@@ -199,6 +199,50 @@ describe('llmPricing', () => {
       expect(price!.cacheWritePerM).toBeCloseTo(3.75, 10);
     });
 
+    // ENG-1202 AC5: a registry entry present but corrupted (NaN, negative, or
+    // infinite) must not silently reach the cost gate as a bad charge — it is
+    // treated the same as "missing": null + cost 0, never a wrong number.
+    describe('fails closed on an invalid (present but corrupted) price entry', () => {
+      const PROBE_MODEL = 'xai.grok-4.3';
+      let original: (typeof MODEL_PRICING)[string];
+
+      beforeEach(() => {
+        original = MODEL_PRICING[PROBE_MODEL];
+        expect(original).toBeDefined();
+      });
+
+      afterEach(() => {
+        MODEL_PRICING[PROBE_MODEL] = original;
+      });
+
+      it('rejects a NaN inPerM', () => {
+        MODEL_PRICING[PROBE_MODEL] = { ...original, inPerM: NaN };
+        expect(getModelPrice(PROBE_MODEL)).toBeNull();
+      });
+
+      it('rejects a negative outPerM', () => {
+        MODEL_PRICING[PROBE_MODEL] = { ...original, outPerM: -1 };
+        expect(getModelPrice(PROBE_MODEL)).toBeNull();
+      });
+
+      it('rejects a non-finite cacheReadPerM', () => {
+        MODEL_PRICING[PROBE_MODEL] = { ...original, cacheReadPerM: Infinity };
+        expect(getModelPrice(PROBE_MODEL)).toBeNull();
+      });
+
+      it('rejects a negative cacheWritePerM', () => {
+        MODEL_PRICING[PROBE_MODEL] = { ...original, cacheWritePerM: -0.5 };
+        expect(getModelPrice(PROBE_MODEL)).toBeNull();
+      });
+
+      it('still returns a corrected valid entry after a bad one was probed', () => {
+        MODEL_PRICING[PROBE_MODEL] = { ...original, inPerM: NaN };
+        expect(getModelPrice(PROBE_MODEL)).toBeNull();
+        MODEL_PRICING[PROBE_MODEL] = original;
+        expect(getModelPrice(PROBE_MODEL)).toEqual(original);
+      });
+    });
+
     it('derives cache prices as 10% / 125% of input price for token models', () => {
       // Models whose provider publishes an explicit cache rate that differs from the
       // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
