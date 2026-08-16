@@ -27,6 +27,7 @@ import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import { usageSnapshot } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
+import { validateHandoff, handoffDoc, handoffPrompt, prRef } from './handoff.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped, assigneeBranchPrefix, kebab,
@@ -324,6 +325,92 @@ function createChat(email) {
   };
   writeFileSync(statePath, JSON.stringify(s, null, 2));
   return { code: 200, body: { identifier } };
+}
+
+// ---------------------------------------------------------------------------
+// Handoff (POST /api/handoff) — a local Claude session on a laptop hands finished work here to be
+// merged. Everything before the merge needed the developer; everything after it (Greptile rounds, a
+// 20-minute CI, the deploy, the live check) is waiting, and waiting is what this box is for.
+//
+// One request does the whole set-up: a standalone chat whose branch IS the PR's branch (so the lazy
+// assembleFromBranch in resolveCwd adopts the pushed work, per repo, on the first turn), the context
+// document on disk, and ONE seeded turn = handoff framing + the existing merge drive. No second call,
+// no confirmation step — the developer has already left.
+
+// Does this branch actually exist on any configured repo's origin? assembleFromBranch silently falls
+// back to origin/<base> for repos that lack the branch — which is correct for a one-repo change, but
+// means a typo'd branch would produce a worktree quietly sitting on main. Checked here so the skill
+// gets a real error instead of an agent puzzling over an empty diff.
+// Remove a half-created chat's state entry. Used only to roll back a handoff whose worktree failed to
+// build — leaving the entry would put a broken chat in the sidebar that can never run a turn.
+function dropChatEntry(identifier) {
+  const s = loadState();
+  for (const [uuid, e] of Object.entries(s)) if ((e.identifier || '').toUpperCase() === identifier.toUpperCase()) delete s[uuid];
+  writeFileSync(statePath, JSON.stringify(s, null, 2));
+}
+
+function branchOnOrigin(branch) {
+  return config.repos.some((repo) => {
+    const r = spawnSync('git', ['ls-remote', '--heads', 'origin', branch], {
+      cwd: path.resolve(agentRoot, repo.root), encoding: 'utf8', timeout: 30000,
+    });
+    return r.status === 0 && String(r.stdout || '').includes(`refs/heads/${branch}`);
+  });
+}
+
+function createHandoff(body) {
+  const v = validateHandoff(body, chatMembers());
+  if (!v.ok) return { code: 400, error: v.error };
+  const { email, member, prUrls, branch, title, context } = v.value;
+  if (!fixEnabled()) return { code: 400, error: 'this machine cannot merge (AUTOFIX_RUN_ENABLED != 1)' };
+  if (!branchOnOrigin(branch)) {
+    return { code: 400, error: `branch "${branch}" is not on origin in any configured repo — push it before handing off` };
+  }
+
+  const identifier = nextChatId();
+  const identity = resolveAssigneeIdentity({ email }) || null;
+  const at = new Date().toISOString();
+  const s = loadState();
+  s[`chat-${randomUUID()}`] = {
+    identifier, standalone: true,
+    branch,                 // the PR's branch, NOT a fresh chat-N — the worktree adopts the pushed work
+    prs: prUrls,            // load-bearing: mergeMsg() scopes itself to this and never discovers PRs
+    outcome: 'chat', title,
+    assigneeEmail: email, assignee: identity, ownerName: member.firstName,
+    handoff: { at, by: member.name }, at,
+  };
+  writeFileSync(statePath, JSON.stringify(s, null, 2));
+
+  // Built EAGERLY, unlike a normal chat (which lets resolveCwd assemble on the first turn): the handoff
+  // document lives in this folder, so the folder has to exist before the seeded turn starts. It also
+  // means a broken branch fails the HTTP call with a real error instead of surfacing as a confused
+  // first turn. Costs the caller a fetch + worktree add; a handoff is a one-shot, so that is fine.
+  const WT = path.join(worktreesDir, identifier);
+  const asm = assembleFromBranch(WT, branch);
+  if (!asm.ok) {
+    dropChatEntry(identifier);
+    return { code: 500, error: `could not build the ${asm.repo} worktree from ${branch}: ${(asm.err || '').slice(0, 400)}` };
+  }
+  applyWorktreeIdentity(WT, identity, log); // commits land as the owner, not as the box
+  prepareWorktreeDeps(WT);
+
+  // In the worktree, matching the convention already in use by hand (CHAT-9 carries ENG-885-HANDOFF.md):
+  // the agent works here, so this is where it looks. The worktree root IS the agentweb repo root, so the
+  // file is untracked and a `git add -A` would commit it onto the PR — handoffPrompt() forbids that
+  // explicitly and tells the agent to stage exact paths instead.
+  const handoffPath = path.join(WT, 'HANDOFF.md');
+  writeFileSync(handoffPath, handoffDoc({ title, prUrls, branch, author: member.name, context, at }));
+
+  const found = findEntry(identifier);
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'could not take the lock for the new chat' };
+  const turnId = `t${Date.now()}-${++turnSeq}`;
+  activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: at, lockPath });
+  // Shown in the transcript; the real instructions ride in as the promptOverride.
+  const disp = `⇄ Handoff from ${member.firstName} — ${title}\n\nReading the handoff document, then driving ${prUrls.map(prRef).join(', ')} to merge.`;
+  runTurn(identifier, found.entry, 'full', disp, turnId, lockPath, null, [],
+    handoffPrompt({ identifier, title, prUrls, branch, handoffPath }) + mergeMsg(found.entry));
+  return { code: 202, body: { identifier, turnId, handoffPath, prs: prUrls, branch, owner: member.name } };
 }
 
 // Resolve a member by email, first name, or full name (case-insensitive) — used by both the UI owner
@@ -1731,6 +1818,12 @@ function mergeMsg(entry) {
     'If the PR(s) above depend on each other, handle them in the right order (merging one advances the base, so the next will fall behind — re-sync it with `gh pr update-branch`, which re-triggers its CI + a fresh Greptile review; that is expected, just ride it out via [[WATCH]] and merge it when it goes green again). You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, to commit, AND to `gh pr merge --merge` for this task — this overrides the earlier note about not pushing/merging.',
     '',
     'Bias hard toward finishing autonomously: pull the developer in ONLY for a genuine decision change — end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` (summarize Greptile\'s point so the developer can decide without re-reading the PR). Also use MERGE_BLOCKED if a PR simply cannot be made mergeable. When the PR(s) above are merged, report the final state of each.',
+    '',
+    '**7. Merged is NOT done — carry the watch through deploy and a live check.** A merge to `main` auto-deploys to production within minutes (both this repo and customer-portal), so the job only ends once the change is actually LIVE. Do NOT emit `[[WATCH_DONE]]` at merge. Instead keep the loop running:',
+    '   - Watch the deploy land (`gh run list --branch main --limit 5`, `gh run view <id>`). An Elastic Beanstalk deploy is slow — several minutes of drain is normal and must NOT be hurried.',
+    '   - Once it reports success, VERIFY THE CHANGE IS LIVE — do not infer it from a green deploy. Pick the cheapest honest check for what actually changed: hit the deployed endpoint, load the deployed page, or query the deployed behaviour. A deploy that succeeded while serving the old build is a real failure mode here, so check the thing itself.',
+    '   - Report what you verified and how. If you genuinely cannot verify it live (no reachable surface, needs a customer account, needs data you must not touch), say so plainly and name what a human would have to do — never claim "deployed and verified" on the strength of a green check alone.',
+    '   - Only then `[[WATCH_DONE]]`. If the deploy fails or the live check shows the old behaviour, treat it like any other failure: fix what you can, otherwise `MERGE_BLOCKED: <what broke>`.',
   ].join('\n');
 }
 
@@ -2027,6 +2120,9 @@ async function route(req, res) {
     return;
   }
   if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
+  // Handoff from a local Claude session — creates the chat, writes the context doc, and starts the
+  // merge drive in one call. See createHandoff.
+  if (req.method === 'POST' && p === '/api/handoff') { const r = createHandoff(await readBody(req)); json(res, r.code, r.body || { error: r.error }); return; }
 
   const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
