@@ -123,6 +123,16 @@ router.post(
 
       const authedUserId = authReq.user.userId;
       const callerIsAdmin = !!authReq.user.isAdmin;
+      // ENG-1251 Greptile P1: captured ONCE and reused for both the ledger
+      // row (below, via recordUsage's `date` override) and the charge
+      // event's occurredAt (below, via incrementUserTokenUsage's
+      // `occurredAt` override). Two independent `new Date()` calls a few
+      // awaits apart can straddle a UTC-midnight boundary -- the ledger row
+      // lands on one date, the charge event on the next -- and the
+      // itemization reconciliation's (date, model, feature) key no longer
+      // matches between them.
+      const requestReceivedAt = new Date();
+      const requestDate = requestReceivedAt.toISOString().slice(0, 10);
 
       let accepted = 0;
       let skipped = 0;
@@ -144,7 +154,14 @@ router.post(
       // exactly reconcilable against its own aggregate row.
       const charges = new Map<
         string,
-        { userId: string; model: string; feature: string; tokens: number; cost: number; recordFingerprints: string[] }
+        {
+          userId: string; model: string; feature: string; tokens: number; cost: number;
+          // ENG-1251 Greptile P1: how many records (calls) contributed to
+          // this charge entry -- a batch sums several calls' tokens/cost
+          // into one entry, so the entry's own "call count" is NOT 1.
+          calls: number;
+          recordFingerprints: string[];
+        }
       >();
 
       for (const record of records) {
@@ -174,7 +191,7 @@ router.post(
           const chargeKey = [userId, record.model, chargeFeature].join("\u0001");
           const entry =
             charges.get(chargeKey) ||
-            { userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, recordFingerprints: [] };
+            { userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0, recordFingerprints: [] };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
           entry.cost +=
@@ -185,6 +202,7 @@ router.post(
               cacheReadTokens,
               cacheWriteTokens
             ) / 1e6;
+          entry.calls += 1;
           // ENG-1251: fingerprint the record's own content, not just its
           // taskId. A single task can legitimately submit usage across
           // multiple separate batches (e.g. a long-running task reporting
@@ -223,6 +241,7 @@ router.post(
             outputTokens: record.outputTokens!,
             cacheReadTokens,
             cacheWriteTokens,
+            date: requestDate,
           })
         );
         accepted++;
@@ -254,7 +273,7 @@ router.post(
       const RETRY_COLLAPSE_WINDOW_MS = 10 * 60 * 1000;
       const timeBucket = Math.floor(Date.now() / RETRY_COLLAPSE_WINDOW_MS);
       await Promise.all(
-        [...charges.values()].map(({ userId, model, feature, tokens, cost, recordFingerprints }) => {
+        [...charges.values()].map(({ userId, model, feature, tokens, cost, calls, recordFingerprints }) => {
           // A charge entry only exists once at least one record contributed a
           // fingerprint, so both branches below always have content to hash.
           // Includes model/feature: one engine flush (one reportId) can carry
@@ -289,6 +308,8 @@ router.post(
             eventId,
             model,
             feature,
+            occurredAt: requestReceivedAt.toISOString(),
+            calls,
           }).catch((err: unknown) =>
             console.error(
               `[internalUsage] failed to charge usage for ${userId}:`,

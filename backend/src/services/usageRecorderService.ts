@@ -47,6 +47,19 @@ export interface RecordUsageContext {
    * When set, it is recorded verbatim instead of computing cost from tokens.
    */
   costUsdOverride?: number;
+  /**
+   * ENG-1251 Greptile P1: YYYY-MM-DD override. A caller that ALSO writes a
+   * paired charge event for the same logical usage (internalUsage.ts is the
+   * only one today) must compute this ledger row's date from the exact same
+   * instant as that charge event's occurredAt -- two independent `new
+   * Date()` calls a few awaits apart can straddle a UTC-midnight boundary,
+   * landing the ledger row on one date and the charge event on the next.
+   * The itemization reconciliation keys on (date, model, feature), so a
+   * one-day mismatch breaks the key match: the charge event can no longer
+   * cover its own aggregate row, and both show up (double count). Omit for
+   * every other caller -- defaults to `new Date()` at call time, unchanged.
+   */
+  date?: string;
 }
 
 /**
@@ -126,7 +139,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
   try {
     const userId = ctx.userId || "system";
     const billingUserId = ctx.billingUserId || userId;
-    const date = new Date().toISOString().slice(0, 10);
+    const date = ctx.date || new Date().toISOString().slice(0, 10);
     const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
     const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
     const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));

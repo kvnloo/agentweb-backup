@@ -108,6 +108,34 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(cost).toBeCloseTo(15, 5);
   });
 
+  it("ENG-1251 Greptile P1: passes the true call count, not a hardcoded 1, for a summed batch", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record(), record(), record()] });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit?.calls).toBe(3);
+  });
+
+  it("ENG-1251 Greptile P1: the ledger row's date and the charge event's occurredAt are derived from the SAME instant", async () => {
+    // Two independent `new Date()` calls a few awaits apart could straddle
+    // a UTC-midnight boundary, landing the ledger row and the charge event
+    // on different dates -- breaking the (date, model, feature) key the
+    // itemization reconciliation matches on. Both must come from one
+    // shared timestamp captured at the top of the request.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record()] });
+
+    const recordDate = mockRecordUsage.mock.calls[0][0].date;
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(recordDate).toBeDefined();
+    expect(audit?.occurredAt).toBeDefined();
+    expect(audit.occurredAt.slice(0, 10)).toBe(recordDate);
+  });
+
   it("counts cache tokens in both the charge and its cost", async () => {
     await request(app)
       .post("/api/internal/usage")

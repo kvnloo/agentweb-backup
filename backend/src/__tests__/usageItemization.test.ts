@@ -127,4 +127,33 @@ describe("reconcileItemizedUsage", () => {
     const result = reconcileItemizedUsage([], [row(), row({ date: "2026-08-14" })]);
     expect(result.precision).toBe("daily_aggregate");
   });
+
+  it("ENG-1251 Greptile P1: a batch-charge event's own call count is used, not hardcoded 1", () => {
+    // internalUsage.ts sums an engine batch into ONE charge event per
+    // (user, model, feature) -- that event can represent several calls,
+    // not one. Both the event's own displayed `calls` and the coverage
+    // subtracted from its aggregate row must reflect the true count.
+    const result = reconcileItemizedUsage(
+      [event({ tokens: 300, costMicroUsd: 5000, calls: 3 })],
+      [row({ totalTokens: 500, costMicroUsd: 8000, callCount: 5 })]
+    );
+    const chargeItem = result.items.find((i) => i.source === "charge_event");
+    expect(chargeItem).toEqual(expect.objectContaining({ calls: 3, tokens: 300 }));
+
+    const aggregateItem = result.items.find((i) => i.source === "daily_aggregate");
+    // 5 total calls - 3 covered by the batch event = 2 uncovered, not 4
+    // (which is what a hardcoded calls:1 would have produced).
+    expect(aggregateItem).toEqual(expect.objectContaining({ calls: 2, tokens: 200 }));
+  });
+
+  it("treats a charge event with no `calls` field (pre-existing data, or a single-call caller) as exactly 1 call", () => {
+    const result = reconcileItemizedUsage(
+      [event({ tokens: 100, costMicroUsd: 5000 })], // no `calls` field
+      [row({ totalTokens: 300, costMicroUsd: 15000, callCount: 3 })]
+    );
+    const chargeItem = result.items.find((i) => i.source === "charge_event");
+    expect(chargeItem?.calls).toBe(1);
+    const aggregateItem = result.items.find((i) => i.source === "daily_aggregate");
+    expect(aggregateItem?.calls).toBe(2);
+  });
 });

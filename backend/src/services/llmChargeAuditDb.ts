@@ -21,6 +21,13 @@ export type LlmChargeAuditEvent = {
   tokens: number; costMicroUsd: number; model?: string; provider?: string; feature?: string;
   sessionId?: string;
   counterAppliedAt?: string;
+  /**
+   * ENG-1251 Greptile P1: how many underlying LLM calls this one event
+   * represents. Absent (undefined) on every event recorded before this
+   * field existed, and on every single-call caller today -- readers must
+   * treat a missing value as exactly 1, never 0.
+   */
+  calls?: number;
 };
 
 export async function recordLlmChargeEvent(event: LlmChargeAuditEvent): Promise<boolean> {

@@ -297,7 +297,35 @@ export async function incrementUserTokenUsage(
   userId: string,
   tokens: number,
   cost: number,
-  audit?: { eventId?: string; model?: string; provider?: string; feature?: string; sessionId?: string }
+  audit?: {
+    eventId?: string;
+    model?: string;
+    provider?: string;
+    feature?: string;
+    sessionId?: string;
+    /**
+     * ENG-1251 Greptile P1: overrides the charge event's occurredAt. A
+     * caller that ALSO writes a paired shadow-ledger row for the same
+     * logical usage (internalUsage.ts is the only one today) must derive
+     * this from the exact same instant as that row's date -- otherwise two
+     * independent `new Date()` calls a few awaits apart can straddle a
+     * UTC-midnight boundary, and the itemization reconciliation's
+     * (date, model, feature) key no longer matches between the two.
+     * Omit for every other caller -- defaults to `new Date()`, unchanged.
+     */
+    occurredAt?: string;
+    /**
+     * ENG-1251 Greptile P1: how many underlying calls this ONE charge event
+     * represents. internalUsage.ts sums an engine batch's tokens/cost into
+     * one charge event per (user, model, feature), so that event can stand
+     * in for several calls, not one -- the itemization reconciliation must
+     * subtract the true count from the aggregate row's callCount, or a
+     * multi-call batch under-subtracts and leaves phantom "uncovered" calls
+     * behind. Every other caller charges exactly one call per invocation,
+     * so omitting this defaults to 1, unchanged.
+     */
+    calls?: number;
+  }
 ): Promise<void> {
   if (tokens <= 0 && cost <= 0) return;
 
@@ -321,7 +349,7 @@ export async function incrementUserTokenUsage(
     // either structurally called at most once per success today or lacks a
     // verified stable id at the call site; tracked as a fast-follow rather
     // than guessed here.
-    const occurredAt = new Date().toISOString();
+    const occurredAt = audit?.occurredAt || new Date().toISOString();
     const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
     // ENG-1251 Greptile P1: isNewCharge=false means an event with this ID was
     // ALREADY RECORDED -- it does NOT mean it was already APPLIED. A prior
@@ -339,6 +367,7 @@ export async function incrementUserTokenUsage(
       billingUserId, eventId, occurredAt, actingUserId: userId,
       tokens: Math.max(0, Math.round(tokens)), costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
       model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
+      calls: audit?.calls,
     });
 
     // Apply the counter update and mark the audit event applied atomically —

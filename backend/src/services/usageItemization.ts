@@ -52,7 +52,12 @@ export function reconcileItemizedUsage(
     provider: event.provider || "unknown",
     feature: event.feature || "unknown",
     tokens: event.tokens,
-    calls: 1,
+    // ENG-1251 Greptile P1: a batch-charge event (internalUsage.ts sums an
+    // engine batch into one event per (user, model, feature)) can stand in
+    // for several calls, not one. `calls` is undefined on every event
+    // recorded before this field existed and on every single-call caller
+    // today -- both cases mean exactly 1.
+    calls: event.calls ?? 1,
     costMicroUsd: event.costMicroUsd,
     source: "charge_event",
     sessionId: event.sessionId,
@@ -64,7 +69,7 @@ export function reconcileItemizedUsage(
     const entry = coverageByKey.get(key) || { microUsd: 0, tokens: 0, calls: 0 };
     entry.microUsd += event.costMicroUsd;
     entry.tokens += event.tokens || 0;
-    entry.calls += 1;
+    entry.calls += event.calls ?? 1;
     coverageByKey.set(key, entry);
   }
 
