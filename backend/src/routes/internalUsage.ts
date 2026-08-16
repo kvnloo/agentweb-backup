@@ -127,13 +127,25 @@ router.post(
       let accepted = 0;
       let skipped = 0;
       const writes: Promise<void>[] = [];
-      // ENG-1134: quota charge, summed per user across the batch rather than
-      // applied per record. A batch carries up to 500 records and
-      // incrementUserTokenUsage is a read-modify-write on one user row, so
-      // charging per record would mean hundreds of contended sequential writes
-      // for a single task run. Ledger rows stay granular (they are keyed by
-      // model+feature); only the deduction is aggregated.
-      const charges = new Map<string, { tokens: number; cost: number; recordFingerprints: string[] }>();
+      // ENG-1134: quota charge, summed per (user, model, feature) across the
+      // batch rather than applied per record. A batch carries up to 500
+      // records and incrementUserTokenUsage is a read-modify-write on one
+      // user row, so charging per record would mean hundreds of contended
+      // sequential writes for a single task run.
+      //
+      // ENG-1251 Greptile P1: keyed by (userId, model, feature), not userId
+      // alone. The itemization reconciliation (subscription.ts) matches a
+      // charge event against its covered daily-aggregate row by
+      // (date, model, feature) -- a single charge event summed across every
+      // model in the batch cannot carry one true model/feature, so it could
+      // never key-match the aggregate row it's supposed to cover, and the
+      // itemized view double-counted the batch (event + full aggregate,
+      // both shown). Splitting by model/feature makes each charge event
+      // exactly reconcilable against its own aggregate row.
+      const charges = new Map<
+        string,
+        { userId: string; model: string; feature: string; tokens: number; cost: number; recordFingerprints: string[] }
+      >();
 
       for (const record of records) {
         if (!isValidRecord(record)) {
@@ -158,7 +170,11 @@ router.post(
         // engine token could drain someone else's quota by naming them.
         // "system" is platform overhead with no one to bill, so it is skipped.
         if (userId && userId !== "system") {
-          const entry = charges.get(userId) || { tokens: 0, cost: 0, recordFingerprints: [] };
+          const chargeFeature = namespaceFeature(record.feature);
+          const chargeKey = [userId, record.model, chargeFeature].join("\u0001");
+          const entry =
+            charges.get(chargeKey) ||
+            { userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, recordFingerprints: [] };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
           entry.cost +=
@@ -186,10 +202,10 @@ router.post(
               record.outputTokens,
               cacheReadTokens,
               cacheWriteTokens,
-              namespaceFeature(record.feature),
+              chargeFeature,
             ].join("|")
           );
-          charges.set(userId, entry);
+          charges.set(chargeKey, entry);
         }
 
         // recordUsage is fail-open by contract (always resolves).
@@ -238,19 +254,23 @@ router.post(
       const RETRY_COLLAPSE_WINDOW_MS = 10 * 60 * 1000;
       const timeBucket = Math.floor(Date.now() / RETRY_COLLAPSE_WINDOW_MS);
       await Promise.all(
-        [...charges.entries()].map(([userId, { tokens, cost, recordFingerprints }]) => {
+        [...charges.values()].map(({ userId, model, feature, tokens, cost, recordFingerprints }) => {
           // A charge entry only exists once at least one record contributed a
           // fingerprint, so the fallback branch always has content to hash.
+          // Includes model/feature: one engine flush (one reportId) can carry
+          // several (model, feature) charge entries, so reportId alone is not
+          // unique per entry.
           const eventId = reportId
-            ? `engine:${userId}:${reportId}`
-            : `engine:${userId}:${createHash("sha256")
+            ? `engine:${userId}:${model}:${feature}:${reportId}`
+            : `engine:${userId}:${model}:${feature}:${createHash("sha256")
                 .update([...recordFingerprints].sort().join("\u0001"))
                 .update(`bucket:${timeBucket}`)
                 .digest("hex")
                 .slice(0, 32)}`;
           return incrementUserTokenUsage(userId, tokens, cost, {
             eventId,
-            feature: "engine",
+            model,
+            feature,
           }).catch((err: unknown) =>
             console.error(
               `[internalUsage] failed to charge usage for ${userId}:`,

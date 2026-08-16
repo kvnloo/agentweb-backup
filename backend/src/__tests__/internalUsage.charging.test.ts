@@ -137,6 +137,39 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(byUser["user-b"]).toBe(1_000_000);
   });
 
+  it("ENG-1251 Greptile P1: splits a mixed-model batch into one charge event per (model, feature), not one summed event for the user", async () => {
+    // A single charge event aggregated across every model in the batch cannot
+    // carry one true model -- the itemization reconciliation (subscription.ts)
+    // matches a charge event against its covered daily-aggregate row by
+    // (date, model, feature), so a mis-attributed or missing model means the
+    // event can never key-match its aggregate row, and both show up in the
+    // itemized view (double-counted).
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({
+        records: [
+          record({ model: "anthropic.claude-opus-5", outputTokens: 100 }),
+          record({ model: "gemini-2.5-pro", inputTokens: 500_000, outputTokens: 0 }),
+        ],
+      });
+
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
+    const byModel = Object.fromEntries(
+      mockIncrementUserTokenUsage.mock.calls.map((c) => [c[3]?.model, c[3]])
+    );
+    expect(byModel["anthropic.claude-opus-5"]).toMatchObject({
+      model: "anthropic.claude-opus-5",
+      feature: "engine:agent_task",
+    });
+    expect(byModel["gemini-2.5-pro"]).toMatchObject({
+      model: "gemini-2.5-pro",
+      feature: "engine:agent_task",
+    });
+    // Distinct (model, feature) keys must never collapse into the same eventId.
+    expect(byModel["anthropic.claude-opus-5"].eventId).not.toBe(byModel["gemini-2.5-pro"].eventId);
+  });
+
   it("ignores a spoofed userId and bills the authenticated caller", async () => {
     // A non-admin engine token claiming someone else's userId must not be able to
     // drain that user's quota.
@@ -220,7 +253,7 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
       .send({ records: [record()] });
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
 
   it("derives the identical eventId for a byte-identical resubmitted batch", async () => {
@@ -352,7 +385,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .send({ records: [record({ taskId: "task-abc" })], reportId: "a1b2c3d4e5f6" });
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit).toMatchObject({ eventId: "engine:user-1:a1b2c3d4e5f6" });
+    expect(audit).toMatchObject({ eventId: "engine:user-1:anthropic.claude-opus-5:engine:agent_task:a1b2c3d4e5f6" });
   });
 
   it("collapses a genuine retry (same reportId) even with different-shaped records, since it's the same buffered submission", async () => {
@@ -407,7 +440,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .send({ records: [record({ taskId: "task-abc" })] });
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
 
   it("ignores a non-string reportId rather than using it verbatim", async () => {
@@ -418,7 +451,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
     // Falls back to the fingerprint format, not "engine:user-1:12345".
-    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
 });
 
