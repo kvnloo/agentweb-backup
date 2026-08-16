@@ -778,6 +778,26 @@ createTestAccount().then(async () => {
         console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
       }
 
+      // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
+      // Charging a customer while their ad platform connection is silently dead
+      // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
+      // manually). Flags active-subscription users renewing within the lookahead
+      // window whose ad integration is missing/expired via a deduped oncall alert.
+      try {
+        const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
+        const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+          .catch(e => console.error('[renewalIntegrationHealthCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+            .catch(e => console.error('[renewalIntegrationHealthCron] Error:', e));
+        }, RENEWAL_HEALTH_INTERVAL_MS);
+        console.log('[renewalIntegrationHealthCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
       // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
       // mailbox send (Graph produces no Resend webhooks), so this polls each connected
