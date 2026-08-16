@@ -141,7 +141,18 @@ check() {
       "${label}" "${want_status}" "${STATUS}" "${STDOUT}"
     return
   fi
-  if ! printf '%s' "${STDOUT}" | grep -qF "${want_text}"; then
+  # ENG-1277: a here-string, not `printf ... | grep -qF`. Under `set -o
+  # pipefail` (line 28), `grep -q` exits as soon as it finds a match — if
+  # `want_text` appears early in a long STDOUT (e.g. "UNKNOWN" as the first
+  # line of a multi-line fixture), grep closes the pipe before printf finishes
+  # writing the rest, printf dies of SIGPIPE, and pipefail reports that
+  # nonzero exit for the WHOLE pipeline even though grep genuinely matched —
+  # flipping a real pass into a FAIL. Observed live on ci-scripts-tests moving
+  # to ubuntu-slim (ENG-1277): the race pre-dates that change (grep -qF has
+  # always raced pipefail here) but the new runner's scheduling made it land.
+  # A here-string has no live producer process for grep to SIGPIPE — bash
+  # buffers it before grep runs — so this is not merely retrying past a flake.
+  if ! grep -qF "${want_text}" <<<"${STDOUT}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  %s\n      expected output to contain '%s'\n      output: %s\n" \
       "${label}" "${want_text}" "${STDOUT}"

@@ -229,7 +229,9 @@ check() {
       "${desc}" "${expected_exit}" "${LAST_EXIT}" "${LAST_OUTPUT}"
     return
   fi
-  if [ -n "${expected_substr}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${expected_substr}"; then
+  # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+  # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+  if [ -n "${expected_substr}" ] && ! grep -qF "${expected_substr}" <<<"${LAST_OUTPUT}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf 'FAIL  %s\n      expected output to contain: %s\n      output: %s\n' \
       "${desc}" "${expected_substr}" "${LAST_OUTPUT}"
@@ -1205,7 +1207,8 @@ for job_key in backend-tests-a backend-tests-b; do
   ' "${WORKFLOW}" | tr '\n' ' ')"
 
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_HEADER}" | grep -q "greptile"; then
+  # ENG-1277: here-string, not a pipe — see the check() fix above for why.
+  if grep -q "greptile" <<<"${JOB_HEADER}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s references greptile-review in needs/if.\n" "${job_key}"
     printf "      Found: '%s'\n" "${JOB_HEADER}"
@@ -1219,8 +1222,8 @@ for job_key in backend-tests-a backend-tests-b; do
   # The suite must still be draft-gated and path-gated — decoupling from the
   # reviewer check must not turn into running on every draft push.
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_HEADER}" | grep -qF "github.event.pull_request.draft == false" \
-     && printf '%s' "${JOB_HEADER}" | grep -qF "needs.detect-changes.outputs.backend == 'true'"; then
+  if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
+     && grep -qF "needs.detect-changes.outputs.backend == 'true'" <<<"${JOB_HEADER}"; then
     printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
