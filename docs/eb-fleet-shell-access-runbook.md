@@ -33,13 +33,19 @@ command-level forensic evidence.
 
 Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 installed locally (`session-manager-plugin`) and, on the **caller's own IAM identity** (user or role),
-an attached policy granting at minimum `ssm:StartSession` on the target instance plus
-`ssm:TerminateSession`/`ssm:ResumeSession` on the caller's own session resource. This is separate from
-the instance side: `AmazonSSMManagedInstanceCore` on the shared `aws-elasticbeanstalk-ec2-role`
-instance profile only lets the *instance* register with SSM and receive sessions — it grants nothing
-to the operator calling `aws ssm start-session`. If `start-session` fails with an authorization error,
-the caller's identity is missing the `ssm:StartSession` grant; request it before assuming the instance
-is unreachable.
+an attached policy granting at minimum:
+- `ssm:StartSession` on the target instance (`arn:aws:ec2:us-west-2:*:instance/*`)
+- `ssm:StartSession` on the session document used to open the shell's data channel
+  (`arn:aws:ssm:us-west-2:*:document/SSM-SessionManagerRunShell`) — omitting this grant fails the
+  session establishment even though the instance-targeted grant above is present
+- `ssm:TerminateSession`/`ssm:ResumeSession` on the caller's own session resource
+  (`arn:aws:ssm:us-west-2:*:session/${aws:username}-*`)
+
+This is separate from the instance side: `AmazonSSMManagedInstanceCore` on the shared
+`aws-elasticbeanstalk-ec2-role` instance profile only lets the *instance* register with SSM and
+receive sessions — it grants nothing to the operator calling `aws ssm start-session`. If
+`start-session` fails with an authorization error, the caller's identity is missing one of the three
+grants above; request it before assuming the instance is unreachable.
 
 ## Verifying the fleet is actually closed
 
@@ -47,13 +53,18 @@ Raw check (works for any operator, no extra setup):
 
 ```bash
 aws ec2 describe-security-groups --region us-west-2 \
-  --filters Name=ip-permission.to-port,Values=22 \
-  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?ToPort==\`22\`]}" \
-  --output json
+  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?FromPort<=\`22\` && ToPort>=\`22\`]}" \
+  --output json | jq '[.[] | select(.Rules | length > 0)]'
 ```
 
-An empty result (no groups returned) means no security group in the region has any inbound rule for
-port 22 — the expected state. Any group listed here is a regression (a redeployed environment somehow
+**Do not filter on `ip-permission.to-port,Values=22`** — that only matches rules whose `ToPort` is
+exactly 22 and silently misses a broader range (e.g. `FromPort=0, ToPort=65535`, or any range like
+`20-25`) that also permits port 22. The query above instead pulls every rule on each group and
+filters for any range that covers port 22 (`FromPort<=22 AND ToPort>=22`), which catches both an
+exact `22-22` rule and a wider range that includes it.
+
+An empty result (`[]`) means no security group in the region has any inbound rule covering port 22 —
+the expected state. Any group listed here is a regression (a redeployed environment somehow
 re-opening 22, a new environment created without this runbook in mind) and needs the rule removed.
 
 On the swarm box, `python3 ~/.agentweb-swarm/scripts/sg-guard.py --region us-west-2` runs the
