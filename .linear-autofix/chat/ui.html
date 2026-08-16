@@ -305,6 +305,10 @@
   .btwcompose { display: flex; gap: 8px; align-items: flex-end; }
   .btwcompose textarea { flex: 1; resize: none; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px; line-height: 1.4; max-height: 120px; }
   .btwcompose textarea:focus { outline: 1px solid var(--accent); }
+  .btwcompose textarea.recording { outline: 1px solid var(--red); }
+  /* Mirrors #voice, but lives INSIDE the modal — the composer's bar is behind the overlay. */
+  #btwVoice { display: none; align-items: center; gap: 9px; color: var(--red); font-size: 11.5px; }
+  #btwVoice .mic { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1.1s infinite; }
   .btwcompose button { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
   .btw-dots::after { content: '…'; animation: btwpulse 1.2s infinite; }
   @keyframes btwpulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
@@ -731,7 +735,9 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 // their gap is far larger. RELEASE_MS is the tiny grace period after a keyup before we treat the key
 // as truly released (must outlast the auto-repeat keyup→keydown gap).
 const HOLD_MS = 300, REPEAT_GAP = 12, RELEASE_MS = 20, VOICE_LANG = 'en-US';
-const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null };
+// `tgt` is the box this press belongs to — the main composer or the /btw modal's textarea. See
+// mainVoiceTarget/btwVoiceTarget below; it is pinned on keydown and cleared when the polish lands.
+const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null, tgt: null };
 
 // ---------- sidebar ----------
 let lastIssuesJson = '';
@@ -1847,21 +1853,49 @@ $('input').addEventListener('input', () => { S.escArmed = 0; autosize(); updateS
 $('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 120); }); // let a row mousedown fire first
 
 // ---------- voice: push-to-talk dictation ----------
-// Only intercept space when the composer is actually usable; otherwise spaces behave normally.
-function voiceEnabled() {
+// TWO boxes share this one implementation: the main composer and the /btw side-thread box in the
+// modal. A "target" bundles the textarea, how to resize it, and which status bar to write to; it is
+// PINNED into V.tgt for the whole press, so an async polish that lands after you've switched boxes
+// (or closed the modal) can never type into the wrong one.
+function mainVoiceTarget() { return { el: $('input'), fit: autosize, bar: 'voice', key: 'main' }; }
+function btwVoiceTarget() {
+  const el = document.getElementById('btwInput');
+  return el ? { el, fit: () => btwAutosize(el), bar: 'btwVoice', key: 'btw' } : null;
+}
+// Is this target still the box it claims to be? The /btw textarea is rebuilt on every modal open and
+// closeCmd only HIDES the panel (the old node stays in the document), so `document.contains` is not a
+// sufficient staleness test — identity is. Anything holding a target across an await must re-check
+// this before typing into it.
+function voiceLive(tgt) {
+  const t = tgt || V.tgt;
+  if (!t || !t.el) return false;
+  if (t.key === 'btw') return S.cmd === 'By the way' && document.getElementById('btwInput') === t.el;
+  return $('input') === t.el;
+}
+// Only intercept space when the target box is actually usable; otherwise spaces behave normally.
+function voiceEnabled(tgt) {
   // Note: intentionally NOT gated on S.busy — you can dictate your NEXT message while a turn runs;
   // it lands in the composer and the send path queues it (see send() S.busy branch). Only a truly
   // locked composer (compact/delete disable the input) or an in-progress delete blocks the mic.
-  return V.supported && !V.denied && !!S.sel && !S.deleting && !$('input').disabled;
+  const t = tgt || V.tgt;
+  if (!V.supported || V.denied || !S.sel || S.deleting) return false;
+  return !!(t && !t.el.disabled && voiceLive(t));
 }
-function showVoice(on) { $('voice').style.display = on ? 'flex' : 'none'; $('input').classList.toggle('recording', on); }
-function voiceNote(msg) { const v = $('voice'); if (v) v.lastElementChild.textContent = msg; }
-function startVoice() {
+function voiceBar(tgt) { const t = tgt || V.tgt; return t ? document.getElementById(t.bar) : null; }
+function showVoice(on, tgt) {
+  const t = tgt || V.tgt; if (!t) return;
+  const bar = voiceBar(t); if (bar) bar.style.display = on ? 'flex' : 'none';
+  t.el.classList.toggle('recording', on);
+}
+function voiceNote(msg, tgt) { const bar = voiceBar(tgt); if (bar) bar.lastElementChild.textContent = msg; }
+function startVoice(tgt) {
   if (V.recording) return;
+  const t = tgt || V.tgt; if (!t) return;
+  V.tgt = t;
   V.recording = true;
-  showVoice(true); // show the bar first, so we can tell startVoice ran even if the recognizer fails
-  voiceNote('🎤 Starting mic…'); // rec.onstart flips this to "Listening…" once audio is actually captured
-  const el = $('input'), val = el.value, at = V.spaceAt;
+  showVoice(true, t); // show the bar first, so we can tell startVoice ran even if the recognizer fails
+  voiceNote('🎤 Starting mic…', t); // rec.onstart flips this to "Listening…" once audio is actually captured
+  const el = t.el, val = el.value, at = V.spaceAt;
   const hadSpace = val[at] === ' ';
   // Keep the tapped space as a word separator (so "hello"+dictate = "hello world"),
   // but drop it when it would just be leading whitespace in an otherwise-empty composer.
@@ -1872,48 +1906,51 @@ function startVoice() {
   el.value = before + after; // reflect the trim immediately (no stray leading space)
   const caret0 = before.length;
   try { el.setSelectionRange(caret0, caret0); } catch {}
-  autosize();
+  t.fit();
   try {
     const rec = new SR();
     V.rec = rec;
     rec.lang = VOICE_LANG; rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
-    rec.onstart = () => voiceNote('🎤 Listening… — release space to stop · Esc to cancel');
+    rec.onstart = () => voiceNote('🎤 Listening… — release space to stop', t);
     rec.onresult = (ev) => {
       let out = '';
       for (let i = 0; i < ev.results.length; i++) out += ev.results[i][0].transcript;
-      const t = out.replace(/^\s+/, '');
-      el.value = V.before + t + V.after;
-      const caret = (V.before + t).length;
+      const said = out.replace(/^\s+/, '');
+      el.value = V.before + said + V.after;
+      const caret = (V.before + said).length;
       try { el.setSelectionRange(caret, caret); } catch {}
-      autosize();
+      t.fit();
     };
     rec.onerror = (ev) => {
       const e = ev.error;
       if (e === 'not-allowed' || e === 'service-not-allowed') {
-        V.denied = true; V.recording = false; V.pressActive = false; V.awaitingFinal = false; showVoice(false);
+        V.denied = true; V.recording = false; V.pressActive = false; V.awaitingFinal = false; showVoice(false, t);
         $('hint').innerHTML = '⚠ Microphone blocked — click the address-bar mic/site icon, allow access, then reload.';
         setTimeout(updateHint, 6000); // restore the capability line instead of clobbering it for good
       } else if (e === 'network') {
-        voiceNote('⚠ Voice: network error reaching the speech service.');
+        voiceNote('⚠ Voice: network error reaching the speech service.', t);
       } else if (e !== 'no-speech' && e !== 'aborted') {
-        voiceNote('⚠ Voice error: ' + e);
+        voiceNote('⚠ Voice error: ' + e, t);
       }
       // 'no-speech' / 'aborted' are benign — onend handles restart-while-held or cleanup.
     };
     rec.onend = () => {
       // Web Speech auto-stops on a silence gap; if the key is still physically held, reopen the mic.
-      if (V.recording && V.pressActive && !V.denied) { try { rec.start(); } catch { V.recording = false; showVoice(false); finalizeVoice(); } }
+      if (V.recording && V.pressActive && !V.denied) { try { rec.start(); } catch { V.recording = false; showVoice(false, t); finalizeVoice(); } }
       else finalizeVoice(); // released (or auto-ended) → clean up the transcript
     };
     rec.start();
-  } catch (e) { voiceNote('⚠ Voice failed to start: ' + (e && e.message || e)); }
+  } catch (e) { voiceNote('⚠ Voice failed to start: ' + (e && e.message || e), t); }
 }
 function endVoice() { // release: stop recognition; the transcript stays and then gets polished
   V.pressActive = false;
   if (!V.recording) return;
   V.recording = false;
-  $('input').classList.remove('recording'); // drop the red outline; keep the bar for the polish phase
-  $('input').focus();
+  const t = V.tgt;
+  if (t) {
+    t.el.classList.remove('recording'); // drop the red outline; keep the bar for the polish phase
+    if (voiceLive(t)) t.el.focus();
+  }
   V.awaitingFinal = true;
   if (V.rec) { try { V.rec.stop(); } catch {} } // → final onresult, then onend → finalizeVoice
   clearTimeout(V.finalTimer);
@@ -1937,20 +1974,25 @@ function finalizeVoice() {
   if (!V.awaitingFinal) return;
   V.awaitingFinal = false;
   clearTimeout(V.finalTimer);
-  const el = $('input'), val = el.value, before = V.before, after = V.after;
-  if (val.length < before.length + after.length) { showVoice(false); return; }
+  const t = V.tgt;
+  // The /btw box can be torn down mid-dictation (modal closed); there is nothing left to finalize.
+  if (!voiceLive(t)) { showVoice(false, t); V.tgt = null; return; }
+  const el = t.el, val = el.value, before = V.before, after = V.after;
+  if (val.length < before.length + after.length) { showVoice(false, t); return; }
   const raw = val.slice(before.length, val.length - after.length);
-  if (!raw.trim()) { showVoice(false); return; }
+  if (!raw.trim()) { showVoice(false, t); return; }
   const heur = heuristicClean(raw);
   const heurVal = before + heur + after;
-  el.value = heurVal; autosize();
+  el.value = heurVal; t.fit();
   const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {}
-  voicePolish(raw, before, after, heurVal);
+  voicePolish(raw, before, after, heurVal, t);
 }
-async function voicePolish(raw, before, after, baseline) {
-  if (!S.sel) { showVoice(false); return; }
+async function voicePolish(raw, before, after, baseline, tgt) {
+  const t = tgt || V.tgt;
+  if (!S.sel || !t) { showVoice(false, t); return; }
   const sel = S.sel; // pin the issue so a late result can't land on a composer you've navigated away from
-  $('voice').style.display = 'flex'; $('input').classList.remove('recording'); voiceNote('✨ Polishing…');
+  const bar = voiceBar(t); if (bar) bar.style.display = 'flex';
+  t.el.classList.remove('recording'); voiceNote('✨ Polishing…', t);
   let out = null;
   try {
     const r = await fetch(`/api/issues/${sel}/chat/polish`, {
@@ -1961,18 +2003,23 @@ async function voicePolish(raw, before, after, baseline) {
   } catch { /* keep the heuristic version */ }
   // Swap in the polished text only if you're still on the same issue, haven't edited the box, and
   // aren't actively editing mid-text (caret away from the end) — so nothing reshuffles under you.
-  if (out != null && S.sel === sel) {
-    const el = $('input');
+  if (out != null && S.sel === sel && voiceLive(t)) {
+    const el = t.el;
     const caretAtEnd = document.activeElement !== el || el.selectionStart === baseline.length;
     if (el.value === baseline && caretAtEnd) {
-      el.value = before + out + after; autosize();
+      el.value = before + out + after; t.fit();
       const c = (before + out).length; try { el.setSelectionRange(c, c); } catch {}
     }
   }
-  showVoice(false);
+  showVoice(false, t);
+  if (V.tgt === t) V.tgt = null; // press fully done; next hold re-pins its own target
 }
-if (V.supported) {
-  const inp = $('input');
+// Wire hold-space dictation onto ONE textarea. `mkTarget` is resolved at press time rather than
+// captured, because the /btw box is rebuilt every time the modal opens — capturing the element would
+// pin a detached node. Called once for the main composer at load, and again per /btw open.
+function attachPushToTalk(mkTarget) {
+  if (!V.supported) return;
+  const inp = mkTarget()?.el; if (!inp) return;
   // Cross-platform push-to-talk. ev.repeat is unreliable (X11 sends auto-repeat as keyup/keydown
   // pairs with repeat===false). The definitive tell of a held key is that NO other key event occurs
   // between the space-keyup and the next space-keydown, and they share ~the same timestamp — whereas
@@ -1988,12 +2035,14 @@ if (V.supported) {
       return;
     }
     if (V.recording) { clearTimeout(V.releaseTimer); V.releaseTimer = null; ev.preventDefault(); return; } // held key: swallow the space, cancel any pending release
-    if (!voiceEnabled()) return;                            // let the space type normally
+    const tgt = mkTarget();
+    if (!voiceEnabled(tgt)) return;                         // let the space type normally
     // Genuine new press: let this one space type natively (keeps undo/tap), then arm the hold timer.
     V.pressActive = true;
+    V.tgt = tgt;                                            // pin the box for this whole press
     V.spaceAt = inp.selectionStart;
     clearTimeout(V.holdTimer);
-    V.holdTimer = setTimeout(() => { if (V.pressActive && !V.recording && voiceEnabled()) startVoice(); }, HOLD_MS);
+    V.holdTimer = setTimeout(() => { if (V.pressActive && !V.recording && voiceEnabled(tgt)) startVoice(tgt); }, HOLD_MS);
   });
   inp.addEventListener('keyup', (ev) => {
     if (ev.code !== 'Space') return;
@@ -2015,6 +2064,7 @@ if (V.supported) {
     if (V.recording) endVoice(); else V.pressActive = false;
   });
 }
+attachPushToTalk(mainVoiceTarget);
 
 // ---------- keyboard: Claude Code-style Esc (stop) / Esc-Esc (jump to a previous message) ----------
 function openPicker() {
@@ -2117,7 +2167,15 @@ function openCmd(title, bodyHtml) {
   ov.innerHTML = `<div class="cbox"><div class="chead">${esc(title)}<span>Esc to close</span></div><div class="cbody">${bodyHtml}</div></div>`;
   S.cmd = title; ov.style.display = 'flex'; $('input').blur(); ov.focus();
 }
-function closeCmd() { S.cmd = null; const ov = $('cmd'); if (ov) ov.style.display = 'none'; if (!S.busy) $('input').focus(); }
+function closeCmd() {
+  // Closing the panel destroys the /btw box, so never leave its mic open or a hold timer armed —
+  // the next keyup would otherwise fire endVoice against a detached node.
+  if (V.tgt && V.tgt.key === 'btw') {
+    clearTimeout(V.holdTimer); clearTimeout(V.releaseTimer); V.releaseTimer = null;
+    if (V.recording) endVoice(); else { V.pressActive = false; V.tgt = null; }
+  }
+  S.cmd = null; const ov = $('cmd'); if (ov) ov.style.display = 'none'; if (!S.busy) $('input').focus();
+}
 const kRow = (k, v) => `<div class="krow"><span class="k">${esc(k)}</span><span class="v">${esc(String(v))}</span></div>`;
 // The absolute clock time in the viewer's own timezone FIRST, then how long is left: "Jul 11,
 // 5:59 PM · in 42m", "Jul 11, 9:10 PM · in 3h 10m", "Jul 13, 2:00 AM · in 2d". fmtTime() renders
@@ -2216,14 +2274,22 @@ function openBtw(question) {
   openCmd('By the way', '<div class="btwwrap">'
     + '<div class="btwnote">A side thread — it can see the main conversation (even while the agent is working) but never adds to it. Ask follow-ups below.</div>'
     + '<div class="btwthread" id="btwThread"></div>'
-    + '<div class="btwcompose"><textarea id="btwInput" rows="1" placeholder="Ask a side question…" autocomplete="off" spellcheck="false"></textarea><button id="btwSend">Ask</button></div>'
+    // Its own status bar: the composer's #voice line sits behind the modal overlay, so dictation here
+    // would otherwise give no feedback at all.
+    + '<div id="btwVoice"><span class="mic"></span><span>🎤 Listening… — release space to stop</span></div>'
+    + '<div class="btwcompose"><textarea id="btwInput" rows="1" placeholder="Ask a side question… (hold space to dictate)" autocomplete="off" spellcheck="false"></textarea><button id="btwSend">Ask</button></div>'
     + '</div>');
   renderBtwThread(S.detail?.btw || []);
   const inp = document.getElementById('btwInput'), btn = document.getElementById('btwSend');
-  const submit = () => { const v = inp.value.trim(); if (!v) return; inp.value = ''; btwAutosize(inp); btwSend(v); };
+  const submit = () => {
+    if (V.recording) return; // mid-dictation: don't send a partial transcript — release space first
+    const v = inp.value.trim(); if (!v) return;
+    inp.value = ''; btwAutosize(inp); btwSend(v);
+  };
   btn.onclick = submit;
   inp.addEventListener('input', () => btwAutosize(inp));
   inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } });
+  attachPushToTalk(btwVoiceTarget); // hold space to dictate, same as the main composer
   inp.focus();
   const q = String(question || '').trim();
   if (q) btwSend(q); // a typed "/btw <question>" fires immediately
