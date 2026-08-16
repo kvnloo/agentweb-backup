@@ -271,6 +271,27 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items[0]).toMatchObject({ tokens: 5000, calls: 3, costMicroUsd: 0, source: 'daily_aggregate' });
   });
 
+  it('does NOT double-show a $0 aggregate row that IS already represented by a matching $0 charge event (Greptile P1)', async () => {
+    // Distinct from the previous test: here a charge event for this exact
+    // (date, model, feature) DOES exist -- it just happens to be $0
+    // (unpriced model, captured by the audit-event system). That event is
+    // already in perChargeItems with its own tokens/calls; showing the
+    // aggregate row too would double them.
+    mockListLlmChargeEvents.mockResolvedValue([
+      { billingUserId: 'u1', eventId: 'chatcmpl-unpriced', actingUserId: 'u1', occurredAt: '2026-08-05T12:00:00.000Z', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', tokens: 5000, costMicroUsd: 0, sessionId: 's1' },
+    ]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 1, costMicroUsd: 0 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0].source).toBe('charge_event');
+  });
+
   it('returns 401 when unauthenticated', async () => {
     (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
       req.user = undefined;

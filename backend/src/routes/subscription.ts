@@ -61,33 +61,41 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     // row has no call-level attribution to split them exactly — an
     // estimate, but one that keeps the dollar figure (the one this whole
     // reconciliation is about) exact.
-    const chargedMicroUsdByKey = new Map<string, number>();
+    // Greptile P1: tracking coverage as a bare dollar sum conflates "no
+    // charge events touch this key at all" with "charge events touch it but
+    // happen to sum to $0" (an unpriced model whose calls WERE captured by
+    // the audit-event system). Those need opposite treatment: the first
+    // means the aggregate row is entirely unrepresented elsewhere and must
+    // show in full; the second means it IS already represented (by the $0
+    // event itself, already in perChargeItems) and must NOT also appear via
+    // the aggregate row, or its tokens/calls get double-counted.
+    const coverageByKey = new Map<string, { hasEvents: boolean; microUsd: number }>();
     for (const event of events) {
       const key = `${event.occurredAt.slice(0, 10)}#${event.model || 'unknown'}#${event.feature || 'unknown'}`;
-      chargedMicroUsdByKey.set(key, (chargedMicroUsdByKey.get(key) || 0) + event.costMicroUsd);
+      const entry = coverageByKey.get(key) || { hasEvents: false, microUsd: 0 };
+      entry.hasEvents = true;
+      entry.microUsd += event.costMicroUsd;
+      coverageByKey.set(key, entry);
     }
     const rows = await usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`);
     const aggregateItems = rows.flatMap((row) => {
       const key = `${row.date}#${row.model}#${row.feature}`;
-      const covered = chargedMicroUsdByKey.get(key) || 0;
+      const coverage = coverageByKey.get(key);
       // row.costMicroUsd is already micro-USD, same unit as the charge
       // events summed above -- no conversion.
       const rowMicroUsd = row.costMicroUsd || 0;
-      // Greptile P1: no charge-event coverage exists for this (date, model,
-      // feature) at all -- the row cannot be redundant with anything, so it
-      // always shows in full, even at $0 cost. An unpriced model still has
-      // real token/call usage worth showing; the earlier remainder check
-      // (rowMicroUsd - covered <= 0) wrongly treated "$0 row, $0 covered" as
-      // "fully covered" and silently dropped it.
-      if (covered === 0) {
+      if (!coverage) {
+        // No charge-event coverage exists for this (date, model, feature) at
+        // all -- the row cannot be redundant with anything, so it always
+        // shows in full, even at $0 cost.
         return [{
           date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
           tokens: row.totalTokens || 0, calls: row.callCount || 0, costMicroUsd: rowMicroUsd,
           source: 'daily_aggregate' as const,
         }];
       }
-      const remainderMicroUsd = rowMicroUsd - covered;
-      if (remainderMicroUsd <= 0) return []; // fully covered by charge events
+      const remainderMicroUsd = rowMicroUsd - coverage.microUsd;
+      if (remainderMicroUsd <= 0) return []; // fully covered by charge events (including a matching $0 event)
       const remainderFraction = remainderMicroUsd / rowMicroUsd;
       return [{
         date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
