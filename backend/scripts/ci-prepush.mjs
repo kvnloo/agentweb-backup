@@ -23,10 +23,10 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffNameStatus } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -53,7 +53,7 @@ async function readPushedRefs() {
 }
 
 function changedFilesForRefs(refs) {
-  const files = new Set();
+  const statusByPath = {};
   const bases = new Set();
   for (const r of refs) {
     const base = resolveBaseSha(r, {
@@ -65,34 +65,43 @@ function changedFilesForRefs(refs) {
       parentOf: (sha) => `${sha}~1`,
     });
     bases.add(base);
-    // ENG-1277 / Greptile P1: ACMRD, not ACMR — a deletion-only push (e.g. removing a
-    // source file something else still imports) must still be classified as a
-    // backend change, or the hook's own "no backend changes — skipping" short
-    // circuit below silently skips tsc/jest for exactly the push most likely to
-    // break the build.
-    for (const f of git(['diff', '--name-only', '--diff-filter=ACMRD', `${base}..${r.localSha}`], { cwd: root }).split('\n')) {
-      if (f) files.add(f);
-    }
+    // ENG-1277 / Greptile P1 #1 and #3: `--name-status`, not `--name-only`, and
+    // `--diff-filter=AMD` (Added/Modified/Deleted — C requires an explicit
+    // --find-copies flag we don't pass, so it can never appear; R is excluded by
+    // --no-renames below). The STATUS letter is what makes classification
+    // git-truth-based instead of filesystem-truth-based (see
+    // parseDiffNameStatus's doc comment for why that distinction is the whole
+    // point) — a deletion-only push must still be classified as a backend change,
+    // or the hook's own "no backend changes — skipping" short circuit silently
+    // skips tsc/jest for exactly the push most likely to break the build.
+    const out = git(['diff', '--no-renames', '--name-status', '--diff-filter=AMD', `${base}..${r.localSha}`], { cwd: root });
+    Object.assign(statusByPath, parseDiffNameStatus(out));
   }
-  return { files: [...files], bases: [...bases] };
+  return { statusByPath, bases: [...bases] };
 }
 
-// ENG-1277 / Greptile P1 #2: a deleted source file is dropped from `nonTestChanged`
-// (it fails `existsSync`) before `--findRelatedTests` runs, so tests that depended on
-// its behavior — and would catch a regression TypeScript can't see (e.g. a
-// side-effect-only `import './handler'` that registers something at runtime) — never
-// get discovered or run. jest's `--findRelatedTests` needs the file to exist on disk
-// to resolve who imports it, so this materializes the file's PRE-deletion content
-// (via `git show <base>:<path>`) back at its real path just long enough for jest to
-// compute relatedness, then removes it again before any test actually executes —
-// tests still run against the true, post-deletion tree, only *discovery* sees the
-// old file. Returns the temp-restored paths so the caller can clean them up even if
+// ENG-1277 / Greptile P1 #2 and #3: a deleted source file must still have its
+// dependent tests discovered — jest's `--findRelatedTests` needs the file to exist
+// on disk to resolve who imports it, so this materializes the file's PRE-deletion
+// content (via `git show <base>:<path>`) back at its real path just long enough for
+// jest to compute relatedness, then reverts the path to its exact pre-call state —
+// removed if nothing was there, restored byte-for-byte if something was — before
+// any test actually executes. Reverting rather than unconditionally deleting matters
+// because the path being git-truth-"deleted" does not mean the path is empty on
+// disk: an uncommitted file having nothing to do with this push could legitimately
+// sit there (leftover scratch work, a stale build artifact, anything), and this must
+// never destroy it — only borrow the path for the duration of discovery. Tests
+// themselves still run against the true, post-deletion tree; only *discovery* sees
+// the old file. Returns revert callbacks so the caller can restore correctly even if
 // something downstream throws.
 function materializeDeletedForDiscovery(deletedRelPaths, bases) {
-  const restored = [];
+  const revert = [];
+  const revertAll = () => { while (revert.length) revert.pop()(); };
   try {
     for (const relPath of deletedRelPaths) {
       const absPath = path.join(backend, relPath);
+      const hadLocalContent = existsSync(absPath);
+      const localContent = hadLocalContent ? readFileSync(absPath) : null;
       let content = null;
       for (const base of bases) {
         const r = spawnSync('git', ['show', `${base}:${path.posix.join('backend', relPath)}`], { cwd: root, encoding: 'utf8' });
@@ -100,21 +109,24 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
       }
       if (content === null) {
         // Could not recover pre-deletion content from any resolved base. Throw
-        // (not `fail()`, which exits immediately) so the catch below can clean up
-        // any files THIS loop already restored before this one failed — leaving a
-        // half-restored temp file behind on a failed push would pollute the
-        // developer's working tree with an untracked file they never created.
+        // (not `fail()`, which exits immediately) so the catch below can revert
+        // any paths THIS loop already touched before this one failed — leaving a
+        // half-materialized path behind on a failed push would either pollute the
+        // developer's working tree with an untracked file they never created, or
+        // worse, leave their own pre-existing file overwritten.
         throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit (tried: ${bases.join(', ')}) — cannot check for tests that depended on it.`);
       }
       mkdirSync(path.dirname(absPath), { recursive: true });
       writeFileSync(absPath, content);
-      restored.push(absPath);
+      revert.push(hadLocalContent
+        ? () => writeFileSync(absPath, localContent)
+        : () => rmSync(absPath, { force: true }));
     }
   } catch (e) {
-    for (const p of restored) rmSync(p, { force: true });
+    revertAll();
     fail(e.message);
   }
-  return restored;
+  return revertAll;
 }
 
 function run(label, cmd, args, { cwd, budgetMs }) {
@@ -133,9 +145,21 @@ function run(label, cmd, args, { cwd, budgetMs }) {
 const refs = await readPushedRefs();
 if (!refs.length) process.exit(0);
 
-const { files, bases } = changedFilesForRefs(refs);
+const { statusByPath, bases } = changedFilesForRefs(refs);
+const files = Object.keys(statusByPath);
 const backendFiles = files.filter((f) => isBackendPath(f));
 if (!backendFiles.length) { log(`no backend changes in ${files.length} pushed file(s) — skipping.`); process.exit(0); }
+
+// ENG-1277 / Greptile P1 #3: a path git says is Added/Modified (not Deleted) but is
+// missing from the working tree means the tree does not match what's about to be
+// pushed — fail loud rather than let tsc/jest silently verify a smaller set than
+// what's actually being pushed. This is the mirror image of the deletion fix: that
+// one stops the filesystem from hiding a real deletion; this one stops the
+// filesystem from hiding a real addition/modification.
+const missingButNotDeleted = backendFiles.filter((f) => statusByPath[f] !== 'D' && !existsSync(path.join(root, f)));
+if (missingButNotDeleted.length) {
+  fail(`these paths are Added/Modified per the pushed commit(s) but missing from the working tree — cannot verify against a tree that doesn't match what you're about to push: ${missingButNotDeleted.join(', ')}`);
+}
 
 const bin = (name) => path.join(backend, 'node_modules', '.bin', name);
 if (!existsSync(bin('tsc')) || !existsSync(bin('jest'))) {
@@ -150,26 +174,26 @@ run('tsc --noEmit (backend)', process.execPath,
 // (b) targeted jest
 const rel = (f) => path.relative(backend, path.join(root, f));
 const { testChanged: testChangedAbs, nonTestChanged: nonTestChangedAbs } = classifyChangedFiles(backendFiles);
-const testChanged = testChangedAbs.map(rel).filter((f) => existsSync(path.join(backend, f)));
-const nonTestChangedAll = nonTestChangedAbs.map(rel);
-const nonTestChanged = nonTestChangedAll.filter((f) => existsSync(path.join(backend, f)));
-// ENG-1277 / Greptile P1 #2: files classified as backend/non-test but absent on disk
-// were DELETED by this push (not renamed — renames are their own diff entries and
-// still exist post-rename). See materializeDeletedForDiscovery above.
-const deletedNonTest = nonTestChangedAll.filter((f) => !existsSync(path.join(backend, f)));
+// ENG-1277 / Greptile P1 #3: deleted-ness comes from `statusByPath` (git truth),
+// never from `existsSync` (filesystem truth) — see parseDiffNameStatus and
+// materializeDeletedForDiscovery's doc comments for why the filesystem can lie.
+const isDeleted = (f) => statusByPath[f] === 'D';
+const testChanged = testChangedAbs.filter((f) => !isDeleted(f)).map(rel);
+const nonTestChanged = nonTestChangedAbs.filter((f) => !isDeleted(f)).map(rel);
+const deletedNonTest = nonTestChangedAbs.filter(isDeleted).map(rel);
 
 let relatedSuites = null;
 if (nonTestChanged.length || deletedNonTest.length) {
-  const restoredPaths = materializeDeletedForDiscovery(deletedNonTest, bases);
+  const revertMaterialized = materializeDeletedForDiscovery(deletedNonTest, bases);
   let list;
   try {
     list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],
       { cwd: backend, encoding: 'utf8', timeout: 60_000 });
   } finally {
     // Discovery is the only step allowed to see the pre-deletion content — the tests
-    // themselves must run against the real, post-deletion tree. Clean up even if the
+    // themselves must run against the real, post-deletion tree. Revert even if the
     // spawnSync above threw.
-    for (const p of restoredPaths) rmSync(p, { force: true });
+    revertMaterialized();
   }
   // ENG-1277 / Greptile: fail loud, not silently empty — see evaluateListTestsResult.
   const evaluated = evaluateListTestsResult(list);

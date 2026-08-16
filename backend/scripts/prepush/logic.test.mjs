@@ -9,6 +9,7 @@ import {
   classifyChangedFiles,
   selectJestSuites,
   evaluateListTestsResult,
+  parseDiffNameStatus,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -209,4 +210,36 @@ test('evaluateListTestsResult: a spurious non-.test.ts line in stdout is filtere
     stdout: '/repo/backend/src/__tests__/fooService.test.ts\nsome warning line\n',
   });
   assert.deepEqual(result.suites, ['/repo/backend/src/__tests__/fooService.test.ts']);
+});
+
+// ENG-1277 / Greptile P1 #3: classification must come from git (this parser), never
+// from the filesystem — an uncommitted file sitting at a git-deleted path must not
+// be able to make that path look "still there".
+
+test('parseDiffNameStatus: parses Added/Modified/Deleted lines', () => {
+  const out = 'A\tbackend/src/newFile.ts\nM\tbackend/src/changed.ts\nD\tbackend/src/removed.ts\n';
+  assert.deepEqual(parseDiffNameStatus(out), {
+    'backend/src/newFile.ts': 'A',
+    'backend/src/changed.ts': 'M',
+    'backend/src/removed.ts': 'D',
+  });
+});
+
+test('parseDiffNameStatus: empty output -> empty map', () => {
+  assert.deepEqual(parseDiffNameStatus(''), {});
+  assert.deepEqual(parseDiffNameStatus(null), {});
+});
+
+test('parseDiffNameStatus: blank lines are skipped', () => {
+  const out = 'A\tbackend/src/a.ts\n\nM\tbackend/src/b.ts\n\n';
+  assert.deepEqual(parseDiffNameStatus(out), {
+    'backend/src/a.ts': 'A',
+    'backend/src/b.ts': 'M',
+  });
+});
+
+test('parseDiffNameStatus: a path containing a tab character is preserved after the first tab', () => {
+  // Pathological but shouldn't corrupt parsing: only the FIRST tab separates status from path.
+  const out = 'M\tbackend/src/weird\tname.ts\n';
+  assert.deepEqual(parseDiffNameStatus(out), { 'backend/src/weird\tname.ts': 'M' });
 });

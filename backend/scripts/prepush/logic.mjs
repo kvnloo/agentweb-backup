@@ -25,6 +25,32 @@ export function isBackendPath(filePath, prefixes = BACKEND_PREFIXES) {
 }
 
 /**
+ * Parse `git diff --no-renames --name-status --diff-filter=AMD <a>..<b>` output into
+ * a {path: status} map — the single source of truth for "is this path part of the
+ * push, and as what kind of change" (Greptile P1 #3, ENG-1277 pre-push hook). The
+ * caller previously asked the FILESYSTEM (`existsSync`) whether a path was deleted,
+ * which answers a different question than the one that matters: whether the pushed
+ * COMMIT deletes it. An uncommitted file sitting at the same path (leftover
+ * scratch work, a stale editor artifact, anything not part of this push) made
+ * `existsSync` say "still exists" for a path git says is gone, silently routing
+ * around the deletion-discovery fix entirely. `--no-renames` guarantees every line
+ * is a plain "STATUS<TAB>path" pair (a rename becomes an independent D + A rather
+ * than one R entry spanning two paths), so parsing never special-cases a two-path
+ * line — treating a rename's old path as deleted and its new path as added is
+ * exactly the semantics this hook wants.
+ */
+export function parseDiffNameStatus(output) {
+  const result = {};
+  for (const line of (output || '').split('\n')) {
+    if (!line) continue;
+    const tab = line.indexOf('\t');
+    if (tab === -1) continue;
+    result[line.slice(tab + 1)] = line[0];
+  }
+  return result;
+}
+
+/**
  * Decide the base SHA to diff a ref against.
  *   - A known remote SHA (already on the remote, commitExists(remoteSha) true) diffs from itself.
  *   - A new branch (remoteSha === ZERO) or an unknown/unreachable remote SHA (force-pushed history,
