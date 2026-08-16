@@ -13,7 +13,8 @@ Session Manager provides the same capability over an outbound-only, IAM-authenti
 Session start/stop is always recorded in CloudTrail; command-level shell content is only captured if
 the account has Session Manager logging (S3/CloudWatch) configured separately — check
 `aws ssm get-document --region us-west-2 --name SSM-SessionManagerRunShell` for the active preferences before relying on
-command-level forensic evidence.
+command-level forensic evidence. This check requires `ssm:GetDocument` on the caller's identity (see
+the grant list below) — without it, the logging-preferences check itself is denied.
 
 ## Getting a shell
 
@@ -42,6 +43,10 @@ an attached policy granting at minimum:
   (`arn:aws:ssm:us-west-2:*:session/${aws:userid}-*`) — use `${aws:userid}`, not `${aws:username}`:
   an assumed IAM role's session does not populate `aws:username`, so a role-based caller's resource
   would silently fail to match
+- `ssm:GetDocument` (resource `*`, it is a read-only account-level lookup) — required for the
+  `aws ssm get-document ... SSM-SessionManagerRunShell` logging-preferences check above; without it,
+  an operator with only the three session grants cannot confirm whether command-level shell content
+  is being recorded
 
 This is separate from the instance side: `AmazonSSMManagedInstanceCore` on the shared
 `aws-elasticbeanstalk-ec2-role` instance profile only lets the *instance* register with SSM and
