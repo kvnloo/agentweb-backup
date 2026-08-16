@@ -3,6 +3,9 @@ import request from 'supertest';
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import subscriptionRoutes from '../subscription';
 import { authenticateToken } from '../../middleware/auth';
+import { resolveBillingUserId } from '../../services/tokenUsageService';
+import { listLlmChargeEvents } from '../../services/llmChargeAuditDb';
+import { usageRecordDb } from '../../services/usageRecordDb';
 
 // Mock the middleware
 jest.mock('../../middleware/auth', () => ({
@@ -25,6 +28,26 @@ jest.mock('../../services/customerPortalPages', () => ({
     { path: '/videos', label: 'Ad Videos', description: 'Video generation and management' },
   ]),
 }));
+
+jest.mock('../../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn(),
+  resolveBillingUserId: jest.fn(),
+}));
+
+jest.mock('../../services/llmChargeAuditDb', () => ({
+  listLlmChargeEvents: jest.fn(),
+}));
+
+jest.mock('../../services/usageRecordDb', () => ({
+  usageRecordDb: { queryByUserDateRange: jest.fn() },
+}));
+
+// @jest/globals' bare `jest.Mock` defaults its return type to `unknown`, so
+// mockResolvedValueOnce's argument infers as `never`. Tying the mock to the
+// real function's type gives it a real Promise<T> return to infer against.
+const mockResolveBillingUserId = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
+const mockListLlmChargeEvents = listLlmChargeEvents as jest.MockedFunction<typeof listLlmChargeEvents>;
+const mockQueryByUserDateRange = usageRecordDb.queryByUserDateRange as jest.MockedFunction<typeof usageRecordDb.queryByUserDateRange>;
 
 let app: express.Application;
 
@@ -96,5 +119,96 @@ describe('GET /api/subscription/customer-portal-pages', () => {
     expect(reportsPage.path).toBe('/research-reports');
     expect(reportsPage.label).toBe('Reports');
     expect(reportsPage.description).toBe('View market research reports');
+  });
+});
+
+describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
+      req.user = { userId: 'u1' };
+      next();
+    });
+    mockResolveBillingUserId.mockResolvedValue('u1');
+    app = express();
+    app.use(express.json());
+    app.use('/api/subscription', subscriptionRoutes);
+  });
+
+  it('returns per_charge precision when every call this month has audit-event coverage', async () => {
+    mockListLlmChargeEvents.mockResolvedValue([
+      { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
+    ]);
+    mockQueryByUserDateRange.mockResolvedValue([]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.precision).toBe('per_charge');
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0].source).toBe('charge_event');
+    // No aggregate query result should leak in when every day is charge-event covered.
+    expect(mockQueryByUserDateRange).toHaveBeenCalled();
+  });
+
+  it('returns daily_aggregate precision when no charge events exist yet this month', async () => {
+    mockListLlmChargeEvents.mockResolvedValue([]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.precision).toBe('daily_aggregate');
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0].source).toBe('daily_aggregate');
+  });
+
+  it('merges both sources on a partial-rollout month WITHOUT dropping pre-event charges (Greptile P1)', async () => {
+    // The rollout landed mid-month: 08-10 onward has charge-event coverage,
+    // 08-01..08-09 only has the legacy daily aggregate. Both halves of the
+    // month must appear — the pre-fix code early-returned on events.length
+    // and silently dropped every pre-rollout day.
+    mockListLlmChargeEvents.mockResolvedValue([
+      { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
+    ]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-01#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-01T00:00:00.000Z', ttl: 0, date: '2026-08-01', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 50, callCount: 1, costMicroUsd: 200 },
+      // Same day as the charge event above — must be EXCLUDED to avoid
+      // double-counting the same underlying call the shadow table also recorded.
+      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 999, callCount: 1, costMicroUsd: 9999 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.precision).toBe('mixed');
+    expect(res.body.items).toHaveLength(2);
+    const sources = res.body.items.map((item: any) => item.source).sort();
+    expect(sources).toEqual(['charge_event', 'daily_aggregate']);
+    // The 08-01 aggregate row survives...
+    expect(res.body.items.some((item: any) => item.date === '2026-08-01' && item.source === 'daily_aggregate')).toBe(true);
+    // ...but the 08-10 aggregate row (shadowing the charge event) does not.
+    expect(res.body.items.some((item: any) => item.date === '2026-08-10' && item.source === 'daily_aggregate')).toBe(false);
+  });
+
+  it('returns 401 when unauthenticated', async () => {
+    (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
+      req.user = undefined;
+      next();
+    });
+    app = express();
+    app.use(express.json());
+    app.use('/api/subscription', subscriptionRoutes);
+
+    await request(app).get('/api/subscription/usage/itemized?month=2026-08').expect(401);
+  });
+
+  it('returns 400 for a malformed month', async () => {
+    await request(app).get('/api/subscription/usage/itemized?month=not-a-month').expect(400);
   });
 });
