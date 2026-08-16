@@ -39,10 +39,15 @@ an attached policy granting at minimum:
 - `ssm:StartSession` on the session document used to open the shell's data channel
   (`arn:aws:ssm:us-west-2:*:document/SSM-SessionManagerRunShell`) — omitting this grant fails the
   session establishment even though the instance-targeted grant above is present
-- `ssm:TerminateSession`/`ssm:ResumeSession` on the caller's own session resource
-  (`arn:aws:ssm:us-west-2:*:session/${aws:userid}-*`) — use `${aws:userid}`, not `${aws:username}`:
-  an assumed IAM role's session does not populate `aws:username`, so a role-based caller's resource
-  would silently fail to match
+- `ssm:TerminateSession`/`ssm:ResumeSession` on `arn:aws:ssm:us-west-2:*:session/*` — do **not**
+  scope this to a caller-name prefix (`${aws:userid}-*` or `${aws:username}-*`). SSM names the
+  session resource from the STS role-session-name for an assumed role but from the IAM user name for
+  a direct IAM user, and neither `${aws:userid}` (which prepends the role's unique ID, e.g.
+  `AROAEXAMPLE:session-name`, not present in the session name) nor `${aws:username}` (unpopulated for
+  assumed-role callers) matches both caller types reliably. Scoping this grant by caller name has
+  broken resume/terminate for one or the other caller type on every past revision of this doc — the
+  session resource is inherently per-caller already (nobody else's session ID collides with yours),
+  so the wildcard costs nothing in practice.
 - `ssm:GetDocument` (resource `*`, it is a read-only account-level lookup) — required for the
   `aws ssm get-document ... SSM-SessionManagerRunShell` logging-preferences check above; without it,
   an operator with only the three session grants cannot confirm whether command-level shell content
