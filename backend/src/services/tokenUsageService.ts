@@ -323,12 +323,23 @@ export async function incrementUserTokenUsage(
     // than guessed here.
     const occurredAt = new Date().toISOString();
     const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
-    const isNewCharge = await recordLlmChargeEvent({
+    // ENG-1251 Greptile P1: isNewCharge=false means an event with this ID was
+    // ALREADY RECORDED -- it does NOT mean it was already APPLIED. A prior
+    // attempt could have recorded the event and then been interrupted before
+    // (or during) the atomic apply below -- e.g. a crash, a timeout, or the
+    // retry loop below exhausting its attempts. Returning here on
+    // isNewCharge=false used to strand that event permanently: eventId is
+    // stable across a legitimate retry, so recordLlmChargeEvent would keep
+    // returning false for it forever, and the counter would never be
+    // charged. So this is intentionally NOT gated on isNewCharge -- always
+    // proceed to the atomic apply below; its own idempotency guard
+    // (attribute_not_exists(counterAppliedAt) inside applyMonthlyChargeAtomic)
+    // is what makes re-attempting a truly-already-applied charge a no-op.
+    await recordLlmChargeEvent({
       billingUserId, eventId, occurredAt, actingUserId: userId,
       tokens: Math.max(0, Math.round(tokens)), costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
       model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
     });
-    if (!isNewCharge) return;
 
     // Apply the counter update and mark the audit event applied atomically —
     // either both land or neither does (ENG-1251 Greptile fix). Previously

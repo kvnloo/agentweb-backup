@@ -27,11 +27,20 @@ jest.mock("../services/subscriptionService", () => ({
   getSubscriptionTypeConfig: jest.fn(),
 }));
 
+// Explicit mock (rather than relying on the shared aws-sdk auto-mock's
+// always-succeeding `put`) so isNewCharge can be driven to false for the
+// "don't strand an unapplied event" regression test below.
+jest.mock("../services/llmChargeAuditDb", () => ({
+  recordLlmChargeEvent: jest.fn(),
+  LLM_CHARGE_EVENTS_TABLE: "AW-LlmChargeEvents",
+}));
+
 import { userDb, orgDb } from "../services/db";
 import {
   getUserSubscriptionType,
   getSubscriptionTypeConfig,
 } from "../services/subscriptionService";
+import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
@@ -41,6 +50,7 @@ const mockApplyMonthlyChargeAtomic = (userDb as any).applyMonthlyChargeAtomic as
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
+const mockRecordLlmChargeEvent = recordLlmChargeEvent as jest.Mock;
 
 function currentMonth(): string {
   const now = new Date();
@@ -52,6 +62,7 @@ beforeEach(() => {
   mockIncrementTokenUsageForMonth.mockResolvedValue({});
   mockResetTokenUsageForMonth.mockResolvedValue(true);
   mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
+  mockRecordLlmChargeEvent.mockResolvedValue(true);
 });
 
 // ─── FAIL TESTS ──────────────────────────────────────────────────────────
@@ -718,6 +729,27 @@ describe("incrementUserTokenUsage", () => {
 
     expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
       expect.objectContaining({ eventId: "chatcmpl-stable-123" })
+    );
+  });
+
+  it("still attempts to apply the charge when the audit event was already recorded (ENG-1251 Greptile P1: unapplied events must not block retries)", async () => {
+    // isNewCharge=false means an event with this ID already EXISTS -- it does
+    // NOT mean it was already APPLIED. A prior attempt could have recorded
+    // the event and then been interrupted before completing the atomic
+    // apply. Returning early here would strand that charge forever, since a
+    // retry reuses the same stable eventId and recordLlmChargeEvent would
+    // keep reporting false for it.
+    mockRecordLlmChargeEvent.mockResolvedValue(false);
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 100, totalCost: 1, resetDate: "2026-09-01T00:00:00.000Z" },
+    });
+
+    await incrementUserTokenUsage("u1", 1000, 0.1, { eventId: "chatcmpl-recovery-case" });
+
+    expect(mockApplyMonthlyChargeAtomic).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: "chatcmpl-recovery-case" })
     );
   });
 });
