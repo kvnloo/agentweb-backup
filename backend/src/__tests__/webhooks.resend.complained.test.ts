@@ -31,7 +31,9 @@ jest.mock('../services/webhookService', () => ({
 jest.mock('../services/emailEventsDb', () => ({
   emailEventsDb: {
     eventExists: jest.fn().mockResolvedValue(false),
+    getEventById: jest.fn().mockResolvedValue(null),
     addEmailEvent: jest.fn().mockResolvedValue({ eventId: 'evt_complained_001' }),
+    clearHardBounceFlagPending: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -83,6 +85,7 @@ describe('POST /api/webhooks/resend — email.complained', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (emailEventsDb.eventExists as jest.Mock).mockResolvedValue(false);
+    (emailEventsDb.getEventById as jest.Mock).mockResolvedValue(null);
     (emailEventsDb.addEmailEvent as jest.Mock).mockResolvedValue({ eventId: 'evt_complained_001' });
     (leadListAlertService.notifyForEmailEvent as jest.Mock).mockResolvedValue(undefined);
     (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([]);
@@ -99,7 +102,7 @@ describe('POST /api/webhooks/resend — email.complained', () => {
 
   it('skips duplicate events', async () => {
     webhookService.verifyWebhook.mockReturnValue(makeComplainedEvent());
-    (emailEventsDb.eventExists as jest.Mock).mockResolvedValue(true);
+    (emailEventsDb.getEventById as jest.Mock).mockResolvedValue({ eventId: 'evt_complained_001', eventType: 'email.complained' });
 
     const res = await request(app).post('/api/webhooks/resend').send({});
 
