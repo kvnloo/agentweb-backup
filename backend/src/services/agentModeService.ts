@@ -3034,6 +3034,11 @@ export class AgentModeService {
                 : model.startsWith('claude-') ? 'vertex'
                 : 'azure-openai',
               feature: usageContext?.feature || 'agent_task',
+              // ENG-1251: the response's own id is stable across a retried/
+              // re-processed response and distinct across real calls — closes
+              // the "retries defeat charge dedup" Greptile P1 for the highest-
+              // volume metering site in the codebase.
+              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
               inputTokens: usage.prompt_tokens || 0,
               outputTokens: usage.completion_tokens || 0,
               cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,

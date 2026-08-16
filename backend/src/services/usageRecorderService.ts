@@ -35,6 +35,13 @@ export interface RecordUsageContext {
   sessionId?: string;
   taskId?: string;
   /**
+   * ENG-1251: stable identity for THIS charge, used to dedupe a retried usage
+   * report against the per-user monthly cap (see llmChargeAuditDb.recordLlmChargeEvent).
+   * Omit only when the caller genuinely has no natural per-call id — a retry
+   * will then be double-charged, since a fresh one is minted each time.
+   */
+  eventId?: string;
+  /**
    * Explicit USD cost for calls that are NOT token-priced (image/video are billed
    * per generation, so getModelPrice returns null and token-derived cost is 0).
    * When set, it is recorded verbatim instead of computing cost from tokens.
@@ -247,6 +254,7 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
   // Lazy-required (see import-site note) to keep this module's static load graph light.
   const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
   void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd, {
+    eventId: ctx.eventId,
     model: ctx.model,
     provider: ctx.provider,
     feature: ctx.feature,
