@@ -119,3 +119,72 @@ describe('crmDb.updateLead — attribution fields persistence', () => {
     expect(params.ExpressionAttributeValues).not.toHaveProperty(':utmMedium');
   });
 });
+
+/**
+ * ENG-926 §B — the match-quality signals that survive to the relay.
+ *
+ * `client_ip_address` and `client_user_agent` are, in Meta's own guidance, among the most
+ * commonly skipped and most valuable Event Match Quality inputs. Both were already in hand
+ * at capture (routes/webhooks.ts reads them off the request), were used for the immediate
+ * Lead event, and were then thrown away — so every conversion §C relays WEEKS later, when a
+ * deal closes, reached Meta with weaker identity than we held at the moment of capture.
+ *
+ * `metaFbp` is fixed here in the same pass, and its absence is the reason this file exists:
+ * db.ts's own comment says a field missing from updateLead is "silently dropped with every
+ * test still passing, which is exactly how §C's metaFbp shipped doing nothing." It was
+ * added to createLead only, so a lead that first arrived WITHOUT an fbp and later submitted
+ * WITH one never received it. Adding new fields to one path and not the other would have
+ * repeated the bug this very file was written about.
+ */
+describe('crmDb.updateLead — match-quality fields persistence (ENG-926 §B)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    updatePromiseMock.mockResolvedValue({ Attributes: {} });
+    getPromiseMock.mockResolvedValue({
+      Item: { listId: 'list-1', leadId: 'lead-1', email: 'jane@acme.com' },
+    });
+  });
+
+  it('SETs clientIp when supplied', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { clientIp: '203.0.113.7' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/SET\b.*\bclientIp\b/);
+    expect(params.ExpressionAttributeValues[':clientIp']).toBe('203.0.113.7');
+  });
+
+  it('SETs clientUserAgent when supplied', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { clientUserAgent: 'Mozilla/5.0 (iPhone)' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/SET\b.*\bclientUserAgent\b/);
+    expect(params.ExpressionAttributeValues[':clientUserAgent']).toBe('Mozilla/5.0 (iPhone)');
+  });
+
+  it('SETs metaFbp — the field db.ts documents as having shipped doing nothing', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { metaFbp: 'fb.1.1754000000000.987654321' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/SET\b.*\bmetaFbp\b/);
+    expect(params.ExpressionAttributeValues[':metaFbp']).toBe('fb.1.1754000000000.987654321');
+  });
+
+  it('SETs all three together, alongside the touch blobs', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', {
+      firstTouch,
+      metaFbp: 'fb.1.1754000000000.987654321',
+      clientIp: '203.0.113.7',
+      clientUserAgent: 'Mozilla/5.0 (iPhone)',
+    });
+    const params = leadUpdateParams();
+    expect(params.ExpressionAttributeValues[':firstTouch']).toEqual(firstTouch);
+    expect(params.ExpressionAttributeValues[':metaFbp']).toBe('fb.1.1754000000000.987654321');
+    expect(params.ExpressionAttributeValues[':clientIp']).toBe('203.0.113.7');
+    expect(params.ExpressionAttributeValues[':clientUserAgent']).toBe('Mozilla/5.0 (iPhone)');
+  });
+
+  it('does NOT include any of them when none are supplied', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: 'Jane' });
+    const params = leadUpdateParams();
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':clientIp');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':clientUserAgent');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':metaFbp');
+  });
+});
