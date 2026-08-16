@@ -2073,14 +2073,19 @@ function uiHtml() {
   return uiCache.body;
 }
 
-function readBody(req) {
+// `max` is per-route because one route legitimately carries far more than the rest: a handoff's context
+// document is the whole point of that call, and real ones already run to ~223KB (CHAT-9's is 223KB and
+// grew over many sessions). The default 1MB is right for chat turns; hitting it silently destroys the
+// connection, so the handoff route gets real headroom instead.
+function readBody(req, max = 1e6) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (d) => { data += d; if (data.length > 1e6) { reject(new Error('body too large')); req.destroy(); } });
+    req.on('data', (d) => { data += d; if (data.length > max) { reject(new Error(`body too large (over ${Math.round(max / 1024)}KB)`)); req.destroy(); } });
     req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('invalid JSON')); } });
     req.on('error', reject);
   });
 }
+const HANDOFF_MAX_BYTES = 16 * 1024 * 1024;
 // Raw binary body (for file uploads) buffered to a size cap. JSON's 1MB limit is too small for media.
 function readRawBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
@@ -2122,7 +2127,7 @@ async function route(req, res) {
   if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
   // Handoff from a local Claude session — creates the chat, writes the context doc, and starts the
   // merge drive in one call. See createHandoff.
-  if (req.method === 'POST' && p === '/api/handoff') { const r = createHandoff(await readBody(req)); json(res, r.code, r.body || { error: r.error }); return; }
+  if (req.method === 'POST' && p === '/api/handoff') { const r = createHandoff(await readBody(req, HANDOFF_MAX_BYTES)); json(res, r.code, r.body || { error: r.error }); return; }
 
   const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
