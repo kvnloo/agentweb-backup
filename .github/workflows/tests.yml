@@ -386,6 +386,9 @@ jobs:
       - name: Run greptile-request-review.sh regression suite
         run: bash .github/scripts/greptile-request-review.test.sh
 
+      - name: Run greptile-review Dependabot bypass invariants
+        run: bash .github/scripts/greptile-dependabot-bypass.test.sh
+
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
@@ -532,7 +535,7 @@ jobs:
     # test jobs no longer wait on this gate); it is kept for the job log and
     # any future consumer. Nothing may ever treat a non-pass as a pass.
     outputs:
-      verdict: ${{ steps.gate.outputs.verdict }}
+      verdict: ${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}
     steps:
       # Deliberately the PR's own copy of the gate, not main's: whatever gates
       # merges has to gate its own changes, or the fix ships unexercised
@@ -540,12 +543,32 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # ENG-1282: greptile.json now excludes dependabot[bot] from review
+      # (excludeAuthors) — a version bump doesn't need a full LLM review, and
+      # dependabot PRs were ~4.6% of Greptile's billed reviews for something
+      # tests + Dependabot's own compatibility scoring already cover. Without
+      # this step, excluding the author means Greptile NEVER posts a verdict
+      # for these PRs, and greptile-gate.sh polls its full 10-minute timeout
+      # every single time before returning UNAVAILABLE — turning every
+      # dependabot PR's required check permanently red. Same author-based
+      # bypass pattern already established below for backend-staging-deploy
+      # (ENG-991) — `user.login`, not `actor`, so a human pushing to fix a
+      # Dependabot branch doesn't accidentally lose the bypass or gain a
+      # stuck gate either way.
+      - name: Skip the Greptile gate for Dependabot (excluded from review)
+        id: dependabot_skip
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        run: |
+          echo "verdict=pass" >> "$GITHUB_OUTPUT"
+          echo "[greptile-review] dependabot[bot] PR: excluded from Greptile review by greptile.json, so no verdict will ever land here. Gate short-circuits to pass — tests + Dependabot's own compatibility score are the review for a dependency bump."
+
       # Split across two steps on purpose. A step that fails cannot publish an
       # output, and `continue-on-error` would mark the JOB successful, silently
       # deleting the merge gate. So this step records the verdict and always
       # succeeds, and the next one converts it back into the job's result.
       - name: Require a true Greptile 5/5 on this head
         id: gate
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         env:
           # ENG-1039 fail-fast: see the job comment above.
           GREPTILE_GATE_TIMEOUT_SECONDS: '600'
@@ -568,10 +591,10 @@ jobs:
           echo "greptile-gate verdict=${verdict} (exit ${rc})"
 
       - name: Fail the gate unless Greptile returned 5/5
-        if: steps.gate.outputs.verdict != 'pass'
+        if: (steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict) != 'pass'
         run: |
           printf '::error::Greptile gate verdict=%s (exit %s). This job fails for both `refused` and `unavailable`; the merge gate is unchanged.\n' \
-            '${{ steps.gate.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
+            '${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
           exit 1
 
   # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
