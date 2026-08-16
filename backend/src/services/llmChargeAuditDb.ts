@@ -49,11 +49,3 @@ export async function listLlmChargeEvents(billingUserId: string, start: string, 
   return items.filter((event) => !!event.counterAppliedAt);
 }
 
-export async function markLlmChargeApplied(billingUserId: string, eventId: string): Promise<void> {
-  await db().update({
-    TableName: LLM_CHARGE_EVENTS_TABLE,
-    Key: { billingUserId, eventId },
-    UpdateExpression: 'SET counterAppliedAt = :now',
-    ExpressionAttributeValues: { ':now': new Date().toISOString() },
-  }).promise();
-}

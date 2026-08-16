@@ -4,7 +4,7 @@ import { inheritsOrgBilling } from "./orgAuthz";
 import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
-import { markLlmChargeApplied, recordLlmChargeEvent } from './llmChargeAuditDb';
+import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -308,6 +308,19 @@ export async function incrementUserTokenUsage(
     // Persist the evidence before changing the counter. A failed evidence write
     // therefore fails open (no surprise charge), while a retry with the same
     // event id is a no-op rather than a duplicate counter increment.
+    //
+    // ENG-1251 Greptile P1: the random fallback below only protects a caller
+    // that truly has no stable identity for this charge. When the SAME usage
+    // report is retried without an eventId, the fallback mints a fresh one
+    // every time and the dedup above never fires — so callers that CAN supply
+    // a real one must. The two highest-volume paths (agentModeService.callLLM,
+    // chatbotService's chat turn) now pass the provider response's own id,
+    // which is identical across a re-processed/retried response and distinct
+    // across genuinely separate calls. Other callers (image/video/voice/deep
+    // research/llmService) still fall through to the random default — each is
+    // either structurally called at most once per success today or lacks a
+    // verified stable id at the call site; tracked as a fast-follow rather
+    // than guessed here.
     const occurredAt = new Date().toISOString();
     const eventId = audit?.eventId || `${occurredAt}#${randomUUID()}`;
     const isNewCharge = await recordLlmChargeEvent({
@@ -316,65 +329,68 @@ export async function incrementUserTokenUsage(
       model: audit?.model, provider: audit?.provider, feature: audit?.feature, sessionId: audit?.sessionId,
     });
     if (!isNewCharge) return;
-    // Try to read current user to check if we need a month reset
-    const user = await userDb.getUserById(billingUserId);
-    if (!user) return;
 
-    const existingMonth = user.tokenUsage?.month;
-
-    if (existingMonth !== currentMonth) {
-      // New month — archive previous month to history, reset usage, clear bonus
-      const prevUsage = user.tokenUsage;
-      const existingHistory = user.tokenUsageHistory || [];
-      let newHistory = existingHistory;
-      if (prevUsage && prevUsage.month) {
-        const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
-        newHistory = [...existingHistory, entry].slice(-24);
+    // Apply the counter update and mark the audit event applied atomically —
+    // either both land or neither does (ENG-1251 Greptile fix). Previously
+    // these were two separate calls: a markLlmChargeApplied failure after a
+    // successful counter update silently hid an applied charge from
+    // itemization, and a lost concurrency race still marked the event
+    // applied even though the counter was never touched. Bounded retry
+    // against a fresh read handles a genuine concurrent writer (rollover or
+    // same-month increment) the same way the old two-branch logic did.
+    const MAX_ATTEMPTS = 3;
+    let outcome: "applied" | "already_applied" | "lost_race" | "no_user" = "lost_race";
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const user = await userDb.getUserById(billingUserId);
+      if (!user || !user.email) {
+        outcome = "no_user";
+        break;
       }
-      // Conditional: succeeds only while nobody else has rolled the month over.
-      // The previous unconditional write meant two concurrent charges at rollover
-      // both reset the counter and the second silently discarded the first.
-      const didReset = await userDb.resetTokenUsageForMonth({
+
+      const existingMonth = user.tokenUsage?.month;
+      const isNewMonth = existingMonth !== currentMonth;
+
+      let history: Array<{ month: string; totalTokens: number; totalCost: number }> | undefined;
+      if (isNewMonth) {
+        // New month — archive previous month to history, reset usage, clear bonus.
+        const prevUsage = user.tokenUsage;
+        const existingHistory = user.tokenUsageHistory || [];
+        history = existingHistory;
+        if (prevUsage && prevUsage.month) {
+          const entry = { month: prevUsage.month, totalTokens: prevUsage.totalTokens, totalCost: prevUsage.totalCost };
+          history = [...existingHistory, entry].slice(-24);
+        }
+      }
+
+      outcome = await userDb.applyMonthlyChargeAtomic({
         userId: billingUserId,
+        userEmail: user.email,
         month: currentMonth,
         tokens,
         cost,
-        resetDate: getNextResetDate(),
-        history: newHistory,
+        resetDate: isNewMonth ? getNextResetDate() : (user.tokenUsage?.resetDate || getNextResetDate()),
+        isNewMonth,
+        history,
+        auditTableName: LLM_CHARGE_EVENTS_TABLE,
+        billingUserId,
+        eventId,
       });
 
-      if (!didReset) {
-        // Lost the race — the winner already created this month's counter (and
-        // archived the previous month). Apply this charge on top of theirs rather
-        // than dropping it.
-        const updated = await userDb.incrementTokenUsageForMonth(
-          billingUserId,
-          currentMonth,
-          tokens,
-          cost,
-          getNextResetDate()
-        );
-        if (!updated) {
-          console.warn(
-            `[tokenUsageService] Skipped token increment for ${billingUserId}: month changed again during rollover`
-          );
-        }
-      }
-    } else {
-      const updated = await userDb.incrementTokenUsageForMonth(
-        billingUserId,
-        currentMonth,
-        tokens,
-        cost,
-        user.tokenUsage?.resetDate || getNextResetDate()
-      );
-      if (!updated) {
-        console.warn(
-          `[tokenUsageService] Skipped token increment for ${billingUserId}: tokenUsage month changed during update`
-        );
-      }
+      if (outcome === "applied" || outcome === "already_applied") break;
+      // outcome === "lost_race": another writer rolled the month or incremented
+      // this user concurrently — re-read fresh state and retry.
     }
-    await markLlmChargeApplied(billingUserId, eventId);
+
+    if (outcome === "lost_race") {
+      // Exhausted retries under real contention. Fail open, per the same
+      // contract recordLlmChargeEvent already documents: the counter is NOT
+      // incremented, and the audit event is left unmarked rather than
+      // falsely claiming the charge was applied.
+      console.warn(
+        `[tokenUsageService] Failed to atomically apply charge for ${billingUserId} after ${MAX_ATTEMPTS} attempts ` +
+        `(eventId=${eventId}): concurrent writers kept winning the race. Charge NOT counted.`
+      );
+    }
   } catch (error) {
     // Don't block message flow on usage tracking failures
     console.error(`[tokenUsageService] Failed to increment usage for ${userId}:`, error);

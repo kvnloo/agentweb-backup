@@ -3,6 +3,7 @@ import AWS from "aws-sdk";
 const mockDocClient = {
   query: jest.fn(),
   update: jest.fn(),
+  transactWrite: jest.fn(),
 };
 
 jest.mock("aws-sdk", () => ({
@@ -152,5 +153,110 @@ describe("userDb.resetTokenUsageForMonth (ENG-1134)", () => {
     });
 
     await expect(userDb.resetTokenUsageForMonth(args)).rejects.toThrow(/not found/i);
+  });
+});
+
+describe("userDb.applyMonthlyChargeAtomic (ENG-1251)", () => {
+  const baseArgs = {
+    userId: "u1",
+    userEmail: "u1@example.com",
+    month: "2026-08",
+    tokens: 500,
+    cost: 5,
+    resetDate: "2026-09-01T00:00:00.000Z",
+    auditTableName: "AW-LlmChargeEvents",
+    billingUserId: "u1",
+    eventId: "chatcmpl-abc123",
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("increment path: combines the counter update and the audit marker in ONE transaction", async () => {
+    mockDocClient.transactWrite.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+    const result = await userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false });
+
+    expect(result).toBe("applied");
+    expect(mockDocClient.transactWrite).toHaveBeenCalledTimes(1);
+    const { TransactItems } = mockDocClient.transactWrite.mock.calls[0][0];
+    expect(TransactItems).toHaveLength(2);
+
+    const [usersItem, auditItem] = TransactItems;
+    expect(usersItem.Update).toMatchObject({
+      Key: { email: "u1@example.com" },
+      ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+    });
+    expect(usersItem.Update.UpdateExpression).toContain(
+      "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens"
+    );
+    expect(auditItem.Update).toMatchObject({
+      TableName: "AW-LlmChargeEvents",
+      Key: { billingUserId: "u1", eventId: "chatcmpl-abc123" },
+      UpdateExpression: "SET counterAppliedAt = :now",
+      // The idempotency guard: a retried transaction that already landed
+      // must not re-apply the charge a second time.
+      ConditionExpression: "attribute_not_exists(counterAppliedAt)",
+    });
+  });
+
+  it("new-month path: combines the reset-shaped write and the audit marker in ONE transaction", async () => {
+    mockDocClient.transactWrite.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+    const history = [{ month: "2026-07", totalTokens: 900, totalCost: 9 }];
+
+    const result = await userDb.applyMonthlyChargeAtomic({
+      ...baseArgs,
+      isNewMonth: true,
+      history,
+    });
+
+    expect(result).toBe("applied");
+    const { TransactItems } = mockDocClient.transactWrite.mock.calls[0][0];
+    const [usersItem] = TransactItems;
+    expect(usersItem.Update.ConditionExpression).toContain("<>");
+    expect(usersItem.Update.ExpressionAttributeValues[":usage"]).toMatchObject({
+      month: "2026-08",
+      totalTokens: 500,
+      totalCost: 5,
+    });
+    expect(usersItem.Update.ExpressionAttributeValues[":history"]).toEqual(history);
+  });
+
+  it("reports lost_race when the users-table condition fails (a concurrent writer won)", async () => {
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({
+        code: "TransactionCanceledException",
+        CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+      }),
+    });
+
+    const result = await userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false });
+
+    expect(result).toBe("lost_race");
+  });
+
+  it("reports already_applied when only the audit-table condition fails (idempotent retry)", async () => {
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({
+        code: "TransactionCanceledException",
+        CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }],
+      }),
+    });
+
+    const result = await userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false });
+
+    expect(result).toBe("already_applied");
+  });
+
+  it("rethrows a genuine DynamoDB failure instead of reporting a lost race", async () => {
+    // Swallowing this would silently drop the charge while looking like contention.
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({ code: "ProvisionedThroughputExceededException" }),
+    });
+
+    await expect(
+      userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false })
+    ).rejects.toBeDefined();
   });
 });
