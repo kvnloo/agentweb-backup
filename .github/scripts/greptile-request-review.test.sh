@@ -164,11 +164,19 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     */issues/*/comments\?*)
-      # comments_exit lets a test simulate the GitHub API call itself
-      # failing (e.g. a transient network error), distinct from the call
-      # succeeding with an empty/non-matching result.
-      if [ -f "${MOCK_DIR}/comments_exit" ] && [ "$(cat "${MOCK_DIR}/comments_exit")" != "0" ]; then
-        echo "mock gh: simulated transient failure" >&2
+      # comments_exit=1 simulates a total failure (no output at all).
+      # comments_exit=2 simulates a PARTIAL pagination failure: `gh
+      # --paginate` printed an earlier page to stdout, then a LATER page
+      # failed — non-empty output, non-zero exit. Both must be treated as
+      # "the fetch failed", never as "here is the complete list".
+      exit_code="$(cat "${MOCK_DIR}/comments_exit" 2>/dev/null || echo 0)"
+      if [ "${exit_code}" = "1" ]; then
+        echo "mock gh: simulated total transient failure" >&2
+        exit 1
+      fi
+      if [ "${exit_code}" = "2" ]; then
+        cat "${MOCK_DIR}/comments_partial.json" 2>/dev/null || true
+        echo "mock gh: simulated partial-pagination failure (later page errored)" >&2
         exit 1
       fi
       # No --jq on this call in the real script (parsed in bash instead), so
@@ -392,6 +400,30 @@ if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
     'no rerun attempted after a transient lookup failure'
 else
   printf 'PASS: %s\n' 'no rerun attempted after a transient lookup failure'
+fi
+
+# CAUGHT LIVE A SECOND TIME (Greptile 4/5, agentweb#2427, reviewing the fix
+# above): a PARTIAL pagination failure is a different shape than a total
+# one -- `gh --paginate` can print an earlier page's real comments to
+# stdout, THEN fail fetching a later page. Non-empty output, non-zero
+# exit. The old fix only checked "is the output empty" and would have
+# treated this truncated (but non-empty) list as the complete one --
+# searched it, found no marker on the missing later page, and returned a
+# false "confirmed absent". Must be treated exactly like a total failure:
+# retryable, never a confirmed negative.
+new_mock
+echo 2 >"${MOCK_DIR}/comments_exit"
+marker_comment_for 'cccccccccccccccccccccccccccccccccccccccc' >"${MOCK_DIR}/comments_partial.json"
+run_script --rerun-only
+check 'a PARTIAL pagination failure (non-empty output, non-zero exit) is treated as a failure, not a confirmed-absent marker' 1 \
+  'could not confirm whether a request exists'
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${LAST_OUTPUT}" == *'Re-run WITHOUT --rerun-only'* ]] || [[ "${LAST_OUTPUT}" == *'head changed since the original request'* ]]; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a partial-pagination failure must not be advised as "post a duplicate"\n  output: %s\n' \
+    'a partial pagination failure is never advised as "post a duplicate"' "${LAST_OUTPUT}"
+else
+  printf 'PASS: %s\n' 'a partial pagination failure is never advised as "post a duplicate"'
 fi
 
 # Caught live by Greptile (4/5) a THIRD time on this same PR (portal#1035):

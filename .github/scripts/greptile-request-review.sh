@@ -175,11 +175,48 @@ resolve_head_sha() {
 # the CHECK made a perfectly valid outstanding request look absent, and the
 # advice was to pay for a duplicate. A transient failure must never look
 # like a confirmed negative.
+#
+# CAUGHT LIVE A SECOND TIME (Greptile 4/5, agentweb#2427, reviewing that
+# exact fix): the fix above checked `comments_json` for EMPTINESS as its
+# failure signal, discarding `gh`'s actual exit code (`2>/dev/null || true`
+# swallows it). `--paginate` fetches this endpoint across multiple pages on
+# a busy PR — if an early page succeeds and a LATER page fails (rate limit,
+# blip mid-pagination), `gh` can still have printed the early page(s) to
+# stdout before erroring. That output is non-empty, so the old code treated
+# a truncated, incomplete comment list as "fetched fine, search it" — and
+# if the marker's comment happened to be among the pages that never
+# arrived, this searched a PARTIAL list, found nothing, and returned a
+# confirmed-absent verdict for a request that was actually still there.
+# Reintroduces the exact duplicate-billing bug the first fix closed, via a
+# different failure shape (partial success) the first fix didn't consider.
+#
+# Fix: capture the REAL exit code (`set +e` / `set -e` around the call, the
+# same idiom used elsewhere in this file), not just whether stdout is
+# empty. Any non-zero exit — whatever partial output came with it — is
+# retried exactly like a total failure. Never trust partial pagination
+# output as if it were the complete list.
 request_marker_exists_for() {
-  local head_sha="$1" comments_json attempt
+  local head_sha="$1" comments_json rc attempt
   for attempt in 1 2 3; do
-    comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null || true)"
-    if [ -n "${comments_json}" ]; then
+    # Deliberately NOT `set +e; ...; rc=$?; set -e` here: that toggle
+    # re-enables errexit as a side effect of this function's own body, and
+    # a caller that wrapped ITS OWN call to this function in `set +e`
+    # cannot rely on that surviving once this function starts flipping the
+    # global errexit flag internally — bash's `set -e` state is a single
+    # process-wide flag, not scoped per function call. A function ending
+    # with errexit back on, then returning non-zero as a bare statement,
+    # kills the whole script before the caller ever reads $? — which is
+    # exactly what happened live (empty output, wrong exit code) building
+    # this fix. The `if cmd; then rc=0; else rc=$?; fi` form is immune to
+    # this: POSIX exempts the tested command of an `if` from errexit
+    # regardless of what that command does internally, with no shared
+    # mutable state to leak across the call boundary.
+    if comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null)"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "${rc}" -eq 0 ]; then
       if printf '%s' "${comments_json}" | grep -qF "$(request_marker "${head_sha}")"; then
         return 0
       fi
@@ -251,10 +288,16 @@ main() {
     # A LOOKUP failure (exit 2) is a DIFFERENT outcome from a confirmed
     # absence (exit 1) and must never be told to post a duplicate — see
     # request_marker_exists_for's header for why that distinction exists.
-    set +e
-    request_marker_exists_for "${head_sha}"
-    local marker_rc=$?
-    set -e
+    # Same errexit hazard as inside request_marker_exists_for itself (see
+    # its header) -- `if fn; then rc=0; else rc=$?; fi`, not a `set +e` /
+    # `set -e` pair, so this call site can't be taken down by whatever
+    # errexit state the function leaves behind internally.
+    local marker_rc
+    if request_marker_exists_for "${head_sha}"; then
+      marker_rc=0
+    else
+      marker_rc=$?
+    fi
     case "${marker_rc}" in
       0) ;;
       2) fail "--rerun-only could not confirm whether a request exists for head ${head_sha} — the GitHub API lookup itself failed after retries (see the log above for the underlying error). This is NOT the same as 'no request exists': do not post a fresh review request. Re-run '$0 --rerun-only' again once the API is reachable." ;;
