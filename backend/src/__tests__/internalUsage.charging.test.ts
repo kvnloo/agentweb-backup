@@ -213,27 +213,36 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
   // resubmission is a second full charge with no corresponding ledger evidence
   // of it being a duplicate — the exact shape of an unreconcilable counter/
   // ledger divergence.
-  it("derives eventId from userId + taskId so a resubmitted batch carries the same key", async () => {
+  it("always derives an eventId, even with no taskId on any record", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record()] });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+  });
+
+  it("derives the identical eventId for a byte-identical resubmitted batch", async () => {
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
-
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit).toMatchObject({ eventId: "engine:user-1:task-abc" });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
 
     mockIncrementUserTokenUsage.mockClear();
 
-    // Same task resubmitted (e.g. engine retry / crash-restart) — must derive
-    // the identical eventId, which is what lets recordLlmChargeEvent's
-    // conditional write turn this into a no-op instead of a second charge.
+    // Same task, identical record content resubmitted (e.g. engine retry /
+    // crash-restart) — must derive the identical eventId, which is what lets
+    // recordLlmChargeEvent's conditional write turn this into a no-op
+    // instead of a second charge.
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })] });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
 
-    const [, , , retryAudit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(retryAudit).toMatchObject({ eventId: "engine:user-1:task-abc" });
+    expect(second.eventId).toBe(first.eventId);
   });
 
   it("derives a different eventId for a genuinely different task", async () => {
@@ -254,7 +263,31 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
     expect(first.eventId).not.toBe(second.eventId);
   });
 
-  it("combines multiple taskIds contributing to one user's aggregate charge, order-independent", async () => {
+  it("derives a different eventId for a genuinely different (larger) batch on the SAME taskId — does not undercharge incremental submissions", async () => {
+    // Greptile P1: a task-only key would make a second, legitimately larger
+    // batch for the same task collide with the first submission and get
+    // silently dropped. A long-running task reporting usage incrementally
+    // must have each distinct batch charged in full.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })] });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    // Same task, but a second record on top this time — a genuinely
+    // different batch, not a resubmission.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" }), record({ taskId: "task-abc", outputTokens: 500 })] });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(second.eventId).not.toBe(first.eventId);
+  });
+
+  it("combines multiple records contributing to one user's aggregate charge, order-independent", async () => {
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
@@ -263,8 +296,8 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
 
     mockIncrementUserTokenUsage.mockClear();
 
-    // Same two tasks, reported in the opposite order — must still collapse to
-    // the same key.
+    // Same two records, reported in the opposite order — must still collapse
+    // to the same key.
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
@@ -272,17 +305,6 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
     const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
 
     expect(first.eventId).toBe(second.eventId);
-    expect(first.eventId).toBe("engine:user-1:task-a,task-b");
-  });
-
-  it("falls back to no eventId when no record carries a taskId (unchanged best-effort behavior)", async () => {
-    await request(app)
-      .post("/api/internal/usage")
-      .set("Authorization", `Bearer ${ownerToken}`)
-      .send({ records: [record()] });
-
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit).toBeUndefined();
   });
 });
 

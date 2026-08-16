@@ -29,6 +29,7 @@
  */
 
 import express, { Response } from "express";
+import { createHash } from "crypto";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd } from "../services/usageRecorderService";
 import { incrementUserTokenUsage } from "../services/tokenUsageService";
@@ -119,7 +120,7 @@ router.post(
       // charging per record would mean hundreds of contended sequential writes
       // for a single task run. Ledger rows stay granular (they are keyed by
       // model+feature); only the deduction is aggregated.
-      const charges = new Map<string, { tokens: number; cost: number; taskIds: Set<string> }>();
+      const charges = new Map<string, { tokens: number; cost: number; recordFingerprints: string[] }>();
 
       for (const record of records) {
         if (!isValidRecord(record)) {
@@ -144,7 +145,7 @@ router.post(
         // engine token could drain someone else's quota by naming them.
         // "system" is platform overhead with no one to bill, so it is skipped.
         if (userId && userId !== "system") {
-          const entry = charges.get(userId) || { tokens: 0, cost: 0, taskIds: new Set<string>() };
+          const entry = charges.get(userId) || { tokens: 0, cost: 0, recordFingerprints: [] };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
           entry.cost +=
@@ -155,9 +156,26 @@ router.post(
               cacheReadTokens,
               cacheWriteTokens
             ) / 1e6;
-          if (typeof record.taskId === "string" && record.taskId.trim()) {
-            entry.taskIds.add(record.taskId.trim());
-          }
+          // ENG-1251: fingerprint the record's own content, not just its
+          // taskId. A single task can legitimately submit usage across
+          // multiple separate batches (e.g. a long-running task reporting
+          // incrementally) -- keying only on taskId would make the SECOND
+          // legitimate batch collide with the first and silently undercharge
+          // it. Two records with identical (task, model, token counts,
+          // feature) fingerprint the same; a genuine resubmission of the
+          // exact same batch reproduces the same fingerprint set, while a
+          // batch carrying different amounts does not.
+          entry.recordFingerprints.push(
+            [
+              record.taskId || "",
+              record.model,
+              record.inputTokens,
+              record.outputTokens,
+              cacheReadTokens,
+              cacheWriteTokens,
+              namespaceFeature(record.feature),
+            ].join("|")
+          );
           charges.set(userId, entry);
         }
 
@@ -189,23 +207,24 @@ router.post(
       // that crashes and resubmits a task's usage after restart) hits this
       // endpoint with no server-side signal that it already applied the first
       // attempt. ENG-1251: derive a stable idempotency key from the resolved
-      // user plus the set of taskIds that contributed to this charge, so a
-      // resubmission of the SAME task's usage collapses to a no-op via
-      // recordLlmChargeEvent's conditional write instead of a second charge.
-      // Falls back to no key (today's behavior — best-effort, not idempotent)
-      // only when no record in this user's aggregate carried a taskId.
+      // user plus a fingerprint of the exact records that contributed to this
+      // charge, so a byte-identical resubmission collapses to a no-op via
+      // recordLlmChargeEvent's conditional write instead of a second charge —
+      // while a genuinely different batch (even for the same taskId, e.g. a
+      // long task reporting incrementally) still gets its own key and is
+      // charged in full rather than colliding with an earlier submission.
       await Promise.all(
-        [...charges.entries()].map(([userId, { tokens, cost, taskIds }]) => {
-          const eventId =
-            taskIds.size > 0
-              ? `engine:${userId}:${[...taskIds].sort().join(",")}`
-              : undefined;
-          return incrementUserTokenUsage(
-            userId,
-            tokens,
-            cost,
-            eventId ? { eventId, feature: "engine" } : undefined
-          ).catch((err: unknown) =>
+        [...charges.entries()].map(([userId, { tokens, cost, recordFingerprints }]) => {
+          // A charge entry only exists once at least one record contributed a
+          // fingerprint, so this always has content to hash.
+          const eventId = `engine:${userId}:${createHash("sha256")
+            .update([...recordFingerprints].sort().join("\u0001"))
+            .digest("hex")
+            .slice(0, 32)}`;
+          return incrementUserTokenUsage(userId, tokens, cost, {
+            eventId,
+            feature: "engine",
+          }).catch((err: unknown) =>
             console.error(
               `[internalUsage] failed to charge usage for ${userId}:`,
               err
