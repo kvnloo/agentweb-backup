@@ -76,6 +76,27 @@ export function selectJestSuites({ testChanged, relatedSuites, nonTestChanged, c
   return { suites: [...suites], capped: true, namedMatched };
 }
 
+/**
+ * Classify the result of `jest --listTests --findRelatedTests <files>` (a spawnSync
+ * result shape: {error, status, stdout}). Distinguishes "genuinely nothing related"
+ * (exit 0, possibly empty stdout — verified live: jest exits 0 even for a file with
+ * zero related tests) from "jest could not answer" (non-zero exit, or a timeout
+ * surfaced as `error.code === 'ETIMEDOUT'`), which must fail loud rather than be
+ * silently read as an empty — and therefore trivially safe — related set (Greptile
+ * review on ENG-1277's pre-push hook PR: a failed/timed-out discovery previously fell
+ * through to "empty successful output", one of two reported verification bypasses).
+ */
+export function evaluateListTestsResult({ error, status, stdout }) {
+  if (error && error.code === 'ETIMEDOUT') {
+    return { ok: false, reason: 'timeout' };
+  }
+  if (status !== 0) {
+    return { ok: false, reason: 'nonzero-exit', status };
+  }
+  const suites = (stdout || '').split('\n').filter((l) => l.endsWith('.test.ts'));
+  return { ok: true, suites };
+}
+
 function basenameOf(p) {
   const i = p.lastIndexOf('/');
   return i === -1 ? p : p.slice(i + 1);

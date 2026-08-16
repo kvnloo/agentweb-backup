@@ -26,7 +26,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -63,7 +63,15 @@ function changedFilesForRefs(refs) {
       },
       parentOf: (sha) => `${sha}~1`,
     });
-    for (const f of git(['diff', '--name-only', '--diff-filter=ACMR', `${base}..${r.localSha}`], { cwd: root }).split('\n')) {
+    // ENG-1277 / Greptile: ACMRD, not ACMR — a deletion-only push (e.g. removing a
+    // source file something else still imports) must still be classified as a
+    // backend change, or the hook's own "no backend changes — skipping" short
+    // circuit below silently skips tsc/jest for exactly the push most likely to
+    // break the build. `existsSync` filtering further down already drops deleted
+    // paths before they're handed to tsc/jest as real files — this only affects
+    // whether the change is COUNTED, not what gets passed to a tool that needs it
+    // to exist.
+    for (const f of git(['diff', '--name-only', '--diff-filter=ACMRD', `${base}..${r.localSha}`], { cwd: root }).split('\n')) {
       if (f) files.add(f);
     }
   }
@@ -110,7 +118,15 @@ let relatedSuites = null;
 if (nonTestChanged.length) {
   const list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged],
     { cwd: backend, encoding: 'utf8', timeout: 60_000 });
-  relatedSuites = (list.stdout || '').split('\n').filter((l) => l.endsWith('.test.ts')).map((a) => path.relative(backend, a));
+  // ENG-1277 / Greptile: fail loud, not silently empty — see evaluateListTestsResult.
+  const evaluated = evaluateListTestsResult(list);
+  if (!evaluated.ok && evaluated.reason === 'timeout') {
+    fail('jest --listTests --findRelatedTests exceeded its 60s budget — cannot determine which suites this change touches.');
+  }
+  if (!evaluated.ok && evaluated.reason === 'nonzero-exit') {
+    fail(`jest --listTests --findRelatedTests failed (exit ${evaluated.status}) — cannot determine which suites this change touches.\n${(list.stderr || '').slice(-2000)}`);
+  }
+  relatedSuites = evaluated.suites.map((a) => path.relative(backend, a));
 }
 
 const { suites, capped, namedMatched } = selectJestSuites({ testChanged, relatedSuites, nonTestChanged, cap: RELATED_CAP });

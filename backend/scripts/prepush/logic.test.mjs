@@ -8,6 +8,7 @@ import {
   resolveBaseSha,
   classifyChangedFiles,
   selectJestSuites,
+  evaluateListTestsResult,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -158,4 +159,54 @@ test('selectJestSuites: directly-changed test files always survive the cap, even
     cap: 150,
   });
   assert.ok(suites.includes('backend/src/services/__tests__/agentModeService.test.ts'));
+});
+
+// ENG-1277 / Greptile finding: a failed or timed-out `jest --listTests --findRelatedTests`
+// must fail loud, never be read as "zero related tests" (which would let an unverified
+// push through as if it were safely covered).
+
+test('evaluateListTestsResult: exit 0 with real output -> ok, parsed suites', () => {
+  const result = evaluateListTestsResult({
+    error: null,
+    status: 0,
+    stdout: '/repo/backend/src/__tests__/fooService.test.ts\n/repo/backend/src/__tests__/barService.test.ts\n',
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    suites: [
+      '/repo/backend/src/__tests__/fooService.test.ts',
+      '/repo/backend/src/__tests__/barService.test.ts',
+    ],
+  });
+});
+
+test('evaluateListTestsResult: exit 0 with EMPTY output -> ok, zero suites (a genuine "nothing related", not a failure)', () => {
+  const result = evaluateListTestsResult({ error: null, status: 0, stdout: '' });
+  assert.deepEqual(result, { ok: true, suites: [] });
+});
+
+test('evaluateListTestsResult: non-zero exit -> NOT ok, even if stdout happens to be empty', () => {
+  const result = evaluateListTestsResult({ error: null, status: 1, stdout: '' });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'nonzero-exit');
+  assert.equal(result.status, 1);
+});
+
+test('evaluateListTestsResult: ETIMEDOUT -> NOT ok, regardless of status/stdout', () => {
+  const result = evaluateListTestsResult({
+    error: { code: 'ETIMEDOUT' },
+    status: null,
+    stdout: '',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'timeout');
+});
+
+test('evaluateListTestsResult: a spurious non-.test.ts line in stdout is filtered out, not treated as a suite', () => {
+  const result = evaluateListTestsResult({
+    error: null,
+    status: 0,
+    stdout: '/repo/backend/src/__tests__/fooService.test.ts\nsome warning line\n',
+  });
+  assert.deepEqual(result.suites, ['/repo/backend/src/__tests__/fooService.test.ts']);
 });
