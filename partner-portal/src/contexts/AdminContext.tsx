@@ -70,6 +70,12 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  llmUsageCredits?: {
+    month: string;
+    totalPurchasedMicroUsd?: number;
+    totalAdminGrantedMicroUsd?: number;
+    totalMigrationOffsetMicroUsd?: number;
+  };
   extraCostUsage?: {
     month: string;
     totalCost: number;

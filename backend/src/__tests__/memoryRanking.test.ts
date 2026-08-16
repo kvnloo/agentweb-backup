@@ -190,6 +190,19 @@ describe('buildMemoryContextMessage', () => {
   });
 });
 
+describe('MEMORY_STALENESS_NOTE', () => {
+  // ENG-1187: a memory-sourced metric ("416 form_starts → 91 submits") was quoted as current
+  // in a client-facing report. The original note (ENG-305) only warned about stale config/
+  // state facts (disabled channels, expired tokens) — it must also cover numeric figures.
+  it('warns against repeating a stale metric/count/KPI as current, not just config/state facts', () => {
+    expect(MEMORY_STALENESS_NOTE).toMatch(/metric|count|KPI/i);
+  });
+
+  it('still warns against silently skipping a configured action from stale state (ENG-305)', () => {
+    expect(MEMORY_STALENESS_NOTE).toMatch(/disabled|expired/i);
+  });
+});
+
 describe('cosineSimilarity — additional branches', () => {
   it('returns 0 for a null vector', () => {
     expect(cosineSimilarity(null as any, [1])).toBe(0);

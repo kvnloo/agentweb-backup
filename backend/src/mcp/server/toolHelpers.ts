@@ -12,6 +12,13 @@ export function ctx(context: any) {
     userId: context?.userId,
     agentUserId: context?.agentUserId,
     isDelegatedAccess: context?.isDelegatedAccess,
+    // ENG-827 (Greptile, security): a publishing tool that reaches its platform
+    // through a REST self-call checks consent HERE, then hands off — and the slow,
+    // irreversible part (video upload, Instagram container) runs on the far side of
+    // that boundary, where the in-process re-check hook cannot follow. Identity alone
+    // does not let the route rebuild it; the guard is keyed on the SESSION, because
+    // that is what carries the run's admission scope. So the session crosses too.
+    sessionId: context?.sessionId,
   };
 }
 

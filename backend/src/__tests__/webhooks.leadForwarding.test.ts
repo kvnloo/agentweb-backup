@@ -1093,6 +1093,79 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
           expect(updates.utmMedium).toBe('social');
         });
 
+        // ENG-1176 — the click-ID denorm follows the same only-if-absent
+        // contract as the utm denorm above.
+        it('backfills clickIds when an existing lead has none', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_noclick',
+            listId: 'list_123',
+            email: 'noclick@example.com',
+            firstName: 'NoClick',
+            customFields: { source: 'manual' },
+            // no firstTouch / clickIds
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'noclick@example.com',
+              attribution: {
+                timestamp: '2026-08-13T10:00:00.000Z',
+                utm: { source: 'google', medium: 'cpc', campaign: 'brand' },
+                clickIds: { gclid: 'Cj0-late-backfill' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_noclick'
+          )?.[2];
+          expect(updates.clickIds).toEqual({ gclid: 'Cj0-late-backfill' });
+        });
+
+        it('never overwrites clickIds once the acquiring click is stamped', async () => {
+          (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+            leadId: 'lead_hasclick',
+            listId: 'list_123',
+            email: 'hasclick@example.com',
+            firstName: 'HasClick',
+            firstTouch,
+            lastTouch: firstTouch,
+            utmSource: 'linkedin',
+            utmMedium: 'social',
+            clickIds: { gclid: 'original-acquiring-click' },
+            customFields: { source: 'api' },
+          });
+
+          const response = await request(app)
+            .post('/api/webhooks/forward-lead')
+            .send({
+              listId: 'list_123',
+              email: 'hasclick@example.com',
+              attribution: {
+                timestamp: '2026-08-13T11:00:00.000Z',
+                clickIds: { gclid: 'a-later-click' },
+              },
+            });
+
+          expect(response.status).toBe(200);
+
+          const updates = (crmDb.updateLead as jest.Mock).mock.calls.find(
+            (c) => c[1] === 'lead_hasclick'
+          )?.[2];
+          // The later click refreshes lastTouch and nothing else — attributing
+          // the lead to the click that re-engaged it would credit the wrong
+          // campaign for an acquisition it did not cause.
+          expect(updates.clickIds).toBeUndefined();
+          expect(updates.lastTouch).toEqual(
+            expect.objectContaining({
+              clickIds: expect.objectContaining({ gclid: 'a-later-click' }),
+            })
+          );
+        });
+
         it('does not touch attribution fields when the repeat touch carries none', async () => {
           (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
             leadId: 'lead_noinc',

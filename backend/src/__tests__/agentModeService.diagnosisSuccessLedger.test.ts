@@ -128,4 +128,75 @@ describe('generateDiagnosticMessage — success ledger and no-lost-work rule (EN
     const { user } = { user: (callLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user').content };
     expect(user).not.toMatch(/Succeeded operations/i);
   });
+
+  /**
+   * ENG-1133. Session 39eb5663 imported a 97-row CSV; `add_leads_to_list` ran three
+   * times and wrote 75 leads (confirmed against the list's stored leadCount). The
+   * turn then hit the 600s cap and THIS agent closed it with "I have successfully
+   * added the 3 leads to your CRM list" — two of the three satisfaction judges
+   * called that out as a hallucination.
+   *
+   * It was not a hallucination. The agent was handed {"add_leads_to_list": 3} and
+   * read a call count as a lead count; it never sees tool RESULTS, so 75 was not
+   * available to it. The unit therefore has to be stated on the wire, and
+   * restating a run count as a quantity of things has to be forbidden outright.
+   */
+  describe('run counts are never restated as record counts (ENG-1133)', () => {
+    /** The production shape of session 39eb5663 when the whole-turn cap fired. */
+    const LEAD_IMPORT_CONTEXT: DiagnosisContext = {
+      errorType: 'unknown',
+      errorMessage:
+        'Generation timed out after 600000ms for session 39eb5663-126a-4ee4-bc0a-7543232b1aed.',
+      userMessage: 'park the lead list to the CRM under "8/13/26: Founder raising" with all columns',
+      workPlanSummary: null,
+      succeededFunctions: {
+        install_skills: 1,
+        read_file_content: 1,
+        perform_data_analysis: 2,
+        get_lead_lists: 1,
+        read_tool_response: 6,
+        add_leads_to_list: 3,
+      },
+      failedFunctions: null,
+    };
+
+    it('labels the succeeded ledger as times-run rather than as a bare number', async () => {
+      const { user } = await promptFor(LEAD_IMPORT_CONTEXT);
+
+      // The number must not reach the model as an unlabelled `{"tool": 3}`.
+      expect(user).toContain('"add_leads_to_list":3');
+      expect(user).toMatch(/number of times it RAN/i);
+      expect(user).toMatch(/NOT a count of records handled/i);
+    });
+
+    it('labels the failed ledger with its unit too', async () => {
+      const { user } = await promptFor({
+        ...LEAD_IMPORT_CONTEXT,
+        failedFunctions: { add_leads_to_list: 2 },
+      });
+
+      expect(user).toMatch(/number of times it FAILED/i);
+      expect(user).toMatch(/NOT a count of records handled/i);
+    });
+
+    it('forbids reading a run count as a quantity of leads, rows or records', async () => {
+      const { system } = await promptFor(LEAD_IMPORT_CONTEXT);
+
+      expect(system).toMatch(/HOW MANY TIMES IT RAN/i);
+      // The exact conflation the production message made, spelled out.
+      expect(system).toContain('"add_leads_to_list: 3"');
+      expect(system).toMatch(/never how many leads/i);
+      // And the fallback when the quantity is genuinely unknown: say nothing
+      // numeric rather than invent it.
+      expect(system).toMatch(/without inventing a number/i);
+    });
+
+    it('still keeps the ENG-971 no-lost-work guarantee alongside the unit rule', async () => {
+      const { system } = await promptFor(LEAD_IMPORT_CONTEXT);
+
+      // The added rule must not have displaced the rule it sits next to.
+      expect(system).toMatch(/not\s+saved|lost/i);
+      expect(system).toMatch(/HOW MANY TIMES IT RAN/i);
+    });
+  });
 });

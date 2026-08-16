@@ -297,6 +297,14 @@ export interface ExecutePreparedToolsInput {
    */
   generationHardCapMs?: number;
   /**
+   * The turn's REAL wall-clock cap (epoch ms) — the ENG-907 budget, set only when the
+   * caller actually armed `withGenerationTimeout`. Unlike the two media deadlines above
+   * this is not an invented ceiling: callers that impose no cap (scheduled, Slack, GTM,
+   * email) leave it undefined. Tools that must return a result before the turn is
+   * guillotined bound their own work with it (ENG-1133's lead import).
+   */
+  turnHardCapMs?: number;
+  /**
    * Longest media-call wall-clock duration (ms) observed so far this run, across prior
    * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
    * latency rather than a guess. The dispatcher returns an updated value each iteration.
@@ -314,6 +322,12 @@ export interface ExecutePreparedToolsInput {
    * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
    */
   priorMediaCallKeys?: Map<string, string>;
+  /**
+   * ENG-936: optional approved image source URLs that must be used for image
+   * revisions. When supplied, a confirm=true `generate_image` call is rejected
+   * unless every requested input image is in this allow-list.
+   */
+  approvedRevisionImageSources?: string[];
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -343,6 +357,53 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+}
+
+/**
+ * ENG-936: normalize image input fields into a single string array for source checks.
+ */
+function getInputImages(toolCallArgs: any): string[] {
+  const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
+  if (typeof rawInputImages === 'string') return [rawInputImages];
+  if (!Array.isArray(rawInputImages)) return [];
+  return rawInputImages.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * ENG-936: ensure a revision-style image edit binds to an explicitly approved
+ * source URL before execution. A false pass here means `confirm=true` was issued
+ * for the wrong source and must be stopped before gateway execution.
+ */
+function isApprovedImageSourceForRevision(
+  args: any,
+  approvedSources: string[] | undefined,
+): { approved: boolean; errorMessage?: string } {
+  if (!approvedSources || approvedSources.length === 0) {
+    return { approved: true };
+  }
+
+  const inputImages = getInputImages(args);
+  if (!Array.isArray(inputImages) || inputImages.length === 0) {
+    return {
+      approved: false,
+      errorMessage:
+        `generate_image confirmation requires explicit approved source inputImages. ` +
+        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
+    };
+  }
+
+  const mismatch = inputImages.find((url) => !approvedSources.includes(url));
+  if (!mismatch) {
+    return { approved: true };
+  }
+
+  return {
+    approved: false,
+    errorMessage:
+      `generate_image source mismatch under confirmation gate. ` +
+      `Expected one of: ${approvedSources.join(', ')}. ` +
+      `Received: ${mismatch}`,
+  };
 }
 
 /**
@@ -380,8 +441,10 @@ export async function executePreparedTools(
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
     generationHardCapMs,
+    turnHardCapMs,
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
+    approvedRevisionImageSources,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -551,6 +614,32 @@ export async function executePreparedTools(
         continue;
       }
 
+      if (
+        toolCall.function.name === 'generate_image'
+        && Array.isArray(approvedRevisionImageSources)
+        && approvedRevisionImageSources.length > 0
+      ) {
+        const sourceCheck = isApprovedImageSourceForRevision(
+          preparedFunctionArgs,
+          approvedRevisionImageSources,
+        );
+        if (!sourceCheck.approved) {
+          const errorMsg = sourceCheck.errorMessage || 'generate_image rejected: unapproved source image.';
+          const guidance = appendRetryabilityGuidance(
+            ports.formatToolError(toolCall.function.name, errorMsg),
+            'invalid_args',
+          );
+          appendPreflightToolFailure(
+            toolCall,
+            preparedFunctionArgs,
+            errorMsg,
+            guidance,
+            policyDecision,
+          );
+          continue;
+        }
+      }
+
       // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
       // was already accepted this turn and the tool isn't exempt, collapse this
       // one — do NOT execute it. Still answer its tool_call_id with a tool-role
@@ -632,6 +721,11 @@ export async function executePreparedTools(
           // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
           // killed mid-wait by the generation timeout (ENG-124).
           runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+          // The turn's real cap, for tools that must hand a result back before the turn
+          // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
+          // a soft media-only budget, so it both under-budgets the work and, once it has
+          // passed, would report no time left while the turn still has minutes.
+          turnHardCapMs,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
