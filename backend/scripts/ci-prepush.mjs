@@ -178,22 +178,34 @@ function materializeDeletedForDiscovery(deletedRelPaths, basesForPath) {
         // worse, leave their own pre-existing file overwritten.
         throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
       }
-      mkdirSync(path.dirname(absPath), { recursive: true });
-      // ENG-1277 / Greptile P1 #5: refuse to write outside the repo. If the
-      // deleted path's directory (or an ancestor of it) is a symlink pointing
-      // outside `backend/` — a real pattern in THIS repo's own worktree setup,
-      // where `backend/node_modules` is routinely symlinked into a different
-      // worktree entirely (ENG-731) — `writeFileSync` would silently follow it
-      // and overwrite a file outside the repository, and the later revert could
-      // then rewrite or delete that external file too. `mkdirSync` above already
-      // ran, so the directory chain exists; verify its REAL path resolves inside
-      // `backend/`'s real path before writing anything into it.
+      // ENG-1277 / Greptile P1 #5, and P1 "containment check runs too late":
+      // check containment BEFORE creating any directories, not after. The
+      // original guard called `mkdirSync(dir, {recursive:true})` first and
+      // only checked containment afterward — if a missing intermediate
+      // directory sits beneath an ancestor symlink pointing outside
+      // `backend/` (the ENG-731 borrowed-node_modules pattern, one level
+      // deeper), `mkdirSync` recursive would have already CREATED the missing
+      // remainder on the external filesystem, through the symlink, before the
+      // check ever ran — real directories left behind outside the repo even
+      // though the subsequent check correctly refused the file write. Instead,
+      // walk up from the deleted path's directory to the nearest ALREADY-
+      // EXISTING ancestor and check only that one's real path: if it's
+      // contained, everything `mkdirSync` would create beneath it is brand-new
+      // and necessarily contained too (nothing new is a symlink); if it's not
+      // contained, refuse before creating anything at all.
       const dir = path.dirname(absPath);
-      const realDir = realpathSync(dir);
-      const realBackend = realpathSync(backend);
-      if (realDir !== realBackend && !realDir.startsWith(realBackend + path.sep)) {
-        throw new Error(`refusing to materialize ${relPath} for test discovery — its directory resolves to ${realDir}, outside backend/ (${realBackend}), likely via a symlink in its ancestry. Writing there would escape the repository.`);
+      let nearestExisting = dir;
+      while (!existsSync(nearestExisting)) {
+        const parent = path.dirname(nearestExisting);
+        if (parent === nearestExisting) break; // filesystem root — should be unreachable under backend/, but never loop forever.
+        nearestExisting = parent;
       }
+      const realNearestExisting = realpathSync(nearestExisting);
+      const realBackend = realpathSync(backend);
+      if (realNearestExisting !== realBackend && !realNearestExisting.startsWith(realBackend + path.sep)) {
+        throw new Error(`refusing to materialize ${relPath} for test discovery — its nearest existing ancestor directory (${nearestExisting}) resolves to ${realNearestExisting}, outside backend/ (${realBackend}), likely via a symlink. Creating directories there would escape the repository.`);
+      }
+      mkdirSync(dir, { recursive: true });
       writeFileSync(absPath, content);
       // ENG-1277 / Greptile P1: "cleanup destroys concurrent worktree
       // changes" — this revert used to unconditionally restore the
