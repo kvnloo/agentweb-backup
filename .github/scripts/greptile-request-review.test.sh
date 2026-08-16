@@ -38,12 +38,16 @@ JOB_ID='95202232733'
 #   rerun_exit             exit code for the job rerun POST (default 0)
 #   calls.log              one line per gh invocation, args space-joined
 
-greptile_comment_for() {
+# A request comment carrying the per-head marker the real script posts —
+# this is what --rerun-only looks for, independent of whether Greptile has
+# answered it yet (a landed verdict is NOT required — see the script header
+# for why checking the verdict footer alone was the earlier, wrong fix).
+marker_comment_for() {
   local sha="$1"
   cat <<EOF
 [
-  {"user": {"type": "Bot", "login": "greptile-apps[bot]"},
-   "body": "Confidence Score: 5/5\n\n<sub>Reviews (1): Last reviewed commit: [\"fix\"](https://github.com/agentwebpro/agentweb/commit/${sha})</sub>"}
+  {"user": {"type": "User", "login": "harshmoney123"},
+   "body": "@greptileai\n<!-- greptile-request-review: head=${sha} -->"}
 ]
 EOF
 }
@@ -65,9 +69,9 @@ EOF
   {"id": 2, "name": "CI script tests"}
 ]}
 EOF
-  # Default: a landed 5/5 review already covers HEAD_SHA — the common case for
-  # a --rerun-only retry (the original call's comment did land).
-  greptile_comment_for "${HEAD_SHA}" >"${MOCK_DIR}/comments.json"
+  # Default: a request marker already exists for HEAD_SHA — the common case
+  # for a --rerun-only retry (the original call's comment did post).
+  marker_comment_for "${HEAD_SHA}" >"${MOCK_DIR}/comments.json"
   echo 0 >"${MOCK_DIR}/comment_exit"
   echo 0 >"${MOCK_DIR}/rerun_exit"
   : >"${MOCK_DIR}/rerun_stderr"
@@ -234,8 +238,9 @@ TEST_PR_NUMBER='2427'
 new_mock
 run_script
 check 'happy path posts the comment AND re-runs the gate job' 0 "re-ran 'Require Greptile Review'"
-check_call_logged 'the comment carries the exact @greptileai mention' \
-  'pr comment 2427 --repo AgentWebPro/agentweb --body @greptileai'
+check_call_logged 'the comment carries the @greptileai mention' '@greptileai'
+check_call_logged 'the comment carries the per-head request marker' \
+  "greptile-request-review: head=${HEAD_SHA}"
 check_call_logged "the rerun POST targets the resolved job id (${JOB_ID})" \
   "actions/jobs/${JOB_ID}/rerun"
 
@@ -288,15 +293,14 @@ check_call_logged '--rerun-only still targets the resolved job id' \
   "actions/jobs/${JOB_ID}/rerun"
 
 # Caught live by Greptile (4/5) reviewing the exit-2 fix itself: a push
-# between the original request and a `--rerun-only` retry means Greptile's
-# latest review covers a DIFFERENT (older) commit than the current head —
-# nobody ever asked for a review of the current head. Blindly rerunning the
-# gate would poll for a review that will never arrive. Must fail loudly
-# (exit 1) and must NOT attempt the rerun.
+# between the original request and a `--rerun-only` retry means no request
+# marker exists for the current head — nobody ever asked for a review of it.
+# Blindly rerunning the gate would poll for a review that will never arrive.
+# Must fail loudly (exit 1) and must NOT attempt the rerun.
 new_mock
-greptile_comment_for 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >"${MOCK_DIR}/comments.json"
+marker_comment_for 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >"${MOCK_DIR}/comments.json"
 run_script --rerun-only
-check '--rerun-only for a head with no matching review fails loudly, not a silent rerun' 1 \
+check '--rerun-only for a head with no matching marker fails loudly, not a silent rerun' 1 \
   'the head changed since the original request'
 TESTS_RUN=$((TESTS_RUN + 1))
 if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
@@ -307,13 +311,34 @@ else
   printf 'PASS: %s\n' 'stale --rerun-only never attempts a rerun'
 fi
 
-# Same failure mode when no Greptile comment has ever landed at all (e.g. the
-# very first exit-2 happened before Greptile even answered the initial ask).
+# Same failure mode when no request was ever made at all (e.g. the very
+# first exit-2 happened before this script ever ran successfully).
 new_mock
 echo '[]' >"${MOCK_DIR}/comments.json"
 run_script --rerun-only
-check '--rerun-only with no Greptile comment at all fails loudly, not a silent rerun' 1 \
-  'no commit yet'
+check '--rerun-only with no comments at all fails loudly, not a silent rerun' 1 \
+  'the head changed since the original request'
+
+# THE core fix, caught live by Greptile a SECOND time on the same PR: the
+# request has posted but Greptile has not answered yet — no "Last reviewed
+# commit" verdict has landed, only the plain request marker exists. The
+# earlier (wrong) fix checked the verdict footer and would treat this
+# in-flight state as "stale", triggering a needless duplicate request. The
+# marker-based check must treat "requested, pending" the same as
+# "requested, landed" — both mean skip the comment and just rerun.
+new_mock
+marker_comment_for "${HEAD_SHA}" >"${MOCK_DIR}/comments.json"
+run_script --rerun-only
+check '--rerun-only succeeds on a PENDING request with no landed verdict yet' 0 \
+  "re-ran 'Require Greptile Review'"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a pending (unanswered) request must not be treated as absent\n  calls.log:\n%s\n' \
+    '--rerun-only does not re-request when the answer is merely pending' "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' '--rerun-only does not re-request when the answer is merely pending'
+fi
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"
