@@ -49,6 +49,11 @@ rather than after. That is also why the preflight below is not a formality.
 - **409** → this branch is already handed off, and the error names the chat that owns it. Do NOT
   start a second one: two agents on one PR race each other. Tell me the existing chat id instead.
 - Request bodies are capped at 16 MB, so a large document is fine.
+- **`"dryRun": true`** in the body validates everything — owner, PR, branch, branch-on-origin, no
+  duplicate, PR head matches branch, context length — and returns **202** with
+  `{ dryRun: true, wouldCreate, prs, branch, title, owner }` **without creating anything or arming a
+  merge**. Use it to exercise the success path safely; a real 202 immediately starts driving a real
+  PR to production.
 
 ## Transport
 

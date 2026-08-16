@@ -395,6 +395,17 @@ function createHandoff(body) {
     }
   }
 
+  // Dry run: everything above has been checked for real — owner, PR shape, branch charset, branch on
+  // origin, no duplicate, PR head matches branch — but nothing is created and no merge is armed. It
+  // exists because the success path is otherwise untestable: a real 202 immediately starts driving a
+  // real PR to production, so anyone building or maintaining a client had no safe way to exercise it.
+  if (body?.dryRun) {
+    return { code: 202, body: {
+      dryRun: true, wouldCreate: nextChatId(), prs: prUrls, branch, title, owner: member.name,
+      note: 'validated only — no chat, no worktree, no merge. Re-send without dryRun to hand off for real.',
+    } };
+  }
+
   const identifier = nextChatId();
   const identity = resolveAssigneeIdentity({ email }) || null;
   const at = new Date().toISOString();
