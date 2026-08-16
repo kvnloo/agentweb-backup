@@ -94,6 +94,27 @@ export function mergeStatusByPathAcrossRefs(perRefMaps) {
 }
 
 /**
+ * Identify pushed refs that are NOT the currently checked-out HEAD but still
+ * touch a backend path (Greptile finding, ENG-1277 pre-push hook, round 5b,
+ * ci-prepush.mjs:88-90). tsc/jest in this hook always run against the CURRENT
+ * WORKING TREE on disk, which reflects only whatever branch is actually
+ * checked out — `git diff` can compute a ref's changes without checking it
+ * out, but tsc/jest cannot verify content they never see. A single
+ * `git push origin branch-B` while sitting on a different branch is enough to
+ * hit this (no second ref needed): branch-B's diff is computed correctly, but
+ * whatever tsc/jest actually read at each of branch-B's changed paths is
+ * whatever the CHECKED-OUT branch has there instead — a different version of
+ * the same path, or nothing at all if the path doesn't exist on the checked-
+ * out branch. The hook cannot safely verify a ref it cannot check out, so it
+ * refuses rather than silently passing on the wrong tree.
+ */
+export function findForeignBackendRefs(refs, perRefMaps, currentHeadSha, prefixes = BACKEND_PREFIXES) {
+  return refs
+    .filter((r, i) => r.localSha !== currentHeadSha && Object.keys(perRefMaps[i] || {}).some((p) => isBackendPath(p, prefixes)))
+    .map((r) => r.localRef);
+}
+
+/**
  * Decide the base SHA to diff a ref against.
  *   - A known remote SHA (already on the remote, commitExists(remoteSha) true) diffs from itself.
  *   - A new branch (remoteSha === ZERO) or an unknown/unreachable remote SHA (force-pushed history,

@@ -26,7 +26,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -78,6 +78,18 @@ function changedFilesForRefs(refs) {
     // on a path while actually leaving different content there.
     const out = git(['diff', '--no-renames', '--raw', '--diff-filter=AMD', `${base}..${r.localSha}`], { cwd: root });
     perRefMaps.push(parseDiffRaw(out));
+  }
+  // ENG-1277 / Greptile round 5b: tsc/jest below only ever read the CURRENT
+  // checked-out working tree — a ref that isn't HEAD can be diffed (git diff
+  // needs no checkout) but can never actually be verified by them. Refuse
+  // before running anything, rather than silently checking the checked-out
+  // ref's content in place of the foreign ref's real, pushed content. See
+  // findForeignBackendRefs's doc comment for why one non-checked-out ref is
+  // already enough to trigger this — no second ref required.
+  const currentHeadSha = git(['rev-parse', 'HEAD'], { cwd: root }).trim();
+  const foreignRefs = findForeignBackendRefs(refs, perRefMaps, currentHeadSha);
+  if (foreignRefs.length) {
+    fail(`pushing ${foreignRefs.join(', ')} — not the currently checked-out ref — is not supported by this hook when it touches backend/: tsc and jest below only ever read the checked-out working tree, so a non-checked-out ref's actual content is never what gets verified. Checkout and push that ref on its own (\`git checkout <ref> && git push origin <ref>\`), or bypass with --no-verify (CI still checks it for real on its own head).`);
   }
   // ENG-1277 / Greptile P1 #4: merge per-ref maps through a conflict-detecting
   // merge, not `Object.assign` — a single `git push` can push multiple refs, and

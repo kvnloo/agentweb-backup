@@ -11,6 +11,7 @@ import {
   evaluateListTestsResult,
   parseDiffRaw,
   mergeStatusByPathAcrossRefs,
+  findForeignBackendRefs,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -315,4 +316,55 @@ test('mergeStatusByPathAcrossRefs: three refs, only one conflicting path is repo
 
 test('mergeStatusByPathAcrossRefs: no refs -> ok, empty map', () => {
   assert.deepEqual(mergeStatusByPathAcrossRefs([]), { ok: true, statusByPath: {} });
+});
+
+// ENG-1277 / Greptile round 5b: tsc/jest only ever see the checked-out working
+// tree — a pushed ref that isn't HEAD can never actually be verified by them,
+// even alone (no second ref required), even when it touches a path the
+// checked-out ref doesn't touch at all.
+
+test('findForeignBackendRefs: the checked-out ref (localSha === HEAD) is never flagged', () => {
+  const refs = [{ localRef: 'refs/heads/main', localSha: 'head-sha' }];
+  const perRefMaps = [{ 'backend/src/a.ts': { status: 'M', blob: 'x' } }];
+  assert.deepEqual(findForeignBackendRefs(refs, perRefMaps, 'head-sha'), []);
+});
+
+test('findForeignBackendRefs: a SOLO non-checked-out ref touching backend/ is flagged — no second ref needed', () => {
+  const refs = [{ localRef: 'refs/heads/branch-b', localSha: 'branch-b-sha' }];
+  const perRefMaps = [{ 'backend/src/a.ts': { status: 'M', blob: 'x' } }];
+  assert.deepEqual(findForeignBackendRefs(refs, perRefMaps, 'head-sha'), ['refs/heads/branch-b']);
+});
+
+test('findForeignBackendRefs: a non-checked-out ref touching only NON-backend paths is not flagged', () => {
+  const refs = [{ localRef: 'refs/heads/branch-b', localSha: 'branch-b-sha' }];
+  const perRefMaps = [{ 'README.md': { status: 'M', blob: 'x' } }];
+  assert.deepEqual(findForeignBackendRefs(refs, perRefMaps, 'head-sha'), []);
+});
+
+test('findForeignBackendRefs: mixed push — checked-out ref ok, non-checked-out ref on a DISJOINT backend path flagged', () => {
+  const refs = [
+    { localRef: 'refs/heads/main', localSha: 'head-sha' },
+    { localRef: 'refs/heads/branch-b', localSha: 'branch-b-sha' },
+  ];
+  const perRefMaps = [
+    { 'backend/src/a.ts': { status: 'M', blob: 'x' } },
+    { 'backend/src/b.ts': { status: 'A', blob: 'y' } },
+  ];
+  assert.deepEqual(findForeignBackendRefs(refs, perRefMaps, 'head-sha'), ['refs/heads/branch-b']);
+});
+
+test('findForeignBackendRefs: multiple non-checked-out refs are all flagged, not just the first', () => {
+  const refs = [
+    { localRef: 'refs/heads/branch-b', localSha: 'b-sha' },
+    { localRef: 'refs/heads/branch-c', localSha: 'c-sha' },
+  ];
+  const perRefMaps = [
+    { 'backend/src/b.ts': { status: 'M', blob: 'x' } },
+    { 'backend/src/c.ts': { status: 'M', blob: 'y' } },
+  ];
+  assert.deepEqual(findForeignBackendRefs(refs, perRefMaps, 'head-sha'), ['refs/heads/branch-b', 'refs/heads/branch-c']);
+});
+
+test('findForeignBackendRefs: no refs -> empty', () => {
+  assert.deepEqual(findForeignBackendRefs([], [], 'head-sha'), []);
 });
