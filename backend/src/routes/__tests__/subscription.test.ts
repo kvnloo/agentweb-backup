@@ -177,9 +177,11 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     ]);
     mockQueryByUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-01#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-01T00:00:00.000Z', ttl: 0, date: '2026-08-01', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 50, callCount: 1, costMicroUsd: 200 },
-      // Same day as the charge event above — must be EXCLUDED to avoid
-      // double-counting the same underlying call the shadow table also recorded.
-      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 999, callCount: 1, costMicroUsd: 9999 },
+      // Same (date, model, feature) as the charge event above, and its
+      // dollar total is FULLY covered by it (500 <= 500) — must be EXCLUDED
+      // to avoid double-counting the same underlying call the shadow table
+      // also recorded.
+      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 100, callCount: 1, costMicroUsd: 500 },
     ]);
 
     const res = await request(app)
@@ -194,6 +196,51 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items.some((item: any) => item.date === '2026-08-01' && item.source === 'daily_aggregate')).toBe(true);
     // ...but the 08-10 aggregate row (shadowing the charge event) does not.
     expect(res.body.items.some((item: any) => item.date === '2026-08-10' && item.source === 'daily_aggregate')).toBe(false);
+  });
+
+  it('shows the uncovered remainder when a day has an applied event but MORE aggregate-only spend (Greptile P1: one event hides whole day)', async () => {
+    // A charge event covers only $0.0005 of this (date, model, feature), but
+    // the aggregate row for the exact same combination totals $0.009999 —
+    // most of that day's usage predates or otherwise falls outside the
+    // event's coverage. Date-only suppression would drop ALL of it just
+    // because SOME charge-event coverage exists that day; this must keep
+    // showing the uncovered remainder rather than discarding it.
+    mockListLlmChargeEvents.mockResolvedValue([
+      { billingUserId: 'u1', eventId: 'chatcmpl-partial', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
+    ]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 999, callCount: 5, costMicroUsd: 9999 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.items).toHaveLength(2);
+    const aggregateRow = res.body.items.find((item: any) => item.source === 'daily_aggregate');
+    expect(aggregateRow).toBeDefined();
+    expect(aggregateRow.date).toBe('2026-08-10');
+    expect(aggregateRow.costMicroUsd).toBe(9999);
+  });
+
+  it('suppresses only the exact (date, model, feature) covered by a charge event, not other models/features on the same day', async () => {
+    mockListLlmChargeEvents.mockResolvedValue([
+      { billingUserId: 'u1', eventId: 'chatcmpl-a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
+    ]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      // Fully covered — same date, model, feature, dollar amount.
+      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 100, callCount: 1, costMicroUsd: 500 },
+      // Same day, different model — never touched by the sonnet/chat event.
+      { userId: 'u1', sk: '2026-08-10#opus#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'opus', provider: 'bedrock', feature: 'chat', totalTokens: 50, callCount: 1, costMicroUsd: 300 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    const aggregateRows = res.body.items.filter((item: any) => item.source === 'daily_aggregate');
+    expect(aggregateRows).toHaveLength(1);
+    expect(aggregateRows[0].model).toBe('opus');
   });
 
   it('returns 401 when unauthenticated', async () => {

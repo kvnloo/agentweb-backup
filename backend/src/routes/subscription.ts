@@ -43,17 +43,38 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
 
     // ENG-1251 Greptile P1: a charge event covers the SAME call the shadow
     // daily-aggregate table also records (recordUsage runs unconditionally,
-    // regardless of whether a charge event exists for that call). Including
-    // an aggregate row for a day that already has charge-event coverage would
-    // double the itemized total for that day. Only days with NO charge-event
-    // coverage — before this rollout reached the user, or before the user's
-    // first audited charge this month — fall back to the aggregate rows, so
-    // a partial-month rollout still shows both halves instead of dropping
-    // every pre-event charge.
-    const chargedDates = new Set(events.map((event) => event.occurredAt.slice(0, 10)));
+    // regardless of whether a charge event exists for that call), so an
+    // aggregate row fully covered by charge events would double that
+    // usage. But suppressing by DATE ALONE is too coarse: a row bundles
+    // every call for one (date, model, feature) into a single total, so a
+    // day with an applied charge event AND separate, uncovered
+    // aggregate-only usage (the exact day the rollout reached this user,
+    // or any other partial-coverage day) would have its whole aggregate
+    // row discarded instead of just the covered portion.
+    //
+    // Key at (date, model, feature) — the aggregate table's own natural
+    // grouping (its sort key is `{date}#{model}#{feature}`) — and only
+    // suppress the DOLLAR AMOUNT actually covered by charge events for
+    // that exact combination. A day/model/feature fully covered nets to
+    // ~0 and disappears (the common case); one with a genuine uncovered
+    // remainder still shows, at its full totals (token/call counts can't
+    // be split proportionally without call-level attribution in the
+    // aggregate row, so a partially-covered row shows in full rather than
+    // being silently dropped or estimated).
+    const chargedMicroUsdByKey = new Map<string, number>();
+    for (const event of events) {
+      const key = `${event.occurredAt.slice(0, 10)}#${event.model || 'unknown'}#${event.feature || 'unknown'}`;
+      chargedMicroUsdByKey.set(key, (chargedMicroUsdByKey.get(key) || 0) + event.costMicroUsd);
+    }
     const rows = await usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`);
     const aggregateItems = rows
-      .filter((row) => !chargedDates.has(row.date))
+      .filter((row) => {
+        const key = `${row.date}#${row.model}#${row.feature}`;
+        const covered = chargedMicroUsdByKey.get(key) || 0;
+        // row.costMicroUsd is already micro-USD, same unit as the charge
+        // events summed above -- no conversion.
+        return (row.costMicroUsd || 0) > covered;
+      })
       .map((row) => ({
         date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
         tokens: row.totalTokens || 0, calls: row.callCount || 0, costMicroUsd: row.costMicroUsd || 0,
