@@ -6,7 +6,11 @@ const event = (overrides: Partial<LlmChargeAuditEvent> = {}): LlmChargeAuditEven
   billingUserId: "bill-1",
   eventId: "evt-1",
   occurredAt: "2026-08-15T10:00:00.000Z",
-  actingUserId: "user-1",
+  // Matches row()'s default userId: "bill-1" -- the common non-pooled case,
+  // where the acting user and the billing owner are the same person.
+  // Coverage is scoped by actingUserId, so a test exercising pooled/
+  // cross-actor behavior must override this explicitly on both sides.
+  actingUserId: "bill-1",
   tokens: 100,
   costMicroUsd: 5000,
   model: "gpt-4o",
@@ -155,5 +159,53 @@ describe("reconcileItemizedUsage", () => {
     expect(chargeItem?.calls).toBe(1);
     const aggregateItem = result.items.find((i) => i.source === "daily_aggregate");
     expect(aggregateItem?.calls).toBe(2);
+  });
+
+  it("ENG-1251 Greptile P1: does not let one pooled member's charge-event coverage suppress ANOTHER member's aggregate row on the same (date, model, feature)", () => {
+    // Two org members pooled onto the same billing owner both use gpt-4o
+    // for chat on the same day. member-A is fully covered by a charge
+    // event; member-B has aggregate-only usage with NO event at all.
+    // Coverage must be scoped per acting user -- if it weren't, member-A's
+    // coverage would incorrectly suppress member-B's real, uncovered usage.
+    const result = reconcileItemizedUsage(
+      [event({ actingUserId: "member-A", tokens: 100, costMicroUsd: 5000 })],
+      [
+        row({ userId: "member-A", totalTokens: 100, costMicroUsd: 5000, callCount: 1 }),
+        row({ userId: "member-B", totalTokens: 300, costMicroUsd: 9000, callCount: 3 }),
+      ]
+    );
+
+    expect(result.items).toHaveLength(2);
+    const memberBItem = result.items.find(
+      (i) => i.source === "daily_aggregate"
+    );
+    // member-B's row shows IN FULL -- not suppressed by member-A's coverage,
+    // and not incorrectly reduced by it either.
+    expect(memberBItem).toEqual(
+      expect.objectContaining({ tokens: 300, calls: 3, costMicroUsd: 9000 })
+    );
+  });
+
+  it("ENG-1251 Greptile P1: two pooled members' PARTIAL coverage on the same (date, model, feature) resolve independently, not summed across both", () => {
+    const result = reconcileItemizedUsage(
+      [
+        event({ actingUserId: "member-A", tokens: 100, costMicroUsd: 5000 }),
+        event({ actingUserId: "member-B", tokens: 50, costMicroUsd: 2000 }),
+      ],
+      [
+        row({ userId: "member-A", totalTokens: 400, costMicroUsd: 20000, callCount: 4 }),
+        row({ userId: "member-B", totalTokens: 200, costMicroUsd: 8000, callCount: 2 }),
+      ]
+    );
+
+    const aggregateItems = result.items.filter((i) => i.source === "daily_aggregate");
+    expect(aggregateItems).toHaveLength(2);
+    // member-A's remainder uses ONLY member-A's coverage (100 tokens), not
+    // both members' coverage summed (150).
+    const memberARemainder = aggregateItems.find((i) => i.tokens === 300);
+    expect(memberARemainder).toBeDefined();
+    // member-B's remainder uses ONLY member-B's coverage (50 tokens).
+    const memberBRemainder = aggregateItems.find((i) => i.tokens === 150);
+    expect(memberBRemainder).toBeDefined();
   });
 });

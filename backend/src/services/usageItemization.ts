@@ -40,7 +40,17 @@ export interface ItemizedUsageResult {
   precision: ItemizedUsagePrecision;
 }
 
-const aggregateKey = (date: string, model: string, feature: string) => `${date}#${model}#${feature}`;
+// ENG-1251 Greptile P1: keyed by acting user too, not just (date, model,
+// feature). Once itemization could pull in multiple acting users' rows for
+// one billing owner (pooled org members), two different members can share a
+// (date, model, feature) slot -- their aggregate rows are still separate
+// (usageRecordDb's partition key is the acting user), but a coverage map
+// keyed without the actor would apply ONE member's charge-event coverage to
+// the OTHER member's aggregate row, since both hash to the same key. Every
+// charge event carries actingUserId and every aggregate row carries userId,
+// so both sides can always be scoped correctly.
+const aggregateKey = (actingUserId: string, date: string, model: string, feature: string) =>
+  `${actingUserId}#${date}#${model}#${feature}`;
 
 export function reconcileItemizedUsage(
   events: LlmChargeAuditEvent[],
@@ -65,7 +75,12 @@ export function reconcileItemizedUsage(
 
   const coverageByKey = new Map<string, { microUsd: number; tokens: number; calls: number }>();
   for (const event of events) {
-    const key = aggregateKey(event.occurredAt.slice(0, 10), event.model || "unknown", event.feature || "unknown");
+    const key = aggregateKey(
+      event.actingUserId,
+      event.occurredAt.slice(0, 10),
+      event.model || "unknown",
+      event.feature || "unknown"
+    );
     const entry = coverageByKey.get(key) || { microUsd: 0, tokens: 0, calls: 0 };
     entry.microUsd += event.costMicroUsd;
     entry.tokens += event.tokens || 0;
@@ -74,7 +89,7 @@ export function reconcileItemizedUsage(
   }
 
   const aggregateItems: ItemizedUsageItem[] = rows.flatMap((row) => {
-    const key = aggregateKey(row.date, row.model, row.feature);
+    const key = aggregateKey(row.userId, row.date, row.model, row.feature);
     const coverage = coverageByKey.get(key);
     // row.costMicroUsd is already micro-USD, same unit as the charge events summed above.
     const rowMicroUsd = row.costMicroUsd || 0;
