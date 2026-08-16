@@ -161,8 +161,23 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const eventId = webhookService.generateEventId(event);
 
     // Check if event already exists (deduplication)
-    const eventExists = await emailEventsDb.eventExists(eventId);
-    if (eventExists) {
+    const existingEvent = await emailEventsDb.getEventById(eventId);
+    if (existingEvent) {
+      // ENG-720: a prior delivery of this same eventId recorded the event but
+      // never durably persisted the hard-bounce account flag (the write failed,
+      // the process died, etc.). Retry the flag write on this duplicate instead
+      // of silently acking it — otherwise the recipient stays unflagged forever,
+      // because Resend never retries an event once we've returned 200 for it.
+      if (existingEvent.eventType === 'email.bounced' && existingEvent.hardBounceFlagPending) {
+        const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
+        }
+        await emailEventsDb.clearHardBounceFlagPending(eventId);
+      }
       console.log(`Event already exists, skipping duplicate: ${eventId}`);
       return res.status(200).json({
         message: 'Event already processed (duplicate)',
@@ -175,8 +190,12 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const isEmmaEvent = emmaEmailService.isEmmaRelatedEvent(event.data.from || '', eventTo);
 
     if (!isEmmaEvent) {
-      // Store the event in the database
-      const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
+      // Store the event in the database. Mark hardBounceFlagPending for bounce
+      // events up front (ENG-720) so a duplicate delivery before the flag write
+      // below succeeds can retry it instead of being swallowed by dedup.
+      const emailEvent = await emailEventsDb.addEmailEvent(
+        event, emailDomain, eventId, undefined, event.type === 'email.bounced'
+      );
       try {
         await leadListAlertService.notifyForEmailEvent(emailEvent);
       } catch (alertError) {
@@ -212,6 +231,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
           throw new Error(
             `[webhooks] handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
           );
+        }
+        if (!isEmmaEvent) {
+          await emailEventsDb.clearHardBounceFlagPending(eventId);
         }
         void (async () => {
           try {
