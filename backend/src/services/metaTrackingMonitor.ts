@@ -186,6 +186,110 @@ export function countAttributedConversions(actions: any[] | undefined | null): A
   return { conversions, unrecognized };
 }
 
+/**
+ * Campaign objectives that actually optimise for a conversion.
+ *
+ * Established on production 2026-08-16, and the reason this filter exists: of the three
+ * accounts the blackout check flagged, TWO were running campaigns that were never trying
+ * to convert.
+ *
+ *   Every.io      $557.39  OUTCOME_ENGAGEMENT — boosted posts, NO destination URL
+ *   Kraftersland  $ 60.59  LINK_CLICKS + OUTCOME_ENGAGEMENT
+ *   AgentWeb own  $175.57  OUTCOME_LEADS — a real blackout
+ *
+ * A boosted post with no link cannot produce an attributed conversion however perfect the
+ * tracking is. Alerting on it trains people to ignore the channel, which is the outcome
+ * §F exists to prevent — reached from the opposite direction.
+ *
+ * Both the outcome-era names and the legacy ones, because older campaigns still carry the
+ * old values.
+ */
+export const CONVERSION_OBJECTIVES = new Set([
+  'OUTCOME_LEADS',
+  'OUTCOME_SALES',
+  'CONVERSIONS',
+  'LEAD_GENERATION',
+  'PRODUCT_CATALOG_SALES',
+  'APP_INSTALLS',
+  'OUTCOME_APP_PROMOTION',
+  'STORE_VISITS',
+]);
+
+/**
+ * Whether spend under this objective should be judged for conversions.
+ *
+ * An UNKNOWN objective counts as YES, deliberately. Meta adds objectives over time, and a
+ * name this list has not caught up with must never silently suppress a real blackout — a
+ * false alert is recoverable, silence is the failure this card exists to end. So the
+ * filter can only ever REMOVE noise it positively recognises.
+ */
+export function isConversionOptimisedObjective(objective?: string | null): boolean {
+  const name = typeof objective === 'string' ? objective.trim().toUpperCase() : '';
+  if (!name) return true;
+  if (CONVERSION_OBJECTIVES.has(name)) return true;
+  return !NON_CONVERSION_OBJECTIVES.has(name);
+}
+
+/** Objectives positively known NOT to optimise for conversions. Everything here was seen
+ *  on a real account that this check wrongly flagged, or is documented alongside them. */
+const NON_CONVERSION_OBJECTIVES = new Set([
+  'OUTCOME_ENGAGEMENT',
+  'OUTCOME_AWARENESS',
+  'OUTCOME_TRAFFIC',
+  'LINK_CLICKS',
+  'BRAND_AWARENESS',
+  'REACH',
+  'VIDEO_VIEWS',
+  'POST_ENGAGEMENT',
+  'PAGE_LIKES',
+  'EVENT_RESPONSES',
+  'MESSAGES',
+  'OUTCOME_MESSAGES',
+  'LOCAL_AWARENESS',
+]);
+
+export interface SpendByObjective {
+  /** Spend under objectives that are trying to convert — the only spend a blackout judges. */
+  conversionSpend: number;
+  /** Spend explicitly excluded, reported so an operator can see WHY nothing alerted. */
+  nonConversionSpend: number;
+  excludedObjectives: string[];
+  /** Objectives not in either list. Counted as conversion spend (fail loud) and surfaced
+   *  so the catalogue can be extended rather than silently drifting. */
+  unknownObjectives: string[];
+}
+
+/** Split a window's campaign rows into spend that was trying to convert and spend that
+ *  never was. */
+export function splitSpendByObjective(rows: any[]): SpendByObjective {
+  let conversionSpend = 0;
+  let nonConversionSpend = 0;
+  const excluded = new Set<string>();
+  const unknown = new Set<string>();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row) continue;
+    const spend = Number.parseFloat(row.spend);
+    if (!Number.isFinite(spend)) continue;
+    const raw = typeof row.objective === 'string' ? row.objective.trim().toUpperCase() : '';
+
+    if (raw && NON_CONVERSION_OBJECTIVES.has(raw)) {
+      nonConversionSpend += spend;
+      excluded.add(raw);
+      continue;
+    }
+    if (raw && !CONVERSION_OBJECTIVES.has(raw)) unknown.add(raw);
+    conversionSpend += spend;
+  }
+
+  return {
+    conversionSpend,
+    nonConversionSpend,
+    excludedObjectives: [...excluded],
+    unknownObjectives: [...unknown],
+  };
+}
+
 export interface MonitorFetchDeps {
   fetchImpl: typeof fetch;
 }
@@ -201,6 +305,12 @@ export type AdAccountActivity = {
   status: 'ok' | 'token_error' | 'fetch_error';
   days: AdAccountDay[];
   error?: string;
+  /** Objectives whose spend was excluded from the judgement, so an operator can see WHY
+   *  an account that is visibly spending did not alert. */
+  excludedObjectives?: string[];
+  /** Objectives in neither catalogue. Counted as in-scope (fail loud) and surfaced so the
+   *  list can be extended rather than drifting silently. */
+  unknownObjectives?: string[];
 };
 
 /**
@@ -220,9 +330,13 @@ export async function fetchDailyAdAccountActivity(
 ): Promise<AdAccountActivity> {
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
+  // CAMPAIGN level, not account: `objective` is only available per campaign, and without
+  // it the check cannot tell spend that was trying to convert from spend that never was.
+  // Two of the three accounts this flagged on 2026-08-16 were running engagement campaigns
+  // where zero attributed conversions is the CORRECT outcome (§28).
   const params = new URLSearchParams({
-    fields: 'spend,actions,date_start',
-    level: 'account',
+    fields: 'spend,actions,date_start,objective,campaign_name',
+    level: 'campaign',
     time_increment: '1',
     date_preset: dayWindowToPreset(days),
   });
@@ -250,17 +364,42 @@ export async function fetchDailyAdAccountActivity(
     }
 
     const rows: any[] = Array.isArray(body?.data) ? body.data : [];
+
+    // Campaign rows collapse into one row per DAY, counting only campaigns that were
+    // trying to convert. A non-conversion campaign contributes neither its spend nor its
+    // conversions: including its spend manufactures a blackout, and including its
+    // conversions would let engagement traffic mask a real one on the same account.
+    const byDay = new Map<string, AdAccountDay>();
+    const excluded = new Set<string>();
+    const unknown = new Set<string>();
+
+    for (const row of rows) {
+      const date = String(row?.date_start ?? '');
+      if (!date) continue;
+      const objective = typeof row?.objective === 'string' ? row.objective.trim().toUpperCase() : '';
+
+      const day = byDay.get(date) || { date, spend: 0, conversions: 0, unrecognized: [] };
+      byDay.set(date, day);
+
+      if (objective && !isConversionOptimisedObjective(objective)) {
+        excluded.add(objective);
+        continue;
+      }
+      if (objective && !CONVERSION_OBJECTIVES.has(objective)) unknown.add(objective);
+
+      const counted = countAttributedConversions(row?.actions);
+      day.spend += Number.parseFloat(row?.spend ?? '0') || 0;
+      day.conversions += counted.conversions;
+      for (const u of counted.unrecognized) {
+        if (!day.unrecognized.includes(u)) day.unrecognized.push(u);
+      }
+    }
+
     return {
       status: 'ok',
-      days: rows.map((row) => {
-        const counted = countAttributedConversions(row?.actions);
-        return {
-          date: String(row?.date_start ?? ''),
-          spend: Number.parseFloat(row?.spend ?? '0') || 0,
-          conversions: counted.conversions,
-          unrecognized: counted.unrecognized,
-        };
-      }),
+      days: [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date)),
+      excludedObjectives: [...excluded],
+      unknownObjectives: [...unknown],
     };
   } catch (error: any) {
     // A network failure must never abort the sweep — the next account still needs checking.
