@@ -107,6 +107,19 @@ describe('isUnusableSynthesis', () => {
     expect(isUnusableSynthesis(echo)).toBe(true);
   });
 
+  // ENG-1188 follow-up: a terminating turn whose ENTIRE content is exactly one bare
+  // copy of the nudge is non-empty, so it never re-triggers the empty-synthesis
+  // retry ladder in termination.ts either — it must be caught here.
+  it('flags a reply that is exactly one bare copy of the nudge', () => {
+    expect(isUnusableSynthesis(SYNTHESIS_NUDGE)).toBe(true);
+  });
+
+  // Pins the exact >= 2 cutoff used by isNudgeEcho, distinct from the 3-repeat and
+  // exact-single-copy cases already covered above.
+  it('flags exactly two verbatim copies of the nudge (the boundary)', () => {
+    expect(isUnusableSynthesis(`${SYNTHESIS_NUDGE} ${SYNTHESIS_NUDGE}`)).toBe(true);
+  });
+
   it('does NOT flag a single quoted mention of the nudge text', () => {
     expect(
       isUnusableSynthesis(`I saw the system message "${SYNTHESIS_NUDGE}" and then finished the export.`)
