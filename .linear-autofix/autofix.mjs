@@ -296,7 +296,7 @@ async function main() {
   if (isAlreadyProcessed(state[issue.id], { force })) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
 
   const labelNames = (issue.labels?.nodes || []).map((l) => l.name.toLowerCase());
-  const model = labelNames.some((n) => config.opusLabels.includes(n)) ? config.opusModel : config.defaultModel;
+  const model = labelNames.some((n) => config.escalationLabels.includes(n)) ? config.escalationModel : config.defaultModel;
   const branch = `${assigneeBranchPrefix(identity, config.branchPrefix)}${id.toLowerCase()}-${kebab(issue.title)}`;
   const WT = path.resolve(agentRoot, config.worktreesDir, id);
 
@@ -425,13 +425,13 @@ async function main() {
   let marker = parseMarker(result);
   let changed = detectChangedRepos(WT);
 
-  // Escalate a "heavy" bug (default model finished with no committed change) to Opus, continuing in
-  // the SAME workspace to finish. NOTE: dormant while defaultModel === opusModel; it re-activates
-  // automatically if defaultModel is set back to a smaller model.
-  if (changed.length === 0 && config.escalateToOpus && model !== config.opusModel) {
-    log(`No committed change from ${model} — escalating to ${config.opusModel} on the same workspace...`);
+  // Escalate a "heavy" bug (default model finished with no committed change) to the escalation model,
+  // continuing in the SAME workspace to finish. NOTE: dormant while defaultModel === escalationModel;
+  // it re-activates automatically if defaultModel is set back to a smaller model.
+  if (changed.length === 0 && config.escalateOnNoChange && model !== config.escalationModel) {
+    log(`No committed change from ${model} — escalating to ${config.escalationModel} on the same workspace...`);
     const escalationNote = '\n\n## Escalation pass\nA previous automated attempt with a smaller model may have left UNCOMMITTED changes in this workspace without finishing. Review any existing changes, complete or correct the fix, then COMMIT per the steps above (do NOT push or open a PR — a later stage does that). The work only counts once it is committed. Do not restart from scratch unless the existing changes are wrong.';
-    const r2 = await runClaude(claudeArgs({ model: config.opusModel, maxTurns: config.maxTurns }), prompt + escalationNote, WT, config.timeoutMs, 'fixer-escalation');
+    const r2 = await runClaude(claudeArgs({ model: config.escalationModel, maxTurns: config.maxTurns }), prompt + escalationNote, WT, config.timeoutMs, 'fixer-escalation');
     marker = parseMarker(r2);
     changed = detectChangedRepos(WT);
   }
@@ -473,7 +473,7 @@ async function main() {
       const rp = fillTemplate(readFileSync(refixPromptPath, 'utf8'), {
         IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', COMMENTS: commentsText, BRANCH: branch, CONFIRMED: feedback,
       });
-      await runClaude(claudeArgs({ model: config.review?.refixModel || config.opusModel, maxTurns: config.review?.maxTurns || 60 }), rp, WT, config.review?.timeoutMs || 20 * 60 * 1000, 'verify-refix');
+      await runClaude(claudeArgs({ model: config.review?.refixModel || config.defaultModel, maxTurns: config.review?.maxTurns || 60 }), rp, WT, config.review?.timeoutMs || 20 * 60 * 1000, 'verify-refix');
       changed = detectChangedRepos(WT);
       if (countCommits(changed) > before) {
         pushFailed = pushChanged(changed);

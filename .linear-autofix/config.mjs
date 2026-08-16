@@ -251,14 +251,21 @@ export const config = {
                                    // change, full rebuild only if a portal changed. false = leave it stale.
 
   // --- Claude ---
-  defaultModel: 'opus',            // the fixer model
-  opusModel: 'opus',
-  opusLabels: ['opus', 'hard', 'complex'], // any of these labels on the issue → use Opus for it
-  escalateToOpus: true,            // if the default model finishes with no committed change (the "heavy bug"
+  // EVERY agent this system runs is on Sonnet (2026-08-16, owner's call) — the fixer, the review
+  // manager, the re-fix/rework passes, browser verify, revise, and the chat agent. Nothing runs on
+  // Opus any more; the only cheaper model in play is Haiku for the /btw aside and the merge-intent
+  // classifier. The three knobs below are the "harder model for a harder bug" escalation path; they
+  // point at Sonnet too, which makes the escalation a deliberate no-op. Re-arm it by raising
+  // escalationModel above defaultModel.
+  defaultModel: 'sonnet',          // the fixer model
+  escalationModel: 'sonnet',       // the model an escalated / label-flagged bug runs on
+  escalationLabels: ['opus', 'hard', 'complex'], // any of these labels on the issue → use escalationModel
+                                   // (identical to defaultModel today, so the labels select nothing new)
+  escalateOnNoChange: true,        // if the default model finishes with no committed change (the "heavy bug"
                                    // signal — e.g. it ran out of budget mid-fix), automatically re-run the
-                                   // SAME workspace with Opus to finish the job. Skipped if already on Opus —
-                                   // so this is DORMANT while defaultModel === 'opus'; it re-activates
-                                   // automatically if defaultModel is lowered (e.g. back to 'sonnet').
+                                   // SAME workspace with escalationModel to finish the job. Skipped when the
+                                   // run is already on escalationModel — so this is DORMANT while the two are
+                                   // equal; it re-activates automatically if defaultModel is lowered.
   skipPermissions: true,           // required for unattended runs; the fix is confined to an isolated
                                    // workspace and PRs are draft-only (human review is the safety net)
   maxTurns: 400,                   // raised alongside the 2h timeout below so wall-clock, not turns, is the cap
@@ -283,10 +290,10 @@ export const config = {
   // browser test runs and the draft PR opens on the reviewed code.
   review: {
     enabled: true,
-    model: 'sonnet',               // the expert lens reviewers — the Opus manager filters their noise,
-                                   // so a cheaper model here saves ~4 Opus runs per bug at little cost
-    managerModel: 'opus',          // the verifier that gates which findings get fixed
-    refixModel: 'opus',            // the pass that MODIFIES code (applies confirmed findings / rework)
+    model: 'sonnet',               // the expert lens reviewers — the manager adversarially filters their
+                                   // noise, and four of them are the bulk of the review cost
+    managerModel: 'sonnet',        // the verifier that gates which findings get fixed
+    refixModel: 'sonnet',          // the pass that MODIFIES code (applies confirmed findings / rework)
     lenses: ['correctness', 'conventions', 'security', 'tests'], // which expert lenses to run (de-duped)
     autoScaleLenses: true,         // skip lenses that cannot apply to the diff: security on docs/styles-only
                                    // diffs; tests when neither backend logic nor test files changed
@@ -309,7 +316,7 @@ export const config = {
   // a dead environment. The PR opens regardless of the verdict; the verdict drives triage.
   verify: {
     enabled: true,
-    model: 'opus',
+    model: 'sonnet',
     retryNotFixed: true,             // a not_fixed verdict triggers ONE re-fix (fed the verify failure
                                      // report as the finding) followed by ONE re-verify, then it's final
     testEmail: 'test@example.com',
@@ -331,7 +338,7 @@ export const config = {
   revise: {
     enabled: true,
     trigger: 'revise:',
-    model: 'opus',
+    model: 'sonnet',
     maxTurns: 100,
     timeoutMs: 30 * 60 * 1000,
   },
@@ -348,8 +355,9 @@ export const config = {
   chat: {
     port: process.env.CHAT_PORT ? Number(process.env.CHAT_PORT) : 8790, // env override lets a test/second instance run off 8790
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
-    btwModel: 'sonnet',              // /btw side-thread model — a read-only aside doesn't need Opus, so it
-                                     // runs on Sonnet (cheaper) while keeping the read-only tool set.
+    btwModel: 'haiku',               // /btw side-thread model — a read-only aside is a lookup, not reasoning
+                                     // work, so it runs a tier BELOW the main conversation (Haiku) while
+                                     // keeping the exact same read-only tool set.
     nlMergeTrigger: true,            // may a natural-language message ("merge it when green") trigger the
                                      // merge-watch, or is merging BUTTON-ONLY? true = NL allowed (still gated
                                      // by the strict isMergeRequest classifier); false = only the Merge button
@@ -360,7 +368,7 @@ export const config = {
     // model/cost-themed issue (e.g. ENG-200) → fires almost every turn, silently defeating /compact (it
     // re-inflates ~30 min later) and burning the 5hr limit ~3x fast. And it's redundant here: this repo's
     // real model IDs + pricing live in code (config.mjs modelPricing, agentModeService.ts llmModels).
-    // Each name becomes `--disallowedTools Skill(<name>)` — a SURGICAL deny: the agent keeps Opus, every
+    // Each name becomes `--disallowedTools Skill(<name>)` — a SURGICAL deny: the agent keeps its model, every
     // tool (incl. the WebSearch/WebFetch *tools* — untouched, so it can still look things up on the web),
     // and every other skill (code-review, verify, simplify, …). Not dumbed down; it just can't drag a
     // manual (or a report-writing harness) into a re-billed session.
@@ -446,13 +454,14 @@ export const config = {
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every
                                      // turn (the reason /compact felt like a no-op). Reversible A/B knob.
     full: {
-      model: 'opus',
+      model: 'sonnet',
       maxTurns: 100,
       timeoutMs: 30 * 60 * 1000,     // mirrors revise — a full-access turn is an interactive revise
     },
     readOnly: {
-      model: 'opus',                 // the user-facing chat agent is ALWAYS Opus (full or read-only); it may
-                                     // still spawn subagents on cheaper models, but the main conversation is Opus.
+      model: 'sonnet',               // the user-facing chat agent is ALWAYS Sonnet (full or read-only); it may
+                                     // still spawn subagents on cheaper models, but the main conversation is
+                                     // Sonnet. /btw asides drop to btwModel above.
       maxTurns: 30,
       timeoutMs: 10 * 60 * 1000,
       // Read-only enforcement: headless -p auto-denies any tool not listed here (and there is

@@ -94,9 +94,9 @@ async function main() {
 
   const rv = config.revise || {};
   const pre = countCommits(detectChangedRepos(WT));
-  log(`Running claude (model=${rv.model || config.opusModel})...`);
+  log(`Running claude (model=${rv.model || config.defaultModel})...`);
   const result = await runClaude(
-    claudeArgs({ model: rv.model || config.opusModel, maxTurns: rv.maxTurns || 100 }),
+    claudeArgs({ model: rv.model || config.defaultModel, maxTurns: rv.maxTurns || 100 }),
     prompt, WT, rv.timeoutMs || 30 * 60 * 1000, 'revise',
   );
   const marker = extractJson(result, 'REVISE_RESULT', { status: 'unknown' });
