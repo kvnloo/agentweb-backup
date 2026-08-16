@@ -6,7 +6,7 @@ import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
 import { meterUserUsage } from '../services/usageRecorderService';
-import { resolveBedrockModelId } from './bedrockInferenceProfiles';
+import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from './bedrockInferenceProfiles';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -84,6 +84,12 @@ export class LLMService {
     this.provider = isClaude ? 'bedrock' : 'azure-openai';
 
     if (isClaude) {
+      if (BEDROCK_BEARER_TOKEN_MODELS.has(model)) {
+        throw new Error(
+          `LLMService: model "${model}" is served by the bearer-token account and cannot be reached through this SigV4-only path; use the bearer-token Bedrock client`,
+        );
+      }
+
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
       const bedrockClient = new BedrockRuntimeClient({
         region,

@@ -22,11 +22,27 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   }))
 }));
 
+const mockClassifyAdsRefusalTier = jest.fn().mockResolvedValue('unknown');
 jest.mock('../services/metaService', () => ({
   metaService: {
-    listCampaigns: jest.fn()
+    listCampaigns: jest.fn(),
+    classifyAdsRefusalTier: (...args: any[]) => mockClassifyAdsRefusalTier(...args),
   }
 }));
+
+/**
+ * updateAccountConfig's 4th arg is now either a plain object or a function of
+ * the freshly-read config (Greptile P1: a CAS retry must recompute a derived
+ * update from what it actually reads, not reapply a stale precomputed one).
+ * Resolves either form against `freshConfig` the way the real CAS loop would.
+ */
+const resolveMutation = (call: any[], freshConfig: Record<string, any>) => {
+  const [, , , configUpdates, options] = call;
+  if (typeof configUpdates === 'function') {
+    return configUpdates(freshConfig);
+  }
+  return { updates: configUpdates, unset: options?.unset };
+};
 
 jest.mock('../services/db', () => ({
   userDb: {
@@ -88,6 +104,7 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
     jest.clearAllMocks();
     mockUpdateAccountConfig.mockResolvedValue(undefined);
     mockIsTokenValid.mockResolvedValue(true);
+    mockClassifyAdsRefusalTier.mockResolvedValue('unknown');
   });
 
   // ── AC2 + AC3: fail closed BEFORE calling Meta when we know scopes are missing ──
@@ -245,13 +262,55 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
-      const [userId, platform, accountId, updates] = mockUpdateAccountConfig.mock.calls[0];
+      const [userId, platform, accountId] = mockUpdateAccountConfig.mock.calls[0];
       expect(userId).toBe('user1');
       expect(platform).toBe('meta');
       expect(accountId).toBe(AD_ACCOUNT_ID);
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
       expect(Array.isArray(updates.granted_scopes)).toBe(true);
       expect(updates.granted_scopes).not.toContain('ads_read');
       expect(updates.granted_scopes).not.toContain('ads_management');
+    });
+
+    it('records which grant is missing when the tier can be classified', async () => {
+      // Mirrors metaAdsCapabilitySync's own classification (ENG-1158 follow-up):
+      // an app-level grant confirmed present means the gap is on the ad account,
+      // not the OAuth connection, and the re-consent message must say so.
+      mockClassifyAdsRefusalTier.mockResolvedValue('asset');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
+      expect(updates.ads_scope_tier).toBe('asset');
+    });
+
+    /**
+     * Greptile P1 follow-up: this path acts on a SINGLE read failure — weaker
+     * evidence than the sweep's two-strike confirmation — so if the sweep
+     * already recorded a newer, opposite conclusion (a recovery) between this
+     * failure and the write landing, that newer signal must win.
+     */
+    it('does not revoke over a recovery the sweep already confirmed more recently', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      const newerFreshConfig = {
+        ...legacyUser.connected_accounts[0].config,
+        ads_capability_probed_at: '3000-01-01T00:00:00.000Z',
+      };
+      const { updates, unset } = resolveMutation(mockUpdateAccountConfig.mock.calls[0], newerFreshConfig);
+      expect(updates).toEqual({});
+      expect(unset).toEqual([]);
     });
 
     it('records a signal strong enough that the NEXT read fails without calling Meta', async () => {
@@ -265,7 +324,10 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
 
       expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
-      const persisted = mockUpdateAccountConfig.mock.calls[0][3];
+      const { updates: persisted } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
 
       // Feed exactly what we persisted back in, as the next run would read it.
       (userDb.getUserById as jest.Mock).mockResolvedValue({
@@ -446,6 +508,72 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(account.ads_capable).toBeUndefined();
       expect(account.capability_warning).toBeUndefined();
       expect(account.is_active).toBe(true);
+    });
+  });
+  /**
+   * ENG-1158 — these paths detect and RECORD; they do not notify.
+   *
+   * Owner email is out of scope for this PR and tracked separately. What these
+   * paths persist is what the Settings row and the agent tool read, so the
+   * detection still reaches the owner — through the UI rather than the inbox.
+   */
+  describe('detection is recorded for the surfaces to report (ENG-1158)', () => {
+    const legacyUser = {
+      id: 'user1',
+      connected_accounts: [
+        metaAccount({ scopes: ['ads_management', 'ads_read', 'pages_show_list'] }),
+      ],
+    };
+
+    it('records rather than notifies when Meta refuses during a real run', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the revocation, which is what the surfaces read', async () => {
+      // The handoff only works because this path persists the state the
+      // Settings row and the agent tool read.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(mockUpdateAccountConfig).toHaveBeenCalledTimes(1);
+      const { updates } = resolveMutation(
+        mockUpdateAccountConfig.mock.calls[0],
+        legacyUser.connected_accounts[0].config
+      );
+      expect(typeof updates.ads_scope_revoked_at).toBe('string');
+      expect(updates.granted_scopes).not.toContain('ads_read');
+    });
+
+    it('writes nothing when the pre-flight gate refuses a latched account', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user1',
+        connected_accounts: [
+          metaAccount({ granted_scopes: [], ads_scope_revoked_at: '2026-07-31T07:00:21.688Z' }),
+        ],
+      });
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      // ...and the caller still gets the actionable error.
+      expect(err.isMetaAdsScopeError).toBe(true);
+    });
+
+    it('surfaces the re-consent error unchanged', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      const err: any = await agentModeService.listMetaAdsCampaignsNew('user1').catch(e => e);
+
+      expect(err.isMetaAdsScopeError).toBe(true);
+      expect(err.message).toContain(META_ADS_RECONSENT_MESSAGE);
     });
   });
 });

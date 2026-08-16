@@ -1,4 +1,8 @@
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import {
+  appendConfirmedPublishNotice,
+  ledgerFromSucceededFunctions,
+} from "../utils/falseFailureReport";
 
 export const SCORING_MODEL = "gemini-3.1-flash-lite";
 
@@ -469,9 +473,18 @@ function hasRunFailureNotice(messages: ChatMessage[] = []): boolean {
 async function surfaceFailedRun(session: ChatSession): Promise<void> {
   if (hasRunFailureNotice(session.messages)) return;
   const nowIso = new Date().toISOString();
+  // ENG-971: "please send your message again to retry" is blanket advice, and a
+  // turn-less death does NOT mean nothing happened — see the note above about a run
+  // whose side-effecting tool call landed before the instance was terminated. If the
+  // ledger confirms a publish, name it, so the retry does not become a second
+  // production deploy. Append-only and idempotent; the isRunFailureNotice marker the
+  // dedup check keys off is metadata, so it survives untouched.
   const notice: ChatMessage = {
     role: "assistant",
-    content: RUN_FAILED_USER_MESSAGE,
+    content: appendConfirmedPublishNotice(
+      RUN_FAILED_USER_MESSAGE,
+      ledgerFromSucceededFunctions(session.calledFunctions),
+    ),
     timestamp: nowIso,
     metadata: { timestamp: nowIso, isErrorMessage: true, isRunFailureNotice: true },
   } as any;

@@ -31,6 +31,9 @@ jest.mock('../services/subscriptionService', () => ({
   ]),
   getPublicAllowedSkills: jest.fn(async () => []),
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
+  getAllAvailableSubscriptionFeatures: jest.fn(() => [{
+    id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.',
+  }]),
 }));
 
 // Mock skillService

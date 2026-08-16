@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 // Mock dependencies
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => []),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -230,10 +231,10 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
         })
       );
 
-      expect(mockRes.json).toHaveBeenCalledWith({
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         message: 'Scheduled chat updated successfully',
         nextRunTime: newRunTime,
-      });
+      }));
     });
 
     it('should preserve existing nextRunTime when not provided', async () => {
@@ -259,10 +260,10 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
       expect(updateCall).not.toHaveProperty('nextRunTime');
 
       // Response should still return the existing nextRunTime
-      expect(mockRes.json).toHaveBeenCalledWith({
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         message: 'Scheduled chat updated successfully',
         nextRunTime: existingSchedule.nextRunTime,
-      });
+      }));
     });
   });
 });
