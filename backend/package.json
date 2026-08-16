@@ -3,6 +3,7 @@
   "version": "28.4.1",
   "main": "dist/server.js",
   "scripts": {
+    "prepare": "node scripts/install-git-hooks.mjs",
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --exit-child --transpile-only src/server.ts",
     "build": "node --max-old-space-size=6144 ./node_modules/typescript/bin/tsc -p tsconfig.build.json",
