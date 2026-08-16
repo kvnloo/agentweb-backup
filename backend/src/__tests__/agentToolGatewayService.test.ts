@@ -2283,6 +2283,41 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    // Hard-quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
+    // current quota") is 429-shaped like transient rate limiting, but permanent —
+    // classifyToolErrorClass buckets it as 'quota_exceeded', distinct from
+    // 'rate_limit', so shouldTrackInSessionScope must NOT exempt it: a hard-quota
+    // account should still trip the session-wide media budget instead of retrying
+    // generate_image indefinitely for the rest of the session.
+    it('ENG-1220: still locks generate_image after two hard-quota-exhaustion failures (quota_exceeded is not rate-limit-exempt)', async () => {
+      const sessionScope = 'session-eng1220-quota';
+      for (const runId of ['run-quota-a', 'run-quota-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'quota exhausted prompt' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('gpt-image-2 API failed: You exceeded your current quota, please check your plan and billing details.'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'try again' },
+        runId: 'run-quota-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('isolates failure counts between runs', async () => {
       await failNTimes('run-d', 'linkedin_outreach', 'Invalid parameters', 3);
 
