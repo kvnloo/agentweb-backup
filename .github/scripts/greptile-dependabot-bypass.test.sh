@@ -66,34 +66,49 @@ else
        "verdict that will never arrive — every Dependabot PR goes permanently red."
 fi
 
-# CAUGHT LIVE (Greptile 3/5, security-review section, portal#1037): the
-# first version of this gated on `user.login` ALONE, copying
-# backend-staging-deploy's bypass without checking its reasoning actually
-# transfers. It doesn't — that job's gate is "can this job ever succeed"
-# (secrets withheld from the PR permanently, regardless of who pushes
-# later); this gate's job is "was this exact head reviewed", and
-# `user.login` never changes even when a human pushes onto an existing
-# Dependabot branch. Gating on it alone means a human's unreviewed changes
-# would ride the same free pass. The fix requires BOTH `user.login` (PR
-# opened by Dependabot) AND `github.actor` (THIS push also made by
-# Dependabot) — assert both are present, not just one.
-if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login == 'dependabot[bot]'" \
-  && printf '%s\n' "${JOB_BLOCK}" | grep -qF "github.actor == 'dependabot[bot]'"; then
-  pass "the skip step requires BOTH the PR author and the pushing actor to be dependabot[bot]"
+# This bypass went through two prior designs before this one, both caught
+# live by Greptile reviewing this exact PR:
+#   v1 — `user.login` alone. Never changes even after a human pushes onto
+#        an existing Dependabot branch, so a human's unreviewed commit
+#        rides the bypass forever.
+#   v2 — v1 AND `github.actor` (this push's trigger) both dependabot. Closes
+#        the direct case, but not laundering: a human push correctly fails
+#        its own actor check, but a LATER routine Dependabot update of the
+#        same PR has actor=dependabot again and grants pass for the current
+#        head — which still contains the human's earlier unreviewed commit.
+# v3 (current) asks the only question that actually matters: does the PR's
+# FULL commit history contain anything other than Dependabot commits.
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "id: dependabot_only"; then
+  pass "a dependabot_only step exists, checking the PR's full commit history"
 else
-  fail "the skip step is not gated on both user.login AND github.actor." \
-       "user.login alone lets a human's commits, pushed onto an existing" \
-       "Dependabot branch, ride the same bypass without ever being reviewed —" \
-       "user.login never changes to reflect who actually pushed the current head."
+  fail "no step with id: dependabot_only found in greptile-review." \
+       "Event-metadata checks (user.login, github.actor) were tried and caught" \
+       "live as insufficient twice — the bypass must ask 'does this PR's commit" \
+       "history contain anything other than dependabot[bot] commits', not 'who" \
+       "opened this PR' or 'who triggered this specific push'."
 fi
 
-if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login != 'dependabot[bot]'" \
-  && printf '%s\n' "${JOB_BLOCK}" | grep -qF "github.actor != 'dependabot[bot]'"; then
-  pass "the real gate step (id: gate) runs whenever EITHER condition fails (De Morgan's complement of the skip)"
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "dependabot-only-pr.sh"; then
+  pass "dependabot_only actually calls dependabot-only-pr.sh (not a re-inlined heuristic)"
 else
-  fail "the 'gate' step's guard does not reference both user.login != and github.actor !=." \
-       "It must be the exact logical complement of the skip step's condition, or the" \
-       "two steps are no longer mutually exclusive and exhaustive."
+  fail "the dependabot_only step does not call .github/scripts/dependabot-only-pr.sh." \
+       "That script is the one place this exact check is tested (dependabot-only-pr.test.sh)" \
+       "— re-inlining the logic here means it drifts from its own test coverage."
+fi
+
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "steps.dependabot_only.outputs.all_dependabot == 'true'"; then
+  pass "the skip step only fires when dependabot_only confirmed an all-Dependabot history"
+else
+  fail "the skip step is not gated on steps.dependabot_only.outputs.all_dependabot == 'true'." \
+       "Any other condition here reopens the exact class of bug this script exists to close."
+fi
+
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "steps.dependabot_only.outputs.all_dependabot != 'true'"; then
+  pass "the real gate step (id: gate) runs whenever the history check did NOT confirm all-Dependabot"
+else
+  fail "the 'gate' step's guard is not the exact logical complement of the skip step's condition." \
+       "Both steps must key off the same dependabot_only output, or they can stop being" \
+       "mutually exclusive and exhaustive."
 fi
 
 OUTPUTS_LINE="$(printf '%s\n' "${JOB_BLOCK}" | grep -F 'verdict: ' | head -n 1)"

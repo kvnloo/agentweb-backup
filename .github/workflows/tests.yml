@@ -389,6 +389,9 @@ jobs:
       - name: Run greptile-review Dependabot bypass invariants
         run: bash .github/scripts/greptile-dependabot-bypass.test.sh
 
+      - name: Run dependabot-only-pr.sh regression suite
+        run: bash .github/scripts/dependabot-only-pr.test.sh
+
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
@@ -552,37 +555,50 @@ jobs:
       # every single time before returning UNAVAILABLE — turning every
       # dependabot PR's required check permanently red.
       #
-      # CAUGHT LIVE (Greptile 3/5, its own security-review section, on
-      # portal#1037): the first version of this gated on
-      # `pull_request.user.login` alone, copying backend-staging-deploy's
-      # bypass below WITHOUT checking that its reasoning actually transfers.
-      # It doesn't. That job's gate is "can this job ever succeed" (AWS
-      # secrets are withheld from any PR Dependabot opened, permanently,
-      # regardless of who pushes to it later) — `user.login` is correct
-      # there because the underlying constraint really is tied to the PR's
-      # original author. THIS gate's job is "was this exact head actually
-      # reviewed" — and `user.login` never changes even if a human pushes
-      # additional commits onto an existing Dependabot branch. Gating on it
-      # alone means a human's unreviewed changes ride the same free pass:
-      # the PR still reads as Dependabot-authored, so the bypass still
-      # fires, and that human's head never gets a real Greptile review.
-      #
-      # Fix: require BOTH `pull_request.user.login` (the PR was opened by
-      # Dependabot) AND `github.actor` (THIS SPECIFIC push was also made by
-      # Dependabot, not a human who pushed to the branch afterward) to be
-      # dependabot[bot]. A human pushing to fix or extend a Dependabot PR
-      # fails the actor check on their own push, so their head falls through
-      # to the real gate step below and gets an actual review — at the cost
-      # of one more Greptile credit for that one PR, which is the correct
-      # trade against shipping unreviewed code to prod.
+      # This bypass went through TWO prior designs, both caught live by
+      # Greptile reviewing this exact PR, both on the same principle: an
+      # event-metadata check (who opened the PR, who triggered this push)
+      # tells you nothing about what's actually IN the current head.
+      #   v1 — `pull_request.user.login` alone: never changes even after a
+      #        human pushes onto an existing Dependabot branch, so a human's
+      #        unreviewed commit rides the bypass forever.
+      #   v2 — v1 AND `github.actor` (this push's trigger) both dependabot:
+      #        closes the direct case, but not the laundering case — a human
+      #        push correctly fails ITS OWN actor check and gets reviewed,
+      #        but if Dependabot performs a LATER routine update of the same
+      #        PR, THAT push's actor is dependabot again, and the bypass
+      #        fires for the CURRENT head — which still contains the human's
+      #        earlier, still-unreviewed commit.
+      # Neither version asked the only question that actually matters: does
+      # this PR's commit history contain anything other than Dependabot
+      # commits, full stop. dependabot-only-pr.sh asks exactly that — it
+      # walks every commit in the PR via the GitHub API and fails closed on
+      # a single non-Dependabot (or unresolvable) author anywhere in the
+      # history, not just the most recent event.
+      - name: Check whether this Dependabot PR contains only Dependabot commits
+        id: dependabot_only
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          bash .github/scripts/dependabot-only-pr.sh
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "all_dependabot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "all_dependabot=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Skip the Greptile gate for Dependabot (excluded from review)
         id: dependabot_skip
-        if: >-
-          github.event.pull_request.user.login == 'dependabot[bot]'
-          && github.actor == 'dependabot[bot]'
+        if: steps.dependabot_only.outputs.all_dependabot == 'true'
         run: |
           echo "verdict=pass" >> "$GITHUB_OUTPUT"
-          echo "[greptile-review] dependabot[bot] PR, pushed by dependabot[bot]: excluded from Greptile review by greptile.json, so no verdict will ever land here. Gate short-circuits to pass — tests + Dependabot's own compatibility score are the review for a dependency bump."
+          echo "[greptile-review] every commit in this PR is authored by dependabot[bot]: excluded from Greptile review by greptile.json, so no verdict will ever land here. Gate short-circuits to pass — tests + Dependabot's own compatibility score are the review for a dependency bump."
 
       # Split across two steps on purpose. A step that fails cannot publish an
       # output, and `continue-on-error` would mark the JOB successful, silently
@@ -590,9 +606,7 @@ jobs:
       # succeeds, and the next one converts it back into the job's result.
       - name: Require a true Greptile 5/5 on this head
         id: gate
-        if: >-
-          github.event.pull_request.user.login != 'dependabot[bot]'
-          || github.actor != 'dependabot[bot]'
+        if: steps.dependabot_only.outputs.all_dependabot != 'true'
         env:
           # ENG-1039 fail-fast: see the job comment above.
           GREPTILE_GATE_TIMEOUT_SECONDS: '600'
