@@ -10,6 +10,7 @@ import {
   isUnusableSynthesis,
   buildExecutedActionsFallback,
 } from '../synthesisResidue';
+import { SYNTHESIS_NUDGE } from '../termination';
 
 describe('isUnusableSynthesis', () => {
   it('flags the exact production residue "}]"', () => {
@@ -92,6 +93,24 @@ describe('isUnusableSynthesis', () => {
 
   it('does NOT flag a short repetitive answer below the word floor', () => {
     expect(isUnusableSynthesis('yes '.repeat(50))).toBe(false);
+  });
+
+  // ENG-1188: a 101-message gemini-3.1-pro-preview work-plan session generated and
+  // screenshot-verified the corrected ad assets, then closed with the model echoing
+  // the injected synthesis nudge back verbatim instead of writing the delivery
+  // message — three repeats in 744 chars, well under isDegenerateRepetition's
+  // 1000-char/300-word floor, so the real answer never reached the user even though
+  // the guard built for exactly this failure class (ENG-1054/946) was already live.
+  it('flags a reply that echoes the injected synthesis nudge back verbatim', () => {
+    const echo = `${SYNTHESIS_NUDGE} ${SYNTHESIS_NUDGE} ${SYNTHESIS_NUDGE}`;
+    expect(echo.length).toBeLessThan(1000);
+    expect(isUnusableSynthesis(echo)).toBe(true);
+  });
+
+  it('does NOT flag a single quoted mention of the nudge text', () => {
+    expect(
+      isUnusableSynthesis(`I saw the system message "${SYNTHESIS_NUDGE}" and then finished the export.`)
+    ).toBe(false);
   });
 
   it('does NOT flag prose that merely mentions a tool result', () => {

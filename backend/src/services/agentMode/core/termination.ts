@@ -79,7 +79,9 @@ const CONTINUE_PROMPT =
 const CONTENT_FILTER_MESSAGE =
   "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
 
-const SYNTHESIS_NUDGE =
+// Exported so synthesisResidue.ts can recognize a turn that echoes this text back
+// instead of answering it (ENG-1188) — the two must never drift apart.
+export const SYNTHESIS_NUDGE =
   '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.';
 
 /**
