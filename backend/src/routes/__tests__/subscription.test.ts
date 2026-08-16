@@ -3,7 +3,7 @@ import request from 'supertest';
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import subscriptionRoutes from '../subscription';
 import { authenticateToken } from '../../middleware/auth';
-import { resolveBillingUserId } from '../../services/tokenUsageService';
+import { resolveBillingUserId, getPooledMemberUserIds } from '../../services/tokenUsageService';
 import { listLlmChargeEvents } from '../../services/llmChargeAuditDb';
 import { usageRecordDb } from '../../services/usageRecordDb';
 
@@ -32,6 +32,7 @@ jest.mock('../../services/customerPortalPages', () => ({
 jest.mock('../../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(),
   resolveBillingUserId: jest.fn(),
+  getPooledMemberUserIds: jest.fn(),
 }));
 
 jest.mock('../../services/llmChargeAuditDb', () => ({
@@ -46,6 +47,7 @@ jest.mock('../../services/usageRecordDb', () => ({
 // mockResolvedValueOnce's argument infers as `never`. Tying the mock to the
 // real function's type gives it a real Promise<T> return to infer against.
 const mockResolveBillingUserId = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
+const mockGetPooledMemberUserIds = getPooledMemberUserIds as jest.MockedFunction<typeof getPooledMemberUserIds>;
 const mockListLlmChargeEvents = listLlmChargeEvents as jest.MockedFunction<typeof listLlmChargeEvents>;
 const mockQueryByUserDateRange = usageRecordDb.queryByUserDateRange as jest.MockedFunction<typeof usageRecordDb.queryByUserDateRange>;
 
@@ -130,6 +132,10 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
       next();
     });
     mockResolveBillingUserId.mockResolvedValue('u1');
+    // No pooled org members by default -- every existing test in this
+    // block is a solo user, so the itemized route queries only its own
+    // billingUserId, matching the pre-pooling-fix behavior exactly.
+    mockGetPooledMemberUserIds.mockResolvedValue([]);
     app = express();
     app.use(express.json());
     app.use('/api/subscription', subscriptionRoutes);
@@ -165,6 +171,49 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.precision).toBe('daily_aggregate');
     expect(res.body.items).toHaveLength(1);
     expect(res.body.items[0].source).toBe('daily_aggregate');
+  });
+
+  it('ENG-1251 Greptile P1: merges a pooled org member\'s aggregate-only rows into the billing owner\'s itemized report', async () => {
+    // usageRecordDb stores each row under the ACTING user's own id, not the
+    // resolved billing owner. A pooled member's aggregate-only usage is
+    // otherwise unreachable from a query keyed on billingUserId alone, even
+    // though it WAS correctly charged to the owner's counter.
+    mockGetPooledMemberUserIds.mockResolvedValue(['member-2']);
+    mockListLlmChargeEvents.mockResolvedValue([]);
+    mockQueryByUserDateRange.mockImplementation(async (userId: string) => {
+      if (userId === 'u1') {
+        return [
+          { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
+        ];
+      }
+      if (userId === 'member-2') {
+        return [
+          { userId: 'member-2', sk: '2026-08-06#opus#chat', billingUserId: 'member-2', updatedAt: '2026-08-06T00:00:00.000Z', ttl: 0, date: '2026-08-06', model: 'opus', provider: 'bedrock', feature: 'chat', totalTokens: 500, callCount: 1, costMicroUsd: 4000 },
+        ];
+      }
+      return [];
+    });
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
+    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('member-2', '2026-08-01', '2026-08-31');
+    expect(res.body.items).toHaveLength(2);
+    const dates = res.body.items.map((item: any) => item.date).sort();
+    expect(dates).toEqual(['2026-08-05', '2026-08-06']);
+  });
+
+  it('queries only the billing owner when there are no pooled members (solo user, unchanged behavior)', async () => {
+    mockGetPooledMemberUserIds.mockResolvedValue([]);
+    mockListLlmChargeEvents.mockResolvedValue([]);
+    mockQueryByUserDateRange.mockResolvedValue([]);
+
+    await request(app).get('/api/subscription/usage/itemized?month=2026-08').expect(200);
+
+    expect(mockQueryByUserDateRange).toHaveBeenCalledTimes(1);
+    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
   });
 
   it('merges both sources on a partial-rollout month WITHOUT dropping pre-event charges (Greptile P1)', async () => {

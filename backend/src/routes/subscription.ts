@@ -2,7 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
-import { resolveBillingUserId } from '../services/tokenUsageService';
+import { resolveBillingUserId, getPooledMemberUserIds } from '../services/tokenUsageService';
 import { usageRecordDb } from '../services/usageRecordDb';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
 import { reconcileItemizedUsage } from '../services/usageItemization';
@@ -35,10 +35,20 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     const month = String(req.query.month || new Date().toISOString().slice(0, 7));
     if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month must be YYYY-MM' });
     const billingUserId = await resolveBillingUserId(userId);
-    const [events, rows] = await Promise.all([
+    // ENG-1251 Greptile P1: the shadow-ledger aggregate table stores each row
+    // under the ACTING user's own id, not the resolved billing owner -- a
+    // pooled org member's aggregate-only usage is otherwise unreachable from
+    // a query keyed on billingUserId alone. Query every pooled member's rows
+    // too and merge. No-op (empty list) for a solo user or an org with no
+    // other pooled members -- the owner's own billingUserId is always queried.
+    const pooledMemberIds = await getPooledMemberUserIds(billingUserId);
+    const [events, ...rowsByUser] = await Promise.all([
       listLlmChargeEvents(billingUserId, `${month}-01`, `${month}-31`),
-      usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`),
+      ...[billingUserId, ...pooledMemberIds].map((id) =>
+        usageRecordDb.queryByUserDateRange(id, `${month}-01`, `${month}-31`)
+      ),
     ]);
+    const rows = rowsByUser.flat();
     const { items, precision } = reconcileItemizedUsage(events, rows);
     return res.json({ month, billingUserId, precision, items });
   } catch (error) {
