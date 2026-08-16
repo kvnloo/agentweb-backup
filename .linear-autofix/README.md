@@ -156,10 +156,10 @@ debugging and budget tuning.
 
 ## Models / cost
 
-The fixer, manager, re-fix/rework passes, and browser verify run on **Opus**; the four lens
-reviewers run on **Sonnet** (`review.model`) — the Opus manager adversarially filters their
-findings anyway, so cheap reviewers cost little quality and save ~4 Opus runs per bug.
-`review.autoScaleLenses` additionally skips lenses that can't apply to the diff (security on
+Every agent runs on **Sonnet** — the fixer, the four lens reviewers, the manager, the
+re-fix/rework passes, browser verify, `revise:`, and the chat agent. The only cheaper tier in
+play is **Haiku**, for the `/btw` chat aside (`chat.btwModel`) and the merge-intent classifier.
+Nothing runs on Opus. `review.autoScaleLenses` additionally skips lenses that can't apply to the diff (security on
 docs/styles-only diffs; tests when neither backend logic nor tests changed). Everything draws on
 the same subscription quota pool as your interactive Claude use. Set `review.enabled: false` to
 revert to the lean fix→verify→PR flow. Workspaces live in `../autofix-worktrees/<id>/` outside

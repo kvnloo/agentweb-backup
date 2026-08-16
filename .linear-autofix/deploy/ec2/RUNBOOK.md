@@ -267,8 +267,9 @@ ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
   after merge). Re-run `bootstrap.sh` to refresh deps.
 - **Pause:** comment out the crontab line (`crontab -e`).
 - **Cost:** every fix + verify draws on the same subscription quota pool as your own
-  interactive Claude use. Default model is Sonnet; an `opus`/`hard`/`complex` label on
-  an issue switches that one to Opus.
+  interactive Claude use. Every stage runs on Sonnet (Haiku for the `/btw` aside); nothing
+  runs on Opus. The `opus`/`hard`/`complex` labels still map to `config.escalationModel`,
+  which is Sonnet too — so they currently change nothing.
 
 ### Observability (ENG-655)
 
