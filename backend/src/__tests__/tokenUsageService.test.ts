@@ -12,6 +12,7 @@ import {
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByIdConsistent: jest.fn(),
     updateUser: jest.fn(),
     incrementTokenUsageForMonth: jest.fn(),
     resetTokenUsageForMonth: jest.fn(),
@@ -43,6 +44,7 @@ import {
 import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockGetUserByIdConsistent = (userDb as any).getUserByIdConsistent as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
 const mockResetTokenUsageForMonth = (userDb as any).resetTokenUsageForMonth as jest.Mock;
@@ -63,6 +65,12 @@ beforeEach(() => {
   mockResetTokenUsageForMonth.mockResolvedValue(true);
   mockApplyMonthlyChargeAtomic.mockResolvedValue("applied");
   mockRecordLlmChargeEvent.mockResolvedValue(true);
+  // incrementUserTokenUsage's retry loop reads via getUserByIdConsistent
+  // (Greptile P1: a stale GSI read on retry can exhaust every attempt on
+  // the same staleness window). Delegate to whatever mockGetUserById is
+  // configured to return so every existing test's setup applies to both
+  // without touching each call site individually.
+  mockGetUserByIdConsistent.mockImplementation((...args: unknown[]) => mockGetUserById(...args));
 });
 
 // ─── FAIL TESTS ──────────────────────────────────────────────────────────

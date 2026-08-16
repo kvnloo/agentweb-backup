@@ -352,7 +352,18 @@ export async function incrementUserTokenUsage(
     const MAX_ATTEMPTS = 3;
     let outcome: "applied" | "already_applied" | "lost_race" | "no_user" = "lost_race";
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-      const user = await userDb.getUserById(billingUserId);
+      // Greptile P1: getUserById reads through the UserIdIndex GSI, which
+      // DynamoDB cannot serve as a strongly consistent read. After a lost
+      // race (another writer just committed the counter this attempt is
+      // about to retry against), a GSI read can still return the
+      // pre-transaction row, so this attempt derives isNewMonth from stale
+      // state and fails the SAME way again -- all MAX_ATTEMPTS retries can
+      // exhaust on a staleness window rather than genuine repeated
+      // contention, silently dropping the charge. getUserByIdConsistent
+      // does the same two-step lookup this codebase already uses elsewhere
+      // for exactly this guarantee (see its own docstring): resolve the
+      // key via the GSI, then a strongly consistent read on the base table.
+      const user = await userDb.getUserByIdConsistent(billingUserId);
       if (!user || !user.email) {
         outcome = "no_user";
         break;
