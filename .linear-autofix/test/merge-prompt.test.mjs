@@ -103,6 +103,12 @@ console.log('\n— verifying on production —');
   ok(/production/i.test(p) && /real/i.test(p), 'makes clear this is real production, not a test env');
 }
 
+console.log('\n— access it has —');
+{
+  ok(/production database and production logs, READ-ONLY/i.test(p), 'prod DB + logs, read-only');
+  ok(/preview database and preview logs, full access/i.test(p), 'preview DB + logs, full access');
+}
+
 console.log('\n— reporting back to Linear —');
 {
   ok(/LINEAR_API_KEY/.test(p), 'tells it the key is already in its environment');

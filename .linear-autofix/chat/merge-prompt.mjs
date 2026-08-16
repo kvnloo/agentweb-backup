@@ -46,6 +46,8 @@ export function mergeMsg(entry) {
     '',
     '**How to work: aim at states, not steps.** The commands, flags, check names, review scoring and deploy plumbing all change over time, and anything specific written here may already be out of date. Treat every concrete detail below as orientation you should confirm, not as instructions to follow literally. Look at what the PR *actually* says right now and work from that. If a suggested approach does not match what you observe, trust what you observe and find the current way — you have a full shell and the `gh` CLI. Do not report failure because something in this prompt did not work; report failure only when the goal itself is genuinely unreachable.',
     '',
+    '**Access you have:** the production database and production logs, READ-ONLY; the preview database and preview logs, full access.',
+    '',
     'The states to drive each PR through, in order:',
     '',
     '**1. Open for review.** Not a draft, and its branch current enough with the base that the checks mean something. Re-syncing a branch normally re-runs CI and triggers a fresh review — expected, not a problem, just another cycle to ride out.',
