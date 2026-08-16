@@ -37,21 +37,43 @@ MOCK
   chmod +x "${WORKDIR}/bin/gh"
 }
 
+# Shape matches what was verified live against a real Dependabot PR
+# (agentweb#2276): author.login resolves to dependabot[bot] AND
+# commit.verification.verified is true, reason "valid".
 commits_all_dependabot() {
   cat <<'EOF'
 [
-  {"sha": "aaa", "author": {"login": "dependabot[bot]"}},
-  {"sha": "bbb", "author": {"login": "dependabot[bot]"}}
+  {"sha": "aaa", "author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true, "reason": "valid"}}},
+  {"sha": "bbb", "author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true, "reason": "valid"}}}
 ]
 EOF
 }
 
+# Shape matches what was verified live on this org's own commit history:
+# not every human commit is signed (several of harshmoney123's own show
+# verified:false, reason:"unsigned") -- included here as the "ordinary,
+# not an attack" mixed case.
 commits_mixed() {
   cat <<'EOF'
 [
-  {"sha": "aaa", "author": {"login": "dependabot[bot]"}},
-  {"sha": "bbb", "author": {"login": "harshmoney123"}},
-  {"sha": "ccc", "author": {"login": "dependabot[bot]"}}
+  {"sha": "aaa", "author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true, "reason": "valid"}}},
+  {"sha": "bbb", "author": {"login": "harshmoney123"}, "commit": {"verification": {"verified": false, "reason": "unsigned"}}},
+  {"sha": "ccc", "author": {"login": "dependabot[bot]"}, "commit": {"verification": {"verified": true, "reason": "valid"}}}
+]
+EOF
+}
+
+# THE forgery Greptile caught: a human sets their local git author email to
+# Dependabot's real, public noreply address (49699333+dependabot[bot]@
+# users.noreply.github.com). GitHub resolves .author.login to
+# "dependabot[bot]" exactly as it would for the genuine bot -- but the human
+# cannot produce a signature GitHub attributes to dependabot[bot]'s own
+# signing identity, so verification fails. Author-login-only would have
+# waved this straight through; this is why verification is required too.
+commits_forged_author() {
+  cat <<'EOF'
+[
+  {"sha": "aaa", "author": {"login": "dependabot[bot]"}, "commit": {"author": {"email": "49699333+dependabot[bot]@users.noreply.github.com"}, "verification": {"verified": false, "reason": "unsigned"}}}
 ]
 EOF
 }
@@ -59,7 +81,7 @@ EOF
 commits_unlinked_author() {
   cat <<'EOF'
 [
-  {"sha": "aaa", "author": null, "commit": {"author": {"email": "someone@example.com"}}}
+  {"sha": "aaa", "author": null, "commit": {"author": {"email": "someone@example.com"}, "verification": {"verified": false, "reason": "unsigned"}}}
 ]
 EOF
 }
@@ -135,6 +157,24 @@ else
   TESTS_FAILED=$((TESTS_FAILED + 1))
   printf 'FAIL: %s\n  output: %s\n' 'reports the exact non-dependabot commit count (1 of 3)' "${LAST_OUTPUT}"
 fi
+
+# THE forgery Greptile caught in a second review pass, on this same script:
+# author.login alone is forgeable (self-declared git config, not
+# authenticated). A forged-but-unsigned commit must fail even though
+# .author.login reads exactly like the real thing.
+commits_forged_author >"${WORKDIR}/commits.json"
+run_script
+check 'a forged author email with no valid Dependabot signature fails, not waved through' 1 \
+  'Not bypass-eligible'
+
+# An all-dependabot-author history where the signature itself is missing/
+# invalid must ALSO fail -- verification is required, not merely present as
+# an extra field that could be ignored.
+commits_forged_author >"${WORKDIR}/commits_no_sig.json"
+jq '.[0].commit.verification = {}' "${WORKDIR}/commits_no_sig.json" >"${WORKDIR}/commits.json"
+run_script
+check 'a missing verification object fails closed, not treated as verified' 1 \
+  'Not bypass-eligible'
 
 # An unlinked commit author (no GitHub account resolves the email) must
 # fail closed -- never treated as "probably fine".

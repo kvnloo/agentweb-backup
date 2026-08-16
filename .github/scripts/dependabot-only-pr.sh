@@ -23,9 +23,33 @@
 # there is no way to "clean" a PR back to bypass-eligible short of closing
 # it and letting Dependabot open a fresh one.
 #
+# CAUGHT LIVE A SECOND TIME (Greptile 3/5, security-review section, same
+# PR, reviewing the fix above): commit author metadata is SELF-DECLARED,
+# not authenticated. `.author.login` resolving to dependabot[bot] only
+# means the commit's email happens to match Dependabot's public, known
+# noreply address (49699333+dependabot[bot]@users.noreply.github.com) —
+# any repository writer can set that as their local `git config user.email`
+# and push a commit that resolves the exact same way, with arbitrary
+# attacker-controlled content, and the original version of this check would
+# have waved it straight through.
+#
+# Fix: also require `.commit.verification.verified == true` on every
+# commit. Verified live against a real Dependabot PR on this org
+# (agentweb#2276): its Dependabot commit is `verified: true, reason:
+# "valid"` — a real cryptographic signature GitHub attributes to the
+# dependabot[bot] identity specifically, which only GitHub's own Dependabot
+# infrastructure can produce. A human forging the author EMAIL cannot also
+# forge a signature GitHub verifies as belonging to dependabot[bot]'s own
+# signing identity — that would require possessing GitHub's actual signing
+# key, not just knowing a public noreply address. (Also verified live: not
+# all human commits in this org are signed — several of harshmoney123's own
+# commits show `verified: false, reason: "unsigned"` — so this check is a
+# real filter, not one that happens to pass everything anyway.)
+#
 # Fails CLOSED on any ambiguity: an unlinked commit author (no GitHub
-# account resolves the commit's email — .author is null), an API failure,
-# or zero commits found all mean NOT CONFIRMED dependabot-only, which the
+# account resolves the commit's email — .author is null), an unverified or
+# unsigned commit even if the author resolves correctly, an API failure, or
+# zero commits found all mean NOT CONFIRMED dependabot-only, which the
 # caller must treat as "run the real gate," never as "safe to skip."
 #
 # Environment:
@@ -77,13 +101,25 @@ main() {
     exit 1
   fi
 
-  # .author is GitHub's resolved account for the commit (null if the
-  # commit's email doesn't map to any account) — this is who GITHUB
-  # attributes the commit to, which is what matters for this check, not
-  # the raw .commit.author.email (which a human could set to anything).
+  # Two independent conditions, both required, per commit:
+  #   .author.login       — GitHub's resolved account (null if the commit's
+  #                         email doesn't map to any account). This is WHO
+  #                         github attributes the commit to.
+  #   .commit.verification.verified — whether that attribution is actually
+  #                         backed by a valid cryptographic signature, not
+  #                         just a self-declared email. The author login
+  #                         alone is forgeable by anyone with push access;
+  #                         a verified signature attributed to
+  #                         dependabot[bot] is not.
+  # Neither check alone is sufficient: author-only is forgeable (see
+  # header); verified-only would accept any human's own legitimately
+  # signed commit, since it doesn't ask WHOSE signature it is.
   non_dependabot="$(printf '%s' "${commits_json}" | jq -s '
       [.[]] | flatten
-      | map(select((.author.login // "UNLINKED") != "dependabot[bot]"))
+      | map(select(
+          (.author.login // "UNLINKED") != "dependabot[bot]"
+          or (.commit.verification.verified // false) != true
+        ))
       | length
     ' 2>/dev/null || echo -1)"
 
@@ -93,11 +129,11 @@ main() {
   fi
 
   if [ "${non_dependabot}" -gt 0 ]; then
-    echo "[dependabot-only-pr] ${REPO}#${PR_NUMBER}: ${non_dependabot} of ${total} commits are NOT authored by dependabot[bot] (or authorship is unlinked). Not bypass-eligible."
+    echo "[dependabot-only-pr] ${REPO}#${PR_NUMBER}: ${non_dependabot} of ${total} commits are NOT both dependabot[bot]-authored AND signature-verified. Not bypass-eligible."
     exit 1
   fi
 
-  echo "[dependabot-only-pr] ${REPO}#${PR_NUMBER}: all ${total} commit(s) authored by dependabot[bot]. Bypass-eligible."
+  echo "[dependabot-only-pr] ${REPO}#${PR_NUMBER}: all ${total} commit(s) authored by dependabot[bot] AND signature-verified. Bypass-eligible."
 }
 
 main "$@"
