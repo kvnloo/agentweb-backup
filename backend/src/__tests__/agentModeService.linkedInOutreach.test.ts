@@ -30,6 +30,7 @@ const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
+const mockResolveAccountIdWithSource = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
@@ -44,6 +45,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
@@ -788,7 +790,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('reports the unconnected-account error, not the disconnect error, when no account exists', async () => {
-      mockResolveAccountId.mockResolvedValue(null);
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: null, usedSharedAccount: false });
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'search-people',
@@ -1168,7 +1170,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('falls back to site-wide account_id when none is provided', async () => {
-      mockResolveAccountId.mockResolvedValue('site-wide-account');
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'site-wide-account', usedSharedAccount: true });
       mockResolve.mockResolvedValue({ candidates: [], fromCache: false, source: 'api' });
 
       const result = await service.linkedinOutreach('user-1', {
@@ -1177,7 +1179,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         keywords: 'Acme',
       });
 
-      expect(mockResolveAccountId).toHaveBeenCalledWith('user-1');
+      expect(mockResolveAccountIdWithSource).toHaveBeenCalledWith('user-1');
       expect(mockResolve).toHaveBeenCalledWith('site-wide-account', expect.any(Object));
       expect(result.success).toBe(true);
     });
