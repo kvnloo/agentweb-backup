@@ -31554,10 +31554,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // or refuse degree-based logic instead of silently trusting it.
     const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
     let usedSharedAccount = false;
-    if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
-      const resolved = await linkedInOutreachService.resolveAccountIdWithSource(userId);
-      account_id = resolved.accountId;
-      usedSharedAccount = resolved.usedSharedAccount;
+    if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
+      if (!account_id) {
+        const resolved = await linkedInOutreachService.resolveAccountIdWithSource(userId);
+        account_id = resolved.accountId;
+        usedSharedAccount = resolved.usedSharedAccount;
+      } else {
+        // ENG-1198: an explicit account_id isn't necessarily the user's own —
+        // it may be a `sharedAccountId` this same endpoint disclosed on a prior
+        // call and the caller echoed back. Check ownership instead of assuming
+        // false whenever the caller supplied an id, so the flag stays accurate.
+        const ownAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+        usedSharedAccount = !ownAccountIds.includes(account_id);
+      }
       if (account_id) {
         console.log(`[AgentMode] linkedinOutreach: using ${usedSharedAccount ? 'site-wide' : 'own'} account for ${action}`);
       }
@@ -31714,8 +31723,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               (raw.public_identifier
                 ? `https://www.linkedin.com/in/${raw.public_identifier}`
                 : (isUrl ? target : null));
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
+            // with public_identifier literally the string 'undefined' — mirrors
+            // the search-people filtering above. get-profile can't drop the row
+            // (the caller asked for this specific person), so flag it and drop
+            // the fabricated /in/undefined URL instead.
+            const isAnonymized = raw.public_identifier === 'undefined';
             let conn: { connectedAt?: number } | null = null;
-            if (profileUrl) {
+            // A shared/site-wide account's connection state belongs to a
+            // STRANGER, not the user — reconciling is_relationship/connected_at
+            // from it would present that stranger's "already connected/pending"
+            // status as the user's own (ENG-1198). Skip the lookup entirely so
+            // both fields are omitted below, same as network_distance.
+            if (profileUrl && !usedSharedAccount) {
               const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
               conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
             }
@@ -31733,6 +31753,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               is_relationship: rawRelationship,
               connected_at: rawConnectedAt,
               network_distance: rawNetworkDistance,
+              public_profile_url: rawPublicProfileUrl,
               ...viewerIndependentRaw
             } = raw;
             // Reconcile as a union: connected if our per-account cache has a row OR a
@@ -31744,20 +31765,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
               ...viewerIndependentRaw,
-              is_relationship: isConnected,
-              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
-              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
-              // otherwise keep the raw timestamp ONLY from a live response.
-              ...(conn && typeof conn.connectedAt === 'number'
-                ? { connected_at: conn.connectedAt }
-                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
-                  ? { connected_at: rawConnectedAt }
-                  : {}),
+              // Never surface the fabricated /in/undefined URL for an anonymized profile.
+              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              // See ENG-1198 note above: is_relationship/connected_at are the
+              // user's "already connected/pending" signal — only meaningful
+              // relative to the user's own account, not a borrowed shared one.
+              ...(usedSharedAccount ? {} : {
+                is_relationship: isConnected,
+                // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+                // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+                // otherwise keep the raw timestamp ONLY from a live response.
+                ...(conn && typeof conn.connectedAt === 'number'
+                  ? { connected_at: conn.connectedAt }
+                  : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                    ? { connected_at: rawConnectedAt }
+                    : {}),
+              }),
               // See ENG-1198 note above: only keep network_distance when it's
               // relative to the user's own account, not a borrowed shared one.
               ...(!usedSharedAccount && rawNetworkDistance !== undefined
                 ? { network_distance: rawNetworkDistance }
                 : {}),
+              ...(isAnonymized ? { anonymized: true } : {}),
             };
             return { success: true, data: withAccountMeta(data) };
           }
@@ -32169,7 +32198,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileCompanyService.ts.
           const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
           const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
-          return { success: true, data: companyResult.rawData };
+          return { success: true, data: withAccountMeta(companyResult.rawData) };
         }
 
         case 'cancel-invitation': {
@@ -32211,11 +32240,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }));
           return {
             success: true,
-            data: {
+            data: withAccountMeta({
               candidates: trimmedCandidates,
               fromCache: resolveResult.fromCache,
               source: resolveResult.source,
-            },
+            }),
           };
         }
 
