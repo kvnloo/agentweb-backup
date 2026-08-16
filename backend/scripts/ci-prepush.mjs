@@ -26,7 +26,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffNameStatus } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffNameStatus, mergeStatusByPathAcrossRefs } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -53,7 +53,7 @@ async function readPushedRefs() {
 }
 
 function changedFilesForRefs(refs) {
-  const statusByPath = {};
+  const perRefMaps = [];
   const bases = new Set();
   for (const r of refs) {
     const base = resolveBaseSha(r, {
@@ -75,9 +75,18 @@ function changedFilesForRefs(refs) {
     // or the hook's own "no backend changes — skipping" short circuit silently
     // skips tsc/jest for exactly the push most likely to break the build.
     const out = git(['diff', '--no-renames', '--name-status', '--diff-filter=AMD', `${base}..${r.localSha}`], { cwd: root });
-    Object.assign(statusByPath, parseDiffNameStatus(out));
+    perRefMaps.push(parseDiffNameStatus(out));
   }
-  return { statusByPath, bases: [...bases] };
+  // ENG-1277 / Greptile P1 #4: merge per-ref maps through a conflict-detecting
+  // merge, not `Object.assign` — a single `git push` can push multiple refs, and
+  // if two of them assign different statuses to the same path, last-write-wins
+  // would silently verify the wrong ref's version of that path (or none of them).
+  // See mergeStatusByPathAcrossRefs's doc comment for the full reasoning.
+  const merged = mergeStatusByPathAcrossRefs(perRefMaps);
+  if (!merged.ok) {
+    fail(`pushing multiple refs in one \`git push\` with different changes to the same path is not supported by this hook — it verifies against a single shared working tree and cannot check two different versions of the same path at once: ${merged.conflictingPaths.join(', ')}. Push these refs separately (one \`git push origin <ref>\` at a time), or bypass with --no-verify (CI still checks each ref for real on its own head).`);
+  }
+  return { statusByPath: merged.statusByPath, bases: [...bases] };
 }
 
 // ENG-1277 / Greptile P1 #2 and #3: a deleted source file must still have its

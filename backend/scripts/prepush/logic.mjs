@@ -51,6 +51,34 @@ export function parseDiffNameStatus(output) {
 }
 
 /**
+ * Merge the per-ref {path: status} maps from `changedFilesForRefs` (one map per
+ * pushed ref — a single `git push` can push several refs at once) into a single
+ * {path: status} map, detecting when the SAME path has DIFFERENT statuses across
+ * different refs (Greptile P1 #4, ENG-1277 pre-push hook). This hook verifies
+ * against ONE shared working tree — it cannot check two different versions of the
+ * same path at once — so a plain last-write-wins merge (the previous
+ * `Object.assign`) would silently apply whichever ref happened to be processed
+ * last to BOTH refs' verification: either failing a valid push because a path one
+ * ref modified looks deleted per the other ref, or discovering related tests from
+ * stale pre-deletion content instead of the actually-changed content, letting
+ * affected suites go unrun. Returns `{ok:false, conflictingPaths}` rather than
+ * guessing, so the caller can fail loud instead of silently picking a version.
+ */
+export function mergeStatusByPathAcrossRefs(perRefMaps) {
+  const statusesByPath = {};
+  for (const map of perRefMaps) {
+    for (const [p, status] of Object.entries(map)) {
+      (statusesByPath[p] ??= new Set()).add(status);
+    }
+  }
+  const conflictingPaths = Object.keys(statusesByPath).filter((p) => statusesByPath[p].size > 1);
+  if (conflictingPaths.length) return { ok: false, conflictingPaths };
+  const statusByPath = {};
+  for (const p of Object.keys(statusesByPath)) statusByPath[p] = [...statusesByPath[p]][0];
+  return { ok: true, statusByPath };
+}
+
+/**
  * Decide the base SHA to diff a ref against.
  *   - A known remote SHA (already on the remote, commitExists(remoteSha) true) diffs from itself.
  *   - A new branch (remoteSha === ZERO) or an unknown/unreachable remote SHA (force-pushed history,

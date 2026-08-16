@@ -10,6 +10,7 @@ import {
   selectJestSuites,
   evaluateListTestsResult,
   parseDiffNameStatus,
+  mergeStatusByPathAcrossRefs,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -242,4 +243,53 @@ test('parseDiffNameStatus: a path containing a tab character is preserved after 
   // Pathological but shouldn't corrupt parsing: only the FIRST tab separates status from path.
   const out = 'M\tbackend/src/weird\tname.ts\n';
   assert.deepEqual(parseDiffNameStatus(out), { 'backend/src/weird\tname.ts': 'M' });
+});
+
+// ENG-1277 / Greptile P1 #4: a single `git push` can push multiple refs at once;
+// their per-ref status maps must never be merged via silent last-write-wins.
+
+test('mergeStatusByPathAcrossRefs: single ref, no conflicts possible -> ok', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' },
+  ]);
+  assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' } });
+});
+
+test('mergeStatusByPathAcrossRefs: two refs touching disjoint paths -> ok, union', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/a.ts': 'M' },
+    { 'backend/src/b.ts': 'D' },
+  ]);
+  assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' } });
+});
+
+test('mergeStatusByPathAcrossRefs: two refs agreeing on the same path/status -> ok, not a conflict', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/a.ts': 'M' },
+    { 'backend/src/a.ts': 'M' },
+  ]);
+  assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M' } });
+});
+
+test('mergeStatusByPathAcrossRefs: two refs assigning DIFFERENT statuses to the same path -> refused, not silently merged', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/a.ts': 'M', 'backend/src/shared.ts': 'D' },
+    { 'backend/src/shared.ts': 'M', 'backend/src/c.ts': 'A' },
+  ]);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.conflictingPaths, ['backend/src/shared.ts']);
+});
+
+test('mergeStatusByPathAcrossRefs: three refs, only one conflicting path is reported, not the whole set', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/a.ts': 'M', 'backend/src/x.ts': 'D' },
+    { 'backend/src/b.ts': 'A', 'backend/src/x.ts': 'D' },
+    { 'backend/src/c.ts': 'M', 'backend/src/x.ts': 'M' },
+  ]);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.conflictingPaths, ['backend/src/x.ts']);
+});
+
+test('mergeStatusByPathAcrossRefs: no refs -> ok, empty map', () => {
+  assert.deepEqual(mergeStatusByPathAcrossRefs([]), { ok: true, statusByPath: {} });
 });
