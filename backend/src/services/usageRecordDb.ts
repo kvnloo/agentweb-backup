@@ -15,6 +15,7 @@
  */
 
 import AWS from "aws-sdk";
+import { LLM_CHARGE_EVENTS_TABLE, LlmChargeAuditEvent } from "./llmChargeAuditDb";
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-UsageRecords`;
@@ -71,6 +72,14 @@ export interface UsageRecordIncrement {
    * produced by applying our own rate ("allocated"). Absent on pre-ENG-693 rows.
    */
   costSource?: CostSource;
+  /**
+   * ENG-1251 Greptile P1: how many calls this ONE increment represents.
+   * Every existing caller increments one call at a time and omits this
+   * (defaults to 1, unchanged behavior). The atomic charge-coupled path
+   * below sums a whole charge group's calls into a single increment, so it
+   * must add the true count to callCount, not always 1.
+   */
+  calls?: number;
 }
 
 /** Provenance of a cost figure — see `UsageRecordIncrement.costSource`. */
@@ -125,6 +134,125 @@ function buildSortKey(date: string, model: string, feature: string): string {
   return `${date}#${model}#${feature}`;
 }
 
+/**
+ * Pure builder for the ledger row's atomic increment — shared by the plain
+ * single-item `update()` call (incrementUsage) and the DynamoDB TransactWrite
+ * item used to couple a ledger write with a charge event atomically
+ * (incrementUsageWithChargeEvent). Kept as one function so the two paths can
+ * never drift: whatever incrementUsage writes standalone is byte-identical
+ * to what the atomic path writes as part of a transaction.
+ */
+function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
+  Key: AWS.DynamoDB.DocumentClient.Key;
+  UpdateExpression: string;
+  ExpressionAttributeNames: Record<string, string>;
+  ExpressionAttributeValues: Record<string, any>;
+} {
+  // A per-unit vendor entry counts `quantity`, not tokens. Writing the token
+  // counters as zeros would make "this vendor doesn't bill by tokens"
+  // indistinguishable from "this call used zero tokens", so they're omitted.
+  const isUnitEntry = inc.unit != null;
+  const cacheReadTokens = inc.cacheReadTokens || 0;
+  const cacheWriteTokens = inc.cacheWriteTokens || 0;
+  const totalTokens =
+    inc.inputTokens + inc.outputTokens + cacheReadTokens + cacheWriteTokens;
+  const now = new Date().toISOString();
+  const calls = Math.max(1, Math.round(inc.calls ?? 1));
+
+  const names: Record<string, string> = {
+    "#date": "date",
+    "#model": "model",
+    "#feature": "feature",
+    "#ttl": "ttl",
+  };
+  const values: Record<string, any> = {
+    ":cost": Math.round(inc.costMicroUsd),
+    ":calls": calls,
+    ":date": inc.date,
+    ":model": inc.model,
+    ":feature": inc.feature,
+    ":billing": inc.billingUserId,
+    ":now": now,
+    ":ttl": Math.floor(Date.now() / 1000) + TTL_SECONDS,
+  };
+
+  const addClauses: string[] = [];
+  if (isUnitEntry) {
+    names["#quantity"] = "quantity";
+    values[":qty"] = Math.max(0, Math.round(inc.quantity || 0));
+    addClauses.push("#quantity :qty");
+  } else {
+    Object.assign(values, {
+      ":in": inc.inputTokens,
+      ":out": inc.outputTokens,
+      ":cr": cacheReadTokens,
+      ":cw": cacheWriteTokens,
+      ":tt": totalTokens,
+    });
+    addClauses.push(
+      "inputTokens :in",
+      "outputTokens :out",
+      "cacheReadTokens :cr",
+      "cacheWriteTokens :cw",
+      "totalTokens :tt"
+    );
+  }
+  addClauses.push("costMicroUsd :cost", "callCount :calls");
+
+  const setClauses = [
+    "#date = :date",
+    "#model = :model",
+    "#feature = :feature",
+    "billingUserId = :billing",
+    "updatedAt = :now",
+    "#ttl = if_not_exists(#ttl, :ttl)",
+  ];
+  if (inc.onBehalfOf) {
+    setClauses.push("onBehalfOf = :obo");
+    values[":obo"] = inc.onBehalfOf;
+  }
+
+  // Descriptive (non-counter) attributes of the row. A row is a DAILY AGGREGATE
+  // of N calls, so these are written with if_not_exists: the first writer's
+  // value sticks and the row never flaps between concurrent callers. That is
+  // sound only because each of these is constant across every writer to a given
+  // key — `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`,
+  // so one row cannot mix vendors, units, or cost provenance. All three go through
+  // ExpressionAttributeNames because `unit` is a DynamoDB reserved word.
+  const descriptive: Array<[string, unknown]> = [
+    ["provider", inc.provider],
+    ["unit", inc.unit],
+    ["costSource", inc.costSource],
+  ];
+  for (const [attr, value] of descriptive) {
+    if (value == null) continue;
+    names[`#${attr}`] = attr;
+    values[`:${attr}`] = value;
+    setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
+  }
+
+  // Session is the one call-level fact that is NOT constant across a row. The sort
+  // key is {date}#{model}#{feature}, so N sessions share one bucket while its
+  // counters accumulate all of their usage. Pinning a single id onto that row —
+  // the first (if_not_exists) or the last — reads as "this session owns this
+  // usage" and is false for every session but one. Stored as `lastSessionId`
+  // under plain SET so the attribute name states exactly what it holds: a trace
+  // breadcrumb to the most recent contributing session, never an attribution key.
+  // Session-granular spend would need the session in the sort key, which is a key
+  // change this slice deliberately excludes (see the issue's out-of-scope list).
+  if (inc.sessionId != null) {
+    values[":lastSessionId"] = inc.sessionId;
+    setClauses.push("lastSessionId = :lastSessionId");
+  }
+
+  return {
+    Key: { userId: inc.userId, sk: buildSortKey(inc.date, inc.model, inc.feature) },
+    UpdateExpression: `ADD ${addClauses.join(", ")} SET ${setClauses.join(", ")}`,
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+  };
+}
+
 export const usageRecordDb = {
   tableName: TABLE_NAME,
 
@@ -133,111 +261,82 @@ export const usageRecordDb = {
    * Single UpdateExpression with ADD — creates the row on first write.
    */
   async incrementUsage(inc: UsageRecordIncrement): Promise<void> {
-    // A per-unit vendor entry counts `quantity`, not tokens. Writing the token
-    // counters as zeros would make "this vendor doesn't bill by tokens"
-    // indistinguishable from "this call used zero tokens", so they're omitted.
-    const isUnitEntry = inc.unit != null;
-    const cacheReadTokens = inc.cacheReadTokens || 0;
-    const cacheWriteTokens = inc.cacheWriteTokens || 0;
-    const totalTokens =
-      inc.inputTokens + inc.outputTokens + cacheReadTokens + cacheWriteTokens;
-    const now = new Date().toISOString();
-
-    const names: Record<string, string> = {
-      "#date": "date",
-      "#model": "model",
-      "#feature": "feature",
-      "#ttl": "ttl",
-    };
-    const values: Record<string, any> = {
-      ":cost": Math.round(inc.costMicroUsd),
-      ":one": 1,
-      ":date": inc.date,
-      ":model": inc.model,
-      ":feature": inc.feature,
-      ":billing": inc.billingUserId,
-      ":now": now,
-      ":ttl": Math.floor(Date.now() / 1000) + TTL_SECONDS,
-    };
-
-    const addClauses: string[] = [];
-    if (isUnitEntry) {
-      names["#quantity"] = "quantity";
-      values[":qty"] = Math.max(0, Math.round(inc.quantity || 0));
-      addClauses.push("#quantity :qty");
-    } else {
-      Object.assign(values, {
-        ":in": inc.inputTokens,
-        ":out": inc.outputTokens,
-        ":cr": cacheReadTokens,
-        ":cw": cacheWriteTokens,
-        ":tt": totalTokens,
-      });
-      addClauses.push(
-        "inputTokens :in",
-        "outputTokens :out",
-        "cacheReadTokens :cr",
-        "cacheWriteTokens :cw",
-        "totalTokens :tt"
-      );
-    }
-    addClauses.push("costMicroUsd :cost", "callCount :one");
-
-    const setClauses = [
-      "#date = :date",
-      "#model = :model",
-      "#feature = :feature",
-      "billingUserId = :billing",
-      "updatedAt = :now",
-      "#ttl = if_not_exists(#ttl, :ttl)",
-    ];
-    if (inc.onBehalfOf) {
-      setClauses.push("onBehalfOf = :obo");
-      values[":obo"] = inc.onBehalfOf;
-    }
-
-    // Descriptive (non-counter) attributes of the row. A row is a DAILY AGGREGATE
-    // of N calls, so these are written with if_not_exists: the first writer's
-    // value sticks and the row never flaps between concurrent callers. That is
-    // sound only because each of these is constant across every writer to a given
-    // key — `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`,
-    // so one row cannot mix vendors, units, or cost provenance. All three go through
-    // ExpressionAttributeNames because `unit` is a DynamoDB reserved word.
-    const descriptive: Array<[string, unknown]> = [
-      ["provider", inc.provider],
-      ["unit", inc.unit],
-      ["costSource", inc.costSource],
-    ];
-    for (const [attr, value] of descriptive) {
-      if (value == null) continue;
-      names[`#${attr}`] = attr;
-      values[`:${attr}`] = value;
-      setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
-    }
-
-    // Session is the one call-level fact that is NOT constant across a row. The sort
-    // key is {date}#{model}#{feature}, so N sessions share one bucket while its
-    // counters accumulate all of their usage. Pinning a single id onto that row —
-    // the first (if_not_exists) or the last — reads as "this session owns this
-    // usage" and is false for every session but one. Stored as `lastSessionId`
-    // under plain SET so the attribute name states exactly what it holds: a trace
-    // breadcrumb to the most recent contributing session, never an attribution key.
-    // Session-granular spend would need the session in the sort key, which is a key
-    // change this slice deliberately excludes (see the issue's out-of-scope list).
-    if (inc.sessionId != null) {
-      values[":lastSessionId"] = inc.sessionId;
-      setClauses.push("lastSessionId = :lastSessionId");
-    }
-
+    const params = buildIncrementUsageUpdate(inc);
     await getDocumentClient()
-      .update({
-        TableName: TABLE_NAME,
-        Key: { userId: inc.userId, sk: buildSortKey(inc.date, inc.model, inc.feature) },
-        UpdateExpression: `ADD ${addClauses.join(", ")} SET ${setClauses.join(", ")}`,
-        ExpressionAttributeNames: names,
-        ExpressionAttributeValues: values,
-      })
+      .update({ TableName: TABLE_NAME, ...params })
       .promise();
+  },
+
+  /**
+   * ENG-1251 Greptile P1 ("Coverage suppresses unrelated aggregate usage"):
+   * couples this ledger increment with its paired charge event in ONE
+   * DynamoDB transaction, so the two either both land or neither does.
+   *
+   * Before this, internalUsage.ts pre-checked the charge event via a
+   * standalone recordLlmChargeEvent() call, then wrote the ledger row as a
+   * SEPARATE step. recordUsage() is fail-open by design (never throws), so a
+   * real write failure on that second step left the charge event recorded
+   * with NO matching ledger contribution. Reconciliation still matched the
+   * event to whatever pre-existing aggregate row shared its (actor, date,
+   * model, feature) key and subtracted the event's tokens/calls from it —
+   * discarding real usage that row's OWN successful writes actually
+   * represented, usage the failed write never contributed in the first
+   * place. Structural fix: an atomic transaction makes "charge event exists
+   * but its own ledger contribution doesn't" impossible going forward, so
+   * reconciliation's assumption (an event's coverage always has a matching
+   * ledger contribution) is sound rather than merely usually true.
+   *
+   * Returns:
+   *  - "applied": both items were written.
+   *  - "duplicate": the charge event already existed (confirmed retry) —
+   *    neither item was written this call; the caller must not also skip
+   *    writing the ledger via ANY other path, since a genuinely-new-but-
+   *    unwritten contribution would then be lost forever.
+   *  - "conflict": a transient DynamoDB contention error (not a confirmed
+   *    duplicate) — the caller should fail toward writing via its own
+   *    non-atomic fallback, per this route's existing "undercounting is
+   *    worse than an occasional double-count" policy.
+   */
+  async incrementUsageWithChargeEvent(
+    inc: UsageRecordIncrement,
+    chargeEvent: LlmChargeAuditEvent
+  ): Promise<"applied" | "duplicate" | "conflict"> {
+    const ledgerParams = buildIncrementUsageUpdate(inc);
+    const ledgerItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: { TableName: TABLE_NAME, ...ledgerParams },
+    };
+    const chargeItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Put: {
+        TableName: LLM_CHARGE_EVENTS_TABLE,
+        Item: { ...chargeEvent, ttl: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60 },
+        // Same guard as recordLlmChargeEvent's standalone put.
+        ConditionExpression: "attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)",
+      },
+    };
+
+    try {
+      await getDocumentClient()
+        .transactWrite({ TransactItems: [ledgerItem, chargeItem] })
+        .promise();
+      return "applied";
+    } catch (error: any) {
+      // Same classification as db.ts's applyMonthlyChargeAtomic: a
+      // TransactWriteItems condition failure surfaces as
+      // TransactionCanceledException with a per-item CancellationReasons
+      // array (index order matches TransactItems: 0 = ledger, 1 = charge),
+      // not the single-item ConditionalCheckFailedException recordLlmChargeEvent
+      // catches on its own standalone put.
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      if (error?.code === "TransactionConflictException") return "conflict";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "duplicate";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "conflict";
+      }
+      throw error;
+    }
   },
 
   /**

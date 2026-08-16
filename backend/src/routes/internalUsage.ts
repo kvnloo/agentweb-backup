@@ -33,7 +33,7 @@ import { createHash } from "crypto";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../services/usageRecorderService";
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
-import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
+import { usageRecordDb } from "../services/usageRecordDb";
 
 const router = express.Router();
 
@@ -172,6 +172,15 @@ router.post(
           // into one entry, so the entry's own "call count" is NOT 1.
           calls: number;
           recordFingerprints: string[];
+          // ENG-1251 Greptile P1 ("coverage suppresses unrelated aggregate
+          // usage"): tracked per-dimension (not just the combined `tokens`
+          // above) so the atomic ledger+charge-event write below can
+          // populate the ledger row's separate counters directly from this
+          // group, instead of via N separate per-record recordUsage() calls.
+          inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number;
+          // First non-empty provider wins -- matches the ledger row's own
+          // if_not_exists(provider) semantic (first writer sticks).
+          provider: string;
         }
       >();
 
@@ -225,6 +234,8 @@ router.post(
         const cacheWriteTokens = isNonNegativeFiniteNumber(record.cacheWriteTokens)
           ? record.cacheWriteTokens!
           : 0;
+        const recordProvider =
+          typeof record.provider === "string" && record.provider ? record.provider : "unknown";
 
         // Charge the RESOLVED user, never the record's claim — otherwise any
         // engine token could drain someone else's quota by naming them.
@@ -235,7 +246,11 @@ router.post(
           chargeKey = [userId, record.model, chargeFeature].join("\u0001");
           const entry =
             charges.get(chargeKey) ||
-            { userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0, recordFingerprints: [] };
+            {
+              userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0,
+              recordFingerprints: [], inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+              provider: recordProvider,
+            };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
           entry.cost +=
@@ -247,6 +262,10 @@ router.post(
               cacheWriteTokens
             ) / 1e6;
           entry.calls += 1;
+          entry.inputTokens += record.inputTokens!;
+          entry.outputTokens += record.outputTokens!;
+          entry.cacheReadTokens += cacheReadTokens;
+          entry.cacheWriteTokens += cacheWriteTokens;
           // ENG-1251: fingerprint the record's own content, not just its
           // taskId. A single task can legitimately submit usage across
           // multiple separate batches (e.g. a long-running task reporting
@@ -345,54 +364,82 @@ router.post(
         eventIdByChargeKey.set(chargeKey, eventId);
       }
 
-      // ENG-1251 Greptile P1 ("retries duplicate aggregate usage"): the
-      // ledger write (recordUsage, an unconditional ADD with no idempotency
-      // concept) previously ran for every record regardless of whether its
-      // charge group was a genuine retry. A retried batch's charge event
-      // correctly no-op'd via recordLlmChargeEvent's conditional put, but
-      // the ledger row got incremented a second time anyway, and
-      // reconciliation reported that phantom increment as real uncovered
-      // usage. Pre-checking each group's idempotency HERE, before any
-      // ledger write, lets a confirmed retry skip its ledger contribution
-      // entirely -- the exact same conditional-write primitive
-      // incrementUserTokenUsage uses internally, called directly so this
-      // route can see the true/false outcome before deciding what to write.
-      const isNewChargeByKey = new Map<string, boolean>();
+      // ENG-1251 Greptile P1 ("retries duplicate aggregate usage" +
+      // "coverage suppresses unrelated aggregate usage"): the ledger write
+      // for a charged group and its paired charge event are now written in
+      // ONE DynamoDB transaction (usageRecordDb.incrementUsageWithChargeEvent)
+      // instead of two independent steps. This closes both findings at once:
+      // a retried batch's charge event no-ops AND its ledger contribution is
+      // skipped together (never independently duplicated), and a real ledger
+      // write failure can no longer leave a charge event recorded with no
+      // matching ledger contribution for reconciliation to (wrongly) assume
+      // exists. Built directly from each charge GROUP (not per record) since
+      // every record in a group shares the exact same (userId, date, model,
+      // feature) ledger row by construction (chargeKey = userId+model+feature,
+      // date is the single batch-wide requestDate).
+      const chargeOutcomeByKey = new Map<string, "applied" | "duplicate" | "conflict" | "error">();
       await Promise.all(
-        [...charges.entries()].map(async ([chargeKey, { userId, model, feature, tokens, cost, calls }]) => {
+        [...charges.entries()].map(async ([chargeKey, entry]) => {
           const eventId = eventIdByChargeKey.get(chargeKey)!;
+          const billingUserId = billingUserIdByActor.get(entry.userId) || entry.userId;
+          const costMicroUsd = Math.max(0, Math.round(entry.cost * 1_000_000));
           try {
-            const isNew = await recordLlmChargeEvent({
-              billingUserId: billingUserIdByActor.get(userId) || userId,
-              eventId,
-              occurredAt: requestReceivedAt.toISOString(),
-              actingUserId: userId,
-              tokens: Math.max(0, Math.round(tokens)),
-              costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
-              model,
-              feature,
-              calls,
-            });
-            isNewChargeByKey.set(chargeKey, isNew);
+            const outcome = await usageRecordDb.incrementUsageWithChargeEvent(
+              {
+                userId: entry.userId,
+                date: requestDate,
+                model: entry.model,
+                feature: entry.feature,
+                inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
+                cacheReadTokens: entry.cacheReadTokens,
+                cacheWriteTokens: entry.cacheWriteTokens,
+                costMicroUsd,
+                billingUserId,
+                costSource: "allocated",
+                provider: entry.provider,
+                calls: entry.calls,
+              },
+              {
+                billingUserId,
+                eventId,
+                occurredAt: requestReceivedAt.toISOString(),
+                actingUserId: entry.userId,
+                tokens: Math.max(0, Math.round(entry.tokens)),
+                costMicroUsd,
+                model: entry.model,
+                feature: entry.feature,
+                calls: entry.calls,
+              }
+            );
+            chargeOutcomeByKey.set(chargeKey, outcome);
           } catch (err) {
-            console.error(`[internalUsage] idempotency pre-check failed for eventId=${eventId}:`, err);
-            // Fail toward writing the ledger: an ambiguous outcome (a
-            // genuine infra error, not a confirmed "already recorded") is
-            // not proof of a retry, and undercounting real usage is worse
-            // than an occasional double-count under a real error.
-            isNewChargeByKey.set(chargeKey, true);
+            console.error(`[internalUsage] atomic ledger+charge write failed for eventId=${eventId}:`, err);
+            chargeOutcomeByKey.set(chargeKey, "error");
           }
         })
       );
 
-      // Ledger writes: always for uncharged (system) records; for charged
-      // records, only when the pre-check above confirmed this group is
-      // genuinely new. recordUsage is fail-open by contract (always
-      // resolves) -- unaffected by this gating, which happens before it's
-      // ever called.
+      // Ledger writes: always for uncharged (system) records (unaffected by
+      // any of this -- they never had a charge event to couple with).
+      //
+      // For charged records: "applied" already wrote the ledger row
+      // atomically above -- nothing more to do. "duplicate" is a confirmed
+      // retry -- the group's ledger contribution was already written the
+      // first time this exact charge was recorded, so skipping here is
+      // correct, not a gap (this is the ENG-1251 "retries duplicate
+      // aggregate usage" fix). "conflict"/"error" are ambiguous, not a
+      // confirmed duplicate -- fall back to the pre-atomic per-record write
+      // path so a real infra error never silently drops real usage
+      // (undercounting is worse than an occasional double-count).
       const writes: Promise<void>[] = [];
       for (const pending of pendingWrites) {
-        if (pending.chargeKey === null || isNewChargeByKey.get(pending.chargeKey)) {
+        if (pending.chargeKey === null) {
+          writes.push(recordUsage(pending.ctx));
+          continue;
+        }
+        const outcome = chargeOutcomeByKey.get(pending.chargeKey);
+        if (outcome === "conflict" || outcome === "error") {
           writes.push(recordUsage(pending.ctx));
         }
       }
@@ -402,13 +449,13 @@ router.post(
       // ledger writes above: the engine treats ingestion as best-effort, so
       // surfacing a 500 here would only make it retry, and a retry hits
       // this endpoint with no server-side signal that it already applied
-      // the first attempt. Runs unconditionally (not gated on
-      // isNewChargeByKey) -- a prior attempt could have recorded the event
-      // above and then been interrupted before reaching the atomic apply
-      // (crash, timeout), so a "duplicate" pre-check result must still
-      // retry the apply step; incrementUserTokenUsage's own
+      // the first attempt. Runs unconditionally (not gated on the atomic
+      // write's outcome) -- a prior attempt could have recorded the charge
+      // event and then been interrupted before reaching the atomic counter
+      // apply (crash, timeout), so a "duplicate"/"applied" outcome must
+      // still retry the apply step; incrementUserTokenUsage's own
       // recordLlmChargeEvent call simply no-ops when it finds the event
-      // already recorded by the pre-check above.
+      // already recorded above.
       await Promise.all(
         [...charges.entries()].map(([chargeKey, { userId, model, feature, tokens, cost, calls }]) => {
           const eventId = eventIdByChargeKey.get(chargeKey)!;

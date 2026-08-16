@@ -42,14 +42,19 @@ jest.mock("../middleware/auth", () => ({
 
 const mockRecordUsage = jest.fn().mockResolvedValue(undefined);
 const mockIncrementUserTokenUsage = jest.fn().mockResolvedValue(undefined);
-// ENG-1251 Greptile P1: internalUsage.ts now pre-checks each charge group's
-// idempotency directly via recordLlmChargeEvent, BEFORE deciding whether to
-// write its ledger rows (a confirmed duplicate skips the ledger write
-// entirely, closing the "retries duplicate aggregate usage" finding).
-// Defaults to true ("genuinely new charge") so every existing test's
-// ledger-write expectations are unaffected unless a test opts into
-// simulating a duplicate.
-const mockRecordLlmChargeEvent = jest.fn().mockResolvedValue(true);
+// ENG-1251 Greptile P1 ("Coverage suppresses unrelated aggregate usage"): a
+// charged group's ledger write and its paired charge event are now written
+// atomically in one DynamoDB transaction (usageRecordDb.incrementUsageWithChargeEvent) --
+// closing BOTH "retries duplicate aggregate usage" (the pre-check era's fix)
+// AND the deeper finding that a real ledger-write failure could leave a
+// charge event recorded with no matching ledger contribution.
+//
+// Default "applied": a clean transaction, ledger + charge event both written
+// atomically -- so recordUsage() (the plain per-record ledger call) is NOT
+// invoked for a charged record in the default/happy-path case any more. It
+// is only invoked for uncharged ("system") records and the "conflict"/"error"
+// non-atomic fallback path -- tests exercising those override this per-call.
+const mockIncrementUsageWithChargeEvent = jest.fn().mockResolvedValue("applied");
 
 jest.mock("../services/usageRecorderService", () => ({
   ...jest.requireActual("../services/usageRecorderService"),
@@ -62,8 +67,10 @@ jest.mock("../services/tokenUsageService", () => ({
   // "same as input" (no pooling) -- no test in this file exercises pooling.
   resolveBillingUserId: (userId: string) => Promise.resolve(userId),
 }));
-jest.mock("../services/llmChargeAuditDb", () => ({
-  recordLlmChargeEvent: (...args: unknown[]) => mockRecordLlmChargeEvent(...args),
+jest.mock("../services/usageRecordDb", () => ({
+  usageRecordDb: {
+    incrementUsageWithChargeEvent: (...args: unknown[]) => mockIncrementUsageWithChargeEvent(...args),
+  },
 }));
 
 import internalUsageRoutes from "../routes/internalUsage";
@@ -97,8 +104,8 @@ beforeEach(() => {
   // set via mockImplementation()/mockResolvedValue() -- a test that installs
   // a custom implementation (e.g. the mixed-batch duplicate test below)
   // would otherwise leak it into every later test in this file. Restore the
-  // "genuinely new charge" default explicitly every test.
-  mockRecordLlmChargeEvent.mockResolvedValue(true);
+  // "clean atomic write" default explicitly every test.
+  mockIncrementUsageWithChargeEvent.mockResolvedValue("applied");
 });
 
 describe("POST /api/internal/usage — charges the per-user quota", () => {
@@ -116,15 +123,21 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(cost).toBeCloseTo(5, 5); // 1M input tokens at $5/M
   });
 
-  it("charges ONCE with the batch summed, not once per record", async () => {
+  it("writes the ledger contribution ONCE via the atomic charge write, with the batch summed -- not once per record", async () => {
     const res = await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record(), record(), record()] });
 
     expect(res.status).toBe(202);
-    // Three ledger rows, one charge.
-    expect(mockRecordUsage).toHaveBeenCalledTimes(3);
+    // Three records in the SAME (userId, model, feature) charge group share
+    // one ledger row by construction -- the atomic write sums them into ONE
+    // combined increment, not three separate recordUsage() calls.
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+    const [ledgerInc] = mockIncrementUsageWithChargeEvent.mock.calls[0];
+    expect(ledgerInc.inputTokens).toBe(3_000_000);
+    expect(ledgerInc.calls).toBe(3);
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
     const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
     expect(tokens).toBe(3_000_000);
@@ -141,7 +154,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(audit?.calls).toBe(3);
   });
 
-  it("ENG-1251 Greptile P1: the ledger row's date and the charge event's occurredAt are derived from the SAME instant", async () => {
+  it("ENG-1251 Greptile P1: the ledger increment's date and the charge event's occurredAt are derived from the SAME instant", async () => {
     // Two independent `new Date()` calls a few awaits apart could straddle
     // a UTC-midnight boundary, landing the ledger row and the charge event
     // on different dates -- breaking the (date, model, feature) key the
@@ -152,11 +165,10 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record()] });
 
-    const recordDate = mockRecordUsage.mock.calls[0][0].date;
-    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(recordDate).toBeDefined();
-    expect(audit?.occurredAt).toBeDefined();
-    expect(audit.occurredAt.slice(0, 10)).toBe(recordDate);
+    const [ledgerInc, chargeEvent] = mockIncrementUsageWithChargeEvent.mock.calls[0];
+    expect(ledgerInc.date).toBeDefined();
+    expect(chargeEvent.occurredAt).toBeDefined();
+    expect(chargeEvent.occurredAt.slice(0, 10)).toBe(ledgerInc.date);
   });
 
   it("counts cache tokens in both the charge and its cost", async () => {
@@ -241,7 +253,7 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ model: "some-unlisted-model-xyz" })] });
 
-    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
     const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
     expect(tokens).toBe(1_000_000);
     expect(cost).toBe(0);
@@ -271,8 +283,12 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
 
     expect(res.status).toBe(202);
     // Still recorded — platform overhead must stay visible in the ledger.
+    // Uncharged records have no charge group to pair with, so they always go
+    // through the plain (non-atomic) recordUsage() path, unaffected by any
+    // of the atomic-write machinery above.
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    expect(mockIncrementUsageWithChargeEvent).not.toHaveBeenCalled();
   });
 
   it("never lets a metering failure fail the ingestion", async () => {
@@ -318,8 +334,8 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
 
     // Same task, identical record content resubmitted (e.g. engine retry /
     // crash-restart) — must derive the identical eventId, which is what lets
-    // recordLlmChargeEvent's conditional write turn this into a no-op
-    // instead of a second charge.
+    // the atomic write's conditional put turn this into a no-op instead of
+    // a second charge.
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
@@ -559,14 +575,27 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
   });
 });
 
-describe("POST /api/internal/usage — a confirmed duplicate charge skips its ledger write (ENG-1251 Greptile P1: retries duplicate aggregate usage)", () => {
-  it("does not call recordUsage when the pre-check confirms this charge group already exists", async () => {
-    // recordLlmChargeEvent's conditional put returning false means: this
-    // exact eventId was already recorded by a prior attempt. The ledger
-    // contribution for that attempt was already written -- writing it
-    // again here would double the daily aggregate while the charge event
-    // (correctly) stays applied exactly once.
-    mockRecordLlmChargeEvent.mockResolvedValueOnce(false);
+describe("POST /api/internal/usage — atomic ledger+charge write outcomes (ENG-1251 Greptile P1: retries duplicate aggregate usage + coverage suppresses unrelated aggregate usage)", () => {
+  it("on a clean write (\"applied\"), the ledger contribution goes through the atomic call, not the separate recordUsage() fallback", async () => {
+    mockIncrementUsageWithChargeEvent.mockResolvedValueOnce("applied");
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "fresh-report-id" });
+
+    expect(res.status).toBe(202);
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it("on a confirmed duplicate (\"duplicate\"), neither the atomic write nor the recordUsage() fallback double-writes the ledger", async () => {
+    // "duplicate" means the transaction's conditional put on the charge event
+    // failed -- this exact eventId (and by construction, its paired ledger
+    // contribution) was already recorded by a prior attempt. Writing again
+    // via ANY path would double the daily aggregate.
+    mockIncrementUsageWithChargeEvent.mockResolvedValueOnce("duplicate");
 
     const res = await request(app)
       .post("/api/internal/usage")
@@ -581,25 +610,24 @@ describe("POST /api/internal/usage — a confirmed duplicate charge skips its le
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("calls recordUsage normally when the pre-check confirms this is a genuinely new charge", async () => {
-    mockRecordLlmChargeEvent.mockResolvedValueOnce(true);
+  it("on a transient conflict (\"conflict\", not a confirmed duplicate), falls back to the non-atomic recordUsage() write so real usage is never silently dropped", async () => {
+    mockIncrementUsageWithChargeEvent.mockResolvedValueOnce("conflict");
 
     const res = await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
-      .send({ records: [record({ taskId: "task-abc" })], reportId: "fresh-report-id" });
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "conflict-report-id" });
 
     expect(res.status).toBe(202);
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("only skips the ledger write for the DUPLICATE group in a mixed batch, not the whole batch", async () => {
+  it("only the DUPLICATE group in a mixed batch skips its ledger write -- the genuinely new group still writes atomically, neither goes through the fallback", async () => {
     // Two charge groups (different models): the opus-5 one is a confirmed
-    // duplicate, the gemini one is genuinely new. Only the duplicate's
-    // ledger contribution should be skipped.
-    mockRecordLlmChargeEvent.mockImplementation(async (event: { model?: string }) =>
-      event.model === "anthropic.claude-opus-5" ? false : true
+    // duplicate, the gemini one is genuinely new.
+    mockIncrementUsageWithChargeEvent.mockImplementation(async (inc: { model?: string }) =>
+      inc.model === "anthropic.claude-opus-5" ? "duplicate" : "applied"
     );
 
     const res = await request(app)
@@ -614,16 +642,38 @@ describe("POST /api/internal/usage — a confirmed duplicate charge skips its le
       });
 
     expect(res.status).toBe(202);
-    // Only the gemini record's ledger row was written.
-    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ model: "gemini-2.5-pro" });
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(2);
+    // Neither group ever reaches the non-atomic fallback: "applied" wrote its
+    // ledger row atomically, "duplicate" correctly skipped writing at all.
+    expect(mockRecordUsage).not.toHaveBeenCalled();
     // Both charge groups still get their counter-apply attempt.
     expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
   });
 
+  it("a conflict/error in one group's atomic write does not affect a sibling group's clean atomic write in the same batch", async () => {
+    mockIncrementUsageWithChargeEvent.mockImplementation(async (inc: { model?: string }) =>
+      inc.model === "anthropic.claude-opus-5" ? "conflict" : "applied"
+    );
+
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({
+        records: [
+          record({ model: "anthropic.claude-opus-5", taskId: "task-a" }),
+          record({ model: "gemini-2.5-pro", taskId: "task-b" }),
+        ],
+        reportId: "mixed-conflict-report-id",
+      });
+
+    // Only the conflicted group's record falls back to recordUsage().
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ model: "anthropic.claude-opus-5" });
+  });
+
   it("still writes the ledger row for an uncharged (system) record even when other charge groups in the batch are duplicates", async () => {
     // No mockResolvedValueOnce queued here on purpose: a system-attributed
-    // record never reaches the pre-check at all (asserted below), so a
+    // record never reaches the atomic write at all (asserted below), so a
     // queued "once" value would sit unconsumed and leak into the very next
     // test's call to this same mock instead (clearAllMocks() drains call
     // history, not a pending mockResolvedValueOnce queue).
@@ -635,7 +685,7 @@ describe("POST /api/internal/usage — a confirmed duplicate charge skips its le
     // batch is not directly expressible with this route's attribution
     // rule (system comes from the AUTHENTICATED caller, not per-record).
     // Exercise it directly: a system-authenticated submission is never
-    // charged at all, so the pre-check/gating path must not touch it.
+    // charged at all, so the atomic write's gating path must not touch it.
     const res = await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${systemToken}`)
@@ -644,12 +694,12 @@ describe("POST /api/internal/usage — a confirmed duplicate charge skips its le
     expect(res.status).toBe(202);
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
-    // "system" is never charged, so the duplicate pre-check never runs for it.
-    expect(mockRecordLlmChargeEvent).not.toHaveBeenCalled();
+    // "system" is never charged, so the atomic write never runs for it.
+    expect(mockIncrementUsageWithChargeEvent).not.toHaveBeenCalled();
   });
 
-  it("fails toward writing the ledger when the pre-check itself errors (ambiguous, not a confirmed duplicate)", async () => {
-    mockRecordLlmChargeEvent.mockRejectedValueOnce(new Error("DynamoDB unavailable"));
+  it("falls back to writing the ledger when the atomic write itself throws (ambiguous, not a confirmed duplicate)", async () => {
+    mockIncrementUsageWithChargeEvent.mockRejectedValueOnce(new Error("DynamoDB unavailable"));
 
     const res = await request(app)
       .post("/api/internal/usage")
@@ -660,6 +710,8 @@ describe("POST /api/internal/usage — a confirmed duplicate charge skips its le
     // An error is not proof of a duplicate -- undercounting real usage is
     // worse than an occasional double-count under a genuine infra error.
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    // The counter apply still proceeds regardless.
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -687,8 +739,8 @@ describe("POST /api/internal/usage — engine spend is separable in the ledger",
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record()] });
 
-    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUsageWithChargeEvent.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
   });
 
   it("preserves a more specific feature rather than flattening it", async () => {
@@ -697,7 +749,7 @@ describe("POST /api/internal/usage — engine spend is separable in the ledger",
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ feature: "deep_research" })] });
 
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:deep_research" });
+    expect(mockIncrementUsageWithChargeEvent.mock.calls[0][0]).toMatchObject({ feature: "engine:deep_research" });
   });
 
   it("does not double-prefix an already-namespaced feature", async () => {
@@ -706,7 +758,7 @@ describe("POST /api/internal/usage — engine spend is separable in the ledger",
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ feature: "engine:agent_task" })] });
 
-    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
+    expect(mockIncrementUsageWithChargeEvent.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
   });
 
   it("labels without changing what the user is charged", async () => {
