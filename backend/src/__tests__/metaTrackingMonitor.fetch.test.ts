@@ -272,11 +272,28 @@ describe('fetchDailyAdAccountActivity — pagination', () => {
     expect(result.excludedObjectives!.sort()).toEqual(['LINK_CLICKS', 'OUTCOME_ENGAGEMENT']);
   });
 
-  it('stops at a page bound rather than following a pathological loop', async () => {
+  it('refuses to judge a window still paging at the cap, rather than returning it partially', async () => {
+    // Exhausting the cap with pages outstanding is not a complete read. Returning what we
+    // have presents a truncated window as a whole one — indistinguishable from genuinely
+    // reduced spend, and able to produce a false blackout or hide a real one.
     const fetchImpl = jest.fn().mockResolvedValue(page([row('2026-08-14', 'OUTCOME_LEADS', 1)], 'https://forever'));
+
     const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+
     expect(fetchImpl.mock.calls.length).toBeLessThanOrEqual(25);
+    expect(result.status).toBe('fetch_error');
+    expect(result.days).toEqual([]);
+    expect(result.error).toMatch(/pages|incomplete/i);
+  });
+
+  it('returns ok when the last page has no further paging', async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 10)], 'https://n'))
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 5)]));
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
     expect(result.status).toBe('ok');
+    expect(result.days[0].spend).toBe(15);
   });
 
   it('a failure on a LATER page discards the whole read rather than reporting a partial one', async () => {

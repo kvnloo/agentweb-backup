@@ -401,6 +401,23 @@ export async function fetchDailyAdAccountActivity(
       }
 
       url = typeof body?.paging?.next === 'string' ? body.paging.next : '';
+
+      // Exhausting the cap with pages still outstanding is NOT a complete read. Returning
+      // what we have would present a truncated window as a whole one — indistinguishable
+      // from genuinely reduced spend, and able to produce either a false blackout or a
+      // missed one. Same rule as a failure on a later page: no answer beats a partial one
+      // dressed as complete (Greptile P1 on #2420, second pass).
+      if (url && page === MAX_INSIGHTS_PAGES - 1) {
+        console.warn(
+          `${TAG} ${adAccountId}: campaign insights still paging after ${MAX_INSIGHTS_PAGES} ` +
+          `pages — refusing to judge a truncated window`,
+        );
+        return {
+          status: 'fetch_error',
+          days: [],
+          error: `insights exceeded ${MAX_INSIGHTS_PAGES} pages; window incomplete`,
+        };
+      }
     }
   } catch (error: any) {
     // A network failure must never abort the sweep — the next account still needs checking.
