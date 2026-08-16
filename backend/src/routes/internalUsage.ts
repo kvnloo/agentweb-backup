@@ -119,7 +119,7 @@ router.post(
       // charging per record would mean hundreds of contended sequential writes
       // for a single task run. Ledger rows stay granular (they are keyed by
       // model+feature); only the deduction is aggregated.
-      const charges = new Map<string, { tokens: number; cost: number }>();
+      const charges = new Map<string, { tokens: number; cost: number; taskIds: Set<string> }>();
 
       for (const record of records) {
         if (!isValidRecord(record)) {
@@ -144,7 +144,7 @@ router.post(
         // engine token could drain someone else's quota by naming them.
         // "system" is platform overhead with no one to bill, so it is skipped.
         if (userId && userId !== "system") {
-          const entry = charges.get(userId) || { tokens: 0, cost: 0 };
+          const entry = charges.get(userId) || { tokens: 0, cost: 0, taskIds: new Set<string>() };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
           entry.cost +=
@@ -155,6 +155,9 @@ router.post(
               cacheReadTokens,
               cacheWriteTokens
             ) / 1e6;
+          if (typeof record.taskId === "string" && record.taskId.trim()) {
+            entry.taskIds.add(record.taskId.trim());
+          }
           charges.set(userId, entry);
         }
 
@@ -182,16 +185,33 @@ router.post(
 
       // Apply the aggregated quota charges. Fail-open, exactly like the ledger
       // writes above: the engine treats ingestion as best-effort, so surfacing a
-      // 500 here would only make it retry and double-charge.
+      // 500 here would only make it retry — and a retry (or an engine worker
+      // that crashes and resubmits a task's usage after restart) hits this
+      // endpoint with no server-side signal that it already applied the first
+      // attempt. ENG-1251: derive a stable idempotency key from the resolved
+      // user plus the set of taskIds that contributed to this charge, so a
+      // resubmission of the SAME task's usage collapses to a no-op via
+      // recordLlmChargeEvent's conditional write instead of a second charge.
+      // Falls back to no key (today's behavior — best-effort, not idempotent)
+      // only when no record in this user's aggregate carried a taskId.
       await Promise.all(
-        [...charges.entries()].map(([userId, { tokens, cost }]) =>
-          incrementUserTokenUsage(userId, tokens, cost).catch((err: unknown) =>
+        [...charges.entries()].map(([userId, { tokens, cost, taskIds }]) => {
+          const eventId =
+            taskIds.size > 0
+              ? `engine:${userId}:${[...taskIds].sort().join(",")}`
+              : undefined;
+          return incrementUserTokenUsage(
+            userId,
+            tokens,
+            cost,
+            eventId ? { eventId, feature: "engine" } : undefined
+          ).catch((err: unknown) =>
             console.error(
               `[internalUsage] failed to charge usage for ${userId}:`,
               err
             )
-          )
-        )
+          );
+        })
       );
 
       return res.status(202).json({ accepted, skipped });

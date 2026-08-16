@@ -205,6 +205,87 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
   });
 });
 
+describe("POST /api/internal/usage — idempotent against a resubmitted batch (ENG-1251)", () => {
+  // This endpoint is fail-open by contract (202 regardless of charge success),
+  // so the engine has no signal telling it whether a submission already landed.
+  // A network timeout, or a worker that crashes mid-task and resubmits after
+  // restart, can resend the SAME task's usage. Without a stable eventId, that
+  // resubmission is a second full charge with no corresponding ledger evidence
+  // of it being a duplicate — the exact shape of an unreconcilable counter/
+  // ledger divergence.
+  it("derives eventId from userId + taskId so a resubmitted batch carries the same key", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })] });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit).toMatchObject({ eventId: "engine:user-1:task-abc" });
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    // Same task resubmitted (e.g. engine retry / crash-restart) — must derive
+    // the identical eventId, which is what lets recordLlmChargeEvent's
+    // conditional write turn this into a no-op instead of a second charge.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })] });
+
+    const [, , , retryAudit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(retryAudit).toMatchObject({ eventId: "engine:user-1:task-abc" });
+  });
+
+  it("derives a different eventId for a genuinely different task", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-one" })] });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-two" })] });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(first.eventId).not.toBe(second.eventId);
+  });
+
+  it("combines multiple taskIds contributing to one user's aggregate charge, order-independent", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-b" }), record({ taskId: "task-a" })] });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    // Same two tasks, reported in the opposite order — must still collapse to
+    // the same key.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-a" }), record({ taskId: "task-b" })] });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(first.eventId).toBe(second.eventId);
+    expect(first.eventId).toBe("engine:user-1:task-a,task-b");
+  });
+
+  it("falls back to no eventId when no record carries a taskId (unchanged best-effort behavior)", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record()] });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit).toBeUndefined();
+  });
+});
+
 describe("POST /api/internal/usage — engine spend is separable in the ledger", () => {
   /**
    * The ledger's sort key is `{date}#{model}#{feature}`, so `feature` is the only
