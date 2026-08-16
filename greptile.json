@@ -1,5 +1,5 @@
 {
-  "triggerOnUpdates": true,
+  "triggerOnUpdates": false,
   "statusCheck": true,
   "fixWithAI": true
 }

@@ -367,6 +367,9 @@ jobs:
       - name: Run greptile-gate.sh regression suite
         run: bash .github/scripts/greptile-gate.test.sh
 
+      - name: Run greptile-request-review.sh regression suite
+        run: bash .github/scripts/greptile-request-review.test.sh
+
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
@@ -446,6 +449,18 @@ jobs:
   # It now reads the score and the reviewed-commit pointer out of the comment
   # body and fails closed. See .github/scripts/greptile-gate.sh for why the
   # comment is the only source of the score.
+  #
+  # ENG-1282: greptile.json sets `triggerOnUpdates: false`, so Greptile no
+  # longer auto-reviews every push to an already-ready PR — only `opened` and
+  # `ready_for_review` do (Greptile's own default; PRs here averaged 6.4 pushes
+  # before merge, max 50, and Greptile bills $1/review past 50/seat/month, so
+  # that was $1 per push, not per PR). A push after the first review therefore
+  # leaves this job polling for a review that will never arrive until someone
+  # deliberately asks for one via `.github/scripts/greptile-request-review.sh`
+  # — call it once per batch of fixes, not once per push, or this reintroduces
+  # the exact cost it removes. Until that's called, this job fails closed
+  # (unavailable) exactly as it did for any other missing review — that is the
+  # existing, correct behavior, not a regression.
   greptile-review:
     name: Require Greptile Review
     needs: detect-changes
