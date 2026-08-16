@@ -256,3 +256,48 @@ describe('monitorUserTracking — the alert carries its diagnosis', () => {
     expect(alerts[0].context['Alert Class']).toBe(BLACKOUT_ALERT_CLASS);
   });
 });
+
+describe('monitorUserTracking — the objective filter must be observable', () => {
+  it('rolls excluded objectives into the summary', async () => {
+    // A filter nobody can see is indistinguishable from a broken detector. Someone asking
+    // "why does this spending account never alert" must find the answer without reading
+    // the source (Greptile P2 on #2420).
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: ['OUTCOME_ENGAGEMENT'], unknownObjectives: [],
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(summary.excludedObjectives).toEqual(['OUTCOME_ENGAGEMENT']);
+  });
+
+  it('surfaces unknown objectives so the catalogue can be extended deliberately', async () => {
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: [], unknownObjectives: ['OUTCOME_NEW_2027'],
+    });
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.unknownObjectives).toEqual(['OUTCOME_NEW_2027']);
+  });
+
+  it('passes excluded objectives into the alert context', async () => {
+    // The ticket's spend figure is smaller than Ads Manager's for this account; the reader
+    // needs to know why rather than assume the number is wrong.
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: blackoutDays(), excludedObjectives: ['LINK_CLICKS'], unknownObjectives: [],
+    });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(buildAlertContextForAccount).toHaveBeenCalledWith(
+      expect.anything(), 'acct1', expect.any(String), expect.any(Array), ['LINK_CLICKS'],
+    );
+  });
+
+  it('de-duplicates excluded objectives across accounts', async () => {
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: ['OUTCOME_ENGAGEMENT'], unknownObjectives: [],
+    });
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1', 'acct2']), deps);
+    expect(summary.excludedObjectives).toEqual(['OUTCOME_ENGAGEMENT']);
+  });
+});

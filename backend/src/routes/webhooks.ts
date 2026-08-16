@@ -24,6 +24,7 @@ import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService'
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
+import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 // ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
 // module-private state. Extracted so the CRM → Meta conversion relay throttles against the
 // same counters instead of a second set that drifts out of step with this one.
@@ -160,8 +161,23 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const eventId = webhookService.generateEventId(event);
 
     // Check if event already exists (deduplication)
-    const eventExists = await emailEventsDb.eventExists(eventId);
-    if (eventExists) {
+    const existingEvent = await emailEventsDb.getEventById(eventId);
+    if (existingEvent) {
+      // ENG-720: a prior delivery of this same eventId recorded the event but
+      // never durably persisted the hard-bounce account flag (the write failed,
+      // the process died, etc.). Retry the flag write on this duplicate instead
+      // of silently acking it — otherwise the recipient stays unflagged forever,
+      // because Resend never retries an event once we've returned 200 for it.
+      if (existingEvent.eventType === 'email.bounced' && existingEvent.hardBounceFlagPending) {
+        const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
+        }
+        await emailEventsDb.clearHardBounceFlagPending(eventId);
+      }
       console.log(`Event already exists, skipping duplicate: ${eventId}`);
       return res.status(200).json({
         message: 'Event already processed (duplicate)',
@@ -174,8 +190,40 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const isEmmaEvent = emmaEmailService.isEmmaRelatedEvent(event.data.from || '', eventTo);
 
     if (!isEmmaEvent) {
-      // Store the event in the database
-      const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
+      // Store the event in the database. Mark hardBounceFlagPending for bounce
+      // events up front (ENG-720) so a duplicate delivery before the flag write
+      // below succeeds can retry it instead of being swallowed by dedup.
+      let emailEvent;
+      try {
+        emailEvent = await emailEventsDb.addEmailEvent(
+          event, emailDomain, eventId, undefined, event.type === 'email.bounced'
+        );
+      } catch (error: any) {
+        if (error?.isDuplicateEventId) {
+          // ENG-720: a concurrent delivery of the same eventId won the write
+          // between our existence check above and this put — the winner's
+          // row (and its hardBounceFlagPending marker) is now the source of
+          // truth. Retry the flag write off it, same as the pre-existing
+          // dedup path, instead of silently acking a bounce nobody flagged.
+          const winnerEvent = await emailEventsDb.getEventById(eventId);
+          if (winnerEvent?.eventType === 'email.bounced' && winnerEvent.hardBounceFlagPending) {
+            const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+            const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+            if (failedRecipients.length > 0) {
+              throw new Error(
+                `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+              );
+            }
+            await emailEventsDb.clearHardBounceFlagPending(eventId);
+          }
+          console.log(`Event already exists (concurrent write), skipping duplicate: ${eventId}`);
+          return res.status(200).json({
+            message: 'Event already processed (duplicate)',
+            eventId: eventId
+          });
+        }
+        throw error;
+      }
       try {
         await leadListAlertService.notifyForEmailEvent(emailEvent);
       } catch (alertError) {
@@ -196,6 +244,25 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         console.log(`Email bounced: ${event.data.email_id} - ${bounceReason}`);
         // Auto-flag bounced leads as do-not-contact
         const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        // ENG-720: a hard bounce to an *account's own address* flags the
+        // account undeliverable so support/CS can see replies won't land.
+        // Awaited (not fire-and-forget) so the flag is persisted before the
+        // webhook ack — Resend won't retry a 200, so a dropped process here
+        // would otherwise leave the account silently unflagged.
+        // Do NOT swallow a persistence failure here: catching it and still
+        // acknowledging 200 would tell Resend the event was durably handled
+        // when the account flag was actually lost, and Resend never retries
+        // a 200. Let a thrown error (or a reported failed recipient) reach
+        // the outer catch below so the webhook fails and Resend retries.
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
+        }
+        if (!isEmmaEvent) {
+          await emailEventsDb.clearHardBounceFlagPending(eventId);
+        }
         void (async () => {
           try {
             const users = await userDb.getUsersByEmailDomain(emailDomain);

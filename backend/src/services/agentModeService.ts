@@ -21,6 +21,7 @@ import {
   TURN_TIME_BUDGET_FALLBACK_CONTENT,
 } from '../utils/turnTimeBudget';
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
+import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
@@ -15221,6 +15222,89 @@ TRUTHFULNESS RULES (these override tone):
       return summary || null;
     } catch (error) {
       console.error('AgentMode: Failed to generate scheduled chat summary:', error);
+      return null;
+    }
+  }
+
+  /**
+   * ENG-1259 — the cheap pre-check gate's LLM call.
+   *
+   * The caller (`runScheduledChat` in agentModeController.ts, via
+   * `shouldRunPreCheckGate` / `resolvePreCheckDecision` in
+   * utils/scheduledRunPreCheck.ts) only invokes this when the schedule's
+   * immediately preceding run had no actionable output — the exact repeat
+   * pattern PMPS's LUCAS schedule showed (four full-cost runs in a row that
+   * each concluded there was nothing to publish). This call is a SINGLE
+   * cheap/fast classification, not the schedule's own multi-step agent loop:
+   * it has no tools, no live data access, and must never be mistaken for the
+   * primary generation model.
+   *
+   * Fail-open by contract: returns `null` on any error, timeout, or
+   * unparseable response — NEVER a guessed decision — so the caller's fold
+   * (`resolvePreCheckDecision`) can apply the fail-TOWARD-running invariant
+   * uniformly regardless of why the classification was unavailable.
+   * Uses gemini-3.1-flash-lite (DIAGNOSIS_MODEL) — the same cheap tier as
+   * generateScheduledChatSummary / generateDiagnosticMessage.
+   */
+  async evaluateScheduledRunPreCheck(params: {
+    scheduleName: string;
+    startingMessage: string;
+    lastRunStatus: string | null;
+    lastRunSummary: string | null;
+    consecutiveNoOutputRuns: number;
+  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+    try {
+      const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
+
+You have NO live access to any upstream data source, inbox, feed, or connected account — you cannot check whether new content actually exists right now. You are only judging a PATTERN: does the recent history show a clear run of "nothing to do" outcomes for a reason that gives no sign of having changed?
+
+Default to "proceed" whenever you are not highly confident. Proceeding when there was in fact nothing to do costs a bit of compute. Skipping when there actually WAS something to do silently drops real, value-producing work — that is the far worse outcome, so proceeding is always the safe choice on any doubt. Only answer "skip" with "confidence":"high" when the evidence is unambiguous: several consecutive runs already reported nothing to do, for the same underlying reason, and the task's own instructions give no indication anything is different this time (e.g. no new date, event, or trigger they describe).
+
+Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "confidence": "high" | "low", "reason": "<one short sentence>"}`;
+
+      const lastRunLine = params.lastRunStatus
+        ? `Most recent run outcome: ${params.lastRunStatus}${params.lastRunSummary ? ` — ${params.lastRunSummary}` : ''}`
+        : 'Most recent run outcome: none (this is the first run for this schedule)';
+
+      const userContent = [
+        `Task instructions: ${params.startingMessage.slice(0, 800)}`,
+        lastRunLine,
+        `Consecutive "nothing to do" runs immediately before this one: ${params.consecutiveNoOutputRuns}`,
+      ].join('\n\n');
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ], {
+        max_completion_tokens: 150,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+      });
+
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), DIAGNOSIS_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn(`AgentMode: Scheduled-run pre-check timed out for "${params.scheduleName}"; failing open (proceed).`);
+        return null;
+      }
+
+      const raw = (response as any).choices?.[0]?.message?.content?.trim();
+      if (!raw) return null;
+
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.decision !== 'string' || typeof parsed?.confidence !== 'string') {
+        return null;
+      }
+      return {
+        decision: parsed.decision,
+        confidence: parsed.confidence,
+        reason: typeof parsed?.reason === 'string' ? parsed.reason.slice(0, 300) : '',
+      };
+    } catch (error) {
+      console.error(`AgentMode: Scheduled-run pre-check failed for "${params.scheduleName}"; failing open (proceed):`, error);
       return null;
     }
   }
