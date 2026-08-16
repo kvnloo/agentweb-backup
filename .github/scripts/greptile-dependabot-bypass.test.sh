@@ -66,21 +66,34 @@ else
        "verdict that will never arrive — every Dependabot PR goes permanently red."
 fi
 
-if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login == 'dependabot[bot]'"; then
-  pass "the skip step is gated on the PR author being dependabot[bot]"
+# CAUGHT LIVE (Greptile 3/5, security-review section, portal#1037): the
+# first version of this gated on `user.login` ALONE, copying
+# backend-staging-deploy's bypass without checking its reasoning actually
+# transfers. It doesn't — that job's gate is "can this job ever succeed"
+# (secrets withheld from the PR permanently, regardless of who pushes
+# later); this gate's job is "was this exact head reviewed", and
+# `user.login` never changes even when a human pushes onto an existing
+# Dependabot branch. Gating on it alone means a human's unreviewed changes
+# would ride the same free pass. The fix requires BOTH `user.login` (PR
+# opened by Dependabot) AND `github.actor` (THIS push also made by
+# Dependabot) — assert both are present, not just one.
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login == 'dependabot[bot]'" \
+  && printf '%s\n' "${JOB_BLOCK}" | grep -qF "github.actor == 'dependabot[bot]'"; then
+  pass "the skip step requires BOTH the PR author and the pushing actor to be dependabot[bot]"
 else
-  fail "no step condition matches on user.login == 'dependabot[bot]'." \
-       "Author-based (github.event.pull_request.user.login), not actor-based —" \
-       "see backend-staging-deploy's existing bypass for why: a human pushing to" \
-       "fix a Dependabot branch must not gain or lose the bypass."
+  fail "the skip step is not gated on both user.login AND github.actor." \
+       "user.login alone lets a human's commits, pushed onto an existing" \
+       "Dependabot branch, ride the same bypass without ever being reviewed —" \
+       "user.login never changes to reflect who actually pushed the current head."
 fi
 
-if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login != 'dependabot[bot]'"; then
-  pass "the real gate step (id: gate) is skipped for dependabot[bot]"
+if printf '%s\n' "${JOB_BLOCK}" | grep -qF "user.login != 'dependabot[bot]'" \
+  && printf '%s\n' "${JOB_BLOCK}" | grep -qF "github.actor != 'dependabot[bot]'"; then
+  pass "the real gate step (id: gate) runs whenever EITHER condition fails (De Morgan's complement of the skip)"
 else
-  fail "the 'gate' step (running greptile-gate.sh) has no != 'dependabot[bot]' guard." \
-       "Without it, the real gate step still runs and polls for 10 minutes on" \
-       "every Dependabot PR even though the skip step already decided the verdict."
+  fail "the 'gate' step's guard does not reference both user.login != and github.actor !=." \
+       "It must be the exact logical complement of the skip step's condition, or the" \
+       "two steps are no longer mutually exclusive and exhaustive."
 fi
 
 OUTPUTS_LINE="$(printf '%s\n' "${JOB_BLOCK}" | grep -F 'verdict: ' | head -n 1)"
