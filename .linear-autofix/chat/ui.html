@@ -1726,8 +1726,12 @@ async function sendMessage(message, atts = []) {
     if (running) {
       setBusy(true);
       ensureStream();
-      if (!S.queue.length) { $('input').value = message; autosize(); } // keep the text; it queues on the next send
-      addSys('⏳ A turn is already running here — reconnected to it. Your message is back in the box; press Stop to end the turn, or send again to queue it.');
+      // QUEUE it rather than handing it back. We only land here when our own busy flag was stale — a
+      // dropped stream, a turn started in another tab, or one the SERVER started on its own (a [[WATCH]]
+      // wake-up). From the developer's side that is indistinguishable from any other send during a turn,
+      // and every one of those queues, so this must too. Making them re-send was a hole in that rule.
+      queueMessage(message, atts);
+      addSys('⏳ A turn was already running — reconnected to it. Your message is queued and sends when it finishes.');
     } else {
       addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
       if (!S.queue.length) { $('input').value = message; autosize(); }
