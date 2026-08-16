@@ -202,10 +202,16 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         // Awaited (not fire-and-forget) so the flag is persisted before the
         // webhook ack — Resend won't retry a 200, so a dropped process here
         // would otherwise leave the account silently unflagged.
-        try {
-          await handleHardBounceRecipients(bouncedTo, event.data.bounce);
-        } catch (hardBounceError) {
-          console.error('[webhooks] handleHardBounceRecipients error:', hardBounceError);
+        // Do NOT swallow a persistence failure here: catching it and still
+        // acknowledging 200 would tell Resend the event was durably handled
+        // when the account flag was actually lost, and Resend never retries
+        // a 200. Let a thrown error (or a reported failed recipient) reach
+        // the outer catch below so the webhook fails and Resend retries.
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
         }
         void (async () => {
           try {

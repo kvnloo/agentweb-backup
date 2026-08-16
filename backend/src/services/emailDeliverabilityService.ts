@@ -66,21 +66,28 @@ export async function flagUserEmailUndeliverable(
 /**
  * Webhook wire-in: given the recipients of a bounced send and the bounce
  * payload, flag matching accounts when — and only when — the bounce is hard.
- * Never throws; a failure for one recipient does not stop the others.
+ * A failure for one recipient does not stop the others being attempted, but
+ * is collected and returned so the caller can decide whether the event was
+ * durably processed (a swallowed persistence failure must not be silently
+ * acknowledged — the caller needs to know to fail the webhook so Resend
+ * retries; see ENG-720 Greptile finding).
  */
 export async function handleHardBounceRecipients(
   recipients: string[],
   bounce: ResendBounceInfo | undefined
-): Promise<void> {
-  if (classifyResendBounce(bounce) !== 'hard') return;
+): Promise<{ failedRecipients: string[] }> {
+  if (classifyResendBounce(bounce) !== 'hard') return { failedRecipients: [] };
   const reason = bounce?.reason || 'hard bounce';
+  const failedRecipients: string[] = [];
   for (const recipient of recipients) {
     try {
       await flagUserEmailUndeliverable(recipient, reason, 'resend-webhook');
     } catch (err) {
       console.error(`${TAG} failed to flag ${recipient}:`, err);
+      failedRecipients.push(recipient);
     }
   }
+  return { failedRecipients };
 }
 
 // ─── MX sweep (AC4 — report only) ────────────────────────────────────────────

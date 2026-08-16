@@ -123,16 +123,18 @@ describe('handleHardBounceRecipients', () => {
     expect(mockUpdateUser).toHaveBeenCalledTimes(1);
   });
 
-  it('survives a lookup error for one recipient and continues (never throws)', async () => {
+  it('survives a lookup error for one recipient, continues to the rest, and reports the failure', async () => {
     mockGetUserByEmail
       .mockRejectedValueOnce(new Error('dynamo blip'))
       .mockResolvedValueOnce({ userId: 'u2', email: 'c@d.com' });
     mockUpdateUser.mockResolvedValue({});
 
-    await expect(
-      handleHardBounceRecipients(['a@b.com', 'c@d.com'], { reason: '550 5.1.1 unknown user' })
-    ).resolves.not.toThrow();
+    const result = await handleHardBounceRecipients(
+      ['a@b.com', 'c@d.com'],
+      { reason: '550 5.1.1 unknown user' }
+    );
     expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(result.failedRecipients).toEqual(['a@b.com']);
   });
 });
 
