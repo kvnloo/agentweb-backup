@@ -19,13 +19,34 @@ env:
 jobs:
   detect-changes:
     name: Detect changed projects
-    runs-on: ubuntu-latest
+    # ENG-1277: draft-gated. This job ran unconditionally on every push
+    # including drafts — 446 of 1,489 Tests runs in Aug 2026 were draft-time
+    # and bought nothing (the heavy jobs it feeds were already skipping on
+    # draft; this stops paying the ~1 billed minute to compute filters nothing
+    # downstream will use). `ready_for_review` already re-triggers a full run,
+    # so no evidence is lost — merge-evidence.sh already treats an all-skipped
+    # draft-time run as NO_EVIDENCE, not a pass.
+    if: github.event.pull_request.draft == false
+    # ENG-1277: 1 vCPU ubuntu-slim ($0.002/min vs ubuntu-latest's $0.006). This
+    # job is a ~15-25s paths-filter read via the REST API — no docker, no build.
+    runs-on: ubuntu-slim
     # Per-PR concurrency: a newer commit on the same PR cancels this superseded
     # test job. Group is unique per job so jobs within one run never serialize
     # against each other. The deploy job is deliberately excluded (own lane) so
     # an in-flight staging deploy is never interrupted.
+    #
+    # ENG-1277: the draft flag is now part of every per-job group name in this
+    # file (except backend-staging-deploy's deliberate global lane). Incident:
+    # PR #2360 — a push, `gh pr ready`, and auto-merge landed within 5s; the
+    # per-ref cancel-in-progress group (previously keyed only on ref, with no
+    # draft distinction) cancelled the ready_for_review run, and the surviving
+    # synchronize run's payload still read draft:true — every gated job
+    # skipped, the run reported success, and GitHub counted the skipped
+    # required checks as passing. An untested change merged. With the draft
+    # flag in the group name, a still-draft run and a ready run on the same
+    # ref can never occupy the same group and so can never cancel each other.
     concurrency:
-      group: ${{ github.workflow }}-detect-changes-${{ github.ref }}
+      group: ${{ github.workflow }}-detect-changes-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
@@ -179,9 +200,10 @@ jobs:
       && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-b so the two still run in parallel; a
-    # newer commit on the same PR cancels this job's superseded run.
+    # newer commit on the same PR cancels this job's superseded run. Draft flag
+    # in the group name per ENG-1277 — see the detect-changes job comment.
     concurrency:
-      group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}
+      group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
       # ENG-729: shallow. This job installs, type-checks and runs Jest against
@@ -203,25 +225,17 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      # ENG-729: type-check instead of build. Jest runs through ts-jest against
-      # `src/`, so `dist/` is written by this step and then read by nothing —
-      # the emit was the waste, NOT the type-check.
-      #
-      # The type-check itself has to stay, and that is the part worth being
-      # explicit about. `tsconfig.jest.json` sets `isolatedModules: true`, so
-      # ts-jest is transpile-only and reports no type errors at all. This step
-      # is therefore the ONLY thing type-checking the backend on a PR; deleting
-      # it (rather than narrowing it) would have silently removed that gate.
-      # `npm run typecheck` is `tsc --noEmit` over `tsconfig.json`, which spans
-      # the whole `src/` tree including `__tests__`. ENG-1059 pointed the deploy
-      # build at `tsconfig.build.json` (same options, tests excluded) so compiled
-      # tests stop shipping to Elastic Beanstalk — which makes this step a strict
-      # SUPERSET of `npm run build`'s diagnostics, never a subset. The test files
-      # are type-checked here and nowhere else, so this stays over tsconfig.json.
-      - name: Type-check
-        working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
-
+      # ENG-1277: type-check removed from THIS job. It ran identically in both
+      # backend-tests-a and backend-tests-b (same `tsc --noEmit` over the same
+      # tsconfig.json), so every PR paid for it twice — ~1,650 min/mo of pure
+      # duplication. backend-tests-b (below) still runs it, so the backend is
+      # still type-checked exactly once per run, and it is still the ONLY thing
+      # type-checking the backend (see the comment on that job's Type-check
+      # step for why: isolatedModules/transpile-only ts-jest reports no type
+      # errors, and this step is a strict superset of `npm run build`'s
+      # diagnostics since ENG-1059 pointed the deploy build at
+      # tsconfig.build.json). Nothing here depends on the type-check having
+      # already run in this job — Jest resolves and transpiles independently.
       - name: Run tests (agentMode files)
         working-directory: backend
         run: >
@@ -241,9 +255,10 @@ jobs:
       && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-a so the two still run in parallel; a
-    # newer commit on the same PR cancels this job's superseded run.
+    # newer commit on the same PR cancels this job's superseded run. Draft flag
+    # in the group name per ENG-1277 — see the detect-changes job comment.
     concurrency:
-      group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}
+      group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
       # ENG-729: shallow, for the same reason as backend-tests-a. The coverage
@@ -349,10 +364,11 @@ jobs:
     name: CI script tests
     needs: detect-changes
     if: needs.detect-changes.outputs.workflows == 'true'
-    runs-on: ubuntu-latest
+    # ENG-1277: ubuntu-slim — shellcheck + bash regression suites, no docker.
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-ci-scripts-tests-${{ github.ref }}
+      group: ${{ github.workflow }}-ci-scripts-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
@@ -403,10 +419,11 @@ jobs:
     # `.platform/*` and `.ebextensions/*.config` paths, so PRs touching neither
     # cannot produce a hit and were paying 397 runs / 480 min for nothing.
     if: needs.detect-changes.outputs.ebconfig == 'true'
-    runs-on: ubuntu-latest
+    # ENG-1277: ubuntu-slim — a git diff + bash classifier, no docker.
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     concurrency:
-      group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}
+      group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
@@ -446,11 +463,39 @@ jobs:
   # It now reads the score and the reviewed-commit pointer out of the comment
   # body and fails closed. See .github/scripts/greptile-gate.sh for why the
   # comment is the only source of the score.
+  # ENG-1277: reordered to run AFTER the two backend test jobs, not in
+  # parallel with them — the reverse of what ENG-915/ENG-1039 fought over.
+  # ENG-915 made TESTS wait on Greptile (skip tests if Greptile refused);
+  # ENG-1039 killed that because a 61%-flaky reviewer check was deciding
+  # whether test evidence exists. This is not that: backend-tests-a/b are
+  # UNCHANGED — they still never wait on Greptile and never skip because of
+  # it. What moved is the POLL: it now waits on the TESTS instead of racing
+  # them. By the time the ~15-17 min test pair finishes, Greptile has almost
+  # always already posted its review (~2.5 min latency), so this job's own
+  # wait collapses from ~3 standard-min to under 1 slim-min.
+  #
+  # `always()` is mandatory, not decoration. GitHub implicitly ANDs an `if:`
+  # with `success()` unless the expression names a status-check function
+  # explicitly — so without `always()`, a skipped backend-tests-a/b (e.g. a
+  # non-backend PR, where the path filter skips them) would silently skip
+  # this required check too, and a skipped required check satisfies branch
+  # protection. `always()` restores "runs unless draft" exactly as before,
+  # just later in the graph.
+  #
+  # Side benefit: this closes a real hole. With Greptile running in parallel,
+  # GitHub's own two required contexts (`Detect changed projects`,
+  # `Require Greptile Review`) could both go green minutes before the backend
+  # tests finished, so a human merging from GitHub's UI on "all checks
+  # passed" (bypassing merge-evidence.sh, which is not itself a required
+  # check) could merge before tests completed. Both required contexts now
+  # correctly wait for the tests.
   greptile-review:
     name: Require Greptile Review
-    needs: detect-changes
-    if: github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    needs: [detect-changes, backend-tests-a, backend-tests-b]
+    if: always() && github.event.pull_request.draft == false
+    # ENG-1277: ubuntu-slim — this job is a bash poll against the GitHub API,
+    # no docker, no build.
+    runs-on: ubuntu-slim
     # ENG-1039: the poll deadline is 10 minutes (GREPTILE_GATE_TIMEOUT_SECONDS
     # below), down from 20. Greptile reviews land in ~2 min when it answers at
     # all, and failed polls billed 947 runner-minutes over 2026-08-01..10 —
@@ -460,11 +505,12 @@ jobs:
     # on the next push, never a 31-min test pair. The 2-minute headroom keeps
     # the ENG-734 shape: the script's deadline stays under the job timeout so
     # the gate fails with a diagnosable message instead of being killed
-    # mid-poll.
+    # mid-poll. ENG-1277: 12 min still fits ubuntu-slim's 15-min job cap.
     timeout-minutes: 12
     # A newer commit on the same PR cancels this superseded Greptile-wait job.
+    # Draft flag in the group name per ENG-1277 — see detect-changes' comment.
     concurrency:
-      group: ${{ github.workflow }}-greptile-review-${{ github.ref }}
+      group: ${{ github.workflow }}-greptile-review-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     # `verdict` is pass | refused | unavailable. The job still FAILS on anything
     # but pass. Since ENG-1039 nothing downstream consumes this output (the
@@ -572,27 +618,54 @@ jobs:
       group: backend-staging-deploy
       cancel-in-progress: false
     steps:
+      # ENG-1277: this job queues behind the single global
+      # `backend-staging-deploy` concurrency lane above (cancel-in-progress:
+      # false, by design), so by the time it actually starts, a newer push to
+      # this same PR may already have superseded it — that newer push gets its
+      # own run, queued right behind this one. Deploying this stale SHA anyway
+      # wastes a full ~12-min deploy building a version nobody will look at
+      # (measured: 18 stale deploys / 176 min in Aug 2026). Not a required
+      # check, so skipping it here costs nothing.
+      - name: Preflight — skip if a newer push already superseded this head
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LIVE_HEAD_SHA="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq .head.sha)"
+          if [ "${LIVE_HEAD_SHA}" != "${{ github.event.pull_request.head.sha }}" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "This run's head (${{ github.event.pull_request.head.sha }}) is no longer the PR's live head (${LIVE_HEAD_SHA}) — a newer push superseded it. Skipping the deploy; the newer push gets its own run."
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
+        if: steps.preflight.outputs.stale != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Node.js
+        if: steps.preflight.outputs.stale != 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
       - name: Install dependencies
+        if: steps.preflight.outputs.stale != 'true'
         working-directory: backend
         run: npm ci
 
       - name: Build
+        if: steps.preflight.outputs.stale != 'true'
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
       - name: Copy dev env user-data script into dist
+        if: steps.preflight.outputs.stale != 'true'
         working-directory: backend
         run: cp ../test-env/user-data-dev-auto.sh dist/
 
@@ -608,6 +681,7 @@ jobs:
       # the SHA the label names exactly one build, which is also what makes a
       # rollback to a labelled version reproducible (ENG-743).
       - name: Resolve staging version label
+        if: steps.preflight.outputs.stale != 'true'
         id: version
         run: |
           set -euo pipefail
@@ -617,6 +691,7 @@ jobs:
           echo "Resolved staging version label: ${VERSION_LABEL}"
 
       - name: Package artifact
+        if: steps.preflight.outputs.stale != 'true'
         working-directory: backend
         env:
           VERSION_LABEL: ${{ steps.version.outputs.version_label }}
@@ -626,6 +701,7 @@ jobs:
           zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
+        if: steps.preflight.outputs.stale != 'true'
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -633,6 +709,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload deployment package to S3
+        if: steps.preflight.outputs.stale != 'true'
         working-directory: backend
         env:
           VERSION_LABEL: ${{ steps.version.outputs.version_label }}
@@ -648,6 +725,7 @@ jobs:
       # reports the reason instead of being killed mid-poll; together they keep
       # the 35 minutes the previous deploy + readiness steps allowed.
       - name: Deploy to Elastic Beanstalk and verify the environment took it
+        if: steps.preflight.outputs.stale != 'true'
         timeout-minutes: 35
         env:
           EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}
@@ -661,6 +739,7 @@ jobs:
       # Only reachable when the step above proved the environment is Ready on
       # this exact version, so this banner is now a report rather than a claim.
       - name: Backend Staging Deployment Status
+        if: steps.preflight.outputs.stale != 'true'
         env:
           VERSION_LABEL: ${{ steps.version.outputs.version_label }}
         run: |
@@ -674,9 +753,10 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.partner == 'true'
     runs-on: ubuntu-latest
-    # A newer commit on the same PR cancels this superseded test job.
+    # A newer commit on the same PR cancels this superseded test job. Draft
+    # flag in the group name per ENG-1277 — see detect-changes' comment.
     concurrency:
-      group: ${{ github.workflow }}-partner-tests-${{ github.ref }}
+      group: ${{ github.workflow }}-partner-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
       # ENG-729: shallow — this job builds and tests the working tree only.

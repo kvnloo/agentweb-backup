@@ -3,7 +3,6 @@ import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
-import { google } from 'googleapis';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
@@ -21169,6 +21168,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Knowledge base search functionality
   // Helper: get an authenticated Google Drive client using the service account
   private async getGoogleDriveClient() {
+    // ENG-1277: lazy load. `googleapis` pulls in ~990 transitive modules that
+    // every jest worker paid on `require()` of this file (1,023 of 1,388 test
+    // files statically import agentModeService.ts) even when a test never
+    // touches Drive/Sheets.
+    const { google } = await import('googleapis');
     const { getSecret } = await import('../utils/secretsManager');
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
@@ -22481,6 +22485,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Read a Google Doc or Sheet directly by file ID.
   // Tries user OAuth first (works for internal Workspace files); falls back to service account.
   public async readGoogleFileById(fileId: string, userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let drive: any;
     let usingOAuth = false;
     try {
@@ -22573,6 +22579,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async listGoogleDriveFolder(folderIdOrUrl: string, userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -22625,6 +22633,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleDriveFolder(name: string, userId: string, parentFolderId?: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -22650,6 +22660,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async searchGoogleDrive(query: string, userId: string, type?: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -23380,6 +23392,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // ─────────────────────────────────────────────────────────────────────────
 
   public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let docId: string | undefined;
     let drive: any;
     try {
@@ -23433,6 +23447,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -23466,6 +23482,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleSheet(title: string, data: string[][], userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let sheetId: string | undefined;
     let drive: any;
     try {
@@ -23530,6 +23548,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async updateGoogleSheet(fileIdOrUrl: string, range: string, data: string[][], userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const sheets = google.sheets({ version: 'v4', auth });
