@@ -37,6 +37,7 @@ import { validateEmail } from "../utils/validation";
 import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
+import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 
 const router = express.Router();
 
@@ -149,6 +150,10 @@ const ADMIN_USER_LIST_FIELDS = [
   "lastActiveAt",
   "displayName",
   "supportNote",
+  // ENG-720: undeliverable-email flag so support/CS sees replies won't land
+  "emailUndeliverable",
+  "emailUndeliverableReason",
+  "emailUndeliverableAt",
   "role",
   "roles",
   "taskCount",
@@ -746,6 +751,18 @@ router.post("/crm-sync/:source/start", async (req, res) => {
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
     return res.status(500).json({ message: error.message || "Error running CRM sync" });
+  }
+});
+
+// ENG-720 AC4: report-only MX sweep — active accounts whose email domain
+// fails MX resolution. Repairing/contacting those users is a human decision.
+router.get("/email-deliverability/mx-sweep", async (_req, res) => {
+  try {
+    const report = await sweepUndeliverableDomains();
+    res.json(report);
+  } catch (error) {
+    console.error("Error running MX sweep:", error);
+    res.status(500).json({ error: "Failed to run MX sweep" });
   }
 });
 

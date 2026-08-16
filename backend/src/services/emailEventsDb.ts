@@ -17,6 +17,11 @@ export interface EmailEvent {
     text?: string;
     headers?: Record<string, string>;
   }; // Optional, cached email content (truncated to 10k chars if needed)
+  // ENG-720: set true when an email.bounced event is recorded before the hard-bounce
+  // account flag has durably persisted. A Resend retry of the same event would
+  // otherwise be swallowed by the eventId dedup guard and the flag write never
+  // retried. Cleared once handleHardBounceRecipients succeeds for this event.
+  hardBounceFlagPending?: boolean;
 }
 
 class EmailEventsDb {
@@ -67,7 +72,7 @@ class EmailEventsDb {
     }
   }
 
-  async addEmailEvent(event: ResendWebhookEvent, emailDomain: string, eventId: string, overrideLeadEmail?: string): Promise<EmailEvent> {
+  async addEmailEvent(event: ResendWebhookEvent, emailDomain: string, eventId: string, overrideLeadEmail?: string, hardBounceFlagPending?: boolean): Promise<EmailEvent> {
     const processedAt = new Date().toISOString();
 
     // Extract leadEmail based on event type, or use override if provided
@@ -81,15 +86,30 @@ class EmailEventsDb {
       createdAt: event.created_at,
       data: event.data,
       processedAt,
-      ...(leadEmail && { leadEmail }) // Only include leadEmail if it was successfully extracted
+      ...(leadEmail && { leadEmail }), // Only include leadEmail if it was successfully extracted
+      ...(hardBounceFlagPending && { hardBounceFlagPending })
     };
 
     const params = {
       TableName: TABLE_NAME,
-      Item: emailEvent
+      Item: emailEvent,
+      // ENG-720: claim the eventId atomically so two concurrent deliveries of
+      // the same webhook can't both pass the caller's existence check and
+      // both run bounce-flag processing — the loser gets a conditional-check
+      // failure instead of silently overwriting the winner's row.
+      ConditionExpression: 'attribute_not_exists(eventId)'
     };
 
-    await dynamodb.put(params).promise();
+    try {
+      await dynamodb.put(params).promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const duplicateError: any = new Error(`Duplicate eventId: ${eventId}`);
+        duplicateError.isDuplicateEventId = true;
+        throw duplicateError;
+      }
+      throw error;
+    }
 
     return emailEvent;
   }
@@ -325,6 +345,23 @@ class EmailEventsDb {
   async eventExists(eventId: string): Promise<boolean> {
     const event = await this.getEventById(eventId);
     return event !== null;
+  }
+
+  /**
+   * ENG-720: clear the hardBounceFlagPending marker once the account flag
+   * write has durably succeeded for this event, so a later duplicate delivery
+   * of the same eventId is recognized as fully handled.
+   */
+  async clearHardBounceFlagPending(eventId: string): Promise<void> {
+    const params = {
+      TableName: TABLE_NAME,
+      Key: {
+        eventId
+      },
+      UpdateExpression: 'REMOVE hardBounceFlagPending'
+    };
+
+    await dynamodb.update(params).promise();
   }
 
   /**
