@@ -23,7 +23,7 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult } from './prepush/logic.mjs';
@@ -54,6 +54,7 @@ async function readPushedRefs() {
 
 function changedFilesForRefs(refs) {
   const files = new Set();
+  const bases = new Set();
   for (const r of refs) {
     const base = resolveBaseSha(r, {
       commitExists: (sha) => spawnSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: root }).status === 0,
@@ -63,19 +64,57 @@ function changedFilesForRefs(refs) {
       },
       parentOf: (sha) => `${sha}~1`,
     });
-    // ENG-1277 / Greptile: ACMRD, not ACMR — a deletion-only push (e.g. removing a
+    bases.add(base);
+    // ENG-1277 / Greptile P1: ACMRD, not ACMR — a deletion-only push (e.g. removing a
     // source file something else still imports) must still be classified as a
     // backend change, or the hook's own "no backend changes — skipping" short
     // circuit below silently skips tsc/jest for exactly the push most likely to
-    // break the build. `existsSync` filtering further down already drops deleted
-    // paths before they're handed to tsc/jest as real files — this only affects
-    // whether the change is COUNTED, not what gets passed to a tool that needs it
-    // to exist.
+    // break the build.
     for (const f of git(['diff', '--name-only', '--diff-filter=ACMRD', `${base}..${r.localSha}`], { cwd: root }).split('\n')) {
       if (f) files.add(f);
     }
   }
-  return [...files];
+  return { files: [...files], bases: [...bases] };
+}
+
+// ENG-1277 / Greptile P1 #2: a deleted source file is dropped from `nonTestChanged`
+// (it fails `existsSync`) before `--findRelatedTests` runs, so tests that depended on
+// its behavior — and would catch a regression TypeScript can't see (e.g. a
+// side-effect-only `import './handler'` that registers something at runtime) — never
+// get discovered or run. jest's `--findRelatedTests` needs the file to exist on disk
+// to resolve who imports it, so this materializes the file's PRE-deletion content
+// (via `git show <base>:<path>`) back at its real path just long enough for jest to
+// compute relatedness, then removes it again before any test actually executes —
+// tests still run against the true, post-deletion tree, only *discovery* sees the
+// old file. Returns the temp-restored paths so the caller can clean them up even if
+// something downstream throws.
+function materializeDeletedForDiscovery(deletedRelPaths, bases) {
+  const restored = [];
+  try {
+    for (const relPath of deletedRelPaths) {
+      const absPath = path.join(backend, relPath);
+      let content = null;
+      for (const base of bases) {
+        const r = spawnSync('git', ['show', `${base}:${path.posix.join('backend', relPath)}`], { cwd: root, encoding: 'utf8' });
+        if (r.status === 0) { content = r.stdout; break; }
+      }
+      if (content === null) {
+        // Could not recover pre-deletion content from any resolved base. Throw
+        // (not `fail()`, which exits immediately) so the catch below can clean up
+        // any files THIS loop already restored before this one failed — leaving a
+        // half-restored temp file behind on a failed push would pollute the
+        // developer's working tree with an untracked file they never created.
+        throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit (tried: ${bases.join(', ')}) — cannot check for tests that depended on it.`);
+      }
+      mkdirSync(path.dirname(absPath), { recursive: true });
+      writeFileSync(absPath, content);
+      restored.push(absPath);
+    }
+  } catch (e) {
+    for (const p of restored) rmSync(p, { force: true });
+    fail(e.message);
+  }
+  return restored;
 }
 
 function run(label, cmd, args, { cwd, budgetMs }) {
@@ -94,7 +133,7 @@ function run(label, cmd, args, { cwd, budgetMs }) {
 const refs = await readPushedRefs();
 if (!refs.length) process.exit(0);
 
-const files = changedFilesForRefs(refs);
+const { files, bases } = changedFilesForRefs(refs);
 const backendFiles = files.filter((f) => isBackendPath(f));
 if (!backendFiles.length) { log(`no backend changes in ${files.length} pushed file(s) — skipping.`); process.exit(0); }
 
@@ -112,12 +151,26 @@ run('tsc --noEmit (backend)', process.execPath,
 const rel = (f) => path.relative(backend, path.join(root, f));
 const { testChanged: testChangedAbs, nonTestChanged: nonTestChangedAbs } = classifyChangedFiles(backendFiles);
 const testChanged = testChangedAbs.map(rel).filter((f) => existsSync(path.join(backend, f)));
-const nonTestChanged = nonTestChangedAbs.map(rel).filter((f) => existsSync(path.join(backend, f)));
+const nonTestChangedAll = nonTestChangedAbs.map(rel);
+const nonTestChanged = nonTestChangedAll.filter((f) => existsSync(path.join(backend, f)));
+// ENG-1277 / Greptile P1 #2: files classified as backend/non-test but absent on disk
+// were DELETED by this push (not renamed — renames are their own diff entries and
+// still exist post-rename). See materializeDeletedForDiscovery above.
+const deletedNonTest = nonTestChangedAll.filter((f) => !existsSync(path.join(backend, f)));
 
 let relatedSuites = null;
-if (nonTestChanged.length) {
-  const list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged],
-    { cwd: backend, encoding: 'utf8', timeout: 60_000 });
+if (nonTestChanged.length || deletedNonTest.length) {
+  const restoredPaths = materializeDeletedForDiscovery(deletedNonTest, bases);
+  let list;
+  try {
+    list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],
+      { cwd: backend, encoding: 'utf8', timeout: 60_000 });
+  } finally {
+    // Discovery is the only step allowed to see the pre-deletion content — the tests
+    // themselves must run against the real, post-deletion tree. Clean up even if the
+    // spawnSync above threw.
+    for (const p of restoredPaths) rmSync(p, { force: true });
+  }
   // ENG-1277 / Greptile: fail loud, not silently empty — see evaluateListTestsResult.
   const evaluated = evaluateListTestsResult(list);
   if (!evaluated.ok && evaluated.reason === 'timeout') {
@@ -129,7 +182,7 @@ if (nonTestChanged.length) {
   relatedSuites = evaluated.suites.map((a) => path.relative(backend, a));
 }
 
-const { suites, capped, namedMatched } = selectJestSuites({ testChanged, relatedSuites, nonTestChanged, cap: RELATED_CAP });
+const { suites, capped, namedMatched } = selectJestSuites({ testChanged, relatedSuites, nonTestChanged: [...nonTestChanged, ...deletedNonTest], cap: RELATED_CAP });
 if (capped) {
   log(`related set is ${relatedSuites.length} suites (> cap ${RELATED_CAP}) — a hub file changed; running ${testChanged.length} directly changed + ${namedMatched.length} name-matched suite(s). CI runs the full suite on ready-flip.`);
 }
