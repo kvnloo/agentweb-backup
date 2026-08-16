@@ -1865,13 +1865,31 @@ const createUsageRecordsTable = async () => {
   }
 };
 
-// Append-only, per-charge LLM audit evidence. The eventId begins with its ISO
-// timestamp so a billing subject's charges are queryable in chronological order.
+// Append-only, per-charge LLM audit evidence. eventId is the uniqueness/dedup
+// key (caller-controlled, not reliably date-prefixed); the GSI below on
+// occurredAt is what makes a billing subject's charges queryable by month.
 const createLlmChargeEventsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-LlmChargeEvents`,
-    AttributeDefinitions: [{ AttributeName: 'billingUserId', AttributeType: 'S' }, { AttributeName: 'eventId', AttributeType: 'S' }],
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
     KeySchema: [{ AttributeName: 'billingUserId', KeyType: 'HASH' }, { AttributeName: 'eventId', KeyType: 'RANGE' }],
+    // eventId is caller-controlled and not reliably date-prefixed (provider
+    // response IDs, engine task-derived keys) -- monthly queries go through
+    // occurredAt, which is always a real timestamp. See llmChargeAuditDb.ts.
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
     BillingMode: 'PAY_PER_REQUEST',
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }

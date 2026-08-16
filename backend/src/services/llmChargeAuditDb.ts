@@ -5,6 +5,14 @@
 import AWS from "aws-sdk";
 
 export const LLM_CHARGE_EVENTS_TABLE = `${process.env.NODE_ENV === "development" ? "Dev-" : ""}AW-LlmChargeEvents`;
+// ENG-1251 Greptile P1: eventId is caller-controlled and, since callers now
+// thread through provider response IDs and engine task-derived keys, is NOT
+// reliably date-prefixed the way the original `{occurredAt}#{uuid}` fallback
+// was. A month-range query keyed on eventId silently misses any event whose
+// id doesn't happen to sort within the date bounds. occurredAt is always a
+// real timestamp regardless of what the eventId looks like, so the monthly
+// query goes through this GSI instead of the base table's key.
+export const LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX = "BillingUserOccurredAtIndex";
 let client: AWS.DynamoDB.DocumentClient | null = null;
 const db = () => (client ||= new AWS.DynamoDB.DocumentClient());
 
@@ -37,7 +45,8 @@ export async function listLlmChargeEvents(billingUserId: string, start: string, 
   do {
     const result = await db().query({
       TableName: LLM_CHARGE_EVENTS_TABLE,
-      KeyConditionExpression: "billingUserId = :user AND eventId BETWEEN :start AND :end",
+      IndexName: LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX,
+      KeyConditionExpression: "billingUserId = :user AND occurredAt BETWEEN :start AND :end",
       ExpressionAttributeValues: { ":user": billingUserId, ":start": start, ":end": `${end}~` },
       ScanIndexForward: false,
       ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),

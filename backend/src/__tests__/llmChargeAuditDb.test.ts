@@ -21,10 +21,28 @@ describe('llmChargeAuditDb', () => {
     put.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('down')) });
     await expect(recordLlmChargeEvent(event)).rejects.toThrow('down');
   });
-  it('queries one billing subject by chronological event key', async () => {
+  it('queries one billing subject by occurredAt via the GSI, not the eventId range', async () => {
+    // ENG-1251 Greptile P1: eventId is caller-controlled (provider response
+    // IDs, engine task-derived keys) and not reliably date-prefixed, so a
+    // month-range query MUST key on occurredAt (always a real timestamp),
+    // via a GSI, rather than the base table's eventId range.
     query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [event] }) });
     await expect(listLlmChargeEvents('bill-1', '2026-08-01', '2026-08-31')).resolves.toEqual([event]);
-    expect(query).toHaveBeenCalledWith(expect.objectContaining({ KeyConditionExpression: expect.stringContaining('eventId BETWEEN') }));
+    expect(query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeyConditionExpression: expect.stringContaining('occurredAt BETWEEN'),
+      })
+    );
+  });
+
+  it('finds an event stored under a non-date-prefixed provider eventId (Greptile P1: provider IDs evade monthly queries)', async () => {
+    const providerKeyedEvent = { ...event, eventId: 'chatcmpl-abc123' };
+    query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [providerKeyedEvent] }) });
+
+    const result = await listLlmChargeEvents('bill-1', '2026-08-01', '2026-08-31');
+
+    expect(result).toEqual([providerKeyedEvent]);
   });
   it('does not surface an audit intent that never reached the counter', async () => {
     query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [{ ...event, counterAppliedAt: undefined }] }) });

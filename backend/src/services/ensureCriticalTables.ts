@@ -22,7 +22,7 @@ import { LOOP_LEARNING_TABLE } from '../loops/core/learning/dynamoLearningStore'
 import { LOOP_DISPATCHES_TABLE } from './loopDispatchTracker';
 import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboardingMetricsService';
 import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './contactEventsDb';
-import { LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
+import { LLM_CHARGE_EVENTS_TABLE, LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX } from './llmChargeAuditDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -30,10 +30,21 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
     AttributeDefinitions: [
       { AttributeName: 'billingUserId', AttributeType: 'S' },
       { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'billingUserId', KeyType: 'HASH' },
       { AttributeName: 'eventId', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: LLM_CHARGE_EVENTS_OCCURRED_AT_INDEX,
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
     ],
     BillingMode: 'PAY_PER_REQUEST',
   },
