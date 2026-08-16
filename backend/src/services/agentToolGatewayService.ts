@@ -427,7 +427,11 @@ function findTrippedSessionTimeout(
  * same as a permanent failure (safety-filter rejection, invalid args) locked
  * generate_image for the rest of the session even though the rate limit clears.
  * Exclude rate_limit specifically so a real retry spiral (any other class)
- * still trips the budget, but a temporary 429 does not. */
+ * still trips the budget, but a temporary 429 does not. Hard-quota exhaustion
+ * (OpenAI/Azure `insufficient_quota`, "exceeded your current quota") is also
+ * 429-shaped but permanent, not transient — classifyToolErrorClass buckets it
+ * as 'quota_exceeded', a distinct class from 'rate_limit', so it is NOT
+ * exempted here and still counts toward the session-wide media budget. */
 function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
   if (mediaFailureBudget(toolName) != null) {
     return classifyToolErrorClass(error) !== 'rate_limit';
