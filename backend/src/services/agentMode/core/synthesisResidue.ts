@@ -16,6 +16,8 @@
  *     ledger, so a synthesis failure can never erase the record of what ran.
  */
 
+import { SYNTHESIS_NUDGE } from './termination';
+
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
  * finish emitting. Anything longer is far likelier to be real (if odd) output, so
@@ -43,6 +45,35 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
  * its opening marker instead.
  */
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
+
+/**
+ * ENG-1188: a gemini-3.1-pro-preview work-plan session generated and
+ * screenshot-verified the corrected assets, then closed with the model echoing the
+ * injected synthesis nudge back verbatim — 3 repeats in 744 chars — instead of
+ * writing the delivery message. Non-empty and only 744 chars, it is far under
+ * `isDegenerateRepetition`'s 1000-char/300-word floor (built for a much larger
+ * collapse) and does not start with the history-echo marker above, so it slipped
+ * past every existing check and shipped straight to the user.
+ *
+ * Two or more verbatim copies of a nudge WE injected is never a real answer — a
+ * turn that merely quotes it once (e.g. explaining what the system told it) is
+ * left alone; only actual repetition trips this.
+ */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count++;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+/** True when `trimmed` is mostly our own injected nudge text, echoed back. */
+function isNudgeEcho(trimmed: string): boolean {
+  return countOccurrences(trimmed, SYNTHESIS_NUDGE) >= 2;
+}
 
 /**
  * Degenerate-repetition thresholds. A model that collapses into a repetition loop
@@ -81,9 +112,10 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Both checked before the length cap: a history echo and a repetition collapse
-  // are long by nature.
+  // Checked before the length cap: a history echo, a nudge echo, and a repetition
+  // collapse are all either long by nature or an intentionally short exact-match.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
+  if (isNudgeEcho(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   if (!STRUCTURAL_ONLY.test(trimmed)) return false;
