@@ -37,6 +37,13 @@ console.log('\n— the invariants that must never be softened —');
   ok(/never bypass branch protection/i.test(p), 'no bypassing branch protection');
   ok(/admin|force|disabling a check/i.test(p), 'names the bypass shapes without depending on one flag');
   ok(/merge commit/i.test(p) && /never delete the branch/i.test(p), 'merge commit, branch kept');
+  // Auto-merge is the sharp edge here: this repo's checks are ADVISORY, so "merge when ready" merges
+  // instantly rather than waiting for CI or the reviewer. The agent must hold the decision itself.
+  ok(/never use auto-merge/i.test(p), 'auto-merge is forbidden outright');
+  ok(/merge queue|merge when ready/i.test(p), 'and the other deferred-merge shapes with it');
+  ok(/advisory/i.test(p), 'explains WHY — the checks are advisory, so it would not wait');
+  ok(/you decide the moment|YOU decide/i.test(p), 'the agent holds the merge decision itself');
+  ok(/genuinely finished|nothing red yet/i.test(p), 'CI must be finished-and-passing, not merely not-yet-red');
   ok(/MERGE_BLOCKED/.test(p), 'has an escalation channel');
   ok(/\[\[WATCH:/.test(p) && /\[\[WATCH_DONE\]\]/.test(p), 'the watch loop markers are exact — they are OUR protocol, parsed by us');
   ok(/never sit on a blocking wait|never block/i.test(p), 'forbids blocking waits');
