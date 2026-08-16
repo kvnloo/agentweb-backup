@@ -1,0 +1,18 @@
+# Copy to ~/.autofix-handoff.conf on the laptop. Sourced by send-handoff.sh, and read by the skill
+# for the default owner. All optional — the values below are the defaults.
+
+# Who the handoff is attributed to. This selects the GitHub token the merge commits and Greptile
+# replies come from, plus the git identity and Linear key, so it must be someone on the box's roster.
+# Set it once here and the skill never has to ask.
+AUTOFIX_OWNER=mvarma@argusoft.com
+
+# The box. Only used when no SSH tunnel is open — with `ssh -L 8790:localhost:8790 …` already running,
+# the handoff goes over that and neither of these is touched.
+# NOTE: the public IP changes every time the instance is stopped and started. Current value:
+#   aws ec2 describe-instances --instance-ids i-0cb38aac2332941dc \
+#     --query 'Reservations[].Instances[].PublicIpAddress' --output text
+AUTOFIX_HOST=54.148.185.209
+AUTOFIX_KEY=$HOME/.ssh/agentweb-test-env-harshit.pem
+
+# Chat server port, both ends of the tunnel.
+AUTOFIX_PORT=8790
