@@ -61,10 +61,12 @@
 #       against PR #2427 — the greptile-review job itself was long since
 #       `completed`/`failure`, but the run overall was still `in_progress`
 #       because the backend Jest pair was still running, and the rerun API
-#       403'd). The comment WAS still posted. Call this again once the run
-#       for the current head has settled — a later Watchdog tick, not a busy
-#       wait here, since that settling can take the same ~15-17 minutes the
-#       backend test pair already takes.
+#       403'd). The comment WAS still posted. Retry with `--rerun-only` once
+#       the run for the current head has settled — a later Watchdog tick, not
+#       a busy wait here, since that settling can take the same ~15-17 minutes
+#       the backend test pair already takes. Plain re-invocation (no flag)
+#       would post a second `@greptileai` comment for the same head, paying
+#       for a redundant review the first call already requested.
 
 set -euo pipefail
 
@@ -122,7 +124,7 @@ rerun_gate_job() {
   rerun_err="$(mktemp)"
   if ! gh api -X POST "repos/${REPO}/actions/jobs/${job_id}/rerun" >/dev/null 2>"${rerun_err}"; then
     if grep -qi 'already running' "${rerun_err}"; then
-      log "run ${run_id} still has other jobs in progress, so GitHub refuses to re-run '${REQUIRED_CHECK_JOB_NAME}' on its own yet (this is expected, not an error). The comment above was still posted — call this script again once CI has settled for this head."
+      log "run ${run_id} still has other jobs in progress, so GitHub refuses to re-run '${REQUIRED_CHECK_JOB_NAME}' on its own yet (this is expected, not an error). The comment above was still posted — retry with '$0 --rerun-only' once CI has settled for this head, so the retry doesn't post a second review request."
       rm -f "${rerun_err}"
       exit 2
     fi
@@ -141,7 +143,16 @@ main() {
     fail "the gh CLI is not on PATH, so the review request could not be posted."
   fi
 
-  post_review_request
+  local rerun_only=0
+  if [ "${1:-}" = "--rerun-only" ]; then
+    rerun_only=1
+  fi
+
+  if [ "${rerun_only}" -eq 0 ]; then
+    post_review_request
+  else
+    log "--rerun-only: skipping the review request, retrying only the gate-job rerun."
+  fi
   rerun_gate_job
 }
 

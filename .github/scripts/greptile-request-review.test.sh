@@ -150,7 +150,7 @@ run_script() {
     MOCK_DIR="${MOCK_DIR}" \
     REPO="${TEST_REPO:-}" \
     PR_NUMBER="${TEST_PR_NUMBER:-}" \
-    bash "${SCRIPT}" 2>&1
+    bash "${SCRIPT}" "$@" 2>&1
   )
   LAST_RC=$?
   set -e
@@ -239,7 +239,7 @@ echo 1 >"${MOCK_DIR}/rerun_exit"
 echo 'gh: The workflow run containing this job is already running (HTTP 403)' >"${MOCK_DIR}/rerun_stderr"
 run_script
 check 'a run-still-in-progress rerun refusal exits 2 (retryable), not 1' 2 \
-  'call this script again once CI has settled'
+  'retry with'
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "${LAST_OUTPUT}" == *'GREPTILE_REQUEST_REVIEW_FAILED'* ]]; then
   TESTS_FAILED=$((TESTS_FAILED + 1))
@@ -248,6 +248,24 @@ if [[ "${LAST_OUTPUT}" == *'GREPTILE_REQUEST_REVIEW_FAILED'* ]]; then
 else
   printf 'PASS: %s\n' 'the retryable case is not reported as GREPTILE_REQUEST_REVIEW_FAILED'
 fi
+
+# ENG-1282 fix: a retry after the retryable "still running" case must use
+# --rerun-only, or it silently pays for a second @greptileai review of the
+# same head. Verify --rerun-only skips the comment post entirely.
+new_mock
+run_script --rerun-only
+check '--rerun-only re-runs the gate job without posting a comment' 0 \
+  "re-ran 'Require Greptile Review'"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  --rerun-only must not post a review request\n  calls.log:\n%s\n' \
+    '--rerun-only skips the comment post' "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' '--rerun-only skips the comment post'
+fi
+check_call_logged '--rerun-only still targets the resolved job id' \
+  "actions/jobs/${JOB_ID}/rerun"
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"
