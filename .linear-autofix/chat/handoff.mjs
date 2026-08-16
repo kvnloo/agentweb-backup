@@ -67,6 +67,20 @@ export function validateHandoff(body, members = []) {
 
 export const prRef = (url) => { const m = /\/pull\/(\d+)/.exec(url || ''); return m ? `#${m[1]}` : String(url || ''); };
 
+// Is some existing handoff chat already holding this branch? Two chats on one branch means two agents
+// driving the same PR to merge — racing commits and duplicate review cycles. Git does stop the second
+// worktree ("already used by worktree at …"), but only after the entry is written, and it surfaces as
+// an opaque 500. Checked up front instead so the caller is told which chat already owns it.
+// Only handoff chats count: a pipeline issue may legitimately sit on a branch a developer later hands off.
+export function existingHandoffForBranch(state, branch) {
+  const b = String(branch || '').toLowerCase();
+  if (!b) return null;
+  for (const e of Object.values(state || {})) {
+    if (e?.handoff && String(e.branch || '').toLowerCase() === b) return e.identifier || null;
+  }
+  return null;
+}
+
 // The document written to disk. Deliberately a FILE and not just a chat message: a turn's transcript
 // gets summarised away by /compact, but a file can be re-read verbatim on turn 40, after a restart, or
 // by a fresh session — which is exactly when a Greptile argument about intent shows up.

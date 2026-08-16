@@ -8,7 +8,7 @@
 //
 // These cover the pure parts: what a handoff must contain to be accepted, and what the agent is told.
 // Run: node test/handoff.test.mjs
-import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, MIN_CONTEXT_CHARS } from '../chat/handoff.mjs';
+import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, existingHandoffForBranch, MIN_CONTEXT_CHARS } from '../chat/handoff.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -109,6 +109,23 @@ console.log('\n— what the agent is told —');
   ok(/git add -A/.test(p) && /do NOT use/i.test(p), 'names the exact command that would sweep it in, and forbids it');
   ok(/stage the exact paths/i.test(p), 'tells it what to do INSTEAD — stage explicit paths');
   ok(/unstage/i.test(p), 'gives it a recovery step if the file ever does get staged');
+}
+
+console.log('\n— handing the same branch off twice —');
+{
+  // Two chats on one branch means two agents driving the same PR to merge: racing commits, duplicate
+  // review cycles. Git blocks the second worktree, but only with "already used by worktree at …",
+  // which surfaces as an opaque 500. Catch it up front and name the chat that already owns it.
+  const state = {
+    'u1': { identifier: 'CHAT-8', standalone: true, branch: 'rui/thing', handoff: { at: 'x' } },
+    'u2': { identifier: 'CHAT-9', standalone: true, branch: 'other/branch' },
+    'u3': { identifier: 'ENG-1', branch: 'rui/thing' }, // a pipeline issue, not a handoff
+  };
+  ok(existingHandoffForBranch(state, 'rui/thing') === 'CHAT-8', 'finds the chat already holding the branch');
+  ok(existingHandoffForBranch(state, 'other/branch') === null, 'a non-handoff chat on a branch does not block');
+  ok(existingHandoffForBranch(state, 'unused/branch') === null, 'an unused branch is free');
+  ok(existingHandoffForBranch({}, 'rui/thing') === null, 'empty state is fine');
+  ok(existingHandoffForBranch(state, 'RUI/THING') === 'CHAT-8', 'branch match is case-insensitive');
 }
 
 console.log('\n— a handoff chat is the developer\'s to delete, never its own —');

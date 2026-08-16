@@ -27,7 +27,7 @@ import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import { usageSnapshot } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
-import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, prRef } from './handoff.mjs';
+import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, existingHandoffForBranch, prRef } from './handoff.mjs';
 import { mergeMsg, entryPrUrls, prShortRef } from './merge-prompt.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
@@ -359,6 +359,21 @@ function branchOnOrigin(branch) {
   });
 }
 
+// The head branch GitHub thinks each PR is on. Best-effort: a lookup failure (no token, offline, gh
+// missing) returns null and the caller proceeds — a flaky network must not block a handoff — but a
+// definite MISMATCH is fatal, because it is silent and expensive: the agent would get a worktree on one
+// branch while driving a PR built from another, and push its review fixes somewhere the PR never sees.
+function prHeadBranch(prUrl, email) {
+  const env = { ...process.env };
+  const tok = email ? resolveAssigneeGhToken({ email }) : null;
+  if (tok) env.GH_TOKEN = tok;
+  const r = spawnSync('gh', ['pr', 'view', prUrl, '--json', 'headRefName', '-q', '.headRefName'],
+    { encoding: 'utf8', timeout: 30000, env });
+  if (r.status !== 0) return null;
+  const b = String(r.stdout || '').trim();
+  return b || null;
+}
+
 function createHandoff(body) {
   const v = validateHandoff(body, chatMembers());
   if (!v.ok) return { code: 400, error: v.error };
@@ -366,6 +381,18 @@ function createHandoff(body) {
   if (!fixEnabled()) return { code: 400, error: 'this machine cannot merge (AUTOFIX_RUN_ENABLED != 1)' };
   if (!branchOnOrigin(branch)) {
     return { code: 400, error: `branch "${branch}" is not on origin in any configured repo — push it before handing off` };
+  }
+  const dup = existingHandoffForBranch(loadState(), branch);
+  if (dup) {
+    return { code: 409, error: `branch "${branch}" is already handed off as ${dup} — talk to that chat instead of starting a second one (two agents on one PR race each other). Close ${dup} first if you really want to restart.` };
+  }
+  // Every PR must actually be built from this branch. Unchecked, a mismatch is silent: the worktree
+  // sits on one branch while the merge drive works another, and the fixes land where nobody looks.
+  for (const u of prUrls) {
+    const head = prHeadBranch(u, email);
+    if (head && head !== branch) {
+      return { code: 400, error: `${prRef(u)} is built from "${head}", not "${branch}" — hand off the branch the PR is actually on, or the agent's fixes would go to a branch the PR never sees` };
+    }
   }
 
   const identifier = nextChatId();
