@@ -419,9 +419,20 @@ function findTrippedSessionTimeout(
  * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
  * expensive-media budget tools, and now also for any timeout-class failure
  * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
- * a per-run one, since the model retries it across separate user turns/runs. */
+ * a per-run one, since the model retries it across separate user turns/runs.
+ *
+ * ENG-1220: a rate_limit-class failure on a media tool (gpt-image-2 429s) is
+ * transient — the gateway's own retryability guidance tells the model to wait
+ * and retry it. Counting it toward the tiny (2) session-wide media budget the
+ * same as a permanent failure (safety-filter rejection, invalid args) locked
+ * generate_image for the rest of the session even though the rate limit clears.
+ * Exclude rate_limit specifically so a real retry spiral (any other class)
+ * still trips the budget, but a temporary 429 does not. */
 function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
-  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
+  if (mediaFailureBudget(toolName) != null) {
+    return classifyToolErrorClass(error) !== 'rate_limit';
+  }
+  return classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
