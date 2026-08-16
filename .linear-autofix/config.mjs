@@ -276,6 +276,17 @@ export const config = {
     jestTimeoutMs: 10 * 60 * 1000, // backend `npx jest <changed test files>`
   },
 
+  // --- Build lock watchdog (gc.mjs, ENG-1016) ---
+  // /tmp/aw-heavy-build.lock is a real OS flock, not the self-healing per-issue lock.mjs above —
+  // nothing there self-heals a wedged holder of THIS lock. build-lock.mjs's reentrancy check (see
+  // runUnderBuildLock) stops the deadlock at the source, but this is a second, independent line of
+  // defense: watchBuildLock() in gc.mjs notices a holder that's been sitting at ~0% CPU (blocked, not
+  // building) for this long and logs it loudly — the deadlock's whole danger was that it looked
+  // exactly like a healthy-but-slow box (processes present, cron firing, no error anywhere).
+  buildLockStaleMinutes: 20,  // longer than any real tsc/vite build on this box comfortably takes
+  buildLockAutoKill: false,   // observe-only until proven safe on live traffic — same rollout pattern
+                              // as previewOrphanDryRun above; flip once the log line has been trusted
+
   // --- Code review gate (multi-agent) ---
   // After the fixer commits (but BEFORE the PR opens and BEFORE browser verify), N expert
   // reviewers inspect the diff in parallel, a manager adversarially verifies their findings
@@ -406,16 +417,28 @@ export const config = {
     // all inside ONE capped cgroup. The pipeline's own checks never do this: autofix.mjs already runs
     // tsc under `flock /tmp/aw-heavy-build.lock` with NODE_OPTIONS=--max-old-space-size=4096. Agents
     // typing the command themselves bypassed both, so the discipline has to be stated to them.
+    //
+    // Revised 2026-08-15 (ENG-1016): the original wording said flock is "always safe to add" — an
+    // agent took that literally and wrapped preview.mjs itself (`flock ... node preview.mjs up ...`),
+    // which internally flocks the SAME file again for its own vite build. flock is not reentrant:
+    // that self-nested wrap deadlocked at 0% CPU and took the whole machine-wide lock (and every other
+    // bug's build) down for 2h05m. Fixed here (drop the false claim) AND in code: build-lock.mjs's
+    // runUnderBuildLock() now detects an ancestor already holding the lock and skips re-wrapping.
     resourcePrompt:
       'RESOURCES — serialize heavy builds. A type-check, bundler build or test run (`tsc --noEmit`, ' +
       '`vite build`, `jest`) each peaks at 1-4GB, and every worktree on this box shares ONE ' +
       'memory-capped cgroup with the chat server and all other in-flight turns. Two of them at once is ' +
       'what OOMs the box and kills everyone\'s work mid-turn (it happened four times on 2026-08-05). So ' +
-      'never run one bare: wrap it in the machine-wide build lock with a bounded heap — ' +
-      '`NODE_OPTIONS=--max-old-space-size=4096 flock /tmp/aw-heavy-build.lock <command>`. flock simply ' +
-      'waits its turn, it does not fail, so this is always safe to add. The autofix pipeline runs its ' +
-      'own tsc/jest exactly this way — match it. Also scope the command: type-check or test only the ' +
-      'package you actually changed, never the whole repo, and never raise the heap above 4096.',
+      'when YOU are about to run one of those three bare, wrap ONLY that bare command in the ' +
+      'machine-wide build lock with a bounded heap — e.g. `NODE_OPTIONS=--max-old-space-size=4096 ' +
+      'flock /tmp/aw-heavy-build.lock tsc --noEmit` (or `vite build` / `jest`). The autofix pipeline ' +
+      'runs its own tsc/jest exactly this way — match it. Do NOT wrap anything else in this lock, and ' +
+      'NEVER wrap a pipeline entrypoint like `preview.mjs` — it already takes this same lock ' +
+      'internally for its own build step, and flock is NOT reentrant: wrapping it again deadlocks the ' +
+      'whole box waiting on itself (took the pipeline down 2h05m on 2026-08-09, ENG-1016). If you are ' +
+      'not personally about to type a bare `tsc`/`vite build`/`jest`, do not add flock at all. Also ' +
+      'scope the command: type-check or test only the package you actually changed, never the whole ' +
+      'repo, and never raise the heap above 4096.',
     // Autonomous background "watch": a chat has NO free-running execution between turns (each `claude -p`
     // exits when the turn ends). So a task that must WAIT for something (CI to finish, a PR to become
     // mergeable) can't be done in one turn. Instead the agent ends a waiting turn with a `[[WATCH: …]]`
