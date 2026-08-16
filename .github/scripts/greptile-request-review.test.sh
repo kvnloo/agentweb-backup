@@ -74,6 +74,7 @@ EOF
   marker_comment_for "${HEAD_SHA}" >"${MOCK_DIR}/comments.json"
   echo 0 >"${MOCK_DIR}/comment_exit"
   echo 0 >"${MOCK_DIR}/rerun_exit"
+  echo 0 >"${MOCK_DIR}/comments_exit"
   : >"${MOCK_DIR}/rerun_stderr"
   : >"${MOCK_DIR}/calls.log"
 }
@@ -163,6 +164,13 @@ if [ "$1" = "api" ]; then
       exit 0
       ;;
     */issues/*/comments\?*)
+      # comments_exit lets a test simulate the GitHub API call itself
+      # failing (e.g. a transient network error), distinct from the call
+      # succeeding with an empty/non-matching result.
+      if [ -f "${MOCK_DIR}/comments_exit" ] && [ "$(cat "${MOCK_DIR}/comments_exit")" != "0" ]; then
+        echo "mock gh: simulated transient failure" >&2
+        exit 1
+      fi
       # No --jq on this call in the real script (parsed in bash instead), so
       # serve the raw fixture, same convention as `pr view` with no --jq.
       cat "${MOCK_DIR}/comments.json"
@@ -355,6 +363,35 @@ if grep -qF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null; then
     '--rerun-only does not re-request when the answer is merely pending' "$(cat "${MOCK_DIR}/calls.log")"
 else
   printf 'PASS: %s\n' '--rerun-only does not re-request when the answer is merely pending'
+fi
+
+# CAUGHT LIVE (Greptile 3/5, portal#1035) — and then reproduced for real by
+# this session's own transient DNS failure mid-dogfood: a lookup FAILURE
+# (the GitHub API call erroring) must not read the same as a CONFIRMED
+# absence. The old code returned 1 either way, and main() told the caller
+# to post a duplicate paid request on a network blip that had nothing to do
+# with whether a request actually existed. Must fail loudly with a message
+# that does NOT recommend posting a fresh request.
+new_mock
+echo 1 >"${MOCK_DIR}/comments_exit"
+run_script --rerun-only
+check '--rerun-only on a transient lookup failure fails loudly, distinct from "absent"' 1 \
+  'could not confirm whether a request exists'
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${LAST_OUTPUT}" == *'Re-run WITHOUT --rerun-only'* ]] || [[ "${LAST_OUTPUT}" == *'head changed since the original request'* ]]; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a lookup failure must not be advised the same way as a confirmed-absent marker\n  output: %s\n' \
+    'a transient lookup failure is never advised as "post a duplicate"' "${LAST_OUTPUT}"
+else
+  printf 'PASS: %s\n' 'a transient lookup failure is never advised as "post a duplicate"'
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a lookup failure must not proceed to the rerun API\n' \
+    'no rerun attempted after a transient lookup failure'
+else
+  printf 'PASS: %s\n' 'no rerun attempted after a transient lookup failure'
 fi
 
 # Caught live by Greptile (4/5) a THIRD time on this same PR (portal#1035):

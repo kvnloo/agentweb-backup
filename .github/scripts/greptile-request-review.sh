@@ -91,6 +91,32 @@
 # for THAT — "was a request ever posted for this exact head" — not for a
 # landed verdict. A pending review and a landed one both count as "already
 # requested"; only a genuinely absent marker fails loudly.
+#
+# main() also re-resolves the head immediately before calling the rerun (not
+# just once at the top) — caught live a third time (Greptile 4/5,
+# portal#1035): reusing the head resolved at the top for the rerun call too
+# means a push in between could make the request and the rerun target
+# different commits.
+#
+# TWO KNOWN, DELIBERATE LIMITS, both flagged in the same portal#1035 review
+# (3/5) and left as-is rather than chased further:
+#   - The window between that final re-check and the actual rerun API call
+#     is still non-atomic — GitHub has no "rerun this job, but only if HEAD
+#     is still X" endpoint. Every fix so far has narrowed this from "however
+#     long a human takes to notice and retry" down to consecutive API calls
+#     milliseconds apart. Closing it completely isn't possible without a
+#     capability this API doesn't offer, and the fail-closed gate means the
+#     worst residual outcome is a wasted credit and a retry — never a false
+#     pass. Diminishing returns past this point.
+#   - A LOOKUP failure inside request_marker_exists_for (the GitHub API call
+#     itself erroring — reproduced for real by a transient DNS failure
+#     during this script's own development) is retried 3x before giving up,
+#     and reported as a DISTINCT outcome from "confirmed absent" — see that
+#     function and the case statement in main() for why conflating the two
+#     was the actual bug, not the retry count. A network blip lasting longer
+#     than the retry window still ends the script; that's the correct
+#     failure mode (loud, not a duplicate request), not a bug to fix by
+#     retrying harder.
 
 set -euo pipefail
 
@@ -137,20 +163,33 @@ resolve_head_sha() {
   printf '%s' "${head_sha}"
 }
 
-# True (exit 0) iff a request comment carrying THIS head's marker exists —
-# regardless of whether Greptile has answered it yet. That's the entire
-# point: a pending request and a landed one must both read as "already
-# asked", or --rerun-only misfires on every retry that lands before Greptile
-# does (see the header). Never fails the whole script on a lookup error —
-# treated as "can't confirm", which the caller reads as absent (the safe
-# direction: request one rather than silently skip).
+# Exit 0: the marker was found. Exit 1: comments were fetched fine and the
+# marker is genuinely absent. Exit 2: the lookup itself failed after retries
+# — a DIFFERENT outcome from "absent", and the caller must not conflate them.
+#
+# CAUGHT LIVE (Greptile 3/5, portal#1035) — and then reproduced for real by
+# this session's own transient DNS failure mid-dogfood: the original version
+# collapsed "confirmed no marker" and "couldn't check because the GitHub API
+# call itself failed" into the same `return 1`. main()'s caller treated both
+# as "no request exists, post a new one" — so a one-off network blip during
+# the CHECK made a perfectly valid outstanding request look absent, and the
+# advice was to pay for a duplicate. A transient failure must never look
+# like a confirmed negative.
 request_marker_exists_for() {
-  local head_sha="$1" comments_json
-  comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null || true)"
-  if [ -z "${comments_json}" ]; then
-    return 1
-  fi
-  printf '%s' "${comments_json}" | grep -qF "$(request_marker "${head_sha}")"
+  local head_sha="$1" comments_json attempt
+  for attempt in 1 2 3; do
+    comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null || true)"
+    if [ -n "${comments_json}" ]; then
+      if printf '%s' "${comments_json}" | grep -qF "$(request_marker "${head_sha}")"; then
+        return 0
+      fi
+      return 1
+    fi
+    if [ "${attempt}" -lt 3 ]; then
+      sleep 3
+    fi
+  done
+  return 2
 }
 
 # Finds the job to rerun. Deliberately errors loudly rather than silently
@@ -209,9 +248,18 @@ main() {
     # flight, either counts. If the head moved since the original request
     # (a new push landed in between), no marker matches the current head:
     # fail loudly rather than rerun-and-wait for a review nobody asked for.
-    if ! request_marker_exists_for "${head_sha}"; then
-      fail "--rerun-only was called for head ${head_sha}, but no review request marker was found for it — the head changed since the original request (or none was ever made for this head). Re-run WITHOUT --rerun-only so the current head actually gets a review requested."
-    fi
+    # A LOOKUP failure (exit 2) is a DIFFERENT outcome from a confirmed
+    # absence (exit 1) and must never be told to post a duplicate — see
+    # request_marker_exists_for's header for why that distinction exists.
+    set +e
+    request_marker_exists_for "${head_sha}"
+    local marker_rc=$?
+    set -e
+    case "${marker_rc}" in
+      0) ;;
+      2) fail "--rerun-only could not confirm whether a request exists for head ${head_sha} — the GitHub API lookup itself failed after retries (see the log above for the underlying error). This is NOT the same as 'no request exists': do not post a fresh review request. Re-run '$0 --rerun-only' again once the API is reachable." ;;
+      *) fail "--rerun-only was called for head ${head_sha}, but no review request marker was found for it — the head changed since the original request (or none was ever made for this head). Re-run WITHOUT --rerun-only so the current head actually gets a review requested." ;;
+    esac
     log "--rerun-only: confirmed a request is outstanding for head ${head_sha}; skipping a duplicate review request, retrying only the gate-job rerun."
   fi
 
