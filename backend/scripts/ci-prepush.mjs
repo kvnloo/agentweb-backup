@@ -26,7 +26,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -54,7 +54,7 @@ async function readPushedRefs() {
 
 function changedFilesForRefs(refs) {
   const perRefMaps = [];
-  const bases = new Set();
+  const refBases = [];
   for (const r of refs) {
     const base = resolveBaseSha(r, {
       commitExists: (sha) => spawnSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: root }).status === 0,
@@ -64,7 +64,7 @@ function changedFilesForRefs(refs) {
       },
       parentOf: (sha) => `${sha}~1`,
     });
-    bases.add(base);
+    refBases.push(base);
     // ENG-1277 / Greptile P1 #1, #3, #5: `--raw`, not `--name-only`, and
     // `--diff-filter=AMD` (Added/Modified/Deleted — C requires an explicit
     // --find-copies flag we don't pass, so it can never appear; R is excluded by
@@ -100,7 +100,12 @@ function changedFilesForRefs(refs) {
   if (!merged.ok) {
     fail(`pushing multiple refs in one \`git push\` with different changes to the same path is not supported by this hook — it verifies against a single shared working tree and cannot check two different versions of the same path at once: ${merged.conflictingPaths.join(', ')}. Push these refs separately (one \`git push origin <ref>\` at a time), or bypass with --no-verify (CI still checks each ref for real on its own head).`);
   }
-  return { statusByPath: merged.statusByPath, bases: [...bases] };
+  // ENG-1277 / Greptile P1: "wrong base restores deleted source" — scope each
+  // deleted path's candidate bases to only the refs that actually reported it
+  // deleted, not every base from the whole push. See basesForDeletedPaths's
+  // doc comment for why an unrelated ref's base can otherwise win.
+  const basesForPath = basesForDeletedPaths(refBases, perRefMaps);
+  return { statusByPath: merged.statusByPath, basesForPath };
 }
 
 // ENG-1277 / Greptile P1 #2 and #3: a deleted source file must still have its
@@ -117,7 +122,7 @@ function changedFilesForRefs(refs) {
 // themselves still run against the true, post-deletion tree; only *discovery* sees
 // the old file. Returns revert callbacks so the caller can restore correctly even if
 // something downstream throws.
-function materializeDeletedForDiscovery(deletedRelPaths, bases) {
+function materializeDeletedForDiscovery(deletedRelPaths, basesForPath) {
   const revert = [];
   const revertAll = () => { while (revert.length) revert.pop()(); };
   try {
@@ -154,8 +159,14 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
       const hadLocalContent = existsSync(absPath);
       const localContent = hadLocalContent ? readFileSync(absPath) : null;
       let content = null;
-      for (const base of bases) {
-        const r = spawnSync('git', ['show', `${base}:${path.posix.join('backend', relPath)}`], { cwd: root, encoding: 'utf8' });
+      // ENG-1277 / Greptile P1: only try bases from refs that actually
+      // reported THIS path deleted — never a base belonging to some other,
+      // unrelated ref in the same multi-ref push. See basesForDeletedPaths's
+      // doc comment.
+      const fullPath = path.posix.join('backend', relPath);
+      const candidateBases = basesForPath[fullPath] || [];
+      for (const base of candidateBases) {
+        const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
         if (r.status === 0) { content = r.stdout; break; }
       }
       if (content === null) {
@@ -165,7 +176,7 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
         // half-materialized path behind on a failed push would either pollute the
         // developer's working tree with an untracked file they never created, or
         // worse, leave their own pre-existing file overwritten.
-        throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit (tried: ${bases.join(', ')}) — cannot check for tests that depended on it.`);
+        throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
       }
       mkdirSync(path.dirname(absPath), { recursive: true });
       // ENG-1277 / Greptile P1 #5: refuse to write outside the repo. If the
@@ -184,9 +195,25 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
         throw new Error(`refusing to materialize ${relPath} for test discovery — its directory resolves to ${realDir}, outside backend/ (${realBackend}), likely via a symlink in its ancestry. Writing there would escape the repository.`);
       }
       writeFileSync(absPath, content);
-      revert.push(hadLocalContent
-        ? () => writeFileSync(absPath, localContent)
-        : () => rmSync(absPath, { force: true }));
+      // ENG-1277 / Greptile P1: "cleanup destroys concurrent worktree
+      // changes" — this revert used to unconditionally restore the
+      // pre-materialization snapshot (or unconditionally rmSync), regardless
+      // of anything that touched absPath DURING the discovery window in
+      // between (an editor, a watcher, a genuinely concurrent process). Only
+      // revert if the content is still exactly what we just wrote — i.e.
+      // nothing else touched this path since. If something else changed it,
+      // leave it alone and warn loudly rather than silently destroying that
+      // change; the developer can `git status` and sort it out themselves.
+      revert.push(() => {
+        let current = null;
+        try { current = readFileSync(absPath, 'utf8'); } catch { /* nothing there now */ }
+        if (current !== content) {
+          log(`WARNING: ${relPath} changed (by something other than this hook) while test discovery ran — leaving it as-is rather than overwriting or deleting that change. Check \`git status\` for ${relPath} before pushing again.`);
+          return;
+        }
+        if (hadLocalContent) writeFileSync(absPath, localContent);
+        else rmSync(absPath, { force: true });
+      });
     }
   } catch (e) {
     revertAll();
@@ -211,7 +238,7 @@ function run(label, cmd, args, { cwd, budgetMs }) {
 const refs = await readPushedRefs();
 if (!refs.length) process.exit(0);
 
-const { statusByPath, bases } = changedFilesForRefs(refs);
+const { statusByPath, basesForPath } = changedFilesForRefs(refs);
 const files = Object.keys(statusByPath);
 const backendFiles = files.filter((f) => isBackendPath(f));
 if (!backendFiles.length) { log(`no backend changes in ${files.length} pushed file(s) — skipping.`); process.exit(0); }
@@ -250,7 +277,7 @@ const deletedNonTest = nonTestChangedAbs.filter(isDeleted).map(rel);
 
 let relatedSuites = null;
 if (nonTestChanged.length || deletedNonTest.length) {
-  const revertMaterialized = materializeDeletedForDiscovery(deletedNonTest, bases);
+  const revertMaterialized = materializeDeletedForDiscovery(deletedNonTest, basesForPath);
   let list;
   try {
     list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],

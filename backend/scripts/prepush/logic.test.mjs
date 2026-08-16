@@ -12,6 +12,7 @@ import {
   parseDiffRaw,
   mergeStatusByPathAcrossRefs,
   findForeignBackendRefs,
+  basesForDeletedPaths,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -367,4 +368,46 @@ test('findForeignBackendRefs: multiple non-checked-out refs are all flagged, not
 
 test('findForeignBackendRefs: no refs -> empty', () => {
   assert.deepEqual(findForeignBackendRefs([], [], 'head-sha'), []);
+});
+
+// ENG-1277 / Greptile P1: "wrong base restores deleted source" — a deleted
+// path's candidate bases must come ONLY from the ref(s) that actually
+// reported it deleted, never from an unrelated ref's base in the same push.
+
+test('basesForDeletedPaths: single ref, one deletion -> that ref\'s base only', () => {
+  const perRefMaps = [{ 'backend/src/a.ts': { status: 'D', blob: ZERO } }];
+  assert.deepEqual(basesForDeletedPaths(['base-1'], perRefMaps), { 'backend/src/a.ts': ['base-1'] });
+});
+
+test('basesForDeletedPaths: non-deletion statuses (A/M) are excluded entirely', () => {
+  const perRefMaps = [{ 'backend/src/a.ts': { status: 'M', blob: 'x' }, 'backend/src/b.ts': { status: 'A', blob: 'y' } }];
+  assert.deepEqual(basesForDeletedPaths(['base-1'], perRefMaps), {});
+});
+
+test('basesForDeletedPaths: an unrelated ref that never touches a path never contributes a base for it', () => {
+  const perRefMaps = [
+    { 'backend/src/a.ts': { status: 'D', blob: ZERO } },        // ref 0: deletes a.ts
+    { 'README.md': { status: 'M', blob: 'z' } },                 // ref 1: docs-only, unrelated to a.ts
+  ];
+  assert.deepEqual(basesForDeletedPaths(['base-0', 'base-1'], perRefMaps), { 'backend/src/a.ts': ['base-0'] });
+});
+
+test('basesForDeletedPaths: two refs that both delete the same path contribute BOTH their bases', () => {
+  const perRefMaps = [
+    { 'backend/src/a.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/a.ts': { status: 'D', blob: ZERO } },
+  ];
+  assert.deepEqual(basesForDeletedPaths(['base-0', 'base-1'], perRefMaps), { 'backend/src/a.ts': ['base-0', 'base-1'] });
+});
+
+test('basesForDeletedPaths: the same base appearing twice for one path is deduped', () => {
+  const perRefMaps = [
+    { 'backend/src/a.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/a.ts': { status: 'D', blob: ZERO } },
+  ];
+  assert.deepEqual(basesForDeletedPaths(['shared-base', 'shared-base'], perRefMaps), { 'backend/src/a.ts': ['shared-base'] });
+});
+
+test('basesForDeletedPaths: no refs -> empty object', () => {
+  assert.deepEqual(basesForDeletedPaths([], []), {});
 });

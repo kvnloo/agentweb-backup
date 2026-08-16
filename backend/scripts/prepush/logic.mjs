@@ -94,6 +94,34 @@ export function mergeStatusByPathAcrossRefs(perRefMaps) {
 }
 
 /**
+ * For each path some ref reports Deleted, record ONLY the base(s) of the
+ * ref(s) that actually reported that deletion (Greptile P1, ENG-1277 pre-push
+ * hook: "wrong base restores deleted source"). `materializeDeletedForDiscovery`
+ * previously tried every base from the WHOLE push (a flat Set, one entry per
+ * pushed ref) for every deleted path, in Set-iteration order, and took the
+ * first `git show <base>:<path>` that succeeded. In a multi-ref push where a
+ * ref unrelated to a given deletion (e.g. a docs-only ref) happens to have
+ * its OWN base resolve to a totally different commit that coincidentally also
+ * has a file at that same path, that unrelated base could be tried first and
+ * "win" — recovering the wrong historical content and making
+ * `--findRelatedTests` resolve the wrong import graph, potentially missing
+ * suites that actually cover the real deletion. Scoping candidate bases to
+ * only the refs that actually deleted a given path closes that gap.
+ */
+export function basesForDeletedPaths(refBases, perRefMaps) {
+  const result = {};
+  perRefMaps.forEach((map, i) => {
+    for (const [p, entry] of Object.entries(map)) {
+      if (entry.status === 'D') {
+        (result[p] ??= []).push(refBases[i]);
+      }
+    }
+  });
+  for (const p of Object.keys(result)) result[p] = [...new Set(result[p])];
+  return result;
+}
+
+/**
  * Identify pushed refs that are NOT the currently checked-out HEAD but still
  * touch a backend path (Greptile finding, ENG-1277 pre-push hook, round 5b,
  * ci-prepush.mjs:88-90). tsc/jest in this hook always run against the CURRENT
