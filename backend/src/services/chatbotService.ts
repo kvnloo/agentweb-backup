@@ -4816,6 +4816,10 @@ export async function generateChatResponse(
             model: activeDeployment,
             provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
             feature: 'chat',
+            // ENG-1251: response.id is stable across a retried/re-processed
+            // response and distinct across real calls — closes the "retries
+            // defeat charge dedup" Greptile P1 for this iteration's charge.
+            eventId: typeof response?.id === 'string' ? response.id : undefined,
             inputTokens: u.prompt_tokens || 0,
             outputTokens: u.completion_tokens || 0,
             cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
