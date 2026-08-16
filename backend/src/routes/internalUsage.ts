@@ -105,10 +105,21 @@ router.post(
       // its measurements happen to be identical to a prior run's. Optional
       // for backward compatibility during rollout — an engine version predating
       // this falls through to the content+time-bucket fingerprint below.
+      //
+      // Greptile P1 (security): reportId is embedded verbatim into the
+      // charge event's DynamoDB sort key (eventId). DynamoDB sort keys are
+      // capped at 1024 bytes -- an oversized reportId (a real UUID is ~36
+      // chars, so anything past a generous multiple of that is not a
+      // legitimate engine value) would make recordLlmChargeEvent's PUT fail
+      // validation, which the fail-open charging path swallows, silently
+      // omitting the batch from BOTH the counter and itemization. Rejecting
+      // it here and falling through to the content+time-bucket fingerprint
+      // (the same path an absent reportId already takes) keeps the batch
+      // charged instead of silently dropped.
+      const MAX_REPORT_ID_LENGTH = 256;
+      const rawReportId = typeof (req.body || {}).reportId === "string" ? (req.body || {}).reportId.trim() : "";
       const reportId =
-        typeof (req.body || {}).reportId === "string" && (req.body || {}).reportId.trim()
-          ? (req.body || {}).reportId.trim()
-          : undefined;
+        rawReportId && rawReportId.length <= MAX_REPORT_ID_LENGTH ? rawReportId : undefined;
 
       if (!Array.isArray(records) || records.length === 0) {
         return res

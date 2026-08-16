@@ -508,6 +508,36 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
     // Falls back to the fingerprint format, not "engine:user-1:12345".
     expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
   });
+
+  it("ENG-1251 Greptile P1 (security): rejects an oversized reportId instead of letting it silently drop the charge", async () => {
+    // DynamoDB sort keys are capped at 1024 bytes; a real engine reportId
+    // is a ~36-char UUID. An oversized value embedded verbatim in the
+    // charge event's key would make the audit write fail validation --
+    // which the fail-open charging path would otherwise swallow, silently
+    // omitting the batch from both the counter and itemization. Falls
+    // through to the content+time-bucket fingerprint instead, same as an
+    // absent reportId, so the batch still gets charged.
+    const oversizedReportId = "x".repeat(2000);
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: oversizedReportId });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:[0-9a-f]{32}$/));
+    expect(audit?.eventId).not.toContain(oversizedReportId);
+  });
+
+  it("accepts a reportId right at the length boundary", async () => {
+    const boundaryReportId = "x".repeat(256);
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: boundaryReportId });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit?.eventId).toContain(boundaryReportId);
+  });
 });
 
 describe("POST /api/internal/usage — engine spend is separable in the ledger", () => {
