@@ -102,8 +102,28 @@ console.log('\n— reporting back to Linear —');
   ok(/LINEAR_API_KEY/.test(p), 'tells it the key is already in its environment');
   ok(/if .*linear issue|when .*linear issue|has a linear/i.test(p), 'conditional — a laptop handoff often has no card');
   ok(/comment/i.test(p), 'asks for a comment on the card');
-  ok(/do not.*(mark|move).*(done|status)|never.*(mark|move) it (to )?done/i.test(p),
-    'must NOT close the card — the human owns that transition');
+  ok(/Verifying/.test(p), 'names the state it MAY move the card to');
+  ok(/everything (that )?the card asks/i.test(p), 'only when EVERYTHING the card asked for is done');
+  ok(/live[- ]tested|verified (on|in) prod/i.test(p), 'and only after it was live-tested on production');
+  ok(/never.*done|not.*mark it done/i.test(p), 'still must NOT close the card — a human owns that');
+  ok(/partially|some of|not all/i.test(p), 'partial completion explicitly does not earn the move');
+}
+
+console.log('\n— preview-testing a review-driven change before merging —');
+{
+  ok(/preview/i.test(p), 'the agent knows a preview is available to it');
+  ok(/before merging|pre-merge/i.test(p), 'and that it may use it BEFORE the merge');
+  ok(/free to|may|your call|judgement/i.test(p), 'framed as permission/judgement, not an obligation');
+  ok(!/preview\.mjs|proxy\.mjs|nip\.io/.test(p), 'but the preview MECHANICS are not scripted (they rot too)');
+}
+
+console.log('\n— where autonomy stops —');
+{
+  ok(/production decision|decision about production/i.test(p), 'a production decision blocks');
+  ok(/big|significant|consequential|far-reaching/i.test(p), 'so does a big/consequential one');
+  ok(/wait|stop|do not proceed/i.test(p), 'it must stop and wait rather than proceed');
+  // The flip side matters just as much: everything else is the agent's to do alone.
+  ok(/otherwise|everything else|anything short of/i.test(p), 'and everything else is full autonomy');
 }
 
 console.log('\n— orientation that is still allowed —');
