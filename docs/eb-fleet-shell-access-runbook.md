@@ -55,7 +55,7 @@ Raw check (works for any operator, no extra setup):
 
 ```bash
 aws ec2 describe-security-groups --region us-west-2 \
-  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?IpProtocol=='-1' || (FromPort<=\\\`22\\\` && ToPort>=\\\`22\\\`)]}" \
+  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?IpProtocol=='-1' || (FromPort<=\`22\` && ToPort>=\`22\`)]}" \
   --output json | jq '[.[] | select(.Rules | length > 0)]'
 ```
 
