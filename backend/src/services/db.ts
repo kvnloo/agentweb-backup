@@ -1362,14 +1362,20 @@ export class UserDB {
   ): Promise<any[]> {
     const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
     const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
-    const result = await this.docClient
-      .scan({
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const params: AWS.DynamoDB.DocumentClient.ScanInput = {
         TableName: this.tableName,
         FilterExpression: combinedFilter,
         ExpressionAttributeValues: combinedValues,
-      })
-      .promise();
-    return result.Items || [];
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      };
+      const result = await this.docClient.scan(params).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
   }
 
   async getUserAnalytics(startDate: string, endDate: string) {
