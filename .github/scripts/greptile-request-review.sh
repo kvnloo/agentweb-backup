@@ -67,6 +67,17 @@
 #       the backend test pair already takes. Plain re-invocation (no flag)
 #       would post a second `@greptileai` comment for the same head, paying
 #       for a redundant review the first call already requested.
+#
+# `--rerun-only`: skip the comment, only retry the gate-job rerun for a
+# request already made. CAUGHT LIVE (Greptile 4/5 reviewing the exit-2 fix
+# itself, same PR): if a new commit lands between the original request and
+# the `--rerun-only` retry, blindly reusing this flag reruns the gate for a
+# head NOBODY asked Greptile to review — it polls for a review that was never
+# requested and eventually goes `unavailable`, silently. So `--rerun-only`
+# first checks Greptile's latest comment against the CURRENT head: if its
+# `Last reviewed commit` doesn't match, that request is stale and this exits
+# 1 rather than rerun-and-wait-for-nothing — call the script again without
+# `--rerun-only` so the current head actually gets asked for.
 
 set -euo pipefail
 
@@ -97,16 +108,48 @@ post_review_request() {
   log "requested a fresh Greptile review on ${REPO}#${PR_NUMBER}."
 }
 
+resolve_head_sha() {
+  local head_sha
+  head_sha="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
+  if [ -z "${head_sha}" ]; then
+    fail "could not resolve the current head SHA for ${REPO}#${PR_NUMBER}."
+  fi
+  printf '%s' "${head_sha}"
+}
+
+# The same parsing convention as greptile-gate.sh: Greptile edits one comment
+# in place, so the LATEST Greptile comment carrying a "Last reviewed commit"
+# footer is the one that matters. Prints the reviewed SHA, or nothing if no
+# verdict has landed yet. Never fails the whole script — a lookup failure
+# here means "can't confirm a review exists", which the caller treats as
+# "assume it doesn't" (the safe direction: request one rather than skip).
+last_reviewed_sha() {
+  local comments_json body footer_line
+  comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null || true)"
+  if [ -z "${comments_json}" ]; then
+    return 0
+  fi
+  body="$(printf '%s' "${comments_json}" | jq -r '
+      [ .[]
+        | select((.user.type // "") == "Bot")
+        | select(((.user.login // "") | ascii_downcase | startswith("greptile")))
+        | (.body // "")
+      ] as $bodies
+      | ( [ $bodies[] | select(test("last reviewed commit"; "i")) ] | last )
+        // ""
+    ' 2>/dev/null || true)"
+  if [ -z "${body}" ]; then
+    return 0
+  fi
+  footer_line="$(printf '%s\n' "${body}" | grep -iE 'last reviewed commit' | head -n 1)"
+  printf '%s' "${footer_line}" | grep -oiE 'commit/[0-9a-f]{40}' | head -n 1 | cut -d/ -f2 | tr '[:upper:]' '[:lower:]'
+}
+
 # Finds the job to rerun. Deliberately errors loudly rather than silently
 # skipping the rerun on any ambiguity — a skipped rerun leaves the gate stuck
 # on a stale refusal with no visible sign anything is wrong.
 rerun_gate_job() {
-  local head_sha run_id job_id
-
-  head_sha="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
-  if [ -z "${head_sha}" ]; then
-    fail "could not resolve the current head SHA for ${REPO}#${PR_NUMBER}, so the gate job could not be re-run. The comment above was still posted."
-  fi
+  local head_sha="$1" run_id job_id
 
   run_id="$(gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&event=pull_request&per_page=10" \
     --jq "[.workflow_runs[] | select(.name == \"${WORKFLOW_NAME}\")] | sort_by(.run_number) | last | .id" 2>/dev/null || true)"
@@ -148,12 +191,25 @@ main() {
     rerun_only=1
   fi
 
+  local head_sha
+  head_sha="$(resolve_head_sha)"
+
   if [ "${rerun_only}" -eq 0 ]; then
     post_review_request
   else
-    log "--rerun-only: skipping the review request, retrying only the gate-job rerun."
+    # Verify the earlier request actually covers THIS head. If the head moved
+    # since then (a new push landed between the original call and this
+    # retry), rerunning the gate now would poll for a review nobody asked
+    # for — fail loudly instead of wasting the rerun on a request that was
+    # never made.
+    local reviewed_sha
+    reviewed_sha="$(last_reviewed_sha)"
+    if [ "${reviewed_sha}" != "${head_sha}" ]; then
+      fail "--rerun-only was called for head ${head_sha}, but Greptile's latest review is for $( [ -n "${reviewed_sha}" ] && echo "${reviewed_sha}" || echo "no commit yet" ) — the head changed since the original request (or none was ever made for this head). Re-run WITHOUT --rerun-only so the current head actually gets a review requested."
+    fi
+    log "--rerun-only: confirmed the outstanding request covers head ${head_sha}; skipping a duplicate review request, retrying only the gate-job rerun."
   fi
-  rerun_gate_job
+  rerun_gate_job "${head_sha}"
 }
 
 main "$@"

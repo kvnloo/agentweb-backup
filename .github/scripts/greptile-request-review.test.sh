@@ -33,9 +33,20 @@ JOB_ID='95202232733'
 #   pull.json           `gh pr view --json headRefOid` response
 #   runs.json            `gh api .../actions/runs?head_sha=...` response
 #   jobs.json             `gh api .../actions/runs/<id>/jobs` response
+#   comments.json          `gh api .../issues/<pr>/comments` response
 #   comment_exit          exit code for `gh pr comment` (default 0)
 #   rerun_exit             exit code for the job rerun POST (default 0)
 #   calls.log              one line per gh invocation, args space-joined
+
+greptile_comment_for() {
+  local sha="$1"
+  cat <<EOF
+[
+  {"user": {"type": "Bot", "login": "greptile-apps[bot]"},
+   "body": "Confidence Score: 5/5\n\n<sub>Reviews (1): Last reviewed commit: [\"fix\"](https://github.com/agentwebpro/agentweb/commit/${sha})</sub>"}
+]
+EOF
+}
 
 write_default_fixtures() {
   cat >"${MOCK_DIR}/pull.json" <<EOF
@@ -54,6 +65,9 @@ EOF
   {"id": 2, "name": "CI script tests"}
 ]}
 EOF
+  # Default: a landed 5/5 review already covers HEAD_SHA — the common case for
+  # a --rerun-only retry (the original call's comment did land).
+  greptile_comment_for "${HEAD_SHA}" >"${MOCK_DIR}/comments.json"
   echo 0 >"${MOCK_DIR}/comment_exit"
   echo 0 >"${MOCK_DIR}/rerun_exit"
   : >"${MOCK_DIR}/rerun_stderr"
@@ -125,6 +139,12 @@ if [ "$1" = "api" ]; then
       ;;
     */jobs\?*)
       jq -r "${jq_filter}" "${MOCK_DIR}/jobs.json"
+      exit 0
+      ;;
+    */issues/*/comments\?*)
+      # No --jq on this call in the real script (parsed in bash instead), so
+      # serve the raw fixture, same convention as `pr view` with no --jq.
+      cat "${MOCK_DIR}/comments.json"
       exit 0
       ;;
   esac
@@ -266,6 +286,34 @@ else
 fi
 check_call_logged '--rerun-only still targets the resolved job id' \
   "actions/jobs/${JOB_ID}/rerun"
+
+# Caught live by Greptile (4/5) reviewing the exit-2 fix itself: a push
+# between the original request and a `--rerun-only` retry means Greptile's
+# latest review covers a DIFFERENT (older) commit than the current head —
+# nobody ever asked for a review of the current head. Blindly rerunning the
+# gate would poll for a review that will never arrive. Must fail loudly
+# (exit 1) and must NOT attempt the rerun.
+new_mock
+greptile_comment_for 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >"${MOCK_DIR}/comments.json"
+run_script --rerun-only
+check '--rerun-only for a head with no matching review fails loudly, not a silent rerun' 1 \
+  'the head changed since the original request'
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a stale --rerun-only must not touch the jobs API at all\n  calls.log:\n%s\n' \
+    'stale --rerun-only never attempts a rerun' "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' 'stale --rerun-only never attempts a rerun'
+fi
+
+# Same failure mode when no Greptile comment has ever landed at all (e.g. the
+# very first exit-2 happened before Greptile even answered the initial ask).
+new_mock
+echo '[]' >"${MOCK_DIR}/comments.json"
+run_script --rerun-only
+check '--rerun-only with no Greptile comment at all fails loudly, not a silent rerun' 1 \
+  'no commit yet'
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"
