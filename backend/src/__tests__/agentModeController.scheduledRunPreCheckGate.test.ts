@@ -191,11 +191,12 @@ describe('runScheduledChat — ENG-1259 cheap pre-check gate', () => {
 
   // Reconstructed from the evidence: three prior "Schedule skipped" runs in a
   // row, each of which ran the OLD (un-gated) full flow to conclude there was
-  // nothing to publish.
+  // nothing to publish. `attempt` is set (matching the 41-129 message real
+  // occurrences) so these read as GENUINE declines, not pre-flight blocks.
   const lucasNoOutputHistory = [
-    { status: 'failure', passed: false, actualResponse: 'Schedule skipped', createdAt: '2026-08-10T13:00:00Z' },
-    { status: 'failure', passed: false, actualResponse: 'Schedule skipped', createdAt: '2026-08-12T13:00:00Z' },
-    { status: 'failure', passed: false, actualResponse: 'Nothing Published', createdAt: '2026-08-13T13:00:00Z' },
+    { status: 'failure', passed: false, actualResponse: 'Schedule skipped', attempt: 6, createdAt: '2026-08-10T13:00:00Z' },
+    { status: 'failure', passed: false, actualResponse: 'Schedule skipped', attempt: 3, createdAt: '2026-08-12T13:00:00Z' },
+    { status: 'failure', passed: false, actualResponse: 'Nothing Published', attempt: 2, createdAt: '2026-08-13T13:00:00Z' },
   ];
 
   beforeEach(() => {
@@ -233,14 +234,72 @@ describe('runScheduledChat — ENG-1259 cheap pre-check gate', () => {
 
     it('never calls the pre-check LLM when the most recent run was productive', async () => {
       const healthyHistory = [
-        { status: 'failure', passed: false, actualResponse: 'Schedule skipped' },
-        { status: 'success', passed: true, actualFunctionCalls: ['post_on_connected_account'] },
+        { status: 'failure', passed: false, actualResponse: 'Schedule skipped', attempt: 4 },
+        { status: 'success', passed: true, actualFunctionCalls: ['post_on_connected_account'], attempt: 1 },
       ];
 
       await runScheduledChat({ ...lucasSchedule, runResults: healthyHistory }, mockUserId, false);
 
       expect(mockAgentModeService.evaluateScheduledRunPreCheck).not.toHaveBeenCalled();
       expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    });
+
+    // Greptile P1 (initial review): a bare status:'failure' also covers pre-flight
+    // blocks that never reached the model at all (entitlement checks, token-limit
+    // caps, an orphaned schedule owner, a generic exception before any turn ran) —
+    // every one of which this codebase records with attempt: 0. The schedule's
+    // next fire is supposed to retry normally, not have this gate reason about it
+    // as a content decision.
+    it('never calls the pre-check LLM when the most recent run was a pre-flight operational failure (attempt: 0)', async () => {
+      const operationalFailureHistory = [
+        { status: 'failure', passed: false, actualResponse: 'Scheduled chat cannot run: Monthly cost limit reached', attempt: 0 },
+      ];
+
+      await runScheduledChat({ ...lucasSchedule, runResults: operationalFailureHistory }, mockUserId, false);
+
+      expect(mockAgentModeService.evaluateScheduledRunPreCheck).not.toHaveBeenCalled();
+      expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('skip-streak ceiling — the gate cannot suppress real work forever (Greptile P1, initial review)', () => {
+    it('bypasses the classifier and forces the full flow after the consecutive-skip cap is reached', async () => {
+      const skipStreakHistory = [
+        ...lucasNoOutputHistory,
+        { status: 'skipped_no_content', passed: false, actualResponse: 'Skipped before running the full flow', attempt: 0 },
+        { status: 'skipped_no_content', passed: false, actualResponse: 'Skipped before running the full flow', attempt: 0 },
+      ];
+      // Even if the classifier WOULD confidently say skip again, the streak cap
+      // must win — the classifier is never even asked.
+      mockAgentModeService.evaluateScheduledRunPreCheck.mockResolvedValue({
+        decision: 'skip',
+        confidence: 'high',
+        reason: 'would skip again',
+      });
+
+      const result = await runScheduledChat({ ...lucasSchedule, runResults: skipStreakHistory }, mockUserId, false);
+
+      expect(mockAgentModeService.evaluateScheduledRunPreCheck).not.toHaveBeenCalled();
+      expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+      expect(result.status).not.toBe('skipped_no_content');
+    });
+
+    it('still gates normally below the cap (single prior gate skip)', async () => {
+      const oneSkipHistory = [
+        ...lucasNoOutputHistory,
+        { status: 'skipped_no_content', passed: false, actualResponse: 'Skipped before running the full flow', attempt: 0 },
+      ];
+      mockAgentModeService.evaluateScheduledRunPreCheck.mockResolvedValue({
+        decision: 'skip',
+        confidence: 'high',
+        reason: 'still nothing new',
+      });
+
+      const result = await runScheduledChat({ ...lucasSchedule, runResults: oneSkipHistory }, mockUserId, false);
+
+      expect(mockAgentModeService.evaluateScheduledRunPreCheck).toHaveBeenCalledTimes(1);
+      expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+      expect(result.status).toBe('skipped_no_content');
     });
   });
 

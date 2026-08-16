@@ -29,6 +29,25 @@
  *      gate that silently skips real, value-producing work because it
  *      guessed wrong is a worse failure than occasionally spending a bit
  *      more on an unnecessary full run (ENG-1259 acceptance criterion 4).
+ *   3. `shouldForceProceedAfterSkipStreak` — a hard ceiling on the gate's OWN
+ *      risk. The classifier only ever reasons from static history, so a
+ *      confidently-wrong verdict (or a genuine change in circumstance the
+ *      history-only signal cannot see) could otherwise repeat forever. Once
+ *      the trailing streak of THIS GATE's own skips reaches a small cap, the
+ *      next due run is forced through the full flow, guaranteeing a real
+ *      check-in no matter what the classifier would say. A genuine full-flow
+ *      decline (a real "ran and had nothing to publish" result) does not
+ *      count toward this — only skips this gate itself caused do.
+ *
+ * `wasNoActionableOutputRun` — the trigger's core predicate — deliberately
+ * requires more than a bare `status: 'failure'`: that status also covers
+ * pre-flight blocks that never reached the model (an entitlement check, a
+ * token-limit cap, an orphaned schedule owner, a generic exception before any
+ * turn ran), all of which this codebase records with `attempt: 0`. Folding
+ * those into "no actionable output" would suppress the retry those failures
+ * are supposed to get on the schedule's next fire — so a `'failure'` only
+ * counts when the run actually spent at least one real attempt against the
+ * model (`attempt >= 1`).
  *
  * No I/O, no network, no LLM call — fully unit-testable without mocks. The
  * LLM call itself is a separate, thin wrapper on agentModeService so the
@@ -43,6 +62,16 @@ export interface ScheduledRunResultLike {
   actualResponse?: string;
   summary?: string;
   createdAt?: string;
+  /**
+   * runVerifiedChat's attempt counter. Every genuine full-flow completion
+   * (success, conditionalSkip, or a real "ran and didn't meet requirements"
+   * failure) sets this to the number of attempts actually spent (>= 1). Every
+   * pre-flight block that never reaches the model — an entitlement check, a
+   * token-limit cap, an orphaned schedule owner, a disallowed-function check,
+   * or a generic exception caught before any turn ran — hardcodes this to 0.
+   * `wasNoActionableOutputRun` uses this to tell the two apart (Greptile P1).
+   */
+  attempt?: number;
   [key: string]: unknown;
 }
 
@@ -66,10 +95,23 @@ export interface ScheduledRunPreCheckOutcome {
  *    `conditionalSkip: true` — status is 'success' but zero write calls were
  *    made by design), or
  *  - is this gate's own prior skip (`status: 'skipped_no_content'`), or
- *  - failed to meet its requirements (`status: 'failure'`) — the shape every
- *    one of the LUCAS "Schedule skipped" / "Nothing Published" runs in the
- *    evidence actually took, since the model correctly declined to publish
- *    but that decline did not match ENG-844's narrow cadence-skip carve-out.
+ *  - genuinely RAN — at least one real turn against the model — and still
+ *    failed to meet its requirements (`status: 'failure'` AND `attempt >= 1`)
+ *    — the shape every one of the LUCAS "Schedule skipped" / "Nothing
+ *    Published" runs in the evidence actually took, since the model
+ *    correctly declined to publish but that decline did not match ENG-844's
+ *    narrow cadence-skip carve-out.
+ *
+ * A bare `status: 'failure'` is deliberately NOT enough on its own (Greptile
+ * P1, ENG-1259): the same status also covers pre-flight blocks that never
+ * reached the model at all — a subscription/entitlement check, a token-limit
+ * cap, an orphaned schedule owner, a disallowed-function check, or a generic
+ * exception caught before any turn ran — every one of which this codebase
+ * records with `attempt: 0`. Those are NOT evidence of "nothing to publish";
+ * they are evidence the run never got a fair shot, and the schedule's next
+ * fire is supposed to retry, not have this gate reason from a history entry
+ * that was never a real judgment. Requiring `attempt >= 1` excludes all of
+ * them without having to enumerate each failure shape by name.
  *
  * A genuine success or a parked `pending_user_input` run is NOT no-actionable-
  * output — both represent real progress (a publish, or a run waiting on a
@@ -79,7 +121,9 @@ export function wasNoActionableOutputRun(result: ScheduledRunResultLike | null |
   if (!result || typeof result !== 'object') return false;
   if (result.conditionalSkip === true) return true;
   if (result.status === 'skipped_no_content') return true;
-  if (result.status === 'failure') return true;
+  if (result.status === 'failure' && typeof result.attempt === 'number' && result.attempt >= 1) {
+    return true;
+  }
   return false;
 }
 
@@ -114,6 +158,51 @@ export function shouldRunPreCheckGate(runResults: ScheduledRunResultLike[] | nul
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) return false;
   return wasNoActionableOutputRun(results[results.length - 1]);
+}
+
+/**
+ * How many runs, counted back from the most recent, were consecutively a
+ * pre-check SKIP specifically (`status: 'skipped_no_content'`) — narrower
+ * than `countTrailingNoActionableOutputRuns`, which also counts genuine
+ * full-flow runs that had nothing to publish. This narrower count is what
+ * bounds the gate's OWN risk of silently starving a schedule of real runs
+ * (Greptile P1, ENG-1259): a genuine decline (conditionalSkip / a real
+ * unmet-requirements failure) is information gathered by actually running
+ * the task; a chain of pre-check skips is not — the cheap classifier never
+ * checks live reality, it only reasons from the same static history each
+ * time, so a confidently-wrong verdict (or a genuine change in circumstance
+ * the history-only signal cannot see) could otherwise repeat forever.
+ */
+export function countTrailingGateSkips(runResults: ScheduledRunResultLike[] | null | undefined): number {
+  const results = Array.isArray(runResults) ? runResults : [];
+  let count = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i]?.status === 'skipped_no_content') count++;
+    else break;
+  }
+  return count;
+}
+
+/**
+ * After this many consecutive pre-check skips, the next due run is forced to
+ * proceed through the full flow — bypassing the classifier entirely — rather
+ * than asking it again. A periodic real check-in, sized small deliberately:
+ * this still captures the large majority of the waste in the evidence (three
+ * of LUCAS's four occurrences would have been caught) while guaranteeing the
+ * schedule cannot go silent for more than this many fires in a row.
+ */
+export const MAX_CONSECUTIVE_GATE_SKIPS = 2;
+
+/**
+ * True when the trailing pre-check-skip streak has reached the cap and this
+ * due run must be forced through the full flow, skipping the classifier call
+ * entirely (saving even that small cost on the forced-proceed run).
+ */
+export function shouldForceProceedAfterSkipStreak(
+  runResults: ScheduledRunResultLike[] | null | undefined,
+  maxConsecutiveSkips: number = MAX_CONSECUTIVE_GATE_SKIPS
+): boolean {
+  return countTrailingGateSkips(runResults) >= maxConsecutiveSkips;
 }
 
 /**

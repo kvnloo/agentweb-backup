@@ -27,7 +27,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
-import { shouldRunPreCheckGate, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
+import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -3996,48 +3996,60 @@ export async function runScheduledChat(
     // schedule (last run produced real output, or this is its first-ever run)
     // pays nothing extra and proceeds exactly as today.
     if (!isTest && !isResumeRun && shouldRunPreCheckGate(schedule.runResults)) {
-      const priorRunResults: any[] = Array.isArray(schedule.runResults) ? schedule.runResults : [];
-      const lastRun = priorRunResults.length > 0 ? priorRunResults[priorRunResults.length - 1] : null;
-      let llmResult: ScheduledRunPreCheckLLMResult | null = null;
-      try {
-        llmResult = await agentModeService.evaluateScheduledRunPreCheck({
-          scheduleName: schedule.scheduleName,
-          startingMessage: schedule.startingMessage || '',
-          lastRunStatus: lastRun?.status ?? null,
-          lastRunSummary: (lastRun?.summary || lastRun?.actualResponse || null) as string | null,
-          consecutiveNoOutputRuns: countTrailingNoActionableOutputRuns(priorRunResults),
-        });
-      } catch (preCheckError) {
-        // evaluateScheduledRunPreCheck is itself fail-open (never throws), but an
-        // unexpected throw here must still fail TOWARD running, not abort the run.
-        console.error(`runScheduledChat: pre-check gate threw for schedule ${schedule.scheduleId}; failing open (proceed):`, preCheckError);
-        llmResult = null;
-      }
-      const gateOutcome = resolvePreCheckDecision(llmResult);
-      if (gateOutcome.decision === 'skip') {
-        console.log(`runScheduledChat: pre-check gate SKIPPED schedule ${schedule.scheduleId} (${schedule.scheduleName}) before invoking the primary generation model — ${gateOutcome.reason}`);
-        const skipResult = {
-          scheduleId: schedule.scheduleId,
-          runId: preGeneratedRunId || require('uuid').v4(),
-          status: 'skipped_no_content' as const,
-          passed: false,
-          actualResponse: `Skipped before running the full flow: ${gateOutcome.reason}`,
-          actualFunctionCalls: [],
-          keywordMatches: [],
-          keywordMisses: schedule.keywords || [],
-          functionCallMatches: [],
-          functionCallMisses: schedule.requiredFunctionCalls || [],
-          executionTime: Date.now() - now.getTime(),
-          sessionId: '',
-          attempt: 0,
-          createdAt: new Date().toISOString(),
-        };
+      // ENG-1259 (Greptile P1): a chain of pre-check skips is NOT the same as a
+      // chain of genuine declines — the classifier never checks live reality, it
+      // only reasons from the same static history each time, so a confidently-
+      // wrong verdict could otherwise suppress a schedule's real work forever.
+      // Once the trailing skip streak hits the cap, force a real run — bypassing
+      // the classifier call entirely — rather than asking it again. Falling
+      // through (no early return) is deliberate: the full flow below runs
+      // exactly as it would if the gate had never fired at all.
+      if (shouldForceProceedAfterSkipStreak(schedule.runResults)) {
+        console.log(`runScheduledChat: pre-check gate FORCING a real run for schedule ${schedule.scheduleId} (${schedule.scheduleName}) after ${countTrailingGateSkips(schedule.runResults)} consecutive pre-check skips — periodic real check-in, classifier bypassed.`);
+      } else {
+        const priorRunResults: any[] = Array.isArray(schedule.runResults) ? schedule.runResults : [];
+        const lastRun = priorRunResults.length > 0 ? priorRunResults[priorRunResults.length - 1] : null;
+        let llmResult: ScheduledRunPreCheckLLMResult | null = null;
         try {
-          await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
-        } catch (saveError) {
-          console.error(`Error saving pre-check skip result for schedule ${schedule.scheduleId}:`, saveError);
+          llmResult = await agentModeService.evaluateScheduledRunPreCheck({
+            scheduleName: schedule.scheduleName,
+            startingMessage: schedule.startingMessage || '',
+            lastRunStatus: lastRun?.status ?? null,
+            lastRunSummary: (lastRun?.summary || lastRun?.actualResponse || null) as string | null,
+            consecutiveNoOutputRuns: countTrailingNoActionableOutputRuns(priorRunResults),
+          });
+        } catch (preCheckError) {
+          // evaluateScheduledRunPreCheck is itself fail-open (never throws), but an
+          // unexpected throw here must still fail TOWARD running, not abort the run.
+          console.error(`runScheduledChat: pre-check gate threw for schedule ${schedule.scheduleId}; failing open (proceed):`, preCheckError);
+          llmResult = null;
         }
-        return skipResult;
+        const gateOutcome = resolvePreCheckDecision(llmResult);
+        if (gateOutcome.decision === 'skip') {
+          console.log(`runScheduledChat: pre-check gate SKIPPED schedule ${schedule.scheduleId} (${schedule.scheduleName}) before invoking the primary generation model — ${gateOutcome.reason}`);
+          const skipResult = {
+            scheduleId: schedule.scheduleId,
+            runId: preGeneratedRunId || require('uuid').v4(),
+            status: 'skipped_no_content' as const,
+            passed: false,
+            actualResponse: `Skipped before running the full flow: ${gateOutcome.reason}`,
+            actualFunctionCalls: [],
+            keywordMatches: [],
+            keywordMisses: schedule.keywords || [],
+            functionCallMatches: [],
+            functionCallMisses: schedule.requiredFunctionCalls || [],
+            executionTime: Date.now() - now.getTime(),
+            sessionId: '',
+            attempt: 0,
+            createdAt: new Date().toISOString(),
+          };
+          try {
+            await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
+          } catch (saveError) {
+            console.error(`Error saving pre-check skip result for schedule ${schedule.scheduleId}:`, saveError);
+          }
+          return skipResult;
+        }
       }
     }
 
