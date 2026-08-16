@@ -11,6 +11,7 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
+import { flockHolderPids, processCpuTicks, DEFAULT_LOCK_PATH } from './build-lock.mjs';
 import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
 import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, reconcileFailedBringUps, reapOrphanPreviewProcs, stalePreviews } from './preview/policy.mjs';
@@ -74,6 +75,47 @@ function pipelineLockPid(id) {
     let cmd = ''; try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { return null; }
     return /autofix\.mjs|revise\.mjs/.test(cmd) ? pid : null;    // confirm it's a pipeline run, not the chat server
   } catch { return null; }
+}
+
+// ENG-1016: a second, independent line of defense against a wedged /tmp/aw-heavy-build.lock holder,
+// on top of build-lock.mjs's reentrancy fix. A deadlocked holder is alive, holds the lock, and does
+// NO work — it looks exactly like a healthy-but-slow box (the incident's whole danger: no crash, no
+// error, cron still firing, 0.07 load average on a box with "7 live processes"). Two consecutive
+// readings with an unchanged CPU-tick count is the signature a real build never produces (compilers
+// and bundlers burn CPU continuously); a legitimately long build simply won't trip this. Injectable
+// end-to-end so it's unit-testable without a real /proc or a real wedged process.
+const buildLockWatchPath = path.join(__dirname, 'chat', 'build-lock-watch.json');
+export function watchBuildLock({
+  lockPath = DEFAULT_LOCK_PATH,
+  staleMinutes = config.buildLockStaleMinutes ?? 20,
+  autoKill = config.buildLockAutoKill === true,
+  holderPid = () => { const s = flockHolderPids(lockPath); return s.size ? [...s][0] : null; },
+  cpuTicks = processCpuTicks,
+  now = () => Date.now(),
+  watchPath = buildLockWatchPath,
+  kill = (pid) => process.kill(pid, 'SIGKILL'),
+  logFn = log,
+} = {}) {
+  const pid = holderPid();
+  let watch = {}; try { watch = JSON.parse(readFileSync(watchPath, 'utf8')); } catch { /* first run */ }
+  if (!pid) { if (watch.pid) writeFileSync(watchPath, '{}'); return null; } // lock free → nothing to track
+
+  const ticks = cpuTicks(pid);
+  const sameHolder = watch.pid === pid;
+  const firstSeenAt = sameHolder ? watch.firstSeenAt : now();
+  // First sighting of this holder: nothing to compare against yet, so don't false-alarm on tick 1.
+  const cpuAdvanced = sameHolder ? ticks !== watch.lastTicks : true;
+  writeFileSync(watchPath, JSON.stringify({ pid, firstSeenAt, lastTicks: ticks }));
+
+  const heldMs = now() - firstSeenAt;
+  if (heldMs < staleMinutes * 60 * 1000 || cpuAdvanced) return null; // still fresh, or genuinely working
+
+  logFn(`⚠️  BUILD LOCK WEDGED: pid ${pid} has held ${lockPath} for ${Math.round(heldMs / 60000)}m with zero CPU progress — the ENG-1016 self-flock deadlock shape, not a real build`);
+  if (autoKill) {
+    try { kill(pid); logFn(`killed wedged build-lock holder pid ${pid}`); }
+    catch (e) { logFn(`could not kill wedged holder pid ${pid}: ${e.message}`); }
+  }
+  return { pid, heldMs };
 }
 
 // ENG-654: abort IN-FLIGHT forced runs whose admission a human has WITHDRAWN (force label removed, moved
@@ -153,6 +195,10 @@ export async function reapableWorktreelessIds(entries, worktreeIds, {
 
 async function main() {
   if (!process.env.LINEAR_API_KEY) { console.error('[gc] LINEAR_API_KEY not set'); process.exit(2); }
+
+  // Best-effort, first, cheap: notice a wedged /tmp/aw-heavy-build.lock holder before anything else
+  // in this pass. Never let it block the rest of GC.
+  try { watchBuildLock(); } catch (e) { log(`build-lock watchdog failed: ${e.message}`); }
 
   // ENG-654: abort any in-flight forced run whose admission a human withdrew — BEFORE the normal reap
   // (which skips locked/in-flight worktrees). Best-effort; never let it block the rest of the GC pass.
