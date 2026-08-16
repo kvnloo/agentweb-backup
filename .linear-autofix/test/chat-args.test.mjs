@@ -10,8 +10,8 @@ const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail
 
 // ── Faithful copy of chat/server.mjs chatArgs + the relevant CHAT config (keep in sync) ──
 const CHAT = {
-  full: { model: 'opus', maxTurns: 100 },
-  readOnly: { model: 'opus', maxTurns: 30, allowedTools: ['Read', 'Grep', 'Bash(git log:*)'] },
+  full: { model: 'sonnet', maxTurns: 100 },
+  readOnly: { model: 'sonnet', maxTurns: 30, allowedTools: ['Read', 'Grep', 'Bash(git log:*)'] },
   skillDenylist: ['claude-api', 'deep-research'],
   capabilityPrompt: 'Linear access: ... (persistent capability text)',
   safetyPrompt: 'SAFETY — you are CONFINED to your own assigned repo ... (compaction-proof guard)',
@@ -78,10 +78,12 @@ console.log('chatArgs — heavyweight skills denied, the rest kept');
   ok(!ro.includes('--dangerously-skip-permissions'), 'readOnly cap never gets skip-permissions');
   ok(!ro.includes('--append-system-prompt'), 'readOnly cap gets NO capability prompt (its Bash is git-only — cannot curl)');
 
-  // btw-style: readOnly cap + a model override (Sonnet) — still denies, and honors the override
-  const btw = chatArgs('readOnly', 'btw-sid', 'sonnet');
+  // btw-style: readOnly cap + a model override (Haiku, a tier below the conversation's Sonnet) —
+  // still denies, and honors the override
+  const btw = chatArgs('readOnly', 'btw-sid', 'haiku');
   ok(deniesSkills(btw, ['claude-api', 'deep-research']), 'btw (readOnly + override) denies the heavyweight skills');
-  ok(btw[btw.indexOf('--model') + 1] === 'sonnet', 'model override is honored');
+  ok(btw[btw.indexOf('--model') + 1] === 'haiku', 'model override is honored');
+  ok(btw[btw.indexOf('--model') + 1] !== CHAT.readOnly.model, 'btw runs BELOW the main conversation model');
 
   // boundary: no sessionId (fresh/first turn or post-compact seed) — still denies, no --resume
   const fresh = chatArgs('full', null);
