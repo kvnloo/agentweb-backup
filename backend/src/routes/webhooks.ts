@@ -18,7 +18,7 @@ import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { pruneClickIds } from '../utils/leadSchema';
-import { normalizeAttribution } from '../types/attribution';
+import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
@@ -524,16 +524,6 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       linkedin: linkedin?.trim() || '',
     };
 
-    // Attribution — accept either the new `attribution` shape or the legacy
-    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
-    // If the client sends nothing, we stamp nothing; the CSV import and other
-    // internal paths won't carry attribution.
-    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
-    if (touch) {
-      leadData.firstTouch = touch;
-      leadData.lastTouch = touch;
-    }
-
     // ENG-926 §C: persist Meta's browser id so a conversion relayed WEEKS later (a deal
     // closing in the CRM) can still be matched to this person. `fbp` is a first-party
     // cookie read here at capture time and used immediately for the Lead event; by the
@@ -590,6 +580,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
     };
+
+    // Attribution — accept either the new `attribution` shape or the legacy
+    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
+    // If the client sends nothing, we stamp nothing; the CSV import and other
+    // internal paths won't carry attribution.
+    //
+    // ENG-926 §A: then fill any keys still absent from allowlisted click IDs and
+    // utm_* values sitting in customFields. A lander can capture attribution
+    // perfectly and still deliver a lead with none, by posting it into the free-form
+    // bag rather than the structured envelope — `hireemma.ai` forwards no
+    // `attribution` and no `utm` at all, so its leads arrived with no firstTouch
+    // whatsoever while the site, the POST and the resulting row all looked correct.
+    //
+    // Sourced from `incomingCustomFields` rather than the raw `customFields`, so a
+    // lander that posts its click IDs FLAT at the top level is covered too — those
+    // land in passthrough, and this handler's fixed destructure never reads them.
+    // This is why the block sits here rather than above: it needs that merge.
+    const touch = promoteAttributionFromCustomFields(
+      incomingCustomFields,
+      normalizeAttribution(attribution) ?? normalizeAttribution(utm),
+    );
+    if (touch) {
+      leadData.firstTouch = touch;
+      leadData.lastTouch = touch;
+    }
 
     // Check if lead already exists by email - merge instead of dropping
     const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
