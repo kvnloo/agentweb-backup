@@ -135,6 +135,12 @@ describe('POST /api/internal/usage', () => {
       outputTokens: 250,
       cacheReadTokens: 100,
       cacheWriteTokens: 0,
+      // ENG-1251 Greptile P1: date is now captured once at the top of the
+      // handler and passed to recordUsage so it stays in lockstep with the
+      // paired charge event's occurredAt (both must agree, or a UTC-midnight
+      // straddle breaks the itemization reconciliation's key match). The
+      // value is today's date, which this test doesn't control.
+      date: expect.any(String),
     });
     expect(mockRecordUsage).toHaveBeenCalledWith({
       userId: 'user-1',
@@ -146,6 +152,7 @@ describe('POST /api/internal/usage', () => {
       outputTokens: 5,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
+      date: expect.any(String),
     });
   });
 
