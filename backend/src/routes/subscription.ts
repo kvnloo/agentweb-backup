@@ -5,6 +5,7 @@ import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveBillingUserId } from '../services/tokenUsageService';
 import { usageRecordDb } from '../services/usageRecordDb';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
+import { reconcileItemizedUsage } from '../services/usageItemization';
 
 const router = express.Router();
 
@@ -34,86 +35,11 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     const month = String(req.query.month || new Date().toISOString().slice(0, 7));
     if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month must be YYYY-MM' });
     const billingUserId = await resolveBillingUserId(userId);
-    const events = await listLlmChargeEvents(billingUserId, `${month}-01`, `${month}-31`);
-    const perChargeItems = events.map((event) => ({
-      date: event.occurredAt, model: event.model || 'unknown', provider: event.provider || 'unknown',
-      feature: event.feature || 'unknown', tokens: event.tokens, calls: 1,
-      costMicroUsd: event.costMicroUsd, source: 'charge_event' as const, sessionId: event.sessionId,
-    }));
-
-    // ENG-1251 Greptile P1: a charge event covers the SAME call the shadow
-    // daily-aggregate table also records (recordUsage runs unconditionally,
-    // regardless of whether a charge event exists for that call), so an
-    // aggregate row fully covered by charge events would double that
-    // usage. But suppressing by DATE ALONE is too coarse: a row bundles
-    // every call for one (date, model, feature) into a single total, so a
-    // day with an applied charge event AND separate, uncovered
-    // aggregate-only usage (the exact day the rollout reached this user,
-    // or any other partial-coverage day) would have its whole aggregate
-    // row discarded instead of just the covered portion.
-    //
-    // Key at (date, model, feature) — the aggregate table's own natural
-    // grouping (its sort key is `{date}#{model}#{feature}`) — and show only
-    // the UNCOVERED REMAINDER for that exact combination, not the row's
-    // full total: showing the full row alongside its own charge events
-    // would double-count the covered portion's dollar amount. Token/call
-    // counts are scaled by the same remainder fraction, since the aggregate
-    // row has no call-level attribution to split them exactly — an
-    // estimate, but one that keeps the dollar figure (the one this whole
-    // reconciliation is about) exact.
-    // Greptile P1: tracking coverage as a bare dollar sum conflates "no
-    // charge events touch this key at all" with "charge events touch it but
-    // happen to sum to $0" (an unpriced model whose calls WERE captured by
-    // the audit-event system). Those need opposite treatment: the first
-    // means the aggregate row is entirely unrepresented elsewhere and must
-    // show in full; the second means it IS already represented (by the $0
-    // event itself, already in perChargeItems) and must NOT also appear via
-    // the aggregate row, or its tokens/calls get double-counted.
-    const coverageByKey = new Map<string, { hasEvents: boolean; microUsd: number }>();
-    for (const event of events) {
-      const key = `${event.occurredAt.slice(0, 10)}#${event.model || 'unknown'}#${event.feature || 'unknown'}`;
-      const entry = coverageByKey.get(key) || { hasEvents: false, microUsd: 0 };
-      entry.hasEvents = true;
-      entry.microUsd += event.costMicroUsd;
-      coverageByKey.set(key, entry);
-    }
-    const rows = await usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`);
-    const aggregateItems = rows.flatMap((row) => {
-      const key = `${row.date}#${row.model}#${row.feature}`;
-      const coverage = coverageByKey.get(key);
-      // row.costMicroUsd is already micro-USD, same unit as the charge
-      // events summed above -- no conversion.
-      const rowMicroUsd = row.costMicroUsd || 0;
-      if (!coverage) {
-        // No charge-event coverage exists for this (date, model, feature) at
-        // all -- the row cannot be redundant with anything, so it always
-        // shows in full, even at $0 cost.
-        return [{
-          date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
-          tokens: row.totalTokens || 0, calls: row.callCount || 0, costMicroUsd: rowMicroUsd,
-          source: 'daily_aggregate' as const,
-        }];
-      }
-      const remainderMicroUsd = rowMicroUsd - coverage.microUsd;
-      if (remainderMicroUsd <= 0) return []; // fully covered by charge events (including a matching $0 event)
-      const remainderFraction = remainderMicroUsd / rowMicroUsd;
-      return [{
-        date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
-        tokens: Math.round((row.totalTokens || 0) * remainderFraction),
-        calls: Math.round((row.callCount || 0) * remainderFraction),
-        costMicroUsd: remainderMicroUsd,
-        source: 'daily_aggregate' as const,
-      }];
-    });
-
-    const items = [...perChargeItems, ...aggregateItems].sort(
-      (a, b) => b.date.localeCompare(a.date) || b.costMicroUsd - a.costMicroUsd
-    );
-    const precision = perChargeItems.length && aggregateItems.length
-      ? 'mixed'
-      : perChargeItems.length
-      ? 'per_charge'
-      : 'daily_aggregate';
+    const [events, rows] = await Promise.all([
+      listLlmChargeEvents(billingUserId, `${month}-01`, `${month}-31`),
+      usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`),
+    ]);
+    const { items, precision } = reconcileItemizedUsage(events, rows);
     return res.json({ month, billingUserId, precision, items });
   } catch (error) {
     console.error('Error getting itemized usage:', error);
