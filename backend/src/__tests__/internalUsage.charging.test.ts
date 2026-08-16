@@ -340,6 +340,88 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
   });
 });
 
+describe("POST /api/internal/usage — prefers the engine's own reportId over the content fingerprint (ENG-1251)", () => {
+  // agent-engine/usage_reporter.py generates one UUID per UsageReporter
+  // instance (one per task-execution process) and sends it as reportId on
+  // every flush attempt. Unlike the content+time-bucket fallback, this is
+  // exact: no coincidental collisions, no bucket-boundary edge case.
+  it("derives eventId from the resolved user + reportId when present", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "a1b2c3d4e5f6" });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit).toMatchObject({ eventId: "engine:user-1:a1b2c3d4e5f6" });
+  });
+
+  it("collapses a genuine retry (same reportId) even with different-shaped records, since it's the same buffered submission", async () => {
+    // A true retry resends the exact same instance's buffer verbatim, so
+    // this scenario (same reportId, different content) shouldn't arise in
+    // practice — but the key must be derived from reportId alone once
+    // present, not mixed with content, or a partial coincidental content
+    // difference could defeat the exact guarantee reportId is meant to give.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc", outputTokens: 999 })], reportId: "same-report-id" });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(second.eventId).toBe(first.eventId);
+  });
+
+  it("derives a different eventId for a different reportId, even with identical record content", async () => {
+    // The exact scenario the content-only fingerprint couldn't handle: two
+    // genuinely distinct executions with identical measurements. Two
+    // different UsageReporter instances always carry two different
+    // reportIds, so both are charged in full.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "report-one" });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "report-two" });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(second.eventId).not.toBe(first.eventId);
+  });
+
+  it("falls back to the content+time-bucket fingerprint when reportId is absent (older engine version)", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })] });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+  });
+
+  it("ignores a non-string reportId rather than using it verbatim", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: 12345 });
+
+    const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
+    // Falls back to the fingerprint format, not "engine:user-1:12345".
+    expect(audit?.eventId).toEqual(expect.stringMatching(/^engine:user-1:[0-9a-f]{32}$/));
+  });
+});
+
 describe("POST /api/internal/usage — engine spend is separable in the ledger", () => {
   /**
    * The ledger's sort key is `{date}#{model}#{feature}`, so `feature` is the only

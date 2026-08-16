@@ -96,6 +96,19 @@ router.post(
     try {
       const authReq = req as AuthenticatedRequest;
       const records = (req.body || {}).records;
+      // ENG-1251: a genuine per-flush nonce from the engine (one UsageReporter
+      // instance per task-execution process, generated once, sent on every
+      // flush attempt for that instance — see agent-engine/usage_reporter.py).
+      // A retried HTTP submission of the SAME instance's buffered totals
+      // carries the SAME reportId; a genuinely new execution (new process,
+      // new instance) always gets a new one, so it's charged in full even if
+      // its measurements happen to be identical to a prior run's. Optional
+      // for backward compatibility during rollout — an engine version predating
+      // this falls through to the content+time-bucket fingerprint below.
+      const reportId =
+        typeof (req.body || {}).reportId === "string" && (req.body || {}).reportId.trim()
+          ? (req.body || {}).reportId.trim()
+          : undefined;
 
       if (!Array.isArray(records) || records.length === 0) {
         return res
@@ -203,38 +216,38 @@ router.post(
 
       // Apply the aggregated quota charges. Fail-open, exactly like the ledger
       // writes above: the engine treats ingestion as best-effort, so surfacing a
-      // 500 here would only make it retry — and a retry (or an engine worker
-      // that crashes and resubmits a task's usage after restart) hits this
-      // endpoint with no server-side signal that it already applied the first
-      // attempt. ENG-1251: derive a stable idempotency key from the resolved
-      // user plus a fingerprint of the exact records that contributed to this
-      // charge, so a byte-identical resubmission collapses to a no-op via
-      // recordLlmChargeEvent's conditional write instead of a second charge —
-      // while a genuinely different batch (even for the same taskId, e.g. a
-      // long task reporting incrementally) still gets its own key and is
-      // charged in full rather than colliding with an earlier submission.
-      // Greptile P1: content alone can't distinguish "the same submission
-      // retried" from "a distinct task rerun that happens to produce
-      // identical measurements" (deterministic/templated tasks can do this).
-      // The engine sends no per-submission nonce, so fold in a coarse time
-      // bucket: a retry (network timeout, crash-restart) lands within
-      // seconds to low minutes of the original, so a wide bucket still
-      // dedupes it, while a genuinely separate rerun -- almost never
-      // launched in the SAME bucket as a prior identical one -- gets its own
-      // key and is charged. Bounded residual: a true retry landing on the
-      // opposite side of a bucket boundary is still double-charged; there is
-      // no nonce-free way to eliminate that risk entirely, only shrink it.
+      // 500 here would only make it retry, and a retry hits this endpoint with
+      // no server-side signal that it already applied the first attempt.
+      //
+      // ENG-1251: prefer the engine's own reportId (a genuine per-execution
+      // nonce -- see agent-engine/usage_reporter.py) as the idempotency key.
+      // It is exact: a retried HTTP submission of the same UsageReporter
+      // instance carries the identical reportId (dedupe correctly), while a
+      // genuinely new execution -- a new process, a new instance -- always
+      // gets a new one and is charged in full even if its measurements
+      // happen to be identical to a prior run's.
+      //
+      // Falls back to a content fingerprint + a coarse 10-minute time bucket
+      // only when reportId is absent (an engine version predating this
+      // field, during rollout). That fallback is a heuristic, not exact: a
+      // genuinely separate rerun is charged unless it happens to land in the
+      // same 10-minute bucket as an identical-shaped prior submission, and a
+      // true retry straddling a bucket boundary is still double-charged.
+      // Both residual risks disappear once every engine instance sends
+      // reportId.
       const RETRY_COLLAPSE_WINDOW_MS = 10 * 60 * 1000;
       const timeBucket = Math.floor(Date.now() / RETRY_COLLAPSE_WINDOW_MS);
       await Promise.all(
         [...charges.entries()].map(([userId, { tokens, cost, recordFingerprints }]) => {
           // A charge entry only exists once at least one record contributed a
-          // fingerprint, so this always has content to hash.
-          const eventId = `engine:${userId}:${createHash("sha256")
-            .update([...recordFingerprints].sort().join("\u0001"))
-            .update(`bucket:${timeBucket}`)
-            .digest("hex")
-            .slice(0, 32)}`;
+          // fingerprint, so the fallback branch always has content to hash.
+          const eventId = reportId
+            ? `engine:${userId}:${reportId}`
+            : `engine:${userId}:${createHash("sha256")
+                .update([...recordFingerprints].sort().join("\u0001"))
+                .update(`bucket:${timeBucket}`)
+                .digest("hex")
+                .slice(0, 32)}`;
           return incrementUserTokenUsage(userId, tokens, cost, {
             eventId,
             feature: "engine",
