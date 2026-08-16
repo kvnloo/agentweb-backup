@@ -252,6 +252,25 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(aggregateRows[0].model).toBe('opus');
   });
 
+  it('shows a $0 aggregate row (unpriced model) that has no charge-event coverage at all, not just a covered remainder (Greptile P1)', async () => {
+    // An unpriced model prices at $0 on both sides, so `covered` for this
+    // (date, model, feature) is 0 too. The remainder check (row - covered)
+    // would read 0 - 0 = 0 and wrongly treat that as "fully covered by
+    // charge events", silently dropping real, positive token/call usage
+    // that no charge event actually represents.
+    mockListLlmChargeEvents.mockResolvedValue([]);
+    mockQueryByUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 3, costMicroUsd: 0 },
+    ]);
+
+    const res = await request(app)
+      .get('/api/subscription/usage/itemized?month=2026-08')
+      .expect(200);
+
+    expect(res.body.items).toHaveLength(1);
+    expect(res.body.items[0]).toMatchObject({ tokens: 5000, calls: 3, costMicroUsd: 0, source: 'daily_aggregate' });
+  });
+
   it('returns 401 when unauthenticated', async () => {
     (authenticateToken as jest.Mock).mockImplementation((req: any, _res: any, next: any) => {
       req.user = undefined;

@@ -73,6 +73,19 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
       // row.costMicroUsd is already micro-USD, same unit as the charge
       // events summed above -- no conversion.
       const rowMicroUsd = row.costMicroUsd || 0;
+      // Greptile P1: no charge-event coverage exists for this (date, model,
+      // feature) at all -- the row cannot be redundant with anything, so it
+      // always shows in full, even at $0 cost. An unpriced model still has
+      // real token/call usage worth showing; the earlier remainder check
+      // (rowMicroUsd - covered <= 0) wrongly treated "$0 row, $0 covered" as
+      // "fully covered" and silently dropped it.
+      if (covered === 0) {
+        return [{
+          date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
+          tokens: row.totalTokens || 0, calls: row.callCount || 0, costMicroUsd: rowMicroUsd,
+          source: 'daily_aggregate' as const,
+        }];
+      }
       const remainderMicroUsd = rowMicroUsd - covered;
       if (remainderMicroUsd <= 0) return []; // fully covered by charge events
       const remainderFraction = remainderMicroUsd / rowMicroUsd;
