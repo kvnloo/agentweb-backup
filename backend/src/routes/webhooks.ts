@@ -538,6 +538,24 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.metaFbp = fbp.trim();
     }
 
+    // ENG-926 §B: the other two Event Match Quality signals, kept for the same reason as
+    // `fbp` above. Both were already read here, spent on the immediate Lead event, and then
+    // discarded — so a conversion §C relays weeks later went to Meta with LESS identity than
+    // we held at capture, for no reason other than nothing persisted them.
+    //
+    // Computed once here rather than inside the CAPI block below, because the lead write
+    // needs them too and re-deriving the same value twice is how the two drift apart.
+    // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
+    // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
+    // handler. 'unknown' is a sentinel for the CAPI call, never something to store.
+    const capturedClientIp = (
+      req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? ''
+    ).trim();
+    const capturedUserAgent =
+      typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].trim() : '';
+    if (capturedClientIp) leadData.clientIp = capturedClientIp;
+    if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
+
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
     // nested under `customFields`) got a 201 and a visible lead row with the data gone.
@@ -679,9 +697,42 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         }
       }
 
-      if (changed) {
+      // ENG-926 §B: backfill the match-quality signals on a repeat touch, and ONLY when the
+      // lead has none — same immutability contract as the click-ID denorm above. A returning
+      // visitor's IP and device are not the ones that acquired them, so overwriting would
+      // quietly degrade the very signal this is here to strengthen.
+      //
+      // `metaFbp` is included because it was accepted by createLead alone: a lead that first
+      // arrived WITHOUT an fbp and later submitted WITH one never got one. That is the
+      // silent-drop failure db.ts's own comment describes, and this is the path it needed.
+      //
+      // Tracked SEPARATELY from `changed`, and that separation is load-bearing. `changed`
+      // becomes `isUpdated`, which gates drip-sequence auto-enrolment, external CRM push and
+      // the owner notification — real outbound email. Counting a silent metadata backfill as
+      // a lead update would enrol a returning visitor into a sequence and notify the owner
+      // because we quietly stored an IP, which is a side effect nobody asked for and the
+      // caller cannot see coming. The write still happens; only the "this lead changed"
+      // claim is withheld.
+      let matchQualityBackfilled = false;
+      if (!existingLead.metaFbp && leadData.metaFbp) {
+        updates.metaFbp = leadData.metaFbp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientIp && leadData.clientIp) {
+        updates.clientIp = leadData.clientIp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientUserAgent && leadData.clientUserAgent) {
+        updates.clientUserAgent = leadData.clientUserAgent;
+        matchQualityBackfilled = true;
+      }
+
+      if (changed || matchQualityBackfilled) {
         await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
-        isUpdated = true;
+        // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
+        // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
+        // metadata backfill deliberately does not set it.
+        isUpdated = changed;
       }
 
       lead = { ...existingLead, ...updates };
@@ -732,10 +783,9 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           const owner = await userDb.getUserById(leadList.userId);
           const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
           const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
-          // ENG-493 is deferred (flipping Express's global `trust proxy` also changes
-          // auth.ts's IP-keyed rate limiters — a separate, riskier change). Scope the fix to
-          // just this CAPI call site instead, same pattern as loopEvents.ts/assetController.ts.
-          const clientIp = (req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? 'unknown').trim();
+          // Resolved once at capture (see the ENG-926 §B block above) so the value sent here
+          // and the value stored on the lead are the same one, not two independent reads.
+          const clientIp = capturedClientIp || 'unknown';
           const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
             eventId,
             email: leadData.email,
@@ -743,7 +793,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             lastName: leadData.lastName,
             phone: leadData.phone,
             clientIp,
-            userAgent: req.headers['user-agent'],
+            userAgent: capturedUserAgent || undefined,
             sourceUrl: req.headers['referer'],
             fbp: typeof fbp === 'string' ? fbp : undefined,
             fbc: typeof fbc === 'string' ? fbc : undefined,
