@@ -259,4 +259,51 @@ describe("userDb.applyMonthlyChargeAtomic (ENG-1251)", () => {
       userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false })
     ).rejects.toBeDefined();
   });
+
+  it("reports lost_race on a top-level TransactionConflictException (Greptile P1)", async () => {
+    // A concurrent charge transaction on the same billing user (org-pooled
+    // account, or parallel task executions) can reject the whole
+    // transaction outright with this code rather than a per-item
+    // condition failure. Previously this fell through to the generic
+    // handler and rethrew, which the fire-and-forget caller only logs --
+    // silently dropping a real charge under contention instead of retrying.
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({ code: "TransactionConflictException" }),
+    });
+
+    const result = await userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false });
+
+    expect(result).toBe("lost_race");
+  });
+
+  it("reports lost_race when every cancelled item is a transient TransactionConflict, not a condition failure (Greptile P1)", async () => {
+    // DynamoDB's per-item cancellation code for "another transaction is
+    // touching this item right now" is "TransactionConflict", distinct
+    // from "ConditionalCheckFailed". Neither item actually failed its own
+    // business condition -- this is pure contention and must retry, same
+    // as a lost condition race.
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({
+        code: "TransactionCanceledException",
+        CancellationReasons: [{ Code: "TransactionConflict" }, { Code: "TransactionConflict" }],
+      }),
+    });
+
+    const result = await userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false });
+
+    expect(result).toBe("lost_race");
+  });
+
+  it("still rethrows when CancellationReasons mixes TransactionConflict with an unexplained code (not a clean conflict)", async () => {
+    mockDocClient.transactWrite.mockReturnValue({
+      promise: jest.fn().mockRejectedValue({
+        code: "TransactionCanceledException",
+        CancellationReasons: [{ Code: "TransactionConflict" }, { Code: "ValidationError" }],
+      }),
+    });
+
+    await expect(
+      userDb.applyMonthlyChargeAtomic({ ...baseArgs, isNewMonth: false })
+    ).rejects.toBeDefined();
+  });
 });

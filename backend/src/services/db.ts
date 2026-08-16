@@ -1923,10 +1923,29 @@ export class UserDB {
       return "applied";
     } catch (error: any) {
       const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      // Greptile P1: concurrent charge transactions on the same billing user
+      // (e.g. an org-pooled account, or several task executions charging in
+      // parallel) can fail with a transaction CONFLICT rather than a
+      // condition failure -- either the whole transaction rejected outright
+      // with TransactionConflictException, or TransactionCanceledException
+      // cancelled every item for "TransactionConflict" (DynamoDB's code for
+      // "another transaction is touching this item right now", distinct
+      // from ConditionalCheckFailed). Neither is a real "already applied" or
+      // a genuine business-condition failure -- both are transient and must
+      // map to "lost_race" so the caller's bounded retry loop re-reads and
+      // retries, the same as it already does for a lost condition race.
+      // Previously these fell through to the generic handler and were
+      // rethrown, which the fire-and-forget caller only logs -- silently
+      // dropping a real charge under contention.
+      if (error?.code === "TransactionConflictException") return "lost_race";
       if (error?.code === "TransactionCanceledException" && reasons) {
         // Index order matches TransactItems above: 0 = users table, 1 = audit table.
         if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_applied";
         if (reasons[0]?.Code === "ConditionalCheckFailed") return "lost_race";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "lost_race";
       }
       handleDynamoDbError(error, "applyMonthlyChargeAtomic");
       throw error;
