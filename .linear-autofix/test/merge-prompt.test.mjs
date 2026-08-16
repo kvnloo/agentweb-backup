@@ -87,6 +87,25 @@ console.log('\n— mechanics stay OUT (this is the part that rots) —');
     'a stale detail must not become a reported failure');
 }
 
+console.log('\n— verifying on production —');
+{
+  ok(/PROD_TEST_EMAIL/.test(p) && /PROD_TEST_PASSWORD/.test(p), 'points at the env vars holding the account');
+  ok(!/Argus@123/.test(p), 'the password itself is NEVER in the prompt — it lives only in the gitignored .env');
+  ok(/seed|create/i.test(p) && /clean/i.test(p), 'says to clean up data it seeded');
+  ok(/only read|read-only|observ/i.test(p), 'and distinguishes the read-only case');
+  ok(/proof|evidence/i.test(p), 'a read-only trace is left deliberately, as proof');
+  ok(/production/i.test(p) && /real/i.test(p), 'makes clear this is real production, not a test env');
+}
+
+console.log('\n— reporting back to Linear —');
+{
+  ok(/LINEAR_API_KEY/.test(p), 'tells it the key is already in its environment');
+  ok(/if .*linear issue|when .*linear issue|has a linear/i.test(p), 'conditional — a laptop handoff often has no card');
+  ok(/comment/i.test(p), 'asks for a comment on the card');
+  ok(/do not.*(mark|move).*(done|status)|never.*(mark|move) it (to )?done/i.test(p),
+    'must NOT close the card — the human owns that transition');
+}
+
 console.log('\n— orientation that is still allowed —');
 {
   // Naming the reviewer and its current pass shape is useful, as long as it is flagged as checkable
