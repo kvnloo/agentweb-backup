@@ -30,4 +30,28 @@ describe('llmChargeAuditDb', () => {
     query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [{ ...event, counterAppliedAt: undefined }] }) });
     await expect(listLlmChargeEvents('bill-1', '2026-08-01', '2026-08-31')).resolves.toEqual([]);
   });
+
+  it('follows LastEvaluatedKey past a single DynamoDB query page (Greptile P1, fixed in 690f7597d)', async () => {
+    const page1Event = { ...event, eventId: '2026-08-01T00:00:00.000Z#a' };
+    const page2Event = { ...event, eventId: '2026-08-15T00:00:00.000Z#b' };
+    query
+      .mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Items: [page1Event],
+          LastEvaluatedKey: { billingUserId: 'bill-1', eventId: page1Event.eventId },
+        }),
+      })
+      .mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({ Items: [page2Event] }),
+      });
+
+    const result = await listLlmChargeEvents('bill-1', '2026-08-01', '2026-08-31');
+
+    expect(query).toHaveBeenCalledTimes(2);
+    // The second query resumes from exactly the key the first page returned.
+    expect(query.mock.calls[1][0]).toMatchObject({
+      ExclusiveStartKey: { billingUserId: 'bill-1', eventId: page1Event.eventId },
+    });
+    expect(result).toEqual([page1Event, page2Event]);
+  });
 });
