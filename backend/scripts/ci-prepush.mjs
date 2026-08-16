@@ -23,7 +23,7 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs } from './prepush/logic.mjs';
@@ -123,6 +123,34 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
   try {
     for (const relPath of deletedRelPaths) {
       const absPath = path.join(backend, relPath);
+      // ENG-1277 / Greptile: the directory-containment check below only covers
+      // path.dirname(absPath) — an ancestor. It says nothing about absPath's
+      // OWN final path component. If a symlink sits at the exact deleted path
+      // (not one of its ancestors), the directory check passes cleanly (the
+      // directory itself is real and contained) while writeFileSync still
+      // follows that final symlink and writes through it — to an existing
+      // external file (silently overwriting it, "restored" on revert by
+      // writing the external file's own prior content back, which is still a
+      // real write to something outside the repo in between), or, worse, to a
+      // DANGLING symlink's target: writeFileSync's open() follows the link and
+      // creates a brand-new file at the external, nonexistent target, but the
+      // revert path only knows to `rmSync` the symlink itself (POSIX unlink
+      // never follows a symlink to remove its target) — leaving that newly
+      // created external file permanently orphaned once the symlink pointing
+      // to it is gone. `lstatSync` (unlike `existsSync`/`statSync`) does not
+      // follow the final symlink, so it sees the symlink itself regardless of
+      // whether its target exists — refuse outright rather than write through
+      // it: a legitimately git-deleted path should have nothing sitting there
+      // at all, so anything already there (let alone a symlink) is foreign.
+      let existingEntry = null;
+      try {
+        existingEntry = lstatSync(absPath);
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e; // anything other than "nothing there" is a real stat failure, not the expected case.
+      }
+      if (existingEntry && existingEntry.isSymbolicLink()) {
+        throw new Error(`refusing to materialize ${relPath} for test discovery — a symlink already sits at that exact path (${absPath}). Writing through it could overwrite or create content outside the repository, and cleanup cannot safely undo that for a dangling symlink. Remove the stray symlink before pushing, or bypass with --no-verify.`);
+      }
       const hadLocalContent = existsSync(absPath);
       const localContent = hadLocalContent ? readFileSync(absPath) : null;
       let content = null;
