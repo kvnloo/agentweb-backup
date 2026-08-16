@@ -12,7 +12,7 @@ attack surface (credential-stuffing, 0-days in `sshd`) without losing operator s
 Session Manager provides the same capability over an outbound-only, IAM-authenticated channel.
 Session start/stop is always recorded in CloudTrail; command-level shell content is only captured if
 the account has Session Manager logging (S3/CloudWatch) configured separately — check
-`aws ssm get-document --name SSM-SessionManagerRunShell` for the active preferences before relying on
+`aws ssm get-document --region us-west-2 --name SSM-SessionManagerRunShell` for the active preferences before relying on
 command-level forensic evidence.
 
 ## Getting a shell
@@ -39,7 +39,9 @@ an attached policy granting at minimum:
   (`arn:aws:ssm:us-west-2:*:document/SSM-SessionManagerRunShell`) — omitting this grant fails the
   session establishment even though the instance-targeted grant above is present
 - `ssm:TerminateSession`/`ssm:ResumeSession` on the caller's own session resource
-  (`arn:aws:ssm:us-west-2:*:session/${aws:username}-*`)
+  (`arn:aws:ssm:us-west-2:*:session/${aws:userid}-*`) — use `${aws:userid}`, not `${aws:username}`:
+  an assumed IAM role's session does not populate `aws:username`, so a role-based caller's resource
+  would silently fail to match
 
 This is separate from the instance side: `AmazonSSMManagedInstanceCore` on the shared
 `aws-elasticbeanstalk-ec2-role` instance profile only lets the *instance* register with SSM and
@@ -53,7 +55,7 @@ Raw check (works for any operator, no extra setup):
 
 ```bash
 aws ec2 describe-security-groups --region us-west-2 \
-  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?FromPort<=\`22\` && ToPort>=\`22\`]}" \
+  --query "SecurityGroups[].{Group:GroupId,Rules:IpPermissions[?IpProtocol==\`-1\` || (FromPort<=\`22\` && ToPort>=\`22\`)]}" \
   --output json | jq '[.[] | select(.Rules | length > 0)]'
 ```
 
@@ -61,7 +63,9 @@ aws ec2 describe-security-groups --region us-west-2 \
 exactly 22 and silently misses a broader range (e.g. `FromPort=0, ToPort=65535`, or any range like
 `20-25`) that also permits port 22. The query above instead pulls every rule on each group and
 filters for any range that covers port 22 (`FromPort<=22 AND ToPort>=22`), which catches both an
-exact `22-22` rule and a wider range that includes it.
+exact `22-22` rule and a wider range that includes it — **plus** an all-protocol rule
+(`IpProtocol: "-1"`), which AWS returns with no `FromPort`/`ToPort` at all, so the numeric range
+check alone would silently miss it even though it exposes port 22.
 
 An empty result (`[]`) means no security group in the region has any inbound rule covering port 22 —
 the expected state. Any group listed here is a regression (a redeployed environment somehow
