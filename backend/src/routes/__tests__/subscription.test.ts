@@ -205,8 +205,13 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     // event's coverage. Date-only suppression would drop ALL of it just
     // because SOME charge-event coverage exists that day; showing the row's
     // FULL total instead would double-count the $500 already covered by the
-    // charge event. Only the $9499 remainder — and tokens/calls scaled by
-    // the same fraction (9499/9999) — should appear.
+    // charge event. Only the $9499 remainder should appear — and, per the
+    // usageItemization.ts rewrite, tokens/calls are each subtracted exactly
+    // (row total minus the event's own tokens/calls), not estimated by
+    // scaling the row's totals by the dollar remainder's fraction. The one
+    // charge event carries 100 tokens across 1 call, so the remainder is
+    // exactly 1000-100=900 tokens and 10-1=9 calls, regardless of dollar
+    // proportions.
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-partial', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
@@ -227,9 +232,10 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     // Total across both items reconciles to the true aggregate total, not more.
     const total = res.body.items.reduce((sum: number, item: any) => sum + item.costMicroUsd, 0);
     expect(total).toBe(9999);
-    // Tokens/calls scaled by the same remainder fraction (9499/9999 ≈ 0.9500).
-    expect(aggregateRow.tokens).toBe(Math.round(1000 * (9499 / 9999)));
-    expect(aggregateRow.calls).toBe(Math.round(10 * (9499 / 9999)));
+    // Exact per-dimension remainder: 1000 total tokens - 100 covered by the
+    // one charge event = 900; 10 total calls - 1 covered call = 9.
+    expect(aggregateRow.tokens).toBe(900);
+    expect(aggregateRow.calls).toBe(9);
   });
 
   it('suppresses only the exact (date, model, feature) covered by a charge event, not other models/features on the same day', async () => {
