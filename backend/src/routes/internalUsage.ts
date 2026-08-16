@@ -32,7 +32,7 @@ import express, { Response } from "express";
 import { createHash } from "crypto";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { recordUsage, computeCostMicroUsd } from "../services/usageRecorderService";
-import { incrementUserTokenUsage } from "../services/tokenUsageService";
+import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
 
 const router = express.Router();
 
@@ -164,6 +164,30 @@ router.post(
         }
       >();
 
+      // ENG-1251 Greptile P1: resolve each contributing actor's TRUE billing
+      // owner up front. recordUsage() below previously wrote every ledger
+      // row's billingUserId as the ACTING user's own id (its own default
+      // when none is passed), not the resolved owner -- for a pooled org
+      // member that is wrong, and made the row unreachable from any query
+      // keyed on the real billing owner (current OR former pooling status).
+      // Resolved once per distinct actor, not per record, since a batch
+      // typically shares one or few actors.
+      const actorUserIds = new Set<string>();
+      for (const record of records) {
+        if (!isValidRecord(record)) continue;
+        const uid =
+          record.userId && (callerIsAdmin || record.userId === authedUserId)
+            ? record.userId
+            : authedUserId;
+        actorUserIds.add(uid);
+      }
+      const billingUserIdByActor = new Map<string, string>();
+      await Promise.all(
+        [...actorUserIds].map(async (uid) => {
+          billingUserIdByActor.set(uid, await resolveBillingUserId(uid));
+        })
+      );
+
       for (const record of records) {
         if (!isValidRecord(record)) {
           skipped++;
@@ -230,6 +254,7 @@ router.post(
         writes.push(
           recordUsage({
             userId,
+            billingUserId: billingUserIdByActor.get(userId) || userId,
             taskId: typeof record.taskId === "string" ? record.taskId : undefined,
             model: record.model!,
             provider:

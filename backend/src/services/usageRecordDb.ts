@@ -303,4 +303,50 @@ export const usageRecordDb = {
 
     return rows;
   },
+
+  /**
+   * Scan for every row attributed to a given billing owner, regardless of
+   * which acting user's partition it lives under (ENG-1251 Greptile P1).
+   *
+   * The table's partition key is the ACTING user's own userId, but a pooled
+   * org member's usage must appear on the OWNER's itemized report. The
+   * owner's own rows are already reachable via queryByUserDateRange; this
+   * covers every OTHER row (current pooled members, and -- since
+   * billingUserId is stamped once at write time and never rewritten --
+   * FORMER pooled members' historical rows too, as long as they were
+   * written while genuinely pooled).
+   *
+   * A Scan is deliberate here, same reasoning as scanByDateRange above: this
+   * table holds compact daily aggregates with a bounded TTL, and itemized
+   * usage is a low-frequency, per-user read (one customer viewing their own
+   * month), not a hot path. If row volume ever makes this slow, the upgrade
+   * path is a billingUserId GSI -- not client-side filtering. Tracked as
+   * ENG-1273 (Low priority, not urgent -- table is 4,747 items as of
+   * 2026-08-16), gated behind Harsha's approval since a new GSI is a
+   * database/data-plane change.
+   */
+  async queryByBillingUserDateRange(
+    billingUserId: string,
+    startDate: string,
+    endDate: string
+  ): Promise<UsageRecordRow[]> {
+    const rows: UsageRecordRow[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+    do {
+      const result = await getDocumentClient()
+        .scan({
+          TableName: TABLE_NAME,
+          FilterExpression: "billingUserId = :billing AND #date BETWEEN :start AND :end",
+          ExpressionAttributeNames: { "#date": "date" },
+          ExpressionAttributeValues: { ":billing": billingUserId, ":start": startDate, ":end": endDate },
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+        })
+        .promise();
+      rows.push(...((result.Items || []) as UsageRecordRow[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+
+    return rows;
+  },
 };

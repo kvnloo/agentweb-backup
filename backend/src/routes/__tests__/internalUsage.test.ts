@@ -26,6 +26,11 @@ jest.mock('../../services/usageRecorderService', () => ({
 }));
 jest.mock('../../services/tokenUsageService', () => ({
   incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
+  // ENG-1251 Greptile P1: internalUsage.ts now resolves each contributing
+  // actor's billing owner before recording the ledger row. Defaults to
+  // "same as input" (no pooling) so every existing test in this file keeps
+  // its current behavior unless a test opts into a different resolution.
+  resolveBillingUserId: jest.fn((userId: string) => Promise.resolve(userId)),
 }));
 
 import internalUsageRoutes from '../internalUsage';
@@ -127,6 +132,10 @@ describe('POST /api/internal/usage', () => {
     expect(res.body).toEqual({ accepted: 2, skipped: 0 });
     expect(mockRecordUsage).toHaveBeenCalledWith({
       userId: 'user-1',
+      // ENG-1251 Greptile P1: billingUserId is now resolved per actor and
+      // passed explicitly (default mock resolves to the same id -- no
+      // pooling in this test).
+      billingUserId: 'user-1',
       taskId: 'task-42',
       model: 'anthropic.claude-sonnet-4-6',
       provider: 'anthropic',
@@ -144,6 +153,7 @@ describe('POST /api/internal/usage', () => {
     });
     expect(mockRecordUsage).toHaveBeenCalledWith({
       userId: 'user-1',
+      billingUserId: 'user-1',
       taskId: undefined,
       model: 'gemini-3.5-flash',
       provider: 'unknown',

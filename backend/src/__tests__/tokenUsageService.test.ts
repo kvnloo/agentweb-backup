@@ -6,7 +6,6 @@ import {
   grantTokenBonus,
   resolveBillingUserId,
   deriveBlockedByCost,
-  getPooledMemberUserIds,
 } from "../services/tokenUsageService";
 
 // Mock dependencies
@@ -21,7 +20,6 @@ jest.mock("../services/db", () => ({
   },
   orgDb: {
     getOrgById: jest.fn(),
-    getOrgMembers: jest.fn(),
   },
 }));
 
@@ -52,7 +50,6 @@ const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as je
 const mockResetTokenUsageForMonth = (userDb as any).resetTokenUsageForMonth as jest.Mock;
 const mockApplyMonthlyChargeAtomic = (userDb as any).applyMonthlyChargeAtomic as jest.Mock;
 const mockGetOrgById = orgDb.getOrgById as jest.Mock;
-const mockGetOrgMembers = orgDb.getOrgMembers as jest.Mock;
 const mockGetUserSubscriptionType = getUserSubscriptionType as jest.Mock;
 const mockGetSubscriptionTypeConfig = getSubscriptionTypeConfig as jest.Mock;
 const mockRecordLlmChargeEvent = recordLlmChargeEvent as jest.Mock;
@@ -831,48 +828,6 @@ describe("resolveBillingUserId - success cases", () => {
     mockGetOrgById.mockResolvedValue({ orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" });
     const result = await resolveBillingUserId("member1");
     expect(result).toBe("owner1");
-  });
-});
-
-describe("getPooledMemberUserIds (ENG-1251 Greptile P1)", () => {
-  it("returns an empty list for a solo user with no org", async () => {
-    mockGetUserById.mockResolvedValueOnce({ userId: "solo1", email: "solo@example.com" });
-
-    const result = await getPooledMemberUserIds("solo1");
-
-    expect(result).toEqual([]);
-    expect(mockGetOrgMembers).not.toHaveBeenCalled();
-  });
-
-  it("returns every member that currently pools onto the billing owner, excluding the owner itself and self-pay members", async () => {
-    const org = { orgId: "org1", ownerUserId: "owner1", name: "Acme", maxMembers: 5, createdAt: "", updatedAt: "" };
-    // 1: getPooledMemberUserIds' own lookup of the billing owner.
-    mockGetUserById.mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", orgId: "org1" });
-    mockGetOrgMembers.mockResolvedValue([
-      { userId: "owner1", email: "owner@example.com", orgId: "org1" },
-      { userId: "member-pooled", email: "pooled@example.com", orgId: "org1" },
-      { userId: "member-selfpay", email: "selfpay@example.com", orgId: "org1", subscription_status: "active" },
-    ]);
-    // resolveBillingUserId("member-pooled"): its own getUserById + getOrgById.
-    mockGetUserById.mockResolvedValueOnce({ userId: "member-pooled", email: "pooled@example.com", orgId: "org1" });
-    mockGetOrgById.mockResolvedValueOnce(org);
-    // resolveBillingUserId("member-selfpay"): has its own live subscription,
-    // so it does NOT pool -- resolves to itself, not owner1.
-    mockGetUserById.mockResolvedValueOnce({ userId: "member-selfpay", email: "selfpay@example.com", orgId: "org1", subscription_status: "active" });
-    mockGetOrgById.mockResolvedValueOnce(org);
-
-    const result = await getPooledMemberUserIds("owner1");
-
-    expect(result).toEqual(["member-pooled"]);
-  });
-
-  it("returns an empty list when the org has no other members", async () => {
-    mockGetUserById.mockResolvedValueOnce({ userId: "owner1", email: "owner@example.com", orgId: "org1" });
-    mockGetOrgMembers.mockResolvedValue([{ userId: "owner1", email: "owner@example.com", orgId: "org1" }]);
-
-    const result = await getPooledMemberUserIds("owner1");
-
-    expect(result).toEqual([]);
   });
 });
 

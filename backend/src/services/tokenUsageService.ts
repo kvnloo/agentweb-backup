@@ -63,42 +63,6 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
   return org.ownerUserId;
 }
 
-/**
- * ENG-1251 Greptile P1: the legacy shadow-ledger aggregate table
- * (usageRecordDb) stores each row under the ACTING user's own raw userId,
- * not the resolved billing owner -- unlike the charge-event/counter path,
- * which always resolves to billingUserId first. For a solo user those are
- * the same id, so this is invisible; for a pooled org, a member's
- * aggregate-only usage (pre-charge-event history, or any path that never
- * grew charge-event coverage) is stored under the MEMBER's id and was
- * unreachable from a query keyed on the owner's billingUserId alone --
- * silently absent from the owner's itemized report even though that same
- * usage WAS correctly charged to the owner's counter.
- *
- * Returns every member userId that currently resolves onto `billingUserId`
- * (the billingUserId itself is not included -- callers already query that
- * one directly). Empty for a solo user or an org with no other pooled
- * members. Reuses resolveBillingUserId per member rather than
- * re-implementing the pooling predicate, so this can never drift from the
- * actual billing resolution logic (the exact failure class ENG-288/954/1084
- * already fixed once for the entitlement/quota pair).
- */
-export async function getPooledMemberUserIds(billingUserId: string): Promise<string[]> {
-  const billingUser = await userDb.getUserById(billingUserId);
-  if (!billingUser?.orgId) return [];
-
-  const members = await orgDb.getOrgMembers(billingUser.orgId);
-  const resolved = await Promise.all(
-    members
-      .filter((member) => member.userId !== billingUserId)
-      .map(async (member) => ({
-        userId: member.userId,
-        resolvesTo: await resolveBillingUserId(member.userId),
-      }))
-  );
-  return resolved.filter((r) => r.resolvesTo === billingUserId).map((r) => r.userId);
-}
-
 function getCurrentMonth(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;

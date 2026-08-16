@@ -3,7 +3,7 @@ import request from 'supertest';
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
 import subscriptionRoutes from '../subscription';
 import { authenticateToken } from '../../middleware/auth';
-import { resolveBillingUserId, getPooledMemberUserIds } from '../../services/tokenUsageService';
+import { resolveBillingUserId } from '../../services/tokenUsageService';
 import { listLlmChargeEvents } from '../../services/llmChargeAuditDb';
 import { usageRecordDb } from '../../services/usageRecordDb';
 
@@ -32,7 +32,6 @@ jest.mock('../../services/customerPortalPages', () => ({
 jest.mock('../../services/tokenUsageService', () => ({
   checkTokenUsage: jest.fn(),
   resolveBillingUserId: jest.fn(),
-  getPooledMemberUserIds: jest.fn(),
 }));
 
 jest.mock('../../services/llmChargeAuditDb', () => ({
@@ -40,16 +39,15 @@ jest.mock('../../services/llmChargeAuditDb', () => ({
 }));
 
 jest.mock('../../services/usageRecordDb', () => ({
-  usageRecordDb: { queryByUserDateRange: jest.fn() },
+  usageRecordDb: { queryByBillingUserDateRange: jest.fn() },
 }));
 
 // @jest/globals' bare `jest.Mock` defaults its return type to `unknown`, so
 // mockResolvedValueOnce's argument infers as `never`. Tying the mock to the
 // real function's type gives it a real Promise<T> return to infer against.
 const mockResolveBillingUserId = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
-const mockGetPooledMemberUserIds = getPooledMemberUserIds as jest.MockedFunction<typeof getPooledMemberUserIds>;
 const mockListLlmChargeEvents = listLlmChargeEvents as jest.MockedFunction<typeof listLlmChargeEvents>;
-const mockQueryByUserDateRange = usageRecordDb.queryByUserDateRange as jest.MockedFunction<typeof usageRecordDb.queryByUserDateRange>;
+const mockQueryByBillingUserDateRange = usageRecordDb.queryByBillingUserDateRange as jest.MockedFunction<typeof usageRecordDb.queryByBillingUserDateRange>;
 
 let app: express.Application;
 
@@ -132,10 +130,6 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
       next();
     });
     mockResolveBillingUserId.mockResolvedValue('u1');
-    // No pooled org members by default -- every existing test in this
-    // block is a solo user, so the itemized route queries only its own
-    // billingUserId, matching the pre-pooling-fix behavior exactly.
-    mockGetPooledMemberUserIds.mockResolvedValue([]);
     app = express();
     app.use(express.json());
     app.use('/api/subscription', subscriptionRoutes);
@@ -145,7 +139,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByUserDateRange.mockResolvedValue([]);
+    mockQueryByBillingUserDateRange.mockResolvedValue([]);
 
     const res = await request(app)
       .get('/api/subscription/usage/itemized?month=2026-08')
@@ -155,12 +149,12 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items).toHaveLength(1);
     expect(res.body.items[0].source).toBe('charge_event');
     // No aggregate query result should leak in when every day is charge-event covered.
-    expect(mockQueryByUserDateRange).toHaveBeenCalled();
+    expect(mockQueryByBillingUserDateRange).toHaveBeenCalled();
   });
 
   it('returns daily_aggregate precision when no charge events exist yet this month', async () => {
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
     ]);
 
@@ -173,47 +167,31 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items[0].source).toBe('daily_aggregate');
   });
 
-  it('ENG-1251 Greptile P1: merges a pooled org member\'s aggregate-only rows into the billing owner\'s itemized report', async () => {
-    // usageRecordDb stores each row under the ACTING user's own id, not the
-    // resolved billing owner. A pooled member's aggregate-only usage is
-    // otherwise unreachable from a query keyed on billingUserId alone, even
-    // though it WAS correctly charged to the owner's counter.
-    mockGetPooledMemberUserIds.mockResolvedValue(['member-2']);
+  it('ENG-1251 Greptile P1: queries by billingUserId (not the caller\'s own id) so pooled AND former-pooled members\' rows are included', async () => {
+    // usageRecordDb's partition key is the ACTING user's own id, not the
+    // resolved billing owner. queryByBillingUserDateRange scans by the row's
+    // OWN billingUserId attribute instead (stamped correctly at write time
+    // by internalUsage.ts), which is how a pooled member's -- or a FORMER
+    // pooled member's, from while they were still pooled -- aggregate-only
+    // usage reaches the owner's itemized report without a second query.
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByUserDateRange.mockImplementation(async (userId: string) => {
-      if (userId === 'u1') {
-        return [
-          { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
-        ];
-      }
-      if (userId === 'member-2') {
-        return [
-          { userId: 'member-2', sk: '2026-08-06#opus#chat', billingUserId: 'member-2', updatedAt: '2026-08-06T00:00:00.000Z', ttl: 0, date: '2026-08-06', model: 'opus', provider: 'bedrock', feature: 'chat', totalTokens: 500, callCount: 1, costMicroUsd: 4000 },
-        ];
-      }
-      return [];
-    });
+    mockQueryByBillingUserDateRange.mockResolvedValue([
+      { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
+      // A different acting user's row, correctly stamped with THIS owner's
+      // billingUserId at write time -- current pooled member, or a former
+      // one whose historical row still carries the right attribution.
+      { userId: 'member-2', sk: '2026-08-06#opus#chat', billingUserId: 'u1', updatedAt: '2026-08-06T00:00:00.000Z', ttl: 0, date: '2026-08-06', model: 'opus', provider: 'bedrock', feature: 'chat', totalTokens: 500, callCount: 1, costMicroUsd: 4000 },
+    ]);
 
     const res = await request(app)
       .get('/api/subscription/usage/itemized?month=2026-08')
       .expect(200);
 
-    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
-    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('member-2', '2026-08-01', '2026-08-31');
+    expect(mockQueryByBillingUserDateRange).toHaveBeenCalledTimes(1);
+    expect(mockQueryByBillingUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
     expect(res.body.items).toHaveLength(2);
     const dates = res.body.items.map((item: any) => item.date).sort();
     expect(dates).toEqual(['2026-08-05', '2026-08-06']);
-  });
-
-  it('queries only the billing owner when there are no pooled members (solo user, unchanged behavior)', async () => {
-    mockGetPooledMemberUserIds.mockResolvedValue([]);
-    mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByUserDateRange.mockResolvedValue([]);
-
-    await request(app).get('/api/subscription/usage/itemized?month=2026-08').expect(200);
-
-    expect(mockQueryByUserDateRange).toHaveBeenCalledTimes(1);
-    expect(mockQueryByUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
   });
 
   it('merges both sources on a partial-rollout month WITHOUT dropping pre-event charges (Greptile P1)', async () => {
@@ -224,7 +202,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-01#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-01T00:00:00.000Z', ttl: 0, date: '2026-08-01', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 50, callCount: 1, costMicroUsd: 200 },
       // Same (date, model, feature) as the charge event above, and its
       // dollar total is FULLY covered by it (500 <= 500) — must be EXCLUDED
@@ -264,7 +242,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-partial', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 1000, callCount: 10, costMicroUsd: 9999 },
     ]);
 
@@ -291,7 +269,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       // Fully covered — same date, model, feature, dollar amount.
       { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 100, callCount: 1, costMicroUsd: 500 },
       // Same day, different model — never touched by the sonnet/chat event.
@@ -314,7 +292,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     // charge events", silently dropping real, positive token/call usage
     // that no charge event actually represents.
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 3, costMicroUsd: 0 },
     ]);
 
@@ -335,7 +313,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-unpriced', actingUserId: 'u1', occurredAt: '2026-08-05T12:00:00.000Z', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', tokens: 5000, costMicroUsd: 0, sessionId: 's1' },
     ]);
-    mockQueryByUserDateRange.mockResolvedValue([
+    mockQueryByBillingUserDateRange.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 1, costMicroUsd: 0 },
     ]);
 

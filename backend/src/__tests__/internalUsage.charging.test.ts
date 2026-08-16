@@ -49,6 +49,10 @@ jest.mock("../services/usageRecorderService", () => ({
 }));
 jest.mock("../services/tokenUsageService", () => ({
   incrementUserTokenUsage: (...args: unknown[]) => mockIncrementUserTokenUsage(...args),
+  // ENG-1251 Greptile P1: internalUsage.ts now resolves each contributing
+  // actor's billing owner before recording the ledger row. Defaults to
+  // "same as input" (no pooling) -- no test in this file exercises pooling.
+  resolveBillingUserId: (userId: string) => Promise.resolve(userId),
 }));
 
 import internalUsageRoutes from "../routes/internalUsage";
