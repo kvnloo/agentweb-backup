@@ -199,7 +199,14 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
         // ENG-720: a hard bounce to an *account's own address* flags the
         // account undeliverable so support/CS can see replies won't land.
-        void handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        // Awaited (not fire-and-forget) so the flag is persisted before the
+        // webhook ack — Resend won't retry a 200, so a dropped process here
+        // would otherwise leave the account silently unflagged.
+        try {
+          await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        } catch (hardBounceError) {
+          console.error('[webhooks] handleHardBounceRecipients error:', hardBounceError);
+        }
         void (async () => {
           try {
             const users = await userDb.getUsersByEmailDomain(emailDomain);

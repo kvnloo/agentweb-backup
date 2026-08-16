@@ -125,9 +125,23 @@ export async function sweepUndeliverableDomains(deps?: {
     errors: [],
   };
 
-  for (const [domain, users] of byDomain) {
+  // Resolving MX sequentially for every domain in a synchronous admin
+  // request risks exceeding the ALB timeout once the domain count grows
+  // (a multi-thousand-user dataset can carry hundreds of unique domains).
+  // Bound each lookup with a per-domain timeout and run a small pool of
+  // domains concurrently so one slow/hanging resolver can't stall the sweep.
+  const MX_LOOKUP_TIMEOUT_MS = 3000;
+  const MX_LOOKUP_CONCURRENCY = 10;
+
+  const checkDomain = async (domain: string, users: Array<{ userId: string; email: string }>) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const records = await resolveMx(domain);
+      const records = await Promise.race([
+        resolveMx(domain),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(Object.assign(new Error('MX lookup timed out'), { code: 'ETIMEOUT' })), MX_LOOKUP_TIMEOUT_MS);
+        }),
+      ]);
       if (!records || records.length === 0) {
         report.undeliverable.push({ domain, error: 'no MX records', users });
       }
@@ -138,7 +152,15 @@ export async function sweepUndeliverableDomains(deps?: {
       } else {
         report.errors.push({ domain, error: `${code || 'ERR'}: ${err?.message || err}` });
       }
+    } finally {
+      if (timer) clearTimeout(timer);
     }
+  };
+
+  const domainEntries = Array.from(byDomain.entries());
+  for (let i = 0; i < domainEntries.length; i += MX_LOOKUP_CONCURRENCY) {
+    const batch = domainEntries.slice(i, i + MX_LOOKUP_CONCURRENCY);
+    await Promise.all(batch.map(([domain, users]) => checkDomain(domain, users)));
   }
 
   return report;
