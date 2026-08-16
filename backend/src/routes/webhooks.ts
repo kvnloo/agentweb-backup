@@ -697,10 +697,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         }
       }
 
-      // ENG-926 §B: backfill the match-quality signals on a repeat touch, and ONLY when the
-      // lead has none — same immutability contract as the click-ID denorm above. A returning
-      // visitor's IP and device are not the ones that acquired them, so overwriting would
-      // quietly degrade the very signal this is here to strengthen.
+      // ENG-926 §B: backfill the match-quality signals on a repeat touch, and only when the
+      // lead has none. A returning visitor's IP and device are not the ones that acquired
+      // them, so overwriting would quietly degrade the very signal this is here to
+      // strengthen.
+      //
+      // These checks are an OPTIMISATION, not the guarantee — they avoid issuing a write
+      // that would change nothing, and keep the `lead.unchanged` response honest. The
+      // write-once contract itself is enforced atomically in db.ts via `if_not_exists`,
+      // because a read here followed by a write there is TOCTOU: two repeat submissions
+      // racing while the field is absent would both pass this check.
       //
       // `metaFbp` is included because it was accepted by createLead alone: a lead that first
       // arrived WITHOUT an fbp and later submitted WITH one never got one. That is the

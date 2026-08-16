@@ -7140,21 +7140,37 @@ export const crmDb = {
         expressionAttributeValues[':clickIds'] = updates.clickIds;
       }
 
-      // ENG-926 §B: Meta Event Match Quality signals. Callers enforce the backfill-only
-      // contract (never overwrite a value already on the lead) — this layer just persists.
+      // ENG-926 §B: Meta Event Match Quality signals, WRITE-ONCE BY CONSTRUCTION.
+      //
+      // `if_not_exists` rather than a plain SET, and that is the whole point: a caller
+      // read-then-write (routes/webhooks.ts checks the lead before deciding to backfill)
+      // is TOCTOU. Two repeat submissions racing while the field is absent both observe
+      // the absence and both issue a SET, and the later one replaces the acquisition
+      // identity Meta will be asked to match on months later. The condition belongs in the
+      // write, where it is atomic, not in a check the caller performs beforehand.
+      //
+      // Deliberately NOT a ConditionExpression: that guards the whole UpdateExpression, so
+      // a lost race would reject the caller's legitimate user-visible edits too. Per-
+      // attribute if_not_exists lets the rest of the update land and only this value hold.
+      //
+      // The consequence, stated plainly: these three attributes cannot be overwritten
+      // through updateLead by anyone. That is the intended contract — the value that
+      // matters is the one from the touch that ACQUIRED the lead. A deliberate correction
+      // needs its own path rather than quietly riding on a lead update.
+      //
       // metaFbp is here because it was added to createLead alone, which is precisely the
       // silent-drop this function's comment above warns about; a field the merge path
       // cannot write is a field a repeat-touch lead never gets.
       if (updates.metaFbp !== undefined) {
-        setExpressions.push('metaFbp = :metaFbp');
+        setExpressions.push('metaFbp = if_not_exists(metaFbp, :metaFbp)');
         expressionAttributeValues[':metaFbp'] = updates.metaFbp;
       }
       if (updates.clientIp !== undefined) {
-        setExpressions.push('clientIp = :clientIp');
+        setExpressions.push('clientIp = if_not_exists(clientIp, :clientIp)');
         expressionAttributeValues[':clientIp'] = updates.clientIp;
       }
       if (updates.clientUserAgent !== undefined) {
-        setExpressions.push('clientUserAgent = :clientUserAgent');
+        setExpressions.push('clientUserAgent = if_not_exists(clientUserAgent, :clientUserAgent)');
         expressionAttributeValues[':clientUserAgent'] = updates.clientUserAgent;
       }
 
