@@ -69,6 +69,10 @@ export const config = {
 
   inProgressState: 'In Progress',  // moved here on pickup (guards against re-processing)
   reviewState: 'In Review',        // moved here ONLY when triage is green (see triageLabels)
+  // Where the merge agent may move a card once it has finished — and ONLY once EVERYTHING the card
+  // asked for is shipped AND live-tested on production. Deliberately not a terminal state: closing a
+  // card stays a human's call, since they may be tracking release/sign-off the agent cannot see.
+  verifyingState: 'Verifying',
   gcDoneStateTypes: ['completed', 'canceled'], // gc.mjs removes a kept worktree once its issue reaches one of these state types
 
   // Triage labels set on the issue after each run, so the board answers "what do I do with
