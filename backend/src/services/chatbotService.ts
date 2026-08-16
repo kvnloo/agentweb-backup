@@ -9,9 +9,16 @@ import { getReleases } from "../controllers/release";
 import { fetchMintlifyDocsContent, chunkDocsContent } from "./docsKnowledgeSource";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
-import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
-import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
+// ENG-1277: type-only. `SearchServiceClient` (the value) is required lazily
+// inside searchPlatformKnowledgeBase() below — that function is the only
+// caller, and `@google-cloud/discoveryengine` pulls in ~379 transitive
+// modules that every jest worker previously paid on `require()` of this file
+// regardless of whether a test ever calls it. `EngineServiceClient` was
+// imported but never referenced anywhere in this file or its tests'
+// production paths (only in mock factories, which don't need the real
+// export to exist) — dropped rather than carried into the lazy form.
+import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
@@ -4154,6 +4161,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     }
 
     // Initialize the Search Service clients
+    // ENG-1277: lazy load — see the import comment above for why.
+    const { SearchServiceClient, protos } = await import('@google-cloud/discoveryengine');
     const privateKey = await getGCSPPrivateKey();
 
     const publicClient = new SearchServiceClient({
