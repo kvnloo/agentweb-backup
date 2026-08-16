@@ -53,33 +53,37 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     // row discarded instead of just the covered portion.
     //
     // Key at (date, model, feature) — the aggregate table's own natural
-    // grouping (its sort key is `{date}#{model}#{feature}`) — and only
-    // suppress the DOLLAR AMOUNT actually covered by charge events for
-    // that exact combination. A day/model/feature fully covered nets to
-    // ~0 and disappears (the common case); one with a genuine uncovered
-    // remainder still shows, at its full totals (token/call counts can't
-    // be split proportionally without call-level attribution in the
-    // aggregate row, so a partially-covered row shows in full rather than
-    // being silently dropped or estimated).
+    // grouping (its sort key is `{date}#{model}#{feature}`) — and show only
+    // the UNCOVERED REMAINDER for that exact combination, not the row's
+    // full total: showing the full row alongside its own charge events
+    // would double-count the covered portion's dollar amount. Token/call
+    // counts are scaled by the same remainder fraction, since the aggregate
+    // row has no call-level attribution to split them exactly — an
+    // estimate, but one that keeps the dollar figure (the one this whole
+    // reconciliation is about) exact.
     const chargedMicroUsdByKey = new Map<string, number>();
     for (const event of events) {
       const key = `${event.occurredAt.slice(0, 10)}#${event.model || 'unknown'}#${event.feature || 'unknown'}`;
       chargedMicroUsdByKey.set(key, (chargedMicroUsdByKey.get(key) || 0) + event.costMicroUsd);
     }
     const rows = await usageRecordDb.queryByUserDateRange(billingUserId, `${month}-01`, `${month}-31`);
-    const aggregateItems = rows
-      .filter((row) => {
-        const key = `${row.date}#${row.model}#${row.feature}`;
-        const covered = chargedMicroUsdByKey.get(key) || 0;
-        // row.costMicroUsd is already micro-USD, same unit as the charge
-        // events summed above -- no conversion.
-        return (row.costMicroUsd || 0) > covered;
-      })
-      .map((row) => ({
+    const aggregateItems = rows.flatMap((row) => {
+      const key = `${row.date}#${row.model}#${row.feature}`;
+      const covered = chargedMicroUsdByKey.get(key) || 0;
+      // row.costMicroUsd is already micro-USD, same unit as the charge
+      // events summed above -- no conversion.
+      const rowMicroUsd = row.costMicroUsd || 0;
+      const remainderMicroUsd = rowMicroUsd - covered;
+      if (remainderMicroUsd <= 0) return []; // fully covered by charge events
+      const remainderFraction = remainderMicroUsd / rowMicroUsd;
+      return [{
         date: row.date, model: row.model, provider: row.provider || 'unknown', feature: row.feature,
-        tokens: row.totalTokens || 0, calls: row.callCount || 0, costMicroUsd: row.costMicroUsd || 0,
+        tokens: Math.round((row.totalTokens || 0) * remainderFraction),
+        calls: Math.round((row.callCount || 0) * remainderFraction),
+        costMicroUsd: remainderMicroUsd,
         source: 'daily_aggregate' as const,
-      }));
+      }];
+    });
 
     const items = [...perChargeItems, ...aggregateItems].sort(
       (a, b) => b.date.localeCompare(a.date) || b.costMicroUsd - a.costMicroUsd

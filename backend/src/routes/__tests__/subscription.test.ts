@@ -198,18 +198,20 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items.some((item: any) => item.date === '2026-08-10' && item.source === 'daily_aggregate')).toBe(false);
   });
 
-  it('shows the uncovered remainder when a day has an applied event but MORE aggregate-only spend (Greptile P1: one event hides whole day)', async () => {
+  it('shows only the UNCOVERED REMAINDER when a day has an applied event but MORE aggregate-only spend, not the full row (Greptile P1: one event hides whole day / mixed itemization double-counts)', async () => {
     // A charge event covers only $0.0005 of this (date, model, feature), but
     // the aggregate row for the exact same combination totals $0.009999 —
     // most of that day's usage predates or otherwise falls outside the
     // event's coverage. Date-only suppression would drop ALL of it just
-    // because SOME charge-event coverage exists that day; this must keep
-    // showing the uncovered remainder rather than discarding it.
+    // because SOME charge-event coverage exists that day; showing the row's
+    // FULL total instead would double-count the $500 already covered by the
+    // charge event. Only the $9499 remainder — and tokens/calls scaled by
+    // the same fraction (9499/9999) — should appear.
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-partial', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
     mockQueryByUserDateRange.mockResolvedValue([
-      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 999, callCount: 5, costMicroUsd: 9999 },
+      { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 1000, callCount: 10, costMicroUsd: 9999 },
     ]);
 
     const res = await request(app)
@@ -220,7 +222,14 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     const aggregateRow = res.body.items.find((item: any) => item.source === 'daily_aggregate');
     expect(aggregateRow).toBeDefined();
     expect(aggregateRow.date).toBe('2026-08-10');
-    expect(aggregateRow.costMicroUsd).toBe(9999);
+    // Remainder, not the full row total — the covered $500 must not appear twice.
+    expect(aggregateRow.costMicroUsd).toBe(9499);
+    // Total across both items reconciles to the true aggregate total, not more.
+    const total = res.body.items.reduce((sum: number, item: any) => sum + item.costMicroUsd, 0);
+    expect(total).toBe(9999);
+    // Tokens/calls scaled by the same remainder fraction (9499/9999 ≈ 0.9500).
+    expect(aggregateRow.tokens).toBe(Math.round(1000 * (9499 / 9999)));
+    expect(aggregateRow.calls).toBe(Math.round(10 * (9499 / 9999)));
   });
 
   it('suppresses only the exact (date, model, feature) covered by a charge event, not other models/features on the same day', async () => {
