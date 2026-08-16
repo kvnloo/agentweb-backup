@@ -549,6 +549,44 @@ create_application_version() {
   fail "create-application-version failed for '${EB_VERSION_LABEL}' and the error is not an already-exists collision. AWS reported: ${out}"
 }
 
+# Ensure the ASG can hold an old instance long enough for the application to
+# drain scheduled work before termination (ENG-764).
+#
+# This belongs in the deploy path, not .ebextensions: an .ebextensions resource
+# delta cannot ride an immutable application deploy, while a one-time manually
+# created hook disappears if Elastic Beanstalk ever replaces the ASG. The API is
+# idempotent, so every deploy repairs the hook before update-environment is
+# allowed to retire an instance.
+ensure_termination_lifecycle_hook() {
+  local asg out
+
+  if ! asg=$(aws elasticbeanstalk describe-environment-resources \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --query 'EnvironmentResources.AutoScalingGroups[0].Name' \
+    --output text 2>&1); then
+    fail "could not resolve the Auto Scaling group for '${EB_ENVIRONMENT_NAME}' before installing the termination lifecycle hook. AWS reported: ${asg}"
+  fi
+
+  if [ -z "${asg}" ] || [ "${asg}" = "None" ]; then
+    fail "environment '${EB_ENVIRONMENT_NAME}' returned no Auto Scaling group; refusing to deploy without the ENG-764 termination lifecycle hook."
+  fi
+
+  case "${asg}" in
+    awseb-*) ;;
+    *) fail "environment '${EB_ENVIRONMENT_NAME}' resolved unexpected Auto Scaling group '${asg}'; refusing to attach the lifecycle hook outside an Elastic Beanstalk-owned ASG." ;;
+  esac
+
+  log "Ensuring termination lifecycle hook 'agentweb-drain-before-terminate' on '${asg}'."
+  if ! out=$(aws autoscaling put-lifecycle-hook \
+    --auto-scaling-group-name "${asg}" \
+    --lifecycle-hook-name agentweb-drain-before-terminate \
+    --lifecycle-transition autoscaling:EC2_INSTANCE_TERMINATING \
+    --heartbeat-timeout 900 \
+    --default-result CONTINUE 2>&1); then
+    fail "could not install termination lifecycle hook on '${asg}'; refusing to start a deploy that could cut off scheduled work. AWS reported: ${out}"
+  fi
+}
+
 # Waits for the environment to reach Ready so this version can actually be
 # applied. Used before update-environment (AC4: a concurrent update is waited
 # out, never shrugged off).
@@ -586,6 +624,7 @@ update_environment() {
 
   while [ "${attempt}" -le "${EB_UPDATE_MAX_ATTEMPTS}" ]; do
     wait_for_environment_ready "pre-update settle ${attempt}/${EB_UPDATE_MAX_ATTEMPTS}"
+    ensure_termination_lifecycle_hook
 
     log "Applying version '${EB_VERSION_LABEL}' to '${EB_ENVIRONMENT_NAME}' (attempt ${attempt}/${EB_UPDATE_MAX_ATTEMPTS})"
     if out=$(aws elasticbeanstalk update-environment \

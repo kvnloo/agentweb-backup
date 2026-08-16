@@ -17,12 +17,19 @@ import { sendRoadmapDeliveryEmail } from '../services/roadmapDelivery';
 import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
-import { normalizeAttribution } from '../types/attribution';
+import { pruneClickIds } from '../utils/leadSchema';
+import { resolveClientIdentity } from '../utils/clientIdentity';
+import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
+import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
+// ENG-926 §C: the per-list budget and the per-account BUC pause used to live here as
+// module-private state. Extracted so the CRM → Meta conversion relay throttles against the
+// same counters instead of a second set that drifts out of step with this one.
+import { shouldAttemptCapiSend, isCapiAccountPaused, recordCapiUsage } from '../services/capiSendBudget';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -76,55 +83,6 @@ async function resolveContactEmail(
 
 const router = express.Router();
 
-// ENG-492: bounds how often the Meta CAPI send (below, in the forward-lead handler) is
-// actually ATTEMPTED per lead list, so a scripted flood against one customer's list can't
-// pollute their live ad account with unlimited fake "Lead" conversions. Deliberately NOT an
-// HTTP-level rate limiter (like express-rate-limit) — this only ever gates the optional,
-// fire-and-forget CAPI call, never the lead save/response itself, so hitting the cap has
-// zero customer-visible effect: the lead still saves normally, the response is still 201,
-// the only consequence is that this one submission doesn't get forwarded to Meta.
-const capiSendTimestampsByListId = new Map<string, number[]>();
-const CAPI_SEND_BUDGET_MAX = 100;
-const CAPI_SEND_BUDGET_WINDOW_MS = 15 * 60 * 1000;
-
-function shouldAttemptCapiSend(listId: string): boolean {
-  const now = Date.now();
-  const recent = (capiSendTimestampsByListId.get(listId) || []).filter(
-    (t) => now - t < CAPI_SEND_BUDGET_WINDOW_MS,
-  );
-  if (recent.length >= CAPI_SEND_BUDGET_MAX) {
-    capiSendTimestampsByListId.set(listId, recent);
-    // Logged every time (not just on the first overflow) so the actual overflow VOLUME is
-    // visible in logs, not just that it happened once — that's what tells us whether
-    // CAPI_SEND_BUDGET_MAX is too low for a real customer's real traffic (tune it up) vs.
-    // a genuine flood (leave it, or investigate the source).
-    console.warn(
-      `[CAPI] Send budget exhausted for list ${listId} (${recent.length}/${CAPI_SEND_BUDGET_MAX} ` +
-      `in the last ${CAPI_SEND_BUDGET_WINDOW_MS / 60000}min) — this submission's Lead event will NOT be forwarded to Meta. Lead itself still saved normally.`
-    );
-    return false;
-  }
-  recent.push(now);
-  capiSendTimestampsByListId.set(listId, recent);
-  return true;
-}
-
-// Second, independent layer on top of the per-listId budget above: that budget is an
-// invented internal number, not Meta's actual rate limit. Meta documents NO fixed CAPI
-// rate limit of its own — CAPI calls count against the ad account's dynamic Business Use
-// Case (BUC) allowance, reported on every response via the X-Business-Use-Case-Usage
-// header (see metaService.sendCapiLeadEvent's CapiUsage return). A customer with many
-// lists, each individually within its own per-list budget, could still collectively
-// exceed what THEIR OWN Meta access token is actually allowed. This tracks that real
-// signal per ad account and pauses sends for that account using Meta's own reported
-// cooldown — Meta's own documented advice is to stop calling once throttled, since
-// calling through it only extends the throttle.
-const capiAccountPausedUntil = new Map<string, number>();
-
-function isCapiAccountPaused(accountId: string): boolean {
-  const pausedUntil = capiAccountPausedUntil.get(accountId);
-  return !!pausedUntil && Date.now() < pausedUntil;
-}
 
 // ENG-449: real client-submission time for CAPI's event_time, instead of server
 // CAPI-send time. Never trust client-supplied input raw — defensively bounded before
@@ -144,18 +102,6 @@ function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
   return Math.floor(capturedAtMs / 1000);
 }
 
-function recordCapiUsage(accountId: string, usage?: { callCountPct: number; totalTimePct: number; totalCpuTimePct: number; estimatedMinutesToRegainAccess?: number }): void {
-  if (!usage || usage.estimatedMinutesToRegainAccess === undefined) return;
-  const atLimit = usage.callCountPct >= 100 || usage.totalTimePct >= 100 || usage.totalCpuTimePct >= 100;
-  if (!atLimit) return;
-  const pausedUntil = Date.now() + usage.estimatedMinutesToRegainAccess * 60_000;
-  capiAccountPausedUntil.set(accountId, pausedUntil);
-  console.warn(
-    `[CAPI] Meta ad account ${accountId} at its Business Use Case rate limit ` +
-    `(call_count=${usage.callCountPct}%, total_time=${usage.totalTimePct}%, total_cputime=${usage.totalCpuTimePct}%) — ` +
-    `pausing CAPI sends for this account for ~${usage.estimatedMinutesToRegainAccess}min. Leads still save normally.`
-  );
-}
 
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
@@ -216,8 +162,23 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const eventId = webhookService.generateEventId(event);
 
     // Check if event already exists (deduplication)
-    const eventExists = await emailEventsDb.eventExists(eventId);
-    if (eventExists) {
+    const existingEvent = await emailEventsDb.getEventById(eventId);
+    if (existingEvent) {
+      // ENG-720: a prior delivery of this same eventId recorded the event but
+      // never durably persisted the hard-bounce account flag (the write failed,
+      // the process died, etc.). Retry the flag write on this duplicate instead
+      // of silently acking it — otherwise the recipient stays unflagged forever,
+      // because Resend never retries an event once we've returned 200 for it.
+      if (existingEvent.eventType === 'email.bounced' && existingEvent.hardBounceFlagPending) {
+        const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
+        }
+        await emailEventsDb.clearHardBounceFlagPending(eventId);
+      }
       console.log(`Event already exists, skipping duplicate: ${eventId}`);
       return res.status(200).json({
         message: 'Event already processed (duplicate)',
@@ -230,8 +191,40 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     const isEmmaEvent = emmaEmailService.isEmmaRelatedEvent(event.data.from || '', eventTo);
 
     if (!isEmmaEvent) {
-      // Store the event in the database
-      const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
+      // Store the event in the database. Mark hardBounceFlagPending for bounce
+      // events up front (ENG-720) so a duplicate delivery before the flag write
+      // below succeeds can retry it instead of being swallowed by dedup.
+      let emailEvent;
+      try {
+        emailEvent = await emailEventsDb.addEmailEvent(
+          event, emailDomain, eventId, undefined, event.type === 'email.bounced'
+        );
+      } catch (error: any) {
+        if (error?.isDuplicateEventId) {
+          // ENG-720: a concurrent delivery of the same eventId won the write
+          // between our existence check above and this put — the winner's
+          // row (and its hardBounceFlagPending marker) is now the source of
+          // truth. Retry the flag write off it, same as the pre-existing
+          // dedup path, instead of silently acking a bounce nobody flagged.
+          const winnerEvent = await emailEventsDb.getEventById(eventId);
+          if (winnerEvent?.eventType === 'email.bounced' && winnerEvent.hardBounceFlagPending) {
+            const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+            const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+            if (failedRecipients.length > 0) {
+              throw new Error(
+                `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+              );
+            }
+            await emailEventsDb.clearHardBounceFlagPending(eventId);
+          }
+          console.log(`Event already exists (concurrent write), skipping duplicate: ${eventId}`);
+          return res.status(200).json({
+            message: 'Event already processed (duplicate)',
+            eventId: eventId
+          });
+        }
+        throw error;
+      }
       try {
         await leadListAlertService.notifyForEmailEvent(emailEvent);
       } catch (alertError) {
@@ -252,6 +245,25 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         console.log(`Email bounced: ${event.data.email_id} - ${bounceReason}`);
         // Auto-flag bounced leads as do-not-contact
         const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        // ENG-720: a hard bounce to an *account's own address* flags the
+        // account undeliverable so support/CS can see replies won't land.
+        // Awaited (not fire-and-forget) so the flag is persisted before the
+        // webhook ack — Resend won't retry a 200, so a dropped process here
+        // would otherwise leave the account silently unflagged.
+        // Do NOT swallow a persistence failure here: catching it and still
+        // acknowledging 200 would tell Resend the event was durably handled
+        // when the account flag was actually lost, and Resend never retries
+        // a 200. Let a thrown error (or a reported failed recipient) reach
+        // the outer catch below so the webhook fails and Resend retries.
+        const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+        if (failedRecipients.length > 0) {
+          throw new Error(
+            `[webhooks] handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+          );
+        }
+        if (!isEmmaEvent) {
+          await emailEventsDb.clearHardBounceFlagPending(eventId);
+        }
         void (async () => {
           try {
             const users = await userDb.getUsersByEmailDomain(emailDomain);
@@ -513,15 +525,46 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       linkedin: linkedin?.trim() || '',
     };
 
-    // Attribution — accept either the new `attribution` shape or the legacy
-    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
-    // If the client sends nothing, we stamp nothing; the CSV import and other
-    // internal paths won't carry attribution.
-    const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
-    if (touch) {
-      leadData.firstTouch = touch;
-      leadData.lastTouch = touch;
+    // ENG-926 §C: persist Meta's browser id so a conversion relayed WEEKS later (a deal
+    // closing in the CRM) can still be matched to this person. `fbp` is a first-party
+    // cookie read here at capture time and used immediately for the Lead event; by the
+    // time the deal closes the cookie is long gone, and it is the strongest match signal
+    // that survives nothing else.
+    //
+    // Stored as its own field rather than inside `firstTouch.clickIds`: every visitor gets
+    // an fbp, including organic ones, so filing it under click IDs would make an organic
+    // lead satisfy `attribute_exists(clickIds)` and read as paid-attributed — the exact
+    // failure pruneClickIds's own contract warns about.
+    if (typeof fbp === 'string' && fbp.trim()) {
+      leadData.metaFbp = fbp.trim();
     }
+
+    // ENG-926 §B: the other two Event Match Quality signals, kept for the same reason as
+    // `fbp` above. Both were already read here, spent on the immediate Lead event, and then
+    // discarded — so a conversion §C relays weeks later went to Meta with LESS identity than
+    // we held at capture, for no reason other than nothing persisted them.
+    //
+    // Computed once here rather than inside the CAPI block below, because the lead write
+    // needs them too and re-deriving the same value twice is how the two drift apart.
+    // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
+    // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
+    // handler.
+    //
+    // ⚠ Landing pages do NOT reach this route from the browser — they POST to their own
+    // Next.js route, which calls us server-side from Vercel (both `hireemma.ai`'s
+    // /api/lead and the platform's own generated /api/capture). So this resolution is
+    // frequently the FORWARDER, not the visitor: a real end-to-end run recorded
+    // `44.202.76.171` + `node` for a lead that came from an actual iPhone. A wrong IP is
+    // worse than no IP — Meta reads it as a match signal and a datacenter address matches
+    // nobody — and these attributes are WRITE-ONCE in db.ts, so a wrong one is permanent.
+    // resolveClientIdentity drops BOTH when the caller is not a browser.
+    const rawClientIp = (
+      req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? ''
+    ).trim();
+    const { clientIp: capturedClientIp, clientUserAgent: capturedUserAgent } =
+      resolveClientIdentity(req.headers['user-agent'], rawClientIp);
+    if (capturedClientIp) leadData.clientIp = capturedClientIp;
+    if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
     // Any top-level key this handler did NOT destructure above is caller data, and used to
     // be silently discarded. A landing page that posts its own fields flat (rather than
@@ -565,6 +608,31 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
     };
+
+    // Attribution — accept either the new `attribution` shape or the legacy
+    // flat `utm` shape (same normaliser controllers/auth.ts uses for signup).
+    // If the client sends nothing, we stamp nothing; the CSV import and other
+    // internal paths won't carry attribution.
+    //
+    // ENG-926 §A: then fill any keys still absent from allowlisted click IDs and
+    // utm_* values sitting in customFields. A lander can capture attribution
+    // perfectly and still deliver a lead with none, by posting it into the free-form
+    // bag rather than the structured envelope — `hireemma.ai` forwards no
+    // `attribution` and no `utm` at all, so its leads arrived with no firstTouch
+    // whatsoever while the site, the POST and the resulting row all looked correct.
+    //
+    // Sourced from `incomingCustomFields` rather than the raw `customFields`, so a
+    // lander that posts its click IDs FLAT at the top level is covered too — those
+    // land in passthrough, and this handler's fixed destructure never reads them.
+    // This is why the block sits here rather than above: it needs that merge.
+    const touch = promoteAttributionFromCustomFields(
+      incomingCustomFields,
+      normalizeAttribution(attribution) ?? normalizeAttribution(utm),
+    );
+    if (touch) {
+      leadData.firstTouch = touch;
+      leadData.lastTouch = touch;
+    }
 
     // Check if lead already exists by email - merge instead of dropping
     const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
@@ -616,8 +684,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // (lastTouch === firstTouch forever for any repeat-touch lead).
       //   - lastTouch  : ALWAYS refreshed when this touch carries attribution.
       //   - firstTouch : immutable — only backfilled if the lead has none yet.
-      //   - utmSource / utmMedium : denormalized from firstTouch — only
-      //     backfilled when absent, never overwritten.
+      //   - utmSource / utmMedium / clickIds : denormalized from firstTouch —
+      //     only backfilled when absent, never overwritten.
       if (touch) {
         updates.lastTouch = touch;
         changed = true;
@@ -629,12 +697,58 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           if (!existingLead.utmMedium && touch.utm?.medium) {
             updates.utmMedium = touch.utm.medium;
           }
+          // ENG-1176. Same immutability contract as the UTM denorm above: the
+          // click that acquired the lead is stamped once. A later touch
+          // carrying a fresh gclid refreshes lastTouch and nothing else.
+          const derivedClickIds = pruneClickIds(touch.clickIds);
+          if (!existingLead.clickIds && derivedClickIds) {
+            updates.clickIds = derivedClickIds;
+          }
         }
       }
 
-      if (changed) {
+      // ENG-926 §B: backfill the match-quality signals on a repeat touch, and only when the
+      // lead has none. A returning visitor's IP and device are not the ones that acquired
+      // them, so overwriting would quietly degrade the very signal this is here to
+      // strengthen.
+      //
+      // These checks are an OPTIMISATION, not the guarantee — they avoid issuing a write
+      // that would change nothing, and keep the `lead.unchanged` response honest. The
+      // write-once contract itself is enforced atomically in db.ts via `if_not_exists`,
+      // because a read here followed by a write there is TOCTOU: two repeat submissions
+      // racing while the field is absent would both pass this check.
+      //
+      // `metaFbp` is included because it was accepted by createLead alone: a lead that first
+      // arrived WITHOUT an fbp and later submitted WITH one never got one. That is the
+      // silent-drop failure db.ts's own comment describes, and this is the path it needed.
+      //
+      // Tracked SEPARATELY from `changed`, and that separation is load-bearing. `changed`
+      // becomes `isUpdated`, which gates drip-sequence auto-enrolment, external CRM push and
+      // the owner notification — real outbound email. Counting a silent metadata backfill as
+      // a lead update would enrol a returning visitor into a sequence and notify the owner
+      // because we quietly stored an IP, which is a side effect nobody asked for and the
+      // caller cannot see coming. The write still happens; only the "this lead changed"
+      // claim is withheld.
+      let matchQualityBackfilled = false;
+      if (!existingLead.metaFbp && leadData.metaFbp) {
+        updates.metaFbp = leadData.metaFbp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientIp && leadData.clientIp) {
+        updates.clientIp = leadData.clientIp;
+        matchQualityBackfilled = true;
+      }
+      if (!existingLead.clientUserAgent && leadData.clientUserAgent) {
+        updates.clientUserAgent = leadData.clientUserAgent;
+        matchQualityBackfilled = true;
+      }
+
+      if (changed || matchQualityBackfilled) {
         await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
-        isUpdated = true;
+        // Only a user-visible change makes this an "update". See the ENG-926 §B note above:
+        // isUpdated drives sequence enrolment, CRM sync and owner alerts, so a silent
+        // metadata backfill deliberately does not set it.
+        isUpdated = changed;
       }
 
       lead = { ...existingLead, ...updates };
@@ -685,18 +799,22 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           const owner = await userDb.getUserById(leadList.userId);
           const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
           const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
-          // ENG-493 is deferred (flipping Express's global `trust proxy` also changes
-          // auth.ts's IP-keyed rate limiters — a separate, riskier change). Scope the fix to
-          // just this CAPI call site instead, same pattern as loopEvents.ts/assetController.ts.
-          const clientIp = (req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? 'unknown').trim();
+          // Resolved once at capture (see the ENG-926 §B block above) so the value sent here
+          // and the value stored on the lead are the same one, not two independent reads.
+          //
+          // OMITTED rather than defaulted when the caller was a forwarding server. This
+          // previously passed `'unknown'`, which metaService treats as truthy and sends
+          // verbatim as `client_ip_address` — a literal placeholder string presented to
+          // Meta as a match signal. Before that it sent the forwarder's real datacenter IP,
+          // which is worse: it looks valid and matches nobody. Sending neither is correct.
           const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
             eventId,
             email: leadData.email,
             firstName: leadData.firstName,
             lastName: leadData.lastName,
             phone: leadData.phone,
-            clientIp,
-            userAgent: req.headers['user-agent'],
+            clientIp: capturedClientIp,
+            userAgent: capturedUserAgent,
             sourceUrl: req.headers['referer'],
             fbp: typeof fbp === 'string' ? fbp : undefined,
             fbc: typeof fbc === 'string' ? fbc : undefined,

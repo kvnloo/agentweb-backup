@@ -21,6 +21,8 @@
  * caused the bug — the rule was already written down, just not shared — so the fix
  * is one exported predicate rather than a third private copy of the same idea.
  */
+import { isPublishName } from './hardeningGaps';
+
 export function toolCallNeverExecuted(toolCall: any): boolean {
   if (!toolCall || typeof toolCall !== 'object') return false;
   return Boolean(toolCall.duplicateOf) || toolCall.result?.deferred === true;
@@ -46,4 +48,55 @@ export function toolCallSucceeded(toolCall: any): boolean {
   if ('error' in toolCall) return false;
   if (toolCall.result?.success === false) return false;
   return !toolCallNeverExecuted(toolCall);
+}
+
+/**
+ * ENG-947 — may this ledger entry satisfy a schedule's `requiredFunctionCalls`?
+ *
+ * The same "did it actually happen" question as above, asked of the gate that
+ * decides whether a scheduled run PASSED. It was not being asked: runVerifiedChat
+ * built its requirement ledger from `toolCalls.map(c => c.name)`, so an ATTEMPT
+ * counted as a SEND. Verified live on the preview 2026-08-11 — a run whose
+ * `post_on_connected_account` returned "Multiple twitter accounts connected"
+ * published nothing and was stored `status: success`, `passed: true`,
+ * `functionCallMatches: ['post_on_connected_account']`. The owner is told their
+ * post went out when it did not, which is the same false success ENG-803 exists to
+ * prevent, one layer below where that fix was applied.
+ *
+ * ONLY PUBLISH TOOLS ARE TIGHTENED, and the asymmetry is the point:
+ *
+ *  - For an irreversible external publish, "attempted" and "happened" are
+ *    different facts to the schedule's owner, and only one of them is worth
+ *    reporting as success.
+ *  - For everything else, requiring success would change pass/fail for EVERY
+ *    scheduled run carrying `requiredFunctionCalls` — a failed read or search
+ *    would start failing runs that pass today, and each would then be re-pressed
+ *    through the full retry budget. That is a product decision about what a
+ *    scheduled run owes its owner, not a defect, so the historical rule stands
+ *    until someone makes it deliberately.
+ *
+ * The scope is pinned by tests on both sides so a later edit cannot widen it by
+ * accident. Note this composes with the publish-press breaker rather than fighting
+ * it: a failed publish now leaves the requirement unmet, which is exactly the
+ * publish-only-unmet state the breaker bounds, so the run reports the truth AND
+ * still stops at three attempts instead of twenty.
+ */
+export function countsTowardRequirement(toolCall: any): boolean {
+  if (!toolCall || typeof toolCall !== 'object') return false;
+  if (typeof toolCall.name !== 'string') return false;
+  // Non-publish tools keep the historical attempted-counts-as-met rule.
+  if (!isPublishName(toolCall.name)) return true;
+  return toolCallSucceeded(toolCall);
+}
+
+/**
+ * The requirement ledger for a set of tool calls: every name that may be counted
+ * against `requiredFunctionCalls`. One shared mapper because runVerifiedChat
+ * builds this ledger in three places (the resumed-run seed, the completion-gate
+ * continuation turn, and the main turn) and they must not drift — three private
+ * copies of a rule is precisely how the bug above survived.
+ */
+export function requirementEvidenceNames(toolCalls: any[]): string[] {
+  if (!Array.isArray(toolCalls)) return [];
+  return toolCalls.filter(countsTowardRequirement).map((call: any) => call.name).filter(Boolean);
 }

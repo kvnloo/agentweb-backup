@@ -1,6 +1,7 @@
 import { instagramService, CarouselItem } from '../instagramService';
 import { ConnectedAccount, MetaInstagramBusinessConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
+import { isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 
 function isInstagramBusiness(config: any): config is MetaInstagramBusinessConfig {
     return config.account_type === 'instagram_business';
@@ -81,7 +82,7 @@ async function withTokenRefresh<T>(
  */
 export class InstagramAdapter implements SocialPlatformAdapter {
 
-    async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+    async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
         const config = account.config;
         if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to post organically.');
@@ -108,9 +109,9 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                     // Single media — route by type
                     const mediaType = detectMediaType(mediaUrls[0]);
                     if (mediaType === 'VIDEO') {
-                        result = await instagramService.createInstagramReelPost(igUserId, activeToken, mediaUrls[0], content);
+                        result = await instagramService.createInstagramReelPost(igUserId, activeToken, mediaUrls[0], content, assertStillAuthorized);
                     } else {
-                        result = await instagramService.createInstagramPost(igUserId, activeToken, mediaUrls[0], content);
+                        result = await instagramService.createInstagramPost(igUserId, activeToken, mediaUrls[0], content, assertStillAuthorized);
                     }
                 } else {
                     // 2-10 items — carousel
@@ -118,7 +119,7 @@ export class InstagramAdapter implements SocialPlatformAdapter {
                         url,
                         mediaType: detectMediaType(url)
                     }));
-                    result = await instagramService.createInstagramCarouselPost(igUserId, activeToken, items, content);
+                    result = await instagramService.createInstagramCarouselPost(igUserId, activeToken, items, content, assertStillAuthorized);
                 }
             }, userId);
 
@@ -150,6 +151,11 @@ export class InstagramAdapter implements SocialPlatformAdapter {
 
             return postResult;
         } catch (error: any) {
+            // ENG-827: choosing not to publish is an outcome, not an Instagram outage.
+            // Reporting it as one would send the run down the retry path.
+            if (isPublishConsentWithdrawn(error)) {
+                return { success: false, message: error.message };
+            }
             throw new Error(`Failed to post on Instagram: ${error.message || 'Unknown error'}`);
         }
     }

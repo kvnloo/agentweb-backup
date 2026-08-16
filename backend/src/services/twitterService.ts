@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from 'async_hooks';
 import { TwitterApi } from 'twitter-api-v2';
+import { PublishConsentWithdrawn, isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
+import type { AssertStillAuthorized } from './adapters/socialPlatformTypes';
 import { getTwitterCredentials } from '../utils/secretsManager';
 import {
   getAccountsByUserId,
@@ -368,11 +370,23 @@ export class TwitterService {
     ownerUserId: string,
     accountId: string,
     fn: (client: TwitterApi) => Promise<T>,
-    meter: TwitterMeterSpec
+    meter: TwitterMeterSpec,
+    assertStillAuthorized?: AssertStillAuthorized
   ): Promise<T> {
     const client = await this.getClient(ownerUserId, accountId, meter.requiredScope);
     const isXAuthError = (e: unknown): boolean =>
       typeof e === 'object' && e !== null && (e as any).code === 401;
+
+    // ENG-827: every X write — post, reply, quote, retweet, each tweet of a thread —
+    // funnels through here, and `getClient` above resolves the account and may refresh
+    // an expired token first. Checking at this one chokepoint puts the re-check
+    // immediately before the write for ALL of them, rather than in six call sites that
+    // would each have to remember. Reads pass no hook and pay nothing.
+    const stopBeforeWrite = await assertStillAuthorized?.();
+    if (stopBeforeWrite) {
+      this.log(`ENG-827: abandoning ${meter.operation} — publish consent was withdrawn before the write.`);
+      throw new PublishConsentWithdrawn(stopBeforeWrite.error);
+    }
 
     try {
       const result = await fn(client);
@@ -400,6 +414,14 @@ export class TwitterService {
         throw new Error(
           'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
         );
+      }
+
+      // The refresh above is another network round-trip, so the retry re-checks too —
+      // otherwise a 401 would be the one path that widens the window it was meant to close.
+      const stopBeforeRetry = await assertStillAuthorized?.();
+      if (stopBeforeRetry) {
+        this.log(`ENG-827: abandoning ${meter.operation} retry — publish consent was withdrawn during the token refresh.`);
+        throw new PublishConsentWithdrawn(stopBeforeRetry.error);
       }
 
       try {
@@ -562,7 +584,8 @@ export class TwitterService {
     ownerUserId: string,
     accountId: string,
     text: string,
-    opts?: { inReplyToTweetId?: string }
+    opts?: { inReplyToTweetId?: string },
+    assertStillAuthorized?: AssertStillAuthorized
   ): Promise<TweetResult> {
     if (!text || text.trim() === '') {
       throw new Error('Tweet text cannot be empty');
@@ -575,7 +598,8 @@ export class TwitterService {
         opts?.inReplyToTweetId
           ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
           : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
-      { operation: opts?.inReplyToTweetId ? 'reply' : 'post', requiredScope: 'tweet.write', text: finalText }
+      { operation: opts?.inReplyToTweetId ? 'reply' : 'post', requiredScope: 'tweet.write', text: finalText },
+      assertStillAuthorized
     );
   }
 
@@ -590,19 +614,63 @@ export class TwitterService {
    * previous whole-thread call, wrapped in a single withRetryOn401, would re-run
    * the entire chain on a mid-thread 401 and duplicate the already-posted tweets.
    */
-  async postThread(ownerUserId: string, accountId: string, texts: string[]): Promise<TweetResult[]> {
+  /**
+   * @param assertStillAuthorized ENG-827 (Greptile, security): a thread is N SEPARATE
+   * public writes, not one. The caller's consent check covers the first tweet only, so
+   * an owner revoking after tweet 1 would still have tweets 2..N go out under a
+   * decision they had already withdrawn — and a long thread takes a while. Re-checked
+   * before every subsequent tweet.
+   *
+   * On withdrawal the loop STOPS and returns what was already posted. Those tweets are
+   * public and cannot be un-made; returning them is what lets the caller report the
+   * truncation honestly instead of claiming a thread that is not there.
+   */
+  async postThread(
+    ownerUserId: string,
+    accountId: string,
+    texts: string[],
+    assertStillAuthorized?: () => Promise<{ success: false; error: string } | null>
+  ): Promise<TweetResult[]> {
     if (!Array.isArray(texts) || texts.length === 0) {
       throw new Error('Thread must contain at least one tweet');
     }
     const results: TweetResult[] = [];
     let inReplyToTweetId: string | undefined;
     for (const text of texts) {
-      const result = await this.postTweet(
-        ownerUserId,
-        accountId,
-        text,
-        inReplyToTweetId ? { inReplyToTweetId } : undefined
-      );
+      if (results.length > 0 && assertStillAuthorized) {
+        const withdrawn = await assertStillAuthorized();
+        if (withdrawn) {
+          console.warn(
+            `[TwitterService] ENG-827: stopping thread after ${results.length} of ${texts.length} ` +
+            'tweets — publish consent was withdrawn mid-thread.'
+          );
+          break;
+        }
+      }
+      // The hook goes down as well, so the check also covers the account resolution
+      // and any token refresh inside this call — including for the FIRST tweet, which
+      // the loop guard above deliberately skips. A withdrawal caught down there
+      // arrives as a throw, and the thread must still report what it already posted,
+      // so it is converted back into the same clean stop.
+      let result: TweetResult;
+      try {
+        result = await this.postTweet(
+          ownerUserId,
+          accountId,
+          text,
+          inReplyToTweetId ? { inReplyToTweetId } : undefined,
+          assertStillAuthorized
+        );
+      } catch (err) {
+        if (isPublishConsentWithdrawn(err)) {
+          console.warn(
+            `[TwitterService] ENG-827: stopping thread after ${results.length} of ${texts.length} ` +
+            'tweets — publish consent was withdrawn before the next write.'
+          );
+          break;
+        }
+        throw err;
+      }
       results.push(result);
       inReplyToTweetId = result.id;
     }
@@ -799,13 +867,13 @@ export class TwitterService {
   // ─── Retweet / unretweet ─────────────────────────────────────────────────────
 
   /** Retweet a tweet. */
-  async retweetTweet(ownerUserId: string, accountId: string, tweetId: string): Promise<any> {
+  async retweetTweet(ownerUserId: string, accountId: string, tweetId: string, assertStillAuthorized?: AssertStillAuthorized): Promise<any> {
     if (!tweetId || tweetId.trim() === '') throw new Error('tweet_id is required for retweet');
     const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.retweet(myId, tweetId.trim());
       return res?.data ?? res;
-    }, { operation: 'retweet', requiredScope: 'tweet.write' });
+    }, { operation: 'retweet', requiredScope: 'tweet.write' }, assertStillAuthorized);
   }
 
   /** Undo a retweet. */
@@ -960,14 +1028,14 @@ export class TwitterService {
   // ─── Quote tweet ─────────────────────────────────────────────────────────────
 
   /** Post a quote tweet — retweet with added commentary. Trimmed to 280 chars. */
-  async quoteTweet(ownerUserId: string, accountId: string, text: string, quotedTweetId: string): Promise<TweetResult> {
+  async quoteTweet(ownerUserId: string, accountId: string, text: string, quotedTweetId: string, assertStillAuthorized?: AssertStillAuthorized): Promise<TweetResult> {
     if (!text || text.trim() === '') throw new Error('text is required for quote-tweet');
     if (!quotedTweetId || quotedTweetId.trim() === '') throw new Error('quoted_tweet_id is required for quote-tweet');
     const finalText = this.trimToLimit(text.trim(), TWEET_CHAR_LIMIT);
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
       return { id: res.data.id, text: res.data.text };
-    }, { operation: 'quote', requiredScope: 'tweet.write', text: finalText });
+    }, { operation: 'quote', requiredScope: 'tweet.write', text: finalText }, assertStillAuthorized);
   }
 
   // ─── Engagement lookup ────────────────────────────────────────────────────────

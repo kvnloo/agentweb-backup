@@ -122,23 +122,25 @@ describe('YouSearchProvider', () => {
         post: jest.fn().mockResolvedValue({
           data: {
             results: {
-              web: [{ title: 'Web', url: 'https://example.com/web', description: 'web' }],
-              news: [{ title: 'News', url: 'https://example.com/news', description: 'news' }],
+              web: [{ title: 'Acme rocket skates', url: 'https://example.com/web', description: 'web' }],
+              news: [{ title: 'Acme launches new rocket skates', url: 'https://example.com/news', description: 'news' }],
             },
-            metadata: { query: 'current topic' },
+            metadata: { query: 'acme rocket skates' },
           },
         }),
       } as any,
     });
 
-    const webOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'web' });
-    const newsOnly = await provider.search({ query: 'current topic', count: 5, resultSource: 'news' });
+    const webOnly = await provider.search({ query: 'acme rocket skates', count: 5, resultSource: 'web' });
+    // ENG-1050: a news search leads with on-topic news and then supplements from
+    // the (same freshness window, query-ranked) web bucket rather than dropping it.
+    const newsFirst = await provider.search({ query: 'acme rocket skates', count: 5, resultSource: 'news' });
 
     expect(webOnly.provider).toBe('you');
     expect(webOnly.results.map((result) => result.sourceType)).toEqual(['web']);
     expect(webOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'web' }));
-    expect(newsOnly.provider).toBe('you');
-    expect(newsOnly.results.map((result) => result.sourceType)).toEqual(['news']);
-    expect(newsOnly.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'news' }));
+    expect(newsFirst.provider).toBe('you');
+    expect(newsFirst.results.map((result) => result.sourceType)).toEqual(['news', 'web']);
+    expect(newsFirst.metadata).toEqual(expect.objectContaining({ provider: 'you', resultSource: 'news' }));
   });
 });

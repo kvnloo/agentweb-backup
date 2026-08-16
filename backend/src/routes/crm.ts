@@ -1365,7 +1365,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, linkedInAccountId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, linkedInAccountId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, conversionMapping, listType } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1394,6 +1394,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       icpsOnly?: boolean;
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: 'sales' | 'customers';
     } = {};
     if (name !== undefined) {
@@ -1529,6 +1530,42 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         }
       }
       updates.statusConfig = statusConfig;
+    }
+
+    // ENG-926 §F — which status means "qualified" for the Meta conversion relay.
+    // Three accepted shapes, and the difference between them is the whole point:
+    //   null                          → clear the override; relay matches by name again
+    //   { qualifiedStatus: null }     → QualifiedLead off for this list
+    //   { qualifiedStatus: 'sql' }    → that status, and only that one, is qualified
+    if (conversionMapping !== undefined) {
+      if (conversionMapping !== null) {
+        if (typeof conversionMapping !== 'object' || Array.isArray(conversionMapping)) {
+          return res.status(400).json({ message: 'conversionMapping must be an object or null' });
+        }
+        const qualified = (conversionMapping as any).qualifiedStatus;
+        if (qualified !== undefined && qualified !== null && typeof qualified !== 'string') {
+          return res.status(400).json({ message: 'conversionMapping.qualifiedStatus must be a string or null' });
+        }
+        if (typeof qualified === 'string' && qualified.trim()) {
+          // Reject a status this list does not have, rather than accepting a mapping that
+          // silently matches nothing. A relay that quietly stops emitting is the failure
+          // this whole card is about.
+          const known = Array.isArray(updates.statusConfig) ? updates.statusConfig : list.statusConfig;
+          const normalize = (v: any) =>
+            typeof v === 'string' ? v.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
+          const target = normalize(qualified);
+          const exists =
+            !Array.isArray(known) ||
+            known.length === 0 ||
+            known.some((e: any) => normalize(e?.value) === target || normalize(e?.label) === target);
+          if (!exists) {
+            return res.status(400).json({
+              message: `conversionMapping.qualifiedStatus "${qualified}" is not a status on this list`,
+            });
+          }
+        }
+      }
+      updates.conversionMapping = conversionMapping;
     }
 
     if (listType !== undefined) {
@@ -2981,17 +3018,26 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     }
 
     const csvAnonymizedSkipped = results.anonymizedSkipped || 0;
+    // ENG-1133: a row already in the list, unchanged, increments neither
+    // successCount nor mergedCount. Re-uploading a file that is already
+    // imported therefore reported "Imported 0 leads" — the CSV wizard's version
+    // of the "No leads were processed" this ticket fixed for Emma. It is a
+    // completed row and has to be named as one.
+    const csvAlreadyPresent = results.alreadyPresentCount || 0;
     res.json({
       success: true,
       successCount: results.successCount,
       mergedCount: results.mergedCount,
+      alreadyPresentCount: csvAlreadyPresent,
       errorCount: results.errorCount,
       // ENG-1002: placeholder rows are refused before the write, so say so —
       // otherwise the row count the user uploaded silently exceeds every
       // number reported back.
       anonymizedSkipped: csvAnonymizedSkipped,
       errors: results.errors,
-      message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`
+      message: `Imported ${results.successCount} leads`
+        + (csvAlreadyPresent > 0 ? `, ${csvAlreadyPresent} already present and up to date` : '')
+        + (results.errorCount > 0 ? `, ${results.errorCount} errors` : '')
         + (csvAnonymizedSkipped > 0 ? `, ${csvAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
     });
   } catch (error: any) {
@@ -6847,6 +6893,45 @@ router.get('/debug/enrichment-raw-cache', async (req: Request, res: Response) =>
       return res.json({ tableName, region, created: false, message: 'Table already exists (race condition)' });
     }
     return res.status(500).json({ createError: createErr.code, message: createErr.message });
+  }
+});
+
+/**
+ * ENG-926 §F / AC5 — click-ID coverage, per customer and per lead list.
+ *
+ * The acceptance criterion is that this percentage is "queryable per account and trending,
+ * not discovered during a post-mortem". RankAI's was zero of four leads for weeks; the
+ * number existed the whole time and nobody could ask for it.
+ *
+ * Scoped to the caller's own lists. Admins reach a customer's number through delegation,
+ * which already rewrites `req.user` to the target — so no separate admin route is needed
+ * and no cross-tenant read exists here.
+ */
+router.get('/attribution/click-id-coverage', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const rawDays = req.query.days;
+    // Matched strictly rather than parsed leniently: `parseInt('7.5.1')` is 7, so a
+    // lenient parse silently answers a question the caller did not ask.
+    const isWellFormed = rawDays === undefined || /^\d+$/.test(String(rawDays));
+    const days = rawDays === undefined ? 30 : Number(rawDays);
+    // Bounded on purpose: this walks every lead in every list of the caller's, so an
+    // unbounded window is a request to page through the customer's entire CRM.
+    if (!isWellFormed || !Number.isFinite(days) || days < 1 || days > 365) {
+      return res.status(400).json({ message: 'days must be an integer between 1 and 365' });
+    }
+
+    const { computeClickIdCoverageForUser } = await import('../services/metaAttributionCoverage');
+    const coverage = await computeClickIdCoverageForUser(userId, days);
+    return res.json(coverage);
+  } catch (error: any) {
+    console.error('[CRM] click-id coverage failed:', error?.message);
+    return res.status(500).json({ message: 'Failed to compute click ID coverage' });
   }
 });
 
