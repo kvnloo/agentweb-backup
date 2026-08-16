@@ -8,7 +8,7 @@
 //
 // These cover the pure parts: what a handoff must contain to be accepted, and what the agent is told.
 // Run: node test/handoff.test.mjs
-import { validateHandoff, handoffDoc, handoffPrompt, MIN_CONTEXT_CHARS } from '../chat/handoff.mjs';
+import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, MIN_CONTEXT_CHARS } from '../chat/handoff.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -109,6 +109,27 @@ console.log('\n— what the agent is told —');
   ok(/git add -A/.test(p) && /do NOT use/i.test(p), 'names the exact command that would sweep it in, and forbids it');
   ok(/stage the exact paths/i.test(p), 'tells it what to do INSTEAD — stage explicit paths');
   ok(/unstage/i.test(p), 'gives it a recovery step if the file ever does get staged');
+}
+
+console.log('\n— a handoff chat is the developer\'s to delete, never its own —');
+{
+  // A normal standalone chat is told it may self-close with [[CLOSE_CHAT]], which deletes the worktree
+  // AND `git branch -D`s the branch. On a handoff that branch is the developer's real feature branch,
+  // and the chat is the record of how the merge went — so the affordance must not exist here at all.
+  const plain = workspaceLines({ branch: 'chat-7' }, '/wt/CHAT-7');
+  ok(/\[\[CLOSE_CHAT\]\]/.test(plain.closeLine), 'a normal standalone chat keeps its self-close');
+  ok(/fresh branch off main/i.test(plain.branchDesc), 'and is correctly described as a fresh branch');
+
+  const ho = workspaceLines({ branch: 'rui/feature', handoff: { at: 'x', by: 'y' } }, '/wt/CHAT-8');
+  ok(!/\[\[CLOSE_CHAT\]\]/.test(ho.closeLine), 'a handoff chat is never offered the self-close marker');
+  ok(/do not close|never/i.test(ho.closeLine), 'it is told explicitly not to close or delete');
+  ok(/developer|UI/i.test(ho.closeLine), 'and told who does delete it, and where');
+  ok(/merged/i.test(ho.closeLine), 'including that finishing the merge is NOT a reason to close');
+
+  // The stock wording would tell a handoff agent its branch is "a fresh branch off main". It is the
+  // opposite: the developer's branch, already carrying their work and an open PR.
+  ok(!/fresh branch off main/i.test(ho.branchDesc), 'a handoff branch is NOT described as fresh off main');
+  ok(/developer/i.test(ho.branchDesc) && /rui\/feature/.test(ho.branchDesc), 'it is described as the developer\'s own branch');
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${fail ? 'FAILURES' : 'ALL PASSED'} — ${pass} passed, ${fail} failed`);
