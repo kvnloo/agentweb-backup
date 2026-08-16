@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile, useAssigneeLinearKey } from './linear.mjs';
 import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
@@ -59,6 +60,18 @@ const logsDir = path.join(__dirname, 'logs');
 let stageLogDir = null;
 const stages = {};
 export function setStageLogDir(id) { stageLogDir = path.join(logsDir, id); mkdirSync(stageLogDir, { recursive: true }); }
+
+// Working directory for the fixability gate. triage-prompt.md tells that pass to judge ONLY from the
+// issue text — "Do not open files, run commands, or browse" — so it needs no repo context at all, yet
+// it used to run from the repo root and pay 59,066 tokens on its single turn (99% of it preamble it
+// never reads). Claude Code collects CLAUDE.md by walking UP from cwd, so a subdirectory of the
+// checkout would still inherit the 39KB project file; the gate has to sit outside the tree entirely.
+// A bare dir costs ~33k instead, and the gate's verdict is unchanged because its input is the prompt.
+export function triageCwd() {
+  const d = path.join(tmpdir(), 'autofix-triage');
+  mkdirSync(d, { recursive: true });
+  return d;
+}
 
 function loadState() { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } }
 function saveState(s) { writeFileSync(statePath, JSON.stringify(s, null, 2)); }
@@ -137,7 +150,17 @@ export function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skip
   // every fix is attributed SOLELY to the issue's assignee. This setting is the deterministic control
   // (the prompt files also forbid it, but this removes it at the source regardless of the model).
   a.push('--settings', '{"includeCoAuthoredBy":false}');
-  if (mcp) a.push('--mcp-config', mcp, '--strict-mcp-config');
+  // MCP isolation on EVERY stage, not just the ones that pass a config. `--strict-mcp-config` means
+  // "load only the servers named by --mcp-config", so with none supplied a stage loads none at all.
+  // Without it, every stage inherited the repo's .mcp.json (playwright + notion + okareo) and paid
+  // 2,368 tokens of tool schema on every API call — ~0.29M per bug across ~122 non-verify calls.
+  // Measured 2026-08-16: across every bug the pipeline has ever run, the non-verify stages made ZERO
+  // MCP tool calls, so this removes cost without removing a capability any stage was using. Browser
+  // verify is unaffected — it passes its own Playwright-only config below and keeps it. The chat
+  // server builds its args separately (chatArgs in chat/server.mjs) and still has its MCP servers,
+  // which it does use (Notion).
+  a.push('--strict-mcp-config');
+  if (mcp) a.push('--mcp-config', mcp);
   if (skipPermissions) a.push('--dangerously-skip-permissions');
   else a.push('--permission-mode', 'acceptEdits');
   return a;
@@ -345,7 +368,7 @@ async function main() {
     });
     log(`Fixability gate (model=${g.model})...`);
     const tr = extractJson(
-      await runClaude(claudeArgs({ model: g.model, maxTurns: g.maxTurns }), tp, agentRoot, g.timeoutMs, 'fixability'),
+      await runClaude(claudeArgs({ model: g.model, maxTurns: g.maxTurns }), tp, triageCwd(), g.timeoutMs, 'fixability'),
       'TRIAGE_RESULT', { fixable: true },
     );
     if (tr.fixable === false) {
