@@ -27,6 +27,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import { shouldRunPreCheckGate, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -3386,7 +3387,11 @@ export async function runScheduledChat(
   scheduleId: string;
   runId: string;
   // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
-  status: 'success' | 'failure' | 'pending_user_input';
+  // ENG-1259: 'skipped_no_content' when the cheap pre-check gate exited BEFORE
+  // invoking the primary generation model — distinct from 'failure' (which means
+  // the full flow ran and did not meet its requirements) so cost/waste analysis
+  // can tell the two apart without re-deriving it from message counts.
+  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -3973,6 +3978,67 @@ export async function runScheduledChat(
       // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
       resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
       console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
+    }
+
+    // ENG-1259: cheap pre-check gate. Runs BEFORE the session is even created —
+    // mirroring the subscription-entitlement and token-usage checks above, which
+    // already exit early with `sessionId: ''` when the run should not proceed.
+    // Placed strictly AFTER the resume decision so it can never be applied to a
+    // resumed run (that run already has real work in flight — never second-guess
+    // it) and is skipped entirely for interactive test runs (a human is waiting
+    // on that result; never silently no-op it).
+    //
+    // `shouldRunPreCheckGate` is a free, deterministic trigger: it only even
+    // considers spending a cheap classification call when the schedule's
+    // immediately preceding run had no actionable output — the exact repeat-
+    // waste pattern PMPS's LUCAS schedule showed in the evidence (four full-cost
+    // runs in a row that each concluded there was nothing to publish). A healthy
+    // schedule (last run produced real output, or this is its first-ever run)
+    // pays nothing extra and proceeds exactly as today.
+    if (!isTest && !isResumeRun && shouldRunPreCheckGate(schedule.runResults)) {
+      const priorRunResults: any[] = Array.isArray(schedule.runResults) ? schedule.runResults : [];
+      const lastRun = priorRunResults.length > 0 ? priorRunResults[priorRunResults.length - 1] : null;
+      let llmResult: ScheduledRunPreCheckLLMResult | null = null;
+      try {
+        llmResult = await agentModeService.evaluateScheduledRunPreCheck({
+          scheduleName: schedule.scheduleName,
+          startingMessage: schedule.startingMessage || '',
+          lastRunStatus: lastRun?.status ?? null,
+          lastRunSummary: (lastRun?.summary || lastRun?.actualResponse || null) as string | null,
+          consecutiveNoOutputRuns: countTrailingNoActionableOutputRuns(priorRunResults),
+        });
+      } catch (preCheckError) {
+        // evaluateScheduledRunPreCheck is itself fail-open (never throws), but an
+        // unexpected throw here must still fail TOWARD running, not abort the run.
+        console.error(`runScheduledChat: pre-check gate threw for schedule ${schedule.scheduleId}; failing open (proceed):`, preCheckError);
+        llmResult = null;
+      }
+      const gateOutcome = resolvePreCheckDecision(llmResult);
+      if (gateOutcome.decision === 'skip') {
+        console.log(`runScheduledChat: pre-check gate SKIPPED schedule ${schedule.scheduleId} (${schedule.scheduleName}) before invoking the primary generation model — ${gateOutcome.reason}`);
+        const skipResult = {
+          scheduleId: schedule.scheduleId,
+          runId: preGeneratedRunId || require('uuid').v4(),
+          status: 'skipped_no_content' as const,
+          passed: false,
+          actualResponse: `Skipped before running the full flow: ${gateOutcome.reason}`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: schedule.keywords || [],
+          functionCallMatches: [],
+          functionCallMisses: schedule.requiredFunctionCalls || [],
+          executionTime: Date.now() - now.getTime(),
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString(),
+        };
+        try {
+          await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
+        } catch (saveError) {
+          console.error(`Error saving pre-check skip result for schedule ${schedule.scheduleId}:`, saveError);
+        }
+        return skipResult;
+      }
     }
 
     // Create a session for the run (skipped when resuming an existing one).
