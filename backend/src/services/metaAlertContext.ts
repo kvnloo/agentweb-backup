@@ -106,6 +106,10 @@ export async function buildAlertContext(
   adAccountId: string,
   days: Array<{ date: string; spend: number; conversions: number }>,
   deps: AlertContextDeps,
+  /** Objectives whose spend this account also carries but which were excluded from the
+   *  judgement. Named in the ticket so a reader is not surprised that the spend figure
+   *  here is smaller than the one in Ads Manager. */
+  excludedObjectives?: string[],
 ): Promise<Record<string, any>> {
   const context: Record<string, any> = {
     'Ad Account': adAccountId,
@@ -127,6 +131,13 @@ export async function buildAlertContext(
       .filter((d) => Number(d?.spend) > 0)
       .map((d) => `${d.date}: ${Number(d.spend).toFixed(2)} spend, ${d.conversions} conversions`)
       .join('\n');
+  }
+
+  if (excludedObjectives && excludedObjectives.length > 0) {
+    context['Spend Excluded From Judgement'] =
+      `This account also spends on ${excludedObjectives.join(', ')}, which do not optimise ` +
+      'for conversions. That spend is deliberately NOT counted here, so the figure above is ' +
+      'lower than Ads Manager\'s total for the account.';
   }
 
   // ── Why: the single most diagnostic number ──
@@ -292,6 +303,7 @@ export async function buildAlertContextForAccount(
   adAccountId: string,
   accessToken: string,
   days: Array<{ date: string; spend: number; conversions: number }>,
+  excludedObjectives?: string[],
 ): Promise<Record<string, any>> {
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   const graph = async (path: string, params: Record<string, string>) => {
@@ -328,5 +340,5 @@ export async function buildAlertContextForAccount(
       }
       return folded;
     },
-  });
+  }, excludedObjectives);
 }
