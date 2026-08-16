@@ -100,6 +100,23 @@ case "$1 $2" in
     exit "$(cat "${MOCK_DIR}/comment_exit")"
     ;;
   "pr view")
+    # If a sha-sequence fixture exists, each successive call advances one
+    # line (sticking on the last line once exhausted) — this is how a test
+    # simulates the head changing mid-script (a push landing between the
+    # script's first and second `gh pr view` call).
+    if [ -f "${MOCK_DIR}/pull_sha_sequence.txt" ]; then
+      n=$(( $(cat "${MOCK_DIR}/pull_view_count" 2>/dev/null || echo 0) + 1 ))
+      echo "${n}" >"${MOCK_DIR}/pull_view_count"
+      total=$(wc -l <"${MOCK_DIR}/pull_sha_sequence.txt" | tr -d '[:space:]')
+      idx=$(( n < total ? n : total ))
+      sha="$(sed -n "${idx}p" "${MOCK_DIR}/pull_sha_sequence.txt")"
+      if [ -n "${jq_filter}" ]; then
+        printf '{"headRefOid": "%s"}' "${sha}" | jq -r "${jq_filter}"
+      else
+        printf '{"headRefOid": "%s"}' "${sha}"
+      fi
+      exit 0
+    fi
     if [ -n "${jq_filter}" ]; then
       jq -r "${jq_filter}" "${MOCK_DIR}/pull.json"
     else
@@ -339,6 +356,31 @@ if grep -qF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null; then
 else
   printf 'PASS: %s\n' '--rerun-only does not re-request when the answer is merely pending'
 fi
+
+# Caught live by Greptile (4/5) a THIRD time on this same PR (portal#1035):
+# head_sha is resolved once and reused unchecked to pick which run's gate
+# job to rerun. If the PR head changes between the initial resolve (used to
+# post the request) and the rerun call, the request may not cover whatever
+# gets rerun. Simulate that with a two-value SHA sequence: the first `pr
+# view` (before posting) sees SHA A, the second (right before the rerun)
+# sees SHA B. Must fail loudly and must NOT touch the jobs API at all —
+# rerunning for either SHA would be a guess.
+new_mock
+printf '%s\n%s\n' "${HEAD_SHA}" 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+  >"${MOCK_DIR}/pull_sha_sequence.txt"
+run_script
+check 'a head change mid-script fails loudly, not a guessed rerun' 1 \
+  'the PR head changed'
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  a mid-script head change must not reach the rerun API\n  calls.log:\n%s\n' \
+    'no rerun attempted after a mid-script head change' "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' 'no rerun attempted after a mid-script head change'
+fi
+check_call_logged 'the review request was still posted before the mismatch was caught' \
+  '@greptileai'
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"

@@ -214,6 +214,21 @@ main() {
     fi
     log "--rerun-only: confirmed a request is outstanding for head ${head_sha}; skipping a duplicate review request, retrying only the gate-job rerun."
   fi
+
+  # CAUGHT LIVE (Greptile 4/5, portal#1035): head_sha was resolved once, used
+  # to post the request, then reused unchecked to pick which workflow run's
+  # gate job to rerun. A push landing in that window means the two diverge —
+  # the posted request may cover different content than the run being
+  # rerun — and the rerun then waits on a review that will never match. Close
+  # the window as tightly as this API allows: re-resolve immediately before
+  # the rerun and refuse to proceed on a mismatch, rather than rerun a gate
+  # for a head the request may not actually cover.
+  local head_sha_before_rerun
+  head_sha_before_rerun="$(resolve_head_sha)"
+  if [ "${head_sha_before_rerun}" != "${head_sha}" ]; then
+    fail "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running — the review just requested may not cover the current head. Re-run the script fresh (without --rerun-only) against the new head rather than rerunning the gate for a request that may be stale."
+  fi
+
   rerun_gate_job "${head_sha}"
 }
 
