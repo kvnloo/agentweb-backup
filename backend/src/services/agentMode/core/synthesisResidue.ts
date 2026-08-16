@@ -70,9 +70,14 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-/** True when `trimmed` is mostly our own injected nudge text, echoed back. */
+/**
+ * True when `trimmed` is mostly our own injected nudge text, echoed back. An exact
+ * match — the entire turn is one bare copy of the nudge — is non-empty, so it never
+ * re-triggers the empty-synthesis retry ladder in termination.ts, and it ships as a
+ * real final answer unless caught here alongside the 2+-repeat case.
+ */
 function isNudgeEcho(trimmed: string): boolean {
-  return countOccurrences(trimmed, SYNTHESIS_NUDGE) >= 2;
+  return trimmed === SYNTHESIS_NUDGE || countOccurrences(trimmed, SYNTHESIS_NUDGE) >= 2;
 }
 
 /**
