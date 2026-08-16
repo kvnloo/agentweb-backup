@@ -256,12 +256,30 @@ router.post(
       await Promise.all(
         [...charges.values()].map(({ userId, model, feature, tokens, cost, recordFingerprints }) => {
           // A charge entry only exists once at least one record contributed a
-          // fingerprint, so the fallback branch always has content to hash.
+          // fingerprint, so both branches below always have content to hash.
           // Includes model/feature: one engine flush (one reportId) can carry
           // several (model, feature) charge entries, so reportId alone is not
           // unique per entry.
+          //
+          // Greptile P1 (security): reportId is caller-controlled and
+          // otherwise unvalidated -- an authenticated caller resubmitting a
+          // DIFFERENT batch under a reused reportId (engine bug or actual
+          // misuse) would collapse into the same eventId as a prior batch
+          // and get silently suppressed, undercharging real usage with no
+          // signal that anything was dropped. Folding the content
+          // fingerprint into the eventId even when reportId is present
+          // closes that: a genuine retry resends identical content under
+          // the same reportId (same fingerprint, same eventId, still
+          // dedupes exactly as intended), while a reused reportId carrying
+          // different content now produces a different eventId and is
+          // charged in full -- fail toward charging, never toward a silent
+          // drop.
+          const contentFingerprint = createHash("sha256")
+            .update([...recordFingerprints].sort().join("\u0001"))
+            .digest("hex")
+            .slice(0, 32);
           const eventId = reportId
-            ? `engine:${userId}:${model}:${feature}:${reportId}`
+            ? `engine:${userId}:${model}:${feature}:${reportId}:${contentFingerprint}`
             : `engine:${userId}:${model}:${feature}:${createHash("sha256")
                 .update([...recordFingerprints].sort().join("\u0001"))
                 .update(`bucket:${timeBucket}`)

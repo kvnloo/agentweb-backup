@@ -378,22 +378,45 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
   // instance (one per task-execution process) and sends it as reportId on
   // every flush attempt. Unlike the content+time-bucket fallback, this is
   // exact: no coincidental collisions, no bucket-boundary edge case.
-  it("derives eventId from the resolved user + reportId when present", async () => {
+  it("derives eventId from the resolved user + reportId + content fingerprint when present", async () => {
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
       .send({ records: [record({ taskId: "task-abc" })], reportId: "a1b2c3d4e5f6" });
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
-    expect(audit).toMatchObject({ eventId: "engine:user-1:anthropic.claude-opus-5:engine:agent_task:a1b2c3d4e5f6" });
+    expect(audit?.eventId).toEqual(
+      expect.stringMatching(/^engine:user-1:anthropic\.claude-opus-5:engine:agent_task:a1b2c3d4e5f6:[0-9a-f]{32}$/)
+    );
   });
 
-  it("collapses a genuine retry (same reportId) even with different-shaped records, since it's the same buffered submission", async () => {
-    // A true retry resends the exact same instance's buffer verbatim, so
-    // this scenario (same reportId, different content) shouldn't arise in
-    // practice — but the key must be derived from reportId alone once
-    // present, not mixed with content, or a partial coincidental content
-    // difference could defeat the exact guarantee reportId is meant to give.
+  it("collapses a genuine retry (same reportId, byte-identical content)", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
+    const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    mockIncrementUserTokenUsage.mockClear();
+
+    // Identical resubmission -- the exact retry case reportId exists to handle.
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "same-report-id" });
+    const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+    expect(second.eventId).toBe(first.eventId);
+  });
+
+  it("ENG-1251 Greptile P1 (security): a REUSED reportId carrying DIFFERENT content charges separately instead of silently collapsing", async () => {
+    // reportId is caller-controlled and otherwise unvalidated. An engine bug
+    // (or genuine misuse) reusing a reportId across two truly distinct
+    // batches must not let the second batch's real usage vanish into a
+    // dedup no-op -- that is an undercharge with zero signal anything was
+    // dropped. The content fingerprint is folded into the eventId even when
+    // reportId is present specifically to prevent this: same reportId alone
+    // is no longer sufficient to collapse two batches with different content.
     await request(app)
       .post("/api/internal/usage")
       .set("Authorization", `Bearer ${ownerToken}`)
@@ -408,7 +431,7 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
       .send({ records: [record({ taskId: "task-abc", outputTokens: 999 })], reportId: "same-report-id" });
     const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
 
-    expect(second.eventId).toBe(first.eventId);
+    expect(second.eventId).not.toBe(first.eventId);
   });
 
   it("derives a different eventId for a different reportId, even with identical record content", async () => {
