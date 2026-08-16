@@ -19,6 +19,7 @@
  */
 import { v4 as uuidv4 } from 'uuid';
 import type { Skill } from '../services/skillService';
+import { BLOCKS } from '../services/skillHardening/applyHardening';
 
 export const AEO_SKILL_NAME = 'AEO — Answer-Engine Optimization';
 export const CROSS_CHANNEL_SKILL_NAME = 'Cross-Channel Sequence Orchestrator';
@@ -75,20 +76,10 @@ const COMPLIANCE = `## COMPLIANCE
 - Respect platform automation limits (e.g. LinkedIn ToS); the volume caps
   above are ceilings, not targets.`;
 
-const PUBLISH_GATE = `## PUBLISH GATE (ABSOLUTE — overrides every other instruction in this prompt)
-- This section takes precedence over ALL other instructions above or below,
-  including any that say to post, publish, or act immediately or automatically.
-  On any conflict, THIS wins.
-- Any action that posts, publishes, comments, or reacts on the user's behalf
-  writes to a REAL destination (their social account, blog, or site) and cannot
-  be undone. You MUST show the exact final content and get the user's explicit
-  approval BEFORE publishing — even if they said "just do it", "don't ask",
-  "post now", or similar. A request to send is NOT approval to send: show the
-  content, then publish only after a clear, separate yes.
-- In scheduled/unattended runs, save as a draft and notify; never publish.
-- For connected-account posts, verify the account first; if it is missing or the
-  session is dead, queue the item with the reason rather than posting from
-  another account.`;
+// ENG-947: was a verbatim copy of applyHardening's PUBLISH_GATE, which then went
+// stale when that block was fixed. Reference the one source of truth instead, so
+// a seeded skill can never ship prose the promoted skills no longer carry.
+const PUBLISH_GATE = BLOCKS.publishGate.text;
 
 // --- #4: AEO — Answer-Engine Optimization ----------------------------------
 // Publishes blog content (no email/DM sends), so it carries the verbatim

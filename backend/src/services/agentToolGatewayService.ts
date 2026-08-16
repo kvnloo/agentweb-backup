@@ -1201,16 +1201,20 @@ function validateJsonSchemaConstraints(name: string, value: unknown, schema: any
   // Both sides must move together: measuring UTF-16 code units here would reject
   // 1,001 emoji that the declared `maxLength: 2000` plainly accepts, which is a
   // contract stricter than its schema — the exact defect ENG-821 exists to fix.
-  if (
-    typeof value === 'string' &&
-    typeof schema?.maxLength === 'number' &&
-    Array.from(value).length > schema.maxLength
-  ) {
-    issues.push({
-      code: 'invalid_args',
-      path: `$.${name}`,
-      message: `Argument "${name}" must be at most ${schema.maxLength} character(s).`,
-    });
+  if (typeof value === 'string' && typeof schema?.maxLength === 'number') {
+    // ENG-1048: state the received length and the overflow, not just the limit.
+    // Knowing only the ceiling makes the correction guess-and-check — a reported
+    // run walked save_memory content down 2926 → 2306 → 2128 → 1817 against a
+    // 2000 limit, one model turn per guess, and those rejections also crowd real
+    // tool results out of the context window (ENG-940).
+    const received = Array.from(value).length;
+    if (received > schema.maxLength) {
+      issues.push({
+        code: 'invalid_args',
+        path: `$.${name}`,
+        message: `Argument "${name}" must be at most ${schema.maxLength} character(s) — received ${received}; remove at least ${received - schema.maxLength}.`,
+      });
+    }
   }
 
   if (Array.isArray(value)) {

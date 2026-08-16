@@ -1,0 +1,202 @@
+/**
+ * `updateAccountConfig` merge + unset semantics.
+ *
+ * The `unset` option exists because a plain merge can only add or overwrite
+ * (ENG-1158). Fields that record a past observation — `ads_scope_revoked_at` —
+ * had no way to be retracted once the observation stopped being true, which is
+ * what left an owner who re-granted their Meta Ads permission out of band
+ * permanently refused.
+ */
+
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserByIdConsistent: jest.fn(),
+    updateUser: jest.fn(),
+  },
+}));
+
+import { updateAccountConfig } from '../services/connectedAccountsDb';
+import { userDb } from '../services/db';
+
+const metaAccount = () => ({
+  platform: 'meta',
+  account_id: '922903076601160',
+  account_name: 'AgentWeb',
+  config: {
+    account_type: 'ad_account',
+    ad_account_id: '922903076601160',
+    access_token: 'EAA-token',
+    token_expires_at: 1791518072617,
+    granted_scopes: [],
+    ads_scope_revoked_at: '2026-07-31T07:00:21.688Z',
+    ads_scope_alerted_at: '2026-08-13T07:00:00.000Z',
+  },
+  created_at: '2026-02-20T06:18:26.758Z',
+  updated_at: '2026-08-10T03:54:32.885Z',
+});
+
+/** The config the call actually persisted. */
+const persistedConfig = () =>
+  (userDb.updateUser as jest.Mock).mock.calls[0][1].connected_accounts[0].config;
+
+describe('updateAccountConfig', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (userDb.getUserByIdConsistent as jest.Mock).mockResolvedValue({
+      userId: 'user-1',
+      email: 'founders@agentweb.pro',
+      connected_accounts: [metaAccount()],
+    });
+    (userDb.updateUser as jest.Mock).mockResolvedValue(undefined);
+  });
+
+  it('merges updates over the existing config, leaving untouched fields alone', async () => {
+    await updateAccountConfig('user-1', 'meta', '922903076601160', {
+      granted_scopes: ['ads_read'],
+    });
+
+    const config = persistedConfig();
+    expect(config.granted_scopes).toEqual(['ads_read']);
+    expect(config.access_token).toBe('EAA-token');
+    expect(config.account_type).toBe('ad_account');
+  });
+
+  it('removes the keys named in `unset`', async () => {
+    await updateAccountConfig(
+      'user-1',
+      'meta',
+      '922903076601160',
+      { granted_scopes: ['ads_read'] },
+      { unset: ['ads_scope_revoked_at', 'ads_scope_alerted_at'] }
+    );
+
+    const config = persistedConfig();
+    expect('ads_scope_revoked_at' in config).toBe(false);
+    expect('ads_scope_alerted_at' in config).toBe(false);
+    expect(config.granted_scopes).toEqual(['ads_read']);
+  });
+
+  it('removes the key outright rather than storing undefined', async () => {
+    // The distinction is the point: an `ads_scope_revoked_at: undefined` left in
+    // the object makes removal depend on marshalling behaviour instead of on
+    // anything the caller asked for.
+    await updateAccountConfig('user-1', 'meta', '922903076601160', {}, {
+      unset: ['ads_scope_revoked_at'],
+    });
+
+    expect(Object.keys(persistedConfig())).not.toContain('ads_scope_revoked_at');
+  });
+
+  it('is a no-op on `unset` keys that were never there', async () => {
+    await updateAccountConfig('user-1', 'meta', '922903076601160', {}, {
+      unset: ['never_present'],
+    });
+
+    expect(persistedConfig().ads_scope_revoked_at).toBe('2026-07-31T07:00:21.688Z');
+  });
+
+  it('behaves exactly as before when no options are passed', async () => {
+    await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] });
+
+    const config = persistedConfig();
+    expect(config.ads_scope_revoked_at).toBe('2026-07-31T07:00:21.688Z');
+    expect(config.ads_scope_alerted_at).toBe('2026-08-13T07:00:00.000Z');
+  });
+
+  /**
+   * The User model forces a whole-list write, so a plain read-modify-write
+   * discards whatever another writer changed in between — a freshly refreshed
+   * token, or a capability marker from a concurrent sweep (Greptile P1).
+   */
+  describe('concurrent writers', () => {
+    it('conditions the write on the list it actually read', async () => {
+      await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] });
+
+      const [, , options] = (userDb.updateUser as jest.Mock).mock.calls[0];
+      expect(Object.values(options.condition.names)).toContain('connected_accounts');
+      // The guard is the list as read, so any concurrent write fails the check.
+      expect(options.condition.values[':expectedConnectedAccounts']).toEqual([metaAccount()]);
+    });
+
+    it('re-reads and re-applies the merge when the record changed under it', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce(conflict).mockResolvedValueOnce(undefined);
+
+      await updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: ['ads_read'] });
+
+      // Read again rather than reusing the stale snapshot.
+      expect((userDb.getUserByIdConsistent as jest.Mock).mock.calls).toHaveLength(2);
+      expect((userDb.updateUser as jest.Mock).mock.calls).toHaveLength(2);
+      const config = (userDb.updateUser as jest.Mock).mock.calls[1][1].connected_accounts[0].config;
+      expect(config.granted_scopes).toEqual(['ads_read']);
+    });
+
+    it('gives up with a typed error rather than clobbering after repeated conflicts', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValue(conflict);
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', { granted_scopes: [] })
+      ).rejects.toMatchObject({ code: 'ConnectedAccountChanged' });
+    });
+
+    it('propagates a non-conflict failure untouched', async () => {
+      (userDb.updateUser as jest.Mock).mockRejectedValue(new Error('dynamo exploded'));
+
+      await expect(
+        updateAccountConfig('user-1', 'meta', '922903076601160', {})
+      ).rejects.toThrow(/dynamo exploded/);
+    });
+
+    /**
+     * Greptile P1: a fixed `configUpdates` object is fine when the update
+     * doesn't depend on current state, but reapplying it unchanged on a CAS
+     * retry is wrong the moment it does — a stale-derived write could clobber
+     * whatever the winning concurrent writer just landed. The function form
+     * exists so each retry recomputes from what THAT attempt actually read.
+     */
+    it('recomputes a derived update from the state each retry attempt reads, not the first', async () => {
+      const conflict = Object.assign(new Error('conflict'), { code: 'ConditionalCheckFailedException' });
+      (userDb.updateUser as jest.Mock).mockRejectedValueOnce(conflict).mockResolvedValueOnce(undefined);
+
+      // Second read simulates a concurrent recovery landing between attempts:
+      // the ads scope is back, which a stale-derived narrowing must not undo.
+      (userDb.getUserByIdConsistent as jest.Mock)
+        .mockResolvedValueOnce({
+          userId: 'user-1',
+          email: 'founders@agentweb.pro',
+          connected_accounts: [metaAccount()],
+        })
+        .mockResolvedValueOnce({
+          userId: 'user-1',
+          email: 'founders@agentweb.pro',
+          connected_accounts: [
+            {
+              ...metaAccount(),
+              config: { ...metaAccount().config, granted_scopes: ['ads_read'] },
+            },
+          ],
+        });
+
+      await updateAccountConfig('user-1', 'meta', '922903076601160', freshConfig => ({
+        updates: {
+          // Derived from whatever THIS attempt actually read — mirrors the
+          // narrowing logic in metaAdsCapabilitySync.ts.
+          granted_scopes: (freshConfig.granted_scopes as string[]).filter((s: string) => s !== 'ads_read'),
+        },
+      }));
+
+      expect((userDb.getUserByIdConsistent as jest.Mock).mock.calls).toHaveLength(2);
+      const config = (userDb.updateUser as jest.Mock).mock.calls[1][1].connected_accounts[0].config;
+      // The retry saw ['ads_read'] on its own read and correctly narrowed it —
+      // not the first read's [], reapplied blind.
+      expect(config.granted_scopes).toEqual([]);
+    });
+  });
+
+  it('throws when the account is not connected', async () => {
+    await expect(
+      updateAccountConfig('user-1', 'meta', 'not-connected', { granted_scopes: [] })
+    ).rejects.toThrow(/No meta account/);
+  });
+});

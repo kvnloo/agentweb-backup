@@ -23,6 +23,7 @@
  */
 
 import { linkedInOutreachService } from "./linkedInOutreachService";
+import { isAnonymizedSearchItem } from "../utils/anonymizedLinkedInLead";
 
 /**
  * Output shape for a single prospect card. Matches the FE
@@ -354,7 +355,17 @@ export async function searchProspectsPreview(
     ? searchResult!.items
     : [];
 
-  const items = rawItems.slice(0, limit).map(mapUnipileItemToPreview);
+  // ENG-1002: drop LinkedIn's anonymized out-of-network hits BEFORE the slice.
+  // These cards are handed straight to POST /api/onboarding/outreach/save,
+  // which persists them via crmDb.batchCreateLeads — so an unfiltered
+  // placeholder becomes a nameless, un-dedupable CRM lead exactly the way the
+  // agent-mode import used to create them. Filtering ahead of the slice also
+  // means the user gets `limit` real prospects instead of losing card slots to
+  // profiles they cannot see, open or contact.
+  const items = rawItems
+    .filter((item) => !isAnonymizedSearchItem(item))
+    .slice(0, limit)
+    .map(mapUnipileItemToPreview);
 
   return {
     ok: true,

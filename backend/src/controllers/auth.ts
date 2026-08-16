@@ -163,7 +163,16 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist, // from waitlist
       touch // attribution — passes through onUserSignup hook
-    );
+    ).catch(() => undefined);
+
+    // Nothing below this boundary is safe unless createUser persisted the row.
+    if (!newUser) {
+      console.error("Registration persistence failed before post-create side effects");
+      return res.status(503).json({
+        message: "We could not create your account. Please try again.",
+        code: "registration_persistence_failed",
+      });
+    }
 
     // Set Free tier defaults for new registrations (subscription upgrades happen via Stripe checkout)
     const freeTierConfig = await getTierConfig("Free");

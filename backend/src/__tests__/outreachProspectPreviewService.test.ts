@@ -281,6 +281,56 @@ describe("searchProspectsPreview", () => {
     if (r.ok) expect(r.items).toHaveLength(10);
   });
 
+  // ENG-1002: these cards are posted straight back to
+  // POST /api/onboarding/outreach/save, which persists them via
+  // batchCreateLeads — an unfiltered placeholder becomes a nameless,
+  // un-dedupable CRM lead.
+  it("drops LinkedIn's anonymized out-of-network hits from the prospect cards", async () => {
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    linkedInOutreachService.searchPeople.mockResolvedValue({
+      items: [
+        { name: "LinkedIn Member", headline: "Regional Property Manager" },
+        { name: "Amy Foley", public_identifier: "amy-foley" },
+        { name: "Miembro de LinkedIn", headline: "Gerente" },
+      ],
+    });
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Founders",
+      specifications: "B2B SaaS",
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.items).toHaveLength(1);
+      expect(r.items[0].name).toBe("Amy Foley");
+    }
+  });
+
+  // Filtering has to happen BEFORE the slice, or placeholders silently eat
+  // card slots and the user gets fewer real prospects than they asked for.
+  it("still returns a full page of real prospects when the page is padded with placeholders", async () => {
+    linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
+    getAccountsByUserId.mockResolvedValue([]);
+    const items = [
+      ...Array.from({ length: 6 }, () => ({ name: "LinkedIn Member" })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        name: `Person ${i}`,
+        public_identifier: `p${i}`,
+      })),
+    ];
+    linkedInOutreachService.searchPeople.mockResolvedValue({ items });
+    const r = await searchProspectsPreview("user-1", {
+      icp: "Founders",
+      specifications: "B2B SaaS",
+      limit: 5,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.items).toHaveLength(5);
+      expect(r.items.every((p) => p.name !== "LinkedIn Member")).toBe(true);
+    }
+  });
+
   it("respects the limit param when smaller than 10", async () => {
     linkedInOutreachService.resolveAccountId.mockResolvedValue("acct-1");
     getAccountsByUserId.mockResolvedValue([]);

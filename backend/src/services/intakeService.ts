@@ -435,10 +435,12 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       stateName: BUG_CANONICAL_STATE,
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
     });
-    canonicalUuid = li.id || '';
+    // `li` is null outside production (ENG-1099) — nothing was filed, so there is no canonical to
+    // link or comment on. The reporter still gets their own Featurebase ticket below.
+    canonicalUuid = li?.id || '';
     // Capture the canonical link (ENG-289) — createInternalLinearIssue returns it; fall back to
     // building from the identifier if the url is ever absent.
-    canonicalUrl = li.url || (li.identifier ? `${LINEAR_ISSUE_BASE}/${li.identifier}` : '');
+    canonicalUrl = li ? li.url || (li.identifier ? `${LINEAR_ISSUE_BASE}/${li.identifier}` : '') : '';
   }
 
   // 3. Record this reporter on the canonical (best-effort). `[reporter-ticket #N]` is the contract
@@ -563,6 +565,8 @@ export interface FiledAutoResult {
   url?: string;
   deduped: boolean;
   tracker: 'Linear';
+  /** True when a non-production backend suppressed the filing entirely (ENG-1099) — no issue exists. */
+  suppressed?: boolean;
 }
 
 /**
@@ -678,6 +682,11 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     // (ENG-350 did). Absent the context key, behavior is unchanged.
     ...(priority ? { priority } : {}),
   });
+  if (!li) {
+    // Outside production nothing is filed (ENG-1099). Report the suppression rather than a fake
+    // issue id, so an alert email links nowhere instead of linking somewhere wrong.
+    return { pageId: '', deduped: false, tracker: 'Linear', suppressed: true };
+  }
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }
 
