@@ -23,6 +23,13 @@ comments arguing about approach. It can answer them without waking me *only* if 
 why the approach is what it is. A thin document silently defeats the feature — the agent escalates
 constantly and I'd have been better off not handing off at all.
 
+**Handing off ARMS THE MERGE IMMEDIATELY.** There is no confirmation step on the far side: the moment
+the handoff lands, the agent starts driving that PR toward being merged and deployed to production,
+and it will merge the instant the gates are green without asking anyone. So a handoff is not "park
+this somewhere" — it is "ship this". Never hand off work I described as partial, experimental, or
+wanting my review first; if there is any doubt about whether the work is final, ask me before sending
+rather than after. That is also why the preflight below is not a formality.
+
 ## The API it talks to
 
 `POST /api/handoff` on the box's chat server (port 8790). JSON body:
@@ -31,13 +38,16 @@ constantly and I'd have been better off not handing off at all.
 |---|---|---|
 | `email` | yes | the owner. Picks the GitHub token, git identity and Linear key the box acts with. Must be a configured member — currently `mvarma@argusoft.com` or `aseth@argusoft.com`. |
 | `prUrl` | yes | a `https://github.com/<owner>/<repo>/pull/<n>` URL, or an array of them for work spanning both repos. |
-| `branch` | yes | the PR's head branch. Must already exist on origin. Letters/digits/`.`/`_`/`/`/`-` only, can't start with a dash, can't be `main`/`master`/`develop`. |
+| `branch` | yes | **the PR's actual head branch** — the server looks it up and rejects a mismatch, because the agent's worktree is built from this and its fixes would otherwise land on a branch the PR never sees. Must already exist on origin. Letters/digits/`.`/`_`/`/`/`-` only, can't start with a dash, can't be `main`/`master`/`develop`. |
 | `title` | no | short description; falls back to "Merge #N". |
 | `context` | yes | the markdown handoff document. Minimum 400 characters — the server rejects anything thinner. |
 
 - **202** → `{ identifier, handoffPath, prs, branch, owner }`. `identifier` is the chat id, e.g. `CHAT-12`.
 - **400** → `{ error }`, always phrased so you can fix it and retry. Don't report failure to me
-  without trying the fix — e.g. "branch is not on origin" means push and try again.
+  without trying the fix — e.g. "branch is not on origin" means push and try again, and a
+  branch/PR mismatch means you sent the wrong branch name for that PR.
+- **409** → this branch is already handed off, and the error names the chat that owns it. Do NOT
+  start a second one: two agents on one PR race each other. Tell me the existing chat id instead.
 - Request bodies are capped at 16 MB, so a large document is fine.
 
 ## Transport
@@ -62,7 +72,7 @@ rather than failing opaquely:
 
 ## What the skill must do
 
-**1. Preflight — refuse to hand off broken work.** Everything committed; branch pushed; a PR open
+**1. Preflight — refuse to hand off broken work.** (Remember this ships straight to production.) Everything committed; branch pushed; a PR open
 (open one if not); both PRs if the work spans `agentweb` and `agentweb-customer-portal`; and run the
 cheap checks now (`npx tsc`, the tests I touched) rather than letting CI find a type error 20 minutes
 later. Fix what you can and tell me what you did.
