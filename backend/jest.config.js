@@ -6,7 +6,19 @@ module.exports = {
   clearMocks: true,
   verbose: false,
   maxWorkers: 2, // Limit to 2 workers to reduce memory usage in CI
-  workerIdleMemoryLimit: '512MB', // Force garbage collection when workers are idle
+  // ENG-1277: NOT a GC trigger despite the old comment. jest-worker checks each
+  // worker's heapUsed after every test file and restarts the child process (full
+  // node + jest bootstrap) once it exceeds this limit (jest-worker's
+  // ChildProcessWorker checkMemoryUsage). Measured on origin/main@96a8a1206 with
+  // --logHeapUsage: agentMode-suite files leave 357-660MB resident (median ~400),
+  // so most of them triggered a restart under the old 512MB limit. Workers already
+  // inherit --max-old-space-size=4096 from the `test`/`test:coverage` npm scripts,
+  // so 1.5GB per worker (x2 workers) is well inside the CI runner's memory — a
+  // genuinely leaking worker still recycles before that ceiling. Measured A/B:
+  // raising this to 1GB cut a 60-file agentMode sample from 59.5s to 39.4s
+  // (-34%, identical tests/assertions/coverage); 1.5GB gives headroom above the
+  // measured 660MB peak without materially more restart-avoidance than 1GB.
+  workerIdleMemoryLimit: '1.5GB',
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   transform: {
     '^.+\\.ts$': [
