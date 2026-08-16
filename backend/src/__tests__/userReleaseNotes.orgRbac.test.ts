@@ -55,7 +55,7 @@ describe('user release notes — org access control (ENG-954)', () => {
   // sufficient. The departing member must end theirs too.
   it('states that the paying member must also end their own subscription before leaving', () => {
     const text = textFor('2026-08-09');
-    expect(text).toMatch(/must end theirs/i);
+    expect(text).toMatch(/must end their own subscription/i);
     expect(text).not.toMatch(/someone else has to start a subscription first, and billing then moves to them/i);
   });
 
