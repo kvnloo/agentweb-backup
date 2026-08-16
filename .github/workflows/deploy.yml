@@ -37,7 +37,9 @@ env:
 jobs:
   detect-changes:
     name: Detect changed projects
-    runs-on: ubuntu-latest
+    # ENG-1277: ubuntu-slim ($0.002/min vs $0.006) — a checkout + paths-filter
+    # read (or a two-line manual-trigger step), no docker, no build.
+    runs-on: ubuntu-slim
     outputs:
       backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
