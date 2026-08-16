@@ -38,6 +38,11 @@ install_mock_aws() {
 MOCK_DIR="${EB_MOCK_DIR:?EB_MOCK_DIR must be set}"
 
 operation="${2:-}"
+all_args="$*"
+
+# Preserve the exact AWS operation order so lifecycle-hook tests can prove the
+# hook is installed before update-environment starts terminating old instances.
+printf '%s\n' "$operation" >>"${MOCK_DIR}/operations"
 
 query=''
 while [ "$#" -gt 0 ]; do
@@ -155,6 +160,12 @@ case "$operation" in
     ;;
 
   describe-environment-resources)
+    # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+    # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+    if grep -qF 'AutoScalingGroups' <<<"$query"; then
+      cat "${MOCK_DIR}/asg_name" 2>/dev/null || printf 'awseb-e-test-stack-AWSEBAutoScalingGroup-test\n'
+      exit 0
+    fi
     # Fixture `lb_arns`: tab/newline separated ALB ARNs, NONE, or "ERROR|<msg>".
     if [ -f "${MOCK_DIR}/lb_arns" ]; then
       first=$(head -n 1 "${MOCK_DIR}/lb_arns")
@@ -170,6 +181,18 @@ case "$operation" in
     else
       printf 'None\n'
     fi
+    exit 0
+    ;;
+
+  put-lifecycle-hook)
+    code=0
+    [ -f "${MOCK_DIR}/put_lifecycle_hook_exit" ] && code=$(cat "${MOCK_DIR}/put_lifecycle_hook_exit")
+    if [ "$code" != "0" ]; then
+      cat "${MOCK_DIR}/put_lifecycle_hook_error" 2>/dev/null >&2 || \
+        printf 'mock aws: simulated put-lifecycle-hook failure\n' >&2
+      exit "$code"
+    fi
+    printf '%s\n' "$all_args" >"${MOCK_DIR}/put_lifecycle_hook_args"
     exit 0
     ;;
 
@@ -288,7 +311,14 @@ check() {
     return
   fi
 
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: here-string, not a pipe. Under `set -o pipefail` (line 15),
+  # `grep -q` exiting early on the first match can SIGPIPE the upstream
+  # printf, and pipefail then reports THAT nonzero for the whole pipeline even
+  # though grep genuinely matched — a race that passes locally most of the
+  # time and fails intermittently (this is very likely the root cause of the
+  # local 1-in-5 flake observed on this exact file during ENG-1277). A
+  # here-string has no live producer process for grep to SIGPIPE.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -784,7 +814,8 @@ M=$(new_mock_dir)
 set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878 dry run: off by default' 0 'SUCCESS: environment'
-if printf '%s' "${LAST_OUTPUT}" | grep -qF 'probe dry run'; then
+# ENG-1277: here-string, not a pipe — see the check() fix above for why.
+if grep -qF 'probe dry run' <<<"${LAST_OUTPUT}"; then
   printf '  FAIL ENG-878 dry run: off by default emits no probe output\n       output:\n%s\n' \
     "${LAST_OUTPUT}"
   TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -837,6 +868,141 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
   EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS='9999'
 check 'ENG-878 dry run: skipped when the budget is nearly spent' 0 'probe dry run: SKIPPED'
 check 'ENG-878 dry run: skipping still leaves the deploy successful' 0 'SUCCESS: environment'
+
+# ---------------------------------------------------------------------------
+# ENG-1127: an aborted rollout is recoverable, not terminal.
+#
+# 2026-08-11, PR #2313: an ASG replacement instance joined 31s before the deploy
+# landed, ran its self-startup pipeline concurrently with app-deploy, and both
+# staged into /var/app/staging/. One flipped it to /var/app/current/ and the
+# other's container_command then died on the missing directory. EB got 3-of-4,
+# aborted the rollout, and reverted the environment's version pointer.
+#
+# verify_deployment saw Ready-on-the-old-version and declared "this will never
+# converge" — which was false. Nothing was wrong with the bundle or the config;
+# the next deploy to land (PR #2352, 28 minutes later) applied cleanly and took
+# the environment Green. The cost of calling it terminal is a red PR and a
+# ~30 runner-minute re-run of a suite that had just passed.
+#
+# So: this exact signature re-applies within the existing budget. Every other
+# terminal condition is untouched, and a terminal pattern still wins outright.
+# ---------------------------------------------------------------------------
+
+ABORT_EVENTS='During an aborted deployment, some instances may have deployed the new application version.	Failed to deploy application.	Unsuccessful command execution on instance id(s) '"'"'i-05f5717b884b5ec85'"'"'. Aborting the operation.'
+
+# The rollout aborts once, the re-apply converges, and the job goes green.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: an aborted rollout is re-applied instead of failing the job' 0 \
+  'SUCCESS: environment'
+check 'ENG-1127: the re-apply is announced, not silent' 0 \
+  'aborted the rollout on a subset of instances'
+
+# Bounded. An abort that keeps aborting still fails — but with the real reason,
+# not the false "will never converge" claim.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: a repeating abort still fails the job' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-1127: and the failure names the abort rather than claiming it never converges' 1 \
+  'aborted the rollout of version'
+
+# The re-apply is opt-outable, so a bad day can be pinned back to old behaviour
+# without a code change.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1' EB_ABORT_MAX_RETRIES='0'
+check 'ENG-1127: EB_ABORT_MAX_RETRIES=0 restores the immediate failure' 1 \
+  'EB_DEPLOY_FAILED'
+
+# Safety: a genuine terminal rejection must still fail immediately even when an
+# abort event is sitting next to it. Terminal wins; recoverable never masks it.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}	Configuration validation exception: Invalid option value" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1127: a terminal pattern still wins over a co-occurring abort' 1 \
+  'Elastic Beanstalk REJECTED this update'
+
+# ---------------------------------------------------------------------------
+
+# ENG-764 — every deploy must recreate the termination lifecycle hook before
+# update-environment can retire an old instance. A one-time console hook is
+# lost when EB replaces its ASG, silently reviving deploy-killed scheduled runs.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "$(grep -c '^put-lifecycle-hook$' "$M/operations" 2>/dev/null || true)" = 1 ]; then
+  pass 'ENG-764: the deploy installs exactly one termination lifecycle hook'
+else
+  printf '  FAIL ENG-764: the deploy installs exactly one termination lifecycle hook\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+hook_line=$(grep -n '^put-lifecycle-hook$' "$M/operations" | cut -d: -f1 || true)
+update_line=$(grep -n '^update-environment$' "$M/operations" | head -1 | cut -d: -f1 || true)
+if [ -n "$hook_line" ] && [ -n "$update_line" ] && [ "$hook_line" -lt "$update_line" ]; then
+  pass 'ENG-764: the lifecycle hook is installed before update-environment'
+else
+  printf '  FAIL ENG-764: lifecycle hook must precede update-environment (hook=%s update=%s)\n' \
+    "${hook_line:-missing}" "${update_line:-missing}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if grep -q -- '--lifecycle-hook-name agentweb-drain-before-terminate' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--heartbeat-timeout 900' "$M/put_lifecycle_hook_args" 2>/dev/null && \
+   grep -q -- '--default-result CONTINUE' "$M/put_lifecycle_hook_args" 2>/dev/null; then
+  pass 'ENG-764: the installed hook keeps the reviewed name and bounded fail-open settings'
+else
+  printf '  FAIL ENG-764: hook arguments do not match the reviewed safety contract\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+# Passing control in the red phase: the existing deploy behavior is unchanged
+# until the new hook assertions above are implemented.
+check 'ENG-764 control: the underlying deploy still reaches success' 0 'SUCCESS: environment'
+
+M=$(new_mock_dir)
+printf '255\n' >"$M/put_lifecycle_hook_exit"
+printf 'AccessDenied: not authorized to perform autoscaling:PutLifecycleHook\n' \
+  >"$M/put_lifecycle_hook_error"
+run_deploy "$M"
+check 'ENG-764: a denied lifecycle-hook install fails the deploy closed' 1 \
+  'refusing to start a deploy that could cut off scheduled work'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if ! grep -q '^update-environment$' "$M/operations"; then
+  pass 'ENG-764: hook failure happens before update-environment can terminate an instance'
+else
+  printf '  FAIL ENG-764: update-environment ran after the hook failed\n'
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+M=$(new_mock_dir)
+printf 'None\n' >"$M/asg_name"
+run_deploy "$M"
+check 'ENG-764: an environment with no ASG fails loudly' 1 \
+  'returned no Auto Scaling group'
 
 # ---------------------------------------------------------------------------
 

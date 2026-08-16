@@ -16,6 +16,7 @@ public entry point swallows all exceptions and at most logs a warning.
 import logging
 import os
 import threading
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,14 @@ class UsageReporter:
         self._lock = threading.Lock()
         # (provider, model) -> aggregated counters
         self._totals = {}
+        # ENG-1251: one reporter is constructed per WebAgent (one per task-
+        # execution process — see web_agent.py), and flush() runs exactly
+        # once, in a finally block. This id lets the backend tell "this exact
+        # HTTP submission retried" (same instance, same buffered totals, same
+        # id — dedupe it) apart from "a genuinely new execution" (a new
+        # WebAgent/UsageReporter instance always gets a new id — charge it in
+        # full, even if the measurements happen to be identical).
+        self.report_id = uuid.uuid4().hex
 
     def add(self, usage, model=None, provider=None):
         """Aggregate one LLM call's usage. Never raises."""
@@ -195,7 +204,7 @@ class UsageReporter:
 
             response = requests.post(
                 f"{backend_url}/api/internal/usage",
-                json={"records": records},
+                json={"records": records, "reportId": self.report_id},
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",

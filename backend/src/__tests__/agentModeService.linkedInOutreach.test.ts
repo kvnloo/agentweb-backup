@@ -33,6 +33,7 @@ const mockResolveAccountId = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
+const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockClearStatusCache = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -46,6 +47,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
+    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
 }));
@@ -64,16 +66,19 @@ jest.mock('../services/emailEventsDb', () => ({
 const mockGetLeadById = jest.fn();
 const mockUpdateLeadLinkedInSyncAt = jest.fn().mockResolvedValue(undefined);
 const mockGetLeadListById = jest.fn();
-const mockCanOrgMemberAccessList = jest.fn();
+const mockGetUserById = jest.fn().mockResolvedValue(null);
+const mockGetOrgById = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
     updateLeadLinkedInSyncAt: (...args: any[]) => mockUpdateLeadLinkedInSyncAt(...args),
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
-    canOrgMemberAccessList: (...args: any[]) => mockCanOrgMemberAccessList(...args),
   },
   userDb: {
-    getUserById: jest.fn().mockResolvedValue(null),
+    getUserById: (...args: any[]) => mockGetUserById(...args),
+  },
+  orgDb: {
+    getOrgById: (...args: any[]) => mockGetOrgById(...args),
   },
 }));
 
@@ -119,6 +124,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // session would leak that state into every test after it.
     mockIsAccountConnected.mockResolvedValue(true);
     mockProbeAccountSession.mockResolvedValue('connected');
+    // Default: the account CAN search, so a zero-result search is a real
+    // no-match and the ENG-975 guard stays out of the way.
+    mockProbeSearchCapability.mockResolvedValue('ok');
   });
 
   describe('send-message', () => {
@@ -928,6 +936,129 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
   });
 
+  // ENG-975 — a people search that returns zero because the ACCOUNT can no
+  // longer search looks byte-identical to one that returns zero because nobody
+  // matches. Reported in production: every query on one account came back
+  // `success: true, items: [], paging.total_count: 0` while get-profile and
+  // list-sent-invitations on the SAME account worked, so the agent read it as
+  // "no one matches", tried six query variants, and reported a false empty.
+  describe('ENG-975: zero-result search is not silently reported as "no matches"', () => {
+    it('returns an explicit failure when the account can no longer search at all', async () => {
+      mockSearchPeople.mockResolvedValue({
+        object: 'LinkedinSearch',
+        items: [],
+        paging: { start: 0, page_count: 0, total_count: 0 },
+        cursor: null,
+      });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'CMO healthtech',
+      });
+
+      expect(mockProbeSearchCapability).toHaveBeenCalledWith('test-account-id');
+      expect(result.success).toBe(false);
+      expect(result.searchUnavailable).toBe(true);
+      expect(result.message).toBe('LinkedIn people search is unavailable');
+    });
+
+    it('tells the agent to stop trying query variants and to report the outage', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.error).toContain('DO NOT');
+      expect(result.error).toMatch(/is not "no one matches your filters"/i);
+    });
+
+    it('leaves a genuine narrow no-match as a successful empty result', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('ok');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'underwater basket weaver at Acme',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toEqual([]);
+    });
+
+    it('does not block on an indeterminate probe', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('unknown');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('does not probe when the search returned people', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [{ provider_id: 'p-1' }], cursor: 'c1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    // Paging past the last page legitimately returns zero — that is exhaustion,
+    // not an outage, and must not cost a probe or raise a false alarm.
+    it('does not probe when a paginated continuation runs out of results', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+        cursor: 'page-4-cursor',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    // The same outage empties entity resolution too: the reported session got
+    // `candidates: []` for INDUSTRY 'hospital health care'.
+    it('surfaces the outage for search-parameters instead of an empty candidate list', async () => {
+      const { setUnipileSearchParamServiceForTesting, __resetUnipileSearchParamServiceForTesting } =
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        require('../services/unipileSearchParamService');
+      __resetUnipileSearchParamServiceForTesting();
+      setUnipileSearchParamServiceForTesting({
+        resolve: jest.fn().mockResolvedValue({ candidates: [], fromCache: true, source: 'cache' }),
+      });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'INDUSTRY',
+        keywords: 'hospital health care',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.searchUnavailable).toBe(true);
+      __resetUnipileSearchParamServiceForTesting();
+    });
+  });
+
   describe('search-parameters', () => {
     const { setUnipileSearchParamServiceForTesting, __resetUnipileSearchParamServiceForTesting } =
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1228,13 +1359,11 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
     it('mirrors the invite when the caller can access the target list', async () => {
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
-      mockCanOrgMemberAccessList.mockResolvedValue(true);
 
       const result = await service.linkedinOutreach('user-1', mirrorArgs);
 
       expect(result.success).toBe(true);
       expect(mockGetLeadListById).toHaveBeenCalledWith('list_owned');
-      expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith('user-1', expect.objectContaining({ id: 'list_owned' }));
       expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-1', listId: 'list_owned', linkedinUrl: 'https://www.linkedin.com/in/jane-doe/' }),
       );
@@ -1244,7 +1373,6 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       // The lead's linkedInInviteSentAt must agree with the cache row this send
       // creates, rather than each being stamped from its own clock read.
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
-      mockCanOrgMemberAccessList.mockResolvedValue(true);
 
       await service.linkedinOutreach('user-1', mirrorArgs);
 
@@ -1259,7 +1387,6 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       // invite — anything it throws must stay contained, or a CRM hiccup surfaces
       // to the user as a failed invite that actually went out.
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
-      mockCanOrgMemberAccessList.mockResolvedValue(true);
       mockMirrorLinkedInInviteToCrm.mockRejectedValueOnce(new Error('dynamo down'));
 
       const result = await service.linkedinOutreach('user-1', mirrorArgs);
@@ -1271,7 +1398,6 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       const { list_id, ...withoutListId } = mirrorArgs as any;
       mockResolveListIdForAccount.mockResolvedValue('list_bound');
       mockGetLeadListById.mockResolvedValue({ id: 'list_bound', userId: 'user-1' });
-      mockCanOrgMemberAccessList.mockResolvedValue(true);
 
       await service.linkedinOutreach('user-1', withoutListId);
 
@@ -1293,14 +1419,79 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
     it('skips the mirror (no cross-tenant write) when the list is foreign / inaccessible', async () => {
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'someone-else' });
-      mockCanOrgMemberAccessList.mockResolvedValue(false);
 
       const result = await service.linkedinOutreach('user-1', mirrorArgs);
 
       // The invite still succeeds (Unipile accepted it); only the CRM write is skipped.
       expect(result.success).toBe(true);
-      expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith('user-1', expect.any(Object));
       expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    // Greptile P1 (ENG-1049 follow-up): mirroring was gated on the read-level
+    // canOrgMemberAccessList, so any same-org member could create/update leads
+    // in another member's list simply by sending an invite with that list_id.
+    // Must require owner/org-owner/crm.editor, same as every other CRM write.
+    describe('org-share access (ENG-1049)', () => {
+      const OWNER = 'owner-1';
+
+      function setSameOrgUsers() {
+        mockGetUserById.mockImplementation((id: string) =>
+          Promise.resolve(id === OWNER ? { userId: OWNER, orgId: 'org-A' } : { userId: id, orgId: 'org-A' })
+        );
+      }
+      function orgWithCrm(overrides: Record<string, any> = {}) {
+        return {
+          orgId: 'org-A',
+          ownerUserId: 'org-owner-id',
+          shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+          ...overrides,
+        };
+      }
+
+      afterEach(() => {
+        // jest.clearAllMocks() (outer beforeEach) clears call history but not
+        // mockImplementation/mockResolvedValue — reset explicitly so these org
+        // fixtures don't leak into unrelated tests later in this file.
+        mockGetUserById.mockReset().mockResolvedValue(null);
+        mockGetOrgById.mockReset();
+      });
+
+      it('skips the mirror (no cross-tenant write) when the caller is a same-org member but not the owner and not a CRM editor', async () => {
+        mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: OWNER });
+        setSameOrgUsers();
+        mockGetOrgById.mockResolvedValue(orgWithCrm());
+
+        const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+        expect(result.success).toBe(true);
+        expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+      });
+
+      it('mirrors when the caller is a listed crm.editor on a list they do not own', async () => {
+        mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: OWNER });
+        setSameOrgUsers();
+        mockGetOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['user-1'] } } }));
+
+        const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+        expect(result.success).toBe(true);
+        expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+          expect.objectContaining({ userId: 'user-1', listId: 'list_owned' }),
+        );
+      });
+
+      it('mirrors when the caller is the org owner on a list they do not personally own', async () => {
+        mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: OWNER });
+        setSameOrgUsers();
+        mockGetOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'user-1' }));
+
+        const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+        expect(result.success).toBe(true);
+        expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+          expect.objectContaining({ userId: 'user-1', listId: 'list_owned' }),
+        );
+      });
     });
 
     it('skips the mirror when the list does not exist', async () => {
@@ -1317,7 +1508,6 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // lead/engagement record. The mirror runs even though no quota-spending send happens.
     it('mirrors an already-pending invite even though the send is skipped', async () => {
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
-      mockCanOrgMemberAccessList.mockResolvedValue(true);
       mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({
         invitedUserPublicId: 'jane-doe',
         invitationText: 'earlier note',

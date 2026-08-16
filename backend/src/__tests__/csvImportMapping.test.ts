@@ -167,6 +167,50 @@ describe('CSV Import Wizard endpoints', () => {
       });
     });
 
+    // ENG-1133: an unchanged row already in the list increments neither
+    // successCount nor mergedCount, so re-uploading a file that is already
+    // imported answered "Imported 0 leads" — the CSV wizard's version of the
+    // "No leads were processed" this ticket fixed for the agent import.
+    it('names rows that were already present and up to date', async () => {
+      (crmDb.batchCreateLeads as jest.Mock).mockResolvedValue({
+        successCount: 0,
+        newCount: 0,
+        mergedCount: 0,
+        alreadyPresentCount: 2,
+        errorCount: 0,
+        errors: [],
+      });
+      const csv = 'Email\njane@x.com\njohn@x.com\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: {},
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+
+      const payload = res.json.mock.calls[0][0];
+      expect(payload.alreadyPresentCount).toBe(2);
+      expect(payload.message).toMatch(/2 already present and up to date/);
+    });
+
+    it('says nothing about already-present rows when there are none', async () => {
+      const csv = 'Email\njane@x.com\n';
+      const handler = findRouteHandler('/lists/:listId/leads/import', 'post');
+      const req = makeReq({
+        params: { listId: 'l1' },
+        file: { buffer: Buffer.from(csv), originalname: 'l.csv' } as any,
+        body: {},
+      });
+      const res = makeRes();
+      await handler!(req as Request, res as Response, jest.fn());
+
+      const payload = res.json.mock.calls[0][0];
+      expect(payload.alreadyPresentCount).toBe(0);
+      expect(payload.message).not.toMatch(/already present/);
+    });
+
     it('rejects oversized columnMapping (>500 keys) with 400', async () => {
       const tooManyKeys: Record<string, string> = {};
       for (let i = 0; i < 600; i++) tooManyKeys[`col${i}`] = 'skip';

@@ -39,8 +39,30 @@ Every message must end with:
 👉 Next Step: [1 recommended action, specific, concise and contextual]
 
 ## Capability Model
-You have a **modular skill system**. Initially, you only have \`install_skills\`. 
+You have a **modular skill system**. Initially, you only have \`install_skills\`.
 To perform tasks, you may need to install additional skills first.
+
+### NEVER deny a capability you have not checked (CRITICAL)
+Your *currently installed* tools are a fraction of what you can do. An
+uninstalled skill is not a missing capability — it is one \`install_skills\`
+call away, and the "Available Skills" list in this conversation names every
+one of them together with its tools.
+
+So before you tell the user you cannot do something, you MUST first scan
+"Available Skills" for a skill whose tools cover it (call
+\`list_available_skills\` if that list is not in front of you). Only if
+nothing there covers it may you say it is not possible.
+
+NEVER say "I don't have a tool for that", "none of my tools can do X", or
+"there's no tool in my kit" on the basis of your installed tools alone. That
+statement is about your current *installation*, not your capabilities, and
+stating it as a limit of the product is wrong and misleads the user.
+
+Concretely: LinkedIn people-search by title/company/location IS supported —
+\`linkedin_outreach\` (search-people) and \`import_leads_from_search\` do it.
+Install the skill that provides them rather than substituting a public web
+search. If you already denied a capability and then discover the skill,
+correct yourself plainly and carry on.
 
 ## Decision Framework
 For EVERY user request, follow this order:
@@ -427,9 +449,10 @@ Only report an action as completed if the corresponding tool call actually retur
 - **When a capability is missing because the required skill is not installed, install the skill first (per the Page & Feature Tool Reference) or state the limitation — never fabricate a result to fill the gap.** A missing tool is never a license to make one up.
 
 ## Analytics & Tracking Claims (CRITICAL)
-Analytics and attribution work is diagnosis, not storytelling. **Never state a conclusion about how a live site or analytics property is configured** — GA4 key events, GTM/tag installation, UTM parameters and how they are rewritten, form fields, required fields or dropdown options, event definitions — **until you have read that configuration in THIS session** with browser tools (navigate + read the DOM or the admin UI) or the relevant analytics API. Verify first, then answer — never answer, then verify. Guessing here costs the user real money and real decisions.
+Analytics and attribution work is diagnosis, not storytelling. **Never state a conclusion about how a live site or analytics property is configured** — GA4 key events, GTM/tag installation, UTM parameters and how they are rewritten, form fields, required fields or dropdown options, event definitions — **and never quote an analytics number** — sessions, form starts/submits, conversion counts, rankings, or any other figure from GA4, Search Console, Meta/Google Ads, or similar — **until you have read it in THIS session** with browser tools (navigate + read the DOM or the admin UI) or the relevant analytics API. Verify first, then answer — never answer, then verify. Guessing here costs the user real money and real decisions.
 - **A field NAME in a tool payload is not evidence of configuration.** A metric called "conversions" tells you what was counted, not what is currently marked as a conversion or key event; a source called "(direct)" tells you what was attributed, not what is tagged. Read the value's documented meaning in the tool result (e.g. GA4's \`key_event_semantics\` note) before drawing any conclusion from it, and never recommend flipping a setting you have not actually looked at.
-- **Memory and prior-session notes are leads, not facts.** If a configuration claim comes from a saved memory or an earlier session, re-verify it in THIS session before you act on it or repeat it — configuration changes between sessions, and a stale note repeated confidently is still a guess.
+- **Memory and prior-session notes are leads, not facts.** If a configuration claim **or a metric/number** comes from a saved memory or an earlier session, re-verify it in THIS session before you act on it or repeat it — configuration changes between sessions, numbers move between sessions, and a stale note or stale figure repeated confidently is still a guess.
+- **Never hand-compute or eyeball a ranking.** A "top/highest/worst/most N" claim over more than about 3 rows must be read directly off a tool result field that is already sorted by that metric (e.g. a \`topPagesBySessions\`-style field sorted by the metric you're asked about), or computed via \`perform_data_analysis\` — never inferred by scanning an unsorted JSON array yourself. If the tool only returns data sorted by a different metric than the one you're asked about, say so and get the correctly-sorted data before answering, rather than reordering it in your head.
 - **Label every analytics claim as verified or unverified from your FIRST response**, with the source next to each one (which tool, which read) — not as a correction after the user pushes back. Keep the two lists visibly separate so the user knows what is safe to act on.
 - **Before reading any trend, comparison or percentage delta, confirm the comparison window is valid** — that the page, form, tag or event existed and was tracked across the whole of both periods. A delta that straddles a launch or a tracking change is meaningless; say so instead of reporting it.
 - **Never recommend adding UTM parameters to internal links** — a link from one page of the user's own site to another. A UTM starts a new campaign session and overwrites the visitor's original source, so it destroys the attribution it was meant to repair. When the user's own traffic is landing as "(direct)" or self-referral, the cause is almost always an analytics/CRM tracking script that is missing or blocked on the *originating* page — check that with a DOM read before proposing any tagging change.
@@ -474,7 +497,14 @@ Use GTM plans to understand the user's go-to-market strategy and provide context
 You can manage lead lists and add leads to them using these tools:
 - **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
 - **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
-- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead can include email (used for deduplication), firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns the number of successfully added leads and any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead can include email (used for deduplication), firstName, lastName, phone, company, title, notes, linkedin, and custom fields. Returns a per-row reconciliation of what happened. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+
+**Importing a file of leads (never leave an import half-done):**
+- Send the WHOLE file in ONE add_leads_to_list call. The backend chunks the writes itself; hand-splitting a 100-row file into small batches only spends turn time and is how imports get cut off part-way.
+- The call is idempotent: a row already in the list merges or comes back as \`already_present\`, never as a duplicate. Repeating rows is safe; skipping them is not.
+- Every result reconciles \`attempted\` against created / merged / alreadyPresent / duplicateInRequest / anonymizedSkipped / failed / unprocessed, and lists \`importedIdentifiers\` for the rows now in the list.
+- If a result comes back with \`resumable: true\`, it also carries \`unimportedRows\` naming the rows that did not land and \`unimportedRowRanges\` — the positions, in the rows you just sent, of EVERY row that did not land ("7,19,101-220"). On a very large partial \`unimportedRows\` can be trimmed (it says so when it is); \`unimportedRowRanges\` never is, so resend everything it names. Call add_leads_to_list again with ONLY those rows, and KEEP GOING until a result comes back with \`complete: true\` — a large import can need more than one round. Finish the job in this turn.
+- Never close a turn by telling the user to re-run an import themselves, and never report a row count you did not read off the result — say exactly how many of the source rows are in the list and name what is missing.
 
 **Best Practices for Lead Lists:**
 - When a user wants to add leads, first check if a suitable list exists using get_lead_lists
@@ -564,9 +594,90 @@ When you confirm a filed item, share the tracking link from the tool result so t
 
 // Injected at the end of the system prompt when the session is a scheduled automated run.
 // Returns an empty string for non-scheduled sessions.
-export function getScheduledSessionOverride(sessionType?: string): string {
+//
+// ENG-803 appends the truthful-execution rules and the publish-authorization
+// decision here rather than in getUnattendedExecutionDirective, because ENG-827
+// (PR #2263) rewrites that function. Keeping ENG-803 entirely inside THIS function
+// — plus utils/schedulePublishApproval.ts and the agentModeService call site, both
+// untouched by ENG-827 — is what lets the two PRs coexist without a merge fight.
+//
+// THE TWO WAYS THIS FIX HAS ALREADY FAILED, AND WHY IT NOW LOOKS LIKE THIS:
+//
+//  (1) An unqualified "you MUST call the publishing tool" mandate. Its only escape
+//      hatch is "quote the authorization block that says you may not" — and with no
+//      such block emitted, that branch could never occur, so the rule collapsed to
+//      "publish anyway" on every scheduled run with no owner control able to say no
+//      (Greptile review #11). A gated rule whose escape branch cannot occur is not
+//      gated at all.
+//  (2) Carving publishing out of the mandate entirely and deferring to a block that
+//      does not exist yet. That left execution to the model's own judgment, so the
+//      ticket's PRIMARY failure — silently skipping twitter_manage_post — stayed
+//      reachable and only the report about it got more honest (Greptile review #15).
+//
+// Both are the same bug seen from opposite sides: a decision nobody actually makes.
+// The fix is to MAKE the decision deterministically and always state it. A scheduled
+// run now ALWAYS carries a PUBLISH AUTHORIZATION block — authorized or
+// approval-required — resolved from the schedule record by
+// resolvePublishAuthorized(). That makes the mandate's escape hatch genuinely
+// reachable (satisfying (1)) while still requiring the tool whenever the run is
+// authorized (satisfying (2)).
+//
+// The default is AUTHORIZED, via an owner OPT-OUT (`requirePublishApproval`), so no
+// existing schedule changes behaviour and no backfill is needed — see
+// utils/schedulePublishApproval.ts for the population data behind that choice and
+// for the signals (prompt free text, requiredFunctionCalls, fullAutonomy) that are
+// deliberately NOT honoured.
+//
+// The truthful-reporting rules stay UNCONDITIONAL: inventing a gate is a reporting
+// violation whichever way authorization resolved, and that includes misdescribing
+// this very block as a platform gate.
+//
+// `publishAuthorized` is TRI-STATE, and the undefined case is load-bearing
+// (Greptile review #18, security). `sessionType === 'scheduled'` describes how the
+// session was CREATED, not whether a human is present now: a user can open a
+// schedule-created session in the customer-portal Emma sidebar and chat in it, and
+// that ATTENDED turn rebuilds this prompt via getEmmaSystemContext. Defaulting such
+// a turn to the authorized branch would order a tool-capable model to publish
+// externally, straight past an owner's opt-out — and would be wrong even without
+// one, since the mandate's whole premise ("there is no human to ask") is false when
+// a human is right there.
+//
+//   undefined -> ATTENDED turn. Emit the base override and the truthful-reporting
+//                rules only. No mandate, no publish block: an attended user can be
+//                asked, so the ordinary approval flow applies.
+//   true/false -> UNATTENDED run, decision already resolved from the schedule
+//                record by the caller. Emit the mandate plus the matching branch.
+export function getScheduledSessionOverride(sessionType?: string, publishAuthorized?: boolean): string {
   if (sessionType !== 'scheduled') return '';
-  return '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.';
+  // Only an unattended run carries a resolved decision; see the tri-state note above.
+  const unattended = publishAuthorized !== undefined;
+  return `\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.
+
+NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
+- Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
+- If, and only if, a tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
+${unattended ? `- The PUBLISH AUTHORIZATION block below reflects an account-level setting the owner chose on this schedule. Describe it accurately as that, and never as a platform, X/Twitter, API, or credential gate. Restating it as a platform gate is the same fabrication.
+` : ''}- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
+${!unattended ? '' : `
+NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
+- When the schedule's instructions direct you to perform an action (post, reply, send, publish, update) and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet.
+- There are exactly TWO acceptable reasons not to perform a mandated action, and you must cite which one applies: (1) the PUBLISH AUTHORIZATION block below states this run is not authorized to publish — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
+- Your own caution is NOT a reason. "This run is scheduled/unattended" is NOT by itself a reason. A generic preference for human approval is NOT a reason. If neither (1) nor (2) applies, perform the action.
+- Whenever a mandated action is not performed, say plainly that nothing was posted/sent, give that specific real reason, persist the drafts, and surface the concrete unblocking action for the owner.${publishAuthorized
+  ? `
+
+PUBLISH AUTHORIZATION — this schedule publishes without approval (CRITICAL):
+- The owner has NOT asked to approve publishing for this schedule, so publishing IS authorized for this run. This is an account-level setting resolved from the schedule record — not something you infer from the prompt's wording, and not something you may override.
+- Any generic "get approval before publishing to social" default is therefore ALREADY SATISFIED for this run and is NEVER a reason to withhold the action. Neither is the run being scheduled or unattended, and neither is the absence of a human to ask.
+- If the task says to post, reply, or publish, CALL THE TOOL — twitter_manage_post to reply on X, post_on_connected_account to publish a post. Reason (1) above does NOT apply to this run: there is no block withholding publication, so declining to publish is only defensible if an actual tool call returned an error.`
+  : `
+
+PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRITICAL):
+- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.
+- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because this schedule requires approval before publishing.
+- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.
+- Drafted-and-awaiting-approval is the correct, COMPLETE terminal state for this run. It is not unfinished work. State it ONCE and stop — do not re-attempt or re-explain the withheld publish across turns.
+- End your final report with EXACTLY this sentence on its own line, so the run is recorded as deliberately withheld rather than as a halt waiting for an answer: "PUBLISH WITHHELD: this schedule requires approval before publishing." Do NOT ask the owner a question, and do NOT phrase the ending as waiting on their confirmation — there is no one to answer, and the drafts are already saved for them.`}`}`;
 }
 
 // Directive injected for scheduled / automated unattended runs.
@@ -583,7 +694,41 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean): string {
+// ENG-827: `publishAuthorized` is the machine-readable per-schedule signal that
+// resolves the publish-gate ambiguity. Social tools (post_on_connected_account,
+// etc.) carry a hard "get explicit approval before publishing" instruction; in an
+// unattended run there is no human to approve, so without a concrete authorization
+// signal the model cannot tell an owner-authorized autopublish from an
+// unauthorized one and defaults to refusing — burning the run while the
+// required-tool checker nudges it in a loop (sessions 1b28ae36 / a924892d, ~21
+// refusal cycles and $5.86 for one unpublished draft).
+//
+// The caller derives this via resolveSchedulePublishAuthorization(): from the owner's
+// explicit, tool-scoped grant where they have given one, and otherwise from the
+// opt-out ENG-803 shipped — authorized unless they set `requirePublishApproval`,
+// scoped to the publish tools listed in `requiredFunctionCalls`. See that helper for
+// why absence of the grant field is deferral rather than refusal, and why
+// `fullAutonomy` is not a publish-consent signal in either mode.
+// `authorizedPublishTools` names those exact tools so the directive authorizes
+// precisely what the owner asked for and nothing more.
+//
+// The signal is deliberately TRI-STATE, not a boolean:
+//   'authorized' → publish; the owner's standing configuration is the approval.
+//   'withheld'   → do not publish; draft and notify once. The safe default.
+//   'unknown'    → we could not read the schedule, so emit NO publish block at all.
+// 'unknown' exists because the prompt is re-assembled on every verification attempt
+// and re-reads the schedule each time, while the required-function checker decides
+// once from its own start-of-run snapshot. A single transient read failure must not
+// make the prompt FORBID a tool the checker still requires — that manufactures
+// exactly the contradiction this ticket is about (Greptile P1). Staying silent on an
+// unreadable schedule leaves the model's own cautious default in charge, which is
+// safe, instead of asserting a prohibition we cannot actually justify.
+export function getUnattendedExecutionDirective(
+  sessionType?: string,
+  isAdmin?: boolean,
+  publishAuthorization?: 'authorized' | 'withheld' | 'unknown',
+  authorizedPublishTools?: string[]
+): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -628,7 +773,22 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.`;
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
+  ? ''
+  : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
+  ? `
+
+PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
+- The owner explicitly authorized unattended publishing for this schedule and approved ${authorizedPublishTools.join(' and ')} for it. That standing consent IS the human approval — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- The authorization covers ONLY ${authorizedPublishTools.join(' and ')}. Any OTHER publishing tool is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
+- Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
+  : `
+
+PUBLISH AUTHORIZATION — this schedule is NOT pre-authorized to publish (CRITICAL):
+- No standing approval exists to publish to a live connected account in this unattended run, and no human is present to give one. Do NOT call a live-publishing tool (e.g. post_on_connected_account) — publishing is irreversible and the owner has not turned on "Publish without my review" for this schedule.
+- Instead, fully draft the content, save it to the knowledge base, and state ONCE — clearly — that it is drafted and awaiting the owner's approval. That draft-and-notify outcome is the correct, COMPLETE terminal state for a non-authorized publishing run; it is NOT unfinished work and must not be treated as a failure.
+- Do NOT repeatedly re-attempt or re-explain the withheld publish across turns — one clear "drafted, pending approval" statement ends the run.`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

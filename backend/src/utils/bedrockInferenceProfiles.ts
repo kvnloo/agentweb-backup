@@ -32,6 +32,7 @@ export const BEDROCK_INFERENCE_PROFILE_MAP: Readonly<Record<string, string>> = O
   // the invoke endpoint with a bearer token — hence a bare profile id, not an
   // ARN in our account. See BEDROCK_BEARER_TOKEN_MODELS below.
   'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
+  'claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
   // ENG-744 — Claude 5 generation. Enablement verified against live Bedrock in
   // us-west-2 before adding (a listed ACTIVE profile is NOT proof of access).
   // Opus 5 and Sonnet 5 are AccessDenied on the default account and reachable
@@ -55,6 +56,8 @@ export const BEDROCK_INFERENCE_PROFILE_MAP: Readonly<Record<string, string>> = O
  */
 export const BEDROCK_BEARER_TOKEN_MODELS: ReadonlySet<string> = new Set([
   'anthropic.claude-opus-4-8',
+  // Legacy settings rows can still contain this unqualified alias.
+  'claude-opus-4-8',
   // ENG-744: verified 2026-07-29 — the default account returns
   // "anthropic.claude-opus-5 is not available for this account" for both of
   // these, while the bearer account returns 200. Haiku 4.5 is deliberately
