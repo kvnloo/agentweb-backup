@@ -31,8 +31,9 @@
 import express, { Response } from "express";
 import { createHash } from "crypto";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
-import { recordUsage, computeCostMicroUsd } from "../services/usageRecorderService";
+import { recordUsage, computeCostMicroUsd, RecordUsageContext } from "../services/usageRecorderService";
 import { incrementUserTokenUsage, resolveBillingUserId } from "../services/tokenUsageService";
+import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
 
 const router = express.Router();
 
@@ -147,7 +148,6 @@ router.post(
 
       let accepted = 0;
       let skipped = 0;
-      const writes: Promise<void>[] = [];
       // ENG-1134: quota charge, summed per (user, model, feature) across the
       // batch rather than applied per record. A batch carries up to 500
       // records and incrementUserTokenUsage is a read-modify-write on one
@@ -199,6 +199,14 @@ router.post(
         })
       );
 
+      // ENG-1251 Greptile P1 ("retries duplicate aggregate usage"): a
+      // record's ledger write is deferred to a SECOND pass, gated on
+      // whether its charge group turns out to be genuinely new. Tagging
+      // each record with its chargeKey (or null when uncharged, e.g. a
+      // "system" actor) here, before that's known.
+      interface PendingLedgerWrite { chargeKey: string | null; ctx: RecordUsageContext }
+      const pendingWrites: PendingLedgerWrite[] = [];
+
       for (const record of records) {
         if (!isValidRecord(record)) {
           skipped++;
@@ -221,9 +229,10 @@ router.post(
         // Charge the RESOLVED user, never the record's claim — otherwise any
         // engine token could drain someone else's quota by naming them.
         // "system" is platform overhead with no one to bill, so it is skipped.
+        let chargeKey: string | null = null;
         if (userId && userId !== "system") {
           const chargeFeature = namespaceFeature(record.feature);
-          const chargeKey = [userId, record.model, chargeFeature].join("\u0001");
+          chargeKey = [userId, record.model, chargeFeature].join("\u0001");
           const entry =
             charges.get(chargeKey) ||
             { userId, model: record.model!, feature: chargeFeature, tokens: 0, cost: 0, calls: 0, recordFingerprints: [] };
@@ -261,9 +270,9 @@ router.post(
           charges.set(chargeKey, entry);
         }
 
-        // recordUsage is fail-open by contract (always resolves).
-        writes.push(
-          recordUsage({
+        pendingWrites.push({
+          chargeKey,
+          ctx: {
             userId,
             billingUserId: billingUserIdByActor.get(userId) || userId,
             taskId: typeof record.taskId === "string" ? record.taskId : undefined,
@@ -278,18 +287,11 @@ router.post(
             cacheReadTokens,
             cacheWriteTokens,
             date: requestDate,
-          })
-        );
+          },
+        });
         accepted++;
       }
 
-      await Promise.all(writes);
-
-      // Apply the aggregated quota charges. Fail-open, exactly like the ledger
-      // writes above: the engine treats ingestion as best-effort, so surfacing a
-      // 500 here would only make it retry, and a retry hits this endpoint with
-      // no server-side signal that it already applied the first attempt.
-      //
       // ENG-1251: prefer the engine's own reportId (a genuine per-execution
       // nonce -- see agent-engine/usage_reporter.py) as the idempotency key.
       // It is exact: a retried HTTP submission of the same UsageReporter
@@ -308,38 +310,108 @@ router.post(
       // reportId.
       const RETRY_COLLAPSE_WINDOW_MS = 10 * 60 * 1000;
       const timeBucket = Math.floor(Date.now() / RETRY_COLLAPSE_WINDOW_MS);
+      const eventIdByChargeKey = new Map<string, string>();
+      for (const [chargeKey, { userId, model, feature, recordFingerprints }] of charges.entries()) {
+        // A charge entry only exists once at least one record contributed a
+        // fingerprint, so both branches below always have content to hash.
+        // Includes model/feature: one engine flush (one reportId) can carry
+        // several (model, feature) charge entries, so reportId alone is not
+        // unique per entry.
+        //
+        // Greptile P1 (security): reportId is caller-controlled and
+        // otherwise unvalidated -- an authenticated caller resubmitting a
+        // DIFFERENT batch under a reused reportId (engine bug or actual
+        // misuse) would collapse into the same eventId as a prior batch
+        // and get silently suppressed, undercharging real usage with no
+        // signal that anything was dropped. Folding the content
+        // fingerprint into the eventId even when reportId is present
+        // closes that: a genuine retry resends identical content under
+        // the same reportId (same fingerprint, same eventId, still
+        // dedupes exactly as intended), while a reused reportId carrying
+        // different content now produces a different eventId and is
+        // charged in full -- fail toward charging, never toward a silent
+        // drop.
+        const contentFingerprint = createHash("sha256")
+          .update([...recordFingerprints].sort().join("\u0001"))
+          .digest("hex")
+          .slice(0, 32);
+        const eventId = reportId
+          ? `engine:${userId}:${model}:${feature}:${reportId}:${contentFingerprint}`
+          : `engine:${userId}:${model}:${feature}:${createHash("sha256")
+              .update([...recordFingerprints].sort().join("\u0001"))
+              .update(`bucket:${timeBucket}`)
+              .digest("hex")
+              .slice(0, 32)}`;
+        eventIdByChargeKey.set(chargeKey, eventId);
+      }
+
+      // ENG-1251 Greptile P1 ("retries duplicate aggregate usage"): the
+      // ledger write (recordUsage, an unconditional ADD with no idempotency
+      // concept) previously ran for every record regardless of whether its
+      // charge group was a genuine retry. A retried batch's charge event
+      // correctly no-op'd via recordLlmChargeEvent's conditional put, but
+      // the ledger row got incremented a second time anyway, and
+      // reconciliation reported that phantom increment as real uncovered
+      // usage. Pre-checking each group's idempotency HERE, before any
+      // ledger write, lets a confirmed retry skip its ledger contribution
+      // entirely -- the exact same conditional-write primitive
+      // incrementUserTokenUsage uses internally, called directly so this
+      // route can see the true/false outcome before deciding what to write.
+      const isNewChargeByKey = new Map<string, boolean>();
       await Promise.all(
-        [...charges.values()].map(({ userId, model, feature, tokens, cost, calls, recordFingerprints }) => {
-          // A charge entry only exists once at least one record contributed a
-          // fingerprint, so both branches below always have content to hash.
-          // Includes model/feature: one engine flush (one reportId) can carry
-          // several (model, feature) charge entries, so reportId alone is not
-          // unique per entry.
-          //
-          // Greptile P1 (security): reportId is caller-controlled and
-          // otherwise unvalidated -- an authenticated caller resubmitting a
-          // DIFFERENT batch under a reused reportId (engine bug or actual
-          // misuse) would collapse into the same eventId as a prior batch
-          // and get silently suppressed, undercharging real usage with no
-          // signal that anything was dropped. Folding the content
-          // fingerprint into the eventId even when reportId is present
-          // closes that: a genuine retry resends identical content under
-          // the same reportId (same fingerprint, same eventId, still
-          // dedupes exactly as intended), while a reused reportId carrying
-          // different content now produces a different eventId and is
-          // charged in full -- fail toward charging, never toward a silent
-          // drop.
-          const contentFingerprint = createHash("sha256")
-            .update([...recordFingerprints].sort().join("\u0001"))
-            .digest("hex")
-            .slice(0, 32);
-          const eventId = reportId
-            ? `engine:${userId}:${model}:${feature}:${reportId}:${contentFingerprint}`
-            : `engine:${userId}:${model}:${feature}:${createHash("sha256")
-                .update([...recordFingerprints].sort().join("\u0001"))
-                .update(`bucket:${timeBucket}`)
-                .digest("hex")
-                .slice(0, 32)}`;
+        [...charges.entries()].map(async ([chargeKey, { userId, model, feature, tokens, cost, calls }]) => {
+          const eventId = eventIdByChargeKey.get(chargeKey)!;
+          try {
+            const isNew = await recordLlmChargeEvent({
+              billingUserId: billingUserIdByActor.get(userId) || userId,
+              eventId,
+              occurredAt: requestReceivedAt.toISOString(),
+              actingUserId: userId,
+              tokens: Math.max(0, Math.round(tokens)),
+              costMicroUsd: Math.max(0, Math.round(cost * 1_000_000)),
+              model,
+              feature,
+              calls,
+            });
+            isNewChargeByKey.set(chargeKey, isNew);
+          } catch (err) {
+            console.error(`[internalUsage] idempotency pre-check failed for eventId=${eventId}:`, err);
+            // Fail toward writing the ledger: an ambiguous outcome (a
+            // genuine infra error, not a confirmed "already recorded") is
+            // not proof of a retry, and undercounting real usage is worse
+            // than an occasional double-count under a real error.
+            isNewChargeByKey.set(chargeKey, true);
+          }
+        })
+      );
+
+      // Ledger writes: always for uncharged (system) records; for charged
+      // records, only when the pre-check above confirmed this group is
+      // genuinely new. recordUsage is fail-open by contract (always
+      // resolves) -- unaffected by this gating, which happens before it's
+      // ever called.
+      const writes: Promise<void>[] = [];
+      for (const pending of pendingWrites) {
+        if (pending.chargeKey === null || isNewChargeByKey.get(pending.chargeKey)) {
+          writes.push(recordUsage(pending.ctx));
+        }
+      }
+      await Promise.all(writes);
+
+      // Apply the aggregated quota charges. Fail-open, exactly like the
+      // ledger writes above: the engine treats ingestion as best-effort, so
+      // surfacing a 500 here would only make it retry, and a retry hits
+      // this endpoint with no server-side signal that it already applied
+      // the first attempt. Runs unconditionally (not gated on
+      // isNewChargeByKey) -- a prior attempt could have recorded the event
+      // above and then been interrupted before reaching the atomic apply
+      // (crash, timeout), so a "duplicate" pre-check result must still
+      // retry the apply step; incrementUserTokenUsage's own
+      // recordLlmChargeEvent call simply no-ops when it finds the event
+      // already recorded by the pre-check above.
+      await Promise.all(
+        [...charges.entries()].map(([chargeKey, { userId, model, feature, tokens, cost, calls }]) => {
+          const eventId = eventIdByChargeKey.get(chargeKey)!;
           return incrementUserTokenUsage(userId, tokens, cost, {
             eventId,
             model,

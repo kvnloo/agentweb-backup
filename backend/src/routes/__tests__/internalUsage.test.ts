@@ -32,6 +32,19 @@ jest.mock('../../services/tokenUsageService', () => ({
   // its current behavior unless a test opts into a different resolution.
   resolveBillingUserId: jest.fn((userId: string) => Promise.resolve(userId)),
 }));
+// ENG-1251 Greptile P1 ("Retries duplicate aggregate usage"): the route now
+// pre-checks each charge group's idempotency via recordLlmChargeEvent before
+// deciding whether to write its ledger row. Without this mock, every test in
+// this file that submits a userId-attributed (charged) record silently hits
+// the real, unmocked AWS SDK — which fails fast in this test env and is
+// caught by the route's fail-open catch, defaulting to "treat as new". That
+// made every existing assertion pass for the wrong reason. Default to
+// "always a new charge" so existing behavior is unaffected; tests that care
+// about the duplicate-skip path override this per-call.
+const mockRecordLlmChargeEvent = jest.fn().mockResolvedValue(true);
+jest.mock('../../services/llmChargeAuditDb', () => ({
+  recordLlmChargeEvent: (...args: unknown[]) => mockRecordLlmChargeEvent(...args),
+}));
 
 import internalUsageRoutes from '../internalUsage';
 import { authenticateToken } from '../../middleware/auth';
@@ -61,6 +74,7 @@ describe('POST /api/internal/usage', () => {
       next();
     });
     mockRecordUsage.mockResolvedValue(undefined);
+    mockRecordLlmChargeEvent.mockResolvedValue(true);
     app = express();
     app.use(express.json());
     app.use('/api/internal', internalUsageRoutes);

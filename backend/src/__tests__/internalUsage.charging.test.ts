@@ -42,6 +42,14 @@ jest.mock("../middleware/auth", () => ({
 
 const mockRecordUsage = jest.fn().mockResolvedValue(undefined);
 const mockIncrementUserTokenUsage = jest.fn().mockResolvedValue(undefined);
+// ENG-1251 Greptile P1: internalUsage.ts now pre-checks each charge group's
+// idempotency directly via recordLlmChargeEvent, BEFORE deciding whether to
+// write its ledger rows (a confirmed duplicate skips the ledger write
+// entirely, closing the "retries duplicate aggregate usage" finding).
+// Defaults to true ("genuinely new charge") so every existing test's
+// ledger-write expectations are unaffected unless a test opts into
+// simulating a duplicate.
+const mockRecordLlmChargeEvent = jest.fn().mockResolvedValue(true);
 
 jest.mock("../services/usageRecorderService", () => ({
   ...jest.requireActual("../services/usageRecorderService"),
@@ -53,6 +61,9 @@ jest.mock("../services/tokenUsageService", () => ({
   // actor's billing owner before recording the ledger row. Defaults to
   // "same as input" (no pooling) -- no test in this file exercises pooling.
   resolveBillingUserId: (userId: string) => Promise.resolve(userId),
+}));
+jest.mock("../services/llmChargeAuditDb", () => ({
+  recordLlmChargeEvent: (...args: unknown[]) => mockRecordLlmChargeEvent(...args),
 }));
 
 import internalUsageRoutes from "../routes/internalUsage";
@@ -80,7 +91,15 @@ function record(over: Record<string, unknown> = {}) {
   };
 }
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  // clearAllMocks() resets call history but NOT a persistent implementation
+  // set via mockImplementation()/mockResolvedValue() -- a test that installs
+  // a custom implementation (e.g. the mixed-batch duplicate test below)
+  // would otherwise leak it into every later test in this file. Restore the
+  // "genuinely new charge" default explicitly every test.
+  mockRecordLlmChargeEvent.mockResolvedValue(true);
+});
 
 describe("POST /api/internal/usage — charges the per-user quota", () => {
   it("charges the authenticated user for a single record", async () => {
@@ -537,6 +556,110 @@ describe("POST /api/internal/usage — prefers the engine's own reportId over th
 
     const [, , , audit] = mockIncrementUserTokenUsage.mock.calls[0];
     expect(audit?.eventId).toContain(boundaryReportId);
+  });
+});
+
+describe("POST /api/internal/usage — a confirmed duplicate charge skips its ledger write (ENG-1251 Greptile P1: retries duplicate aggregate usage)", () => {
+  it("does not call recordUsage when the pre-check confirms this charge group already exists", async () => {
+    // recordLlmChargeEvent's conditional put returning false means: this
+    // exact eventId was already recorded by a prior attempt. The ledger
+    // contribution for that attempt was already written -- writing it
+    // again here would double the daily aggregate while the charge event
+    // (correctly) stays applied exactly once.
+    mockRecordLlmChargeEvent.mockResolvedValueOnce(false);
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "retry-report-id" });
+
+    expect(res.status).toBe(202);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+    // The counter apply still runs unconditionally -- safe (idempotent) and
+    // necessary for the crash-recovery case (event recorded, apply never
+    // reached on a prior attempt).
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it("calls recordUsage normally when the pre-check confirms this is a genuinely new charge", async () => {
+    mockRecordLlmChargeEvent.mockResolvedValueOnce(true);
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "fresh-report-id" });
+
+    expect(res.status).toBe(202);
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+  });
+
+  it("only skips the ledger write for the DUPLICATE group in a mixed batch, not the whole batch", async () => {
+    // Two charge groups (different models): the opus-5 one is a confirmed
+    // duplicate, the gemini one is genuinely new. Only the duplicate's
+    // ledger contribution should be skipped.
+    mockRecordLlmChargeEvent.mockImplementation(async (event: { model?: string }) =>
+      event.model === "anthropic.claude-opus-5" ? false : true
+    );
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({
+        records: [
+          record({ model: "anthropic.claude-opus-5", taskId: "task-a" }),
+          record({ model: "gemini-2.5-pro", taskId: "task-b" }),
+        ],
+        reportId: "mixed-batch-report-id",
+      });
+
+    expect(res.status).toBe(202);
+    // Only the gemini record's ledger row was written.
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ model: "gemini-2.5-pro" });
+    // Both charge groups still get their counter-apply attempt.
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it("still writes the ledger row for an uncharged (system) record even when other charge groups in the batch are duplicates", async () => {
+    // No mockResolvedValueOnce queued here on purpose: a system-attributed
+    // record never reaches the pre-check at all (asserted below), so a
+    // queued "once" value would sit unconsumed and leak into the very next
+    // test's call to this same mock instead (clearAllMocks() drains call
+    // history, not a pending mockResolvedValueOnce queue).
+    const systemToken = jwt.sign({ userId: "system", email: "sys@example.com" }, JWT_SECRET);
+
+    // Two separate requests sharing app state isn't realistic here -- send
+    // one batch as an admin naming both a real user (duplicate charge) and
+    // implicitly "system" via a system-authenticated record in the SAME
+    // batch is not directly expressible with this route's attribution
+    // rule (system comes from the AUTHENTICATED caller, not per-record).
+    // Exercise it directly: a system-authenticated submission is never
+    // charged at all, so the pre-check/gating path must not touch it.
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${systemToken}`)
+      .send({ records: [record({ taskId: "task-sys" })] });
+
+    expect(res.status).toBe(202);
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    // "system" is never charged, so the duplicate pre-check never runs for it.
+    expect(mockRecordLlmChargeEvent).not.toHaveBeenCalled();
+  });
+
+  it("fails toward writing the ledger when the pre-check itself errors (ambiguous, not a confirmed duplicate)", async () => {
+    mockRecordLlmChargeEvent.mockRejectedValueOnce(new Error("DynamoDB unavailable"));
+
+    const res = await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ taskId: "task-abc" })], reportId: "error-report-id" });
+
+    expect(res.status).toBe(202);
+    // An error is not proof of a duplicate -- undercounting real usage is
+    // worse than an occasional double-count under a genuine infra error.
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
   });
 });
 
