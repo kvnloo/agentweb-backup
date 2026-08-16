@@ -23,10 +23,10 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffNameStatus, mergeStatusByPathAcrossRefs } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -65,17 +65,19 @@ function changedFilesForRefs(refs) {
       parentOf: (sha) => `${sha}~1`,
     });
     bases.add(base);
-    // ENG-1277 / Greptile P1 #1 and #3: `--name-status`, not `--name-only`, and
+    // ENG-1277 / Greptile P1 #1, #3, #5: `--raw`, not `--name-only`, and
     // `--diff-filter=AMD` (Added/Modified/Deleted — C requires an explicit
     // --find-copies flag we don't pass, so it can never appear; R is excluded by
-    // --no-renames below). The STATUS letter is what makes classification
-    // git-truth-based instead of filesystem-truth-based (see
-    // parseDiffNameStatus's doc comment for why that distinction is the whole
-    // point) — a deletion-only push must still be classified as a backend change,
+    // --no-renames below). `--raw` carries the blob hash alongside the status
+    // letter — see parseDiffRaw's doc comment for why both matter: the status
+    // letter makes classification git-truth-based instead of filesystem-truth-
+    // based (a deletion-only push must still be classified as a backend change,
     // or the hook's own "no backend changes — skipping" short circuit silently
-    // skips tsc/jest for exactly the push most likely to break the build.
-    const out = git(['diff', '--no-renames', '--name-status', '--diff-filter=AMD', `${base}..${r.localSha}`], { cwd: root });
-    perRefMaps.push(parseDiffNameStatus(out));
+    // skips tsc/jest for exactly the push most likely to break the build), and the
+    // blob hash is what lets a multi-ref push detect two refs that both show `M`
+    // on a path while actually leaving different content there.
+    const out = git(['diff', '--no-renames', '--raw', '--diff-filter=AMD', `${base}..${r.localSha}`], { cwd: root });
+    perRefMaps.push(parseDiffRaw(out));
   }
   // ENG-1277 / Greptile P1 #4: merge per-ref maps through a conflict-detecting
   // merge, not `Object.assign` — a single `git push` can push multiple refs, and
@@ -126,6 +128,21 @@ function materializeDeletedForDiscovery(deletedRelPaths, bases) {
         throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit (tried: ${bases.join(', ')}) — cannot check for tests that depended on it.`);
       }
       mkdirSync(path.dirname(absPath), { recursive: true });
+      // ENG-1277 / Greptile P1 #5: refuse to write outside the repo. If the
+      // deleted path's directory (or an ancestor of it) is a symlink pointing
+      // outside `backend/` — a real pattern in THIS repo's own worktree setup,
+      // where `backend/node_modules` is routinely symlinked into a different
+      // worktree entirely (ENG-731) — `writeFileSync` would silently follow it
+      // and overwrite a file outside the repository, and the later revert could
+      // then rewrite or delete that external file too. `mkdirSync` above already
+      // ran, so the directory chain exists; verify its REAL path resolves inside
+      // `backend/`'s real path before writing anything into it.
+      const dir = path.dirname(absPath);
+      const realDir = realpathSync(dir);
+      const realBackend = realpathSync(backend);
+      if (realDir !== realBackend && !realDir.startsWith(realBackend + path.sep)) {
+        throw new Error(`refusing to materialize ${relPath} for test discovery — its directory resolves to ${realDir}, outside backend/ (${realBackend}), likely via a symlink in its ancestry. Writing there would escape the repository.`);
+      }
       writeFileSync(absPath, content);
       revert.push(hadLocalContent
         ? () => writeFileSync(absPath, localContent)

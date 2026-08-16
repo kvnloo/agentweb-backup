@@ -9,7 +9,7 @@ import {
   classifyChangedFiles,
   selectJestSuites,
   evaluateListTestsResult,
-  parseDiffNameStatus,
+  parseDiffRaw,
   mergeStatusByPathAcrossRefs,
 } from './logic.mjs';
 
@@ -213,78 +213,101 @@ test('evaluateListTestsResult: a spurious non-.test.ts line in stdout is filtere
   assert.deepEqual(result.suites, ['/repo/backend/src/__tests__/fooService.test.ts']);
 });
 
-// ENG-1277 / Greptile P1 #3: classification must come from git (this parser), never
-// from the filesystem — an uncommitted file sitting at a git-deleted path must not
-// be able to make that path look "still there".
+// ENG-1277 / Greptile P1 #3, #5: classification must come from git (this parser),
+// never from the filesystem — an uncommitted file sitting at a git-deleted path
+// must not be able to make that path look "still there" — and must carry the
+// blob hash, not just a status letter, so two refs that both show `M` on a path
+// but leave different content there can still be told apart.
 
-test('parseDiffNameStatus: parses Added/Modified/Deleted lines', () => {
-  const out = 'A\tbackend/src/newFile.ts\nM\tbackend/src/changed.ts\nD\tbackend/src/removed.ts\n';
-  assert.deepEqual(parseDiffNameStatus(out), {
-    'backend/src/newFile.ts': 'A',
-    'backend/src/changed.ts': 'M',
-    'backend/src/removed.ts': 'D',
+test('parseDiffRaw: parses Added/Modified/Deleted raw lines with blob hashes', () => {
+  const out = [
+    ':000000 100644 0000000000000000000000000000000000000000 aaa1111 A\tbackend/src/newFile.ts',
+    ':100644 100644 bbb2222 bbb3333 M\tbackend/src/changed.ts',
+    ':100644 000000 ccc4444 0000000000000000000000000000000000000000 D\tbackend/src/removed.ts',
+    '',
+  ].join('\n');
+  assert.deepEqual(parseDiffRaw(out), {
+    'backend/src/newFile.ts': { status: 'A', blob: 'aaa1111' },
+    'backend/src/changed.ts': { status: 'M', blob: 'bbb3333' },
+    'backend/src/removed.ts': { status: 'D', blob: '0000000000000000000000000000000000000000' },
   });
 });
 
-test('parseDiffNameStatus: empty output -> empty map', () => {
-  assert.deepEqual(parseDiffNameStatus(''), {});
-  assert.deepEqual(parseDiffNameStatus(null), {});
+test('parseDiffRaw: empty output -> empty map', () => {
+  assert.deepEqual(parseDiffRaw(''), {});
+  assert.deepEqual(parseDiffRaw(null), {});
 });
 
-test('parseDiffNameStatus: blank lines are skipped', () => {
-  const out = 'A\tbackend/src/a.ts\n\nM\tbackend/src/b.ts\n\n';
-  assert.deepEqual(parseDiffNameStatus(out), {
-    'backend/src/a.ts': 'A',
-    'backend/src/b.ts': 'M',
-  });
+test('parseDiffRaw: non-raw lines (blank, or anything not starting with ":") are skipped', () => {
+  const out = ':000000 100644 0000000000000000000000000000000000000000 aaa1111 A\tbackend/src/a.ts\n\nsome unrelated line\n';
+  assert.deepEqual(parseDiffRaw(out), { 'backend/src/a.ts': { status: 'A', blob: 'aaa1111' } });
 });
 
-test('parseDiffNameStatus: a path containing a tab character is preserved after the first tab', () => {
-  // Pathological but shouldn't corrupt parsing: only the FIRST tab separates status from path.
-  const out = 'M\tbackend/src/weird\tname.ts\n';
-  assert.deepEqual(parseDiffNameStatus(out), { 'backend/src/weird\tname.ts': 'M' });
+test('parseDiffRaw: a path containing a tab character is preserved after the first tab', () => {
+  // Pathological but shouldn't corrupt parsing: only the FIRST tab separates the meta columns from the path.
+  const out = ':100644 100644 bbb2222 bbb3333 M\tbackend/src/weird\tname.ts';
+  assert.deepEqual(parseDiffRaw(out), { 'backend/src/weird\tname.ts': { status: 'M', blob: 'bbb3333' } });
 });
 
-// ENG-1277 / Greptile P1 #4: a single `git push` can push multiple refs at once;
-// their per-ref status maps must never be merged via silent last-write-wins.
+// ENG-1277 / Greptile P1 #4, #5: a single `git push` can push multiple refs at
+// once; their per-ref {status, blob} maps must never be merged via silent
+// last-write-wins, and matching STATUS letters alone must not be read as
+// agreement — the blob hash is the real proof two refs produce the same content.
 
 test('mergeStatusByPathAcrossRefs: single ref, no conflicts possible -> ok', () => {
   const result = mergeStatusByPathAcrossRefs([
-    { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' },
+    { 'backend/src/a.ts': { status: 'M', blob: 'aaa' }, 'backend/src/b.ts': { status: 'D', blob: ZERO } },
   ]);
   assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' } });
 });
 
 test('mergeStatusByPathAcrossRefs: two refs touching disjoint paths -> ok, union', () => {
   const result = mergeStatusByPathAcrossRefs([
-    { 'backend/src/a.ts': 'M' },
-    { 'backend/src/b.ts': 'D' },
+    { 'backend/src/a.ts': { status: 'M', blob: 'aaa' } },
+    { 'backend/src/b.ts': { status: 'D', blob: ZERO } },
   ]);
   assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M', 'backend/src/b.ts': 'D' } });
 });
 
-test('mergeStatusByPathAcrossRefs: two refs agreeing on the same path/status -> ok, not a conflict', () => {
+test('mergeStatusByPathAcrossRefs: two refs agreeing on the same path/status/blob -> ok, not a conflict', () => {
   const result = mergeStatusByPathAcrossRefs([
-    { 'backend/src/a.ts': 'M' },
-    { 'backend/src/a.ts': 'M' },
+    { 'backend/src/a.ts': { status: 'M', blob: 'aaa' } },
+    { 'backend/src/a.ts': { status: 'M', blob: 'aaa' } },
   ]);
   assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/a.ts': 'M' } });
 });
 
 test('mergeStatusByPathAcrossRefs: two refs assigning DIFFERENT statuses to the same path -> refused, not silently merged', () => {
   const result = mergeStatusByPathAcrossRefs([
-    { 'backend/src/a.ts': 'M', 'backend/src/shared.ts': 'D' },
-    { 'backend/src/shared.ts': 'M', 'backend/src/c.ts': 'A' },
+    { 'backend/src/a.ts': { status: 'M', blob: 'aaa' }, 'backend/src/shared.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/shared.ts': { status: 'M', blob: 'ddd' }, 'backend/src/c.ts': { status: 'A', blob: 'ccc' } },
   ]);
   assert.equal(result.ok, false);
   assert.deepEqual(result.conflictingPaths, ['backend/src/shared.ts']);
 });
 
+test('mergeStatusByPathAcrossRefs: SAME status but DIFFERENT blob on the same path -> refused (Greptile P1 #5 — this is the case a status-only compare would miss)', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/shared.ts': { status: 'M', blob: 'version-one' } },
+    { 'backend/src/shared.ts': { status: 'M', blob: 'version-two' } },
+  ]);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.conflictingPaths, ['backend/src/shared.ts']);
+});
+
+test('mergeStatusByPathAcrossRefs: two refs that both DELETE the same path trivially agree (both blobs are the zero hash)', () => {
+  const result = mergeStatusByPathAcrossRefs([
+    { 'backend/src/gone.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/gone.ts': { status: 'D', blob: ZERO } },
+  ]);
+  assert.deepEqual(result, { ok: true, statusByPath: { 'backend/src/gone.ts': 'D' } });
+});
+
 test('mergeStatusByPathAcrossRefs: three refs, only one conflicting path is reported, not the whole set', () => {
   const result = mergeStatusByPathAcrossRefs([
-    { 'backend/src/a.ts': 'M', 'backend/src/x.ts': 'D' },
-    { 'backend/src/b.ts': 'A', 'backend/src/x.ts': 'D' },
-    { 'backend/src/c.ts': 'M', 'backend/src/x.ts': 'M' },
+    { 'backend/src/a.ts': { status: 'M', blob: 'a1' }, 'backend/src/x.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/b.ts': { status: 'A', blob: 'b1' }, 'backend/src/x.ts': { status: 'D', blob: ZERO } },
+    { 'backend/src/c.ts': { status: 'M', blob: 'c1' }, 'backend/src/x.ts': { status: 'M', blob: 'x1' } },
   ]);
   assert.equal(result.ok, false);
   assert.deepEqual(result.conflictingPaths, ['backend/src/x.ts']);

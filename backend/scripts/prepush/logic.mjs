@@ -25,56 +25,71 @@ export function isBackendPath(filePath, prefixes = BACKEND_PREFIXES) {
 }
 
 /**
- * Parse `git diff --no-renames --name-status --diff-filter=AMD <a>..<b>` output into
- * a {path: status} map — the single source of truth for "is this path part of the
- * push, and as what kind of change" (Greptile P1 #3, ENG-1277 pre-push hook). The
- * caller previously asked the FILESYSTEM (`existsSync`) whether a path was deleted,
- * which answers a different question than the one that matters: whether the pushed
- * COMMIT deletes it. An uncommitted file sitting at the same path (leftover
- * scratch work, a stale editor artifact, anything not part of this push) made
- * `existsSync` say "still exists" for a path git says is gone, silently routing
- * around the deletion-discovery fix entirely. `--no-renames` guarantees every line
- * is a plain "STATUS<TAB>path" pair (a rename becomes an independent D + A rather
- * than one R entry spanning two paths), so parsing never special-cases a two-path
- * line — treating a rename's old path as deleted and its new path as added is
- * exactly the semantics this hook wants.
+ * Parse `git diff --no-renames --raw --diff-filter=AMD <a>..<b>` output — lines of
+ * the form `:<old-mode> <new-mode> <old-blob> <new-blob> <status><TAB>path` — into
+ * a {path: {status, blob}} map. `blob` is the NEW blob's SHA (all-zeros for a
+ * deletion, matching git's own convention — two refs that both delete the same
+ * path trivially produce the same all-zero blob, so they correctly never conflict
+ * without any special-casing). This is the single source of truth for "is this
+ * path part of the push, as what kind of change, and resulting in what content"
+ * (Greptile P1 #3 and #5, ENG-1277 pre-push hook):
+ *   - #3: the caller previously asked the FILESYSTEM (`existsSync`) whether a path
+ *     was deleted, which answers a different question than whether the pushed
+ *     COMMIT deletes it — an uncommitted file sitting at the same path made
+ *     `existsSync` say "still exists" for a path git says is gone.
+ *   - #5: a plain status letter (`M`) is not enough to tell whether two refs that
+ *     both "modify" the same path actually agree — they could produce entirely
+ *     different content while both showing `M`. The blob hash is git's own
+ *     content-addressed proof of exactly what a ref leaves at that path; two refs
+ *     agree on a path if and only if they produce the same blob there.
+ * `--no-renames` guarantees every line is a plain single-path record (a rename
+ * becomes an independent D + A rather than one R entry spanning two paths), so
+ * parsing never special-cases a two-path line — treating a rename's old path as
+ * deleted and its new path as added is exactly the semantics this hook wants.
  */
-export function parseDiffNameStatus(output) {
+export function parseDiffRaw(output) {
   const result = {};
   for (const line of (output || '').split('\n')) {
-    if (!line) continue;
+    if (!line || line[0] !== ':') continue;
     const tab = line.indexOf('\t');
     if (tab === -1) continue;
-    result[line.slice(tab + 1)] = line[0];
+    const meta = line.slice(1, tab).trim().split(/\s+/);
+    if (meta.length < 5) continue;
+    const [, , , newBlob, status] = meta;
+    result[line.slice(tab + 1)] = { status: status[0], blob: newBlob };
   }
   return result;
 }
 
 /**
- * Merge the per-ref {path: status} maps from `changedFilesForRefs` (one map per
- * pushed ref — a single `git push` can push several refs at once) into a single
- * {path: status} map, detecting when the SAME path has DIFFERENT statuses across
- * different refs (Greptile P1 #4, ENG-1277 pre-push hook). This hook verifies
- * against ONE shared working tree — it cannot check two different versions of the
- * same path at once — so a plain last-write-wins merge (the previous
- * `Object.assign`) would silently apply whichever ref happened to be processed
- * last to BOTH refs' verification: either failing a valid push because a path one
- * ref modified looks deleted per the other ref, or discovering related tests from
- * stale pre-deletion content instead of the actually-changed content, letting
- * affected suites go unrun. Returns `{ok:false, conflictingPaths}` rather than
- * guessing, so the caller can fail loud instead of silently picking a version.
+ * Merge the per-ref {path: {status, blob}} maps from `changedFilesForRefs` (one
+ * map per pushed ref — a single `git push` can push several refs at once) into a
+ * single {path: status} map, detecting when the SAME path resolves to a DIFFERENT
+ * status OR a DIFFERENT resulting blob across different refs (Greptile P1 #4 and
+ * #5, ENG-1277 pre-push hook). This hook verifies against ONE shared working
+ * tree — it cannot check two different versions of the same path at once — so a
+ * plain last-write-wins merge (the original `Object.assign`) would silently apply
+ * whichever ref happened to be processed last to BOTH refs' verification: failing
+ * a valid push because a path one ref modified looks deleted per the other ref,
+ * discovering related tests from stale content instead of the actually-changed
+ * content, or — the narrower #5 case — accepting two refs that both show `M` on a
+ * path while actually producing different content, since a status-only compare
+ * can't tell those apart. Comparing the blob hash closes that gap: two refs that
+ * genuinely agree on a path always produce the identical blob for it. Returns
+ * `{ok:false, conflictingPaths}` rather than guessing, so the caller can fail loud
+ * instead of silently picking a version.
  */
 export function mergeStatusByPathAcrossRefs(perRefMaps) {
-  const statusesByPath = {};
+  const seenByPath = {};
   for (const map of perRefMaps) {
-    for (const [p, status] of Object.entries(map)) {
-      (statusesByPath[p] ??= new Set()).add(status);
+    for (const [p, entry] of Object.entries(map)) {
+      (seenByPath[p] ??= new Map()).set(`${entry.status}:${entry.blob}`, entry.status);
     }
   }
-  const conflictingPaths = Object.keys(statusesByPath).filter((p) => statusesByPath[p].size > 1);
+  const conflictingPaths = Object.keys(seenByPath).filter((p) => seenByPath[p].size > 1);
   if (conflictingPaths.length) return { ok: false, conflictingPaths };
   const statusByPath = {};
-  for (const p of Object.keys(statusesByPath)) statusByPath[p] = [...statusesByPath[p]][0];
+  for (const p of Object.keys(seenByPath)) statusByPath[p] = [...seenByPath[p].values()][0];
   return { ok: true, statusByPath };
 }
 
