@@ -30,6 +30,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: jest.fn(),
     resolveAccountIdWithSource: jest.fn(),
+    listUserOwnedUnipileAccountIds: jest.fn().mockResolvedValue([]),
     isAccountConnected: jest.fn().mockResolvedValue(true),
     probeAccountSession: jest.fn().mockResolvedValue('connected'),
     clearStatusCache: jest.fn(),

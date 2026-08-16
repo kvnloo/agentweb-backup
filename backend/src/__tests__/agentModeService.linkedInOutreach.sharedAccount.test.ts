@@ -14,15 +14,26 @@ jest.mock('../services/unipileProfileServiceFactory', () => ({
   getUnipileProfileService: jest.fn(),
 }));
 
+jest.mock('../services/unipileCompanyServiceFactory', () => ({
+  getUnipileCompanyService: jest.fn(),
+}));
+
+jest.mock('../services/unipileSearchParamServiceFactory', () => ({
+  getUnipileSearchParamService: jest.fn(),
+}));
+
+const mockGetConnection = jest.fn().mockResolvedValue(null);
 jest.mock('../services/unipileConnectionsDb', () => ({
-  getConnectionByProfileUrlAndAccount: jest.fn().mockResolvedValue(null),
+  getConnectionByProfileUrlAndAccount: (...args: any[]) => mockGetConnection(...args),
 }));
 
 const mockResolveAccountIdWithSource = jest.fn();
+const mockListUserOwnedUnipileAccountIds = jest.fn().mockResolvedValue([]);
 const mockSearchPeople = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
+    listUserOwnedUnipileAccountIds: (...args: any[]) => mockListUserOwnedUnipileAccountIds(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     isAccountConnected: jest.fn().mockResolvedValue(true),
     probeAccountSession: jest.fn().mockResolvedValue('connected'),
@@ -37,8 +48,12 @@ jest.mock('../services/gmailService', () => ({ gmailService: { sendEmail: jest.f
 
 import { AgentModeService } from '../services/agentModeService';
 import * as unipileProfileServiceFactory from '../services/unipileProfileServiceFactory';
+import * as unipileCompanyServiceFactory from '../services/unipileCompanyServiceFactory';
+import * as unipileSearchParamServiceFactory from '../services/unipileSearchParamServiceFactory';
 
 const mockGetService = unipileProfileServiceFactory.getUnipileProfileService as jest.Mock;
+const mockGetCompanyService = unipileCompanyServiceFactory.getUnipileCompanyService as jest.Mock;
+const mockGetSearchParamService = unipileSearchParamServiceFactory.getUnipileSearchParamService as jest.Mock;
 
 describe('AgentModeService.linkedinOutreach — shared-account fallback disclosure (ENG-1198)', () => {
   let service: AgentModeService;
@@ -118,8 +133,9 @@ describe('AgentModeService.linkedinOutreach — shared-account fallback disclosu
       expect(result.data.items[0].public_identifier).toBe('jsmith');
     });
 
-    it('passes explicit account_id straight through without calling the fallback resolver', async () => {
+    it('passes explicit account_id straight through without calling the fallback resolver, but still checks ownership', async () => {
       mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue(['explicit-acct']);
 
       const result = await service.linkedinOutreach(userId, {
         action: 'search-people',
@@ -128,7 +144,23 @@ describe('AgentModeService.linkedinOutreach — shared-account fallback disclosu
       });
 
       expect(mockResolveAccountIdWithSource).not.toHaveBeenCalled();
+      expect(mockListUserOwnedUnipileAccountIds).toHaveBeenCalledWith(userId);
       expect(result.data.usedSharedAccount).toBe(false);
+    });
+
+    it('flags usedSharedAccount:true when the explicit account_id is not one of the user\'s own accounts (e.g. an echoed-back sharedAccountId)', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockListUserOwnedUnipileAccountIds.mockResolvedValue(['own-acct-1']);
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-people',
+        account_id: 'shared-acct-1',
+        keywords: 'marketing',
+      });
+
+      expect(mockResolveAccountIdWithSource).not.toHaveBeenCalled();
+      expect(result.data.usedSharedAccount).toBe(true);
+      expect(result.data.sharedAccountId).toBe('shared-acct-1');
     });
   });
 
@@ -166,6 +198,114 @@ describe('AgentModeService.linkedinOutreach — shared-account fallback disclosu
       expect(result.data.usedSharedAccount).toBe(false);
       expect(result.data).not.toHaveProperty('sharedAccountId');
       expect(result.data.network_distance).toBe('THIRD_DEGREE');
+    });
+
+    it('omits is_relationship/connected_at (and skips the connection lookup) when the fallback resolved a site-wide account', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'shared-acct-1', usedSharedAccount: true });
+      mockGetConnection.mockResolvedValue({ accountId: 'shared-acct-1', connectedAt: 1780960142000 });
+      stubProfile({ public_identifier: 'jsmith', first_name: 'J' }, true);
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'get-profile',
+        profile_url: 'https://www.linkedin.com/in/jsmith',
+      });
+
+      expect(result.success).toBe(true);
+      // A shared account's connection state belongs to a stranger, not this
+      // user — must not be reconciled/returned as "already connected/pending".
+      expect(mockGetConnection).not.toHaveBeenCalled();
+      expect(result.data).not.toHaveProperty('is_relationship');
+      expect(result.data).not.toHaveProperty('connected_at');
+    });
+
+    it('flags anonymized:true and drops the fabricated /in/undefined URL when public_identifier is the literal string "undefined"', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      stubProfile({
+        public_identifier: 'undefined',
+        public_profile_url: 'https://www.linkedin.com/in/undefined',
+        first_name: 'Anon',
+      }, false);
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'get-profile',
+        provider_id: 'ACoAAA-anon',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.anonymized).toBe(true);
+      expect(result.data).not.toHaveProperty('public_profile_url');
+    });
+  });
+
+  describe('get-company', () => {
+    function stubCompany(rawData: any) {
+      mockGetCompanyService.mockReturnValue({
+        getCompany: jest.fn().mockResolvedValue({ rawData }),
+      });
+    }
+
+    it('flags usedSharedAccount + sharedAccountId when the fallback resolved a site-wide account', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'shared-acct-1', usedSharedAccount: true });
+      stubCompany({ name: 'Acme Inc', industry: 'Software' });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'get-company',
+        company_id: 'acme',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.usedSharedAccount).toBe(true);
+      expect(result.data.sharedAccountId).toBe('shared-acct-1');
+    });
+
+    it('does not flag usedSharedAccount when the user\'s own account was used', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      stubCompany({ name: 'Acme Inc', industry: 'Software' });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'get-company',
+        company_id: 'acme',
+      });
+
+      expect(result.data.usedSharedAccount).toBe(false);
+      expect(result.data).not.toHaveProperty('sharedAccountId');
+    });
+  });
+
+  describe('search-parameters', () => {
+    function stubResolve(resolveResult: any) {
+      mockGetSearchParamService.mockReturnValue({
+        resolve: jest.fn().mockResolvedValue(resolveResult),
+      });
+    }
+
+    it('flags usedSharedAccount + sharedAccountId when the fallback resolved a site-wide account', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'shared-acct-1', usedSharedAccount: true });
+      stubResolve({ candidates: [{ id: 'co_1', title: 'Acme' }], fromCache: false, source: 'api' });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-parameters',
+        type: 'COMPANY',
+        keywords: 'Acme',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.usedSharedAccount).toBe(true);
+      expect(result.data.sharedAccountId).toBe('shared-acct-1');
+    });
+
+    it('does not flag usedSharedAccount when the user\'s own account was used', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      stubResolve({ candidates: [{ id: 'co_1', title: 'Acme' }], fromCache: false, source: 'api' });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-parameters',
+        type: 'COMPANY',
+        keywords: 'Acme',
+      });
+
+      expect(result.data.usedSharedAccount).toBe(false);
+      expect(result.data).not.toHaveProperty('sharedAccountId');
     });
   });
 });

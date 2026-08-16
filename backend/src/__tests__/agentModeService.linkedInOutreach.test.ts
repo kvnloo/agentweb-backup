@@ -31,6 +31,7 @@ const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
 const mockResolveAccountIdWithSource = jest.fn();
+const mockListUserOwnedUnipileAccountIds = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
@@ -46,6 +47,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
     resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
+    listUserOwnedUnipileAccountIds: (...args: any[]) => mockListUserOwnedUnipileAccountIds(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
@@ -129,6 +131,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // Default: the account CAN search, so a zero-result search is a real
     // no-match and the ENG-975 guard stays out of the way.
     mockProbeSearchCapability.mockResolvedValue('ok');
+    // Default: an explicitly-passed account_id is the user's own (ENG-1198
+    // usedSharedAccount determination for read actions).
+    mockListUserOwnedUnipileAccountIds.mockResolvedValue(['test-account-id']);
   });
 
   describe('send-message', () => {
@@ -1103,6 +1108,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         ],
         fromCache: true,
         source: 'cache',
+        usedSharedAccount: false,
       });
     });
 
