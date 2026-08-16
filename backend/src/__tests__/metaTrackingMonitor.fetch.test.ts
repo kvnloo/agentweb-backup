@@ -222,3 +222,74 @@ describe('fetchDailyAdAccountActivity — objective filtering (2026-08-16)', () 
     expect(result.unknownObjectives).toEqual(['OUTCOME_INVENTED_2027']);
   });
 });
+
+describe('fetchDailyAdAccountActivity — pagination', () => {
+  const page = (rows: any[], next?: string) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: rows, ...(next ? { paging: { next } } : {}) }),
+  });
+  const row = (date: string, objective: string, spend: number, leads = 0) => ({
+    date_start: date, objective, spend: String(spend),
+    ...(leads ? { actions: [{ action_type: 'lead', value: String(leads) }] } : {}),
+  });
+
+  it('follows paging.next — campaign level crosses page boundaries that account level did not', async () => {
+    // Switching from level=account (7 rows for a week) to level=campaign multiplies rows by
+    // the campaign count, so a real account spills past Meta's page size. Reading only the
+    // first page silently drops spend AND conversions, producing a wrong verdict either
+    // way. Greptile P1 on #2420.
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 100, 2)], 'https://next-page'))
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 50, 3)]));
+
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(result.days).toHaveLength(1);
+    expect(result.days[0].spend).toBe(150);
+    expect(result.days[0].conversions).toBe(5);
+  });
+
+  it('merges days that arrive split across pages', async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(page([row('2026-08-13', 'OUTCOME_LEADS', 10)], 'https://n'))
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 20)]));
+
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+    expect(result.days.map((d: any) => d.date)).toEqual(['2026-08-13', '2026-08-14']);
+  });
+
+  it('carries excluded objectives across pages', async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_ENGAGEMENT', 10)], 'https://n'))
+      .mockResolvedValueOnce(page([row('2026-08-14', 'LINK_CLICKS', 20)]));
+
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+    expect(result.excludedObjectives!.sort()).toEqual(['LINK_CLICKS', 'OUTCOME_ENGAGEMENT']);
+  });
+
+  it('stops at a page bound rather than following a pathological loop', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue(page([row('2026-08-14', 'OUTCOME_LEADS', 1)], 'https://forever'));
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+    expect(fetchImpl.mock.calls.length).toBeLessThanOrEqual(25);
+    expect(result.status).toBe('ok');
+  });
+
+  it('a failure on a LATER page discards the whole read rather than reporting a partial one', async () => {
+    // A partial window looks exactly like reduced spend, which is a wrong verdict rather
+    // than a missing one. Same discipline as the coverage walk.
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce(page([row('2026-08-14', 'OUTCOME_LEADS', 100, 5)], 'https://n'))
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ error: { message: 'boom', code: 1 } }) });
+
+    const result = await fetchDailyAdAccountActivity('1', 't', 7, { fetchImpl } as any);
+
+    expect(result.status).toBe('fetch_error');
+    expect(result.days).toEqual([]);
+  });
+});
