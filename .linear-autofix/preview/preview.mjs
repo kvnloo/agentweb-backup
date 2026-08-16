@@ -17,6 +17,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
+import { runUnderBuildLock, BuildLockTimeoutError } from '../build-lock.mjs';
 import { atConcurrentPreviewCap, runningPreviewIds } from './policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -211,10 +212,20 @@ async function up(bugRaw, worktreeRaw) {
       env.VITE_API_URL = stripSlash(urls.api);
       // `npx vite build` (not `npm run build`) so a portal build script's `tsc &&` prefix can't
       // block the preview; the deterministic tsc check in autofix.mjs covers type errors.
-      // flock serializes heavy builds MACHINE-WIDE (same lock as autofix's checks): concurrent
-      // vite builds + a verify browser saturated the 4-vCPU runner to the point sshd starved.
+      // Serializes heavy builds MACHINE-WIDE (same lock as autofix's checks): concurrent vite builds +
+      // a verify browser saturated the 4-vCPU runner to the point sshd starved. Reentrant (ENG-1016):
+      // if THIS call is itself already running under an outer `flock /tmp/aw-heavy-build.lock …`
+      // (e.g. an agent wrapped the whole `preview.mjs up` invocation), runUnderBuildLock detects that
+      // ancestor and runs the build directly instead of re-locking — a second flock here would block
+      // forever on a lock its own parent holds. Bounded: a real, unrelated 15-minute wait fails loudly
+      // with a named timeout instead of hanging the box forever.
       console.log(`[preview] building ${svc.name} (one-time, no watchers; queued on the build lock)...`);
-      const b = spawnSync('flock', ['/tmp/aw-heavy-build.lock', 'npx', 'vite', 'build'], { cwd, env, stdio: ['ignore', out, out] });
+      let b;
+      try { b = runUnderBuildLock('npx', ['vite', 'build'], { cwd, env, stdio: ['ignore', out, out] }); }
+      catch (e) {
+        if (e instanceof BuildLockTimeoutError) { console.log(`[preview] WARNING: ${svc.name} build lock timed out — ${e.message}`); b = { status: 1 }; }
+        else throw e;
+      }
       if (b.status !== 0) console.log(`[preview] WARNING: ${svc.name} build failed — check ${LOGS}/${bug}-${svc.name}.log`);
       // #13: allocate the port AFTER the (minutes-long) build, immediately before spawning — not
       // up-front — so it isn't reserved-then-released across the whole build, the window during which

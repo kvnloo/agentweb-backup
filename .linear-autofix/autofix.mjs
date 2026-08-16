@@ -19,6 +19,7 @@ import { acquireLock, releaseLock } from './lock.mjs';
 import { gitRepoOp } from './repo-lock.mjs';
 import { admissionWithdrawal, signalSuppressionVerdict } from './admission.mjs';
 import { isAlreadyProcessed, MAX_SETUP_ATTEMPTS } from './processed-gate.mjs';
+import { runUnderBuildLock, BuildLockTimeoutError } from './build-lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -973,7 +974,15 @@ export function runChecks(WT, changed) {
       const tsc = bin(dir, 'tsc');
       // Serialized with preview vite builds via the same lock: concurrent 4GB tsc + builds +
       // a verify browser saturate the 4-vCPU runner (sshd starves). Timeout covers lock wait.
-      const r = spawnSync('flock', ['/tmp/aw-heavy-build.lock', tsc.cmd, ...tsc.args, '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: (config.checks?.tscTimeoutMs || 300000) + 10 * 60 * 1000 });
+      // Reentrant (ENG-1016): runUnderBuildLock skips re-locking if an ancestor already holds this
+      // exact lock, instead of self-deadlocking against it.
+      let r;
+      try {
+        r = runUnderBuildLock(tsc.cmd, [...tsc.args, '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: (config.checks?.tscTimeoutMs || 300000) + 10 * 60 * 1000 });
+      } catch (e) {
+        if (e instanceof BuildLockTimeoutError) r = { status: 1, error: e, stdout: '', stderr: e.message };
+        else throw e;
+      }
       results.push(checkResult(`npx tsc --noEmit (${pkg})`, r));
     }
     if (pkg === 'backend') {
