@@ -27,7 +27,7 @@ import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import { usageSnapshot } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
-import { validateHandoff, handoffDoc, handoffPrompt, prRef } from './handoff.mjs';
+import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, prRef } from './handoff.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped, assigneeBranchPrefix, kebab,
@@ -510,8 +510,8 @@ function standaloneChatPrompt(entry, cwd, message, history = '') {
   return `You are a coding assistant in a STANDALONE chat — not tied to any tracked issue. It's a normal, full-capability session (like Claude Code): read/edit code, run commands, use git and \`gh\`, open and manage PRs — whatever the developer asks.
 Chat title: "${entry.title || 'New chat'}".${entry.assignee ? `\nYou are acting on behalf of ${entry.assignee.name} — git commits, GitHub PRs, and Linear actions all use their identity/credentials.` : ''}
 If the developer indicates a DIFFERENT person is now working (e.g. "this is Anurag now", "Manan here", "I'm taking over"), acknowledge it and end your reply with a line containing exactly: [[OWNER: <their first name or email>]] — from the next turn on, THEIR GitHub PAT and Linear key are used and the label updates.
-You are in a dedicated git worktree at ${cwd} on branch \`${entry.branch}\` (a fresh branch off main); the main repo is at the root and customer-portal is nested. There is NO autofix pipeline here and commits are NOT auto-pushed — push or open PRs yourself when asked (any PR you open is auto-detected and shown to the developer).
-To CLOSE this chat and delete its workspace when the developer asks, end your reply with a line containing exactly: [[CLOSE_CHAT]]
+You are in a dedicated git worktree at ${cwd} on branch ${workspaceLines(entry, cwd).branchDesc}; the main repo is at the root and customer-portal is nested. There is NO autofix pipeline here and commits are NOT auto-pushed — push or open PRs yourself when asked (any PR you open is auto-detected and shown to the developer).
+${workspaceLines(entry, cwd).closeLine}
 ${history}
 Developer's message: ${message}`;
 }
@@ -1429,7 +1429,14 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       // over. Applied now, so the NEXT turn uses THEIR git identity + GitHub PAT + Linear key.
       const om = txt.match(/\[\[OWNER:\s*([^\]]+)\]\]/i);
       if (om) { const r = setChatOwner(identifier, om[1].trim()); if (r.code === 200) emit({ type: 'owner_changed', ownerName: r.body.ownerName }); }
-      if (/\[\[CLOSE_CHAT\]\]/.test(txt)) closeRequested = true;
+      // A handoff chat may never close itself, and this is the guard — the prompt merely explains it.
+      // Closing removes the worktree and `git branch -D`s the branch, which on a handoff is the
+      // developer's real feature branch, and it destroys the record of how the merge went. Only the
+      // developer deletes one, from the UI. An emitted marker here is ignored and logged, not obeyed.
+      if (/\[\[CLOSE_CHAT\]\]/.test(txt)) {
+        if (entry.handoff) log(`${identifier}: ignoring [[CLOSE_CHAT]] — a handoff chat is only ever deleted by the developer`);
+        else closeRequested = true;
+      }
     }
     if (cap === 'full' && cwd !== agentRoot && !entry.standalone) {
       const changed = detectChangedRepos(cwd);

@@ -89,6 +89,28 @@ export function handoffDoc({ title, prUrls = [], branch, author, context, at }) 
   ].join('\n');
 }
 
+// How a standalone chat's workspace and lifetime are described to it. A handoff differs from an
+// ordinary chat on both counts:
+//
+//   - its branch is the DEVELOPER'S branch with their pushed work and an open PR, not a fresh one cut
+//     off main, and telling the agent otherwise is simply false;
+//   - it must never close itself. [[CLOSE_CHAT]] removes the worktree and `git branch -D`s the branch,
+//     which here is the developer's real feature branch — and the chat is also the record of how the
+//     merge went, which they may want to read afterwards. Finishing the merge is NOT a reason to tidy
+//     up. Deletion is the developer's call, from the UI, whenever they decide.
+export function workspaceLines(entry, cwd) {
+  if (entry?.handoff) {
+    return {
+      branchDesc: `\`${entry.branch}\` — the developer's own branch, which you did not create: it already carries their finished, pushed work and an open PR`,
+      closeLine: 'This chat and its worktree belong to the developer. Do NOT close it, do NOT delete the workspace, and do NOT delete the branch — not when the PR is merged, not when the deploy is verified, not ever. There is no self-close marker in this chat. The developer removes it from the autofix UI when they are done reading it.',
+    };
+  }
+  return {
+    branchDesc: `\`${entry?.branch}\` (a fresh branch off main)`,
+    closeLine: 'To CLOSE this chat and delete its workspace when the developer asks, end your reply with a line containing exactly: [[CLOSE_CHAT]]',
+  };
+}
+
 // The seeded first turn. This runs as a promptOverride PREFIX to the existing mergeMsg, so the proven
 // Greptile/CI/merge instructions are untouched — this only establishes whose work it is and why the
 // agent is holding it.
