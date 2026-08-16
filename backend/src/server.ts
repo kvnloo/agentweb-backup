@@ -763,19 +763,57 @@ createTestAccount().then(async () => {
       // stopped accepting. Both failures are SILENT by nature — nothing errors, leads
       // simply stop arriving — so only a clock can notice them. RankAI's tracking was
       // reported fixed three times without an end-to-end check and nobody caught it.
+      // Anchored to 09:00 UTC rather than a 24h interval, and with NO run on boot.
+      //
+      // A 24h setInterval never elapses here: PRs merge every 1-2 hours, each merge
+      // restarts the process, and the interval resets — so an interval-based daily cron is
+      // really "runs on every boot". This one did exactly that, re-alerting on every
+      // deploy because its in-memory dedupe reset too (observed 2026-08-16: three sweeps
+      // in eleven hours). Anchoring to a wall-clock hour makes restarts free — every boot
+      // re-arms the SAME target, so it fires once a day however often we deploy.
+      // Same shape as the activation cron above; the arithmetic lives in dailySchedule.
       try {
         const { runMetaTrackingMonitor } = await import('./cron/metaTrackingMonitorCron');
-        const TRACKING_MONITOR_INTERVAL_MS = 24 * 60 * 60 * 1000;
-        cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
-          .catch(e => console.error('[metaTrackingMonitorCron] Error on first run:', e));
-        setInterval(() => {
+        const { msUntilNextUtcHour } = await import('./utils/dailySchedule');
+        const TRACKING_MONITOR_HOUR_UTC = 9;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const msUntilFirstRun = msUntilNextUtcHour(TRACKING_MONITOR_HOUR_UTC);
+        setTimeout(() => {
           if (!isCronEnabled()) return;
           cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
             .catch(e => console.error('[metaTrackingMonitorCron] Error:', e));
-        }, TRACKING_MONITOR_INTERVAL_MS);
-        console.log('[metaTrackingMonitorCron] Initialized — running daily');
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('metaTrackingMonitorCron', runMetaTrackingMonitor())
+              .catch(e => console.error('[metaTrackingMonitorCron] Error:', e));
+          }, DAY_MS);
+        }, msUntilFirstRun);
+        console.log(
+          `[metaTrackingMonitorCron] Initialized — first run at ${TRACKING_MONITOR_HOUR_UTC}:00 UTC ` +
+          `(in ${Math.round(msUntilFirstRun / 60000)} min)`,
+        );
       } catch (error) {
         console.error('[metaTrackingMonitorCron] Failed to initialize:', error);
+      }
+
+      // Pre-Renewal Ad-Integration Health Check (ENG-1270) — runs daily.
+      // Charging a customer while their ad platform connection is silently dead
+      // is a trust break (ThinkingAI, TransAmerica — Aug 2026 audit, both caught
+      // manually). Flags active-subscription users renewing within the lookahead
+      // window whose ad integration is missing/expired via a deduped oncall alert.
+      try {
+        const { runRenewalIntegrationHealthCheck } = await import('./cron/renewalIntegrationHealthCron');
+        const RENEWAL_HEALTH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+          .catch(e => console.error('[renewalIntegrationHealthCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('renewalIntegrationHealthCron', runRenewalIntegrationHealthCheck())
+            .catch(e => console.error('[renewalIntegrationHealthCron] Error:', e));
+        }, RENEWAL_HEALTH_INTERVAL_MS);
+        console.log('[renewalIntegrationHealthCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
       }
 
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15

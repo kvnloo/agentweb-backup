@@ -160,7 +160,9 @@ case "$operation" in
     ;;
 
   describe-environment-resources)
-    if printf '%s' "$query" | grep -qF 'AutoScalingGroups'; then
+    # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+    # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+    if grep -qF 'AutoScalingGroups' <<<"$query"; then
       cat "${MOCK_DIR}/asg_name" 2>/dev/null || printf 'awseb-e-test-stack-AWSEBAutoScalingGroup-test\n'
       exit 0
     fi
@@ -309,7 +311,14 @@ check() {
     return
   fi
 
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: here-string, not a pipe. Under `set -o pipefail` (line 15),
+  # `grep -q` exiting early on the first match can SIGPIPE the upstream
+  # printf, and pipefail then reports THAT nonzero for the whole pipeline even
+  # though grep genuinely matched — a race that passes locally most of the
+  # time and fails intermittently (this is very likely the root cause of the
+  # local 1-in-5 flake observed on this exact file during ENG-1277). A
+  # here-string has no live producer process for grep to SIGPIPE.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
@@ -805,7 +814,8 @@ M=$(new_mock_dir)
 set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878 dry run: off by default' 0 'SUCCESS: environment'
-if printf '%s' "${LAST_OUTPUT}" | grep -qF 'probe dry run'; then
+# ENG-1277: here-string, not a pipe — see the check() fix above for why.
+if grep -qF 'probe dry run' <<<"${LAST_OUTPUT}"; then
   printf '  FAIL ENG-878 dry run: off by default emits no probe output\n       output:\n%s\n' \
     "${LAST_OUTPUT}"
   TESTS_FAILED=$(( TESTS_FAILED + 1 ))
