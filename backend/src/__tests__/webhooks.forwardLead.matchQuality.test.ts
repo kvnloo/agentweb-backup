@@ -99,6 +99,7 @@ describe('forward-lead — Event Match Quality signals persisted (ENG-926 §B)',
     await request(app)
       .post('/api/webhooks/forward-lead')
       .set('X-Forwarded-For', '203.0.113.7, 70.41.3.18, 150.172.238.178')
+      .set('User-Agent', UA)
       .send({ listId: 'list_123', email: 'a@b.com' });
     await flush();
 
@@ -106,12 +107,42 @@ describe('forward-lead — Event Match Quality signals persisted (ENG-926 §B)',
   });
 
   it('never stores the "unknown" sentinel the CAPI call falls back to', async () => {
-    // supertest connects over loopback, so req.ip is a real value; the guard being tested is
-    // that an EMPTY resolution stores nothing rather than the literal string CAPI uses.
-    await request(app).post('/api/webhooks/forward-lead').send({ listId: 'list_123', email: 'a@b.com' });
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .set('User-Agent', UA)
+      .send({ listId: 'list_123', email: 'a@b.com' });
     await flush();
 
     expect(createdLead().clientIp).not.toBe('unknown');
+  });
+
+  it('stores NEITHER value when the caller is a forwarding server, not a browser', async () => {
+    // The production case: landing pages POST to their own Next.js route, which calls this
+    // endpoint server-side from Vercel. A real end-to-end run recorded 44.202.76.171 + 'node'
+    // for a lead that came from an actual iPhone. A wrong IP is worse than no IP — Meta
+    // reads it as a match signal and a datacenter address matches nobody — and these
+    // attributes are WRITE-ONCE in db.ts, so a wrong one can never be replaced.
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .set('X-Forwarded-For', '44.202.76.171')
+      .set('User-Agent', 'node')
+      .send({ listId: 'list_123', email: 'server@example.com' });
+    await flush();
+
+    expect(createdLead().clientIp).toBeUndefined();
+    expect(createdLead().clientUserAgent).toBeUndefined();
+  });
+
+  it('stores neither when no User-Agent arrives at all', async () => {
+    // Every real browser sends one; its absence means the caller is not a visitor.
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .set('X-Forwarded-For', '44.202.76.171')
+      .send({ listId: 'list_123', email: 'noua@example.com' });
+    await flush();
+
+    expect(createdLead().clientIp).toBeUndefined();
+    expect(createdLead().clientUserAgent).toBeUndefined();
   });
 
   it('omits the user agent entirely when the request carries none', async () => {
@@ -204,6 +235,7 @@ describe('forward-lead — Event Match Quality signals persisted (ENG-926 §B)',
     const res = await request(app)
       .post('/api/webhooks/forward-lead')
       .set('X-Forwarded-For', '203.0.113.7')
+      .set('User-Agent', UA)
       .send({ listId: 'list_123', email: 'a@b.com', firstName: 'New' });
     await flush();
 

@@ -100,7 +100,13 @@ check() {
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
     return
   fi
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: a here-string, not a pipe. Under `set -o pipefail`, `grep -q`
+  # exiting early on the first match can SIGPIPE the upstream printf, and
+  # pipefail then reports THAT nonzero for the whole pipeline even though grep
+  # genuinely matched — a race that passes locally and fails intermittently in
+  # CI (see trunk-deploy-state.test.sh for the live incident). A here-string
+  # has no live producer process for grep to SIGPIPE.
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))
