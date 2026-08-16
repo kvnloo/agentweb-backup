@@ -90,7 +90,13 @@ console.log('\n— mechanics stay OUT (this is the part that rots) —');
 console.log('\n— verifying on production —');
 {
   ok(/PROD_TEST_EMAIL/.test(p) && /PROD_TEST_PASSWORD/.test(p), 'points at the env vars holding the account');
-  ok(!/Argus@123/.test(p), 'the password itself is NEVER in the prompt — it lives only in the gitignored .env');
+  // Assert the SECRET's VALUE is absent — read from the environment, never written here. An earlier
+  // version of this test hardcoded the password in order to check for it, which put a live production
+  // credential into the repo: exactly the thing the assertion exists to prevent.
+  const secret = process.env.PROD_TEST_PASSWORD;
+  ok(secret ? !p.includes(secret) : true,
+    secret ? 'the password VALUE is never in the prompt — only the env var name' : 'no PROD_TEST_PASSWORD set; absence check skipped');
+  ok(!/password\s*[:=]\s*\S/i.test(p), 'no literal credential of any shape is inlined');
   ok(/seed|create/i.test(p) && /clean/i.test(p), 'says to clean up data it seeded');
   ok(/only read|read-only|observ/i.test(p), 'and distinguishes the read-only case');
   ok(/proof|evidence/i.test(p), 'a read-only trace is left deliberately, as proof');
