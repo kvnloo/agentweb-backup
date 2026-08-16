@@ -112,7 +112,10 @@ export async function sweepUndeliverableDomains(deps?: {
   resolveMx?: (domain: string) => Promise<Array<{ exchange: string; priority: number }>>;
 }): Promise<MxSweepReport> {
   const resolveMx = deps?.resolveMx || ((domain: string) => dns.resolveMx(domain));
-  const allUsers = await userDb.getAllUsers();
+  // Report only needs userId/email/isActive — scanWithFilter skips the
+  // per-user task/workflow/chat count queries getAllUsers() does, which is
+  // what pushed a multi-thousand-user sweep past the ALB timeout.
+  const allUsers = await userDb.scanWithFilter('attribute_exists(email)', {});
   const active = (allUsers || []).filter(
     (u: any) => u.isActive !== false && typeof u.email === 'string' && u.email.includes('@')
   );

@@ -16,6 +16,7 @@ jest.mock('../services/db', () => ({
   userDb: {
     getUserByEmail: jest.fn(),
     getAllUsers: jest.fn(),
+    scanWithFilter: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -29,7 +30,7 @@ import {
 import { userDb } from '../services/db';
 
 const mockGetUserByEmail = userDb.getUserByEmail as jest.Mock;
-const mockGetAllUsers = userDb.getAllUsers as jest.Mock;
+const mockGetAllUsers = userDb.scanWithFilter as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 
 beforeEach(() => jest.clearAllMocks());

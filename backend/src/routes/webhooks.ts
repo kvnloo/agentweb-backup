@@ -193,9 +193,37 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       // Store the event in the database. Mark hardBounceFlagPending for bounce
       // events up front (ENG-720) so a duplicate delivery before the flag write
       // below succeeds can retry it instead of being swallowed by dedup.
-      const emailEvent = await emailEventsDb.addEmailEvent(
-        event, emailDomain, eventId, undefined, event.type === 'email.bounced'
-      );
+      let emailEvent;
+      try {
+        emailEvent = await emailEventsDb.addEmailEvent(
+          event, emailDomain, eventId, undefined, event.type === 'email.bounced'
+        );
+      } catch (error: any) {
+        if (error?.isDuplicateEventId) {
+          // ENG-720: a concurrent delivery of the same eventId won the write
+          // between our existence check above and this put — the winner's
+          // row (and its hardBounceFlagPending marker) is now the source of
+          // truth. Retry the flag write off it, same as the pre-existing
+          // dedup path, instead of silently acking a bounce nobody flagged.
+          const winnerEvent = await emailEventsDb.getEventById(eventId);
+          if (winnerEvent?.eventType === 'email.bounced' && winnerEvent.hardBounceFlagPending) {
+            const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+            const { failedRecipients } = await handleHardBounceRecipients(bouncedTo, event.data.bounce);
+            if (failedRecipients.length > 0) {
+              throw new Error(
+                `[webhooks] retry of handleHardBounceRecipients failed to persist flag for: ${failedRecipients.join(', ')}`
+              );
+            }
+            await emailEventsDb.clearHardBounceFlagPending(eventId);
+          }
+          console.log(`Event already exists (concurrent write), skipping duplicate: ${eventId}`);
+          return res.status(200).json({
+            message: 'Event already processed (duplicate)',
+            eventId: eventId
+          });
+        }
+        throw error;
+      }
       try {
         await leadListAlertService.notifyForEmailEvent(emailEvent);
       } catch (alertError) {

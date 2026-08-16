@@ -92,10 +92,24 @@ class EmailEventsDb {
 
     const params = {
       TableName: TABLE_NAME,
-      Item: emailEvent
+      Item: emailEvent,
+      // ENG-720: claim the eventId atomically so two concurrent deliveries of
+      // the same webhook can't both pass the caller's existence check and
+      // both run bounce-flag processing — the loser gets a conditional-check
+      // failure instead of silently overwriting the winner's row.
+      ConditionExpression: 'attribute_not_exists(eventId)'
     };
 
-    await dynamodb.put(params).promise();
+    try {
+      await dynamodb.put(params).promise();
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        const duplicateError: any = new Error(`Duplicate eventId: ${eventId}`);
+        duplicateError.isDuplicateEventId = true;
+        throw duplicateError;
+      }
+      throw error;
+    }
 
     return emailEvent;
   }
