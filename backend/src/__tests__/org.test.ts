@@ -1,6 +1,5 @@
 import request from 'supertest';
 import express from 'express';
-import orgRoutes from '../routes/org';
 
 // Mock user state
 let mockUser: any = {
@@ -91,18 +90,53 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-// Mock email service
-jest.mock('../services/emailService', () => ({
-  emailService: {
-    sendEmail: jest.fn().mockResolvedValue(undefined),
-  },
-}));
+// Mock email service.
+//
+// ENG-1112: this is the seam that keeps the invite route off the wire. `routes/org.ts`
+// reaches email through `await import("../services/emailService")`, whose real
+// implementation calls `resendService.sendEmail` → the Resend SDK → an HTTPS POST to
+// api.resend.com. Without this mock the invite tests below would send real mail on any
+// host where `dev/AgentWeb/Resend` resolves, and `emailService.sendEmail` swallows send
+// failures by design (ENG-164) — so the suite would stay green either way. The transport
+// guard installed in `beforeEach` is the belt to this mock's braces: it asserts the
+// absence of traffic rather than trusting that the mock registered.
+const mockSendEmail = jest.fn().mockResolvedValue({ id: 'test-email' });
+jest.mock('../services/chatbotService', () => ({ chatbotDb: {} }));
+jest.mock('../services/resendService', () => ({ resendService: { sendEmail: mockSendEmail } }));
+const orgRoutes = require('../routes/org').default;
+
+// ---------------------------------------------------------------------------
+// Outbound-transport guard (ENG-1112, same shape as seo.orgAnalytics.test.ts)
+//
+// These routes should make zero outbound requests, so the guard throws on *any* host
+// instead of returning a plausible `ok`. Returning ok would let a regression — a new
+// un-mocked send, or this file's emailService mock failing to register — pass quietly,
+// which is precisely how a live Resend POST hid here in the first place.
+// ---------------------------------------------------------------------------
+const attemptedFetches: string[] = [];
+const realFetch = global.fetch;
+
+function installNoNetworkGuard() {
+  attemptedFetches.length = 0;
+  global.fetch = jest.fn((input: any) => {
+    const url = typeof input === 'string' ? input : input?.url;
+    attemptedFetches.push(String(url));
+    throw new Error(
+      `org.test.ts attempted a live network call to ${url}. These routes must not reach ` +
+        `third-party APIs — a request to api.resend.com sends real mail.`
+    );
+  }) as unknown as typeof fetch;
+}
 
 let app: express.Application;
 
 describe('Organization routes', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Re-installed per test: `clearMocks` wipes call history, and a fresh guard keeps
+    // each test's `attemptedFetches` assertions independent of run order.
+    installNoNetworkGuard();
+    mockSendEmail.mockResolvedValue(undefined);
     mockOrgs = {};
     mockUsers = {
       'user-1': {
@@ -125,6 +159,16 @@ describe('Organization routes', () => {
     app = express();
     app.use(express.json());
     app.use('/api/org', orgRoutes);
+  });
+
+  afterEach(() => {
+    // Every test in this file, not just the invite ones: no route here has any business
+    // touching the network.
+    expect(attemptedFetches).toEqual([]);
+  });
+
+  afterAll(() => {
+    global.fetch = realFetch;
   });
 
   // === FAIL cases ===
@@ -405,6 +449,66 @@ describe('Organization routes', () => {
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.message).toMatch(/invitation sent/i);
+    });
+
+    // ENG-1112: "send an invite" above asserts only the HTTP envelope. The route's whole
+    // point — that an invite email is actually composed, addressed to the invitee, and
+    // carries a working accept link — was never asserted, so the handler could have sent
+    // nothing, sent to the wrong address, or omitted the token and this suite would still
+    // have passed. Assert the intent against the mocked transport instead.
+    it('composes the invite email: recipient, subject, and an accept link carrying the stored token', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'Member@Example.com' });
+      expect(res.status).toBe(200);
+
+      expect(mockSendEmail).toHaveBeenCalledTimes(1);
+      const [{ to, subject, text, html }] = mockSendEmail.mock.calls[0];
+
+      // Addressed to the invitee, normalised to lower case — the same value stored on
+      // the org's pendingInvites, so accept-invite can match it.
+      expect(to).toBe('member@example.com');
+      const storedInvite = mockOrgs['org-1'].pendingInvites.at(-1);
+      expect(storedInvite.email).toBe('member@example.com');
+
+      expect(subject).toBe("You're invited to join Test Org on AgentWeb");
+
+      // The link must carry the *stored* token and org, or the invitee cannot accept.
+      const expectedLink =
+        `http://localhost:5174/org/accept-invite` +
+        `?token=${storedInvite.inviteToken}&orgId=org-1`;
+      expect(text).toContain(expectedLink);
+      expect(html).toContain(`href="${expectedLink}"`);
+
+      // Inviter is named from the acting user, and the org name is rendered in the body.
+      expect(text).toContain('Test Owner');
+      expect(html).toContain('Test Org');
+
+      // A 64-hex-char token: the route mints 32 random bytes. A truncated or predictable
+      // token would be an authorization defect, not a cosmetic one.
+      expect(storedInvite.inviteToken).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('stamps pendingOrgInvite on an existing account so login routes them to accept-invite', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+      expect(res.status).toBe(200);
+
+      const storedInvite = mockOrgs['org-1'].pendingInvites.at(-1);
+      expect(mockUsers['user-2'].pendingOrgInvite).toEqual({
+        orgId: 'org-1',
+        inviteToken: storedInvite.inviteToken,
+      });
+    });
+
+    it('still creates the invite when the email transport fails — and reports success', async () => {
+      // The handler swallows send failures on purpose ("Don't fail the invite if email
+      // fails"). Pinned here because it is exactly why a live-send regression was
+      // invisible: a rejected POST to api.resend.com produced a 200 and a green suite.
+      mockSendEmail.mockRejectedValueOnce(new Error('transport down'));
+
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
     });
 
     // Replaces the removed maxMembers/memberCount capacity tests. Org size is no

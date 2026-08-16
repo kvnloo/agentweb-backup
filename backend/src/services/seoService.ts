@@ -557,59 +557,90 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         eventCount: number;
       }> = [];
 
+      // Shared row mapper for the two top-pages queries below (identical dimensions/metrics,
+      // different orderBy) so a page's shape can't drift between the two lists.
+      const mapPageRow = (row: any) => {
+        const dimensions = row.dimensionValues || [];
+        const metrics = row.metricValues || [];
+        const pagePath = dimensions[0]?.value || "";
+        const hostName = dimensions[1]?.value || "";
+        const sessions = parseInt(metrics[0]?.value || "0");
+        const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
+        const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
+        const eventCount = parseInt(metrics[3]?.value || "0");
+
+        let fullUrl = pagePath;
+        if (hostName) {
+          const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+          fullUrl = `https://${hostName}${path}`;
+        } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
+          const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+          fullUrl = `https://${resolved.seoDomains[0]}${path}`;
+        }
+
+        return {
+          pageTitle: pagePath,
+          pagePath: fullUrl,
+          sessions,
+          engagementRate,
+          userEngagementDuration,
+          eventCount,
+        };
+      };
+      const topPagesQueryBase = {
+        property: `properties/${propertyId}`,
+        dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+        dimensions: [
+          { name: "pagePath" },
+          { name: "hostName" },
+        ],
+        metrics: [
+          { name: "sessions" },
+          { name: "engagementRate" },
+          { name: "userEngagementDuration" },
+          { name: "eventCount" },
+        ],
+        limit: 20,
+        ...(dimensionFilter && { dimensionFilter }),
+      };
+
       try {
         const [pagesEngagementResponse] = await gaClient.runReport({
-          property: `properties/${propertyId}`,
-          dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
-          dimensions: [
-            { name: "pagePath" },
-            { name: "hostName" },
-          ],
-          metrics: [
-            { name: "sessions" },
-            { name: "engagementRate" },
-            { name: "userEngagementDuration" },
-            { name: "eventCount" },
-          ],
+          ...topPagesQueryBase,
           orderBys: [
             { metric: { metricName: "userEngagementDuration" }, desc: true },
           ],
-          limit: 20,
-          ...(dimensionFilter && { dimensionFilter }),
         });
-
-        if (pagesEngagementResponse.rows) {
-          pagesEngagementResponse.rows.forEach((row) => {
-            const dimensions = row.dimensionValues || [];
-            const metrics = row.metricValues || [];
-            const pagePath = dimensions[0]?.value || "";
-            const hostName = dimensions[1]?.value || "";
-            const sessions = parseInt(metrics[0]?.value || "0");
-            const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
-            const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
-            const eventCount = parseInt(metrics[3]?.value || "0");
-
-            let fullUrl = pagePath;
-            if (hostName) {
-              const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${hostName}${path}`;
-            } else if (resolved.seoDomains && resolved.seoDomains.length > 0) {
-              const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-              fullUrl = `https://${resolved.seoDomains[0]}${path}`;
-            }
-
-            topPagesByEngagement.push({
-              pageTitle: pagePath,
-              pagePath: fullUrl,
-              sessions,
-              engagementRate,
-              userEngagementDuration,
-              eventCount,
-            });
-          });
-        }
+        (pagesEngagementResponse.rows || []).forEach((row) => {
+          topPagesByEngagement.push(mapPageRow(row));
+        });
       } catch (engagementError: any) {
         console.warn("Error fetching top pages by engagement:", engagementError.message);
+      }
+
+      // Its own sessions-ordered GA4 query — NOT a re-sort of topPagesByEngagement's top-20.
+      // A re-sort of an engagement-limited subset can silently omit a page with heavy volume
+      // but middling engagement (that page never made the engagement top-20 to begin with),
+      // which would make this field wrong in exactly the way ENG-1187 was about: a ranking
+      // presented as authoritative that doesn't actually reflect the true top-N.
+      //
+      // On failure this must NOT fall back to []: an empty array reads as "GA4 has zero
+      // session data for this window," a false claim indistinguishable from a real empty
+      // result. Leave it undefined and surface topPagesBySessionsError instead, so the model
+      // is forced to say the ranking is unverified rather than asserting zero/nothing.
+      let topPagesBySessions: typeof topPagesByEngagement | undefined;
+      let topPagesBySessionsError: string | undefined;
+      try {
+        const [pagesSessionsResponse] = await gaClient.runReport({
+          ...topPagesQueryBase,
+          orderBys: [
+            { metric: { metricName: "sessions" }, desc: true },
+          ],
+        });
+        topPagesBySessions = (pagesSessionsResponse.rows || []).map(mapPageRow);
+      } catch (sessionsError: any) {
+        console.warn("Error fetching top pages by sessions:", sessionsError.message);
+        topPagesBySessionsError = "Could not fetch pages ranked by sessions for this request — do not report zero pages, and do not substitute topPagesByEngagement's ordering as a stand-in ranking by volume.";
       }
 
       // Fetch daily data for timeline
@@ -780,6 +811,8 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
         conversionsBySource,
         topPagesByEngagement,
+        topPagesBySessions,
+        ...(topPagesBySessionsError && { topPagesBySessionsError }),
         dateRange: { startDate: startDateStr, endDate: endDateStr },
       };
     } catch (error: any) {

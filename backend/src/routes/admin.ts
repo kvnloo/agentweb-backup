@@ -23,7 +23,8 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
@@ -36,6 +37,7 @@ import { validateEmail } from "../utils/validation";
 import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
+import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 
 const router = express.Router();
 
@@ -148,6 +150,10 @@ const ADMIN_USER_LIST_FIELDS = [
   "lastActiveAt",
   "displayName",
   "supportNote",
+  // ENG-720: undeliverable-email flag so support/CS sees replies won't land
+  "emailUndeliverable",
+  "emailUndeliverableReason",
+  "emailUndeliverableAt",
   "role",
   "roles",
   "taskCount",
@@ -184,6 +190,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
+  "llmUsageCredits",
   "extraCostUsage",
   "extraCostUsageHistory",
   "googleDriveFolders",
@@ -693,7 +700,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
       ? await crmDb.batchCreateLeads(parsed.listId, leads)
-      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
     if (results.errorCount === 0) {
@@ -711,6 +718,16 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       );
     }
 
+    // ENG-1002: this route reports `attemptedCount` outright, so a row refused
+    // as a LinkedIn placeholder leaves attempted > success + errors with
+    // nothing to explain the difference. Report it in both the payload and the
+    // message, as the other import paths do.
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
+    const skippedNote =
+      syncAnonymizedSkipped > 0
+        ? ` ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped.`
+        : "";
+
     return res.json({
       success: true,
       source,
@@ -723,15 +740,29 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
       message:
-        results.errorCount === 0
+        (results.errorCount === 0
           ? `Synced ${results.successCount} record(s) from ${source}.`
-          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`) +
+        skippedNote,
     });
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
     return res.status(500).json({ message: error.message || "Error running CRM sync" });
+  }
+});
+
+// ENG-720 AC4: report-only MX sweep — active accounts whose email domain
+// fails MX resolution. Repairing/contacting those users is a human decision.
+router.get("/email-deliverability/mx-sweep", async (_req, res) => {
+  try {
+    const report = await sweepUndeliverableDomains();
+    res.json(report);
+  } catch (error) {
+    console.error("Error running MX sweep:", error);
+    res.status(500).json({ error: "Failed to run MX sweep" });
   }
 });
 
@@ -4683,6 +4714,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4691,6 +4723,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
+        allowedFeatures: allAvailableFeatures,
       }];
     }
 
@@ -4723,6 +4756,11 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
 
@@ -4732,10 +4770,13 @@ router.get("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
+        ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
+        ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
       };
     }));
 
@@ -4760,6 +4801,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4771,6 +4813,9 @@ router.post("/subscription-types", async (req, res) => {
       }
       if (!Array.isArray(type.allowedSkills)) {
         throw new Error("Each subscription type must have allowedSkills array");
+      }
+      if (type.allowedFeatures !== undefined && !Array.isArray(type.allowedFeatures)) {
+        throw new Error("allowedFeatures must be an array when provided");
       }
 
       // Remove "/marketing" prefix from allowedPages if present
@@ -4800,6 +4845,11 @@ router.post("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4812,6 +4862,54 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyCostAllowance)
         : null;
 
+      let normalizedLlmUsagePolicy: any = undefined;
+      if (type.llmUsagePolicy != null) {
+        const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
+        const { getModelPrice } = await import('../utils/llmPricing');
+        const { agentModeService } = await import('../services/agentModeService');
+        normalizedLlmUsagePolicy = {
+          version: String(type.llmUsagePolicy.version || '').trim(),
+          enforcementState: type.llmUsagePolicy.enforcementState,
+          optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
+          hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
+          optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            : [],
+          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+        };
+        const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
+        const supportedModels = new Set(await agentModeService.getSupportedModels(true));
+        for (const model of normalizedLlmUsagePolicy.optimizedModelIds) {
+          if (!supportedModels.has(model)) policyErrors.push(`optimized model '${model}' is not supported`);
+          if (!getModelPrice(model)) policyErrors.push(`optimized model '${model}' has no price entry`);
+        }
+        if (policyErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage policy: ${policyErrors.join('; ')}`);
+        }
+      }
+
+      let normalizedLlmUsageTopUp: any = undefined;
+      if (type.llmUsageTopUp != null) {
+        const { validateLlmUsageTopUpConfig } = await import('../services/llmUsageTopUpService');
+        normalizedLlmUsageTopUp = {
+          enabled: type.llmUsageTopUp.enabled === true,
+          minimumMarkupBps: Number(type.llmUsageTopUp.minimumMarkupBps),
+          packages: Array.isArray(type.llmUsageTopUp.packages)
+            ? type.llmUsageTopUp.packages.map((item: any) => ({
+                id: String(item.id || '').trim(),
+                label: String(item.label || '').trim(),
+                priceCents: Number(item.priceCents),
+                usageCreditMicroUsd: Number(item.usageCreditMicroUsd),
+                active: item.active === true,
+              }))
+            : [],
+        };
+        const topUpErrors = validateLlmUsageTopUpConfig(normalizedLlmUsageTopUp);
+        if (topUpErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage top-up: ${topUpErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -4823,8 +4921,11 @@ router.post("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
+        ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
+        ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
       };
     }));
 
@@ -4841,6 +4942,11 @@ router.post("/subscription-types", async (req, res) => {
     console.error("Error saving subscription types:", error);
     res.status(400).json({ message: error.message || "Error saving subscription types" });
   }
+});
+
+router.get("/subscription-features", async (_req, res) => {
+  const subscriptionService = await import('../services/subscriptionService');
+  res.json({ features: subscriptionService.getAllAvailableSubscriptionFeatures() });
 });
 
 // Add or remove a single skill from a subscription type
@@ -5050,6 +5156,69 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Grant an auditable, idempotent one-time provider-cost credit for this month.
+// This is the cost-based replacement for ad-hoc token bonuses once a tier has a
+// versioned LLM usage policy. Org members resolve to their billing owner so the
+// grant and the enforced counter cannot diverge.
+router.post("/users/:userId/llm-usage-credit", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { amountUsd, reason, idempotencyKey } = req.body || {};
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ message: "amountUsd must be a positive number" });
+    }
+    // Admin grants are audited in cents on payment-history — sub-cent grants
+    // cannot be represented faithfully there, so reject them here with a 400
+    // instead of letting the service layer throw and surface as a generic 500.
+    // Check whole-cent-ness BEFORE rounding: a naive `Math.round(x * 1e6) % 1e4`
+    // silently lifts $0.0099999 to 1c and grants it. Comparing the pre-round
+    // value against its rounded-cents equivalent (with a floating-point
+    // epsilon) catches over-precise input up to representation limits.
+    const centsExact = amountUsd * 100;
+    const centsRounded = Math.round(centsExact);
+    // Tight epsilon (1e-9) — legitimate 2-decimal IEEE-754 representations
+    // (`0.10 * 100 = 10.000000000000002`) sit at ~2e-15 and pass; over-precise
+    // inputs like `0.009999999` (1e-7 diff) fail. 1e-6 was too loose and let
+    // 7-9-nines sub-cent inputs silently lift to 1c.
+    if (Math.abs(centsExact - centsRounded) > 1e-9) {
+      return res.status(400).json({
+        message: "amountUsd must be in whole cents (2 decimal places max)",
+      });
+    }
+    const amountMicroUsd = centsRounded * 10_000;
+    if (typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ message: "reason is required" });
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+      return res.status(400).json({ message: "idempotencyKey must be 8-100 URL-safe characters" });
+    }
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) return res.status(404).json({ message: "User not found" });
+
+    const billingUserId = await resolveBillingUserId(userId);
+    const admin = (req as any).user;
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId,
+      grantId: `admin:${billingUserId}:${idempotencyKey}`,
+      source: "admin",
+      amountMicroUsd,
+      reason,
+      grantedBy: admin?.email || admin?.userId || "admin",
+    });
+    return res.json({
+      granted: result.granted,
+      billingUserId,
+      amountUsd: amountMicroUsd / 1_000_000,
+      month: result.ledger.month,
+      totalAdminGrantedUsd: (result.ledger.totalAdminGrantedMicroUsd || 0) / 1_000_000,
+      grants: result.ledger.grants,
+    });
+  } catch (error) {
+    console.error("Error granting LLM usage credit:", error);
+    return res.status(500).json({ message: "Error granting LLM usage credit" });
   }
 });
 

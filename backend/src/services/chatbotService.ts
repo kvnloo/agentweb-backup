@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { getAzureClient } from "../utils/llmClients";
+import { meterUserUsage } from "./usageRecorderService";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -18,11 +19,12 @@ import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../utils/citations';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { shrinkMessageForPersistence } from '../utils/messageSizeGuard';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
+import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 // Load environment variables from .env file
@@ -215,6 +217,16 @@ export interface ChatSession {
   feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake"; // Type of session based on how it was created
+  // ENG-827: the publish authorization this scheduled run was ADMITTED under, stamped
+  // before the first turn. A run keeps the permissions it started with: the dispatch
+  // guard intersects this with live schedule state, so consent granted after a run
+  // began cannot reach into it. Written only for runs admitted as authorized —
+  // absent means "not authorized to publish", the fail-closed default.
+  publishAdmission?: {
+    authorized: boolean;
+    tools: string[];
+    recordedAt: string;
+  };
   emailMetadata?: {
     senderEmail?: string;
     lastInboundEmailId?: string;
@@ -245,6 +257,17 @@ export interface ChatSession {
     threadTs: string;
   }; // Slack thread association for in-thread Q&A
   llmModel?: string; // Selected LLM model for this session
+  llmUsagePolicyDecision?: {
+    requestedModel: string | null;
+    effectiveModel: string | null;
+    backupModel: string | null;
+    backupSource: 'user' | 'system' | null;
+    modelSelection: 'honored' | 'corrected' | 'defaulted' | 'blocked';
+    modelSelectionReason: string;
+    usageMode: 'full_choice' | 'optimized' | 'paused';
+    usagePolicyVersion: string | null;
+    recordedAt: string;
+  };
   delegateInfo?: {
     adminUserId: string;
     adminEmail: string;
@@ -520,6 +543,17 @@ function keywordBasedChunkRetrieval(
  * Persisted audit of a Google Ads pre-flight tracking check (ENG-335), stored on
  * the chat/run record so a launch's measurement status is durable and auditable.
  */
+/** ENG-941 — Meta counterpart of GoogleAdsMeasurementCheckRecord below. */
+export interface MetaMeasurementCheckRecord {
+  accountId: string;
+  campaignId?: string;
+  action: string;
+  outcome: 'passed' | 'blocked' | 'overridden';
+  /** Per-destination check results (url + status + detected pixels). */
+  urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
+  checkedAt: string;
+}
+
 export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
@@ -550,7 +584,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -589,6 +624,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {
@@ -668,6 +704,37 @@ export class ChatbotDB {
     return chatSession;
   }
 
+  /**
+   * Bound a message to the per-item persistence budget.
+   *
+   * Check serialized item size in UTF-8 BYTES — covers both string content and
+   * content-block arrays. DynamoDB's hard limit is 400KB per item; we use 350KB as a
+   * safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
+   * a CJK/emoji-heavy message is far bigger encoded than its character count.
+   *
+   * ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
+   * long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
+   * routinely 20x the answer — truncating `content` shed nothing, the item stayed
+   * over 400KB, batchWrite threw, and the report was lost from the transcript while
+   * the run still reported success. shrinkMessageForPersistence sheds the ledger
+   * first and the answer last, and guarantees the item fits.
+   *
+   * ENG-1048: this lives here, rather than inline in one writer, because EVERY path
+   * that writes a message item is subject to the same ceiling. ENG-946 guarded only
+   * the append path, so the session→table migration, the repair pass and the
+   * single-message update still wrote raw messages and still threw on an oversized one.
+   *
+   * Returns the ORIGINAL reference when the message already fits.
+   */
+  private fitMessageForPersistence(message: any, label: string): any {
+    const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
+    const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
+    if (safeMessage !== message) {
+      console.warn(`${label} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
+    }
+    return safeMessage;
+  }
+
   // Add messages to AW-ChatMessages table
   private async addMessagesToMessagesTable(sessionId: string, messages: ChatMessage[], startIndex: number): Promise<void> {
     if (messages.length === 0) {
@@ -680,28 +747,10 @@ export class ChatbotDB {
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
-          let safeMessage = message;
-          // Check serialized item size — covers both string content and content-block arrays.
-          // DynamoDB hard limit is 400KB per item; we use 350KB as a safety margin.
-          const serializedLen = JSON.stringify(message).length;
-          if (serializedLen > MAX_MESSAGE_CONTENT_SIZE) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} chars), truncating`);
-            if (typeof message.content === 'string') {
-              safeMessage = {
-                ...message,
-                content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            } else {
-              // Content is an array of blocks — stringify it, truncate, store as plain string
-              const contentStr = JSON.stringify(message.content);
-              safeMessage = {
-                ...message,
-                content: contentStr.substring(0, MAX_MESSAGE_CONTENT_SIZE)
-                  + `\n\n[Truncated — original size: ${serializedLen} chars]`,
-              };
-            }
-          }
+          const safeMessage = this.fitMessageForPersistence(
+            message,
+            `Message ${startIndex + i + index} for session ${sessionId}`,
+          );
           return {
             PutRequest: {
               Item: {
@@ -895,6 +944,36 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Append a Meta pre-flight tracking check to the session's run record (ENG-941).
+   * Same audit contract as recordGoogleAdsMeasurementCheck above: a launch decision —
+   * passed, blocked, or explicitly overridden — and its per-destination measurement
+   * status must survive, so a later "0 conversions" report can say the campaign was
+   * never measurable instead of presenting a bare zero. Best-effort by design: a
+   * persistence failure must never break the launch flow.
+   */
+  async recordMetaMeasurementCheck(
+    sessionId: string,
+    record: MetaMeasurementCheckRecord
+  ): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression:
+          'SET metaMeasurementChecks = list_append(if_not_exists(metaMeasurementChecks, :empty), :rec), updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':rec': [record],
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error recording Meta measurement check for session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -926,14 +1005,16 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, [message]);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId && message.usage) {
-        await incrementUserTokenUsage(
-          currentSession.userId,
-          message.usage.total_tokens || 0,
-          message.usage.estimated_cost || 0
-        );
-      }
+      // ENG-1134: NO per-user quota charge here. Persisting a message is not a
+      // spend event — the LLM call that produced it already charged the counter
+      // and wrote the ledger row at its metering chokepoint. Charging again here
+      // double-billed every agent-mode turn (measured at exactly 2.000x cost).
+      //
+      // It also hid itself: `usage.total_tokens` is prompt+completion only, while
+      // the real charge includes cache tokens (~73% of traffic), so the token
+      // totals stayed plausible while the dollars silently doubled. And it wrote
+      // no ledger row, breaking ENG-200's rule that nothing is deducted without
+      // also being recorded. Charge where you record: at the call site.
 
       // Return session with updated messages (no need to update session table)
       return {
@@ -976,20 +1057,8 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, messages);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId) {
-        let batchTokens = 0;
-        let batchCost = 0;
-        for (const msg of messages) {
-          if (msg.usage) {
-            batchTokens += msg.usage.total_tokens || 0;
-            batchCost += msg.usage.estimated_cost || 0;
-          }
-        }
-        if (batchTokens > 0 || batchCost > 0) {
-          await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
-        }
-      }
+      // ENG-1134: no per-user quota charge here either — same reasoning as the
+      // single-message path above. The batch variant double-charged identically.
 
       // Return session with updated messages (no need to update session table)
       return {
@@ -1044,7 +1113,11 @@ export class ChatbotDB {
           '#message': 'message',
         },
         ExpressionAttributeValues: {
-          ':message': updatedMessage,
+          // ENG-1048: adding feedback grows an item that may already sit at the ceiling.
+          ':message': this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} feedback for session ${sessionId}`,
+          ),
         },
         ReturnValues: 'ALL_NEW',
       };
@@ -1293,7 +1366,11 @@ export class ChatbotDB {
             Item: {
               sessionId,
               messageIndex: i + index,
-              message,
+              // ENG-1048: same 400KB ceiling as the append path.
+              message: this.fitMessageForPersistence(
+                message,
+                `Migrated message ${i + index} for session ${sessionId}`,
+              ),
             },
           },
         }));
@@ -1498,7 +1575,12 @@ export class ChatbotDB {
           Item: {
             sessionId,
             messageIndex,
-            message
+            // ENG-1048: a repaired message is subject to the same 400KB ceiling —
+            // without this the repair pass throws on exactly the messages it exists to fix.
+            message: this.fitMessageForPersistence(
+              message,
+              `Repaired message ${messageIndex} for session ${sessionId}`,
+            )
           }
         }
       }));
@@ -3074,16 +3156,20 @@ export class ChatbotDB {
 
   async updateSessionLlmModel(
     sessionId: string,
-    llmModel: string
+    llmModel: string,
+    policyDecision?: NonNullable<ChatSession['llmUsagePolicyDecision']>,
   ): Promise<ChatSession> {
     const params = {
       TableName: this.tableName,
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
+      UpdateExpression: policyDecision
+        ? "SET llmModel = :llmModel, llmUsagePolicyDecision = :policyDecision, adminListPartition = :adminListPartition"
+        : "SET llmModel = :llmModel, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
+        ...(policyDecision ? { ":policyDecision": policyDecision } : {}),
         ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
@@ -3096,6 +3182,43 @@ export class ChatbotDB {
       console.error("Error updating session LLM model:", error);
       throw error;
     }
+  }
+
+  /**
+   * ENG-827: stamp the publish authorization a scheduled run was admitted under.
+   *
+   * The dispatch-time consent guard re-reads the SCHEDULE so a revocation bites
+   * immediately, but a re-read alone is only half an answer: it would also let a
+   * grant made while the run is in flight widen it, and publish content that was
+   * generated by a run explicitly admitted as draft-only. Persisting the admitted
+   * scope here gives the guard the other half to intersect against, so live state
+   * can only ever narrow this run's rights.
+   *
+   * Throws on failure — the caller must downgrade the run to draft-only rather
+   * than proceed with a permission it could not record.
+   */
+  async updateSessionPublishAdmission(
+    sessionId: string,
+    admission: { authorized: boolean; tools: string[] }
+  ): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET publishAdmission = :publishAdmission, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":publishAdmission": {
+          authorized: admission.authorized === true,
+          tools: Array.isArray(admission.tools) ? admission.tools : [],
+          recordedAt: new Date().toISOString(),
+        },
+        ":adminListPartition": "all",
+      },
+    };
+
+    await dynamodb.update(params).promise();
   }
 
   async updateSessionError(
@@ -3590,7 +3713,11 @@ export class ChatbotDB {
         },
         UpdateExpression: "SET message = :message",
         ExpressionAttributeValues: {
-          ":message": updatedMessage,
+          // ENG-1048: same 400KB ceiling as every other message write.
+          ":message": this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} for session ${sessionId}`,
+          ),
         },
       };
 
@@ -3765,17 +3892,29 @@ export async function loadKnowledgeBase(): Promise<void> {
   //printKnowledgeBase();
 }
 
-// Load knowledge base on startup and refresh periodically
-loadKnowledgeBase().catch((error) => {
-  console.error("Error loading knowledge base:", error);
-});
-
-// Refresh knowledge base every hour
-setInterval(() => {
+// Load knowledge base on startup and refresh periodically.
+//
+// Skipped under test. This is module-load network I/O, so merely IMPORTING any
+// route that transitively reaches this file fires a real fetch at the docs
+// corpus — which is what trips org.test.ts's "no route here has any business
+// touching the network" assertion (ENG-1112) even though nothing in that suite
+// asks for docs. The hourly timer has the same problem in reverse: it keeps a
+// handle open after a suite finishes, which is where "Cannot log after tests are
+// done" and the non-graceful worker exits come from. Production behaviour is
+// unchanged; the one test that needs the knowledge base calls
+// loadKnowledgeBase() itself.
+if (process.env.NODE_ENV !== "test") {
   loadKnowledgeBase().catch((error) => {
-    console.error("Error refreshing knowledge base:", error);
+    console.error("Error loading knowledge base:", error);
   });
-}, 60 * 60 * 1000);
+
+  // Refresh knowledge base every hour
+  setInterval(() => {
+    loadKnowledgeBase().catch((error) => {
+      console.error("Error refreshing knowledge base:", error);
+    });
+  }, 60 * 60 * 1000);
+}
 
 const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 
@@ -3926,14 +4065,36 @@ Be helpful, concise, and accurate. Focus on actionable growth marketing advice. 
 export function calculateCost(
   promptTokens: number,
   completionTokens: number,
-  model: string
+  model: string,
+  // ENG-1134: cache tokens were omitted entirely, so this under-reported Emma's
+  // cost by the cache share — the bulk of a cached conversation. It no longer
+  // drives billing (that moved to the call-site meter), but it still drives the
+  // per-session cost the admin UI shows, and a display that disagrees with the
+  // ledger is how the last three metering tickets started.
+  cacheReadTokens: number = 0,
+  cacheWriteTokens: number = 0,
+  // ENG-893 splits cache writes by the TTL Bedrock actually applied: 1.25x input
+  // at 5 minutes, 2x at one hour. Dropping it prices every write at the 5-minute
+  // rate, so an Emma-on-Claude session with 1h writes shows a cost materially
+  // below the ledger figure for the same call — the display/ledger disagreement
+  // this whole ticket exists to eliminate.
+  cacheWriteByTtl?: CacheWriteByTtl
 ): number {
   // Price from the single source of truth (llmPricing via computeCostMicroUsd)
   // so chatbot cost stays consistent with the shadow usage book and ENG-207
   // normalization. This replaced a stale hardcoded per-1K table whose gpt-4o
   // prompt rate was 10x the published list price ($25/1M vs $2.50/1M), which
   // silently overcharged Emma chatbot usage. Unknown models → 0 (unchanged).
-  return computeCostMicroUsd(model, promptTokens, completionTokens) / 1_000_000;
+  return (
+    computeCostMicroUsd(
+      model,
+      promptTokens,
+      completionTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      cacheWriteByTtl
+    ) / 1_000_000
+  );
 }
 
 // Helper function to log token usage
@@ -3944,10 +4105,14 @@ function logTokenUsage(
   const usage = response.usage;
   if (!usage) return;
 
+  const u: any = usage;
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model
+    response.model,
+    u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    u.cache_creation_input_tokens || 0,
+    u.cache_creation_by_ttl
   );
 
   console.log(
@@ -4061,7 +4226,11 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: cap here, at the shared source, so every consumer of
+          // this function is protected uniformly instead of relying on each
+          // one to remember to truncate independently (which is exactly how
+          // one uncapped path crashed the backend with ERR_STRING_TOO_LONG).
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'public-knowledge-base',
             ...(fileName && { fileName })
@@ -4108,7 +4277,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: same cap as the public branch above.
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'private-knowledge-base',
             taskId: taskId,
@@ -4540,6 +4710,18 @@ export async function generateChatResponse(
       }
     }
 
+    // ENG-1134: NONE of these clients charges the quota. The llmClients factories
+    // fire `recordUsage` only (see fireRecord) — a ledger row, no deduction — and
+    // the Bedrock/Gemini wrappers from agentModeService do not meter at all.
+    // Message persistence used to be the single charge point for every Emma path,
+    // so removing it (it double-charged agent mode) would have left Emma spending
+    // for free on all three providers.
+    //
+    // So Emma meters explicitly below, for every provider. The Azure client is
+    // therefore requested UN-metered: leaving its factory recording while we also
+    // meter here would write two ledger rows for one call, trading a missing
+    // charge for a doubled record.
+
     if (isClaudeModel) {
       activeClient = await agentModeService!.getBedrockClient(model!);
     } else if (isGeminiModel) {
@@ -4549,7 +4731,9 @@ export async function generateChatResponse(
       // deployment (what the module singleton used). Metered via the factory.
       activeClient = getAzureClient(
         { userId, feature: "chat", sessionId },
-        model || process.env.AZURE_OPENAI_DEPLOYMENT
+        model || process.env.AZURE_OPENAI_DEPLOYMENT,
+        // Un-metered: the meter below is the single record-and-charge point.
+        { metered: false }
       );
     }
 
@@ -4611,6 +4795,40 @@ export async function generateChatResponse(
         response,
         `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
       );
+
+      // ENG-1134: meter this turn for the clients that do not meter themselves.
+      // Runs per iteration, because each loop pass is a separate billable call —
+      // metering only the final one would undercount every tool-using turn.
+      // Fire-and-forget and fail-open by contract, like every other meter.
+      {
+        // Tokens are read exactly the way callLLM reads them, NOT via
+        // meterUsageFromResponse. That helper dispatches on response shape, and
+        // the Bedrock Converse wrapper answers in OpenAI shape — so it would take
+        // normalizeOpenAIUsage, which only knows `prompt_tokens_details.cached_tokens`
+        // and would silently record Bedrock's cache tokens as zero. Cache is ~73%
+        // of traffic, so that would under-count this spend by roughly 4x, in the
+        // very ledger the cost cap is about to be enforced against.
+        const u: any = response?.usage;
+        if (u) {
+          meterUserUsage({
+            userId,
+            sessionId,
+            model: activeDeployment,
+            provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
+            feature: 'chat',
+            // ENG-1251: response.id is stable across a retried/re-processed
+            // response and distinct across real calls — closes the "retries
+            // defeat charge dedup" Greptile P1 for this iteration's charge.
+            eventId: typeof response?.id === 'string' ? response.id : undefined,
+            inputTokens: u.prompt_tokens || 0,
+            outputTokens: u.completion_tokens || 0,
+            cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+            // ENG-893: bill writes at the TTL Bedrock actually applied.
+            cacheWriteByTtl: u.cache_creation_by_ttl,
+          });
+        }
+      }
 
       // Add assistant message to messages array (for next iteration)
       const assistantMsg: any = {

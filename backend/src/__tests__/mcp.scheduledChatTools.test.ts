@@ -51,6 +51,23 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(names).toContain('submit_scheduled_chat_variables');
     });
 
+    it('exposes an explicit backup model for scheduled chat create/update', () => {
+      const definition: any = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition;
+      expect(definition.inputSchema.properties.backup_model).toBeDefined();
+    });
+
+    it('exposes a cost-policy-aware model discovery tool', () => {
+      expect(mcpToolRegistry.getTool('emma_list_models')).toBeDefined();
+      expect(mcpToolRegistry.getToolDefinitions().map((definition: any) => definition.name))
+        .toContain('emma_list_models');
+    });
+
+    it('exposes preferred and backup model selection on Emma messages', () => {
+      const definition: any = mcpToolRegistry.getTool('emma_send_message')?.definition;
+      expect(definition.inputSchema.properties.llm_model).toBeDefined();
+      expect(definition.inputSchema.properties.backup_model).toBeDefined();
+    });
+
     it('should expose scheduled chat tools to external MCP clients', () => {
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
@@ -88,6 +105,109 @@ describe('Scheduled Chat MCP Tools', () => {
     });
   });
 
+  // ─── Publish consent is NOT agent-settable (ENG-827, Greptile P1 #6) ────
+  // Consent to publish unreviewed to a live account must come from a deterministic
+  // owner action — the "Publish without my review" checkbox in the portal. An MCP
+  // argument would let the MODEL mint standing publishing consent from its own
+  // reading of a conversation, which is the same inferred-consent failure that
+  // already sank three earlier signals. Keep this surface closed.
+  describe('manage_scheduled_chat - publish consent is not agent-settable', () => {
+    it('exposes a REVOKE lever only — never a grant', () => {
+      const def = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition as any;
+      const props = def?.inputSchema?.properties || {};
+      expect(Object.keys(props)).toContain('revoke_autopublish');
+      // The grant direction must not exist under ANY spelling. A model able to turn
+      // publishing on would be manufacturing standing consent to post under the
+      // owner's name from its own reading of a conversation.
+      for (const forbidden of [
+        'autopublish_authorized', 'autopublishAuthorized',
+        'grant_autopublish', 'publish_without_review',
+      ]) {
+        expect(Object.keys(props)).not.toContain(forbidden);
+      }
+      expect(props.revoke_autopublish.description).toMatch(/cannot turn it back on/i);
+    });
+
+    it('REVOKES via the dedicated endpoint, before the ordinary update', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: true,
+      } as any, context);
+
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      const put = calls.find(c => c.method === 'PUT');
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
+
+      expect(consent).toBeDefined();
+      expect(consent.method).toBe('POST');
+      expect(consent.path).toBe('/api/agent-mode/scheduled-chats/sc-1/publish-consent');
+      // Revoke-only by construction: the body can never ask to enable publishing.
+      expect(consent.body).toEqual({ authorized: false });
+
+      // ORDER matters. Revoke first, so a failure of the ordinary update leaves the
+      // schedule in the safer (not publishing) state rather than the riskier one.
+      expect(calls.indexOf(consent)).toBeLessThan(calls.indexOf(put));
+    });
+
+    it('does not touch consent at all when revoke_autopublish is absent or false', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+      } as any, context);
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls.find(c => c.path.endsWith('/publish-consent'))).toBeUndefined();
+    });
+
+    it('never sends a GRANT, whatever the model passes', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls[0].body.autopublishAuthorized).toBeUndefined();
+      // Nothing may reach the consent endpoint asking to ENABLE publishing — and with
+      // revoke_autopublish false, nothing may reach it at all.
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
+      expect(consent).toBeUndefined();
+    });
+
+    it('never forwards an autopublish field to the API on create, even if passed', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Daily post',
+        starting_message: 'Write and post it',
+        schedule_frequency: 'daily',
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body).not.toHaveProperty('autopublishAuthorized');
+      expect(body).not.toHaveProperty('autopublish_authorized');
+    });
+
+    it('never forwards an autopublish field to the API on update, even if passed', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body).not.toHaveProperty('autopublishAuthorized');
+      expect(body).not.toHaveProperty('autopublish_authorized');
+    });
+  });
+
   // ─── SUCCESS tests ─────────────────────────────────────────────────────
 
   describe('list_scheduled_chats', () => {
@@ -103,6 +223,58 @@ describe('Scheduled Chat MCP Tools', () => {
       });
       expect(result.content[0].text).toContain('sc-1');
       expect(result.content[0].text).toContain('Daily Report');
+    });
+  });
+
+  describe('emma_list_models', () => {
+    it('reads authoritative model options through the authenticated API', async () => {
+      mockMcpFetch.mockResolvedValue({
+        usageMode: 'optimized',
+        canGenerate: true,
+        selectableModels: ['gemini-3.1-flash-lite'],
+        scheduleBackupModels: ['gemini-3.1-flash-lite'],
+      });
+
+      const result = await mcpToolRegistry.execute('emma_list_models', {}, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'GET',
+        path: '/api/agent-mode/model-options',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      });
+      expect(result.content[0].text).toContain('optimized');
+      expect(result.content[0].text).toContain('gemini-3.1-flash-lite');
+    });
+  });
+
+  describe('emma_send_message', () => {
+    it('passes preferred and backup models to the authoritative generate endpoint', async () => {
+      mockMcpFetch.mockResolvedValue({
+        content: 'done',
+        requestedModel: 'anthropic.claude-opus-5',
+        effectiveModel: 'gemini-3.1-flash-lite',
+        backupModel: 'gemini-3.1-flash-lite',
+        backupSource: 'user',
+      });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'session-1',
+        message: 'Do the work',
+        llm_model: 'anthropic.claude-opus-5',
+        backup_model: 'gemini-3.1-flash-lite',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+        body: {
+          sessionId: 'session-1',
+          userMessage: 'Do the work',
+          llmModel: 'anthropic.claude-opus-5',
+          llmBackupModel: 'gemini-3.1-flash-lite',
+        },
+      });
     });
   });
 
@@ -189,6 +361,32 @@ describe('Scheduled Chat MCP Tools', () => {
         self_improve: false,
       }, context);
       expect((mockMcpFetch.mock.calls[0][0] as any).body.selfImprove).toBe(false);
+    });
+
+    it('maps the preferred and backup models on create and update', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-models' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Model fallback',
+        starting_message: 'Do the thing',
+        schedule_frequency: 'daily',
+        llm_model: 'anthropic.claude-opus-5',
+        backup_model: 'gemini-3.1-flash-lite',
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body).toMatchObject({
+        llmModel: 'anthropic.claude-opus-5',
+        llmBackupModel: 'gemini-3.1-flash-lite',
+      });
+
+      mockMcpFetch.mockClear();
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-models',
+        backup_model: 'anthropic.claude-haiku-4-5-20251001-v1:0',
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.llmBackupModel)
+        .toBe('anthropic.claude-haiku-4-5-20251001-v1:0');
     });
   });
 

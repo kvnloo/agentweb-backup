@@ -1,17 +1,20 @@
 import { twitterService, runWithXActingUser } from '../twitterService';
 import { ConnectedAccount, TwitterXConfig } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 
 export class TwitterAdapter implements SocialPlatformAdapter {
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     // account.userId is the token owner (differs from userId for org-shared accounts).
     const ownerUserId = (account as any).userId || userId;
     if (!ownerUserId) throw new Error('userId is required to post on X');
     // Acting user = the poster (userId); owner = ownerUserId. Metering attributes
     // the ledger to the acting user and bills the owner (ENG-664 Option B).
     const result = await runWithXActingUser(userId, () =>
-      twitterService.postTweet(ownerUserId, account.account_id, content)
+      // ENG-827 (Greptile, security): postTweet already re-checks at the write —
+      // this adapter was dropping the hook on the floor, so a scheduled single tweet
+      // was decided only at dispatch while threads were guarded.
+      twitterService.postTweet(ownerUserId, account.account_id, content, undefined, assertStillAuthorized)
     );
     return {
       success: true,

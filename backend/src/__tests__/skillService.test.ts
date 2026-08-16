@@ -201,6 +201,21 @@ describe('SkillService', () => {
       expect(result).toHaveLength(1);
       expect(result[0].isPublished).toBe(true);
     });
+
+    it('excludes a pending-review skill whose stale publication flag is true', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [{ skillId: 'pending', name: 'Pending', description: 'Desc', toolNames: [], isPublished: true, visibility: 'pending_review', createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+      expect(await skillService.getPublishedSkills()).toEqual([]);
+    });
+  });
+
+  describe('getSkillsAvailableToUser', () => {
+    it('preserves the owner but not another member\'s pending-review skill', async () => {
+      const owned = { skillId: 'owned', ownerId: 'member', visibility: 'pending_review', isPublished: true };
+      jest.spyOn(skillService, 'getPublishedSkills').mockResolvedValue([]);
+      jest.spyOn(skillService, 'getSkillsByOwner').mockResolvedValue([owned]);
+      jest.spyOn(skillService, 'getSkillsByOrg').mockResolvedValue([{ skillId: 'other', ownerId: 'owner', visibility: 'pending_review', isPublished: true }]);
+      expect(await skillService.getSkillsAvailableToUser('member', 'org')).toEqual([owned]);
+    });
   });
 
   describe('getSkillsByIds', () => {
@@ -256,6 +271,65 @@ describe('SkillService', () => {
 
       await skillService.updateSkill(skillToUpdate);
       expect(mockCreateSet).toHaveBeenCalledWith(['tool1', 'tool2']);
+    });
+
+    /**
+     * ENG-947: a bulk migration cannot make a read-then-write safe by re-reading —
+     * the row can still change between the read and the put. `expectedUpdatedAt`
+     * turns the put into a compare-and-swap so the write itself is the check.
+     * Omitting it must leave every existing caller byte-identical.
+     */
+    describe('optimistic concurrency (ENG-947)', () => {
+      const skill = {
+        skillId: 'skill-1',
+        name: 'Test',
+        description: 'Desc',
+        isPublished: false,
+        createdAt: mockTimestamp,
+        updatedAt: mockTimestamp,
+      };
+
+      it('sends no ConditionExpression when no expected timestamp is given', async () => {
+        await skillService.updateSkill(skill);
+        const params = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+        expect(params.ConditionExpression).toBeUndefined();
+        expect(params.ExpressionAttributeValues).toBeUndefined();
+      });
+
+      it('guards the put on the expected updatedAt when one is given', async () => {
+        await skillService.updateSkill(skill, mockTimestamp);
+        const params = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+        expect(params.ConditionExpression).toBe('updatedAt = :expectedUpdatedAt');
+        expect(params.ExpressionAttributeValues).toEqual({ ':expectedUpdatedAt': mockTimestamp });
+      });
+
+      it('stamps the written item from the clock, not from the expected timestamp', async () => {
+        // The expected value is the row's CURRENT stamp; the item must carry a NEW
+        // one. Pick an expected that differs from the frozen clock so the two are
+        // actually distinguishable here.
+        const priorStamp = '2020-01-01T00:00:00.000Z';
+        await skillService.updateSkill({ ...skill, updatedAt: priorStamp }, priorStamp);
+        const params = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+        expect(params.Item.updatedAt).not.toBe(priorStamp);
+        expect(params.ExpressionAttributeValues).toEqual({ ':expectedUpdatedAt': priorStamp });
+      });
+
+      it('propagates a ConditionalCheckFailedException so the caller can skip the row', async () => {
+        const conflict: any = new Error('The conditional request failed');
+        conflict.code = 'ConditionalCheckFailedException';
+        mockPromise.mockRejectedValueOnce(conflict);
+        await expect(skillService.updateSkill(skill, mockTimestamp)).rejects.toMatchObject({
+          code: 'ConditionalCheckFailedException',
+        });
+      });
+
+      it('guards on an empty-string expected timestamp rather than silently skipping the check', async () => {
+        // A row with a falsy updatedAt must not degrade into an unconditional write.
+        await skillService.updateSkill(skill, '');
+        const params = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+        expect(params.ConditionExpression).toBe('updatedAt = :expectedUpdatedAt');
+        expect(params.ExpressionAttributeValues).toEqual({ ':expectedUpdatedAt': '' });
+      });
     });
   });
 

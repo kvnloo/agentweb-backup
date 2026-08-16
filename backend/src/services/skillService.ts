@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -91,8 +92,11 @@ export class SkillService {
     description: string,
     toolNames: string[],
     systemPrompt?: string,
-    isPublished?: boolean
+    isPublished?: boolean,
+    welcomeMessage?: string
   ): Promise<Skill> {
+    const welcomeMessageError = validateWelcomeMessage(welcomeMessage);
+    if (welcomeMessageError) throw new Error(welcomeMessageError);
     const timestamp = new Date().toISOString();
     const skill: Skill = {
       skillId: uuidv4(),
@@ -103,6 +107,7 @@ export class SkillService {
       isPublished: isPublished || false, // Default to Draft (not published)
       createdAt: timestamp,
       updatedAt: timestamp,
+      ...(welcomeMessage ? { welcomeMessage } : {}),
     };
 
     const skillItem: any = {
@@ -174,7 +179,8 @@ export class SkillService {
 
     try {
       const items = await paginatedScan(dynamodb, params);
-      return (items.map(item => this.normalizeSkill(item)) as Skill[]) || [];
+      return ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
+        .filter(skill => skill.visibility !== 'pending_review');
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
         return [];
@@ -198,6 +204,7 @@ export class SkillService {
     const seen = new Set(publishedSkills.map(s => s.skillId));
     const privateSkills: Skill[] = [];
     for (const s of [...userSkills, ...orgSkills]) {
+      if (s.visibility === 'pending_review' && s.ownerId !== userId) continue;
       if (!seen.has(s.skillId)) {
         seen.add(s.skillId);
         privateSkills.push(s);
@@ -232,7 +239,21 @@ export class SkillService {
     }
   }
 
-  async updateSkill(skill: Skill): Promise<void> {
+  /**
+   * ENG-947: pass `expectedUpdatedAt` to make this a compare-and-swap. A bulk
+   * migration cannot make a read-then-write safe by re-reading first — the row can
+   * still change between the read and this put, and the loser of that race is
+   * overwritten silently with a backup that predates the lost edit. Guarding on the
+   * timestamp moves the check into the write itself, where it is atomic.
+   *
+   * Omitted (the default) leaves every existing caller's behaviour unchanged: an
+   * unconditional put. A conflict surfaces as DynamoDB's
+   * ConditionalCheckFailedException, which callers are expected to treat as "skip
+   * this row", not as a failure of the run.
+   */
+  async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<void> {
+    const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
+    if (welcomeMessageError) throw new Error(welcomeMessageError);
     const skillItem: any = {
       ...skill,
       updatedAt: new Date().toISOString()
@@ -242,10 +263,17 @@ export class SkillService {
       skillItem.toolNames = dynamodb.createSet(skill.toolNames);
     }
 
-    const params = {
+    const params: any = {
       TableName: this.tableName,
       Item: skillItem,
     };
+
+    // Explicitly `!== undefined`: a row whose updatedAt is an empty string must
+    // still be guarded, not silently degraded to an unconditional write.
+    if (expectedUpdatedAt !== undefined) {
+      params.ConditionExpression = 'updatedAt = :expectedUpdatedAt';
+      params.ExpressionAttributeValues = { ':expectedUpdatedAt': expectedUpdatedAt };
+    }
 
     try {
       await dynamodb.put(params).promise();

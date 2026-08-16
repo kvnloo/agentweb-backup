@@ -29,6 +29,11 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
+import {
+  buildToolResponseS3Header,
+  buildToolResponseUnavailableHeader,
+} from '../../../utils/toolResponseS3Ref';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -212,13 +217,17 @@ export interface ToolDispatchPorts {
   formatToolError: (toolName: string, errorMessage: string) => string;
   /** upload a playwright screenshot data-url to S3; returns { url } or null */
   uploadScreenshotToS3: (dataUrl: string, userId: string) => Promise<{ url: string } | null>;
-  /** upload a large tool response to S3; returns { success, key } */
+  /**
+   * upload a large tool response to S3; returns { success, key }.
+   * It reports failure by RETURNING success:false with `error` — it swallows its
+   * own exceptions — so callers must check the result, not just catch (ENG-940).
+   */
   uploadFileToS3WithPath: (
     content: string,
     fileName: string,
     contentType: string,
     path: string,
-  ) => Promise<{ success: boolean; key?: string }>;
+  ) => Promise<{ success: boolean; key?: string; error?: string }>;
   /** build the CRM-data-changed socket payload for a mutating tool (or null) */
   buildCrmDataChangedPayload: (toolName: string, functionArgs: any) => any;
   /** the socket event name for CRM data changes */
@@ -288,6 +297,14 @@ export interface ExecutePreparedToolsInput {
    */
   generationHardCapMs?: number;
   /**
+   * The turn's REAL wall-clock cap (epoch ms) — the ENG-907 budget, set only when the
+   * caller actually armed `withGenerationTimeout`. Unlike the two media deadlines above
+   * this is not an invented ceiling: callers that impose no cap (scheduled, Slack, GTM,
+   * email) leave it undefined. Tools that must return a result before the turn is
+   * guillotined bound their own work with it (ENG-1133's lead import).
+   */
+  turnHardCapMs?: number;
+  /**
    * Longest media-call wall-clock duration (ms) observed so far this run, across prior
    * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
    * latency rather than a guess. The dispatcher returns an updated value each iteration.
@@ -305,6 +322,12 @@ export interface ExecutePreparedToolsInput {
    * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
    */
   priorMediaCallKeys?: Map<string, string>;
+  /**
+   * ENG-936: optional approved image source URLs that must be used for image
+   * revisions. When supplied, a confirm=true `generate_image` call is rejected
+   * unless every requested input image is in this allow-list.
+   */
+  approvedRevisionImageSources?: string[];
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -334,6 +357,53 @@ export interface ExecutePreparedToolsResult {
    * the same turn is suppressed instead of regenerating the image.
    */
   producedMediaCallKeys: Map<string, string>;
+}
+
+/**
+ * ENG-936: normalize image input fields into a single string array for source checks.
+ */
+function getInputImages(toolCallArgs: any): string[] {
+  const rawInputImages = toolCallArgs?.inputImages ?? toolCallArgs?.input_images;
+  if (typeof rawInputImages === 'string') return [rawInputImages];
+  if (!Array.isArray(rawInputImages)) return [];
+  return rawInputImages.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * ENG-936: ensure a revision-style image edit binds to an explicitly approved
+ * source URL before execution. A false pass here means `confirm=true` was issued
+ * for the wrong source and must be stopped before gateway execution.
+ */
+function isApprovedImageSourceForRevision(
+  args: any,
+  approvedSources: string[] | undefined,
+): { approved: boolean; errorMessage?: string } {
+  if (!approvedSources || approvedSources.length === 0) {
+    return { approved: true };
+  }
+
+  const inputImages = getInputImages(args);
+  if (!Array.isArray(inputImages) || inputImages.length === 0) {
+    return {
+      approved: false,
+      errorMessage:
+        `generate_image confirmation requires explicit approved source inputImages. ` +
+        `Expected one of: ${approvedSources.join(', ')}. Received none.`,
+    };
+  }
+
+  const mismatch = inputImages.find((url) => !approvedSources.includes(url));
+  if (!mismatch) {
+    return { approved: true };
+  }
+
+  return {
+    approved: false,
+    errorMessage:
+      `generate_image source mismatch under confirmation gate. ` +
+      `Expected one of: ${approvedSources.join(', ')}. ` +
+      `Received: ${mismatch}`,
+  };
 }
 
 /**
@@ -371,8 +441,10 @@ export async function executePreparedTools(
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
     generationHardCapMs,
+    turnHardCapMs,
     longestMediaCallMsThisRun = 0,
     priorMediaCallKeys,
+    approvedRevisionImageSources,
     ports,
   } = input;
   // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
@@ -542,6 +614,32 @@ export async function executePreparedTools(
         continue;
       }
 
+      if (
+        toolCall.function.name === 'generate_image'
+        && Array.isArray(approvedRevisionImageSources)
+        && approvedRevisionImageSources.length > 0
+      ) {
+        const sourceCheck = isApprovedImageSourceForRevision(
+          preparedFunctionArgs,
+          approvedRevisionImageSources,
+        );
+        if (!sourceCheck.approved) {
+          const errorMsg = sourceCheck.errorMessage || 'generate_image rejected: unapproved source image.';
+          const guidance = appendRetryabilityGuidance(
+            ports.formatToolError(toolCall.function.name, errorMsg),
+            'invalid_args',
+          );
+          appendPreflightToolFailure(
+            toolCall,
+            preparedFunctionArgs,
+            errorMsg,
+            guidance,
+            policyDecision,
+          );
+          continue;
+        }
+      }
+
       // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
       // was already accepted this turn and the tool isn't exempt, collapse this
       // one — do NOT execute it. Still answer its tool_call_id with a tool-role
@@ -623,6 +721,11 @@ export async function executePreparedTools(
           // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
           // killed mid-wait by the generation timeout (ENG-124).
           runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+          // The turn's real cap, for tools that must hand a result back before the turn
+          // is killed (ENG-1133). Deliberately NOT the media deadline above: that one is
+          // a soft media-only budget, so it both under-budgets the work and, once it has
+          // passed, would report no time left while the turn still has minutes.
+          turnHardCapMs,
         }),
       });
       endExecuteToolSpan(span, outcome.status === 'error'
@@ -909,27 +1012,60 @@ export async function executePreparedTools(
       // then cap the in-memory copy to prevent worker OOM.
       const S3_IN_MEMORY_CAP = 20_000;
       if (typeof toolContent === 'string' && toolContent.length > toolResponseS3Threshold) {
-        try {
-          const uploadResult = await ports.uploadFileToS3WithPath(
-            toolContent,
-            `${toolCall.id}.txt`,
-            'text/plain',
-            `tool-responses/${sessionId}`,
-          );
-          if (uploadResult.success && uploadResult.key) {
-            const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
-            const preview = toolContent.length > S3_IN_MEMORY_CAP
-              ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
-              : toolContent;
-            toolContent = header + preview;
+        // ENG-940: this offload is the ONLY thing that keeps the payload readable
+        // once the trimmer compresses this message, so a failure here is not a
+        // cosmetic miss — it is silent data loss on a later turn. Retry once (the
+        // common failure is a transient S3 blip), and if it still cannot be stored
+        // say so in the message rather than letting it pass for a small response.
+        // Note uploadFileToS3WithPath reports failure by RETURNING {success:false};
+        // the catch only covers a port that throws.
+        let uploadedKey: string | undefined;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 2 && !uploadedKey; attempt++) {
+          try {
+            const uploadResult = await ports.uploadFileToS3WithPath(
+              toolContent,
+              `${toolCall.id}.txt`,
+              'text/plain',
+              `tool-responses/${sessionId}`,
+            );
+            if (uploadResult.success && uploadResult.key) uploadedKey = uploadResult.key;
+            else lastError = uploadResult.error;
+          } catch (e) {
+            lastError = e;
           }
-        } catch (e) {
-          console.error('AgentMode: Failed to save large tool response to S3:', e);
+        }
+
+        if (uploadedKey) {
+          const header = buildToolResponseS3Header(uploadedKey, toolContent.length);
+          // ENG-1054: seal the slice instead of leaving the JSON it cut open. A bare
+          // substring lands mid-string/mid-object, and a model handed an unterminated
+          // structure completes it rather than answering — that is where the
+          // production `}]` final answer came from.
+          const preview = toolContent.length > S3_IN_MEMORY_CAP
+            ? sealTruncatedPayload(toolContent.substring(0, S3_IN_MEMORY_CAP))
+            : toolContent;
+          toolContent = header + preview;
+        } else {
+          console.error(
+            `AgentMode: Failed to save large ${toolCall.function.name} response ` +
+            `(${toolContent.length} chars) to S3 after 2 attempts:`,
+            lastError,
+          );
+          // Keep the payload in full for THIS turn — it is now the only copy —
+          // and prepend the notice so the loss is visible on every later turn.
+          toolContent = buildToolResponseUnavailableHeader(toolContent.length) + toolContent;
         }
       }
 
+      // ENG-1054: seal here too. This cap is a SECOND bare cut on the same payload,
+      // reached when the S3 offload above failed and left the content full-size —
+      // an unsealed slice here would reopen the JSON just as the preview one did.
       const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > maxToolContentSize
-        ? toolContent.substring(0, maxToolContentSize) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+        ? sealTruncatedPayloadWithNotice(
+          toolContent.substring(0, maxToolContentSize),
+          '[Content truncated for storage — original size: ' + toolContent.length + ' chars]',
+        )
         : toolContent;
       (messages as any[]).push({
         tool_call_id: toolCall.id,

@@ -68,6 +68,7 @@ describe('ensureCriticalTables', () => {
       'Dev-AW-LoopDispatches',
     ]));
     expect(names.some((n) => n.endsWith('AW-OnboardingMetrics'))).toBe(true);
+    expect(names.some((n) => n.endsWith('AW-LlmChargeEvents'))).toBe(true);
   });
 
   it('onboarding metrics spec carries the StepStartedAtIndex GSI', () => {
