@@ -213,12 +213,26 @@ router.post(
       // while a genuinely different batch (even for the same taskId, e.g. a
       // long task reporting incrementally) still gets its own key and is
       // charged in full rather than colliding with an earlier submission.
+      // Greptile P1: content alone can't distinguish "the same submission
+      // retried" from "a distinct task rerun that happens to produce
+      // identical measurements" (deterministic/templated tasks can do this).
+      // The engine sends no per-submission nonce, so fold in a coarse time
+      // bucket: a retry (network timeout, crash-restart) lands within
+      // seconds to low minutes of the original, so a wide bucket still
+      // dedupes it, while a genuinely separate rerun -- almost never
+      // launched in the SAME bucket as a prior identical one -- gets its own
+      // key and is charged. Bounded residual: a true retry landing on the
+      // opposite side of a bucket boundary is still double-charged; there is
+      // no nonce-free way to eliminate that risk entirely, only shrink it.
+      const RETRY_COLLAPSE_WINDOW_MS = 10 * 60 * 1000;
+      const timeBucket = Math.floor(Date.now() / RETRY_COLLAPSE_WINDOW_MS);
       await Promise.all(
         [...charges.entries()].map(([userId, { tokens, cost, recordFingerprints }]) => {
           // A charge entry only exists once at least one record contributed a
           // fingerprint, so this always has content to hash.
           const eventId = `engine:${userId}:${createHash("sha256")
             .update([...recordFingerprints].sort().join("\u0001"))
+            .update(`bucket:${timeBucket}`)
             .digest("hex")
             .slice(0, 32)}`;
           return incrementUserTokenUsage(userId, tokens, cost, {

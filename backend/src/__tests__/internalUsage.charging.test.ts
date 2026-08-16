@@ -245,6 +245,38 @@ describe("POST /api/internal/usage — idempotent against a resubmitted batch (E
     expect(second.eventId).toBe(first.eventId);
   });
 
+  it("derives a different eventId for identical records resubmitted well outside the retry window (Greptile P1: distinct reruns with identical measurements must not silently collapse)", async () => {
+    // Content-only fingerprinting can't tell "the same submission retried"
+    // apart from "a distinct rerun that happens to produce identical
+    // measurements" (a deterministic/templated task can do this). Time
+    // bucketing distinguishes them: near-immediate resubmission (retry,
+    // crash-restart) stays in the same bucket and dedupes; a rerun 20
+    // minutes later — well outside the 10-minute collapse window — gets its
+    // own key and is charged in full, not silently dropped.
+    const realDateNow = Date.now;
+    try {
+      Date.now = jest.fn(() => new Date("2026-08-16T00:00:00.000Z").getTime());
+      await request(app)
+        .post("/api/internal/usage")
+        .set("Authorization", `Bearer ${ownerToken}`)
+        .send({ records: [record({ taskId: "task-abc" })] });
+      const [, , , first] = mockIncrementUserTokenUsage.mock.calls[0];
+
+      mockIncrementUserTokenUsage.mockClear();
+
+      Date.now = jest.fn(() => new Date("2026-08-16T00:20:00.000Z").getTime());
+      await request(app)
+        .post("/api/internal/usage")
+        .set("Authorization", `Bearer ${ownerToken}`)
+        .send({ records: [record({ taskId: "task-abc" })] });
+      const [, , , second] = mockIncrementUserTokenUsage.mock.calls[0];
+
+      expect(second.eventId).not.toBe(first.eventId);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
   it("derives a different eventId for a genuinely different task", async () => {
     await request(app)
       .post("/api/internal/usage")
