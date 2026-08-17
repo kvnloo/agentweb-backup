@@ -144,6 +144,14 @@ router.put("/:planId", async (req, res) => {
         message: `Unrecognised steps_mode ${JSON.stringify(badMode)}. Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
       });
     }
+    // Two valid but contradictory modes pass the check above, and taking the
+    // first would apply semantics the caller explicitly also denied — with
+    // `confirm_step_removal` present that resolves to an unintended replace.
+    if (suppliedModes.length > 1 && new Set(suppliedModes).size > 1) {
+      return res.status(400).json({
+        message: `Conflicting modes: steps_mode="${(req.body as any).steps_mode}" and stepsMode="${(req.body as any).stepsMode}". Supply one, or the same value for both.`,
+      });
+    }
     const rawMode = suppliedModes[0];
     if (normalizedSteps !== undefined) {
       const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
@@ -170,18 +178,26 @@ router.put("/:planId", async (req, res) => {
           const raw = rawSteps[i] ?? {};
           const has = (key: string) => raw[key] !== undefined;
           const out: any = {};
-          // Truthiness, not presence, and deliberately so: normalization turns
-          // a null / 0 / '' stepCount into the array position, and merge
-          // resolution trusts stepCount ahead of title. Treating those as
-          // "supplied" promotes a non-selector into an invented one that then
-          // outranks the title the caller actually gave. Same `||` rule
-          // normalizeWorkPlanSteps applies, so the two cannot disagree.
+          // The rule for every field below: a value counts as SUPPLIED only if
+          // normalization would keep it rather than invent a replacement.
+          // Presence alone is not enough, because the normalizer substitutes for
+          // falsy input — `stepCount` and `title` become the array position and
+          // "Step N", and a null list becomes []. Merging any of those writes a
+          // value the caller never sent over one that was really there, under
+          // the mode whose whole promise is that it does not do that. A
+          // synthesised `stepCount` is worst of all, because merge resolution
+          // trusts it ahead of title and so silently edits the wrong step.
+          //
+          // Truthiness for the two `||` fields mirrors the normalizer exactly,
+          // so the two cannot disagree; `Array.isArray` mirrors `listOf`.
+          // `description` and `userInstructions` pass through unchanged, so
+          // presence is the right test — and mergeWorkPlanStep drops a null.
           if (raw.stepCount) out.stepCount = norm.stepCount;
-          if (has('title')) out.title = norm.title;
+          if (raw.title) out.title = norm.title;
           if (has('description')) out.description = norm.description;
           if (has('userInstructions')) out.userInstructions = norm.userInstructions;
-          if (has('requiredFunctionCalls')) out.requiredFunctionCalls = norm.requiredFunctionCalls;
-          if (has('skillIds')) out.skillIds = norm.skillIds;
+          if (Array.isArray(raw.requiredFunctionCalls)) out.requiredFunctionCalls = norm.requiredFunctionCalls;
+          if (Array.isArray(raw.skillIds)) out.skillIds = norm.skillIds;
           if (has('expectedAssetCount')) out.expectedAssetCount = norm.expectedAssetCount;
           return out;
         });
