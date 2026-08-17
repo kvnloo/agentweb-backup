@@ -12,7 +12,7 @@ import {
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
 import { resolveBillingUserId } from '../services/tokenUsageService';
-import { usageRecordDb } from '../services/usageRecordDb';
+import { readBilledLedgerRows } from '../services/llmUsageLedgerReader';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
 import { reconcileItemizedUsage } from '../services/usageItemization';
 
@@ -209,17 +209,21 @@ router.get('/usage/itemized', authenticateToken, async (req, res) => {
     const month = String(req.query.month || new Date().toISOString().slice(0, 7));
     if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month must be YYYY-MM' });
     const billingUserId = await resolveBillingUserId(userId);
-    // ENG-1251 Greptile P1: the shadow-ledger aggregate table's partition key
-    // is the ACTING user's own id, not the resolved billing owner -- a
-    // pooled org member's (or a FORMER member's, from while they were
-    // pooled) aggregate-only usage is unreachable from a query keyed on
-    // billingUserId alone. queryByBillingUserDateRange scans by the row's
-    // own billingUserId attribute instead (stamped correctly at write time
-    // as of internalUsage.ts's fix in this same PR), so it finds every row
-    // ever attributed to this owner regardless of current org membership.
+    // ENG-1251: the shadow-ledger aggregate table's partition key is the ACTING
+    // user's own id, not the resolved billing owner, so no single strategy sees
+    // the whole ledger. Scanning by the `billingUserId` attribute finds rows
+    // belonging to FORMER members that no partition query can reach, but only
+    // rows carrying the stamp -- and most rows predating internalUsage.ts's
+    // write-time fix do not. That is why this endpoint reported $86.23 against
+    // a true $218.13 for the founders org over Aug 12-15, 60.5% low.
+    //
+    // readBilledLedgerRows takes the union of that scan and the per-member
+    // partition fan-out, deduped on the table's primary key. It repairs the
+    // historical window in place: both halves read data exactly as it already
+    // exists, so no backfill is required.
     const [events, rows] = await Promise.all([
       listLlmChargeEvents(billingUserId, `${month}-01`, `${month}-31`),
-      usageRecordDb.queryByBillingUserDateRange(billingUserId, `${month}-01`, `${month}-31`),
+      readBilledLedgerRows(billingUserId, `${month}-01`, `${month}-31`),
     ]);
     const { items, precision } = reconcileItemizedUsage(events, rows);
     return res.json({ month, billingUserId, precision, items });
