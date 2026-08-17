@@ -1904,7 +1904,15 @@ const createLlmChargeEventsTable = async () => {
 // added after monthly queries were found silently missing events (ENG-1251).
 // TTL: rows carry a `ttl` attr (epoch seconds — 365d). Enable DynamoDB native
 // TTL on the `ttl` attribute manually, same as UsageRecords/LoopEvents.
-const createModelChangeAuditTable = async () => {
+// Append-only audit of customer-confirmed model changes (ENG-1217 AC9).
+// Sort key is `${changedAt}#${changeId}` so the base table is range-queryable by
+// day without a GSI -- llmChargeAuditDb keyed on a caller-controlled id and had
+// to add one after date-range queries silently missed events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds, 365d). Enable DynamoDB native TTL
+// on the `ttl` attribute MANUALLY -- CreateTable does not configure it, and
+// nothing at runtime will report that it is missing. Same manual step as the
+// UsageRecords/LoopEvents/AgentRuns tables.
+export const createModelChangeAuditTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
     AttributeDefinitions: [
