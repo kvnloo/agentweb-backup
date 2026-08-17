@@ -82,8 +82,14 @@ export interface UsageRecordIncrement {
   calls?: number;
 }
 
-/** Provenance of a cost figure — see `UsageRecordIncrement.costSource`. */
-export type CostSource = "measured" | "allocated";
+/**
+ * Provenance of a cost figure — see `UsageRecordIncrement.costSource`.
+ * ENG-700: "unpriced" marks a row whose `costMicroUsd` is 0 because the model
+ * has no price entry (never because the model is genuinely free) — distinct
+ * from "allocated", which means 0 or more real dollars were computed from a
+ * known rate.
+ */
+export type CostSource = "measured" | "allocated" | "unpriced";
 
 export interface UsageRecordRow {
   userId: string;
