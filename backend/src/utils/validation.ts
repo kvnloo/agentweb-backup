@@ -3,6 +3,45 @@ export const validateEmail = (email: string): boolean => {
   return emailRegex.test(email);
 };
 
+// Stricter than validateEmail above: rejects consecutive dots in the local
+// part or domain, and requires a real TLD label — the shapes that pass
+// validateEmail's loose regex but still get rejected by provider validation
+// (e.g. Resend 422s) at send time. See ENG-1194.
+const STRICT_EMAIL_SYNTAX_REGEX =
+  /^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+
+export const isEmailSyntaxValid = (email: string): boolean => {
+  return STRICT_EMAIL_SYNTAX_REGEX.test((email || '').trim());
+};
+
+// RFC 2606 domains/TLDs reserved for documentation/testing — providers like
+// Resend reject sends to these outright. Deliberately does NOT include
+// generic-looking domains like "test.com" (a real, registered domain) —
+// only the formally reserved set.
+const RESERVED_TEST_DOMAINS = new Set(['example.com', 'example.net', 'example.org', 'example.edu']);
+const RESERVED_TEST_TLDS = ['.test', '.example', '.invalid', '.localhost'];
+
+export const isReservedTestDomainEmail = (email: string): boolean => {
+  const trimmed = (email || '').trim().toLowerCase();
+  const atIdx = trimmed.lastIndexOf('@');
+  if (atIdx < 0) return false;
+  const domain = trimmed.slice(atIdx + 1);
+  if (RESERVED_TEST_DOMAINS.has(domain)) return true;
+  return RESERVED_TEST_TLDS.some((tld) => domain.endsWith(tld));
+};
+
+/**
+ * Single source of truth for group-email eligibility on syntax/test-domain
+ * grounds. Shared by both the preview and send endpoints (ENG-1194) so the
+ * preview's "eligible" count can't diverge from what the send actually
+ * queues to the provider. A missing email is NOT flagged here — that's
+ * covered by the separate no-email bucket upstream.
+ */
+export const isGroupEmailIneligible = (email: string | undefined | null): boolean => {
+  if (!email) return false;
+  return !isEmailSyntaxValid(email) || isReservedTestDomainEmail(email);
+};
+
 const PERSONAL_EMAIL_DOMAINS = new Set([
   'gmail.com', 'googlemail.com',
   'yahoo.com', 'yahoo.co.uk', 'yahoo.co.in', 'yahoo.fr', 'yahoo.de', 'yahoo.it', 'yahoo.es',

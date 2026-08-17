@@ -24,6 +24,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { isGroupEmailIneligible } from '../utils/validation';
 import { syncContact, SyncInput } from '../services/contactSyncService';
 import { enrichContact, defaultEnrichmentCache, EnrichmentDeps } from '../services/internalEnrichmentService';
 import { dedupContactsForUser } from '../services/contactDedupService';
@@ -5780,15 +5781,22 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     // the user can decide before sending. Undeliverable is blocked by default
     // in the send endpoint; user can override per-address.
     const validationStatus = (l: any): string | undefined => l?.customFields?.email_validation?.status;
-    const undeliverableLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'undeliverable');
-    const riskyLeadsList = leads.filter((l: any) => l.email && validationStatus(l) === 'risky');
+    // ENG-1194: a lead with malformed syntax or a provider-disallowed test
+    // domain (e.g. example.com) is treated as undeliverable even if it was
+    // never run through (or passed) the async enrich.so validation — the
+    // provider rejects it at send time regardless. isGroupEmailIneligible is
+    // the same function the send endpoint uses, so this count matches what
+    // send actually queues.
+    const isUndeliverable = (l: any) => validationStatus(l) === 'undeliverable' || isGroupEmailIneligible(l.email);
+    const undeliverableLeadsList = leads.filter((l: any) => l.email && isUndeliverable(l));
+    const riskyLeadsList = leads.filter((l: any) => l.email && !isUndeliverable(l) && validationStatus(l) === 'risky');
     const undeliverableCount = undeliverableLeadsList.length;
     const riskyCount = riskyLeadsList.length;
     // Eligibility = has email && not DNC && not undeliverable. Single boolean
     // filter (not arithmetic subtraction) so overlapping categories don't
     // produce negative counts.
     const eligibleLeads = leads.filter((l: any) =>
-      l.email && !isDoNotContact(l) && validationStatus(l) !== 'undeliverable',
+      l.email && !isDoNotContact(l) && !isUndeliverable(l),
     ).length;
 
     // Return small samples (first 50) of email lists so the UI modals can show
@@ -5964,8 +5972,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       );
       const beforeCount = eligibleLeads.length;
       eligibleLeads = eligibleLeads.filter((l: any) => {
+        // ENG-1194: same undeliverable definition as preview — provider-validation
+        // status OR a malformed/test-domain address caught by isGroupEmailIneligible.
         const status = l?.customFields?.email_validation?.status;
-        if (status !== 'undeliverable') return true;
+        const isUndeliverable = status === 'undeliverable' || isGroupEmailIneligible(l.email);
+        if (!isUndeliverable) return true;
         return whitelist.has(String(l.email ?? '').trim().toLowerCase());
       });
       skippedUndeliverable = beforeCount - eligibleLeads.length;
