@@ -23959,7 +23959,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }

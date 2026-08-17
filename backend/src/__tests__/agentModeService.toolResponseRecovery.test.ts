@@ -143,13 +143,45 @@ describe('ENG-940: trimming preserves the S3 recovery reference', () => {
     expect(digest.content).toContain('"totalPRs": 2');
   });
 
-  it('leaves the compressed form unchanged for content with no S3 reference', () => {
+  // ENG-1310 AC2: "Trimmed tool results are re-read, not re-served from prose." The
+  // S3 key already existed (ENG-940) but nothing told the model to actually use it
+  // instead of quietly continuing from its own earlier prose — this is the fix.
+  it('tells the model to re-read via the tool-response tools instead of restating a figure (ENG-1310 AC2)', () => {
+    const body = `{\n  "totalPRs": 2,\n${'x'.repeat(9000)}`;
+    const content = buildToolResponseS3Header(s3Key, body.length) + body;
+
+    const service = new AgentModeService();
+    const trimmed = service.trimToolMessagesForContext(buildMessages(content));
+    const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
+
+    expect(digest.content).toMatch(/not a verified source/i);
+    expect(digest.content).toMatch(/do not restate any number or figure/i);
+    expect(digest.content).toMatch(/read_tool_response\/search_tool_response/);
+  });
+
+  it('tells the model to re-run the source tool when there is no S3 recovery key (ENG-1310 AC2)', () => {
     const content = 'R'.repeat(12000);
     const service = new AgentModeService();
     const trimmed = service.trimToolMessagesForContext(buildMessages(content));
     const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
 
-    expect(digest.content).toBe(`[Tool: get_pr_digest — ${'R'.repeat(200)}...]`);
+    expect(digest.content).toMatch(/not a verified source/i);
+    expect(digest.content).toMatch(/re-run get_pr_digest if you need the full result/i);
+  });
+
+  it('leaves the compressed form using the plain no-ref preview for content with no S3 reference', () => {
+    const content = 'R'.repeat(12000);
+    const service = new AgentModeService();
+    const trimmed = service.trimToolMessagesForContext(buildMessages(content));
+    const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
+
+    // ENG-1310: the placeholder now also names the recovery path and warns the
+    // model off restating figures from this preview or its own earlier reply.
+    expect(digest.content).toBe(
+      `[Tool: get_pr_digest — compressed for context; this preview is NOT a verified source — ` +
+      `do not restate any number or figure from it, or from your own earlier reply, as confirmed; ` +
+      `re-run get_pr_digest if you need the full result. preview: ${'R'.repeat(200)}...]`
+    );
   });
 });
 
