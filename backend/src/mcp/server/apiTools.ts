@@ -2645,6 +2645,8 @@ mcpToolRegistry.register({
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
 - attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran; collapses to a single model name when they agree or nothing to contrast. Null only when attributedModels is null.
+- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, byModel: [{model, sessions, share}] }, sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. Null when no session in range has any resolvable attribution.
 
 The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
@@ -2772,6 +2774,28 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         };
       }
 
+      const attributedModels: string[] | null = generationModels.size > 0
+        ? [...generationModels]
+        : (session.llmModel ? [session.llmModel] : null);
+      const attributionBasis: 'transcript' | 'partial-transcript' | 'selection-only' | null =
+        generationModels.size > 0
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
+          : (session.llmModel ? 'selection-only' : null);
+      // ENG-1313: the Daily Satisfaction Score Report named the picker
+      // (llmModel) instead of the model that ran even after ENG-892 exposed
+      // attributedModels — building the report's per-session line was still a
+      // judgement call the reporting agent had to make correctly every time,
+      // and it silently reverted to the field named `llmModel` on sight. Same
+      // fix pattern as ENG-892: pre-compute the exact display line so there is
+      // no choice left to make. Only names the picker when it disagrees with
+      // what ran — agreement (or selection-only, where there is nothing to
+      // contrast) collapses to a single value.
+      const modelLine: string | null = attributedModels
+        ? (session.llmModel && !attributedModels.includes(session.llmModel)
+            ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}`
+            : attributedModels.join(', '))
+        : null;
+
       return {
         sessionId: session.sessionId,
         userId: session.userId,
@@ -2788,12 +2812,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         // sight; a stored account memory still instructs grouping cost by it.
         // Emitting the answer (plus how trustworthy it is) removes that judgement
         // call rather than relying on the agent to make it correctly.
-        attributedModels: generationModels.size > 0
-          ? [...generationModels]
-          : (session.llmModel ? [session.llmModel] : null),
-        attributionBasis: generationModels.size > 0
-          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
-          : (session.llmModel ? 'selection-only' : null),
+        attributedModels,
+        attributionBasis,
+        // ENG-1313: the exact string the per-session report line should use
+        // verbatim — see the modelLine computation above.
+        modelLine,
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
         cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
@@ -2830,11 +2853,36 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       };
     });
 
+    // ENG-1313 acceptance criterion 3: the model-mix section must be computed
+    // from attributedModels (transcript-derived where available), never from
+    // llmModel — otherwise a fleet-wide default-model switch stays invisible
+    // because every session still shows its old picker selection. Counted per
+    // session (not per turn), against attributedModels only, so this can never
+    // be pulled toward llmModel by accident.
+    const modelMixCounts: Record<string, number> = {};
+    let sessionsWithModelData = 0;
+    for (const s of formattedSessions) {
+      if (!s.attributedModels) continue;
+      sessionsWithModelData++;
+      for (const m of s.attributedModels as string[]) {
+        modelMixCounts[m] = (modelMixCounts[m] || 0) + 1;
+      }
+    }
+    const modelMix = sessionsWithModelData > 0
+      ? {
+          sessionsWithModelData,
+          byModel: Object.entries(modelMixCounts)
+            .map(([model, sessions]) => ({ model, sessions, share: sessions / sessionsWithModelData }))
+            .sort((a, b) => b.sessions - a.sessions || a.model.localeCompare(b.model)),
+        }
+      : null;
+
     return jsonResult({
       sessions: formattedSessions,
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      modelMix,
     });
   }
 });
