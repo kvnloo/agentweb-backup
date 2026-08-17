@@ -50,7 +50,7 @@ export interface RequiredCallLedgerEntry {
 }
 
 /** An alternative route that achieves a required publish outcome. */
-interface EquivalentPublishRoute {
+export interface EquivalentPublishRoute {
   tool: string;
   /**
    * Which actions of an action-multiplexing tool count. Omitted means the whole
@@ -68,8 +68,17 @@ interface EquivalentPublishRoute {
  * `post_thread` is listed as a requirement key even though no tool is named that:
  * it is an ACTION of `twitter_manage_post`, so a schedule that spells it can never
  * be satisfied by a name match either — the same defect with a different spelling.
+ *
+ * Exported (ENG-1045 follow-up) so `schedulePublishAuthorization.ts` can grant
+ * execution consent for exactly these same routes, and the unattended-execution
+ * directive can tell the model about them. Without that, an owner who authorized
+ * `post_on_connected_account` had the model hard-refused from ever calling
+ * `twitter_manage_post` at all — the equivalence route this checker credits was
+ * unreachable in practice, live-verified on preview 2026-08-17: the model narrated
+ * "this schedule is only pre-authorized to publish using post_on_connected_account"
+ * and silently collapsed a requested 2-tweet thread into one tweet instead.
  */
-const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]> = {
+export const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]> = {
   post_on_connected_account: [
     // A multi-tweet thread, a reply and a quote-tweet all put the mandated content
     // on the owner's timeline; only the thread case is impossible to express via
@@ -80,7 +89,7 @@ const EQUIVALENT_PUBLISH_ROUTES: Record<string, EquivalentPublishRoute[]> = {
 };
 
 /** Fold an action to the one spelling the route table is keyed on. */
-function normalizeAction(action: unknown): string {
+export function normalizeAction(action: unknown): string {
   return typeof action === 'string' ? action.trim().toLowerCase().replace(/-/g, '_') : '';
 }
 
