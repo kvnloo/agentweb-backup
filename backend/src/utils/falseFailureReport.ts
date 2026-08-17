@@ -10,6 +10,18 @@
  * not saved. Please try again." All three judges scored it 2/5 for dataAccuracy.
  * Worst-case consequence: the user re-runs a production deploy that already landed.
  *
+ * ENG-1224 (Variant A / session 1e9a4fe4): the same inversion, one seam further —
+ * `update_html_file` had already returned a live preview URL when a trailing
+ * exception threw the turn into this catch block, and the diagnosis path had no
+ * notice for it: `update_html_file` is neither a publish (no email/campaign goes
+ * out) nor a duplicate-unsafe data write (re-running an edit overwrites the same
+ * file rather than duplicating it), so it was in neither confirmed set and the
+ * user was left with the bare "please try again" fallback and no way back to the
+ * page they had just finished editing. `CONFIRMED_ARTIFACT_TOOLS` /
+ * `collectConfirmedArtifactUrls` / `appendConfirmedArtifactNotice` close that gap:
+ * a distinct notice (never "do not re-run" — re-running IS safe here) that
+ * surfaces the produced artifact's URL instead.
+ *
  * Two independent defects produced that sentence, and this module backs the fix for
  * both:
  *   1. The model-visible tool error for a bookkeeping tool carried no criticality
@@ -36,6 +48,8 @@
  * and the diagnosis path (`ledgerFromSucceededFunctions` supplies the ledger there,
  * since `toolCalls[]` does not survive the throw).
  */
+
+import { extractToolResponseS3Ref } from './toolResponseS3Ref';
 
 /** A tool-ledger entry (agentMode toolCalls[]): { name, result, error }. */
 export interface FalseFailureLedgerEntry {
@@ -427,6 +441,98 @@ export function collectPublishActionsSince(
   return out;
 }
 
+/**
+ * HTML-editor tools whose SUCCESS produces a user-visible preview artifact (an S3
+ * URL) but that belong in neither existing set: not a publish (no email/campaign
+ * goes out) and not duplicate-unsafe (an update overwrites the same file, so a
+ * repeat converges rather than duplicates it — same reasoning as the "every
+ * update and delete tool" exclusion from `CONFIRMED_DATA_WRITE_TOOLS` above).
+ * What a false failure after one of these costs the user is not a re-run risk,
+ * it is losing the link to work that already exists.
+ */
+const CONFIRMED_ARTIFACT_TOOLS: ReadonlySet<string> = new Set<string>([
+  'create_html_file',
+  'update_html_file',
+  'create_html_from_template',
+]);
+
+/** Parse a tool result body into JSON, stripping the S3-offload header first if present. */
+function parseToolResultBody(content: unknown): any {
+  if (typeof content !== 'string' || !content) return null;
+  const header = extractToolResponseS3Ref(content);
+  const body = header ? content.slice(header.length) : content;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Preview/artifact URLs a confirmed HTML tool call produced THIS turn, read from
+ * the transcript. Same reasoning and scoping as `collectPublishActionsSince`: the
+ * diagnosis path only has the persisted session, never the in-loop ledger with
+ * tool results, so this reads the timestamped tool messages directly. Accepts
+ * epoch ms (rather than `collectPublishActionsSince`'s ISO string) because both
+ * call sites already hold `turnStartMs` as a number.
+ */
+export function collectConfirmedArtifactUrls(
+  messages: TranscriptToolMessage[] | null | undefined,
+  sinceMs: number | null | undefined,
+): string[] {
+  if (!Array.isArray(messages) || !Number.isFinite(sinceMs as number)) return [];
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  for (const m of messages) {
+    if (!m || m.role !== 'tool' || !m.name || !CONFIRMED_ARTIFACT_TOOLS.has(m.name)) continue;
+    const stamp = m.timestamp || m.metadata?.timestamp;
+    const at = stamp ? new Date(stamp).getTime() : NaN;
+    if (!Number.isFinite(at) || at < (sinceMs as number)) continue;
+    const parsed = parseToolResultBody(m.content);
+    if (!parsed || parsed.success !== true) continue;
+    const url = parsed.s3_url;
+    if (typeof url !== 'string' || !url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+  }
+  return urls;
+}
+
+/** The visible notice appended after a confirmed HTML edit whose URL would otherwise be lost. */
+function buildArtifactNotice(urls: string[]): string {
+  const links = urls.length === 1 ? urls[0] : urls.map((u, i) => `${i + 1}. ${u}`).join('\n');
+  return (
+    `${CORRECTION_MARKER}, successfully: updated your HTML file. `
+    + `You can view it here — the error above did not affect this work:\n${links}`
+  );
+}
+
+/**
+ * ENG-1224 (Variant A): the artifact twin of `appendConfirmedDataWriteNotice`, for
+ * text the CALLER already knows is generic. Never says "do not re-run" — unlike a
+ * publish or a CRM write, re-running an HTML edit is safe (it overwrites the same
+ * file) — it exists purely to hand back the link a thrown turn would otherwise
+ * lose. Composes with the publish/data-write notices via the shared
+ * CORRECTION_MARKER exactly like `extendExistingCorrection`.
+ */
+export function appendConfirmedArtifactNotice(
+  content: string,
+  urls: string[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (!Array.isArray(urls) || urls.length === 0) return content;
+
+  if (content.includes(CORRECTION_MARKER)) {
+    const missing = urls.filter((u) => !content.includes(u));
+    if (missing.length === 0) return content;
+    const links = missing.length === 1 ? missing[0] : missing.map((u, i) => `${i + 1}. ${u}`).join('\n');
+    return `${content.replace(/\s+$/, '')} It also updated your HTML file — you can view it here:\n${links}`;
+  }
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildArtifactNotice(urls)}`;
+}
+
 /** Plain-language labels of every publish/deploy confirmed this run, de-duplicated. */
 export function collectConfirmedPublishActions(
   toolCalls: FalseFailureLedgerEntry[] | null | undefined,
@@ -699,6 +805,25 @@ export function reconcileFalseDataWriteFailure(
   if (actions.length === 0) return content;
 
   return `${content.replace(/\s+$/, '')}\n\n${buildDataWriteNotice(actions)}`;
+}
+
+/**
+ * ENG-1224 (Variant A): the artifact twin of `reconcileFalseDataWriteFailure`, for
+ * the DIAGNOSIS AGENT's own prose rather than a fixed fallback string. Same
+ * contract — fires only when the text asserts an unsaved interruption, appends
+ * only a URL a confirmed tool call actually produced, and never rewrites the
+ * model's own words. Run LAST: the shared `CORRECTION_MARKER` makes whichever
+ * reconciler runs first win the banner, and a landed publish or data write is
+ * more consequential to have re-run than losing a preview link.
+ */
+export function reconcileFalseArtifactFailure(
+  content: string,
+  artifactUrls: string[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(CORRECTION_MARKER)) return appendConfirmedArtifactNotice(content, artifactUrls);
+  if (!assertsUnsavedInterruption(content)) return content;
+  return appendConfirmedArtifactNotice(content, artifactUrls);
 }
 
 /**
