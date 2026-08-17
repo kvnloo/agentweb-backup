@@ -5,6 +5,33 @@ import { userDb } from './db';
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
 // Twitter/X support is suspended — see dev.md for details.
 
+/**
+ * Does this error prove the LinkedIn session is gone, as opposed to merely failing?
+ *
+ * The distinction is the whole point. A timeout, a 5xx or a transport blip says
+ * nothing about session validity, and treating one as a disconnection suppresses a
+ * healthy account behind a false reconnect prompt (ENG-281). Only Unipile's explicit
+ * disconnect code, a 401, or an AUTH_ERROR classification are proof.
+ *
+ * Exported so every caller that persists or blocks on this verdict — the session
+ * probe, the sync cron's health recorder — shares one definition. Two copies of a
+ * safety predicate is one copy too many.
+ */
+export function isProvenDisconnectError(error: any): boolean {
+  // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
+  // `structuredError`. Read both so classification can't depend on which layer threw.
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification =
+    structured?.classification || error?.body?.classification || error?.classification;
+  return (
+    code === 'errors/disconnected_account' ||
+    classification === 'AUTH_ERROR' ||
+    Number(status) === 401
+  );
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -374,21 +401,12 @@ export class LinkedInOutreachService {
         state = 'connected';
       }
     } catch (error: any) {
-      // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
-      // `structuredError`. Read both so the classification cannot depend on which
-      // layer threw.
+      // Only a proven-dead signal may say "disconnected"; everything else is
+      // indeterminate and the caller decides. See isProvenDisconnectError.
+      state = isProvenDisconnectError(error) ? 'disconnected' : 'unknown';
       const structured = error?.structuredError;
       const code = structured?.code || error?.body?.code || error?.code || '';
       const status = structured?.status || error?.body?.status || error?.status;
-      const classification = structured?.classification || error?.body?.classification || error?.classification;
-      // Only these mean "the LinkedIn session is gone". A timeout or transport
-      // failure proves nothing about the session, so it must not be reported as
-      // a disconnection to a caller that would block on it.
-      const definitivelyDisconnected =
-        code === 'errors/disconnected_account' ||
-        classification === 'AUTH_ERROR' ||
-        Number(status) === 401;
-      state = definitivelyDisconnected ? 'disconnected' : 'unknown';
       this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''}) → ${state}`);
     }
     this.connectedStatusCache.set(accountId, { state, timestamp: Date.now() });
