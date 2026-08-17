@@ -5302,7 +5302,15 @@ export class AgentModeService {
    * scratch — an expensive, non-converging loop. Surfacing the existing filenames
    * lets the model generate only what's missing and then advance the step.
    */
-  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+  /**
+   * `sinceIso` (ENG-1188): when set, only images generated at or after this
+   * timestamp count — used to scope a work-plan step's produced-asset count to
+   * that step alone rather than the whole session (see setWorkPlanStatus). A
+   * marker with no timestamp (only possible on messages from before the
+   * `metadata.timestamp` field existed) is counted regardless, so this can never
+   * make an old in-flight session's count go DOWN relative to the unscoped call.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[], sinceIso?: string): string[] {
     if (!Array.isArray(sessionHistory)) return [];
     const seen = new Set<string>();
     const filenames: string[] = [];
@@ -5318,6 +5326,8 @@ export class AgentModeService {
         if (match) filename = match[1].trim();
       }
       if (!filename || seen.has(filename)) continue;
+      const timestamp = typeof msg.metadata?.timestamp === 'string' ? msg.metadata.timestamp : undefined;
+      if (sinceIso && timestamp && timestamp < sinceIso) continue;
       seen.add(filename);
       filenames.push(filename);
     }
@@ -29532,17 +29542,12 @@ ${strippedHtml}`;
       const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
       const notFoundSteps: number[] = [];
       const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
       // Get function call counts from session (make a copy to modify)
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
       let countsModified = false;
 
-      // Count media assets actually produced this session (distinct "Image generated:"
-      // markers), used by the expectedAssetCount completion gate below. This is ground
-      // truth from the message history — independent of the calledFunctions counter,
-      // which can be inflated by non-producing generate_image returns (confirmation
-      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
-      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
       const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
 
       // Process each update
@@ -29555,6 +29560,29 @@ ${strippedHtml}`;
         }
 
         const step = workPlan.steps[stepIndex];
+
+        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+        // the Full Size Matrix" — an earlier step — was still pending, so delivery
+        // never actually gated on the rendering it claimed to deliver. Neither gate
+        // below catches this: both only look at the step being completed, never at
+        // whether the steps before it are actually done. Checked against the
+        // in-progress workPlan.steps (not a snapshot from before the loop), so
+        // several steps completed in the same batch, in order, chain correctly —
+        // and a batch that completes them out of order is caught per-step.
+        if (update.status === 'completed') {
+          const pendingEarlierSteps = workPlan.steps.filter(
+            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+          );
+          if (pendingEarlierSteps.length > 0) {
+            outOfOrderSteps.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+            });
+            continue; // Skip updating this step
+          }
+        }
 
         // Validate required function calls if marking as completed
         if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
@@ -29590,8 +29618,8 @@ ${strippedHtml}`;
         }
 
         // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until the session has actually produced that many
-        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+        // not be marked completed until IT has actually produced that many media
+        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
         // Hook — 18 total" step being marked done with only 3 images produced (the model
         // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
         // required-function-calls gate above could not catch this — it only checked that
@@ -29599,17 +29627,32 @@ ${strippedHtml}`;
         // non-producing confirmation-gate returns. Counting real assets is the fix.
         // The user can still legitimately reduce scope via modify_work_plan (lowering or
         // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        //
+        // ENG-1188: scoped to images generated SINCE the previous step completed, not
+        // the whole session — otherwise an earlier step's images satisfy a later
+        // step's requirement without it producing anything of its own (e.g. step 1's
+        // 18 hero images would silently cover step 2's own "3 required" declaration).
+        // No earlier step (or an earlier step with no completedAt yet) means no
+        // cutoff, matching the session-wide count this replaces for step 1.
         if (update.status === 'completed'
           && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0
-          && producedAssetCount < step.expectedAssetCount) {
-          insufficientAssets.push({
-            stepCount: update.stepCount,
-            title: step.title,
-            expected: step.expectedAssetCount,
-            produced: producedAssetCount,
-          });
-          continue; // Skip updating this step
+          && step.expectedAssetCount > 0) {
+          const earlierCompletedAts = workPlan.steps
+            .filter((s: any) => s.stepCount < step.stepCount && s.completedAt)
+            .map((s: any) => s.completedAt as string);
+          const sinceIso = earlierCompletedAts.length > 0
+            ? earlierCompletedAts.reduce((latest: string, ts: string) => (ts > latest ? ts : latest))
+            : undefined;
+          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          if (producedAssetCount < step.expectedAssetCount) {
+            insufficientAssets.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              expected: step.expectedAssetCount,
+              produced: producedAssetCount,
+            });
+            continue; // Skip updating this step
+          }
         }
 
         // Update the step status
@@ -29625,6 +29668,22 @@ ${strippedHtml}`;
           title: workPlan.steps[stepIndex].title,
           status: update.status
         });
+      }
+
+      // Ordering gate failure — a step was completed while an earlier step in the
+      // plan is still pending. Same all-or-nothing shape as the two gates below:
+      // the caller can just resend the batch in the correct order.
+      if (outOfOrderSteps.length > 0) {
+        const errorDetails = outOfOrderSteps.map(oos =>
+          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
+        ).join('\n');
+
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+          outOfOrderSteps,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
+        };
       }
 
       // Check if there are missing function calls - this is a critical error
