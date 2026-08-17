@@ -395,6 +395,23 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(reportsModels).not.toContain('anthropic.claude-opus-4-6-v1');
     });
 
+    it('should expose xai.grok-4.3 as customer-selectable (not admin-gated), per AC1', async () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['xai.grok-4.3'].adminOnly).not.toBe(true);
+
+      const nonAdminModels = await agentModeService.getSupportedModels(false);
+      expect(nonAdminModels).toContain('xai.grok-4.3');
+
+      const adminModels = await agentModeService.getSupportedModels(true);
+      expect(adminModels).toContain('xai.grok-4.3');
+    });
+
+    it('should NOT expose any older/stale Grok generation, per AC1', async () => {
+      const llmModels = (agentModeService as any).llmModels;
+      const grokKeys = Object.keys(llmModels).filter(k => k.toLowerCase().includes('grok'));
+      expect(grokKeys).toEqual(['xai.grok-4.3']);
+    });
+
     it('should return only anthropic models from getReportsModelOptions', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions(true);
       expect(reportsModels.length).toBeGreaterThan(0);
