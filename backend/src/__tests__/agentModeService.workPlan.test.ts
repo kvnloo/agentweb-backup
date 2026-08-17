@@ -914,6 +914,129 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.success).toBe(true);
       });
     });
+
+    // Greptile (PR #2430, ENG-1188): a "just wrote the image marker, then
+    // immediately completed the step" turn can race the default eventually-
+    // consistent read -- ENG-510 built consistentRead for exactly this shape
+    // (agentModeController.ts already uses it for the analogous timed-out-run
+    // read), setWorkPlanStatus just never opted in.
+    it('reads the session with consistentRead so a marker written moments earlier is never missed', async () => {
+      const mockSession = {
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        messages: [],
+        workPlan: {
+          title: 'Plan',
+          steps: [{ stepCount: 1, title: 'Step 1', status: 'pending' }],
+          createdAt: '2026-08-12T14:54:35.000Z',
+          updatedAt: '2026-08-12T14:54:35.000Z',
+        },
+      };
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+      (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+      await (agentModeService as any).setWorkPlanStatus(
+        [{ stepCount: 1, status: 'completed' }],
+        mockSessionId
+      );
+
+      expect(chatbotDb.getChatSession).toHaveBeenCalledWith(mockSessionId, true);
+    });
+
+    // Greptile (PR #2430, ENG-1188 follow-up): two failure modes in the
+    // timestamp-based per-step asset scoping added above.
+    describe('asset-count cutoff attribution across a batch (Greptile follow-up)', () => {
+      it('scopes correctly against a SKIPPED earlier step instead of falling through to the whole session', async () => {
+        // Step 1 is skipped -- no completedAt is ever set for a skip. Before this
+        // fix, that meant zero earlier steps had a completedAt, sinceIso fell
+        // through to undefined, and step 2's own requirement was checked against
+        // the WHOLE session -- these 5 unrelated pre-existing images (generated
+        // before step 1 was even skipped, belonging to no step in particular)
+        // would have wrongly satisfied it even though step 2 produced nothing.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: Array.from({ length: 5 }, (_, i) => ({
+            role: 'system',
+            content: `Image generated: unrelated_${i}.png`,
+            metadata: { kind: 'image-generated', imageFilename: `unrelated_${i}.png`, timestamp: '2026-08-12T14:55:00.000Z' },
+          })),
+          workPlan: {
+            title: 'Plan',
+            steps: [
+              { stepCount: 1, title: 'Optional intro', status: 'skipped' },
+              { stepCount: 2, title: 'Generate 3 images', status: 'pending', expectedAssetCount: 3 },
+            ],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:56:00.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        // Skip step 1 first (stamping its resolvedAt), then attempt step 2 --
+        // mirrors the real sequence: the skip already happened in an earlier
+        // turn/call, this call is the (premature) attempt to complete step 2.
+        await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'skipped' }],
+          mockSessionId
+        );
+        const skippedWorkPlan = (chatbotDb.updateSessionWorkPlan as jest.Mock).mock.calls[0][1];
+        const sessionAfterSkip = { ...mockSession, workPlan: skippedWorkPlan };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(sessionAfterSkip);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 2, status: 'completed' }],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 2, expected: 3, produced: 0 }),
+        ]);
+      });
+
+      it('does NOT let assets genuinely produced for this step get excluded when earlier steps complete in the SAME batch', async () => {
+        // Steps 1 and 2 produced no images of their own. Step 3's 3 images were
+        // generated in an EARLIER TURN, before this batch. All three steps are
+        // now completed together in one call. A cutoff derived from step 2's
+        // freshly-minted (this-instant) completedAt would wrongly post-date --
+        // and so exclude -- step 3's already-existing images.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'Image generated: matrix_1.png', metadata: { kind: 'image-generated', imageFilename: 'matrix_1.png', timestamp: '2026-08-12T15:00:00.000Z' } },
+            { role: 'system', content: 'Image generated: matrix_2.png', metadata: { kind: 'image-generated', imageFilename: 'matrix_2.png', timestamp: '2026-08-12T15:01:00.000Z' } },
+            { role: 'system', content: 'Image generated: matrix_3.png', metadata: { kind: 'image-generated', imageFilename: 'matrix_3.png', timestamp: '2026-08-12T15:02:00.000Z' } },
+          ],
+          workPlan: {
+            title: 'Plan',
+            steps: [
+              { stepCount: 1, title: 'Intake', status: 'pending' },
+              { stepCount: 2, title: 'Approval', status: 'pending' },
+              { stepCount: 3, title: 'Render the matrix', status: 'pending', expectedAssetCount: 3 },
+            ],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T14:54:35.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [
+            { stepCount: 1, status: 'completed' },
+            { stepCount: 2, status: 'completed' },
+            { stepCount: 3, status: 'completed' },
+          ],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.updatedSteps).toHaveLength(3);
+      });
+    });
   });
 
   describe('buildMarketingContext with work plan', () => {
