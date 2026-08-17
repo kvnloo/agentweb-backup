@@ -100,6 +100,29 @@ describe('getPresignedFileUrl — download disposition', () => {
     expect(filenamePart).not.toMatch(/["/\\]/);
   });
 
+  it('strips HTTP control characters (CR, LF, NUL, DEL) from the filename', async () => {
+    // CodeRabbit (PR #2430): RFC 9110 forbids CR/LF/NUL/other C0 controls and DEL
+    // in a header field value. Left unstripped, S3 can reject the presigned
+    // request (InvalidRequest) or a client can see a malformed/injected header.
+    (presignS3Url as jest.Mock).mockReturnValue('https://presigned.example.com/file.html');
+    const req = {
+      query: {
+        url: 'https://agentweb-user-files.s3.amazonaws.com/users/u1/banner.html',
+        download: 'true',
+        filename: 'report\r\nX-Injected: yes\x00.txt\x7f',
+      },
+    } as unknown as Request;
+    const res = mockRes();
+
+    await getPresignedFileUrl(req, res);
+
+    const disposition = lastDisposition()!;
+    // eslint-disable-next-line no-control-regex
+    expect(disposition).not.toMatch(/[\x00-\x1f\x7f]/);
+    const filenamePart = disposition.match(/^attachment; filename="(.*)"$/)![1];
+    expect(filenamePart).toBe('report__X-Injected_ yes_.txt_');
+  });
+
   it('returns 400 when the URL does not reference the configured bucket, without ever presigning', async () => {
     (extractS3KeyFromUrl as jest.Mock).mockReturnValue(null);
     const req = { query: { url: 'https://evil.example.com/steal.html', download: 'true' } } as unknown as Request;
