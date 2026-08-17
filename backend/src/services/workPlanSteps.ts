@@ -304,10 +304,18 @@ export function findConflictingMergeTargets(existingSteps: any[], incomingSteps:
 export function findStepContentLoss(before: any[], after: any[]) {
   const pairs = pairSteps(before, after);
   const keptAnything = pairs.some((index) => index !== -1);
+  // A wholesale rewrite brings its own content. If the replacement contains a
+  // step with no content of its own, this is not "a new plan" — it is erasure,
+  // and the carve-out must not cover it. Without this, renaming AND reordering
+  // every step at once pairs nothing, `keptAnything` stays false, and a
+  // same-length write blanks a step with neither guard firing.
+  const replacementCarriesContent = after.length > 0
+    && after.every((step: any) => STEP_CONTENT_FIELDS.some((field) => !isEmptyStepValue(step[field])));
+  const isWholesaleRewrite = !keptAnything && replacementCarriesContent;
   const losses: { stepCount: any; title: any; fields: string[] }[] = [];
   before.forEach((existing: any, i: number) => {
     const index = pairs[i];
-    if (index === -1 && !keptAnything) return;
+    if (index === -1 && isWholesaleRewrite) return;
     const populated = STEP_CONTENT_FIELDS.filter((field) => !isEmptyStepValue(existing[field]));
     const fields = index === -1
       ? populated
