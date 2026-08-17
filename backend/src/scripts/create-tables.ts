@@ -1896,6 +1896,31 @@ const createLlmChargeEventsTable = async () => {
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
 };
 
+// ENG-1217 AC9: append-only audit for customer-confirmed model switches, so a
+// change can be explained and undone. Sort key is `{changedAt}#{changeId}` —
+// timestamp FIRST, so a date-range query works on the base table and this needs
+// no GSI. That is the deliberate difference from AW-LlmChargeEvents above, whose
+// caller-controlled `eventId` did not sort by time and had to have an index
+// added after monthly queries were found silently missing events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds — 365d). Enable DynamoDB native
+// TTL on the `ttl` attribute manually, same as UsageRecords/LoopEvents.
+const createModelChangeAuditTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
 // Create Agent Runs table (run-survival core — durable run records +
 // idempotency submit-locks; see services/agentMode/runStore.ts). Single pk
 // hash key with two item kinds: run#<runId>, idem#<key>.
@@ -2434,6 +2459,7 @@ const main = async () => {
     await createMcpSessionsTable();
     await createUsageRecordsTable();
     await createLlmChargeEventsTable();
+    await createModelChangeAuditTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();
