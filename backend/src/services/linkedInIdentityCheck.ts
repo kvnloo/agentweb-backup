@@ -61,8 +61,13 @@ export type IdentityGuardResult =
 
 /**
  * Normalize a company string for tolerant comparison: strip accents, case,
- * punctuation/whitespace, and trailing legal suffixes (Inc, LLC, Ltd, Co,
- * Corp, Corporation, Limited, Company, GmbH).
+ * punctuation, and trailing legal suffixes (Inc, LLC, Ltd, Co, Corp,
+ * Corporation, Limited, Company, GmbH). Word boundaries (single spaces) are
+ * DELIBERATELY preserved (not stripped) so callers can do word/phrase-bounded
+ * containment matching -- see companyOrPhraseContains below. Stripping all
+ * whitespace here is what let a raw substring match slip through unrelated
+ * words (ENG-1026 Greptile P1: lead company "AI" false-matched profile
+ * company "Krai Group" because "ai" is a bare substring of "krai").
  */
 function normalizeCompany(value: string | undefined | null): string {
   const base = (value ?? '')
@@ -72,8 +77,24 @@ function normalizeCompany(value: string | undefined | null): string {
     // drop legal suffixes as trailing words (possibly repeated: "Co., Ltd.")
     .replace(/[.,]/g, ' ')
     .replace(/\s+(inc|llc|ltd|co|corp|corporation|limited|company|gmbh)(?=\s|$)/g, ' ')
-    .replace(/[^a-z0-9]/g, '');
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   return base;
+}
+
+/**
+ * Word/phrase-bounded containment: does `haystack` contain `needle` as a
+ * whole phrase, bounded by start/end-of-string or whitespace on both sides
+ * -- never as an arbitrary embedded substring. Both inputs are expected to
+ * already be normalizeCompany() output (lowercase, single-spaced, alnum
+ * only), so no character in `needle` requires regex escaping in practice;
+ * escaped defensively anyway in case normalization ever changes.
+ */
+function companyOrPhraseContains(haystack: string, needle: string): boolean {
+  if (!needle || !haystack) return false;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)${escaped}(\\s|$)`).test(haystack);
 }
 
 /** Extract the profile's display name from the Unipile profile shape. */
@@ -146,10 +167,14 @@ export function crossCheckProfileIdentity(
   }
 
   const companyMatch = normCandidates.some(
-    (c) => c === normLead || c.includes(normLead) || normLead.includes(c),
+    (c) =>
+      c === normLead ||
+      companyOrPhraseContains(c, normLead) ||
+      companyOrPhraseContains(normLead, c),
   );
-  // Headline is free text ("VP Marketing @ Vivian Health") — containment only.
-  const headlineMatch = !!normHeadline && normHeadline.includes(normLead);
+  // Headline is free text ("VP Marketing @ Vivian Health") — phrase-bounded
+  // containment only (never a raw substring — see companyOrPhraseContains).
+  const headlineMatch = !!normHeadline && companyOrPhraseContains(normHeadline, normLead);
 
   if (companyMatch || headlineMatch) {
     return { ...base, verdict: 'match', reason: 'Profile employer/headline matches lead company' };

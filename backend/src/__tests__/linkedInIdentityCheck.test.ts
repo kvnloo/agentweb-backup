@@ -98,6 +98,59 @@ describe('crossCheckProfileIdentity (pure)', () => {
     );
     expect(res.verdict).toBe('mismatch');
   });
+
+  // ENG-1026 Greptile P1 (round 2): unbounded substring containment lets a
+  // SHORT or common lead company name false-match a completely unrelated
+  // profile company/headline that merely happens to contain those letters
+  // in sequence, with no word boundary. This is not a contrived edge case --
+  // short company names ("AI", "Co", brand initialisms) are common.
+  it('does NOT false-match on a raw substring with no word boundary ("AI" inside "Krai Group")', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [{ company: 'Krai Group', current: true }],
+      },
+      { firstName: 'Florence', lastName: 'Su', company: 'AI' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('does NOT false-match via the reverse containment direction either ("Krai Group" as lead company vs a profile company "AI")', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [{ company: 'AI', current: true }],
+      },
+      { firstName: 'Florence', lastName: 'Su', company: 'Krai Group' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('does NOT false-match on headline containment with no word boundary ("AI" inside "Chai Tea Co")', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'Barista at Chai Tea Co' },
+      { firstName: 'Florence', lastName: 'Su', company: 'AI' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('still matches a genuine whole-word phrase containment ("Google" inside "Software Engineer at Google Cloud")', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'Software Engineer at Google Cloud' },
+      { firstName: 'Florence', lastName: 'Su', company: 'Google' },
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('still matches a genuine multi-word phrase containment ("Vivian Health" inside a longer headline)', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'VP Marketing, Vivian Health Group' },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
 });
 
 describe('verifyLinkedInIdentityForSend (shared guard)', () => {
