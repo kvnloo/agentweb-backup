@@ -4,7 +4,7 @@
 // Haiku Explore subagent can out-total the primary Opus answer, so the turn got labelled Haiku, the window
 // sized to 200K, and 211K/200K rendered as a FALSE 105% (nagging /compact when only ~21% is used). The fix
 // ties the window to the SAME final message's model as contextUsed. Run: node test/usage-snapshot.test.mjs
-import { usageSnapshot } from '../chat/usage.mjs';
+import { usageSnapshot, contextWindowFor } from '../chat/usage.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -60,6 +60,21 @@ console.log('\nfallbacks & edges');
   // contextUsed falls back to result.usage when there is no per-message lastUsage.
   const fromResult = usageSnapshot(null, null, 'claude-opus-4-8', { num_turns: 1, usage: { input_tokens: 3, cache_read_input_tokens: 100, cache_creation_input_tokens: 7 }, modelUsage: { 'claude-opus-4-8': { inputTokens: 3, contextWindow: 1000000 } } });
   ok(fromResult.contextUsed === 110, 'contextUsed falls back to result.usage when lastUsage is absent');
+}
+
+console.log('\n— window by model, for when nothing was observed —');
+{
+  // The bug this fixes: resumeContext defaulted to 200_000 and only guessed 1M once usage had ALREADY
+  // passed 200k — a heuristic from when 1M was a beta. After the move to Sonnet 5 (a 1M model) every
+  // fresh chat rendered as a fraction of 200k and nagged /compact at ~6% of real usage.
+  ok(contextWindowFor('claude-sonnet-5') === 1_000_000, 'sonnet 5 is 1M');
+  ok(contextWindowFor('claude-opus-5') === 1_000_000, 'opus 5 is 1M');
+  ok(contextWindowFor('claude-opus-4-8') === 1_000_000, 'the older opus we ran is 1M');
+  // Haiku stays explicit: it is the one model here that genuinely IS 200k, and sizing it at 1M would
+  // hide a real overflow rather than merely mis-scale a healthy one.
+  ok(contextWindowFor('claude-haiku-4-5-20251001') === 200_000, 'haiku is 200k, not silently widened');
+  ok(contextWindowFor('some-future-model') === null, 'an unknown model returns null so the caller can fall back');
+  ok(contextWindowFor(null) === null && contextWindowFor('') === null, 'null/empty are safe');
 }
 
 console.log(fail ? `\n❌ ${fail} FAILED — ${pass} passed, ${fail} failed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);

@@ -12,6 +12,25 @@
 // (rare) case where the stream never reported a per-message model.
 const muTotal = (x) => (x ? (x.inputTokens || 0) + (x.outputTokens || 0) + (x.cacheReadInputTokens || 0) + (x.cacheCreationInputTokens || 0) : 0);
 
+// Context window by model, for the case where nothing observed is available — a session whose snapshot
+// /compact cleared, or one that has not finished a turn yet. An observed contextWindow (from the CLI's
+// modelUsage) ALWAYS wins; this is a stopgap, not a source of truth.
+//
+// It replaces a hardcoded 200_000 default plus a "guess 1M only once usage already exceeds 200k"
+// heuristic in resumeContext. That dated from when 1M was a beta and 200k was the norm; once the chat
+// agent moved to Sonnet 5 — a 1M model — every fresh chat rendered as a fraction of 200k and started
+// nagging /compact at around 6% of its real usage.
+//
+// Haiku is listed explicitly because it is the one model here that genuinely IS 200k (the /btw thread
+// and the merge-intent classifier). Widening it to 1M would hide a real overflow, which is worse than
+// mis-scaling a healthy one. An unknown model returns null so the caller decides its own fallback.
+const KNOWN_WINDOWS = [[/haiku/i, 200_000], [/opus|sonnet/i, 1_000_000]];
+export function contextWindowFor(model) {
+  const m = String(model || '');
+  for (const [re, w] of KNOWN_WINDOWS) if (re.test(m)) return w;
+  return null;
+}
+
 export function usageSnapshot(prev, lastUsage, lastModel, result) {
   const u = lastUsage || result?.usage || null;
   const mu = result?.modelUsage || null;

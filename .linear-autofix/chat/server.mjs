@@ -24,7 +24,7 @@ import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyW
 import { acquireLock, releaseLock } from '../lock.mjs';
 import { gitRepoOp } from '../repo-lock.mjs';
 import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
-import { usageSnapshot } from './usage.mjs';
+import { usageSnapshot, contextWindowFor } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
 import { validateHandoff, handoffDoc, handoffPrompt, workspaceLines, existingHandoffForBranch, prRef } from './handoff.mjs';
@@ -1183,19 +1183,22 @@ function pipelineSessionId(entry) {
 // truly reloads (e.g. a 397k Opus session), not the optimistic post-compact display value. Also fixes
 // "No context data yet" on a live session whose cs.usage was cleared: the number is read from disk,
 // not from the last turn's snapshot. Side-effect-free (never rebuilds a worktree) so it's safe in a GET.
+// Window to render against: what the CLI actually reported for this session, else what the model is
+// known to have, else 1M. The per-message transcript usage carries no window size, so without this the
+// display has to guess — and it used to guess 200k, which made every 1M chat look nearly full.
+const windowFor = (usage, model) => usage?.contextWindow || contextWindowFor(model) || 1_000_000;
+
 function resumeContext(identifier, entry, cs) {
   const WT = path.join(worktreesDir, identifier);
   const cwd = cs.cwd || (existsSync(WT) ? WT : agentRoot);
   const base = pickResumeBase(cs, { cwd, agentRoot, pipelineSid: pipelineSessionId(entry), resumePipeline: CHAT.resumePipelineSession });
   if (base.kind === 'fresh') return null;
   if (base.kind === 'compact') {
-    return { contextUsed: base.tokens, contextWindow: cs.usage?.contextWindow || 200000, model: cs.usage?.model || null };
+    return { contextUsed: base.tokens, contextWindow: windowFor(cs.usage, cs.usage?.model), model: cs.usage?.model || null };
   }
   const t = transcriptContextUsed(sessionFile(cwd, base.sid));
   if (!t) return null;
-  // The per-message transcript usage carries no window size; infer the 1M beta when the live context
-  // already exceeds the 200k default, else keep whatever the last snapshot recorded (default 200k).
-  const win = cs.usage?.contextWindow || (t.contextUsed > 200000 ? 1000000 : 200000);
+  const win = windowFor(cs.usage, t.model || cs.usage?.model);
   return { contextUsed: t.contextUsed, contextWindow: win, model: t.model || cs.usage?.model || null };
 }
 
