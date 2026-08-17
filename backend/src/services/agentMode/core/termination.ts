@@ -73,16 +73,26 @@ export interface TerminationDecision {
   };
 }
 
-const CONTINUE_PROMPT =
+// Exported so synthesisResidue.ts can recognize a turn that echoes one of these
+// back instead of answering it (ENG-1188) — each is pushed into the conversation
+// and then the model is asked to respond again, so each is just as capable of being
+// echoed back verbatim as an "answer" as SYNTHESIS_NUDGE is. These and their
+// injection sites must never drift apart.
+export const CONTINUE_PROMPT =
   '[SYSTEM] Your previous response was cut off because it exceeded the token limit. Please continue exactly where you left off.';
 
 const CONTENT_FILTER_MESSAGE =
   "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
 
-// Exported so synthesisResidue.ts can recognize a turn that echoes this text back
-// instead of answering it (ENG-1188) — the two must never drift apart.
 export const SYNTHESIS_NUDGE =
   '[SYSTEM] You have gathered all the necessary data. Please now synthesize the information and provide your complete final response to the user.';
+
+// Injected by agentModeService.ts's anti-loop detector when the model repeats an
+// identical tool call MAX_CONSECUTIVE_REPEATS times. Defined here (not inline at the
+// call site) so synthesisResidue.ts can import the same string rather than a copy
+// that could drift.
+export const ANTI_LOOP_STOP_MESSAGE =
+  '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.';
 
 /**
  * Decide what to do after a model turn that returned NO tool calls.

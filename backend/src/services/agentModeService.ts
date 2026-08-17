@@ -22,6 +22,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
+import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
@@ -4661,7 +4662,7 @@ export class AgentModeService {
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
               role: 'user',
-              content: '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.'
+              content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
         } else {

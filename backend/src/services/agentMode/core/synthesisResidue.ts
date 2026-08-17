@@ -16,7 +16,7 @@
  *     ledger, so a synthesis failure can never erase the record of what ran.
  */
 
-import { SYNTHESIS_NUDGE } from './termination';
+import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
 
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
@@ -58,7 +58,18 @@ const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
  * Two or more verbatim copies of a nudge WE injected is never a real answer — a
  * turn that merely quotes it once (e.g. explaining what the system told it) is
  * left alone; only actual repetition trips this.
+ *
+ * `isUnusableSynthesis` is the loop's ONE choke point for terminating content
+ * (agentModeService.ts calls it exactly once, on whatever is about to ship), so
+ * every string the loop pushes as a "respond again" nudge belongs in this list —
+ * not just SYNTHESIS_NUDGE. CONTINUE_PROMPT (max_tokens continuation) and
+ * ANTI_LOOP_STOP_MESSAGE (repeated-identical-tool-calls warning) are injected by
+ * the exact same "push a system message, let the model respond again" mechanism,
+ * so a collapse that echoes either of THOSE back is just as real a failure and was,
+ * before this, just as unguarded.
  */
+const INJECTED_NUDGES = [SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE];
+
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
   let count = 0;
@@ -71,13 +82,15 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /**
- * True when `trimmed` is mostly our own injected nudge text, echoed back. An exact
- * match — the entire turn is one bare copy of the nudge — is non-empty, so it never
- * re-triggers the empty-synthesis retry ladder in termination.ts, and it ships as a
- * real final answer unless caught here alongside the 2+-repeat case.
+ * True when `trimmed` is mostly one of our own injected nudges, echoed back. An
+ * exact match — the entire turn is one bare copy of a nudge — is non-empty, so it
+ * never re-triggers the retry ladder that injected it in the first place, and it
+ * ships as a real final answer unless caught here alongside the 2+-repeat case.
  */
 function isNudgeEcho(trimmed: string): boolean {
-  return trimmed === SYNTHESIS_NUDGE || countOccurrences(trimmed, SYNTHESIS_NUDGE) >= 2;
+  return INJECTED_NUDGES.some(
+    (nudge) => trimmed === nudge || countOccurrences(trimmed, nudge) >= 2,
+  );
 }
 
 /**
