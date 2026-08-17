@@ -697,6 +697,37 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
     }]);
     expect(noIds).toHaveLength(2);
   });
+
+  // ENG-947/ENG-1045: a preflight rejection commonly comes back as
+  // `result.success: false` with NO top-level `error` at all (e.g. publish_blog_article's
+  // result extraction only sets `error` when the tool itself supplied one). callSatisfiesRequirement's
+  // exact-name-match branch now calls toolCallSucceeded for every publish requirement, which reads
+  // `result.success`, so dropping `result` on reconstruction would silently credit an abandoned
+  // portion's failed publish as a success on resume.
+  it('carries the result through so a resumed publish that failed WITHOUT a top-level error still vetoes', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: false, message: 'Multiple twitter accounts connected' } }] },
+    }]);
+    expect(entry).toEqual({
+      name: 'post_on_connected_account',
+      result: { success: false, message: 'Multiple twitter accounts connected' },
+    });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
+
+    // Control: the same shape but result.success: true — must be credited.
+    const [succeeded] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: true, tweetId: '1' } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', succeeded)).toBe(true);
+  });
+
+  it('carries duplicateOf through so a resumed suppressed same-turn duplicate is not credited', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', duplicateOf: 'call_1' }] },
+    }]);
+    expect(entry).toEqual({ name: 'post_on_connected_account', duplicateOf: 'call_1' });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
+  });
 });
 
 describe('runScheduledChat — conditional skip day', () => {
