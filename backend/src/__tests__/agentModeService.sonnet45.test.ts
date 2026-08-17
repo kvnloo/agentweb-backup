@@ -1,6 +1,14 @@
 import { AgentModeService } from '../services/agentModeService';
 import { getSecret } from '../utils/secretsManager';
 
+// ENG-1202: getBedrockMantleClient is a plain module export (not a class
+// method), so it can't be jest.spyOn'd on the service instance like
+// getBedrockClient/getVertexClient below — mock the module instead.
+jest.mock('../utils/llmClients', () => ({
+  ...jest.requireActual('../utils/llmClients'),
+  getBedrockMantleClient: jest.fn(),
+}));
+
 // Mock the dependencies
 jest.mock('../services/db', () => ({
   getSession: jest.fn(),
@@ -631,6 +639,62 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-opus-4-8'].client).toBe(mockBedrockClient);
+    });
+  });
+
+  describe('Bedrock Mantle client lazy-loading (ENG-1202 Grok 4.3)', () => {
+    // AC3: interactive chat, scheduled chats, MCP, and background Agent Mode
+    // all invoke this same callLLM/getClientForModel seam — none of them has
+    // its own model-dispatch path. Proving the seam routes xai.* to the
+    // Mantle client (and that no other client factory is touched) is proof
+    // every caller gets identical, consistent Grok behavior by construction.
+    it('should lazy-load the Bedrock Mantle client for xai.grok-4.3 on first callLLM', async () => {
+      const { getBedrockMantleClient } = require('../utils/llmClients');
+      const mockCreate = jest.fn().mockResolvedValue({
+        id: 'mantle-resp-1',
+        choices: [{ message: { role: 'assistant', content: 'Hi!', tool_calls: undefined }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 },
+      });
+      const mockMantleClient = { chat: { completions: { create: mockCreate } } };
+      (getBedrockMantleClient as jest.Mock).mockReturnValue(mockMantleClient);
+
+      const bedrockSpy = jest.spyOn(agentModeService as any, 'getBedrockClient');
+      const vertexSpy = jest.spyOn(agentModeService as any, 'getVertexClient');
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('xai.grok-4.3', messages, {
+        usageContext: { userId: 'user-1', sessionId: 'session-1', feature: 'agent_task' },
+      });
+
+      expect(getBedrockMantleClient).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-1', sessionId: 'session-1', feature: 'agent_task' }),
+        'xai.grok-4.3',
+        { metered: false },
+      );
+      expect(mockCreate).toHaveBeenCalled();
+      expect(bedrockSpy).not.toHaveBeenCalled();
+      expect(vertexSpy).not.toHaveBeenCalled();
+
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['xai.grok-4.3'].client).toBe(mockMantleClient);
+    });
+
+    it('getClientForModel routes xai.* to the Mantle client, independent of callLLM', async () => {
+      const { getBedrockMantleClient } = require('../utils/llmClients');
+      const mockMantleClient = { chat: { completions: { create: jest.fn() } } };
+      (getBedrockMantleClient as jest.Mock).mockReturnValue(mockMantleClient);
+
+      const client = await agentModeService.getClientForModel('xai.grok-4.3');
+
+      expect(client).toBe(mockMantleClient);
+      expect(getBedrockMantleClient).toHaveBeenCalledWith(
+        { feature: 'agent_task' },
+        'xai.grok-4.3',
+      );
     });
   });
 
