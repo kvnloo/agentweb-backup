@@ -145,11 +145,12 @@ export function formatMemoryLine(memory: FormattableMemory, now: Date): string {
  * the guard against a stale memory silently disabling a configured channel (ENG-305).
  */
 export const MEMORY_STALENESS_NOTE =
-  'These are historical notes from previous sessions, not live state. Before acting on any ' +
-  'time-sensitive fact (e.g. a channel/account being disabled, a token or connection having ' +
-  'expired, or a specific date), re-verify the current state with the relevant tool rather ' +
-  'than assuming an older note still holds — never silently skip a configured action based on ' +
-  'a memory alone.';
+  'These are historical notes from previous sessions, not live state. Before acting on — or ' +
+  'repeating to the user as current — any time-sensitive fact (e.g. a channel/account being ' +
+  'disabled, a token or connection having expired, a specific date, or a stated metric, count, ' +
+  'or KPI such as a conversion count, session number, or funnel figure), re-verify it with the ' +
+  'relevant tool in THIS session rather than assuming an older note still holds — never ' +
+  'silently skip a configured action, and never quote a number, based on a memory alone.';
 
 /**
  * Build the memory-context message injected into the agent conversation: a header, one dated

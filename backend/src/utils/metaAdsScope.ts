@@ -39,6 +39,12 @@ export interface MetaAdsScopeConfigLike {
   granted_scopes?: unknown;
   scopes?: unknown;
   /**
+   * Which kind of Meta connection this is. Only 'ad_account' records can have an
+   * Ads capability at all — a page or Instagram business connection lacking
+   * ads_read is not degraded, it simply never needed the scope.
+   */
+  account_type?: unknown;
+  /**
    * Set when Meta authoritatively refused an ads read for lack of permission.
    *
    * Load-bearing: for a legacy record the retained grant collapses to `[]`, which
@@ -47,6 +53,59 @@ export interface MetaAdsScopeConfigLike {
    * the same impossible read.
    */
   ads_scope_revoked_at?: unknown;
+  /**
+   * When the reconciler first saw Meta refuse this ad account, pending
+   * confirmation by a second sweep (ENG-1158).
+   *
+   * Deliberately NOT read by `getMetaAdsScopeState`: a suspicion must change
+   * nothing a user can feel. One denied probe is weak evidence — Meta returns
+   * the ads refusal transiently too, e.g. while a Business Manager permission
+   * change propagates — and acting on it would strip a working customer's grant
+   * and mail them about an outage that had already ended. Cleared by any
+   * successful probe, so two unrelated denials a month apart can never add up to
+   * a confirmation.
+   */
+  ads_scope_denied_seen_at?: unknown;
+  /**
+   * Which of the two independent grants is actually missing, set alongside
+   * `ads_scope_revoked_at` (ENG-1158 follow-up).
+   *
+   * Meta requires TWO separate grants before an ads read works: the user
+   * authorizing our app for `ads_read`/`ads_management` (OAuth), and the ad
+   * account's owner separately granting that user access to that specific ad
+   * account (Business Manager asset roles) — a screen our OAuth flow never
+   * touches. `ads_scope_revoked_at` alone cannot say which is missing, and
+   * guessing wrong sends a customer to reconnect and re-approve a grant they
+   * already have, for a permission reconnecting can never restore.
+   *
+   * 'oauth'   — our own record shows no ads scope granted to the app. Reconnect
+   *             is the correct, sufficient fix.
+   * 'asset'   — the app grant is confirmed present; Meta refused the ad account
+   *             read anyway. Only the ad account's own admin, in Meta Business
+   *             Settings, can fix this — reconnecting changes nothing.
+   * Absent    — tier could not be determined (e.g. the classifying call itself
+   *             failed); falls back to the OAuth-tier message, matching this
+   *             module's behaviour before this distinction existed.
+   */
+  ads_scope_tier?: unknown;
+  /**
+   * When the Meta signal behind the last revoke-or-recover write was learned
+   * (ISO 8601), set alongside every such write (ENG-1158 follow-up — Greptile).
+   *
+   * Two independent processes can reach a capability conclusion for the same
+   * account close together — the 12-hourly sweep's probe and a live chat run's
+   * read failure — and a CAS retry alone only guarantees the WRITE reflects
+   * fresh DB state, not that the DECISION being written is the newer of the
+   * two. Without this, the loser of that race can still overwrite the
+   * winner's transition with individually-fresh-looking values, just derived
+   * from a stale decision.
+   *
+   * Every revoke/recover write compares its own probe's timestamp against
+   * this field on the config it just read and no-ops if the stored one is
+   * newer — the most recent real signal from Meta always wins, regardless of
+   * which write reaches the database first.
+   */
+  ads_capability_probed_at?: unknown;
 }
 
 /**
@@ -61,6 +120,21 @@ export const META_ADS_RECONSENT_MESSAGE =
   '"ads_read" (or "ads_management") permission, so no campaign or insights data could be read. ' +
   'Reconnect Meta under Settings -> Connected accounts and approve the Ads permissions when prompted, ' +
   'then run this again. No metrics were retrieved.';
+
+/**
+ * The asset-tier counterpart to `META_ADS_RECONSENT_MESSAGE` (ENG-1158 follow-up).
+ *
+ * Used only when `ads_scope_tier === 'asset'` — the app-level grant is confirmed
+ * present, so telling the owner to reconnect and re-approve permissions they
+ * already granted would send them through a flow that cannot fix this and leave
+ * them locked out with no correct next step.
+ */
+export const META_ADS_ASSET_ACCESS_MESSAGE =
+  'Meta Ads access is not authorized for this ad account. This Meta account has already granted AgentWeb the ' +
+  '"ads_read" (or "ads_management") permission, but the ad account itself has not granted this person access, ' +
+  'so no campaign or insights data could be read. Reconnecting will not fix this. Ask whoever manages this ad ' +
+  'account in Meta Business Settings to add this person with Ads permissions, then run this again. ' +
+  'No metrics were retrieved.';
 
 const isAdsScope = (value: unknown): boolean =>
   typeof value === 'string' &&
@@ -99,6 +173,55 @@ export const getMetaAdsScopeState = (
 export const hasMetaAdsReadScope = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): boolean => getMetaAdsScopeState(config) === 'granted';
+
+/** Minimal structural shape of a connected-account record. */
+export interface MetaAdsAccountLike {
+  platform?: unknown;
+  config?: MetaAdsScopeConfigLike | null;
+}
+
+/**
+ * The capability annotation carried by an ad-account connection.
+ *
+ * Deliberately sparse: fields are present only when we actually know the answer,
+ * so an unprovable legacy record stays silent instead of accusing a working
+ * connection of being broken.
+ */
+export interface MetaAdsCapabilityAnnotation {
+  ads_capable?: boolean;
+  capability_warning?: string;
+}
+
+/** Only Meta *ad account* records can have an ads capability at all. */
+export const isMetaAdAccountRecord = (account: MetaAdsAccountLike | null | undefined): boolean =>
+  (account?.platform === 'meta' || account?.platform === 'facebook') &&
+  account?.config?.account_type === 'ad_account';
+
+/**
+ * The single capability annotation for a Meta ad-account connection.
+ *
+ * Shared on purpose (ENG-1158). The agent tool (`list_connected_accounts`) and
+ * the Settings → Connected accounts API both render from this, so a connection
+ * can never read as "degraded" to the model while its owner is still shown a
+ * green "Connected" badge — the split that let account 922903076601160 produce
+ * zero-data reports for days without anyone being told.
+ */
+export const describeMetaAdsCapability = (
+  account: MetaAdsAccountLike | null | undefined
+): MetaAdsCapabilityAnnotation => {
+  if (!isMetaAdAccountRecord(account)) return {};
+
+  const state = getMetaAdsScopeState(account?.config);
+  if (state === 'granted') return { ads_capable: true };
+  if (state === 'missing') {
+    const message =
+      account?.config?.ads_scope_tier === 'asset'
+        ? META_ADS_ASSET_ACCESS_MESSAGE
+        : META_ADS_RECONSENT_MESSAGE;
+    return { ads_capable: false, capability_warning: message };
+  }
+  return {};
+};
 
 /**
  * Read a nested value by path, yielding undefined the moment the chain breaks.

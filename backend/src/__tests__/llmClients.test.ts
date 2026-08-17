@@ -396,6 +396,30 @@ describe('meterUsageFromResponse', () => {
     expect(mockMeterUserUsage).toHaveBeenCalled();
   });
 
+  it('derives eventId from response.id when the caller does not supply one (ENG-1251)', () => {
+    meterUsageFromResponse(ctx, { id: 'chatcmpl-abc123', usage: { prompt_tokens: 5, completion_tokens: 1 } });
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: 'chatcmpl-abc123' })
+    );
+  });
+
+  it('prefers a caller-supplied eventId over response.id', () => {
+    meterUsageFromResponse(
+      { ...ctx, eventId: 'explicit-id' },
+      { id: 'chatcmpl-abc123', usage: { prompt_tokens: 5, completion_tokens: 1 } }
+    );
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: 'explicit-id' })
+    );
+  });
+
+  it('leaves eventId undefined when neither the caller nor the response supplies one', () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 5, completion_tokens: 1 } });
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: undefined })
+    );
+  });
+
   it('never propagates a metering error to the caller', () => {
     mockMeterUserUsage.mockImplementationOnce(() => {
       throw new Error('meter boom');

@@ -646,42 +646,122 @@ export const updateAccountTokens = async (
  * Update arbitrary config fields on a connected account.
  * Used to store webhook_id, webhook_url, etc. after initial creation.
  */
+/**
+ * Config keys to REMOVE outright, applied after the merge.
+ *
+ * A plain merge can only ever add or overwrite, so a field that records a
+ * past observation — `ads_scope_revoked_at`, say — has no way to be retracted
+ * once it is wrong. Setting it to `undefined` is not equivalent: the key
+ * survives the spread and its removal would then depend on marshalling
+ * behaviour rather than on anything stated here. Deleting is explicit.
+ */
+export interface UpdateAccountConfigOptions {
+  unset?: string[];
+}
+
+/**
+ * Either a fixed set of fields to merge (the common case — the value doesn't
+ * depend on what's currently stored), or a function of the freshly-read
+ * config that returns the merge for THIS attempt (for a caller whose update is
+ * *derived* from current state — narrowing a scope list, defaulting a
+ * timestamp only if unset).
+ *
+ * The function form exists because the CAS retry below re-reads on conflict
+ * but, with a fixed object, would reapply the SAME pre-computed values against
+ * the fresh read — silently correct only when the update doesn't depend on
+ * what it's overwriting. For a derived update that's a real bug: two writers
+ * racing on one account's capability fields (a sweep's revocation and a
+ * concurrent recovery) could have the loser's stale-derived write clobber the
+ * winner's fresh state on retry, reversing whichever transition arrived
+ * second. The function form re-derives every attempt, closing that gap.
+ */
+export type AccountConfigMutation =
+  | Record<string, any>
+  | ((freshConfig: Record<string, any>) => {
+      updates: Record<string, any>;
+      unset?: string[];
+    });
+
 export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
   accountId: string,
-  configUpdates: Record<string, any>
+  configUpdates: AccountConfigMutation,
+  options?: UpdateAccountConfigOptions
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error('User not found');
-  }
+  // Compare-and-swap, mirroring updateAccountTokens. The User model forces a
+  // whole-list write, so a plain read-modify-write silently discards anything
+  // another writer changed in between — a token the refresh cron had just
+  // renewed, or a capability marker a concurrent sweep had just set. Conditioning
+  // the write on the list we actually read turns that clobber into a retry.
+  //
+  // Unlike the token path this re-applies the merge rather than failing closed:
+  // this function's contract is "merge these fields into whatever is current",
+  // so a fresh read followed by the same merge is exactly the right answer —
+  // provided the merge itself is recomputed from that fresh read when it needs
+  // to be (see AccountConfigMutation above).
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
 
-  const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accounts.findIndex(
-    acc => acc.platform === platform && acc.account_id === accountId
-  );
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accounts.findIndex(
+      acc => acc.platform === platform && acc.account_id === accountId
+    );
 
-  if (accountIndex < 0) {
-    throw new Error(`No ${platform} account with id "${accountId}" connected`);
-  }
+    if (accountIndex < 0) {
+      throw new Error(`No ${platform} account with id "${accountId}" connected`);
+    }
 
-  const existingAccount = accounts[accountIndex];
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: {
+    const existingAccount = accounts[accountIndex];
+
+    const isDerived = typeof configUpdates === 'function';
+    const { updates, unset } = isDerived
+      ? configUpdates(existingAccount.config || {})
+      : { updates: configUpdates, unset: options?.unset };
+
+    const mergedConfig: Record<string, any> = {
       ...existingAccount.config,
-      ...configUpdates,
-    },
-    updated_at: new Date().toISOString(),
-  };
+      ...updates,
+    };
+    for (const key of unset || []) {
+      delete mergedConfig[key];
+    }
 
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: mergedConfig as ConnectedAccountConfig['config'],
+      updated_at: new Date().toISOString(),
+    };
 
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      if (attempt === 2) {
+        throw Object.assign(
+          new Error(`Connected account "${accountId}" changed while updating its config; retry`),
+          { code: 'ConnectedAccountChanged' },
+        );
+      }
+      // Loop: re-read and re-apply the merge onto whatever is now current.
+    }
+  }
 };
 
 /**

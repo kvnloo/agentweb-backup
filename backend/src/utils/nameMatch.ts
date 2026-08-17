@@ -88,3 +88,46 @@ export function nameTokensMatch(
 ): boolean {
   return componentMatches(aFirst, bFirst) && componentMatches(aLast, bLast);
 }
+
+/**
+ * Verify a Unipile profile/search-result item's name matches the lead's name
+ * before accepting it as the correct LinkedIn profile. Case-insensitive prefix
+ * match on both first and last name — rejects if the item carries name fields
+ * that don't match, or if no name info can be parsed (can't verify → reject).
+ *
+ * Unipile's people-search response typically carries the combined `name`
+ * field ("Ayush Jha") rather than separate `first_name` / `last_name`, so we
+ * fall back to splitting `name` on whitespace when those split fields are
+ * absent. (Moved here from enrichmentV3RealDeps for reuse by the ENG-1026
+ * pre-send identity check — the algorithm is unchanged.)
+ */
+export function unipileNameMatches(
+  item: any,
+  leadFirst: string | undefined,
+  leadLast: string | undefined,
+): boolean {
+  let itemFirst = typeof item.first_name === 'string' ? item.first_name.trim().toLowerCase() : null;
+  let itemLast  = typeof item.last_name  === 'string' ? item.last_name.trim().toLowerCase()  : null;
+
+  // Fallback: derive first/last from the combined `name` field. Split on
+  // whitespace — first token → first name, last token → last name. Handles
+  // middle names by ignoring everything between.
+  //
+  // Drop tokens that normalize to empty (emoji, symbols, decorative marks)
+  // BEFORE choosing first/last, so a display name like "💡 Paul Graham" does
+  // not take "💡" as the first name (which would normalize to "" → "no
+  // constraint" → a WRONG first name would slip through the gate).
+  if (itemFirst === null && itemLast === null && typeof item.name === 'string') {
+    const tokens = item.name.trim().toLowerCase().split(/\s+/)
+      .filter(Boolean)
+      .filter((t: string) => normalizeNameToken(t) !== '');
+    if (tokens.length >= 1) itemFirst = tokens[0];
+    if (tokens.length >= 2) itemLast = tokens[tokens.length - 1];
+  }
+
+  // Can't verify without at least one name field — reject for correctness.
+  if (itemFirst === null && itemLast === null) return false;
+
+  // Bidirectional-prefix token comparison shared with the Apollo identity gate.
+  return nameTokensMatch(itemFirst, itemLast, leadFirst, leadLast);
+}
