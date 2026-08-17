@@ -245,21 +245,53 @@ function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
 
+/**
+ * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
+ * told the user work happened, but not how to get it — "save_file — 1 succeeded"
+ * is not a deliverable. `extractMinimalToolResult` (agentModeService.ts) already
+ * preserves the URL on every asset-producing tool's result — save_file ->
+ * file_url, create_html_file/create_html_from_template -> s3_url, generate_image
+ * -> imageUrl, playwright_browser_take_screenshot -> screenshotUrl, generate_video
+ * -> videoUrl, generate_voiceover -> audioUrl — so it is already sitting in the
+ * ledger this module reads; nothing here ever looked at it.
+ */
+const ASSET_URL_FIELDS = ['file_url', 's3_url', 'imageUrl', 'screenshotUrl', 'videoUrl', 'audioUrl'] as const;
+
+/** The URL on a succeeded call's result, checking every known asset field. */
+function extractAssetUrl(call: ExecutedToolCall): string | null {
+  const result = call.result as Record<string, unknown> | null | undefined;
+  if (!result || typeof result !== 'object') return null;
+  for (const field of ASSET_URL_FIELDS) {
+    const value = result[field];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
+}
+
 /** Tally the ledger into per-tool outcome counts, ignoring collapsed duplicates. */
 function tallyExecutedActions(
   toolCalls: ExecutedToolCall[],
-): Map<string, { ok: number; failed: number; deferred: number }> {
-  const counts = new Map<string, { ok: number; failed: number; deferred: number }>();
+): Map<string, { ok: number; failed: number; deferred: number; urls: string[] }> {
+  const counts = new Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>();
   for (const call of toolCalls || []) {
     const name = call && typeof call.name === 'string' ? call.name.trim() : '';
     if (!name) continue;
     // A collapsed duplicate never ran: the call it points at did, and is counted
     // separately. Including it would report the same action twice.
     if (call.duplicateOf !== undefined && call.duplicateOf !== null) continue;
-    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0 };
-    if ('error' in call || isReportedFailure(call)) entry.failed++;
-    else if (isDeferred(call)) entry.deferred++;
-    else entry.ok++;
+    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0, urls: [] };
+    if ('error' in call || isReportedFailure(call)) {
+      entry.failed++;
+    } else if (isDeferred(call)) {
+      entry.deferred++;
+    } else {
+      entry.ok++;
+      // Only a succeeded call's URL is a real, fetchable asset — a failed call can
+      // still carry a stale/partial URL field in its error payload, and reporting
+      // that would hand the user a link to something that was never produced.
+      const url = extractAssetUrl(call);
+      if (url && !entry.urls.includes(url)) entry.urls.push(url);
+    }
     counts.set(name, entry);
   }
   return counts;
@@ -276,17 +308,18 @@ function tallyExecutedActions(
 const COUNT_BASIS_NOTE =
   '(Counts are tool calls, not the number of records created or changed.)';
 
-/** Render the `- tool — n succeeded, n failed` lines for a tally. */
+/** Render the `- tool — n succeeded, n failed` lines (plus asset URLs) for a tally. */
 function renderLedgerLines(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
 ): string {
   const lines: string[] = [];
-  for (const [name, { ok, failed, deferred }] of counts) {
+  for (const [name, { ok, failed, deferred, urls }] of counts) {
     const parts: string[] = [];
     if (ok > 0) parts.push(`${ok} succeeded`);
     if (failed > 0) parts.push(`${failed} failed`);
     if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
     lines.push(`- ${name} — ${parts.join(', ')}`);
+    for (const url of urls) lines.push(`  ${url}`);
   }
   return lines.join('\n');
 }
@@ -329,7 +362,7 @@ export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): strin
 
 /** True when any tool in the tally has at least one call in `bucket`. */
 function countsInclude(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
   bucket: 'ok' | 'failed' | 'deferred',
 ): boolean {
   for (const entry of counts.values()) if (entry[bucket] > 0) return true;
