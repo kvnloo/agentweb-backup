@@ -1036,6 +1036,53 @@ describe('AgentModeService - Work Plan', () => {
         expect(result.success).toBe(true);
         expect(result.updatedSteps).toHaveLength(3);
       });
+
+      it('does NOT let a reset step\'s redo-attempt images satisfy a later step when it is re-completed in the SAME batch (CodeRabbit)', async () => {
+        // Step 2 was completed once (completedAt 15:00), then reset back to
+        // 'pending' -- simulating a step whose assets needed regenerating.
+        // Only 'completed'/'skipped' transitions stamp completedAt/resolvedAt,
+        // so the reset leaves that 15:00 timestamp in place even though the
+        // step is no longer resolved. The 2 images below (15:03/15:04) are
+        // step 2's OWN redo-attempt images, produced after the reset but
+        // before it's re-completed below -- they must not count toward step
+        // 3 just because they postdate step 2's stale 15:00 timestamp. Step 2
+        // is re-completed in the SAME batch as step 3, so the fix must use
+        // step 2's fresh, just-stamped (real "now") timestamp as step 3's
+        // cutoff, which correctly excludes these 2026-08-12 images.
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'Image generated: redo_1.png', metadata: { kind: 'image-generated', imageFilename: 'redo_1.png', timestamp: '2026-08-12T15:03:00.000Z' } },
+            { role: 'system', content: 'Image generated: redo_2.png', metadata: { kind: 'image-generated', imageFilename: 'redo_2.png', timestamp: '2026-08-12T15:04:00.000Z' } },
+          ],
+          workPlan: {
+            title: 'Plan',
+            steps: [
+              { stepCount: 1, title: 'Intake', status: 'completed', completedAt: '2026-08-12T14:50:00.000Z', resolvedAt: '2026-08-12T14:50:00.000Z' },
+              { stepCount: 2, title: 'Draft images', status: 'pending', completedAt: '2026-08-12T15:00:00.000Z' },
+              { stepCount: 3, title: 'Render final', status: 'pending', expectedAssetCount: 2 },
+            ],
+            createdAt: '2026-08-12T14:54:35.000Z',
+            updatedAt: '2026-08-12T15:05:00.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [
+            { stepCount: 2, status: 'completed' },
+            { stepCount: 3, status: 'completed' },
+          ],
+          mockSessionId
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 3, expected: 2, produced: 0 }),
+        ]);
+      });
     });
   });
 
