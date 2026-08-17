@@ -256,7 +256,9 @@ check() {
     return
   fi
 
-  if [ -n "${needle}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${needle}"; then
+  # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+  # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+  if [ -n "${needle}" ] && ! grep -qF "${needle}" <<<"${LAST_OUTPUT}"; then
     printf '  FAIL %s\n       output did not contain: %s\n       output:\n%s\n' \
       "${desc}" "${needle}" "${LAST_OUTPUT}"
     TESTS_FAILED=$(( TESTS_FAILED + 1 ))

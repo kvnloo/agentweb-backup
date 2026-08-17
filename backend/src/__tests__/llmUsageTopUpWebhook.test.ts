@@ -48,7 +48,7 @@ describe('usage top-up Stripe webhook', () => {
 
   it('proportionally removes purchased capacity when Stripe reports a refund', async () => {
     const getUser = jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: 'u1' } as any);
-    const record = jest.spyOn(paymentHistoryDb, 'record').mockResolvedValue();
+    const record = jest.spyOn(paymentHistoryDb, 'record').mockResolvedValue({ written: true });
 
     await handleChargeRefunded({
       id: 'ch_topup_1',

@@ -3,7 +3,6 @@ import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
-import { google } from 'googleapis';
 import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
@@ -21,6 +20,7 @@ import {
   TURN_TIME_BUDGET_FALLBACK_CONTENT,
 } from '../utils/turnTimeBudget';
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
+import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
@@ -304,6 +304,14 @@ import {
   validateNegativeCampaignCriteria,
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
+import {
+  isMetaSpendStartingWrite,
+  runMetaTrackingGate,
+  collectPendingDestinations,
+  collectPendingCreativeIds,
+  computeTrackingOverrideDigest,
+  trackingOverrideTokenMatches,
+} from './metaLaunchGate';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
@@ -3025,6 +3033,11 @@ export class AgentModeService {
                 : model.startsWith('claude-') ? 'vertex'
                 : 'azure-openai',
               feature: usageContext?.feature || 'agent_task',
+              // ENG-1251: the response's own id is stable across a retried/
+              // re-processed response and distinct across real calls — closes
+              // the "retries defeat charge dedup" Greptile P1 for the highest-
+              // volume metering site in the codebase.
+              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
               inputTokens: usage.prompt_tokens || 0,
               outputTokens: usage.completion_tokens || 0,
               cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
@@ -15218,6 +15231,89 @@ TRUTHFULNESS RULES (these override tone):
   }
 
   /**
+   * ENG-1259 — the cheap pre-check gate's LLM call.
+   *
+   * The caller (`runScheduledChat` in agentModeController.ts, via
+   * `shouldRunPreCheckGate` / `resolvePreCheckDecision` in
+   * utils/scheduledRunPreCheck.ts) only invokes this when the schedule's
+   * immediately preceding run had no actionable output — the exact repeat
+   * pattern PMPS's LUCAS schedule showed (four full-cost runs in a row that
+   * each concluded there was nothing to publish). This call is a SINGLE
+   * cheap/fast classification, not the schedule's own multi-step agent loop:
+   * it has no tools, no live data access, and must never be mistaken for the
+   * primary generation model.
+   *
+   * Fail-open by contract: returns `null` on any error, timeout, or
+   * unparseable response — NEVER a guessed decision — so the caller's fold
+   * (`resolvePreCheckDecision`) can apply the fail-TOWARD-running invariant
+   * uniformly regardless of why the classification was unavailable.
+   * Uses gemini-3.1-flash-lite (DIAGNOSIS_MODEL) — the same cheap tier as
+   * generateScheduledChatSummary / generateDiagnosticMessage.
+   */
+  async evaluateScheduledRunPreCheck(params: {
+    scheduleName: string;
+    startingMessage: string;
+    lastRunStatus: string | null;
+    lastRunSummary: string | null;
+    consecutiveNoOutputRuns: number;
+  }): Promise<ScheduledRunPreCheckLLMResult | null> {
+    try {
+      const systemPrompt = `You are a fast, cheap pre-check gate for a recurring automated marketing task ("scheduled chat"). Your ONLY job is to judge, from the task's own instructions and its recent run history, whether this run is very likely to have NOTHING new or actionable to do — a near-certain repeat of "nothing to publish".
+
+You have NO live access to any upstream data source, inbox, feed, or connected account — you cannot check whether new content actually exists right now. You are only judging a PATTERN: does the recent history show a clear run of "nothing to do" outcomes for a reason that gives no sign of having changed?
+
+Default to "proceed" whenever you are not highly confident. Proceeding when there was in fact nothing to do costs a bit of compute. Skipping when there actually WAS something to do silently drops real, value-producing work — that is the far worse outcome, so proceeding is always the safe choice on any doubt. Only answer "skip" with "confidence":"high" when the evidence is unambiguous: several consecutive runs already reported nothing to do, for the same underlying reason, and the task's own instructions give no indication anything is different this time (e.g. no new date, event, or trigger they describe).
+
+Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "confidence": "high" | "low", "reason": "<one short sentence>"}`;
+
+      const lastRunLine = params.lastRunStatus
+        ? `Most recent run outcome: ${params.lastRunStatus}${params.lastRunSummary ? ` — ${params.lastRunSummary}` : ''}`
+        : 'Most recent run outcome: none (this is the first run for this schedule)';
+
+      const userContent = [
+        `Task instructions: ${params.startingMessage.slice(0, 800)}`,
+        lastRunLine,
+        `Consecutive "nothing to do" runs immediately before this one: ${params.consecutiveNoOutputRuns}`,
+      ].join('\n\n');
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ], {
+        max_completion_tokens: 150,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+      });
+
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), DIAGNOSIS_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn(`AgentMode: Scheduled-run pre-check timed out for "${params.scheduleName}"; failing open (proceed).`);
+        return null;
+      }
+
+      const raw = (response as any).choices?.[0]?.message?.content?.trim();
+      if (!raw) return null;
+
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.decision !== 'string' || typeof parsed?.confidence !== 'string') {
+        return null;
+      }
+      return {
+        decision: parsed.decision,
+        confidence: parsed.confidence,
+        reason: typeof parsed?.reason === 'string' ? parsed.reason.slice(0, 300) : '',
+      };
+    } catch (error) {
+      console.error(`AgentMode: Scheduled-run pre-check failed for "${params.scheduleName}"; failing open (proceed):`, error);
+      return null;
+    }
+  }
+
+  /**
    * Generate 2-3 contextual follow-up suggestion chips for the user after each agent turn.
    * Uses gemini-3.1-flash-lite for fast, low-cost generation.
    * Returns null on failure so the caller can fall back to client-side regex heuristics.
@@ -15513,23 +15609,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (connection?.account_id && connection?.platform) {
       try {
-        const previous: unknown = connection.config?.granted_scopes;
-        const retained = (Array.isArray(previous) ? previous : [])
-          .filter((s: unknown) => typeof s === 'string')
-          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+        // Which of the two independent grants is actually missing (ENG-1158
+        // follow-up)? Without this, the re-consent message tells an owner who
+        // already granted the app scope to reconnect and re-approve a
+        // permission they already have — for a gap that lives on the ad
+        // account, not the OAuth connection, which reconnecting cannot touch.
+        const tier = await metaService.classifyAdsRefusalTier(connection.config?.access_token);
+        const revokedAt = new Date().toISOString();
 
+        // Function form (Greptile P1 on the sibling call in metaAdsCapabilitySync):
+        // `retained` must come from the config a CAS retry actually just read, not
+        // from `connection.config` captured before this call — otherwise a retry
+        // after a concurrent recovery would re-narrow a grant that had just come
+        // back. `tier` and `revokedAt` stay fixed: both are fresh judgments made
+        // once (a live Meta call, this call's own timestamp), not derived from
+        // local state that can go stale.
+        // The probedAt guard (Greptile P1 follow-up, mirrors the sibling in
+        // metaAdsCapabilitySync.ts): this single read failure is weaker
+        // evidence than the sweep's two-strike confirmation, so if the sweep
+        // already recorded a NEWER probe (e.g. a recovery landing moments
+        // after this failure), that signal wins — do nothing rather than
+        // revoke over a connection just confirmed healthy.
         const { updateAccountConfig } = await import('./connectedAccountsDb');
-        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
-          // Meta just told us authoritatively that no ads scope is granted.
-          // Recording it converts every subsequent attempt into a pre-flight refusal.
-          granted_scopes: retained,
-          ads_scope_revoked_at: new Date().toISOString(),
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, freshConfig => {
+          const storedProbedAt = freshConfig.ads_capability_probed_at;
+          if (typeof storedProbedAt === 'string' && storedProbedAt > revokedAt) {
+            return { updates: {}, unset: [] };
+          }
+
+          const freshPrevious: unknown = freshConfig.granted_scopes;
+          const freshRetained = (Array.isArray(freshPrevious) ? freshPrevious : [])
+            .filter((s: unknown) => typeof s === 'string')
+            .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+          return {
+            // Meta just told us authoritatively that no ads scope is granted.
+            // Recording it converts every subsequent attempt into a pre-flight refusal.
+            updates: {
+              granted_scopes: freshRetained,
+              ads_scope_revoked_at: revokedAt,
+              ads_capability_probed_at: revokedAt,
+              ...(tier !== 'unknown' ? { ads_scope_tier: tier } : {}),
+            },
+            unset: tier === 'unknown' ? ['ads_scope_tier'] : undefined,
+          };
         });
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
         );
       }
+
+      // Deliberately does NOT notify the owner. The 12-hourly capability sweep
+      // is the single notifier (ENG-1158): it probes every Meta ad account and
+      // alerts on exactly the accounts this path records, so notifying here too
+      // would only buy latency — at the price of two processes racing to email
+      // the same owner for one episode, which no in-process guard can dedupe.
+      // One sender, one process, no cross-process coordination to get wrong.
     }
 
     throw buildMetaAdsScopeError({
@@ -18305,6 +18440,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lines.push(`Changes: ${Object.keys(contentChanges).join(', ')}.`);
     }
 
+    /*
+     * ENG-941: waiving the tracking check is the single most consequential thing that can
+     * ride along in these params, and it was invisible here. Per ENG-388 the override is
+     * user-granted — but "user-granted" means nothing if the confirmation the user approves
+     * never mentions it. Surfaced in the summary so approving a launch cannot silently
+     * approve launching without measurement.
+     */
+    if (params?.override_tracking_check === true) {
+      target.override_tracking_check = true;
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
+
     return { summary: lines.join(' '), target };
   }
 
@@ -18683,7 +18833,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // an ad into the wrong campaign or editing the wrong asset). `confirm` is a
     // gate-only flag and is stripped before dispatch so it never reaches Meta.
     const confirmed = params.confirm === true;
-    if (AgentModeService.isMetaWriteAction(entity_type, action) && !confirmed) {
+    /*
+     * ENG-941, Greptile security P1 ("Confirmed replay can add override"): the preview and
+     * the confirmed execution are two separate calls with separately supplied params, so a
+     * model could preview a plain activation, let the user approve THAT, and then add
+     * `override_tracking_check` to the replay — waiving the measurement check on something
+     * the user was never told would skip it. An override the model can introduce after
+     * approval is not user-granted, whatever the tool description says.
+     *
+     * So the override is bound to the approval: a preview that carries one issues an HMAC
+     * over that exact call, and the override only counts when the replay presents that token
+     * back. No token, a forged token, or a token for different arguments all fall back into
+     * a fresh preview — which discloses the override and issues the matching token, so the
+     * path is a loop rather than a dead end. Nothing changes for a launch that waives
+     * nothing: those never need a token.
+     */
+    const overrideClaimed = (params as any)?.override_tracking_check === true;
+    const overrideDigest = overrideClaimed
+      ? computeTrackingOverrideDigest(getJwtSecret(), {
+          entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params,
+        })
+      : '';
+    const overrideApproved =
+      overrideClaimed && trackingOverrideTokenMatches((params as any)?.tracking_override_token, overrideDigest);
+    if (AgentModeService.isMetaWriteAction(entity_type, action) && (!confirmed || (overrideClaimed && !overrideApproved))) {
       const { summary, target } = await this.buildMetaWriteConfirmation(
         userId, entity_type, action, account_id, campaign_id, ad_set_id, ad_id, params
       );
@@ -18706,13 +18879,77 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Confirm this Meta Ads ${entity_type} ${action} before it runs: ${summary} ` +
           `Show the user the exact target above (campaign / ad set / asset) and get explicit approval. ` +
           `If more than one campaign or asset could match the request, ask the user to disambiguate first. ` +
-          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.`,
+          `Once approved, call call_meta_marketing_api again with the same arguments plus params.confirm=true.` +
+          (overrideClaimed
+            ? ` This call also waives the tracking pre-flight check, so the user must be shown the ` +
+              `WARNING above and approve it explicitly; the replay must additionally carry ` +
+              `params.tracking_override_token exactly as returned here, or the override will not apply.`
+            : ''),
+        // Only issued when an override was actually described in this preview, so it can only
+        // ever approve a waiver the user was shown.
+        ...(overrideClaimed ? { tracking_override_token: overrideDigest } : {}),
         target
       } as any;
     }
     if ('confirm' in params) {
       params = { ...params };
       delete params.confirm;
+    }
+    if ('tracking_override_token' in params) {
+      params = { ...params };
+      delete (params as any).tracking_override_token;
+    }
+
+    /*
+     * ENG-941: deterministic pre-flight tracking gate.
+     *
+     * Placed here, at the shared write path, rather than on the two named launch tools.
+     * This method can flip a campaign, ad set or ad to ACTIVE directly, so a gate that
+     * only guarded those tools could be bypassed by choosing this one instead — and a
+     * safety gate you can route around is not a safety gate.
+     *
+     * `override_tracking_check` is stripped from params before dispatch for the same
+     * reason `confirm` is above: it is our flag, not a Meta field, and must never reach
+     * the Graph API. Per ENG-388 (Harsha's decision) the conversational override is the
+     * only override path — no portal control — and it is recorded on the run record.
+     *
+     * Order matters and is deliberate: this sits AFTER the ENG-400 confirmation gate,
+     * so it only runs on a confirmed call. The two ask different questions — that gate
+     * asks "did a human intend this?", this one asks "can it report a conversion?" —
+     * and doing the network checks on an unconfirmed preview would waste them.
+     */
+    // Reaching here with an override means it survived the binding check above, so it is one
+    // the user was shown and approved — never one the model added to the replay.
+    const overrideTrackingCheck = overrideApproved;
+    if (params && typeof params === 'object' && 'override_tracking_check' in params) {
+      params = { ...params };
+      delete (params as any).override_tracking_check;
+    }
+    if (isMetaSpendStartingWrite(entity_type, action, params)) {
+      const gateCreds = await this.getMetaCredentials(userId, account_id);
+      const gate = await runMetaTrackingGate(
+        gateCreds,
+        campaign_id,
+        `${entity_type}_${action}`,
+        overrideTrackingCheck,
+        sessionId,
+        {},
+        // Activating one ad is judged on that ad's own destination, not its siblings'.
+        entity_type === 'AD' ? ad_id : undefined,
+        /*
+         * An ad being CREATED as ACTIVE has no entry in the ad list yet, so its destination
+         * has to come from the request itself or it ships unchecked. Meta carries the
+         * destination on the creative, which is why several shapes are possible here.
+         */
+        collectPendingDestinations(entity_type, action, params),
+        /*
+         * And when the ad references an existing creative by id instead of inlining one —
+         * the documented path — the destination is on that creative, so the gate resolves
+         * it through Graph rather than checking nothing.
+         */
+        collectPendingCreativeIds(entity_type, action, params),
+      );
+      if (!gate.proceed) return gate.blockResult as MetaApiResult;
     }
 
     switch (entity_type) {
@@ -19341,6 +19578,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
       lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
     }
+    /*
+     * ENG-941: the preview_token now covers `override_tracking_check`, so the override
+     * cannot be added after approval — but binding it to an approval that never mentioned
+     * it just moves the hole. The user has to be told what they are waiving, in the text
+     * they actually read, or "user-granted" means nothing. Same wording as the shared write
+     * path's confirmation, deliberately: one sentence for one decision.
+     */
+    if (args?.override_tracking_check === true) {
+      lines.push(
+        `WARNING: this launch will SKIP the tracking pre-flight check. Paid delivery may start ` +
+        `at a destination that cannot report conversions. Only confirm if that is intended.`,
+      );
+    }
     return lines.join(' ');
   }
 
@@ -19420,6 +19670,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       lookalike_country: args.lookalike_country,
       exclude_audience_id: args.exclude_audience_id,
       ad_set_params: args.ad_set_params,
+      /*
+       * ENG-941 (Greptile security P1): the override was NOT part of what the preview token
+       * signed, so it could be added to the confirmed replay without changing the digest —
+       * waiving the tracking check on a launch the user approved without one. Including it
+       * means adding it invalidates the approval and forces a fresh, disclosing preview.
+       */
+      override_tracking_check: args.override_tracking_check === true,
     };
     return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
   }
@@ -19579,6 +19836,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     workflow: 'targeted_audience' | 'retargeting',
     source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
   ): Promise<any> {
+      /*
+       * ENG-941: the named ENG-600 launch flows create their ad set directly rather than
+       * going through callMetaMarketingApi, so the gate there does not cover them. Without
+       * this, these two tools are the bypass.
+       *
+       * Ad sets default to PAUSED (metaService: `status: params.status || 'PAUSED'`), so a
+       * launch only starts paid delivery when the caller explicitly asks for ACTIVE — which
+       * is exactly what isMetaSpendStartingWrite tests. Reusing that predicate keeps one
+       * definition of "this spends money" instead of a second, drifting copy.
+       *
+       * Runs after the confirmation step above and before anything is created, so a blocked
+       * launch leaves no audience, lookalike or ad set behind.
+       */
+      if (isMetaSpendStartingWrite('AD_SET', 'CREATE', args?.ad_set_params)) {
+        const gateCreds = await this.getMetaCredentials(userId, args.account_id);
+        const gate = await runMetaTrackingGate(
+          gateCreds,
+          args.campaign_id,
+          `${workflow.toUpperCase()}_LAUNCH`,
+          args?.override_tracking_check === true,
+          args?.session_id,
+        );
+        if (!gate.proceed) return gate.blockResult;
+      }
+
       const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
 
       let attachAudienceId = seed.audience!.id;
@@ -20886,6 +21168,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Knowledge base search functionality
   // Helper: get an authenticated Google Drive client using the service account
   private async getGoogleDriveClient() {
+    // ENG-1277: lazy load. `googleapis` pulls in ~990 transitive modules that
+    // every jest worker paid on `require()` of this file (1,023 of 1,388 test
+    // files statically import agentModeService.ts) even when a test never
+    // touches Drive/Sheets.
+    const { google } = await import('googleapis');
     const { getSecret } = await import('../utils/secretsManager');
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
@@ -22198,6 +22485,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Read a Google Doc or Sheet directly by file ID.
   // Tries user OAuth first (works for internal Workspace files); falls back to service account.
   public async readGoogleFileById(fileId: string, userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let drive: any;
     let usingOAuth = false;
     try {
@@ -22290,6 +22579,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async listGoogleDriveFolder(folderIdOrUrl: string, userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -22342,6 +22633,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleDriveFolder(name: string, userId: string, parentFolderId?: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -22367,6 +22660,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async searchGoogleDrive(query: string, userId: string, type?: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -23097,6 +23392,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // ─────────────────────────────────────────────────────────────────────────
 
   public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let docId: string | undefined;
     let drive: any;
     try {
@@ -23150,6 +23447,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
@@ -23183,6 +23482,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async createGoogleSheet(title: string, data: string[][], userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     let sheetId: string | undefined;
     let drive: any;
     try {
@@ -23247,6 +23548,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   public async updateGoogleSheet(fileIdOrUrl: string, range: string, data: string[][], userId: string): Promise<any> {
+    // ENG-1277: lazy load — see getGoogleDriveClient() above for why.
+    const { google } = await import('googleapis');
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const sheets = google.sheets({ version: 'v4', auth });
@@ -30355,17 +30658,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
    */
   private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
-    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
-    if (acc?.config?.account_type !== 'ad_account') return {};
-
-    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
-    const state = getMetaAdsScopeState(acc.config);
-
-    if (state === 'granted') return { ads_capable: true };
-    if (state === 'missing') {
-      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
-    }
-    return {};
+    // Delegates to the shared helper so this payload and the Settings → Connected
+    // accounts payload are provably the same judgement (ENG-1158). They used to be
+    // computed independently, which is how an account could be "degraded" here and
+    // a green "Connected" row in the UI at the same moment.
+    const { describeMetaAdsCapability } = await import('../utils/metaAdsScope');
+    return describeMetaAdsCapability(acc);
   }
 
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
@@ -31484,6 +31782,48 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
 
+          // ENG-1026: when the model passes CRM lead context, cross-check the live
+          // profile's identity against the lead before spending an invite on the
+          // wrong person. Positive mismatch → structured refusal; no lead context
+          // or unverifiable → unchanged behavior.
+          if (args.list_id && args.lead_id && isUrl && profile_url) {
+            const { crmDb: identityCrmDb } = await import('./db');
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments. Require the same list-access check
+            // every other CRM write in this file uses before reading OR stamping
+            // a lead's identity data — a foreign list_id must never expose or
+            // mutate another tenant's lead. Best-effort skip on denial (mirrors
+            // the CRM-mirror access guard below): this is a side-channel guard,
+            // not the primary user-requested action, so it never blocks the send.
+            const identityList = await identityCrmDb.getLeadListById(args.list_id).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasIdentityAccess = identityList ? await canDestructiveCrmList(userId, identityList) : false;
+            if (!hasIdentityAccess) {
+              console.warn(`[AgentMode] send-invite: skipping identity check — list ${args.list_id} not accessible to user ${userId}`);
+            }
+            const identityLead = hasIdentityAccess
+              ? await identityCrmDb.getLeadById(args.list_id, args.lead_id).catch(() => null)
+              : null;
+            if (identityLead) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: identityLead as any,
+                listId: args.list_id,
+                leadId: args.lead_id,
+                profileUrl: profile_url,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
+              }
+            }
+          }
+
           // ENG-182: cross-check the account's PENDING sent-invitation cache before
           // spending a run's invite quota. A profile with an OUTSTANDING (sent but
           // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
@@ -31662,7 +32002,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
             const { crmDb } = await import('./db');
-            sendLead = await crmDb.getLeadById(sendListId, sendLeadId);
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments — require list access before this
+            // fetch, same as every other CRM write in this file, or a foreign
+            // list_id exposes/mutates another tenant's lead identity data via
+            // both the sync-gate/duplicate check below and the identity guard
+            // further down. Best-effort skip on denial: the send itself is not
+            // blocked, only the CRM-linked checks that need this lead's data.
+            const sendList = await crmDb.getLeadListById(sendListId).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasSendAccess = sendList ? await canDestructiveCrmList(userId, sendList) : false;
+            if (!hasSendAccess) {
+              console.warn(`[AgentMode] send-message: skipping CRM-linked checks — list ${sendListId} not accessible to user ${userId}`);
+            }
+            sendLead = hasSendAccess ? await crmDb.getLeadById(sendListId, sendLeadId) : null;
             if (sendLead) {
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -31700,6 +32053,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                     alreadySentAt: duplicateEvent.createdAt,
                   };
                 }
+              }
+            }
+          }
+
+          // ENG-1026: with CRM lead context, cross-check the live profile's identity
+          // against the lead before sending. Positive mismatch → structured refusal.
+          if (sendLead && sendListId && sendLeadId) {
+            const identityUrl = (isUrl && profile_url) || (sendLead.linkedin as string | undefined)?.trim();
+            if (identityUrl) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: sendLead as any,
+                listId: sendListId,
+                leadId: sendLeadId,
+                profileUrl: identityUrl,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
               }
             }
           }

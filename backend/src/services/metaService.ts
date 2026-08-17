@@ -773,6 +773,117 @@ export class MetaService {
    * callers can distinguish "we could not ask" from "nothing was granted". Storing
    * an empty array in the former case would later read as an authoritative refusal.
    */
+  /**
+   * Can this token actually read ads data for this ad account, right now?
+   *
+   * WHY A REAL READ AND NOT A SCOPE LOOKUP (ENG-1158)
+   * -------------------------------------------------
+   * Two independent grants have to line up before an ads read works, and only
+   * one of them is visible in a token's scopes:
+   *
+   *   1. the USER granting our app `ads_read` at the OAuth dialog, and
+   *   2. the AD ACCOUNT's owner granting that user access to that ad account.
+   *
+   * Production account 922903076601160 has (1) and not (2). Verified live:
+   * `/me/permissions` reports `ads_read` and `ads_management` as granted with
+   * nothing declined, while the very same token gets
+   * "(#200) Ad account owner has NOT grant ads_management or ads_read permission"
+   * from that ad account. Any capability answer derived from scopes alone
+   * therefore reports "capable" for exactly the account that cannot read — the
+   * trap `utils/metaAdsScope.ts` was written to avoid, one level further down.
+   *
+   * So we ask the only question that has an authoritative answer: we try. The
+   * cheapest read on the ad account node is enough; verified live to succeed on
+   * a working account and to return the (#200) refusal on the broken one.
+   *
+   * Returns 'unknown' for anything that is not a clear yes or a clear ads-scope
+   * refusal — a rate limit or an outage must never be read as incapability.
+   */
+  public async probeAdsAccountAccess(
+    accessToken: string,
+    adAccountId: string
+  ): Promise<'accessible' | 'denied' | 'unknown'> {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const id = `act_${String(adAccountId).replace('act_', '')}`;
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/${id}` +
+          `?fields=id&access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (body?.id) return 'accessible';
+      if (!body?.error) return 'unknown';
+
+      // Reuse the deliberately strict predicate rather than re-deciding here:
+      // Meta stamps a whole family of unrelated failures as permission errors,
+      // and only one of them means "no ads access".
+      const { isMetaAdsScopeRefusal } = await import('../utils/metaAdsScope');
+      if (isMetaAdsScopeRefusal({ structuredError: body.error, message: body.error?.message })) {
+        return 'denied';
+      }
+      return 'unknown';
+    } catch (error: any) {
+      console.warn(`[MetaService] probeAdsAccountAccess failed: ${error?.message ?? error}`);
+      return 'unknown';
+    }
+  }
+
+  /**
+   * When `probeAdsAccountAccess` has just returned 'denied', which of the two
+   * independent grants is actually missing? (ENG-1158 follow-up)
+   *
+   * The ad-account refusal alone cannot say — Meta stamps the same (#200)
+   * shape whether the app never got `ads_read` or the app has it and the ad
+   * account's owner just hasn't granted this person access to that asset.
+   * Telling an owner who already granted the app scope to "reconnect and
+   * approve Ads permissions" sends them through a flow that cannot fix
+   * anything and leaves them locked out with no correct next step.
+   *
+   * Deliberately calls `/me/permissions`, NOT `debug_token` (`getGrantedScopes`).
+   * `debug_token` authenticates with an APP token and only answers for a token
+   * minted by the app whose credentials are currently configured — verified
+   * live to fail with "(#100) The App_id in the input_token did not match the
+   * Viewing App" on this repo's own dev test accounts, which would have made
+   * this classifier silently inert wherever that mismatch holds. `/me/permissions`
+   * authenticates with the USER token being classified, same as
+   * `probeAdsAccountAccess`, so it carries no such precondition — this is the
+   * exact call the original investigation used to diagnose account
+   * 922903076601160 live.
+   *
+   * present + granted → the app grant is confirmed, so the ad account itself is
+   * the gap ('asset'). Absent or declined → the app was never granted the scope
+   * ('oauth'). Undetermined (the call itself failed) → 'unknown', which callers
+   * must treat as "fall back to the OAuth-tier message" rather than guess.
+   */
+  public async classifyAdsRefusalTier(accessToken: string): Promise<'oauth' | 'asset' | 'unknown'> {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/me/permissions?access_token=${encodeURIComponent(accessToken)}`
+      );
+      const body: any = await res.json();
+
+      if (!Array.isArray(body?.data)) {
+        console.warn(
+          `[MetaService] classifyAdsRefusalTier: /me/permissions returned an unexpected shape: ${body?.error?.message ?? 'no data array'}`
+        );
+        return 'unknown';
+      }
+
+      const { META_ADS_READ_SCOPES } = await import('../utils/metaAdsScope');
+      const hasAdsScope = body.data.some(
+        (p: any) =>
+          (META_ADS_READ_SCOPES as readonly string[]).includes(String(p?.permission).trim()) &&
+          p?.status === 'granted'
+      );
+      return hasAdsScope ? 'asset' : 'oauth';
+    } catch (error: any) {
+      console.warn(`[MetaService] classifyAdsRefusalTier failed: ${error?.message ?? error}`);
+      return 'unknown';
+    }
+  }
+
   public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
     try {
       const { getMetaCredentials } = await import('../utils/secretsManager');
@@ -2364,7 +2475,15 @@ export class MetaService {
   public async resolveMetaPixelForUser(
     user: any,
     userId: string,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2473,7 +2592,15 @@ export class MetaService {
     user: any,
     userId: string,
     stored: { pixelId: string; accountId: string } | undefined,
-  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+  ): Promise<
+    | { pixelId: string; accountId: string }
+    /** `transient` distinguishes "this account structurally has no pixel to resolve" from
+     *  "we could not reach Meta / could not refresh a token just now". Both surface as
+     *  unresolved because this resolver never throws, but only the second is worth
+     *  retrying — and a caller that treats them alike either drops a conversion forever or
+     *  retries a permanent condition five times (ENG-926 §C, Greptile on #2412). */
+    | { unresolved: true; reason: string; transient?: boolean }
+  > {
     try {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
@@ -2530,6 +2657,10 @@ export class MetaService {
       // resolver exists to fix). One account's failure (expired token, Graph error)
       // is skipped, not fatal — the next account still gets a fair try.
       let lastReason = `No Meta pixel found on any of ${accounts.length} connected ad account(s)`;
+      // A caught failure here is a credential refresh or a Graph call going wrong, not a
+      // statement about how this account is configured — so the result is unresolved but
+      // retryable, unlike "every connected account genuinely has zero pixels".
+      let sawTransientFailure = false;
       for (const account of accounts) {
         try {
           const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, account.accountId);
@@ -2539,11 +2670,13 @@ export class MetaService {
           }
         } catch (error: any) {
           lastReason = error?.message || lastReason;
+          sawTransientFailure = true;
         }
       }
-      return { unresolved: true, reason: lastReason };
+      return { unresolved: true, reason: lastReason, transient: sawTransientFailure };
     } catch (error: any) {
-      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+      // An unexpected throw out of the resolver itself is likewise not a configuration fact.
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel', transient: true };
     }
   }
 
@@ -2586,6 +2719,21 @@ export class MetaService {
        *  conversion type — e.g. calendlyWebhook.ts sending 'Schedule' for a booking,
        *  per ENG-524's PRD and matching ENG-522's sendScheduleEvent — pass it explicitly. */
       eventName?: string;
+      /** ENG-926 §C: Meta's `custom_data`, emitted only when present so every existing
+       *  caller's payload is byte-identical to what it was before this field existed.
+       *  `value`/`currency` are what make a closed-won `Purchase` usable for Meta's
+       *  value-based bidding — without them the event counts but carries no revenue. */
+      customData?: { value?: number; currency?: string };
+      /** Meta's `action_source`. Defaults to 'website', which is correct for this
+       *  function's original callers (a real form submission, and ENG-522's booking flow)
+       *  and keeps their payloads unchanged.
+       *
+       *  A CRM status change is NOT a website event — nobody was on a page — and claiming
+       *  otherwise misdescribes where the conversion happened. Meta validates this field:
+       *  probed against Graph v25 on 2026-08-14, 'system_generated' and 'website' are both
+       *  accepted while a bogus value is rejected with "Invalid Action Source Parameter",
+       *  so acceptance here is meaningful rather than the API ignoring the field. */
+      actionSource?: string;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2620,6 +2768,12 @@ export class MetaService {
           ? (event.eventTimeSeconds as number)
           : Math.floor(Date.now() / 1000);
 
+      // Only build custom_data when there is something to put in it — an empty object
+      // would still be a payload change for every existing caller.
+      const customData: Record<string, any> = {};
+      if (typeof event.customData?.value === 'number') customData.value = event.customData.value;
+      if (event.customData?.currency) customData.currency = event.customData.currency;
+
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
       const body = {
@@ -2629,9 +2783,10 @@ export class MetaService {
             event_name: event.eventName || 'Lead',
             event_id: event.eventId,
             event_time: eventTime,
-            action_source: 'website',
+            action_source: event.actionSource || 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,
+            ...(Object.keys(customData).length > 0 ? { custom_data: customData } : {}),
           },
         ],
       };
