@@ -210,3 +210,50 @@ export async function readPooledLedgerRows(
   );
   return perUser.flat();
 }
+
+/**
+ * ENG-1251 — every row billed to this subject, by BOTH routes into the ledger.
+ *
+ * The two strategies are each blind to rows the other sees, and the blindness is
+ * structural rather than incidental:
+ *
+ *  - The partition fan-out above reaches rows with no `billingUserId` at all,
+ *    because it infers attribution from org membership. That is the only way to
+ *    see spend recorded before the attribute was stamped at write time — but it
+ *    can only ask about people who are members NOW.
+ *  - `queryByBillingUserDateRange` filters on the stamped attribute, so it
+ *    reaches rows belonging to people who have since LEFT the org and are
+ *    unreachable by any partition query — but only rows that carry the stamp.
+ *
+ * `/usage/itemized` used the scan alone and undercounted the founders org by
+ * 60.5% over Aug 12-15 ($86.23 against a true $218.13), because most historical
+ * rows predate the stamp. The union recovers that without touching stored data:
+ * both strategies read what already exists, so there is no backfill to run, no
+ * migration to reverse, and nothing that can go wrong halfway.
+ *
+ * Dedupe is on `{userId, sk}` — the table's own primary key, not `sk` alone,
+ * which is `date#model#feature` and therefore collides whenever two people do
+ * the same kind of work on the same day. Overlap between the two paths is the
+ * common case rather than the exception (any current member with the attribute
+ * stamped appears in both), so getting this wrong would double an org's bill.
+ * On a billing surface an overcount is the worse failure of the two.
+ *
+ * Neither half degrades to empty on error, for the same reason the fan-out
+ * doesn't: half a ledger presented as a whole one is the defect being fixed.
+ */
+export async function readBilledLedgerRows(
+  billingUserId: string,
+  startDate: string,
+  endDate: string,
+): Promise<UsageRecordRow[]> {
+  const [pooled, stamped] = await Promise.all([
+    readPooledLedgerRows(billingUserId, startDate, endDate),
+    usageRecordDb.queryByBillingUserDateRange(billingUserId, startDate, endDate),
+  ]);
+
+  const byPrimaryKey = new Map<string, UsageRecordRow>();
+  for (const row of [...pooled, ...(stamped || [])]) {
+    byPrimaryKey.set(`${row.userId} ${row.sk}`, row);
+  }
+  return [...byPrimaryKey.values()];
+}
