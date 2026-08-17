@@ -128,6 +128,50 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       expect(written.find((s: any) => s.stepCount === 1)).toEqual(TEN[0]);
     });
 
+    it('does not treat a falsy stepCount as a selector', async () => {
+      // `normalizeWorkPlanSteps` turns stepCount null/0/'' into the array
+      // position, and merge resolution trusts stepCount over title. A presence
+      // check (`!== undefined`) therefore promoted a non-selector into an
+      // invented one, amending step 1 while the titled step stayed untouched.
+      for (const bad of [null, 0, '']) {
+        jest.clearAllMocks();
+        mockGetWorkPlan.mockResolvedValue(plan);
+        mockUpdateWorkPlan.mockResolvedValue(8);
+        const res = await request(app)
+          .put('/api/admin/work-plans/plan-1')
+          .send({
+            steps: [{ stepCount: bad, title: 'Step 7: a real title', description: 'rewritten' }],
+            steps_mode: 'merge',
+          });
+        expect(res.status).toBe(200);
+        const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+        expect(written.find((s: any) => s.stepCount === 7).description).toBe('rewritten');
+        expect(written.find((s: any) => s.stepCount === 1)).toEqual(TEN[0]);
+      }
+    });
+
+    it('rejects an explicitly supplied null steps_mode instead of defaulting to replace', async () => {
+      // Nullish coalescing turned a supplied-but-invalid value back into
+      // "absent", so the caller silently got replace semantics.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: TEN, steps_mode: null });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/steps_mode/i);
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('does not let a valid steps_mode mask an unsupported stepsMode', async () => {
+      // `steps_mode ?? stepsMode` never looks at the second key once the first
+      // is set — so one of the two supplied modes was accepted and disregarded.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: TEN, steps_mode: 'merge', stepsMode: 'patch' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/steps_mode|stepsMode/i);
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
     it('refuses a merge entry that names no step at all', async () => {
       // With neither stepCount nor title there is nothing to resolve against.
       // Silently amending whatever sat at that array position is the same

@@ -94,6 +94,20 @@ describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-
     expect(loss.map((l: any) => l.title)).toEqual(['Alpha']);
   });
 
+  it('flags a step destroyed under a duplicated title, where positional fallback cross-pairs', () => {
+    // Alpha is erased and replaced by a second copy of Beta. Two entries now
+    // share Beta's title, so title matching is ambiguous and both fall through
+    // to the positional pass — which pairs Alpha against a Beta that is fully
+    // populated. Every field looks "changed, not blanked", so the destruction
+    // of Alpha reads as no loss at all.
+    const after = [
+      { stepCount: 1, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+      { stepCount: 2, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss.map((l: any) => l.title)).toEqual(['Alpha']);
+  });
+
   it('stays silent on a wholesale rewrite where nothing was kept', () => {
     // The carve-out that makes "replace this plan" possible at all: no step was
     // recognised, so none was plainly meant to survive, and droppedStepTitles
