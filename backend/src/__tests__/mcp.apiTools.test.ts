@@ -1181,6 +1181,30 @@ describe('apiTools', () => {
 
         expect(parsed.modelMix).toBeNull();
       });
+
+      // The top-level truncation signal is independent of whether any session
+      // had resolvable model attribution — a range can be fully truncated with
+      // zero attributed sessions in the returned page, and that still needs to
+      // be visible even though modelMix itself is null.
+      it('still reports the top-level truncated flag when modelMix is null', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-empty-3', userId: 'u-e2', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            messages: [{ role: 'user', content: 'hi' }],
+          }],
+          nextCursor: 'opaque-cursor-more-results-exist',
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix).toBeNull();
+        expect(parsed.truncated).toBe(true);
+      });
     });
 
     it('should direct the model-mix section to attributedModels via the precomputed modelMix field', () => {
