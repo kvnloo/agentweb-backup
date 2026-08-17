@@ -98,25 +98,43 @@
 # means a push in between could make the request and the rerun target
 # different commits.
 #
-# TWO KNOWN, DELIBERATE LIMITS, both flagged in the same portal#1035 review
-# (3/5) and left as-is rather than chased further:
-#   - The window between that final re-check and the actual rerun API call
-#     is still non-atomic — GitHub has no "rerun this job, but only if HEAD
-#     is still X" endpoint. Every fix so far has narrowed this from "however
-#     long a human takes to notice and retry" down to consecutive API calls
-#     milliseconds apart. Closing it completely isn't possible without a
-#     capability this API doesn't offer, and the fail-closed gate means the
-#     worst residual outcome is a wasted credit and a retry — never a false
-#     pass. Diminishing returns past this point.
-#   - A LOOKUP failure inside request_marker_exists_for (the GitHub API call
-#     itself erroring — reproduced for real by a transient DNS failure
-#     during this script's own development) is retried 3x before giving up,
-#     and reported as a DISTINCT outcome from "confirmed absent" — see that
-#     function and the case statement in main() for why conflating the two
-#     was the actual bug, not the retry count. A network blip lasting longer
-#     than the retry window still ends the script; that's the correct
-#     failure mode (loud, not a duplicate request), not a bug to fix by
-#     retrying harder.
+# CAUGHT LIVE A FOURTH TIME (Greptile P1, agentweb#2427, "Head-race recovery
+# duplicates reviews"): the head-mismatch branch below unconditionally told
+# the operator to re-run WITHOUT --rerun-only. But the request comment posted
+# a moment earlier carries no SHA pin on Greptile's side — Greptile reviews
+# whatever the PR's head is when it gets around to processing the mention.
+# If the new commit lands, THEN Greptile processes the original mention, its
+# review can end up covering the NEW head anyway — and the unconditional
+# "post another request" advice pays for a second review of a head that's
+# already covered. Fix: before advising a fresh request, check whether a
+# LANDED Greptile verdict already names the new head (same "Last reviewed
+# commit" footer greptile-gate.sh parses, and the same reply-thread trap it
+# documents — a threaded reply to a finding is newer than the edited-in-place
+# summary and carries no footer, so this must skip those, not just take the
+# newest comment). If the new head is already covered, no duplicate request
+# is needed — just rerun the gate job against it. Only a genuinely
+# not-yet-covered new head still gets the "run this again" advice.
+#
+# ONE KNOWN, DELIBERATE LIMIT, flagged in the same portal#1035 review (3/5)
+# and left as-is rather than chased further: the window between the final
+# re-check and the actual rerun API call is still non-atomic — GitHub has no
+# "rerun this job, but only if HEAD is still X" endpoint. Every fix so far
+# has narrowed this from "however long a human takes to notice and retry"
+# down to consecutive API calls milliseconds apart. Closing it completely
+# isn't possible without a capability this API doesn't offer, and the
+# fail-closed gate means the worst residual outcome is a wasted credit and a
+# retry — never a false pass. Diminishing returns past this point.
+#
+# A LOOKUP failure inside request_marker_exists_for (the GitHub API call
+# itself erroring — reproduced for real by a transient DNS failure during
+# this script's own development) is retried 3x before giving up, and
+# reported as a DISTINCT outcome from "confirmed absent" — see that function
+# and the case statement in main() for why conflating the two was the actual
+# bug, not the retry count. A network blip lasting longer than the retry
+# window still ends the script; that's the correct failure mode (loud, not a
+# duplicate request), not a bug to fix by retrying harder. The same
+# lookup-failure-is-not-absence distinction applies to
+# greptile_reviewed_head() below, for the same reason.
 
 set -euo pipefail
 
@@ -229,6 +247,55 @@ request_marker_exists_for() {
   return 2
 }
 
+# Exit 0: a landed Greptile verdict's "Last reviewed commit" footer already
+# names ${1}. Exit 1: comments were fetched fine and no landed verdict names
+# it (still pending, or genuinely never requested). Exit 2: the lookup itself
+# failed after retries — same three-way split as request_marker_exists_for,
+# for the same reason: a transient failure must never read as "not covered".
+#
+# Mirrors greptile-gate.sh's own comment selection exactly (same query, same
+# reply-thread-avoidance), because that is the one place in this repo that
+# has already been proven correct against Greptile's actual comment-editing
+# behavior — re-deriving different selection logic here risks re-introducing
+# a bug that file's own header describes fixing.
+greptile_reviewed_head() {
+  local head_sha="$1" comments_json rc body reviewed_sha
+  for attempt in 1 2 3; do
+    if comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null)"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [ "${rc}" -eq 0 ]; then
+      body="$(printf '%s' "${comments_json}" | jq -r '
+          [ .[]
+            | select((.user.type // "") == "Bot")
+            | select(((.user.login // "") | ascii_downcase | startswith("greptile")))
+            | (.body // "")
+          ] as $bodies
+          | ( [ $bodies[] | select(test("last reviewed commit"; "i")) ] | last )
+            // ""
+        ' 2>/dev/null || true)"
+      if [ -z "${body}" ]; then
+        return 1
+      fi
+      reviewed_sha="$(printf '%s' "${body}" \
+        | grep -oiE 'commit/[0-9a-f]{40}' \
+        | head -n 1 \
+        | cut -d/ -f2 \
+        | tr '[:upper:]' '[:lower:]')"
+      if [ -n "${reviewed_sha}" ] && [ "${reviewed_sha}" = "${head_sha}" ]; then
+        return 0
+      fi
+      return 1
+    fi
+    if [ "${attempt}" -lt 3 ]; then
+      sleep 3
+    fi
+  done
+  return 2
+}
+
 # Finds the job to rerun. Deliberately errors loudly rather than silently
 # skipping the rerun on any ambiguity — a skipped rerun leaves the gate stuck
 # on a stale refusal with no visible sign anything is wrong.
@@ -317,7 +384,29 @@ main() {
   local head_sha_before_rerun
   head_sha_before_rerun="$(resolve_head_sha)"
   if [ "${head_sha_before_rerun}" != "${head_sha}" ]; then
-    fail "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running — the review just requested may not cover the current head. Re-run the script fresh (without --rerun-only) against the new head rather than rerunning the gate for a request that may be stale."
+    # The head moved. Before telling the operator to pay for another
+    # request, check whether a landed verdict already names the NEW head —
+    # Greptile has no SHA pin on our mention, so it may have processed it
+    # against the head that landed in between. See greptile_reviewed_head's
+    # header for why this is not the same question request_marker_exists_for
+    # answers (that checks OUR marker; this checks GREPTILE'S OWN verdict).
+    local covered_rc
+    if greptile_reviewed_head "${head_sha_before_rerun}"; then
+      covered_rc=0
+    else
+      covered_rc=$?
+    fi
+    case "${covered_rc}" in
+      0)
+        log "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, but Greptile already has a landed verdict for ${head_sha_before_rerun} — no duplicate request needed. Rerunning the gate against the new head."
+        rerun_gate_job "${head_sha_before_rerun}"
+        return
+        ;;
+      2)
+        fail "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, and checking whether Greptile already covered the new head failed after retries (see the log above). Not safe to guess either way — re-run '$0' once the API is reachable." ;;
+      *)
+        fail "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, and no landed Greptile verdict covers the new head yet. Re-run the script fresh (without --rerun-only) against the new head rather than rerunning the gate for a request that may be stale." ;;
+    esac
   fi
 
   rerun_gate_job "${head_sha}"

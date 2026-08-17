@@ -52,6 +52,20 @@ marker_comment_for() {
 EOF
 }
 
+# A LANDED Greptile verdict naming ${1} — the shape greptile_reviewed_head()
+# looks for, distinct from marker_comment_for's own request comment (that one
+# is authored by a User and carries no footer; this one is authored by the
+# Bot and carries the footer greptile-gate.sh itself parses).
+greptile_verdict_comment_for() {
+  local sha="$1"
+  cat <<EOF
+[
+  {"user": {"type": "Bot", "login": "greptileai[bot]"},
+   "body": "<h3>Greptile Summary</h3>\n<h3>Confidence Score: 4/5</h3>\n<sub>Reviews (3): Last reviewed commit: [\\"fix: x\\"](https://github.com/owner/repo/commit/${sha})</sub>"}
+]
+EOF
+}
+
 write_default_fixtures() {
   cat >"${MOCK_DIR}/pull.json" <<EOF
 {"headRefOid": "${HEAD_SHA}"}
@@ -450,6 +464,52 @@ else
 fi
 check_call_logged 'the review request was still posted before the mismatch was caught' \
   '@greptileai'
+
+# CAUGHT LIVE (Greptile P1, agentweb#2427, "Head-race recovery duplicates
+# reviews"): the unconditional fail above pays for a second review even when
+# Greptile's SHA-unscoped mention already landed against the new head (it has
+# no pin on our side; it reviews whatever the PR's head is when it processes
+# the webhook). If a landed verdict already names the new head, no duplicate
+# request is warranted — just rerun the gate against it.
+NEW_HEAD_SHA='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+new_mock
+printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
+greptile_verdict_comment_for "${NEW_HEAD_SHA}" >"${MOCK_DIR}/comments.json"
+run_script
+check 'a head change is NOT a duplicate-request case when Greptile already covered the new head' 0 \
+  'already has a landed verdict'
+check_call_logged 'exactly one review request comment was posted (for the original head, before the race)' \
+  "greptile-request-review: head=${HEAD_SHA}"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "$(grep -cF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null || echo 0)" = "1" ]; then
+  printf 'PASS: %s\n' 'no second review request comment was posted for the new head'
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  calls.log:\n%s\n' 'no second review request comment was posted for the new head' \
+    "$(cat "${MOCK_DIR}/calls.log")"
+fi
+check_call_logged 'the gate was rerun against the NEW head''s job, not the stale one' \
+  "actions/jobs/${JOB_ID}/rerun"
+
+# The lookup for "did Greptile already cover the new head" can itself fail
+# (same class of transient GitHub API error every other lookup in this file
+# already handles). That must read as "cannot confirm either way", never as
+# silently-covered (which would suppress a needed request) nor as
+# silently-not-covered (which would pay for one that may be redundant).
+new_mock
+printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
+echo 1 >"${MOCK_DIR}/comments_exit"
+run_script
+check 'a failed lookup for new-head coverage is a distinct, loud failure' 1 \
+  'checking whether Greptile already covered the new head failed'
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF 'jobs/' "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  calls.log:\n%s\n' 'no rerun attempted when new-head coverage cannot be confirmed' \
+    "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' 'no rerun attempted when new-head coverage cannot be confirmed'
+fi
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"
