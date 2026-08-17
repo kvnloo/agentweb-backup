@@ -4,6 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
+import { parsePendingKinds } from '../utils/metaConversionPending';
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
@@ -14,6 +15,7 @@ import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
 import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
+import { MAX_ATOMIC_RUN_RESULT_REMOVALS, isDynamoItemSizeError, trimListToItemBudget } from "../utils/dynamoItemBudget";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -140,6 +142,12 @@ export interface User {
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
+  // ENG-720: set when a hard (5.x.x) bounce hits this account's own address.
+  // Flag only — never gates login or deactivates the account.
+  emailUndeliverable?: boolean;
+  emailUndeliverableReason?: string;
+  emailUndeliverableSource?: string;
+  emailUndeliverableAt?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
   stripe_customer_id?: string;
@@ -153,6 +161,7 @@ export interface User {
   slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
+  landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>; // Array of GA4 properties with labels
@@ -639,6 +648,8 @@ export interface User {
   lastTouch?: import("../types/attribution").AttributionTouch;
   utmSource?: string;
   utmMedium?: string;
+  /** Denormalized from firstTouch.clickIds — see utils/leadSchema.ts (ENG-1176). */
+  clickIds?: Record<string, string>;
   /**
    * Saved CRM views — user's customized filter+sort combinations applied
    * to the /crm dashboard tabs. Built-in presets are injected by the
@@ -1352,14 +1363,20 @@ export class UserDB {
   ): Promise<any[]> {
     const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
     const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
-    const result = await this.docClient
-      .scan({
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const params: AWS.DynamoDB.DocumentClient.ScanInput = {
         TableName: this.tableName,
         FilterExpression: combinedFilter,
         ExpressionAttributeValues: combinedValues,
-      })
-      .promise();
-    return result.Items || [];
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      };
+      const result = await this.docClient.scan(params).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
   }
 
   async getUserAnalytics(startDate: string, endDate: string) {
@@ -1789,6 +1806,149 @@ export class UserDB {
         return null;
       }
       handleDynamoDbError(error, "incrementTokenUsageForMonth");
+      throw error;
+    }
+  }
+
+  /**
+   * Apply a monthly LLM charge to the user's counter AND mark the matching
+   * `AW-LlmChargeEvents` row `counterAppliedAt` in ONE DynamoDB transaction.
+   *
+   * Root-cause fix for ENG-1251 Greptile P1s: the previous two-call sequence
+   * (update the counter, then separately call markLlmChargeApplied) let the
+   * two diverge — a counter update could succeed while the audit marker
+   * write failed (charge applied but invisible to itemization), or the
+   * marker could be set even when the counter update lost a concurrency
+   * race (itemization shows a charge that was never actually counted).
+   * TransactWriteItems makes both writes succeed or fail together.
+   *
+   * Returns:
+   *  - "applied": both writes landed this call.
+   *  - "already_applied": the audit event already had counterAppliedAt set
+   *    (a prior attempt's transaction already completed) — safe no-op.
+   *  - "lost_race": the users-table condition failed (someone else rolled
+   *    the month, or this increment's assumed prior month no longer
+   *    matches) — caller should re-read the user and retry with fresh state.
+   */
+  async applyMonthlyChargeAtomic(args: {
+    userId: string;
+    userEmail: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    isNewMonth: boolean;
+    history?: Array<{ month: string; totalTokens: number; totalCost: number }>;
+    auditTableName: string;
+    billingUserId: string;
+    eventId: string;
+  }): Promise<"applied" | "already_applied" | "lost_race"> {
+    const userItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = args.isNewMonth
+      ? {
+          Update: {
+            TableName: this.tableName,
+            Key: { email: args.userEmail },
+            UpdateExpression:
+              "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+            // Same guard as resetTokenUsageForMonth: succeeds only while the
+            // stored month is still NOT the new one.
+            ConditionExpression:
+              "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+            ExpressionAttributeNames: {
+              "#userId": "userId",
+              "#tokenUsage": "tokenUsage",
+              "#month": "month",
+              "#history": "tokenUsageHistory",
+              "#bonus": "tokenAllowanceBonus",
+            },
+            ExpressionAttributeValues: {
+              ":userId": args.userId,
+              ":month": args.month,
+              ":usage": {
+                month: args.month,
+                totalTokens: args.tokens,
+                totalCost: args.cost,
+                resetDate: args.resetDate,
+              },
+              ":history": args.history || [],
+              ":zero": 0,
+            },
+          },
+        }
+      : {
+          Update: {
+            TableName: this.tableName,
+            Key: { email: args.userEmail },
+            UpdateExpression:
+              "SET #tokenUsage.#month = :month, " +
+              "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens, " +
+              "#tokenUsage.#totalCost = if_not_exists(#tokenUsage.#totalCost, :zero) + :cost, " +
+              "#tokenUsage.#resetDate = if_not_exists(#tokenUsage.#resetDate, :resetDate)",
+            ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+            ExpressionAttributeNames: {
+              "#userId": "userId",
+              "#tokenUsage": "tokenUsage",
+              "#month": "month",
+              "#totalTokens": "totalTokens",
+              "#totalCost": "totalCost",
+              "#resetDate": "resetDate",
+            },
+            ExpressionAttributeValues: {
+              ":userId": args.userId,
+              ":month": args.month,
+              ":tokens": args.tokens,
+              ":cost": args.cost,
+              ":zero": 0,
+              ":resetDate": args.resetDate,
+            },
+          },
+        };
+
+    const auditItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: {
+        TableName: args.auditTableName,
+        Key: { billingUserId: args.billingUserId, eventId: args.eventId },
+        UpdateExpression: "SET counterAppliedAt = :now",
+        // Idempotency: a retried transaction that already landed must not
+        // re-apply — this condition is what turns a duplicate transaction
+        // attempt into a clean "already_applied" instead of a second charge.
+        ConditionExpression: "attribute_not_exists(counterAppliedAt)",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      },
+    };
+
+    try {
+      await this.docClient
+        .transactWrite({ TransactItems: [userItem, auditItem] })
+        .promise();
+      return "applied";
+    } catch (error: any) {
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      // Greptile P1: concurrent charge transactions on the same billing user
+      // (e.g. an org-pooled account, or several task executions charging in
+      // parallel) can fail with a transaction CONFLICT rather than a
+      // condition failure -- either the whole transaction rejected outright
+      // with TransactionConflictException, or TransactionCanceledException
+      // cancelled every item for "TransactionConflict" (DynamoDB's code for
+      // "another transaction is touching this item right now", distinct
+      // from ConditionalCheckFailed). Neither is a real "already applied" or
+      // a genuine business-condition failure -- both are transient and must
+      // map to "lost_race" so the caller's bounded retry loop re-reads and
+      // retries, the same as it already does for a lost condition race.
+      // Previously these fell through to the generic handler and were
+      // rethrown, which the fire-and-forget caller only logs -- silently
+      // dropping a real charge under contention.
+      if (error?.code === "TransactionConflictException") return "lost_race";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        // Index order matches TransactItems above: 0 = users table, 1 = audit table.
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_applied";
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return "lost_race";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "lost_race";
+      }
+      handleDynamoDbError(error, "applyMonthlyChargeAtomic");
       throw error;
     }
   }
@@ -3072,6 +3232,87 @@ export const waitlistDb = {
 // same warning every five seconds.
 const reportedUnsupportedLegacyScheduleIds = new Set<string>();
 
+// A write that loses its race is recomputed, not replayed — replaying a list built
+// against different history would clobber whatever landed in between.
+const MAX_RUN_RESULT_SHED_ATTEMPTS = 3;
+
+/**
+ * ENG-1048: the run history this row can hold WITH one more result on the end, and
+ * the history that was derived from. Returns null when even the incoming result
+ * cannot fit, so the caller surfaces the original error rather than writing a lie.
+ */
+const planRunResultShed = async (scheduleId: string, runResult: any) => {
+  const tableName = `${TABLE_PREFIX}AW-TaskSchedules`;
+  const existing = (await dynamodb.get({ TableName: tableName, Key: { scheduleId } }).promise()).Item;
+  if (!existing) return null;
+
+  const history = Array.isArray(existing.runResults) ? existing.runResults : [];
+  const appended = [...history, runResult];
+  const { kept, dropped } = trimListToItemBudget(
+    { ...existing, runResults: appended },
+    'runResults',
+    appended,
+  );
+  if (kept.length === 0) return null;
+  if (dropped > 0) {
+    console.warn(
+      `DynamoDB addRunResult: schedule ${scheduleId} hit the 400KB item limit — dropping the ${dropped} oldest of ${appended.length} run results to record this run`
+    );
+  }
+  return { kept, observed: history };
+};
+
+/**
+ * ENG-1048: shed the oldest runs AND record the incoming one in a single write, bound
+ * to the exact history the new list was built from.
+ *
+ * The two halves cannot be separated. Trim in one write and append in another, and a
+ * failure in between deletes history without recording the run it made room for. So:
+ * one `SET`, conditioned on the stored history still being what was read — length AND
+ * tail entry, because a concurrent recovery that drops one and appends one leaves the
+ * length untouched. On mismatch the caller recomputes; nothing is written from a read
+ * that has been overtaken.
+ */
+const writeShedRunResults = async (
+  scheduleId: string,
+  kept: any[],
+  observed: any[]
+): Promise<{ raced: true } | { raced: false; attributes: any }> => {
+  const values: Record<string, any> = {
+    ':runResults': kept,
+    ':updatedAt': new Date().toISOString(),
+    ':expectedLength': observed.length,
+  };
+  let condition = 'size(#runResults) = :expectedLength';
+  if (observed.length === 0) {
+    condition = `(attribute_not_exists(#runResults) OR ${condition})`;
+  } else {
+    condition += ` AND #runResults[${observed.length - 1}] = :expectedLast`;
+    values[':expectedLast'] = observed[observed.length - 1];
+  }
+
+  try {
+    const result = await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: { scheduleId },
+      UpdateExpression: 'SET #runResults = :runResults, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#runResults': 'runResults', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: values,
+      ConditionExpression: condition,
+      ReturnValues: 'ALL_NEW',
+    }).promise();
+    return { raced: false, attributes: result.Attributes };
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException' || error?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `DynamoDB addRunResult: schedule ${scheduleId} run history moved under the shed — recomputing.`
+      );
+      return { raced: true };
+    }
+    throw error;
+  }
+};
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3244,7 +3485,19 @@ export const scheduleDb = {
      * ENG-827: attributes that must STILL hold for this write to land, as read a
      * moment ago. `undefined` means the attribute must still be absent.
      */
-    expect?: Record<string, any>
+    expect?: Record<string, any>,
+    /**
+     * ENG-1048: shed `count` of the OLDEST run results as part of THIS write. The trim
+     * exists to make room for the edit, so the two have to land together — shedding
+     * first and then failing the edit would delete history for a save that never
+     * happened. `expectedLength` binds the removal to the history the count was
+     * measured against, so a run recording at the same moment cannot leave this write
+     * taking a second prefix off an already-shortened list. `expectedLast` pins the
+     * tail with it: an overflow recovery that drops one entry and appends its own
+     * leaves the length unchanged, and length alone would wave the stale count
+     * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
+     */
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3275,12 +3528,33 @@ export const scheduleDb = {
         expressionAttributeValues[`:${alias}`] = value;
       });
 
+      // ENG-1048: removing by index (rather than SETting a list built from a read)
+      // is what makes this safe against a run finishing mid-edit: appends land at the
+      // tail, so index 0 still names the oldest entry. `runResults` is never also SET
+      // here — overlapping document paths in one expression are rejected.
+      let removeExpression = '';
+      if (shedRunResults && shedRunResults.count > 0) {
+        expressionAttributeNames['#runResults'] = 'runResults';
+        removeExpression = ` REMOVE ${Array.from(
+          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+          (_, index) => `#runResults[${index}]`
+        ).join(", ")}`;
+        conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
+        expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
+        if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
+          conditionExpressions.push(
+            `#runResults[${shedRunResults.expectedLength - 1}] = :expectedRunResultsLast`
+          );
+          expressionAttributeValues[':expectedRunResultsLast'] = shedRunResults.expectedLast;
+        }
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
         ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
@@ -3297,32 +3571,48 @@ export const scheduleDb = {
   },
 
   async addRunResult(scheduleId: string, runResult: any) {
-    try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        Key: {
-          scheduleId,
-        },
-        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-        ExpressionAttributeNames: {
-          '#runResults': 'runResults',
-          '#updatedAt': 'updatedAt',
-        },
-        ExpressionAttributeValues: {
-          ':runResult': [runResult],
-          ':emptyList': [],
-          ':updatedAt': new Date().toISOString(),
-        },
-        ReturnValues: 'ALL_NEW',
-      };
+    const params = {
+      TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+      Key: {
+        scheduleId,
+      },
+      UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+      ExpressionAttributeNames: {
+        '#runResults': 'runResults',
+        '#updatedAt': 'updatedAt',
+      },
+      ExpressionAttributeValues: {
+        ':runResult': [runResult],
+        ':emptyList': [],
+        ':updatedAt': new Date().toISOString(),
+      },
+      ReturnValues: 'ALL_NEW',
+    };
 
+    try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes;
     } catch (error) {
+      // ENG-1048: the row is at DynamoDB's 400KB ceiling — make room and retry.
+      if (isDynamoItemSizeError(error)) {
+        try {
+          for (let attempt = 1; attempt <= MAX_RUN_RESULT_SHED_ATTEMPTS; attempt++) {
+            const plan = await planRunResultShed(scheduleId, runResult);
+            if (plan === null) break;
+            const written = await writeShedRunResults(scheduleId, plan.kept, plan.observed);
+            if (written.raced) continue;
+            return written.attributes;
+          }
+        } catch (recoveryError) {
+          // Recovery failed too — report the condition that actually stopped the write.
+          console.error(`DynamoDB addRunResult: could not make room on schedule ${scheduleId}:`, recoveryError);
+        }
+      }
       handleDynamoDbError(error, "addRunResult");
       throw error;
     }
   },
+
 
   async getRunResults(scheduleId: string) {
     try {
@@ -4908,6 +5198,10 @@ export const crmDb = {
       engagedOnly?: boolean;
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      /** ENG-926 §F — which status means "qualified" for the Meta conversion relay.
+       *  `{ qualifiedStatus: null }` turns QualifiedLead off for this list; omitting the
+       *  field entirely leaves the relay matching by name, as it did before. */
+      conversionMapping?: { qualifiedStatus?: string | null } | null;
       listType?: 'sales' | 'customers';
       syncConfig?: {
         platform: 'hubspot' | 'attio';
@@ -5037,6 +5331,18 @@ export const crmDb = {
         expressionAttributeNames['#lastImportMapping'] = 'lastImportMapping';
         updateExpressions.push('#lastImportMapping = :lastImportMapping');
         expressionAttributeValues[':lastImportMapping'] = updates.lastImportMapping;
+      }
+
+      // Field-by-field, like every other key here — a field absent from this function is
+      // silently dropped with every test still passing, which is exactly how §C's metaFbp
+      // shipped doing nothing.
+      if (updates.conversionMapping !== undefined) {
+        // A stored `null` returns the list to matching by name, which is a different
+        // statement from `{ qualifiedStatus: null }` — that turns the conversion off.
+        // Both round-trip correctly, so the write needs no special case for either.
+        expressionAttributeNames['#conversionMapping'] = 'conversionMapping';
+        updateExpressions.push('#conversionMapping = :conversionMapping');
+        expressionAttributeValues[':conversionMapping'] = updates.conversionMapping;
       }
 
       if (updates.statusConfig !== undefined) {
@@ -5493,6 +5799,20 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    /** ENG-926 §C: Meta's `_fbp` browser id, captured at form submission. Persisted so a
+     *  conversion relayed weeks later (a deal closing in the CRM) can still be matched —
+     *  the cookie itself is long gone by then. Deliberately NOT stored inside
+     *  firstTouch.clickIds: every visitor has an fbp, including organic ones, so filing it
+     *  under click IDs would make an organic lead read as paid-attributed. */
+    metaFbp?: string;
+    /** ENG-926 §B: client IP at capture (Meta `client_ip_address`). Read off the request in
+     *  routes/webhooks.ts, where it was previously used for the immediate Lead event and then
+     *  discarded — so a conversion relayed weeks later reached Meta with weaker identity than
+     *  we held at capture. Persisted for the same reason as metaFbp. */
+    clientIp?: string;
+    /** ENG-926 §B: client user-agent at capture (Meta `client_user_agent`). Paired with
+     *  clientIp; Meta treats the two together as a match signal. */
+    clientUserAgent?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -5517,6 +5837,8 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    /** Explicit override for the denormalized click IDs; derived from firstTouch when omitted. */
+    clickIds?: Record<string, string>;
     // CRM-history Tier 0: list-owner denormalized onto the lead for audit
     // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
     // userId, so userId is not load-bearing for retrieval — only audit.
@@ -5616,6 +5938,15 @@ export const crmDb = {
       if (leadData.dealCurrency) {
         item.dealCurrency = leadData.dealCurrency;
       }
+      if (leadData.metaFbp) {
+        item.metaFbp = leadData.metaFbp;
+      }
+      if (leadData.clientIp) {
+        item.clientIp = leadData.clientIp;
+      }
+      if (leadData.clientUserAgent) {
+        item.clientUserAgent = leadData.clientUserAgent;
+      }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;
         if (leadData.contactStatusReason) {
@@ -5663,6 +5994,7 @@ export const crmDb = {
         lastTouch: leadData.lastTouch || leadData.firstTouch,
         utmSource: leadData.utmSource,
         utmMedium: leadData.utmMedium,
+        clickIds: leadData.clickIds,
       });
       Object.assign(item, attributionFields);
 
@@ -5913,6 +6245,274 @@ export const crmDb = {
   },
 
   /**
+   * ENG-926 §C: atomically record that one Meta conversion event has been relayed.
+   *
+   * Deliberately NOT a field on updateLead. Writing the whole array there is a
+   * read-modify-write against a snapshot taken when the relay started, so two conversions
+   * racing on the same lead (a `qualified` and a `won` landing together) each write
+   * `[...their stale list, their event]` and the later write erases the earlier marker —
+   * after which a transition back to that status resends the conversion, leaving only
+   * Meta's own dedup between us and a double-counted deal (Greptile P1 on #2412).
+   *
+   * `list_append` on the stored value plus a `contains` guard makes the append atomic and
+   * idempotent: concurrent relays for different events both survive, and a repeat of the
+   * same event is refused by the condition rather than duplicated into the list.
+   */
+  /**
+   * ENG-926 §C: record that a conversion is owed to Meta but could not be queued.
+   *
+   * The relay's durable retry lives in the async job table. When THAT table is unreachable,
+   * the in-process fallback is all there is, and once it is exhausted the conversion would
+   * simply be gone — "no recoverable work left behind" (Greptile on #2412). This writes the
+   * owed conversion onto the lead instead, in a table we know is writable because the status
+   * update that triggered all of this just succeeded against it.
+   *
+   * Cleared automatically by appendMetaConversionSent when the conversion eventually lands.
+   * Consuming these markers is the reconciliation sweep's job (§F); this side of it just
+   * makes sure the fact is not lost.
+   */
+  async markConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    // ADD/DELETE are set operations, and DynamoDB rejects the WHOLE update with a
+    // ValidationException if the stored attribute is a scalar string — the shape this field
+    // had in an earlier commit of this branch. Reads tolerate that shape, so writes must
+    // too, or a lead carrying it can never record or clear an owed conversion (Greptile P1
+    // on #2412). Recovery is to drop the bad-shaped attribute and redo the write.
+    const addKind = () =>
+      dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Same reasoning as appendMetaConversionSent: no updatedAt. It is a GSI range key,
+          // and this is bookkeeping, not a user edit.
+          // ADD onto a string set, not SET on a scalar. A lead can owe more than one
+          // conversion — a queue outage spanning a `qualified` and then a `won` — and a
+          // scalar silently kept only the last, permanently losing the other (Greptile on
+          // #2412). A set also makes the write naturally idempotent.
+          UpdateExpression: 'ADD metaConversionPending :kinds',
+          ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
+        })
+        .promise();
+
+    try {
+      try {
+        await addKind();
+      } catch (error: any) {
+        if (error?.code !== 'ValidationException') throw error;
+
+        // Read before repairing. Dropping the attribute and adding only the new kind would
+        // discard whatever the scalar already owed — so a lead owing a `qualified` would
+        // lose it the moment a `won` became owed too, which is the marker destroying the
+        // very record it exists to keep (Greptile P1 on #2412, the same mistake as
+        // appendMetaConversionSent's recovery, one function over). Union, then write.
+        const current = await dynamodb
+          .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+          .promise();
+        const merged = new Set(parsePendingKinds((current.Item as any)?.metaConversionPending));
+        merged.add(conversionKind);
+
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Leads`,
+            Key: { listId, leadId },
+            UpdateExpression: 'SET metaConversionPending = :kinds',
+            ExpressionAttributeValues: { ':kinds': dynamodb.createSet([...merged]) },
+          })
+          .promise();
+      }
+      console.warn(
+        `[CRM] lead ${leadId} marked as owing a "${conversionKind}" Meta conversion — ` +
+        `the queue was unavailable, so this is the durable record of it`,
+      );
+    } catch (error: any) {
+      console.error(
+        `[CRM] markConversionRelayPending failed for lead ${leadId}: ${error?.message}`,
+      );
+    }
+  },
+
+  /**
+   * ENG-926 §C: release one owed conversion without recording a send.
+   *
+   * For a marker whose conversion is settled rather than sent — the lead opted out, the
+   * event already went, the status was never a conversion. Leaving it would outlive its own
+   * reason: reconciliation re-finds that lead on every sweep forever, spending budget on a
+   * conversion that will never be sent and starving the leads behind it (Greptile P1 on
+   * #2412).
+   *
+   * Tolerates the scalar shape the field started as, for the same reason its siblings do: a
+   * set DELETE against a scalar rejects the whole update.
+   */
+  async clearConversionRelayPending(listId: string, leadId: string, conversionKind: string): Promise<void> {
+    if (!conversionKind) return;
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          UpdateExpression: 'DELETE metaConversionPending :kinds',
+          ExpressionAttributeValues: { ':kinds': dynamodb.createSet([conversionKind]) },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error?.code === 'ValidationException') {
+        try {
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== conversionKind);
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              UpdateExpression: survivors.length > 0
+                ? 'SET metaConversionPending = :survivors'
+                : 'REMOVE metaConversionPending',
+              ...(survivors.length > 0
+                ? { ExpressionAttributeValues: { ':survivors': dynamodb.createSet(survivors) } }
+                : {}),
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          console.error(
+            `[CRM] clearConversionRelayPending recovery failed for lead ${leadId}: ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+      console.error(
+        `[CRM] clearConversionRelayPending failed for lead ${leadId} (${conversionKind}): ${error?.message}`,
+      );
+    }
+  },
+
+  async appendMetaConversionSent(
+    listId: string,
+    leadId: string,
+    eventName: string,
+    /** Which Meta pixel this conversion was actually sent to (ENG-926 §F). Without it the
+     *  divergence check compares every logged send against whichever pixel resolves today,
+     *  so a customer who connects a second ad account has their history compared against a
+     *  pixel it never went to. Optional because rows written before this existed have none. */
+    pixelId?: string,
+  ): Promise<void> {
+    // Built once and shared by both write paths below. `pixel` is omitted entirely when
+    // unknown — DynamoDB rejects an undefined value inside a map, and absent is also
+    // exactly what a pre-existing row looks like.
+    const logEntry: Record<string, string> = { kind: eventName, at: new Date().toISOString() };
+    if (pixelId) logEntry.pixel = pixelId;
+    try {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          Key: { listId, leadId },
+          // Deliberately does NOT touch updatedAt, for two independent reasons.
+          //
+          // Correctness: updatedAt is the range key on the three sparse cross-tenant lookup
+          // GSIs, so writing it forces DynamoDB to re-project the row — and a legacy row
+          // carrying email/linkedin/nameCompanyKey as "" then fails with ValidationException
+          // (the exact hazard updateLead carries self-heal logic for, which this leaner
+          // write does not have).
+          //
+          // Behaviour: this is internal bookkeeping, not a user edit. Bumping updatedAt
+          // would reorder the customer's CRM list under an updatedAt sort and mark leads as
+          // recently-touched because a Meta event fired, which is not something they did.
+          // Clear ONLY the kind just sent, in the SAME write that records it. Removing the
+          // whole marker wiped an unrelated owed conversion — a successful `won` erased an
+          // outstanding `qualified` that had never been sent (Greptile on #2412). DELETE on
+          // a set removes just that member, and drops the attribute when it empties.
+          //
+          // The timestamped log (ENG-926 §F) rides the SAME write, so a recorded send and
+          // its timestamp can never disagree. `metaConversionsSent` carries no time, which
+          // makes "how many conversions did we relay last Tuesday" unanswerable — the
+          // exact number §F's divergence check compares against Meta's own count.
+          // An append-only list, not a map keyed by kind: DynamoDB rejects overlapping
+          // document paths, so `SET #x = if_not_exists(#x, :empty)` cannot be combined
+          // with `SET #x.#kind = :ts`, and the alternatives are a read-modify-write (racy —
+          // the defect Greptile filed twice on #2412) or a second round trip. Fire-once
+          // bounds this at one entry per kind per lead.
+          UpdateExpression:
+            'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+            '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+            'DELETE metaConversionPending :kinds',
+          ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+          ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
+          ExpressionAttributeValues: {
+            ':empty': [],
+            ':new': [eventName],
+            ':event': eventName,
+            ':logEntry': [logEntry],
+            ':kinds': dynamodb.createSet([eventName]),
+          },
+        })
+        .promise();
+    } catch (error: any) {
+      // The guard firing means this event is already recorded — the desired end state, not
+      // a failure. Anything else is worth surfacing, but never worth throwing into a relay
+      // whose Meta send has already succeeded.
+      if (error?.code === 'ConditionalCheckFailedException') return;
+
+      // Same set-vs-scalar hazard as markConversionRelayPending: a lead still carrying the
+      // scalar shape makes the DELETE clause reject the ENTIRE update, so the send would go
+      // unrecorded and reconciliation would dispatch it again and again. Retry recording the
+      // send while clearing the bad-shaped marker with REMOVE, which works on any type
+      // (Greptile P1 on #2412).
+      if (error?.code === 'ValidationException') {
+        try {
+          // Read first. A blanket REMOVE would drop the WHOLE attribute, so a lead owing a
+          // `qualified` would lose it the moment an unrelated `won` succeeded — erasing a
+          // conversion that had never been sent (Greptile P1 on #2412). Only the kind just
+          // sent may go; anything else owed is rewritten in the correct set shape, which
+          // also repairs the row for every future write.
+          const current = await dynamodb
+            .get({ TableName: `${TABLE_PREFIX}AW-Leads`, Key: { listId, leadId } })
+            .promise();
+          const survivors = parsePendingKinds((current.Item as any)?.metaConversionPending)
+            .filter((kind) => kind !== eventName);
+
+          await dynamodb
+            .update({
+              TableName: `${TABLE_PREFIX}AW-Leads`,
+              Key: { listId, leadId },
+              // The §F log is written here too. A row that needed self-healing is exactly
+              // the one whose accounting is already suspect, so it is the last place to
+              // silently drop its history.
+              UpdateExpression: survivors.length > 0
+                ? 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry), ' +
+                  'metaConversionPending = :survivors'
+                : 'SET #m = list_append(if_not_exists(#m, :empty), :new), ' +
+                  '#log = list_append(if_not_exists(#log, :empty), :logEntry) ' +
+                  'REMOVE metaConversionPending',
+              ConditionExpression: 'attribute_not_exists(#m) OR NOT contains(#m, :event)',
+              ExpressionAttributeNames: { '#m': 'metaConversionsSent', '#log': 'metaConversionsSentLog' },
+              ExpressionAttributeValues: {
+                ':empty': [],
+                ':new': [eventName],
+                ':event': eventName,
+                ':logEntry': [logEntry],
+                ...(survivors.length > 0 ? { ':survivors': dynamodb.createSet(survivors) } : {}),
+              },
+            })
+            .promise();
+          return;
+        } catch (retryError: any) {
+          if (retryError?.code === 'ConditionalCheckFailedException') return;
+          console.error(
+            `[CRM] appendMetaConversionSent recovery failed for lead ${leadId} (${eventName}): ${retryError?.message}`,
+          );
+          return;
+        }
+      }
+
+      console.error(
+        `[CRM] appendMetaConversionSent failed for lead ${leadId} (${eventName}): ${error?.message}`,
+      );
+    }
+  },
+
+  /**
    * Cross-tenant lookup by email — backs CRM-history Tier 0. Queries the
    * EmailLookupIndex GSI globally (no userId filter) so a sibling lead
    * enriched on ANY user's list is returned. Sort key `updatedAt` means
@@ -6150,10 +6750,28 @@ export const crmDb = {
     lastTouch?: AttributionTouch;
     utmSource?: string;
     utmMedium?: string;
+    /** Explicit override for the denormalized click IDs; derived from firstTouch when omitted. */
+    clickIds?: Record<string, string>;
+    /**
+     * ENG-926 §B — Meta Event Match Quality signals, captured once and kept so a conversion
+     * relayed weeks later still carries them.
+     *
+     * `metaFbp` was previously accepted by createLead ONLY. A lead that first arrived without
+     * an fbp and later submitted with one never received it — the silent-drop failure this
+     * function's own comment describes. Present here so the webhook merge path can backfill it.
+     */
+    metaFbp?: string;
+    /** Client IP at capture. Meta `client_ip_address`; among the strongest match signals. */
+    clientIp?: string;
+    /** Client user-agent at capture. Meta `client_user_agent`; paired with clientIp. */
+    clientUserAgent?: string;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
+    linkedinIdentityVerifiedAt?: string | null;
+    linkedinIdentityVerifiedUrl?: string | null;
     /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
      *  icpSource). Sidecar map distinct from customFields so it does NOT
      *  leak into CSV exports, email-template variables, or the
@@ -6163,6 +6781,12 @@ export const crmDb = {
      *  will do a single consolidated updateFieldNames after bulk writes (avoids
      *  read-modify-write races under parallel workers). */
     skipFieldNamesUpdate?: boolean;
+    /** ENG-926 §C: suppress the CRM → Meta conversion relay for this write. The relay's
+     *  own bookkeeping no longer goes through updateLead (see appendMetaConversionSent),
+     *  so this exists for bulk/backfill paths that move status across many historical
+     *  leads at once — those are not live conversions and must not fan out thousands of
+     *  Purchase events. No such path exists today; this is the seam for the first one. */
+    suppressConversionRelay?: boolean;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -6320,6 +6944,18 @@ export const crmDb = {
           expressionAttributeValues[':companyLinkedin'] = trimmedCompanyLinkedin;
         } else {
           removeExpressions.push('companyLinkedin');
+        }
+      }
+
+      // ENG-1026: verified-identity stamp fields
+      for (const field of ['linkedinIdentityVerifiedAt', 'linkedinIdentityVerifiedUrl'] as const) {
+        if (updates[field] !== undefined) {
+          if (updates[field] === null) {
+            removeExpressions.push(field);
+          } else {
+            setExpressions.push(`${field} = :${field}`);
+            expressionAttributeValues[`:${field}`] = updates[field];
+          }
         }
       }
 
@@ -6515,6 +7151,44 @@ export const crmDb = {
         setExpressions.push('utmMedium = :utmMedium');
         expressionAttributeValues[':utmMedium'] = updates.utmMedium;
       }
+      if (updates.clickIds !== undefined) {
+        setExpressions.push('clickIds = :clickIds');
+        expressionAttributeValues[':clickIds'] = updates.clickIds;
+      }
+
+      // ENG-926 §B: Meta Event Match Quality signals, WRITE-ONCE BY CONSTRUCTION.
+      //
+      // `if_not_exists` rather than a plain SET, and that is the whole point: a caller
+      // read-then-write (routes/webhooks.ts checks the lead before deciding to backfill)
+      // is TOCTOU. Two repeat submissions racing while the field is absent both observe
+      // the absence and both issue a SET, and the later one replaces the acquisition
+      // identity Meta will be asked to match on months later. The condition belongs in the
+      // write, where it is atomic, not in a check the caller performs beforehand.
+      //
+      // Deliberately NOT a ConditionExpression: that guards the whole UpdateExpression, so
+      // a lost race would reject the caller's legitimate user-visible edits too. Per-
+      // attribute if_not_exists lets the rest of the update land and only this value hold.
+      //
+      // The consequence, stated plainly: these three attributes cannot be overwritten
+      // through updateLead by anyone. That is the intended contract — the value that
+      // matters is the one from the touch that ACQUIRED the lead. A deliberate correction
+      // needs its own path rather than quietly riding on a lead update.
+      //
+      // metaFbp is here because it was added to createLead alone, which is precisely the
+      // silent-drop this function's comment above warns about; a field the merge path
+      // cannot write is a field a repeat-touch lead never gets.
+      if (updates.metaFbp !== undefined) {
+        setExpressions.push('metaFbp = if_not_exists(metaFbp, :metaFbp)');
+        expressionAttributeValues[':metaFbp'] = updates.metaFbp;
+      }
+      if (updates.clientIp !== undefined) {
+        setExpressions.push('clientIp = if_not_exists(clientIp, :clientIp)');
+        expressionAttributeValues[':clientIp'] = updates.clientIp;
+      }
+      if (updates.clientUserAgent !== undefined) {
+        setExpressions.push('clientUserAgent = if_not_exists(clientUserAgent, :clientUserAgent)');
+        expressionAttributeValues[':clientUserAgent'] = updates.clientUserAgent;
+      }
 
       // Always update updatedAt
       setExpressions.push('updatedAt = :updatedAt');
@@ -6576,7 +7250,7 @@ export const crmDb = {
 
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system'];
+      const internalFields = ['leadId', 'listId', 'createdAt', 'updatedAt', 'lastInteractionAt', 'syncMetadata', 'enrichmentData', 'enrichmentMetadata', 'scores', 'selectedSenderId', 'customFields', 'isICP', 'isEngaged', 'engagements', 'system', 'metaConversionsSent', 'suppressConversionRelay'];
 
       // Top level fields
       Object.keys(updates).forEach(key => {
@@ -6599,6 +7273,71 @@ export const crmDb = {
         const existingFieldNames = (list?.fieldNames as string[]) || [];
         const allFieldNames = [...existingFieldNames, ...fieldNames];
         await this.updateFieldNames(listId, allFieldNames);
+      }
+
+      // ENG-926 §C: relay a real status TRANSITION to Meta as a conversion.
+      //
+      // Hooked here rather than at the ~25 individual updateLead call sites because the
+      // case that matters most is a closed-won arriving from an external-CRM sync, not a
+      // human clicking a dropdown — a per-route hook would miss exactly that. This is the
+      // one chokepoint that already holds both halves of the transition (the pre-read
+      // existingLeadForGuard, and ALL_NEW in `result`).
+      //
+      // Fire-and-forget with a dynamic import: db.ts is a leaf the Meta services import,
+      // so a static import would be circular. A relay failure must never affect the lead
+      // write that has already succeeded above, so nothing here is awaited or rethrown.
+      const previousStatus = existingLeadForGuard?.status ?? null;
+      const nextStatus = (result.Attributes as any)?.status ?? null;
+      const isRealTransition =
+        updates.status !== undefined && !!nextStatus && String(previousStatus ?? '') !== String(nextStatus);
+      // A conversion the queue could not accept was recorded on the lead itself
+      // (metaConversionPending). Nothing scans for those — a sweep over every lead is §F's
+      // job, not something to do on a write path — so they are consumed opportunistically:
+      // the next time anything touches this lead, retry it. That costs nothing on the
+      // overwhelming majority of updates, where the field is simply absent (Greptile on
+      // #2412: a marker nothing consumes is not recovery, it is just a note).
+      // Shared with the reconciliation sweep — see utils/metaConversionPending. Two copies
+      // of "what shape is this field" is how one reader ends up silently skipping rows the
+      // other picks up.
+      const owedKinds = parsePendingKinds((result.Attributes as any)?.metaConversionPending);
+      if (!updates.suppressConversionRelay && (isRealTransition || owedKinds.length > 0)) {
+        void (async () => {
+          try {
+            const { dispatchLeadStatusConversion } = await import('./metaConversionRelay');
+            const list = await this.getLeadListById(listId);
+            if (!list?.userId) return;
+            // Durable: enqueues before processing, so a Meta failure or a rate-limit pause
+            // is retried by the queue poller instead of being lost forever (Greptile P1 on
+            // #2412 — the only other trigger is a status CHANGE, and a won deal stays won).
+            // Every owed conversion gets its own dispatch, PLUS the transition that just
+            // happened. Treating these as alternatives meant a lead that owed a
+            // `qualified` and then legitimately won had the owed one silently dropped —
+            // the transition won the coin toss and the marker stayed put (Greptile on
+            // #2412). Each has its own dedupe key, so they cannot collide.
+            const dispatches: Array<string | undefined> = [
+              ...owedKinds,
+              ...(isRealTransition ? [undefined] : []),
+            ];
+            for (const kind of dispatches) {
+              await dispatchLeadStatusConversion({
+                listId,
+                userId: list.userId as string,
+                lead: result.Attributes as any,
+                previousStatus,
+                statusConfig: (list as any).statusConfig,
+                conversionMapping: (list as any).conversionMapping,
+                // On a retry of an owed conversion the lead's CURRENT status may no longer
+                // be the one that earned it, so the recorded kind wins — same reasoning as
+                // the queued payload's kind. `undefined` means "use the live transition".
+                ...(kind ? { conversionKind: kind as any } : {}),
+              });
+            }
+          } catch (relayError: any) {
+            console.error(
+              `[CAPI Relay] dispatch failed for lead ${leadId} (list ${listId}): ${relayError?.message}`,
+            );
+          }
+        })();
       }
 
       return result.Attributes;
@@ -7480,7 +8219,7 @@ export const crmDb = {
    *
    * Writes three top-level attributes on the Lead:
    *   - onboardingEvents: OnboardingEvent[] (full log mirror)
-   *   - onboardingStage: OnboardingStage
+   *   - onboardingStage: OnboardingStage (when a lifecycle stage exists)
    *   - onboardingDeviationCount: int
    *
    * Overwrites atomically — this is a pure projection of User state.
@@ -7491,19 +8230,22 @@ export const crmDb = {
     leadId: string,
     analytics: {
       onboardingEvents: unknown[];
-      onboardingStage: string;
+      onboardingStage?: string;
       onboardingDeviationCount: number;
     },
   ): Promise<void> {
     const TABLE_NAME = `${TABLE_PREFIX}AW-Leads`;
+    const stageUpdate = analytics.onboardingStage === undefined
+      ? ''
+      : ', onboardingStage = :stage';
     await dynamodb.update({
       TableName: TABLE_NAME,
       Key: { listId, leadId },
       UpdateExpression:
-        'SET onboardingEvents = :events, onboardingStage = :stage, onboardingDeviationCount = :dc, updatedAt = :updatedAt',
+        `SET onboardingEvents = :events${stageUpdate}, onboardingDeviationCount = :dc, updatedAt = :updatedAt`,
       ExpressionAttributeValues: {
         ':events': analytics.onboardingEvents,
-        ':stage': analytics.onboardingStage,
+        ...(analytics.onboardingStage !== undefined && { ':stage': analytics.onboardingStage }),
         ':dc': analytics.onboardingDeviationCount,
         ':updatedAt': new Date().toISOString(),
       },
@@ -9489,6 +10231,26 @@ export const socialEngagementTrackingDb = {
 const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
 
 export const orgDb = {
+  /** Read-only organization listing, optionally capped for administrative diagnostics. */
+  async listAll(maxItems?: number): Promise<Organization[]> {
+    if (!maxItems || maxItems < 1) {
+      return await paginatedScan<Organization>(dynamodb, { TableName: ORGS_TABLE });
+    }
+
+    const organizations: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.scan({
+        TableName: ORGS_TABLE,
+        Limit: maxItems - organizations.length,
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      organizations.push(...((result.Items || []) as Organization[]));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && organizations.length < maxItems);
+    return organizations;
+  },
+
   async createOrg(org: Organization): Promise<Organization> {
     const params = {
       TableName: ORGS_TABLE,

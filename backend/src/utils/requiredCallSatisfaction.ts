@@ -1,4 +1,5 @@
 import { toolCallSucceeded } from './toolCallOutcome';
+import { isPublishName } from './hardeningGaps';
 
 /**
  * ENG-1045 — the required-function checker must verify the mandated OUTCOME, not
@@ -19,13 +20,17 @@ import { toolCallSucceeded } from './toolCallOutcome';
  * nudge was therefore pushing the model toward user-visible harm as the ONLY exit —
  * for any thread output the success condition was unreachable by construction.
  *
- * THE RULE. Exact-name matching is preserved unchanged (it is what every
- * non-publishing requirement relies on, and a run's own failed/duplicate entries
- * still count exactly as before). On top of it, a requirement that names a publish
+ * THE RULE. Exact-name matching is preserved for non-publish requirements (it is
+ * what every non-publishing requirement relies on, and a run's own failed/duplicate
+ * entries still count exactly as before). A requirement that names a publish
  * OUTCOME is ALSO satisfied by a different tool that achieved the same outcome —
- * but only by a call that actually RAN AND SUCCEEDED (`toolCallSucceeded`). A
- * failed or preflight-rejected `twitter_manage_post` published nothing, so crediting
- * it would silently waive a publish the owner is paying for.
+ * but, per ENG-947, only by a call that actually RAN AND SUCCEEDED
+ * (`toolCallSucceeded`), whether that call is the exact-named tool or an
+ * equivalent route. A failed or preflight-rejected publish — `post_on_connected_
+ * account` itself or an equivalent `twitter_manage_post` thread/reply/quote-tweet
+ * — published nothing, so crediting it would silently waive a publish the owner
+ * is paying for (verified live on preview 2026-08-11: a failed
+ * `post_on_connected_account` was still recorded `passed: true`).
  *
  * SCOPE IS DELIBERATELY NARROW. Only publish routes that are genuinely
  * interchangeable are listed, in one direction each. `post_on_connected_account`
@@ -82,8 +87,12 @@ function normalizeAction(action: unknown): string {
 /**
  * Does this ledger entry satisfy one unit of `requirement`?
  *
- * An exact name match always does (unchanged legacy behaviour). Otherwise the entry
- * must be a listed equivalent route AND a call that actually ran and succeeded.
+ * An exact name match satisfies a non-publish requirement unconditionally
+ * (unchanged legacy behaviour — an attempted read/search/write still counts, and
+ * widening that would fail every scheduled run with a non-publish requirement).
+ * A publish requirement additionally needs the call to have actually succeeded
+ * (ENG-947): an attempt is not the same fact to the owner as a completed publish.
+ * A non-exact match must be a listed equivalent route AND a call that succeeded.
  */
 export function callSatisfiesRequirement(
   requirement: string,
@@ -91,7 +100,7 @@ export function callSatisfiesRequirement(
 ): boolean {
   const name = typeof entry?.name === 'string' ? entry.name : '';
   if (!name) return false;
-  if (name === requirement) return true;
+  if (name === requirement) return isPublishName(name) ? toolCallSucceeded(entry) : true;
 
   const routes = EQUIVALENT_PUBLISH_ROUTES[requirement];
   if (!routes) return false;

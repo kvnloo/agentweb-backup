@@ -876,6 +876,23 @@ emmaToolRegistry.register({
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
 
+LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a pre-flight
+  tracking check on the campaign's destination URLs first. A destination is measurable only if its served HTML
+  carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some other account
+  will never receive these conversions, so it does not count. If any destination fails, the launch is BLOCKED
+  (result has blocked=true, reason='tracking_preflight') and the message names each destination and what was
+  checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel is
+  receiving events server-side, the page may be measured through the Conversions API, which this check cannot
+  see. Only pass params.override_tracking_check=true if the user explicitly chooses to launch anyway — never set
+  it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
+  or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
+  The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
+  unconfirmed preview call, show the user the WARNING line that comes back in the summary, and on the confirmed
+  call pass params.tracking_override_token exactly as the preview returned it, alongside params.confirm=true.
+  Adding the override only to the confirmed call, or changing any other argument after the preview, invalidates
+  it — the API returns a fresh preview instead of launching. There is no way to waive the check without the user
+  being shown that it is being waived.
+
 ⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
   CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
   destroy live entities. For these, the API runs a two-phase confirmation:
@@ -6361,7 +6378,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6369,20 +6386,29 @@ emmaToolRegistry.register({
     await bootstrapEmailProviders();
 
     try {
-      const { provider } = await resolveEmailAccount(userId, args.account_id);
+      // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
+      // record, and that is where the provider reads (and refreshes) its tokens.
+      // A send is resolved as a write, so it is refused on a teammate's mailbox.
+      const operation = args.action === 'send' ? 'send' : 'read';
+      const resolved = await resolveEmailAccount(userId, args.account_id, operation);
+      const { provider, ownerUserId } = resolved;
+      // Every provider call runs inside withAccessGuard: a teammate's shared
+      // mailbox is re-checked immediately before the call AND before the result
+      // is returned, so a share revoked mid-read discloses nothing.
+      const guarded = <T>(read: () => Promise<T>) => withAccessGuard(userId, resolved, operation, read);
 
       switch (args.action) {
         case 'search': {
           if (!args.query) return { error: 'search action requires a query parameter.' };
           const maxResults = Math.min(args.max_results || 10, 50);
-          const results = await provider.searchEmails(userId, args.account_id, args.query, maxResults);
+          const results = await guarded(() => provider.searchEmails(ownerUserId, args.account_id, args.query, maxResults));
           if (results.length === 0) return { message: 'No emails found matching your search.' };
           return { emails: results, count: results.length };
         }
 
         case 'list': {
           const maxResults = Math.min(args.max_results || 20, 50);
-          const results = await provider.listEmails(userId, args.account_id, args.folder || 'INBOX', maxResults);
+          const results = await guarded(() => provider.listEmails(ownerUserId, args.account_id, args.folder || 'INBOX', maxResults));
           if (results.length === 0) return { message: 'No emails found.' };
           return { emails: results, count: results.length };
         }
@@ -6390,7 +6416,7 @@ emmaToolRegistry.register({
         case 'get': {
           const ids: string[] = Array.isArray(args.message_ids) ? args.message_ids : [];
           if (ids.length === 0) return { error: 'get action requires a message_ids array with at least one ID.' };
-          const emails = await provider.getEmails(userId, args.account_id, ids);
+          const emails = await guarded(() => provider.getEmails(ownerUserId, args.account_id, ids));
           return { emails, count: emails.length };
         }
 
@@ -6398,7 +6424,7 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
-          const result = await provider.sendEmail(userId, args.account_id, {
+          const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,
             body: args.body,
@@ -6659,7 +6685,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {

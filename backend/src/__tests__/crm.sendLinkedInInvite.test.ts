@@ -69,6 +69,7 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 }));
 
 const mockResolveAccountId = jest.fn();
+const mockGetLinkedInProfile = jest.fn();
 const mockResolveUserOwnedAccountId = jest.fn();
 const mockSendInvitation = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn();
@@ -77,6 +78,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
     resolveUserOwnedAccountId: (...args: any[]) => mockResolveUserOwnedAccountId(...args),
+    getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
   },
@@ -332,5 +334,101 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
       status: 'contacted',
       linkedInInviteSentAt: expect.any(String),
     }));
+  });
+});
+
+// ─── ENG-1026: identity cross-check before invite ────────────────────────────
+
+describe('send-linkedin-invite identity cross-check (ENG-1026)', () => {
+  const handler = findHandler(
+    router,
+    '/lists/:listId/leads/:leadId/send-linkedin-invite',
+    'post',
+  );
+
+  const makeReq = () => ({
+    user: { userId: 'test-user-id' },
+    params: { listId: 'list-123', leadId: 'lead-456' },
+    body: { message: 'Hi Florence!' },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST);
+    mockResolveUserOwnedAccountId.mockResolvedValue('user-own-acct');
+    mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+    mockSendInvitation.mockResolvedValue({ ok: true });
+    mockUpdateLead.mockResolvedValue(undefined);
+    mockUpsertSentInvitation.mockResolvedValue(undefined);
+    mockFindLeadByLinkedinInList.mockResolvedValue(null);
+    mockAddLeadEngagement.mockResolvedValue(undefined);
+  });
+
+  it('refuses with 409 linkedin_identity_mismatch when the live profile belongs to someone else', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      firstName: 'Florence',
+      lastName: 'Su',
+      company: 'Vivian Health',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+    });
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      headline: 'Technical Program Manager at Snowflake',
+      work_experience: [{ position: 'TPM', company: 'Snowflake', current: true }],
+    });
+
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+
+    expect(mockSendInvitation).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'linkedin_identity_mismatch',
+      details: expect.objectContaining({ leadCompany: 'Vivian Health' }),
+    }));
+  });
+
+  it('sends and stamps verified identity on a successful cross-check', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      firstName: 'Florence',
+      lastName: 'Su',
+      company: 'Vivian Health',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+    });
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+
+    expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
+      linkedinIdentityVerifiedAt: expect.any(String),
+      linkedinIdentityVerifiedUrl: expect.stringContaining('/in/florencesu'),
+    }));
+  });
+
+  it('skips the re-fetch for a previously verified lead with the same URL', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      firstName: 'Florence',
+      lastName: 'Su',
+      company: 'Vivian Health',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+      linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+      linkedinIdentityVerifiedUrl: 'https://www.linkedin.com/in/florencesu',
+    });
+
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(mockSendInvitation).toHaveBeenCalledTimes(1);
   });
 });

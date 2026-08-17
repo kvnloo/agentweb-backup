@@ -186,6 +186,11 @@ jest.mock("../services/landerLiveMappingCheck", () => ({
   verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
 }));
 
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock("../services/metaAccountCredentials", () => ({
+  assertOwnedMetaPixel: (...args: any[]) => mockAssertOwnedMetaPixel(...args),
+}));
+
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
 
 const app = express();
@@ -731,6 +736,96 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     expect(res.status).toBe(201);
     expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
+  });
+
+  describe("ENG-1141: meta_pixel_override", () => {
+    it("FAIL: meta_pixel_override missing pixelId → 400, generateLandingPage never called", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: meta_pixel_override missing accountId → 400", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: the pixel/account pair is not owned by the caller → 400, generateLandingPage never called", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      // assertOwnedMetaPixel tags genuine ownership rejections; anything untagged means
+      // "couldn't reach Meta to check", which must NOT block generation (test below).
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(
+        Object.assign(
+          new Error('Meta ad account "acc-1" is not one of your connected accounts.'),
+          { ownershipViolation: true },
+        )
+      );
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/not one of your connected accounts/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    // Verification needs a live Graph call, so Meta being down would otherwise turn "I picked
+    // a pixel" into "I can't create a landing page at all" — a far worse outcome than the
+    // pre-feature behavior, which shipped the page and resolved tracking normally.
+    it("SUCCESS: an unverifiable override (Meta unreachable) still generates, just without the override", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(new Error("ETIMEDOUT graph.facebook.com"));
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage).toHaveBeenCalled();
+      expect(mockGenerateLandingPage.mock.calls[0][6]?.metaPixelOverride).toBeUndefined();
+    });
+
+    it("SUCCESS: a valid, owned override is threaded through to generateLandingPage's opts.metaPixelOverride", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockResolvedValueOnce({ accountId: "resolved-acc-1" });
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockAssertOwnedMetaPixel).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "test-user-id" }), "test-user-id", "px-1", "acc-1"
+      );
+      expect(mockGenerateLandingPage.mock.calls[0][6]).toMatchObject({
+        metaPixelOverride: { pixelId: "px-1", accountId: "resolved-acc-1" },
+      });
+    });
+
+    it("SUCCESS: meta_pixel_override omitted → generateLandingPage's opts.metaPixelOverride is undefined, assertOwnedMetaPixel never called", async () => {
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage.mock.calls[0][6].metaPixelOverride).toBeUndefined();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
   });
 
   it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
