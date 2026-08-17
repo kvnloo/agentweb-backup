@@ -101,6 +101,57 @@ console.log('terminal entry (already fixed) → not treated as in-flight');
   ok(aborted.length === 0, 'a terminal outcome is left for the normal reap, not aborted');
 }
 
+// ENG-1272: the abort comment used to go out under the DEFAULT Linear key, so it landed on the board
+// signed by whoever owns that shared token instead of the engineer who owns the row — making an automated
+// abort look like a colleague had deleted someone's workspace by hand. Attribute to the issue assignee,
+// and always clear it so the next issue in the sweep can't inherit the previous one's identity.
+console.log('abort comment is attributed to the issue assignee, then cleared');
+{
+  seed({ identifier: 'ENG-654', outcome: 'started', admit });
+  const order = [];
+  await abortWithdrawnInFlight(base({
+    resolveIssue: async () => withdrawn,
+    lockActive: () => false,
+    attribute: (a) => order.push(`attribute:${a?.email}`),
+    clearAttribution: () => order.push('clear'),
+    comment: async () => order.push('comment'),
+    teardown: () => {},
+  }));
+  ok(order.join(' > ') === 'attribute:m@x.com > comment > clear', `attributed → commented → cleared (got: ${order.join(' > ')})`);
+}
+
+console.log('attribution is cleared even when the comment throws');
+{
+  seed({ identifier: 'ENG-654', outcome: 'started', admit });
+  const order = [];
+  const aborted = await abortWithdrawnInFlight(base({
+    resolveIssue: async () => withdrawn,
+    lockActive: () => false,
+    attribute: () => order.push('attribute'),
+    clearAttribution: () => order.push('clear'),
+    comment: async () => { throw new Error('linear 500'); },
+    teardown: () => {},
+  }));
+  ok(order.join() === 'attribute,clear', 'a failed comment still clears the borrowed key');
+  ok(aborted.join() === 'ENG-654', 'a failed comment does not stop the abort itself');
+}
+
+console.log('live-pipeline abort comment is attributed too');
+{
+  seed({ identifier: 'ENG-654', outcome: 'started', admit });
+  const order = [];
+  await abortWithdrawnInFlight(base({
+    resolveIssue: async () => withdrawn,
+    lockActive: () => true,
+    pipelinePid: () => 4242,
+    attribute: (a) => order.push(`attribute:${a?.email}`),
+    clearAttribution: () => order.push('clear'),
+    comment: async () => order.push('comment'),
+    kill: () => {},
+  }));
+  ok(order.join(' > ') === 'attribute:m@x.com > comment > clear', 'the SIGTERM path attributes as well');
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\n❌ ${fail} failed, ${pass} passed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);
 process.exit(fail ? 1 : 0);

@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'no
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { resolveIssue, addComment } from './linear.mjs';
+import { resolveIssue, addComment, useAssigneeLinearKey, clearAssigneeLinearKey } from './linear.mjs';
 import { lockActive } from './lock.mjs';
 import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
@@ -87,6 +87,8 @@ export async function abortWithdrawnInFlight({
   lockActive: lockFn = lockActive,
   pipelinePid = pipelineLockPid,
   comment = addComment,
+  attribute = (assignee) => useAssigneeLinearKey(assignee),
+  clearAttribution = clearAssigneeLinearKey,
   kill = (pid) => process.kill(pid, 'SIGTERM'),
   teardown = removeWorktree,
   log: logFn = log,
@@ -94,6 +96,15 @@ export async function abortWithdrawnInFlight({
 } = {}) {
   let state = {}; try { state = JSON.parse(readFileSync(statePathOverride, 'utf8')); } catch { return []; }
   const aborted = [];
+  // Post AS the issue assignee, the way the pipeline does. Without this the abort goes out under the
+  // shared default Linear key and the board shows a colleague tearing down someone else's workspace by
+  // hand (ENG-1272). Always cleared — this sweep walks many issues in one process, and a leaked key
+  // would sign the next issue's comment with the previous assignee's name.
+  const commentAs = async (issue, body) => {
+    try { attribute(issue.assignee); await comment(issue.id, body); }
+    catch { /* best-effort — never let a Linear hiccup block the abort */ }
+    finally { clearAttribution(); }
+  };
   for (const e of Object.values(state)) {
     if (!e?.identifier || e.standalone || !e.admit) continue;   // only admitted (forced) runs are abortable
     // Abortable = still in-flight: a bare admit entry (outcome not yet set), or a live pipeline outcome.
@@ -105,11 +116,11 @@ export async function abortWithdrawnInFlight({
       const pid = pipelinePid(e.identifier);
       if (!pid) { logFn(`${e.identifier}: admission withdrawn (${w.reason}) but a non-pipeline op holds it — deferring abort`); continue; }
       logFn(`${e.identifier}: admission withdrawn (${w.reason}) → SIGTERM pipeline pid ${pid}`);
-      try { await comment(issue.id, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The in-flight autofix run was stopped and its workspace removed.`); } catch { /* best-effort */ }
+      await commentAs(issue, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The in-flight autofix run was stopped and its workspace removed.`);
       try { kill(pid); } catch { /* already gone */ }
     } else {
       logFn(`${e.identifier}: admission withdrawn (${w.reason}) → no live holder, tearing down orphaned run`);
-      try { await comment(issue.id, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The stranded autofix workspace was removed.`); } catch { /* best-effort */ }
+      await commentAs(issue, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The stranded autofix workspace was removed.`);
       try { teardown(e.identifier); } catch { /* best-effort */ }
     }
     aborted.push(e.identifier);
