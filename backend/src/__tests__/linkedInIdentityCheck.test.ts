@@ -189,4 +189,67 @@ describe('verifyLinkedInIdentityForSend (shared guard)', () => {
     expect(mockGetLinkedInProfile).toHaveBeenCalled();
     expect(res.allowed).toBe(false);
   });
+
+  // ENG-1026 Greptile P1 ("cached verification isn't bound to the actual send
+  // target"): a lead's stamp is legitimately for the lead's OWN stored URL
+  // (lead.linkedin). A separate, model-supplied `profileUrl` targeting a
+  // DIFFERENT profile must never be waved through on the strength of that
+  // stamp -- the cache key must be the URL actually being sent to, not the
+  // lead's stored URL.
+  it('does NOT reuse a stamp verified against the lead\'s own URL to authorize a send to a different target profileUrl', async () => {
+    mockGetLinkedInProfile.mockResolvedValue(snowflakeProfile); // a mismatch, if actually checked
+    const differentTargetUrl = 'https://www.linkedin.com/in/totally-different-person';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: differentTargetUrl, // NOT the lead's stored URL
+      lead: {
+        ...vivianLead, // lead.linkedin === 'https://www.linkedin.com/in/florencesu'
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: 'https://www.linkedin.com/in/florencesu', // stamp matches lead.linkedin, NOT the target
+      },
+    });
+    // Must re-verify against the actual target, not short-circuit on the stale stamp.
+    expect(mockGetLinkedInProfile).toHaveBeenCalledWith(differentTargetUrl, expect.anything());
+    expect(res.allowed).toBe(false);
+  });
+
+  it('DOES reuse the stamp when the target profileUrl matches what was actually verified (not just lead.linkedin)', async () => {
+    // The lead's stored URL is stale/different, but the target being sent to
+    // right now is exactly the URL that was previously verified -- this is
+    // the legitimate cache-hit case and must still skip the re-fetch.
+    const verifiedUrl = 'https://www.linkedin.com/in/florencesu';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: verifiedUrl,
+      lead: {
+        firstName: 'Florence',
+        lastName: 'Su',
+        company: 'Vivian Health',
+        linkedin: 'https://www.linkedin.com/in/a-stale-different-slug', // stale lead.linkedin
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: verifiedUrl, // matches the ACTUAL target
+      },
+    });
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(res.allowed).toBe(true);
+    expect((res as any).verified).toBe(true);
+  });
+
+  it('stamps the ACTUAL target profileUrl on a successful cross-check, not lead.linkedin', async () => {
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+    const targetUrl = 'https://www.linkedin.com/in/florencesu-alt-slug';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: targetUrl,
+      lead: { ...vivianLead, linkedin: 'https://www.linkedin.com/in/a-completely-different-stored-slug' },
+    });
+    expect(res.allowed).toBe(true);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      linkedinIdentityVerifiedUrl: targetUrl,
+    }));
+  });
 });

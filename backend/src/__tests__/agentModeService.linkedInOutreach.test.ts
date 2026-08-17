@@ -131,6 +131,14 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // Default: the account CAN search, so a zero-result search is a real
     // no-match and the ENG-975 guard stays out of the way.
     mockProbeSearchCapability.mockResolvedValue('ok');
+    // ENG-1026 Greptile P1 ("agent-tool authorization gap"): send-message's
+    // CRM-linked checks (sync gate, duplicate check, identity check) now
+    // require list access before reading a lead. Every test in this file
+    // that supplies list_id/lead_id calls as user-1 against list_test123 and
+    // expects those checks to run — default to "user-1 owns list_test123"
+    // so existing tests keep passing; the dedicated access-denial tests
+    // override this per-call.
+    mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'user-1' });
   });
 
   describe('send-message', () => {
@@ -1602,6 +1610,12 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
     mockUpdateLeadLinkedInSyncAt.mockResolvedValue(undefined);
     mockUpdateLead.mockResolvedValue(undefined);
+    // ENG-1026 Greptile P1 ("agent-tool authorization gap"): the identity
+    // check now requires list access, same as every other CRM write in this
+    // file. Default to "user-1 owns list_test123" so the existing tests in
+    // this block (all called as user-1 against list_test123) keep passing
+    // unmodified; the access-denial tests below override this per-call.
+    mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'user-1' });
   });
 
   it('send-message with lead context refuses on identity mismatch with a structured error', async () => {
@@ -1677,5 +1691,110 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
     expect(mockUpdateLead).toHaveBeenCalledWith('list_test123', 'lead_test456', expect.objectContaining({
       linkedinIdentityVerifiedAt: expect.any(String),
     }));
+  });
+
+  // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id are
+  // LLM-supplied tool arguments. Without a list-access check, a model-supplied
+  // (or manipulated) list_id belonging to ANOTHER TENANT let this code read
+  // that tenant's lead identity fields and — on a passing cross-check — stamp
+  // (mutate) their lead record, entirely outside any ownership/org-share check.
+  // Fixed the same way every other CRM write in this file is gated: resolve
+  // the list, require canDestructiveCrmList, and never touch the lead's data
+  // at all when access is denied (matches the sibling CRM-mirror access guard
+  // immediately above — best-effort skip, not a hard user-facing error, since
+  // this is a side-channel guard inside send-message/send-invite, not the
+  // primary user-requested action).
+  describe('agent-tool list-access guard (security)', () => {
+    const FOREIGN_LIST = { id: 'list_test123', userId: 'someone-else' };
+
+    it('send-message: never reads the lead when the caller lacks access to the list, and the send proceeds unprotected by the identity check', async () => {
+      mockGetLeadListById.mockResolvedValue(FOREIGN_LIST);
+      mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      // The foreign tenant's lead is never fetched, never read, never stamped.
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      // The send itself is not blocked by this guard (best-effort side channel).
+      expect(result.success).toBe(true);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('send-invite: never reads the lead when the caller lacks access to the list', async () => {
+      mockGetLeadListById.mockResolvedValue(FOREIGN_LIST);
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it('send-message: never reads the lead when the list does not exist', async () => {
+      mockGetLeadListById.mockResolvedValue(null);
+      mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+    });
+
+    it('send-message: a same-org listed CRM editor on the list still gets the identity check (access is granted, not just self-ownership)', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_test123', userId: 'owner-1' });
+      mockGetUserById.mockImplementation((id: string) =>
+        Promise.resolve(
+          id === 'owner-1' ? { userId: 'owner-1', orgId: 'org-A' } : { userId: id, orgId: 'org-A' }
+        )
+      );
+      mockGetOrgById.mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: ['user-1'] } },
+      });
+      mockGetLeadById.mockResolvedValue(vivianLead);
+      mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        profile_url: 'https://www.linkedin.com/in/florencesu/',
+        message: 'Hi Florence!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      });
+
+      // Access WAS granted (listed editor) -- the identity check ran and refused on mismatch.
+      expect(mockGetLeadById).toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.code).toBe('linkedin_identity_mismatch');
+    });
   });
 });

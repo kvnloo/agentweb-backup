@@ -184,14 +184,22 @@ export async function verifyLinkedInIdentityForSend(
   // Contract 3: no lead context → behavior unchanged.
   if (!lead) return { allowed: true, verified: false, verdict: 'skipped' };
 
-  const canonicalLeadUrl = normalizeLinkedInUrl(lead.linkedin || profileUrl);
+  // ENG-1026 Greptile P1 ("cached verification isn't bound to the actual send
+  // target"): the cache/stamp check MUST key on the URL this send is actually
+  // targeting (profileUrl), never on the lead's own stored URL (lead.linkedin).
+  // profileUrl can be model-supplied and differ from the lead's stored URL --
+  // keying on lead.linkedin let a stamp earned by verifying the lead's OWN
+  // profile silently authorize a send to a DIFFERENT, unverified profile.
+  // profileUrl is a required field on VerifyIdentityOptions, so there is no
+  // need to fall back to lead.linkedin at all.
+  const canonicalTargetUrl = normalizeLinkedInUrl(profileUrl);
 
-  // Contract 5: previously verified for this exact URL → skip the re-fetch.
+  // Contract 5: previously verified for this exact target URL → skip the re-fetch.
   if (
     lead.linkedinIdentityVerifiedAt &&
     lead.linkedinIdentityVerifiedUrl &&
-    canonicalLeadUrl &&
-    normalizeLinkedInUrl(lead.linkedinIdentityVerifiedUrl) === canonicalLeadUrl
+    canonicalTargetUrl &&
+    normalizeLinkedInUrl(lead.linkedinIdentityVerifiedUrl) === canonicalTargetUrl
   ) {
     return { allowed: true, verified: true, verdict: 'match' };
   }
@@ -245,7 +253,7 @@ export async function verifyLinkedInIdentityForSend(
       const { crmDb } = await import('./db');
       await crmDb.updateLead(listId, leadId, {
         linkedinIdentityVerifiedAt: new Date().toISOString(),
-        linkedinIdentityVerifiedUrl: canonicalLeadUrl || profileUrl,
+        linkedinIdentityVerifiedUrl: canonicalTargetUrl || profileUrl,
       });
     } catch (err) {
       console.warn(`[linkedInIdentityCheck] failed to stamp verified identity on lead ${leadId}:`, err);
