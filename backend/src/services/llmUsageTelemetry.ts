@@ -40,6 +40,10 @@ export const USAGE_TELEMETRY_EVENTS = {
   recommendationShown: "runway_recommendation_shown",
   /** A customer previewed a combined set of switches (nothing persisted). */
   previewComputed: "runway_preview_computed",
+  /** A customer CONFIRMED a switch and it was persisted (ENG-1210 AC12). */
+  changeApplied: "runway_change_applied",
+  /** A confirmed switch was reverted. */
+  changeUndone: "runway_change_undone",
 } as const;
 
 export type UsageTelemetryEvent =
