@@ -161,6 +161,7 @@ export interface User {
   slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
+  landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>; // Array of GA4 properties with labels
