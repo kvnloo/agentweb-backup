@@ -122,6 +122,50 @@ export function basesForDeletedPaths(refBases, perRefMaps) {
 }
 
 /**
+ * The distinct set of bases a coherent-snapshot discovery pass must run
+ * against — every base that reported AT LEAST ONE of the given deleted
+ * paths deleted (Greptile, ENG-1277 pre-push hook: "extra version pass
+ * mixes bases across paths"). A multi-ref push (`git push origin HEAD:a
+ * HEAD:b`) can resolve `a` and `b` to different bases; since every deleted
+ * path shares the SAME local commit across refs, the only real per-ref
+ * divergence is which base recovers a given path's pre-deletion content —
+ * so the unit of one discovery pass must be "one base, every deleted path",
+ * never "one path, one of its versions" (the old shape, which could mix
+ * path A's content from base 1 with path B's content from base 2 in the
+ * same pass — a combination that existed in no real commit). See
+ * `pathsForBase`'s doc comment for how a single pass decides, per path,
+ * whether this base can recover it. Restricted to only the bases that are
+ * actually a candidate for one of `deletedRelPaths` (not every base in the
+ * push) so a base wholly unrelated to any deletion (e.g. a docs-only ref's
+ * base in the same multi-ref push) never costs a wasted pass.
+ */
+export function distinctBasesForDeletedPaths(deletedRelPaths, basesForPath) {
+  const fullPaths = deletedRelPaths.map((relPath) => `backend/${relPath}`);
+  return [...new Set(fullPaths.flatMap((fp) => basesForPath[fp] || []))];
+}
+
+/**
+ * For ONE base and a list of deleted paths, split them into `recoverable`
+ * (this base's ref reported the path deleted, so `git show base:path`
+ * should succeed with real pre-deletion content) and `absent` (this base
+ * never reported it deleted — predates its addition there, or simply
+ * irrelevant to that ref — so a coherent snapshot at this base has no
+ * content for it and the caller must leave/make it absent, never carry
+ * over stale content a DIFFERENT base's pass wrote). See
+ * `distinctBasesForDeletedPaths`'s doc comment for the full story. Pure —
+ * the actual `git show` I/O and file writes stay in ci-prepush.mjs.
+ */
+export function pathsForBase(base, deletedRelPaths, basesForPath) {
+  const recoverable = [];
+  const absent = [];
+  for (const relPath of deletedRelPaths) {
+    const candidateBases = basesForPath[`backend/${relPath}`] || [];
+    (candidateBases.includes(base) ? recoverable : absent).push(relPath);
+  }
+  return { recoverable, absent };
+}
+
+/**
  * Identify pushed refs that are NOT the currently checked-out HEAD but still
  * touch a backend path (Greptile finding, ENG-1277 pre-push hook, round 5b,
  * ci-prepush.mjs:88-90). tsc/jest in this hook always run against the CURRENT

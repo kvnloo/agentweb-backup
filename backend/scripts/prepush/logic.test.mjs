@@ -13,6 +13,8 @@ import {
   mergeStatusByPathAcrossRefs,
   findForeignBackendRefs,
   basesForDeletedPaths,
+  distinctBasesForDeletedPaths,
+  pathsForBase,
 } from './logic.mjs';
 
 test('parsePushLine: normal branch push', () => {
@@ -410,4 +412,68 @@ test('basesForDeletedPaths: the same base appearing twice for one path is dedupe
 
 test('basesForDeletedPaths: no refs -> empty object', () => {
   assert.deepEqual(basesForDeletedPaths([], []), {});
+});
+
+// distinctBasesForDeletedPaths / pathsForBase: base-coherent discovery
+// (ENG-1277 / Greptile "extra version pass mixes bases across paths" — the
+// unit of one discovery pass must be "one base, every deleted path", never
+// "one path, one of its versions", which can mix path A's content from base
+// 1 with path B's content from base 2 in the same pass — a combination that
+// existed in no real commit).
+
+test('distinctBasesForDeletedPaths: single base, single path', () => {
+  const basesForPath = { 'backend/src/a.ts': ['base-1'] };
+  assert.deepEqual(distinctBasesForDeletedPaths(['src/a.ts'], basesForPath), ['base-1']);
+});
+
+test('distinctBasesForDeletedPaths: two paths sharing one base -> that base once', () => {
+  const basesForPath = { 'backend/src/a.ts': ['base-1'], 'backend/src/b.ts': ['base-1'] };
+  assert.deepEqual(distinctBasesForDeletedPaths(['src/a.ts', 'src/b.ts'], basesForPath), ['base-1']);
+});
+
+test('distinctBasesForDeletedPaths: two paths with genuinely different bases -> both, no duplicates', () => {
+  const basesForPath = { 'backend/src/a.ts': ['base-1'], 'backend/src/b.ts': ['base-2'] };
+  assert.deepEqual(distinctBasesForDeletedPaths(['src/a.ts', 'src/b.ts'], basesForPath), ['base-1', 'base-2']);
+});
+
+test('distinctBasesForDeletedPaths: a base wholly unrelated to any deletion never appears', () => {
+  // basesForPath only ever contains bases that actually reported a deletion
+  // (that's basesForDeletedPaths's job) — a docs-only ref's base in the same
+  // multi-ref push simply never shows up here, so it costs no wasted pass.
+  const basesForPath = { 'backend/src/a.ts': ['base-1'] };
+  assert.deepEqual(distinctBasesForDeletedPaths(['src/a.ts'], basesForPath), ['base-1']);
+});
+
+test('distinctBasesForDeletedPaths: no deleted paths -> no bases', () => {
+  assert.deepEqual(distinctBasesForDeletedPaths([], {}), []);
+});
+
+test('pathsForBase: a path this base reported deleted is recoverable', () => {
+  const basesForPath = { 'backend/src/a.ts': ['base-1'] };
+  assert.deepEqual(pathsForBase('base-1', ['src/a.ts'], basesForPath), { recoverable: ['src/a.ts'], absent: [] });
+});
+
+test('pathsForBase: a path this base never reported deleted is absent, not recoverable', () => {
+  const basesForPath = { 'backend/src/a.ts': ['base-2'] };
+  assert.deepEqual(pathsForBase('base-1', ['src/a.ts'], basesForPath), { recoverable: [], absent: ['src/a.ts'] });
+});
+
+test('pathsForBase: mixed paths split correctly for the same base pass — the core bug this fixes', () => {
+  // path A existed on both base-1 and base-2 (deleted relative to both);
+  // path B was only added after base-1 diverged, so only base-2's ref
+  // reports it deleted. A pass for base-1 must recover A but leave B
+  // absent — never fabricate B's content from base-2 in a base-1 pass.
+  const basesForPath = { 'backend/src/a.ts': ['base-1', 'base-2'], 'backend/src/b.ts': ['base-2'] };
+  assert.deepEqual(pathsForBase('base-1', ['src/a.ts', 'src/b.ts'], basesForPath), {
+    recoverable: ['src/a.ts'],
+    absent: ['src/b.ts'],
+  });
+  assert.deepEqual(pathsForBase('base-2', ['src/a.ts', 'src/b.ts'], basesForPath), {
+    recoverable: ['src/a.ts', 'src/b.ts'],
+    absent: [],
+  });
+});
+
+test('pathsForBase: no candidate bases at all for a path -> always absent', () => {
+  assert.deepEqual(pathsForBase('base-1', ['src/a.ts'], {}), { recoverable: [], absent: ['src/a.ts'] });
 });

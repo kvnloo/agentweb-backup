@@ -23,11 +23,11 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths } from './prepush/logic.mjs';
+import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths, distinctBasesForDeletedPaths, pathsForBase } from './prepush/logic.mjs';
 
 const TSC_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_TSC_BUDGET_MS || 4 * 60 * 1000);
 const JEST_BUDGET_MS = Number(process.env.AGENTWEB_PREPUSH_JEST_BUDGET_MS || 6 * 60 * 1000);
@@ -167,31 +167,36 @@ function createIsolatedWorktreeForDiscovery() {
   return { tmpBackend, cleanup };
 }
 
-// Writes each deleted path's pre-deletion content into the isolated
-// worktree's copy of backend/ (never the real one) so jest can resolve who
-// imports it. Keeps the same symlink/containment guards from rounds 5 and 8
-// as defense-in-depth — a fresh checkout would faithfully reproduce a
+// Writes every deletedNonTest path's content AS OF ONE SPECIFIC BASE into
+// the isolated worktree's copy of backend/ (never the real one), so a
+// single discoverRelatedSuites pass sees one coherent historical snapshot.
+// Keeps the same symlink/containment guards from rounds 5 and 8 as
+// defense-in-depth — a fresh checkout would faithfully reproduce a
 // git-TRACKED symlink if this repo ever commits one under backend/src (it
 // does not today; grep `git ls-files -s backend/src | awk '$1==120000'`) —
 // scoped to the isolated worktree's own boundary instead of the real one.
 //
-// Materializes each path's FIRST recoverable version now (the common case —
-// nearly always the only one). Returns {relPath: [version, ...]}, ALL
-// distinct content versions found across that path's candidate bases
-// (deduped by exact content match), so the caller can run additional
-// discovery passes for any path with more than one — see ENG-1277 /
-// Greptile P1 "first base hides divergent deletions": pushing the SAME
-// local commit to two different remote branch names in one `git push`
-// (`git push origin HEAD:branch-a HEAD:branch-b`) gives both refs the same
-// localSha but potentially different remoteSha/bases; if those bases hold
-// genuinely different historical content at a path both agree is now
-// deleted (status/blob-hash equal — the deletion itself, not the prior
-// content — so mergeStatusByPathAcrossRefs sees no conflict), only
-// materializing the first version silently drops the other version's
-// import-graph relationships from discovery.
-function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend) {
-  const versionsByPath = {};
-  for (const relPath of deletedRelPaths) {
+// Greptile, ENG-1277, "extra version pass mixes bases across paths": the
+// earlier shape materialized each path's OWN recoverable versions
+// independently and cycled through them one path at a time, so a
+// multi-base push could leave path A on base 2's content while path B sat
+// on base 1's — a combination that existed in no real commit, since every
+// deleted path shares the SAME local commit across refs (the only real
+// divergence is which base recovers it). `pathsForBase` (logic.mjs) makes
+// that decision per path for THIS base; a path it puts in `absent` is
+// explicitly unlinked here so a PRIOR base's pass never leaks stale content
+// into this one, matching the real history at this base — the path
+// genuinely predates its addition there, or is otherwise irrelevant.
+function materializeDeletedAsOfBase(base, deletedRelPaths, basesForPath, tmpBackend) {
+  const { recoverable, absent } = pathsForBase(base, deletedRelPaths, basesForPath);
+  for (const relPath of absent) {
+    try {
+      unlinkSync(path.join(tmpBackend, relPath));
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+  for (const relPath of recoverable) {
     const absPath = path.join(tmpBackend, relPath);
     let existingEntry = null;
     try {
@@ -202,25 +207,14 @@ function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend)
     if (existingEntry && existingEntry.isSymbolicLink()) {
       throw new Error(`refusing to materialize ${relPath} for test discovery — a symlink already sits at that exact path in the isolated worktree (${absPath}). A fresh checkout should never produce one unless it's git-tracked; investigate before pushing.`);
     }
-    // ENG-1277 / Greptile P1: only try bases from refs that actually
-    // reported THIS path deleted — never a base belonging to some other,
-    // unrelated ref in the same multi-ref push. See basesForDeletedPaths's
-    // doc comment.
     const fullPath = path.posix.join('backend', relPath);
-    const candidateBases = basesForPath[fullPath] || [];
-    const seenContent = new Set();
-    const versions = [];
-    for (const base of candidateBases) {
-      const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
-      if (r.status === 0 && !seenContent.has(r.stdout)) {
-        seenContent.add(r.stdout);
-        versions.push(r.stdout);
-      }
+    const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
+    if (r.status !== 0) {
+      // pathsForBase said this base's ref reported this exact path deleted,
+      // so recovering it here should never fail — a real inconsistency, not
+      // the expected "predates addition" case (that's already in `absent`).
+      throw new Error(`could not recover the pre-deletion content of ${relPath} from base ${base} (recorded as a deleting base for this path) — cannot check for tests that depended on it.`);
     }
-    if (!versions.length) {
-      throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
-    }
-    versionsByPath[relPath] = versions;
     // Check containment BEFORE creating any directories, not after — see the
     // ENG-1277 round-8 "containment check runs too late" fix this preserves.
     const dir = path.dirname(absPath);
@@ -236,12 +230,11 @@ function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend)
       throw new Error(`refusing to materialize ${relPath} for test discovery — its nearest existing ancestor directory (${nearestExisting}) resolves to ${realNearestExisting}, outside the isolated worktree's backend/ (${realTmpBackend}), likely via a git-tracked symlink. Creating directories there would escape it.`);
     }
     mkdirSync(dir, { recursive: true });
-    writeFileSync(absPath, versions[0]);
+    writeFileSync(absPath, r.stdout);
     // No revert/restore logic needed: the whole worktree is disposable and
     // exclusively ours, torn down unconditionally by the caller. There is
     // nothing of the developer's to preserve here.
   }
-  return versionsByPath;
 }
 
 // Runs `jest --listTests --findRelatedTests <targets>` and returns suite
@@ -336,11 +329,9 @@ if (nonTestChanged.length || deletedNonTest.length) {
   let discoveryCwd = backend;
   let jestBin = bin('jest');
   let wt = null;
-  let versionsByPath = null;
   if (deletedNonTest.length) {
     try {
       wt = createIsolatedWorktreeForDiscovery();
-      versionsByPath = materializeDeletedInWorktree(deletedNonTest, basesForPath, wt.tmpBackend);
     } catch (e) {
       // wt's cleanup (if it was created) runs automatically via its
       // registered `process.on('exit', ...)` handler when fail() exits below.
@@ -349,21 +340,36 @@ if (nonTestChanged.length || deletedNonTest.length) {
     discoveryCwd = wt.tmpBackend;
     jestBin = path.join(wt.tmpBackend, 'node_modules', '.bin', 'jest');
   }
-  const relatedSet = new Set(discoverRelatedSuites(jestBin, discoveryCwd, [...nonTestChanged, ...deletedNonTest]));
-  // ENG-1277 / Greptile P1: "first base hides divergent deletions" — a path
-  // with more than one distinct historical version (see
-  // materializeDeletedInWorktree's doc comment for when this happens) needs
-  // one additional discovery pass PER extra version, each re-materializing
-  // just that one path, unioning any additional related suites found. Runs
-  // zero extra times for the overwhelming common case (one version per path).
-  if (versionsByPath) {
-    for (const relPath of deletedNonTest) {
-      const versions = versionsByPath[relPath] || [];
-      for (let i = 1; i < versions.length; i++) {
-        writeFileSync(path.join(wt.tmpBackend, relPath), versions[i]);
-        for (const s of discoverRelatedSuites(jestBin, discoveryCwd, [relPath])) relatedSet.add(s);
-      }
+  const relatedSet = new Set();
+  if (deletedNonTest.length) {
+    // ENG-1277 / Greptile: "extra version pass mixes bases across paths" — a
+    // multi-ref push (`git push origin HEAD:a HEAD:b`) can resolve `a` and
+    // `b` to different bases; every deleted path shares the SAME local
+    // commit across refs, so the only real per-ref divergence is which base
+    // recovers a given path's pre-deletion content. A coherent historical
+    // snapshot is "every deleted path as of the SAME base" — never path A
+    // from base 1 mixed with path B from base 2, a combination that existed
+    // in no real commit. One discovery pass per distinct base
+    // (distinctBasesForDeletedPaths, logic.mjs), each materializing every
+    // deletedNonTest path from that single base (materializeDeletedAsOfBase
+    // leaves a path absent for a base that never reported it deleted,
+    // matching real history), unioning the related suites found. Collapses
+    // to exactly one pass for the overwhelming common case — a single-ref
+    // push, one base.
+    const distinctBases = distinctBasesForDeletedPaths(deletedNonTest, basesForPath);
+    if (!distinctBases.length) {
+      fail(`could not recover the pre-deletion content of ${deletedNonTest.join(', ')} — no base reports any of them deleted; cannot check for tests that depended on them.`);
     }
+    for (const base of distinctBases) {
+      try {
+        materializeDeletedAsOfBase(base, deletedNonTest, basesForPath, wt.tmpBackend);
+      } catch (e) {
+        fail(e.message);
+      }
+      for (const s of discoverRelatedSuites(jestBin, discoveryCwd, [...nonTestChanged, ...deletedNonTest])) relatedSet.add(s);
+    }
+  } else {
+    for (const s of discoverRelatedSuites(jestBin, discoveryCwd, nonTestChanged)) relatedSet.add(s);
   }
   relatedSuites = [...relatedSet];
 }
