@@ -45,6 +45,23 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
 
 /**
+ * ENG-1224 (Variant B): the internal control-directive text this loop itself
+ * injects as a budget nudge — see turnTimeBudget.ts's final-synthesis warning
+ * ("...Do not call any more tools. Write your final answer NOW...") and the
+ * step-budget warning ("Stop all searching/pagination immediately..."). Both
+ * are OUR instructions TO the model, never something a user asked for.
+ *
+ * Production session d5898ffd (model gemini-3.1-flash-lite, under loop stress
+ * after a tool error) echoed the injected instruction back verbatim as its
+ * final answer instead of following it — the entire final turn was the literal
+ * string "Do not call any more tools." A reply that opens with this phrasing is
+ * the model parroting its own context, not answering, exactly like the history
+ * echo above.
+ */
+const INTERNAL_DIRECTIVE_ECHO_RE =
+  /^(?:\[SYSTEM(?:\s+WARNING)?\]\s*)?(?:do\s*n[o']?t\s+call\s+any\s+(?:more|further)\s+tools|stop\s+calling\s+tools|no\s+more\s+tool\s+calls?|stop\s+all\s+searching(?:\s*\/\s*pagination)?)\b/i;
+
+/**
  * Degenerate-repetition thresholds. A model that collapses into a repetition loop
  * emits a huge message with almost no vocabulary: the live probe that drove the
  * ENG-1054 retry into this state produced 30,791 words built from just 65 unique
@@ -81,9 +98,10 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Both checked before the length cap: a history echo and a repetition collapse
-  // are long by nature.
+  // Checked before the length cap: a history echo and a repetition collapse are
+  // long by nature, and a leaked directive is short but not structural.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
+  if (INTERNAL_DIRECTIVE_ECHO_RE.test(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   if (!STRUCTURAL_ONLY.test(trimmed)) return false;
