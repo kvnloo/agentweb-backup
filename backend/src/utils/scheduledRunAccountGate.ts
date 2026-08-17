@@ -80,6 +80,75 @@ export function countTrailingAccountSkips(
   return count;
 }
 
+export interface UnipileAccountLike {
+  account_id: string;
+  account_name?: string;
+  config?: { needs_reconnect?: boolean };
+}
+
+export interface AccountGateDeps {
+  /** The caller's OWN Unipile accounts. Shared/site-wide accounts must not appear. */
+  listUnipileAccounts: (userId: string) => Promise<UnipileAccountLike[]>;
+  probeSession: (accountId: string) => Promise<'connected' | 'disconnected' | 'unknown'>;
+}
+
+export interface AccountGateResult {
+  blocked: boolean;
+  accountIds: string[];
+  accountNames: string[];
+}
+
+const NOT_BLOCKED: AccountGateResult = { blocked: false, accountIds: [], accountNames: [] };
+
+/**
+ * Decide whether a scheduled run should be withheld because the LinkedIn account it
+ * pins has no live session.
+ *
+ * Deps are injected rather than imported so the decision — which is the whole of
+ * this gate — is testable without standing up the controller. Same split as the
+ * ENG-1259 pre-check: logic here, wiring in `agentModeController`.
+ *
+ * Every uncertain path returns `blocked: false`, and it never throws. Wrongly
+ * withholding a run is an outage we inflicted on ourselves; wrongly running one
+ * costs a single fire and the tool layer refuses it anyway.
+ */
+export async function evaluateAccountGate(
+  startingMessage: string | null | undefined,
+  userId: string,
+  deps: AccountGateDeps,
+): Promise<AccountGateResult> {
+  try {
+    const accounts = await deps.listUnipileAccounts(userId);
+    if (!Array.isArray(accounts) || accounts.length === 0) return NOT_BLOCKED;
+
+    const pinnedIds = findPinnedUnipileAccountIds(
+      startingMessage,
+      accounts.map((acc) => acc.account_id),
+    );
+    if (pinnedIds.length === 0) return NOT_BLOCKED;
+
+    const pinned = accounts.filter((acc) => pinnedIds.includes(acc.account_id));
+    // One live pinned account is enough for the run to have something to work with.
+    if (pinned.some((acc) => !acc.config?.needs_reconnect)) return NOT_BLOCKED;
+
+    // The stored flag is refreshed by a cron on a 10-minute cadence, so it can lag a
+    // reconnect. Confirm against Unipile before withholding — one call, only on the
+    // path that would otherwise skip. 'unknown' falls through and runs.
+    for (const acc of pinned) {
+      if ((await deps.probeSession(acc.account_id)) !== 'disconnected') return NOT_BLOCKED;
+    }
+
+    return {
+      blocked: true,
+      accountIds: pinned.map((acc) => acc.account_id),
+      accountNames: pinned.map((acc) => acc.account_name || acc.account_id),
+    };
+  } catch (error) {
+    console.error('[scheduledRunAccountGate] failing open:', error);
+    return NOT_BLOCKED;
+  }
+}
+
 /**
  * Human-readable reason recorded on the skipped run, and shown in the schedule's
  * run history. Names the account so an owner with more than one knows which to

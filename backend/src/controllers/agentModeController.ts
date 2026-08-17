@@ -28,7 +28,7 @@ import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePu
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
-import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, buildAccountSkipReason, countTrailingAccountSkips, findPinnedUnipileAccountIds } from '../utils/scheduledRunAccountGate';
+import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -3365,61 +3365,25 @@ async function notifyScheduleOwnerOfFailure(
   }
 }
 
-interface LinkedInAccountGateResult {
-  blocked: boolean;
-  accountIds: string[];
-  accountNames: string[];
-}
-
 /**
- * Decide whether this run should be skipped because the LinkedIn account it pins is
- * disconnected (ENG-1197).
- *
- * Every uncertain path returns `blocked: false`. Wrongly skipping a run that could
- * have worked is a self-inflicted outage; wrongly running one costs a single wasted
- * fire and is caught by the tool layer anyway. Never throws, for the same reason.
+ * Wiring only — the decision lives in `scheduledRunAccountGate.evaluateAccountGate`
+ * so it can be tested without standing up a scheduled run (ENG-1197). Same split as
+ * the ENG-1259 pre-check gate.
  */
 async function evaluateLinkedInAccountGate(
   schedule: any,
   userId: string,
-): Promise<LinkedInAccountGateResult> {
-  const notBlocked: LinkedInAccountGateResult = { blocked: false, accountIds: [], accountNames: [] };
-  try {
-    const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
-    const unipileAccounts = (await getAccountsByUserId(userId)).filter(
-      (acc: any) => acc.platform === 'unipile',
-    );
-    if (unipileAccounts.length === 0) return notBlocked;
-
-    const pinnedIds = findPinnedUnipileAccountIds(
-      schedule.startingMessage,
-      unipileAccounts.map((acc: any) => acc.account_id),
-    );
-    if (pinnedIds.length === 0) return notBlocked;
-
-    const pinned = unipileAccounts.filter((acc: any) => pinnedIds.includes(acc.account_id));
-    // Any pinned account still alive means the run has something to work with.
-    if (pinned.some((acc: any) => !acc.config?.needs_reconnect)) return notBlocked;
-
-    // The persisted flag is maintained by a cron on a 10-minute cadence, so it can
-    // in principle lag a reconnect. Confirm against Unipile before withholding a
-    // run — one call, only on the path that would otherwise skip. 'unknown' falls
-    // through and runs.
-    const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
-    for (const acc of pinned) {
-      const state = await linkedInOutreachService.probeAccountSession(acc.account_id);
-      if (state !== 'disconnected') return notBlocked;
-    }
-
-    return {
-      blocked: true,
-      accountIds: pinned.map((acc: any) => acc.account_id),
-      accountNames: pinned.map((acc: any) => acc.account_name || acc.account_id),
-    };
-  } catch (error) {
-    console.error(`evaluateLinkedInAccountGate: failing open for schedule ${schedule?.scheduleId}:`, error);
-    return notBlocked;
-  }
+): Promise<AccountGateResult> {
+  return evaluateAccountGate(schedule?.startingMessage, userId, {
+    listUnipileAccounts: async (uid) => {
+      const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+      return (await getAccountsByUserId(uid)).filter((acc: any) => acc.platform === 'unipile') as any;
+    },
+    probeSession: async (accountId) => {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      return linkedInOutreachService.probeAccountSession(accountId);
+    },
+  });
 }
 
 /**
@@ -3432,7 +3396,7 @@ async function pauseScheduleForDisconnectedAccount(
   schedule: any,
   userId: string,
   consecutiveSkips: number,
-  gate: LinkedInAccountGateResult,
+  gate: AccountGateResult,
 ): Promise<void> {
   try {
     await scheduleDb.updateSchedule(schedule.scheduleId, {
