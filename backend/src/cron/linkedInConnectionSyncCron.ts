@@ -30,6 +30,7 @@ import {
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
 import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
+import { deleteSentInvitationsByProfileUrls } from '../services/unipileSentInvitationsDb';
 
 export {
   sentInvitationChanged,
@@ -520,12 +521,22 @@ const lastRecheckAtByAccount = new Map<string, number>();
 /**
  * How often the sent-invitation walk is a FULL one.
  *
- * Only the full walk prunes, so this also bounds how stale a pending-invitation row
- * can be: at most this long after the invitation was accepted or withdrawn. An hour
- * is far tighter than the cache's real consumers need, and it replaces five of every
- * six full feed walks with a single-page one.
+ * This is now a BACKSTOP, not the freshness mechanism. The two ways an invitation
+ * actually stops being pending — the recipient accepts, or we withdraw it — each
+ * delete their own row the moment we observe them (see
+ * deleteSentInvitationsByProfileUrls / deleteSentInvitationByInvitationId), so an
+ * accepted invite still clears within one 10-minute connection sync exactly as it
+ * did before, and one we withdraw clears immediately rather than up to ten minutes
+ * later. The full walk only catches the residue: invites that expired on LinkedIn's
+ * side, or were withdrawn outside this product.
+ *
+ * Env-tunable so the interval can be tightened without a deploy if that residue ever
+ * turns out to matter more than the traffic it costs.
  */
-export const FULL_INVITATION_WALK_INTERVAL_MS = 60 * 60 * 1000;
+export const FULL_INVITATION_WALK_INTERVAL_MS = (() => {
+  const raw = Number(process.env.LINKEDIN_FULL_INVITE_WALK_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60 * 60 * 1000;
+})();
 
 const lastFullWalkAtByAccount = new Map<string, number>();
 
@@ -640,6 +651,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // Health is derived from the calls this loop already makes; adding a probe
       // per account per cycle would undo the saving above.
       let observed: SessionState = 'unknown';
+      let acceptedProfileUrls: string[] = [];
       try {
         // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
         // forces a full backfill (then sets the __fullsync__ marker) whenever that
@@ -654,6 +666,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
 
         const newConns = await syncConnectionsForAccount(accountId);
         observed = 'connected';
+        acceptedProfileUrls = newConns.map((c) => c.publicProfileUrl);
         if (wasBackfill) {
           console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
         } else {
@@ -666,6 +679,23 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }
+      // A newly-detected connection means that person's invitation was accepted, so
+      // it is no longer pending. Drop it now rather than leaving it for the hourly
+      // full walk — the CRM reads this cache to show "invite pending" on a lead, and
+      // an hour of showing that after they accepted is a visible lie (ENG-1197).
+      //
+      // Deliberately OUTSIDE the sync try/catch above: that catch classifies whether
+      // the LinkedIn session is dead, and a failure to tidy our own cache says
+      // nothing about the session. Inside it, a cleanup error would be misread as a
+      // disconnect and could flag a healthy account.
+      if (acceptedProfileUrls.length > 0) {
+        try {
+          await deleteSentInvitationsByProfileUrls(accountId, acceptedProfileUrls);
+        } catch (err) {
+          console.error(`${TAG} Failed to drop accepted invitations for ${accountId}:`, err);
+        }
+      }
+
       // Refresh pending sent-invitations independently — a failure here must not
       // block connection sync (and vice versa).
       try {

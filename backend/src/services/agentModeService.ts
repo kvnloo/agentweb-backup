@@ -32349,6 +32349,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 
