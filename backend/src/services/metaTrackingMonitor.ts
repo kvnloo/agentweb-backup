@@ -762,7 +762,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
     await checkOptimisationCoverage(
-      account, adAccountId, accessToken, activity.days, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertTransport, now, deps,
     );
 
     const verdict = evaluateAdAccountDays(activity.days);
@@ -893,10 +893,8 @@ async function raise(
  * coverage is invisible reads exactly like a check that passed.
  */
 async function checkOptimisationCoverage(
-  account: any,
   adAccountId: string,
   accessToken: string,
-  days: AdAccountDay[],
   user: any,
   summary: MonitorSummary,
   alertTransport: AlertTransport,
@@ -919,7 +917,7 @@ async function checkOptimisationCoverage(
     }
 
     const verdict = evaluateAccountOptimisationCoverage(
-      inputs.adSets, inputs.receivedEventsByPixel, days,
+      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet,
     );
 
     summary.optimisationDormant += verdict.dormant.length;

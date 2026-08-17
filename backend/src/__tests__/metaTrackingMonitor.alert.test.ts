@@ -62,7 +62,7 @@ beforeEach(() => {
     // Graph call — a unit suite that depends on the network is one that fails for reasons
     // that have nothing to do with the code under test.
     fetchOptimisation: jest.fn().mockResolvedValue({
-      status: 'ok', adSets: [], receivedEventsByPixel: {},
+      status: 'ok', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {},
     }),
     now: Date.parse('2026-08-15T00:00:00Z'),
   };
@@ -336,6 +336,14 @@ const outageDays = () => [
   { date: '2026-08-08', spend: 214.85, conversions: 6, unrecognized: [], families: ['lead'] },
 ];
 
+/** The same days, attributed to the AD SET that is making the claim. Account totals cannot
+ *  stand in for this: they let a sibling vouch for a dead pixel and let a non-delivering
+ *  ad set inherit someone else's spend (both P1s on the first version). */
+const outageDaysByAdSet = (ids = ['as_cr', 'as_lead']) =>
+  Object.fromEntries(ids.map((id) => [id, outageDays().map(({ date, spend, families }) => ({
+    date, spend, families: id === 'as_lead' ? ['lead'] : families.filter((f) => f !== 'lead'),
+  }))]));
+
 describe('monitorUserTracking — §G Tier 1', () => {
   it('ALERTS on an account the blackout check calls healthy — the Haven blind spot', async () => {
     deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
@@ -343,6 +351,7 @@ describe('monitorUserTracking — §G Tier 1', () => {
       status: 'ok',
       adSets: havenAdSets(),
       receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
     });
 
     const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
@@ -369,6 +378,7 @@ describe('monitorUserTracking — §G Tier 1', () => {
           promoted_object: { custom_event_type: 'COMPLETE_REGISTRATION', pixel_id: 'px_haven' } },
       ],
       receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(['as_cr', 'as_lead', 'as_cr2']),
     });
 
     const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
@@ -380,6 +390,7 @@ describe('monitorUserTracking — §G Tier 1', () => {
     deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
     deps.fetchOptimisation.mockResolvedValue({
       status: 'ok', adSets: havenAdSets(), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
     });
 
     await monitorUserTracking(metaUser('u1', ['acct1']), deps);
@@ -395,6 +406,7 @@ describe('monitorUserTracking — §G Tier 1', () => {
     deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
     deps.fetchOptimisation.mockResolvedValue({
       status: 'ok', adSets: havenAdSets('PAUSED'), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
     });
 
     const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
@@ -411,6 +423,10 @@ describe('monitorUserTracking — §G Tier 1', () => {
     });
     deps.fetchOptimisation.mockResolvedValue({
       status: 'ok', adSets: havenAdSets(), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: {
+        as_cr: [{ date: '2026-08-08', spend: 214.85, families: ['lead', 'complete_registration'] }],
+        as_lead: [{ date: '2026-08-08', spend: 214.85, families: ['lead'] }],
+      },
     });
 
     const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
@@ -420,7 +436,7 @@ describe('monitorUserTracking — §G Tier 1', () => {
 
   it('a §G fetch failure never alerts and never disturbs the blackout check', async () => {
     deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
-    deps.fetchOptimisation.mockResolvedValue({ status: 'fetch_error', adSets: [], receivedEventsByPixel: {}, error: 'rate limited' });
+    deps.fetchOptimisation.mockResolvedValue({ status: 'fetch_error', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {}, error: 'rate limited' });
 
     const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
     expect(summary.optimisationAlerts).toBe(0);

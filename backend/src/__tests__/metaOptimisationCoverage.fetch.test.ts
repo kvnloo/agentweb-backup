@@ -13,6 +13,12 @@ import { fetchOptimisationInputs, MAX_PIXELS_CHECKED } from '../services/metaOpt
 const ok = (body: any) => ({ ok: true, status: 200, json: async () => body });
 const fail = (error: any, status = 400) => ({ ok: false, status, json: async () => ({ error }) });
 
+/** Count fetch calls by URL fragment. Raw call totals are brittle: this function makes
+ *  three different kinds of request (ad sets, per-pixel stats, ad-set insights), so a
+ *  count-based assertion silently changes meaning whenever one of them is added. */
+const callsTo = (fetchImpl: jest.Mock, fragment: string) =>
+  fetchImpl.mock.calls.filter((c) => String(c[0]).includes(fragment)).length;
+
 const adSet = (id: string, pixelId?: string, event = 'LEAD') => ({
   id,
   name: `Ad Set ${id}`,
@@ -83,7 +89,8 @@ describe('fetchOptimisationInputs — what it returns', () => {
       .mockResolvedValue(ok(statsBody([{ Lead: 1 }])));
 
     await fetchOptimisationInputs('123', 'tok', { fetchImpl } as any);
-    expect(fetchImpl).toHaveBeenCalledTimes(3); // 1 ad-set page + 2 pixels
+    expect(callsTo(fetchImpl, '/stats')).toBe(2);   // two distinct pixels, not three ad sets
+    expect(callsTo(fetchImpl, '/adsets')).toBe(1);
   });
 
   it('never reads a pixel no ad set promotes an event to', async () => {
@@ -92,7 +99,7 @@ describe('fetchOptimisationInputs — what it returns', () => {
     const fetchImpl = jest.fn().mockResolvedValueOnce(ok({ data: [adSet('a', undefined)] }));
     const result = await fetchOptimisationInputs('123', 'tok', { fetchImpl } as any);
 
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(callsTo(fetchImpl, '/stats')).toBe(0);
     expect(result.receivedEventsByPixel).toEqual({});
   });
 });
@@ -201,7 +208,7 @@ describe('fetchOptimisationInputs — remaining shapes seen in the wild', () => 
       .mockResolvedValueOnce(ok(statsBody([{ Lead: 1 }])));
     const result = await fetchOptimisationInputs('123', 'tok', { fetchImpl } as any);
     expect(result.adSets).toHaveLength(1);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(callsTo(fetchImpl, '/adsets')).toBe(1); // did not follow the non-string cursor
   });
 
   it('tolerates a response whose data is not an array', async () => {
@@ -215,7 +222,7 @@ describe('fetchOptimisationInputs — remaining shapes seen in the wild', () => 
     const fetchImpl = jest.fn().mockResolvedValue(ok({ data: [adSet('a')], paging: { next: 'https://loop' } }));
     const result = await fetchOptimisationInputs('123', 'tok', { fetchImpl } as any);
     expect(result.status).toBe('ok');
-    expect(fetchImpl.mock.calls.length).toBeLessThanOrEqual(10);
+    expect(callsTo(fetchImpl, '/adsets')).toBeLessThanOrEqual(10);
   });
 
   it('treats a stats response carrying an error body as unreadable', async () => {
@@ -241,7 +248,7 @@ describe('fetchOptimisationInputs — remaining shapes seen in the wild', () => 
       data: [{ id: 'a', effective_status: 'ACTIVE', promoted_object: { pixel_id: 'px1' } }],
     }));
     const result = await fetchOptimisationInputs('123', 'tok', { fetchImpl } as any);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(callsTo(fetchImpl, '/stats')).toBe(0);
     expect(result.receivedEventsByPixel).toEqual({});
   });
 

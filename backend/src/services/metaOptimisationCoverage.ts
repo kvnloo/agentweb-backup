@@ -278,15 +278,26 @@ export type AccountOptimisationVerdict = {
  * Notably, the streak needs no stored history and therefore no new table — §39 assumed it
  * would, which is what had this behind the data-plane gate.
  *
- * ── Per PIXEL, never per account ─────────────────────────────────────────────────────
+ * ── Every scope is the AD SET's own, never the account's ─────────────────────────────
  *
- * Haven runs THREE pixels. A conversion arriving on one says nothing about another, so a
- * unioned event set would let a busy pixel vouch for a dead one.
+ * Both halves of the evidence are scoped to the thing the claim is about, and neither was
+ * in the first version of this code:
+ *
+ *   - Pixel events per PIXEL. Haven runs THREE. A conversion arriving on one says nothing
+ *     about another, so a unioned event set lets a busy pixel vouch for a dead one.
+ *   - Spend and conversion families per AD SET. Account-wide figures break BOTH directions.
+ *     A healthy sibling pixel's conversions land in the account's family list and silently
+ *     break a dead pixel's absence streak, hiding the outage this check exists to find.
+ *     And an ACTIVE ad set that is not delivering inherits the account's spend, producing a
+ *     high-priority alert that says it is paying for an event when it is spending nothing.
+ *
+ * An ad set with NO insight rows did not deliver, so there is nothing to conclude about it:
+ * ACTIVE status is a configuration, not evidence of spend.
  */
 export function evaluateAccountOptimisationCoverage(
   adSets: OptimisationAdSet[] | null | undefined,
   receivedEventsByPixel: Record<string, Iterable<string>> | null | undefined,
-  spendingDays: OptimisationSpendingDay[] | null | undefined,
+  spendingDaysByAdSet: Record<string, OptimisationSpendingDay[]> | null | undefined,
 ): AccountOptimisationVerdict {
   const verdict: AccountOptimisationVerdict = {
     alerting: [], unconfirmed: [], unconfirmable: [], dormant: [],
@@ -295,6 +306,8 @@ export function evaluateAccountOptimisationCoverage(
 
   const rows = (Array.isArray(adSets) ? adSets : []).filter(Boolean);
   const byPixel = receivedEventsByPixel && typeof receivedEventsByPixel === 'object' ? receivedEventsByPixel : {};
+  const byAdSet =
+    spendingDaysByAdSet && typeof spendingDaysByAdSet === 'object' ? spendingDaysByAdSet : {};
   const unrecognised = new Set<string>();
   const inconclusive = new Set<string>();
   const eventCache = new Map<string, Set<string>>();
@@ -363,13 +376,17 @@ export function evaluateAccountOptimisationCoverage(
       continue;
     }
 
-    const absent = countTrailingAbsentSpendingDays(spendingDays, family);
+    // This ad set's OWN spend and conversions. An ad set Meta reported no rows for did not
+    // deliver, so `countTrailingAbsentSpendingDays` returns 0 and it cannot alert — which is
+    // the correct outcome: no delivery means no money at risk and nothing to diagnose.
+    const ownDays = Array.isArray(byAdSet[String(row?.id ?? '')]) ? byAdSet[String(row?.id ?? '')] : [];
+    const absent = countTrailingAbsentSpendingDays(ownDays, family);
     if (absent >= OPTIMISATION_ABSENCE_DAYS) {
       verdict.alerting.push({ ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent });
     } else {
-      // The account converted this family recently, so the pixel's 24h silence is far more
-      // likely to be a low-volume window than a fault. This is the case that would have
-      // produced the false positives.
+      // Either this ad set converted the family recently — so the pixel's 24h silence is far
+      // more likely to be a low-volume window than a fault — or it did not deliver at all.
+      // Both are reasons to log rather than alert.
       verdict.unconfirmed.push(hit);
     }
   }
@@ -402,6 +419,17 @@ export type OptimisationInputs = {
   /** Pixels referenced by ad sets but not read, because the cap was hit. Surfaced so a
    *  silently reduced check cannot pass for a complete one. */
   pixelsNotChecked?: string[];
+  /**
+   * Per-AD-SET daily spend and conversion families.
+   *
+   * Read at `level=adset` rather than account, because account totals cannot answer an
+   * ad-set question in either direction: a sibling pixel's conversions would break a dead
+   * pixel's absence streak, and account spend would make a non-delivering ACTIVE ad set
+   * look like it was paying for something.
+   *
+   * An ad set absent from this map produced no rows, which means it did not deliver.
+   */
+  spendingDaysByAdSet: Record<string, OptimisationSpendingDay[]>;
 };
 
 /**
@@ -438,6 +466,7 @@ export async function fetchOptimisationInputs(
           status: 'fetch_error',
           adSets: [],
           receivedEventsByPixel: {},
+          spendingDaysByAdSet: {},
           error: body?.error?.message || `HTTP ${response.status}`,
         };
       }
@@ -445,7 +474,10 @@ export async function fetchOptimisationInputs(
       url = typeof body?.paging?.next === 'string' ? body.paging.next : '';
     }
   } catch (error: any) {
-    return { status: 'fetch_error', adSets: [], receivedEventsByPixel: {}, error: error?.message || 'request failed' };
+    return {
+      status: 'fetch_error', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {},
+      error: error?.message || 'request failed',
+    };
   }
 
   // Only pixels an ad set actually promotes an event to are worth a call. A pixel nobody
@@ -492,5 +524,74 @@ export async function fetchOptimisationInputs(
     adSets,
     receivedEventsByPixel,
     pixelsNotChecked: referenced.slice(MAX_PIXELS_CHECKED),
+    spendingDaysByAdSet: await fetchAdSetSpendingDays(adAccountId, accessToken, fetchImpl, apiVersion),
   };
 }
+
+/**
+ * Per-ad-set daily spend and conversion families for the monitor window.
+ *
+ * `level=adset` with `time_increment=1` and an explicit `actions` field are all three
+ * required. Reading this at account level is what produced both P1s on the first version of
+ * this check: the evidence has to belong to the ad set the alert names.
+ *
+ * A failure here returns an empty map rather than throwing. Every ad set then has no
+ * delivery evidence and none can alert — the safe direction, since this gate only ever
+ * removes alerts.
+ */
+async function fetchAdSetSpendingDays(
+  adAccountId: string,
+  accessToken: string,
+  fetchImpl: typeof fetch,
+  apiVersion: string,
+): Promise<Record<string, OptimisationSpendingDay[]>> {
+  const { countAttributedConversions } = await import('./metaTrackingMonitor');
+  const params = new URLSearchParams({
+    fields: 'spend,actions,date_start,adset_id',
+    level: 'adset',
+    time_increment: '1',
+    date_preset: 'last_7d',
+  });
+
+  const byAdSet: Record<string, Record<string, OptimisationSpendingDay>> = {};
+  let url: string =
+    `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?${params}` +
+    `&access_token=${encodeURIComponent(accessToken)}`;
+
+  try {
+    // Ad-set level multiplies rows by the ad-set count, so a real account pages. Reading
+    // only the first page would silently drop delivery evidence and turn real alerts into
+    // silence — the same pagination trap #2420 hit moving account level to campaign.
+    for (let page = 0; page < MAX_INSIGHT_PAGES && url; page++) {
+      const response = await fetchImpl(url);
+      const body: any = await response.json();
+      if (!response.ok || body?.error) return {};
+
+      for (const row of Array.isArray(body?.data) ? body.data : []) {
+        const adSetId = typeof row?.adset_id === 'string' ? row.adset_id : '';
+        const date = typeof row?.date_start === 'string' ? row.date_start : '';
+        if (!adSetId || !date) continue;
+
+        byAdSet[adSetId] = byAdSet[adSetId] || {};
+        const day = byAdSet[adSetId][date] || { date, spend: 0, families: [] as string[] };
+        byAdSet[adSetId][date] = day;
+        day.spend += Number.parseFloat(row?.spend ?? '0') || 0;
+        for (const f of countAttributedConversions(row?.actions).families) {
+          if (!day.families.includes(f)) day.families.push(f);
+        }
+      }
+      url = typeof body?.paging?.next === 'string' ? body.paging.next : '';
+    }
+  } catch {
+    return {};
+  }
+
+  const out: Record<string, OptimisationSpendingDay[]> = {};
+  for (const [adSetId, days] of Object.entries(byAdSet)) {
+    out[adSetId] = Object.values(days).sort((a, b) => a.date.localeCompare(b.date));
+  }
+  return out;
+}
+
+/** Bound on insight pages followed per account, mirroring the blackout fetch's own cap. */
+const MAX_INSIGHT_PAGES = 20;
