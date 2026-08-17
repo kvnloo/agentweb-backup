@@ -2842,8 +2842,37 @@ export class AgentModeService {
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
     // the suffix after the prefix passed straight through as OpenRouter's own model
     // string, so a new upstream model is one registry line, not new routing code.
-    // First entry mirrors the model already smoke-tested live against this account.
-    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true, maxTools: 128 },
+    //
+    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
+    // (2026-08-17), not guessed:
+    // - supportsTemperature: true iff `supported_parameters` includes "temperature"
+    //   for that model (all entries below do).
+    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
+    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
+    //   endpoints APIs expose no numeric tool-call limit for any model (checked
+    //   both), so setting a number here would be a guess, not evidence. (The
+    //   128 previously on this line was exactly that guess, copied from the Azure
+    //   convention without verification — removed.)
+    // - supportsVision: deliberately OMITTED even where `architecture.modality`
+    //   reports image/video input — this codebase's own convention for the flag
+    //   (see LLMModelConfig.supportsVision above) requires empirical verification
+    //   against the real describe_image path, which none of these have had yet.
+    //   Metadata-only vision support is not the bar this flag uses elsewhere.
+    // - adminOnly: true on every new entry below (not this starter one, which was
+    //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
+    //   matching the existing convention for other non-default/experimental models
+    //   (e.g. anthropic.claude-opus-4-6-v1 above).
+    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true },
+    'openrouter/x-ai/grok-4.6': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/meta-llama/llama-4-maverick': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/meta-llama/llama-3.3-70b-instruct': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-pro': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.8-max': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-large-2512': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-small-2603': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k3': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-5.2': { client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },

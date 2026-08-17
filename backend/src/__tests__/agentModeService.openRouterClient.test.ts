@@ -129,6 +129,40 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
+  // ENG-9: the broader model roster requested 2026-08-17 (grok + open-source
+  // models). One parameterized test, not one per model — the routing logic is
+  // shared (prefix match), so per-model coverage would just re-test the same
+  // branch ten times. Each id is also asserted present in the registry with the
+  // live-sourced flags from GET /api/v1/models (see the registry comment).
+  const NEW_ROSTER_MODELS = [
+    'openrouter/x-ai/grok-4.6',
+    'openrouter/meta-llama/llama-4-maverick',
+    'openrouter/meta-llama/llama-3.3-70b-instruct',
+    'openrouter/deepseek/deepseek-v4-pro',
+    'openrouter/qwen/qwen3.8-max',
+    'openrouter/qwen/qwen3.7-flash',
+    'openrouter/mistralai/mistral-large-2512',
+    'openrouter/mistralai/mistral-small-2603',
+    'openrouter/moonshotai/kimi-k3',
+    'openrouter/z-ai/glm-5.2',
+  ];
+
+  it.each(NEW_ROSTER_MODELS)('routes %s to the OpenRouter client', async (modelId) => {
+    const service = new AgentModeService();
+    expect((service as any).llmModels[modelId]).toBeDefined();
+    const client = await service.getClientForModel(modelId);
+    expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
+  });
+
+  it('gates every new-roster entry adminOnly — unproven-in-our-stack models are opt-in, not default-on', () => {
+    const service = new AgentModeService();
+    for (const modelId of NEW_ROSTER_MODELS) {
+      expect((service as any).llmModels[modelId].adminOnly).toBe(true);
+    }
+    // The already-smoke-tested starter model is intentionally NOT admin-gated.
+    expect((service as any).llmModels['openrouter/openai/gpt-4o-mini'].adminOnly).toBeFalsy();
+  });
+
   it('does not change existing prefix routing (bedrock/azure/vertex/gemini unaffected)', async () => {
     process.env.GEMINI_API_KEY = 'test-gemini-key';
     try {
