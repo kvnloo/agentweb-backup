@@ -133,12 +133,32 @@ export const viewExternalFile = async (req: Request, res: Response) => {
 };
 
 /**
+ * Sanitize a caller-supplied download filename for use inside an HTTP
+ * `Content-Disposition` header. Strips path separators and quote characters (the
+ * two ways a raw filename could escape the `filename="..."` quoting and either
+ * break the header or, for path separators, be misread by some clients as a
+ * path), replacing them with `_`; anything left empty falls back to a generic
+ * name.
+ */
+function sanitizeDownloadFilename(filename: unknown): string {
+  const raw = typeof filename === 'string' ? filename.trim() : '';
+  const cleaned = raw.replace(/[/\\":;]/g, '_');
+  return cleaned.length > 0 ? cleaned : 'download';
+}
+
+/**
  * Generate a presigned URL for an S3 file.
  * Accepts either a public S3 URL or an S3 key via query parameter.
  * Returns a time-limited presigned URL for direct browser access.
+ *
+ * ENG-1188: `download=true` additionally bakes an `attachment` disposition into
+ * the presigned URL (optionally with `filename`) so the response forces a real
+ * download instead of the browser rendering/displaying the object inline — the
+ * generated ad-creative assets (HTML banners, screenshots) had no working
+ * download path; "open in new tab" just opened them as a live page/image.
  */
 export const getPresignedFileUrl = async (req: Request, res: Response) => {
-  const { url, key } = req.query;
+  const { url, key, download, filename } = req.query;
 
   if (!url && !key) {
     return res.status(400).json({
@@ -169,9 +189,16 @@ export const getPresignedFileUrl = async (req: Request, res: Response) => {
       });
     }
 
+    const wantsDownload = download === "true" || download === "1";
+    const responseContentDisposition = wantsDownload
+      ? `attachment; filename="${sanitizeDownloadFilename(filename)}"`
+      : undefined;
+
     const presignedUrl = presignS3Url(
       `https://${DEFAULT_BUCKET}.s3.amazonaws.com/${s3Key}`,
-      DEFAULT_BUCKET
+      DEFAULT_BUCKET,
+      undefined,
+      responseContentDisposition
     );
 
     if (!presignedUrl) {
