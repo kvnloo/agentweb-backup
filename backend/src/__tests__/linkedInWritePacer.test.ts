@@ -9,6 +9,7 @@
 import {
   PACED_WRITE_ACTIONS,
   __resetWritePacerForTests,
+  maxQueueWaitMs,
   minGapMs,
   reserveWriteSlot,
 } from '../services/linkedInWritePacer';
@@ -213,14 +214,26 @@ describe('resilience', () => {
   it('never lets a malformed env var produce a NaN delay', async () => {
     // A NaN gap would make every wait computation NaN and silently stop pacing —
     // the failure mode this whole module exists to prevent.
-    for (const bad of ['not-a-number', '', '-1']) {
-      process.env.LINKEDIN_WRITE_MIN_GAP_MS = bad;
-      expect(Number.isFinite(minGapMs())).toBe(true);
-      expect(minGapMs()).toBeGreaterThanOrEqual(0);
+    // Asserting only `>= 0` passed on the bug: Number('') is 0, so an empty env var
+    // read as a deliberate "no gap" and silently disabled pacing entirely.
+    //
+    // Checked through maxQueueWaitMs rather than minGapMs, because minGapMs's
+    // fallback under Jest IS 0 — so a correct fallback and the bug are
+    // indistinguishable there. This knob falls back to 60000 in every environment,
+    // so the assertion can actually tell them apart.
+    for (const bad of ['not-a-number', '', '   ', '-1']) {
+      process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = bad;
+      expect(maxQueueWaitMs()).toBe(60_000);
     }
+    process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = '1234';
+    expect(maxQueueWaitMs()).toBe(1234);
 
+    // And an explicitly configured 0 must still be honoured as "off".
+    process.env.LINKEDIN_WRITE_MIN_GAP_MS = '0';
+    expect(minGapMs()).toBe(0);
     process.env.LINKEDIN_WRITE_MIN_GAP_MS = '2500';
     expect(minGapMs()).toBe(2500);
+
   });
 });
 

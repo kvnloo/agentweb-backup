@@ -111,6 +111,17 @@ describe('deleteSentInvitationsByProfileUrls — the accepted-invitation path', 
     expect(mockDelete).not.toHaveBeenCalled();
   });
 
+  it('does not delete a malformed row when handed a whitespace-only url', async () => {
+    // '   ' is truthy so it survived filter(Boolean), then normalized to '' — which
+    // matched any cached row that also normalized to '', deleting it.
+    givenCached([{ ...row('alice'), publicProfileUrl: '' }]);
+
+    const removed = await deleteSentInvitationsByProfileUrls(ACCOUNT, ['   ']);
+
+    expect(removed).toBe(0);
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+
   it('deletes nothing when the accepted profile was never invited by us', async () => {
     givenCached([row('alice')]);
 

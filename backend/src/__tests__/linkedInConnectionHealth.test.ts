@@ -428,6 +428,28 @@ describe('getUnipileHealth', () => {
   });
 });
 
+describe('reminder cadence is independent of the owner-email flag', () => {
+  it('still reminds oncall when customer email is suppressed', async () => {
+    // Gating the whole reminder branch on the flag meant that at its production
+    // default a permanently-dead account produced ONE alert ever and then silence —
+    // the exact 38-day blind spot this exists to close.
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false';
+    const old = new Date(NOW - 30 * 24 * 60 * 60 * 1000).toISOString();
+    givenAccount({ needs_reconnect: true, disconnected_at: old, disconnect_notified_at: old });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(outcome).toBe('reminded');
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+});
+
 describe('notification delivery failures', () => {
   it('still records the flag when the owner has no email on file', async () => {
     givenAccount({});
