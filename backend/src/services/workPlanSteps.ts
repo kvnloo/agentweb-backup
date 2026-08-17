@@ -131,6 +131,18 @@ function isEmptyStepValue(value: unknown): boolean {
 }
 
 /**
+ * Does `candidate` carry through every populated content field of `existing`,
+ * unchanged? Used to tell a renamed step from a different step wearing its
+ * number — the one distinction position alone cannot make.
+ */
+function preservesContent(existing: any, candidate: any): boolean {
+  return STEP_CONTENT_FIELDS.every((field) => {
+    if (isEmptyStepValue(existing[field])) return true;
+    return JSON.stringify(existing[field]) === JSON.stringify(candidate?.[field]);
+  });
+}
+
+/**
  * Pair every step in `before` with its counterpart in `after`, as indices into
  * `after` (-1 where there is none).
  *
@@ -181,9 +193,21 @@ function pairSteps(before: any[], after: any[]): number[] {
       if (claimed.has(index)) return false;
       if (Number(candidate.stepCount) !== Number(step.stepCount)) return false;
       const candidateTitle = normalizeStepTitle(candidate.title);
-      // A renamed step is fine — its new title belongs to nobody. A title that
-      // is another existing step's is not ours to take.
-      return candidateTitle === ownTitle || !beforeTitles.has(candidateTitle);
+      // Same title, or none supplied at all (the common partial payload, which
+      // carries stepCount and the field being changed and nothing else) — the
+      // number is the only identity on offer, so trust it.
+      if (candidateTitle === ownTitle || candidateTitle === '') return true;
+      // A title belonging to another existing step is that step's, whatever the
+      // numbers say. Taking it here pairs two unrelated steps.
+      if (beforeTitles.has(candidateTitle)) return false;
+      // Otherwise the title is new, and position alone cannot tell a RENAME of
+      // this step from a REPLACEMENT of it by a different one. Both look like
+      // "old title gone, new title at the same number". So accept the pairing
+      // only where the distinction does not matter — where this step's content
+      // survives intact. A newcomer that brings its own content is treated as a
+      // different step, leaving this one unpaired and its content reported as
+      // lost, which is exactly what happened to it.
+      return preservesContent(step, candidate);
     });
     if (j !== -1) {
       pairs[i] = j;

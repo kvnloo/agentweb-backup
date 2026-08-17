@@ -251,7 +251,20 @@ router.put("/:planId", async (req, res) => {
             ],
           });
         }
-        const contentLoss = findStepContentLoss(existingSteps, normalizedSteps);
+        // Compare against the titles the CALLER sent, not the ones
+        // normalization invented. A partial payload — `{stepCount, skillIds}`,
+        // the shape that destroyed this plan — arrives here with `title` filled
+        // in as "Step N", which reads as a deliberate rename of every step
+        // rather than as "no title supplied". Step identity is then unresolvable
+        // and the loss goes unreported. The raw payload is the authority on
+        // which keys were present, exactly as in the merge branch above.
+        const rawReplace: any[] = steps;
+        const forCompare = normalizedSteps.map((norm: any, i: number) => {
+          if (rawReplace[i]?.title) return norm;
+          const { title, ...rest } = norm;
+          return rest;
+        });
+        const contentLoss = findStepContentLoss(existingSteps, forCompare);
         if (contentLoss.length > 0) {
           return res.status(400).json({
             message: `Refusing to update: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
