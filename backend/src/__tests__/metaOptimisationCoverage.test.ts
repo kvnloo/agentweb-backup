@@ -9,7 +9,12 @@
 
 import {
   evaluateOptimisationCoverage,
+  evaluateAccountOptimisationCoverage,
+  countTrailingAbsentSpendingDays,
   META_EVENT_BY_OPTIMISATION,
+  INSIGHTS_FAMILY_BY_OPTIMISATION,
+  IGNORED_OPTIMISATIONS,
+  OPTIMISATION_ABSENCE_DAYS,
 } from '../services/metaOptimisationCoverage';
 
 const adSet = (o: Partial<any> = {}) => ({
@@ -151,5 +156,380 @@ describe('evaluateOptimisationCoverage', () => {
     );
     expect(v.mismatches).toEqual([]);
     expect(v.inconclusive).toBe(false);
+  });
+});
+
+/**
+ * ENG-926 §G Tier 1, second half — the ALERT gate.
+ *
+ * Everything below was designed against production reads taken 2026-08-17, after the
+ * first half was written. Two of those reads invalidated the original design:
+ *
+ *   1. `/stats?aggregation=event` serves ~24 HOURS and nothing more. Verified on three
+ *      pixels with two tokens: `limit=200` still returns 23 buckets, and following
+ *      `paging.next` returns zero rows. There is no history to ask for.
+ *   2. Haven's `CompleteRegistration` — the event this whole check exists for — arrived in
+ *      exactly ONE of 23 hourly buckets. On a once-a-day conversion, a 24h window is a coin
+ *      flip, and a detector that alerts on one toss would have cried wolf on a pixel that
+ *      was working.
+ *
+ * So the pixel read cannot be the trigger. It is the corroborating signal, and the trigger
+ * is a streak of spending days with no attributed conversion of that family — the same
+ * evidence rule `evaluateAdAccountDays` already uses for blackouts.
+ */
+
+/** Haven's REAL pixel-attributed complete_registration by day, act_1842363582956923,
+ *  read 2026-08-17. The wrapper was removed on 08-05 and PR #12 restored it on 08-16.
+ *  Note 08-11 and 08-12: the outage was a RATE COLLAPSE, not a clean zero, which is why a
+ *  streak measured from the most recent day is the only rule that survives contact. */
+const HAVEN_DAYS = [
+  { date: '2026-08-05', spend: 205.16, families: ['lead', 'complete_registration'] },
+  { date: '2026-08-06', spend: 223.93, families: ['lead'] },
+  { date: '2026-08-07', spend: 229.62, families: ['lead'] },
+  { date: '2026-08-08', spend: 214.85, families: ['lead'] },
+  { date: '2026-08-09', spend: 250.85, families: ['lead'] },
+  { date: '2026-08-10', spend: 190.40, families: ['lead'] },
+  { date: '2026-08-11', spend: 247.95, families: ['lead', 'complete_registration'] },
+  { date: '2026-08-12', spend: 159.20, families: ['lead', 'complete_registration'] },
+  { date: '2026-08-13', spend: 82.25, families: [] },
+  { date: '2026-08-14', spend: 86.85, families: [] },
+  { date: '2026-08-15', spend: 96.32, families: ['lead'] },
+];
+
+const havenAdSet = (status = 'ACTIVE') => ({
+  id: 'as_haven_cr',
+  name: 'Maintenance Triage – Cold Prospecting',
+  effective_status: status,
+  optimization_goal: 'OFFSITE_CONVERSIONS',
+  promoted_object: { custom_event_type: 'COMPLETE_REGISTRATION', pixel_id: '646256265203090' },
+});
+
+describe('INSIGHTS_FAMILY_BY_OPTIMISATION', () => {
+  it('maps to the THIRD vocabulary — insights action families, not pixel event names', () => {
+    // promoted_object says COMPLETE_REGISTRATION, the pixel reports CompleteRegistration,
+    // and insights reports complete_registration. Three spellings of one conversion.
+    expect(INSIGHTS_FAMILY_BY_OPTIMISATION.COMPLETE_REGISTRATION).toBe('complete_registration');
+    expect(INSIGHTS_FAMILY_BY_OPTIMISATION.INITIATED_CHECKOUT).toBe('initiate_checkout');
+    expect(INSIGHTS_FAMILY_BY_OPTIMISATION.START_TRIAL).toBe('start_trial');
+  });
+
+  it('omits optimisations §F cannot count, so they can never be alerted on', () => {
+    // countAttributedConversions has no family for these. Without a countable family there
+    // is no streak, so there is no evidence — and no evidence must mean no alert, not a
+    // silently missing gate.
+    expect(INSIGHTS_FAMILY_BY_OPTIMISATION.CONTENT_VIEW).toBeUndefined();
+    expect(INSIGHTS_FAMILY_BY_OPTIMISATION.SEARCH).toBeUndefined();
+  });
+});
+
+describe('IGNORED_OPTIMISATIONS', () => {
+  it('skips OTHER — it is a real production value meaning "custom conversion"', () => {
+    // Haven runs several. Reporting it as unrecognised would put the same name in every
+    // sweep's output forever, which is how a diagnostic becomes something people filter out.
+    expect(IGNORED_OPTIMISATIONS.has('OTHER')).toBe(true);
+  });
+});
+
+describe('countTrailingAbsentSpendingDays', () => {
+  it('counts back from the most recent day, not the worst run in the window', () => {
+    // Haven on 08-15: 13th, 14th and 15th all spent with no complete_registration.
+    expect(countTrailingAbsentSpendingDays(HAVEN_DAYS, 'complete_registration')).toBe(3);
+  });
+
+  it('returns 0 when the most recent spending day carries the family', () => {
+    expect(countTrailingAbsentSpendingDays(HAVEN_DAYS, 'lead')).toBe(0); // 08-15 carried lead
+    expect(countTrailingAbsentSpendingDays(HAVEN_DAYS.slice(0, 8), 'complete_registration')).toBe(0);
+  });
+
+  it('excludes zero-spend days from the evidence AND lets them not break a streak', () => {
+    // Same rule evaluateAdAccountDays uses: a paused weekend is not proof of anything, and
+    // an outage that spans one is still one outage.
+    const days = [
+      { date: '1', spend: 100, families: [] as string[] },
+      { date: '2', spend: 0, families: [] as string[] },
+      { date: '3', spend: 100, families: [] as string[] },
+    ];
+    expect(countTrailingAbsentSpendingDays(days, 'lead')).toBe(2);
+  });
+
+  it('is 0 for an account that never spent — absence during no delivery proves nothing', () => {
+    expect(countTrailingAbsentSpendingDays(
+      [{ date: '1', spend: 0, families: [] }], 'lead',
+    )).toBe(0);
+  });
+
+  it('survives malformed rows', () => {
+    expect(countTrailingAbsentSpendingDays(null as any, 'lead')).toBe(0);
+    expect(countTrailingAbsentSpendingDays([null as any, undefined as any], 'lead')).toBe(0);
+  });
+});
+
+describe('evaluateAccountOptimisationCoverage', () => {
+  it('WOULD HAVE CAUGHT HAVEN on 2026-08-08 — five days before a human did', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': ['PageView', 'Lead'] },   // what the pixel reported while dark
+      HAVEN_DAYS.slice(0, 4),                        // through 08-08
+    );
+
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0]).toMatchObject({
+      optimisationEvent: 'COMPLETE_REGISTRATION',
+      expectedEventName: 'CompleteRegistration',
+      insightsFamily: 'complete_registration',
+      pixelId: '646256265203090',
+      consecutiveAbsentSpendingDays: 3,
+    });
+  });
+
+  it('STAYS SILENT TODAY — the pixel receives CompleteRegistration again since PR #12', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': ['PageView', 'Lead', 'CompleteRegistration'] },
+      HAVEN_DAYS,
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toEqual([]);
+  });
+
+  it('does NOT alert on the two live days mid-outage — the streak resets, as it must', () => {
+    // 08-11 and 08-12 both carried a complete_registration. A detector that ignored them
+    // would be asserting an outage the account's own data contradicts on those days.
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': ['PageView', 'Lead'] },
+      HAVEN_DAYS.slice(0, 8), // through 08-12
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1); // pixel silent, but insights contradict — log it
+  });
+
+  it('SUPPRESSES the low-volume false positive — quiet 24h, but it converted this week', () => {
+    // The form_start class, observed directly: present in one read, absent in the next, with
+    // nothing broken. This is the case that killed the pixel-only design.
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': ['PageView'] },     // no Lead, no CompleteRegistration in 24h
+      [{ date: '2026-08-15', spend: 96.32, families: ['complete_registration'] }],
+      );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('judges each pixel SEPARATELY — Haven really does run three', () => {
+    // A conversion arriving on pixel A says nothing about pixel B. Unioning the event sets
+    // would let a busy pixel vouch for a dead one on the same account.
+    const v = evaluateAccountOptimisationCoverage(
+      [
+        { ...havenAdSet(), id: 'as_a', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'pix_a' } },
+        { ...havenAdSet(), id: 'as_b', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'pix_b' } },
+      ],
+      { pix_a: ['PageView', 'Lead'], pix_b: ['PageView'] },
+      [
+        { date: '1', spend: 50, families: [] },
+        { date: '2', spend: 50, families: [] },
+        { date: '3', spend: 50, families: [] },
+      ],
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0].adSetId).toBe('as_b');
+  });
+
+  it('reports a PAUSED mismatch as dormant and never alerts on it', () => {
+    // AgentWeb's START_TRIAL ad set, still paused as of 2026-08-17. Costs nothing today.
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_st', name: 'Marketing Leaders', effective_status: 'PAUSED',
+        promoted_object: { custom_event_type: 'START_TRIAL', pixel_id: '1430870751246428' },
+      }],
+      { '1430870751246428': ['PageView', 'Lead', 'scroll', 'click'] },
+      [{ date: '1', spend: 50, families: [] }, { date: '2', spend: 50, families: [] },
+       { date: '3', spend: 50, families: [] }],
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.dormant).toHaveLength(1);
+    expect(v.dormant[0].expectedEventName).toBe('StartTrial');
+  });
+
+  it('never alerts on an optimisation §F cannot count — no family, no evidence', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_vc', effective_status: 'ACTIVE',
+        promoted_object: { custom_event_type: 'CONTENT_VIEW', pixel_id: 'pix_a' },
+      }],
+      { pix_a: ['PageView'] },
+      [{ date: '1', spend: 50, families: [] }, { date: '2', spend: 50, families: [] },
+       { date: '3', spend: 50, families: [] }],
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmable).toHaveLength(1);
+  });
+
+  it('skips OTHER entirely rather than reporting it as unrecognised', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'as_o', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'OTHER', pixel_id: 'pix_a' } }],
+      { pix_a: ['PageView'] },
+      [{ date: '1', spend: 50, families: [] }],
+    );
+    expect(v.unrecognisedOptimisations).toEqual([]);
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmable).toEqual([]);
+  });
+
+  it('marks a pixel INCONCLUSIVE when it reported nothing, and never alerts on it', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': [] },
+      HAVEN_DAYS.slice(0, 4),
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.inconclusivePixels).toEqual(['646256265203090']);
+  });
+
+  it('treats an ad set with no resolvable pixel as unjudgeable, not as a mismatch', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'as_np', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD' } }],
+      {},
+      [{ date: '1', spend: 50, families: [] }],
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmable).toHaveLength(1);
+  });
+
+  it('requires the FULL streak — two absent spending days is not enough', () => {
+    expect(OPTIMISATION_ABSENCE_DAYS).toBe(3);
+    const v = evaluateAccountOptimisationCoverage(
+      [havenAdSet()],
+      { '646256265203090': ['PageView', 'Lead'] },
+      HAVEN_DAYS.slice(0, 3), // 08-05..08-07 → only 2 absent days trailing
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('returns an empty verdict for an account with no ad sets', () => {
+    const v = evaluateAccountOptimisationCoverage([], {}, []);
+    expect(v.alerting).toEqual([]);
+    expect(v.dormant).toEqual([]);
+    expect(v.unconfirmed).toEqual([]);
+    expect(v.unconfirmable).toEqual([]);
+    expect(v.inconclusivePixels).toEqual([]);
+  });
+
+  it('survives malformed input without throwing', () => {
+    expect(() => evaluateAccountOptimisationCoverage(null as any, null as any, null as any)).not.toThrow();
+    const v = evaluateAccountOptimisationCoverage([null as any, {} as any], {}, []);
+    expect(v.alerting).toEqual([]);
+  });
+});
+
+describe('evaluateAccountOptimisationCoverage — the defensive paths', () => {
+  const days = [{ date: '1', spend: 50, families: [] as string[] }];
+
+  it('reports an untranslatable optimisation on a DELIVERING ad set', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'a', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'SOME_2027_EVENT', pixel_id: 'p' } }],
+      { p: ['PageView'] }, days,
+    );
+    expect(v.unrecognisedOptimisations).toEqual(['SOME_2027_EVENT']);
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('stays quiet about an untranslatable optimisation on a PAUSED ad set', () => {
+    // Nobody is spending on it, so naming it is noise rather than a lead to follow.
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'a', effective_status: 'PAUSED', promoted_object: { custom_event_type: 'SOME_2027_EVENT', pixel_id: 'p' } }],
+      { p: ['PageView'] }, days,
+    );
+    expect(v.unrecognisedOptimisations).toEqual([]);
+  });
+
+  it('ignores ad sets that promote nothing, in every shape', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [
+        { id: 'a', effective_status: 'ACTIVE', promoted_object: null },
+        { id: 'b', effective_status: 'ACTIVE', promoted_object: {} },
+        { id: 'c', effective_status: 'ACTIVE', promoted_object: { custom_event_type: '   ' } },
+        { id: 'd', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 42 as any } },
+      ],
+      { p: ['PageView'] }, days,
+    );
+    expect(v).toMatchObject({ alerting: [], dormant: [], unconfirmable: [], unrecognisedOptimisations: [] });
+  });
+
+  it('treats a blank or non-string pixel id as no pixel at all', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [
+        { id: 'a', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: '  ' } },
+        { id: 'b', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 7 as any } },
+      ],
+      {}, days,
+    );
+    expect(v.unconfirmable).toHaveLength(2);
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('treats a missing effective_status as not delivering', () => {
+    // Absent status must never be read as ACTIVE: that would alert on an ad set we cannot
+    // show is spending anything.
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'a', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
+      { p: ['PageView'] },
+      [{ date: '1', spend: 50, families: [] }, { date: '2', spend: 50, families: [] },
+       { date: '3', spend: 50, families: [] }],
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.dormant).toHaveLength(1);
+  });
+
+  it('is case and whitespace insensitive on the optimisation and the event set', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'a', effective_status: 'active', promoted_object: { custom_event_type: ' complete_registration ', pixel_id: 'p' } }],
+      { p: ['  CompleteRegistration  '] }, days,
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toEqual([]);
+  });
+
+  it('ignores blank and non-string entries in a pixel event list', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'a', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
+      { p: ['', '   ', null as any, 42 as any] },
+      days,
+    );
+    // Every entry was junk, so the pixel said nothing usable — inconclusive, not a mismatch.
+    expect(v.inconclusivePixels).toEqual(['p']);
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('reads each pixel once even when many ad sets share it', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [
+        { id: 'a', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } },
+        { id: 'b', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'PURCHASE', pixel_id: 'p' } },
+      ],
+      { p: [] },
+      days,
+    );
+    expect(v.inconclusivePixels).toEqual(['p']); // deduplicated, not ['p','p']
+  });
+
+  it('counts a family present only with a positive value', () => {
+    // A family reported at zero is configuration, not arrival.
+    expect(countTrailingAbsentSpendingDays(
+      [{ date: '1', spend: 10, families: ['LEAD'] }], 'lead',
+    )).toBe(0);
+    expect(countTrailingAbsentSpendingDays(
+      [{ date: '1', spend: 10, families: [null as any, 7 as any] }], 'lead',
+    )).toBe(1);
+    expect(countTrailingAbsentSpendingDays(
+      [{ date: '1', spend: 10, families: null as any }], 'lead',
+    )).toBe(1);
+  });
+
+  it('treats a negative or non-numeric spend as no delivery', () => {
+    expect(countTrailingAbsentSpendingDays(
+      [{ date: '1', spend: -5, families: [] }, { date: '2', spend: 'x' as any, families: [] }], 'lead',
+    )).toBe(0);
   });
 });
