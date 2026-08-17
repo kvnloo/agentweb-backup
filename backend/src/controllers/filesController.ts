@@ -142,7 +142,11 @@ export const viewExternalFile = async (req: Request, res: Response) => {
  */
 function sanitizeDownloadFilename(filename: unknown): string {
   const raw = typeof filename === 'string' ? filename.trim() : '';
-  const cleaned = raw.replace(/[/\\":;]/g, '_');
+  // CodeRabbit (ENG-1188): RFC 9110 forbids CR/LF/NUL/other C0 controls and DEL
+  // in a header field value -- left unstripped, S3 can reject the presigned
+  // request (InvalidRequest) or inject characters into the response header.
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw.replace(/[\x00-\x1f\x7f/\\":;]/g, '_');
   return cleaned.length > 0 ? cleaned : 'download';
 }
 
