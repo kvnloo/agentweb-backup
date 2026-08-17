@@ -174,7 +174,23 @@ function createIsolatedWorktreeForDiscovery() {
 // git-TRACKED symlink if this repo ever commits one under backend/src (it
 // does not today; grep `git ls-files -s backend/src | awk '$1==120000'`) —
 // scoped to the isolated worktree's own boundary instead of the real one.
+//
+// Materializes each path's FIRST recoverable version now (the common case —
+// nearly always the only one). Returns {relPath: [version, ...]}, ALL
+// distinct content versions found across that path's candidate bases
+// (deduped by exact content match), so the caller can run additional
+// discovery passes for any path with more than one — see ENG-1277 /
+// Greptile P1 "first base hides divergent deletions": pushing the SAME
+// local commit to two different remote branch names in one `git push`
+// (`git push origin HEAD:branch-a HEAD:branch-b`) gives both refs the same
+// localSha but potentially different remoteSha/bases; if those bases hold
+// genuinely different historical content at a path both agree is now
+// deleted (status/blob-hash equal — the deletion itself, not the prior
+// content — so mergeStatusByPathAcrossRefs sees no conflict), only
+// materializing the first version silently drops the other version's
+// import-graph relationships from discovery.
 function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend) {
+  const versionsByPath = {};
   for (const relPath of deletedRelPaths) {
     const absPath = path.join(tmpBackend, relPath);
     let existingEntry = null;
@@ -186,20 +202,25 @@ function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend)
     if (existingEntry && existingEntry.isSymbolicLink()) {
       throw new Error(`refusing to materialize ${relPath} for test discovery — a symlink already sits at that exact path in the isolated worktree (${absPath}). A fresh checkout should never produce one unless it's git-tracked; investigate before pushing.`);
     }
-    let content = null;
     // ENG-1277 / Greptile P1: only try bases from refs that actually
     // reported THIS path deleted — never a base belonging to some other,
     // unrelated ref in the same multi-ref push. See basesForDeletedPaths's
     // doc comment.
     const fullPath = path.posix.join('backend', relPath);
     const candidateBases = basesForPath[fullPath] || [];
+    const seenContent = new Set();
+    const versions = [];
     for (const base of candidateBases) {
       const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
-      if (r.status === 0) { content = r.stdout; break; }
+      if (r.status === 0 && !seenContent.has(r.stdout)) {
+        seenContent.add(r.stdout);
+        versions.push(r.stdout);
+      }
     }
-    if (content === null) {
+    if (!versions.length) {
       throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
     }
+    versionsByPath[relPath] = versions;
     // Check containment BEFORE creating any directories, not after — see the
     // ENG-1277 round-8 "containment check runs too late" fix this preserves.
     const dir = path.dirname(absPath);
@@ -215,11 +236,28 @@ function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend)
       throw new Error(`refusing to materialize ${relPath} for test discovery — its nearest existing ancestor directory (${nearestExisting}) resolves to ${realNearestExisting}, outside the isolated worktree's backend/ (${realTmpBackend}), likely via a git-tracked symlink. Creating directories there would escape it.`);
     }
     mkdirSync(dir, { recursive: true });
-    writeFileSync(absPath, content);
+    writeFileSync(absPath, versions[0]);
     // No revert/restore logic needed: the whole worktree is disposable and
     // exclusively ours, torn down unconditionally by the caller. There is
     // nothing of the developer's to preserve here.
   }
+  return versionsByPath;
+}
+
+// Runs `jest --listTests --findRelatedTests <targets>` and returns suite
+// paths relative to `cwd` — fails loud rather than treating a real failure
+// as "nothing related" (see evaluateListTestsResult's doc comment).
+function discoverRelatedSuites(jestBin, cwd, targets) {
+  const list = spawnSync(process.execPath, ['--max-old-space-size=4096', jestBin, '--listTests', '--findRelatedTests', ...targets],
+    { cwd, encoding: 'utf8', timeout: 60_000 });
+  const evaluated = evaluateListTestsResult(list);
+  if (!evaluated.ok && evaluated.reason === 'timeout') {
+    fail('jest --listTests --findRelatedTests exceeded its 60s budget — cannot determine which suites this change touches.');
+  }
+  if (!evaluated.ok && evaluated.reason === 'nonzero-exit') {
+    fail(`jest --listTests --findRelatedTests failed (exit ${evaluated.status}) — cannot determine which suites this change touches.\n${(list.stderr || '').slice(-2000)}`);
+  }
+  return evaluated.suites.map((a) => path.relative(cwd, a));
 }
 
 function run(label, cmd, args, { cwd, budgetMs }) {
@@ -242,6 +280,20 @@ const { statusByPath, basesForPath } = changedFilesForRefs(refs);
 const files = Object.keys(statusByPath);
 const backendFiles = files.filter((f) => isBackendPath(f));
 if (!backendFiles.length) { log(`no backend changes in ${files.length} pushed file(s) — skipping.`); process.exit(0); }
+
+// ENG-1277 / Greptile P1: "dirty tree masks pushed failures" — tsc below (and
+// the real suite run) always read the CURRENT WORKING TREE, which this hook
+// has always implicitly assumed matches exactly the commit being pushed
+// (HEAD) — that assumption was never actually checked. Uncommitted staged or
+// unstaged changes under backend/ mean tsc/jest test something OTHER than
+// the committed code about to be pushed: an uncommitted local fix can make a
+// broken pushed commit pass locally, and unrelated uncommitted breakage can
+// wrongly block a valid pushed commit. Refuse rather than verify a tree that
+// doesn't match what's actually being pushed.
+const dirtyBackend = git(['status', '--porcelain', '--', 'backend'], { cwd: root }).trim();
+if (dirtyBackend) {
+  fail(`backend/ has uncommitted changes — this hook verifies the CURRENT WORKING TREE, which must exactly match the commit being pushed (HEAD) for that verification to mean anything:\n${dirtyBackend}\nCommit or stash these changes first, then push again, or bypass with --no-verify (CI still checks the actual pushed commit for real).`);
+}
 
 // ENG-1277 / Greptile P1 #3: a path git says is Added/Modified (not Deleted) but is
 // missing from the working tree means the tree does not match what's about to be
@@ -283,11 +335,12 @@ if (nonTestChanged.length || deletedNonTest.length) {
   // createIsolatedWorktreeForDiscovery's doc comment for why deletions do.
   let discoveryCwd = backend;
   let jestBin = bin('jest');
+  let wt = null;
+  let versionsByPath = null;
   if (deletedNonTest.length) {
-    let wt;
     try {
       wt = createIsolatedWorktreeForDiscovery();
-      materializeDeletedInWorktree(deletedNonTest, basesForPath, wt.tmpBackend);
+      versionsByPath = materializeDeletedInWorktree(deletedNonTest, basesForPath, wt.tmpBackend);
     } catch (e) {
       // wt's cleanup (if it was created) runs automatically via its
       // registered `process.on('exit', ...)` handler when fail() exits below.
@@ -296,17 +349,23 @@ if (nonTestChanged.length || deletedNonTest.length) {
     discoveryCwd = wt.tmpBackend;
     jestBin = path.join(wt.tmpBackend, 'node_modules', '.bin', 'jest');
   }
-  const list = spawnSync(process.execPath, ['--max-old-space-size=4096', jestBin, '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],
-    { cwd: discoveryCwd, encoding: 'utf8', timeout: 60_000 });
-  // ENG-1277 / Greptile: fail loud, not silently empty — see evaluateListTestsResult.
-  const evaluated = evaluateListTestsResult(list);
-  if (!evaluated.ok && evaluated.reason === 'timeout') {
-    fail('jest --listTests --findRelatedTests exceeded its 60s budget — cannot determine which suites this change touches.');
+  const relatedSet = new Set(discoverRelatedSuites(jestBin, discoveryCwd, [...nonTestChanged, ...deletedNonTest]));
+  // ENG-1277 / Greptile P1: "first base hides divergent deletions" — a path
+  // with more than one distinct historical version (see
+  // materializeDeletedInWorktree's doc comment for when this happens) needs
+  // one additional discovery pass PER extra version, each re-materializing
+  // just that one path, unioning any additional related suites found. Runs
+  // zero extra times for the overwhelming common case (one version per path).
+  if (versionsByPath) {
+    for (const relPath of deletedNonTest) {
+      const versions = versionsByPath[relPath] || [];
+      for (let i = 1; i < versions.length; i++) {
+        writeFileSync(path.join(wt.tmpBackend, relPath), versions[i]);
+        for (const s of discoverRelatedSuites(jestBin, discoveryCwd, [relPath])) relatedSet.add(s);
+      }
+    }
   }
-  if (!evaluated.ok && evaluated.reason === 'nonzero-exit') {
-    fail(`jest --listTests --findRelatedTests failed (exit ${evaluated.status}) — cannot determine which suites this change touches.\n${(list.stderr || '').slice(-2000)}`);
-  }
-  relatedSuites = evaluated.suites.map((a) => path.relative(discoveryCwd, a));
+  relatedSuites = [...relatedSet];
 }
 
 const { suites, capped, namedMatched } = selectJestSuites({ testChanged, relatedSuites, nonTestChanged: [...nonTestChanged, ...deletedNonTest], cap: RELATED_CAP });
