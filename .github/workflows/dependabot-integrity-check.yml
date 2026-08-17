@@ -1,0 +1,56 @@
+name: Dependabot Integrity Check
+
+# CAUGHT LIVE (Greptile 1/5, portal#1037 / ENG-1287): dependabot-only-pr.sh,
+# and the workflow step that invokes it, are both sourced from the PR's own
+# head under the `pull_request` trigger — a repo writer could modify either
+# on their own push to a Dependabot-opened branch to self-approve unreviewed
+# code, and the script cannot detect tampering with ITSELF (any self-check
+# it performed would be exactly as tamperable as the check it guards).
+#
+# `pull_request_target` reads its OWN workflow file from the PR's BASE ref —
+# a PR cannot alter what this job does. Deliberately no `ref:` override on
+# the checkout below: the default for `pull_request_target` is the base
+# branch, not the PR head, so this also runs
+# .github/scripts/dependabot-integrity-check.sh from the trusted base copy,
+# never the PR's. No PR-supplied code is ever checked out or executed here —
+# the check itself is a read-only GitHub API call — so this does NOT
+# reintroduce the secret-exfiltration risk `pull_request_target` normally
+# carries when a workflow builds/tests untrusted PR content.
+#
+# This is made a REQUIRED branch-protection check. That is what actually
+# closes the gap: even if dependabot-only-pr.sh is fully compromised and
+# reports a false "bypass eligible", this check is produced independently
+# from the trusted base ref and still fails, and GitHub blocks the merge
+# regardless of what the (potentially compromised) `pull_request`-triggered
+# job reports.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  # CAUGHT LIVE (deep-dive verification, 2026-08-17): without pull-requests:
+  # read, `gh api .../pulls/{n}/files` 403s ("Resource not accessible by
+  # integration") for every real Dependabot PR — verified against three
+  # genuinely open ones (portal#997/#998/#999), all failing identically.
+  # This was never a content-based "declining the bypass" outcome; it was an
+  # unconditional fail-closed caused by a missing scope, indistinguishable
+  # from the intended behavior only by accident (both result in exit 1).
+  pull-requests: read
+
+jobs:
+  integrity-check:
+    name: Dependabot Integrity Check
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Checkout base ref (deliberately NOT the PR head)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify no CI-security-relevant path changed from base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/dependabot-integrity-check.sh
