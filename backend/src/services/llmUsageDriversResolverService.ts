@@ -35,6 +35,7 @@ import {
   type CostAttribution,
 } from "./llmUsageAttributionService";
 import { computeUsageRunway, TRAILING_WINDOW_DAYS } from "./llmUsageForecastService";
+import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
 export interface UsageRecommendationAlternative {
@@ -292,6 +293,20 @@ export async function previewUsageRunway(
     baseline.estimatedDaysRemaining === null || projected.estimatedDaysRemaining === null
       ? null
       : Math.max(0, projected.estimatedDaysRemaining - baseline.estimatedDaysRemaining);
+
+  // ENG-1217 AC2 / ENG-1210 AC12: a preview is the closest signal we have today
+  // to intent — the customer inspected a combined change without committing to
+  // it. Recording shown-vs-previewed is measurable now; accepted/declined needs
+  // the apply-and-audit path, which does not exist yet.
+  await recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.previewComputed, {
+    appliedCount: applied.length,
+    rejectedCount: rejected.length,
+    rejectionReasons: rejected.map((r) => r.reason),
+    baselineDaysRemaining: baseline.estimatedDaysRemaining,
+    projectedDaysRemaining: projected.estimatedDaysRemaining,
+    estimatedDaysRecovered,
+    confidence: projected.confidence,
+  });
 
   return {
     billingUserId: usage.billingUserId,
@@ -554,11 +569,39 @@ export async function resolveUsageDrivers(
     });
   }
 
+  const ranked = [...best.values()].sort(byImpact);
+
+  // ENG-1210 AC12: record which recommendation each customer was actually shown,
+  // with the model before/after and the driver it was attributed to. Emitted per
+  // recommendation rather than as one summary row so a later analysis can join
+  // an individual suggestion to whatever the customer did next.
+  //
+  // `estimatedSavingsMicroUsd` is deliberately absent. The redactor would remove
+  // it anyway; not sending it keeps that guard a backstop rather than the only
+  // thing between internal economics and a log line.
+  //
+  // Awaited together, and each call swallows its own failure, so telemetry can
+  // never fail the request that produced the recommendations.
+  await Promise.all(
+    ranked.map((rec) =>
+      recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.recommendationShown, {
+        fromModel: rec.fromModel,
+        toModel: rec.toModel,
+        estimatedDaysRecovered: rec.estimatedDaysRecovered,
+        confidence: rec.confidence,
+        qualityStatus: rec.quality.status,
+        shareOfTotal: rec.shareOfTotal,
+        completeDaysObserved: rec.completeDaysObserved,
+        alternativeCount: rec.alternatives.length,
+      }),
+    ),
+  );
+
   return {
     billingUserId: usage.billingUserId,
     available: true,
     attribution,
-    recommendations: [...best.values()].sort(byImpact),
+    recommendations: ranked,
     scheduleDrivers,
   };
 }

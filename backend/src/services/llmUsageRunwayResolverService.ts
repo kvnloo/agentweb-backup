@@ -31,6 +31,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
+import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 import { readPooledLedgerRows } from "./llmUsageLedgerReader";
 import {
   computeUsageRunway,
@@ -96,6 +97,28 @@ export async function resolveUsageRunway(
     cycleStartDate,
     cycleResetDate,
     today,
+  });
+
+  // ENG-1212 AC6: record the forecast's inputs and output version so any figure
+  // a customer was shown can be reproduced later. Awaited but non-throwing —
+  // `recordUsageTelemetry` swallows its own failures, so a telemetry problem can
+  // never turn a working forecast into a 500.
+  //
+  // Deliberately NOT spread from `runway`: `diagnostics` carries the raw burn
+  // rates and remaining allowance in micro-USD. The redactor would strip them,
+  // but naming the safe fields means the guard is a backstop rather than the
+  // only thing standing between internal economics and a log line.
+  await recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.forecastComputed, {
+    version: runway.version,
+    confidence: runway.confidence,
+    onTrack: runway.onTrack,
+    percentUsed: runway.percentUsed,
+    estimatedDaysRemaining: runway.estimatedDaysRemaining,
+    estimatedExhaustionDate: runway.estimatedExhaustionDate,
+    completeDaysElapsed: runway.completeDaysElapsed,
+    daysUntilReset: runway.daysUntilReset,
+    resetDate: runway.resetDate,
+    ledgerRowCount: rows.length,
   });
 
   return { billingUserId: usage.billingUserId, available: true, runway };

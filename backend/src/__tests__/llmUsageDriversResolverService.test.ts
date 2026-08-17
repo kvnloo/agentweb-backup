@@ -42,6 +42,7 @@ import { getEffectiveLlmUsagePolicy } from "../services/llmUsagePolicyResolverSe
 import { usageRecordDb } from "../services/usageRecordDb";
 import { userDb, orgDb, scheduleDb } from "../services/db";
 import { agentModeService } from "../services/agentModeService";
+import { __setUsageTelemetrySinkForTests } from "../services/llmUsageTelemetry";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -113,6 +114,61 @@ const opusLedger = () =>
  * is `unknown`, stated explicitly rather than left absent for a UI to fill in
  * optimistically.
  */
+/**
+ * ENG-1210 AC12 — the recommendations a customer was shown must be recorded,
+ * and recorded without internal dollars.
+ *
+ * The emitter has its own unit tests; what these prove is that the call sites
+ * are wired at all. A redactor nobody calls protects nothing, and a telemetry
+ * requirement is satisfied by emission, not by the existence of a helper.
+ */
+describe("recommendation telemetry (ENG-1210 AC12)", () => {
+  const emitted: { event: string; dimensions: Record<string, unknown> }[] = [];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+    emitted.length = 0;
+    __setUsageTelemetrySinkForTests((event, dimensions) => {
+      emitted.push({ event, dimensions });
+    });
+  });
+
+  afterEach(() => {
+    __setUsageTelemetrySinkForTests(null);
+  });
+
+  it("records every recommendation it surfaces, with model before and after", async () => {
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const shown = emitted.filter((e) => e.event === "runway_recommendation_shown");
+    expect(shown).toHaveLength(recommendations.length);
+    expect(shown[0].dimensions).toMatchObject({
+      fromModel: recommendations[0].fromModel,
+      toModel: recommendations[0].toModel,
+      confidence: recommendations[0].confidence,
+      qualityStatus: "unknown",
+    });
+  });
+
+  it("puts no internal dollar figure into any emitted dimension", async () => {
+    await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const blob = JSON.stringify(emitted);
+    expect(blob).not.toMatch(/MicroUsd|costUsd|estimatedSavings/i);
+    // And the value itself must not survive under a different name.
+    expect(blob).not.toContain(String(50 * USD));
+  });
+
+  it("records a preview without persisting anything", async () => {
+    await previewUsageRunway("u1", [{ fromModel: OPUS, toModel: SONNET }], { today: "2026-08-11" });
+    const preview = emitted.filter((e) => e.event === "runway_preview_computed");
+    expect(preview).toHaveLength(1);
+    expect(preview[0].dimensions).toMatchObject({ appliedCount: 1, rejectedCount: 0 });
+  });
+});
+
 describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
