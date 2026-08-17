@@ -121,6 +121,19 @@ describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-
     expect(loss.map((l: any) => l.title)).toEqual(['Beta']);
   });
 
+  it('flags erasure when every step is renamed and reordered at once', () => {
+    // Rename and move BOTH steps, blanking Beta's content on the way. Nothing
+    // pairs, so "nothing was kept" looks true and the wholesale-rewrite
+    // carve-out would swallow the erasure — a same-length write, so the count
+    // guard never fires either. A real rewrite brings its own content; a hollow
+    // step in the replacement is erasure wearing a rewrite's clothes.
+    const after = [
+      { stepCount: 1, title: 'Gamma', description: '', skillIds: [], requiredFunctionCalls: [] },
+      { stepCount: 2, title: 'Delta', description: 'DELTA', skillIds: ['d'], requiredFunctionCalls: ['i'] },
+    ];
+    expect(findStepContentLoss(before, after).length).toBeGreaterThan(0);
+  });
+
   it('stays silent on a wholesale rewrite where nothing was kept', () => {
     // The carve-out that makes "replace this plan" possible at all: no step was
     // recognised, so none was plainly meant to survive, and droppedStepTitles
