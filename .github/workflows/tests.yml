@@ -216,7 +216,7 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -269,7 +269,7 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -383,6 +383,15 @@ jobs:
       - name: Run greptile-gate.sh regression suite
         run: bash .github/scripts/greptile-gate.test.sh
 
+      - name: Run greptile-request-review.sh regression suite
+        run: bash .github/scripts/greptile-request-review.test.sh
+
+      - name: Run greptile-review Dependabot bypass invariants
+        run: bash .github/scripts/greptile-dependabot-bypass.test.sh
+
+      - name: Run dependabot-only-pr.sh regression suite
+        run: bash .github/scripts/dependabot-only-pr.test.sh
+
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
@@ -463,6 +472,18 @@ jobs:
   # It now reads the score and the reviewed-commit pointer out of the comment
   # body and fails closed. See .github/scripts/greptile-gate.sh for why the
   # comment is the only source of the score.
+  #
+  # ENG-1282: greptile.json sets `triggerOnUpdates: false`, so Greptile no
+  # longer auto-reviews every push to an already-ready PR — only `opened` and
+  # `ready_for_review` do (Greptile's own default; PRs here averaged 6.4 pushes
+  # before merge, max 50, and Greptile bills $1/review past 50/seat/month, so
+  # that was $1 per push, not per PR). A push after the first review therefore
+  # leaves this job polling for a review that will never arrive until someone
+  # deliberately asks for one via `.github/scripts/greptile-request-review.sh`
+  # — call it once per batch of fixes, not once per push, or this reintroduces
+  # the exact cost it removes. Until that's called, this job fails closed
+  # (unavailable) exactly as it did for any other missing review — that is the
+  # existing, correct behavior, not a regression.
   # ENG-1277: reordered to run AFTER the two backend test jobs, not in
   # parallel with them — the reverse of what ENG-915/ENG-1039 fought over.
   # ENG-915 made TESTS wait on Greptile (skip tests if Greptile refused);
@@ -517,7 +538,7 @@ jobs:
     # test jobs no longer wait on this gate); it is kept for the job log and
     # any future consumer. Nothing may ever treat a non-pass as a pass.
     outputs:
-      verdict: ${{ steps.gate.outputs.verdict }}
+      verdict: ${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}
     steps:
       # Deliberately the PR's own copy of the gate, not main's: whatever gates
       # merges has to gate its own changes, or the fix ships unexercised
@@ -525,12 +546,67 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # ENG-1282: greptile.json now excludes dependabot[bot] from review
+      # (excludeAuthors) — a version bump doesn't need a full LLM review, and
+      # dependabot PRs were ~4.6% of Greptile's billed reviews for something
+      # tests + Dependabot's own compatibility scoring already cover. Without
+      # this step, excluding the author means Greptile NEVER posts a verdict
+      # for these PRs, and greptile-gate.sh polls its full 10-minute timeout
+      # every single time before returning UNAVAILABLE — turning every
+      # dependabot PR's required check permanently red.
+      #
+      # This bypass went through TWO prior designs, both caught live by
+      # Greptile reviewing this exact PR, both on the same principle: an
+      # event-metadata check (who opened the PR, who triggered this push)
+      # tells you nothing about what's actually IN the current head.
+      #   v1 — `pull_request.user.login` alone: never changes even after a
+      #        human pushes onto an existing Dependabot branch, so a human's
+      #        unreviewed commit rides the bypass forever.
+      #   v2 — v1 AND `github.actor` (this push's trigger) both dependabot:
+      #        closes the direct case, but not the laundering case — a human
+      #        push correctly fails ITS OWN actor check and gets reviewed,
+      #        but if Dependabot performs a LATER routine update of the same
+      #        PR, THAT push's actor is dependabot again, and the bypass
+      #        fires for the CURRENT head — which still contains the human's
+      #        earlier, still-unreviewed commit.
+      # Neither version asked the only question that actually matters: does
+      # this PR's commit history contain anything other than Dependabot
+      # commits, full stop. dependabot-only-pr.sh asks exactly that — it
+      # walks every commit in the PR via the GitHub API and fails closed on
+      # a single non-Dependabot (or unresolvable) author anywhere in the
+      # history, not just the most recent event.
+      - name: Check whether this Dependabot PR contains only Dependabot commits
+        id: dependabot_only
+        if: github.event.pull_request.user.login == 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          bash .github/scripts/dependabot-only-pr.sh
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 0 ]; then
+            echo "all_dependabot=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "all_dependabot=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip the Greptile gate for Dependabot (excluded from review)
+        id: dependabot_skip
+        if: steps.dependabot_only.outputs.all_dependabot == 'true'
+        run: |
+          echo "verdict=pass" >> "$GITHUB_OUTPUT"
+          echo "[greptile-review] every commit in this PR is authored by dependabot[bot]: excluded from Greptile review by greptile.json, so no verdict will ever land here. Gate short-circuits to pass — tests + Dependabot's own compatibility score are the review for a dependency bump."
+
       # Split across two steps on purpose. A step that fails cannot publish an
       # output, and `continue-on-error` would mark the JOB successful, silently
       # deleting the merge gate. So this step records the verdict and always
       # succeeds, and the next one converts it back into the job's result.
       - name: Require a true Greptile 5/5 on this head
         id: gate
+        if: steps.dependabot_only.outputs.all_dependabot != 'true'
         env:
           # ENG-1039 fail-fast: see the job comment above.
           GREPTILE_GATE_TIMEOUT_SECONDS: '600'
@@ -553,10 +629,10 @@ jobs:
           echo "greptile-gate verdict=${verdict} (exit ${rc})"
 
       - name: Fail the gate unless Greptile returned 5/5
-        if: steps.gate.outputs.verdict != 'pass'
+        if: (steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict) != 'pass'
         run: |
           printf '::error::Greptile gate verdict=%s (exit %s). This job fails for both `refused` and `unavailable`; the merge gate is unchanged.\n' \
-            '${{ steps.gate.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
+            '${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
           exit 1
 
   # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
@@ -649,7 +725,7 @@ jobs:
 
       - name: Setup Node.js
         if: steps.preflight.outputs.stale != 'true'
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -769,7 +845,7 @@ jobs:
           fetch-depth: 1
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json

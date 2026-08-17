@@ -20,6 +20,11 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: jest.fn(),
+    // These tests always pass an explicit account_id that IS the user's own
+    // account, so usedSharedAccount must resolve to false (ENG-1198) — the
+    // whole point of this suite is to exercise the overlay on a genuine own
+    // account, not a borrowed shared one.
+    listUserOwnedUnipileAccountIds: jest.fn().mockResolvedValue(['unipile-acc-1']),
     // linkedinOutreach preflights the Unipile session before every action (ENG-281).
     // These tests exercise the connection overlay on a live account, so the probe
     // reports connected; the disconnected path is covered in

@@ -31546,13 +31546,36 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
+    //
+    // ENG-1198: a shared/site-wide account's network is NOT the user's — its
+    // network_distance and "already connected/pending" signals are computed
+    // relative to a stranger's account. `usedSharedAccount` (+ `sharedAccountId`)
+    // is threaded into every read-action response below so callers can caveat
+    // or refuse degree-based logic instead of silently trusting it.
     const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
-    if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
-      account_id = await linkedInOutreachService.resolveAccountId(userId);
+    let usedSharedAccount = false;
+    if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
+      if (!account_id) {
+        const resolved = await linkedInOutreachService.resolveAccountIdWithSource(userId);
+        account_id = resolved.accountId;
+        usedSharedAccount = resolved.usedSharedAccount;
+      } else {
+        // ENG-1198: an explicit account_id isn't necessarily the user's own —
+        // it may be a `sharedAccountId` this same endpoint disclosed on a prior
+        // call and the caller echoed back. Check ownership instead of assuming
+        // false whenever the caller supplied an id, so the flag stays accurate.
+        const ownAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+        usedSharedAccount = !ownAccountIds.includes(account_id);
+      }
       if (account_id) {
-        console.log(`[AgentMode] linkedinOutreach: using site-wide account for ${action}`);
+        console.log(`[AgentMode] linkedinOutreach: using ${usedSharedAccount ? 'site-wide' : 'own'} account for ${action}`);
       }
     }
+    const withAccountMeta = (data: any) => (
+      data && typeof data === 'object'
+        ? { ...data, usedSharedAccount, ...(usedSharedAccount ? { sharedAccountId: account_id } : {}) }
+        : data
+    );
 
     // Guard: if no account_id is available at this point, return a clear error
     // instead of forwarding a null account_id to Unipile (which returns a
@@ -31634,7 +31657,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
           if (Array.isArray(searchResult?.items)) {
-            const trimmedItems = searchResult.items.map((item: any) => {
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
+            // public_identifier literally the string 'undefined' — passing those
+            // through yields unusable fake profile URLs like /in/undefined.
+            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -31642,7 +31669,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 last_name: item.last_name,
                 headline: item.headline,
                 location: item.location,
-                network_distance: item.network_distance,
+                // network_distance is relative to whichever account ran the search —
+                // omit it when that account is a shared one, not the user's own
+                // (ENG-1198), so degree-based targeting logic isn't silently corrupted.
+                ...(usedSharedAccount ? {} : { network_distance: item.network_distance }),
                 public_profile_url: item.public_profile_url,
                 is_open_profile: item.is_open_profile,
               };
@@ -31653,9 +31683,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: { ...searchResult, items: trimmedItems } };
+            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
           }
-          return { success: true, data: searchResult };
+          return { success: true, data: withAccountMeta(searchResult) };
         }
 
         case 'get-profile': {
@@ -31693,8 +31723,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               (raw.public_identifier
                 ? `https://www.linkedin.com/in/${raw.public_identifier}`
                 : (isUrl ? target : null));
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
+            // with public_identifier literally the string 'undefined' — mirrors
+            // the search-people filtering above. get-profile can't drop the row
+            // (the caller asked for this specific person), so flag it and drop
+            // the fabricated /in/undefined URL instead.
+            const isAnonymized = raw.public_identifier === 'undefined';
             let conn: { connectedAt?: number } | null = null;
-            if (profileUrl) {
+            // A shared/site-wide account's connection state belongs to a
+            // STRANGER, not the user — reconciling is_relationship/connected_at
+            // from it would present that stranger's "already connected/pending"
+            // status as the user's own (ENG-1198). Skip the lookup entirely so
+            // both fields are omitted below, same as network_distance.
+            if (profileUrl && !usedSharedAccount) {
               const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
               conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
             }
@@ -31703,9 +31744,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // BEFORE this change (30-day TTL) can still carry another viewer's stale
             // values — a spread of `raw` would leak them until the row expires. Only a
             // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            // ENG-1198: on a cold (non-cached) response network_distance survives
+            // onto `raw` (see unipileProfileService.ts) — but it's relative to
+            // whichever account was used. Drop it when that account is a shared
+            // one, not the user's own, so a stranger's connection degree isn't
+            // presented as the user's.
             const {
               is_relationship: rawRelationship,
               connected_at: rawConnectedAt,
+              network_distance: rawNetworkDistance,
+              public_profile_url: rawPublicProfileUrl,
               ...viewerIndependentRaw
             } = raw;
             // Reconcile as a union: connected if our per-account cache has a row OR a
@@ -31717,19 +31765,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
               ...viewerIndependentRaw,
-              is_relationship: isConnected,
-              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
-              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
-              // otherwise keep the raw timestamp ONLY from a live response.
-              ...(conn && typeof conn.connectedAt === 'number'
-                ? { connected_at: conn.connectedAt }
-                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
-                  ? { connected_at: rawConnectedAt }
-                  : {}),
+              // Never surface the fabricated /in/undefined URL for an anonymized profile.
+              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              // See ENG-1198 note above: is_relationship/connected_at are the
+              // user's "already connected/pending" signal — only meaningful
+              // relative to the user's own account, not a borrowed shared one.
+              ...(usedSharedAccount ? {} : {
+                is_relationship: isConnected,
+                // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+                // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+                // otherwise keep the raw timestamp ONLY from a live response.
+                ...(conn && typeof conn.connectedAt === 'number'
+                  ? { connected_at: conn.connectedAt }
+                  : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                    ? { connected_at: rawConnectedAt }
+                    : {}),
+              }),
+              // See ENG-1198 note above: only keep network_distance when it's
+              // relative to the user's own account, not a borrowed shared one.
+              ...(!usedSharedAccount && rawNetworkDistance !== undefined
+                ? { network_distance: rawNetworkDistance }
+                : {}),
+              ...(isAnonymized ? { anonymized: true } : {}),
             };
-            return { success: true, data };
+            return { success: true, data: withAccountMeta(data) };
           }
-          return { success: true, data: raw };
+          return { success: true, data: withAccountMeta(raw) };
         }
 
         case 'list-connections': {
@@ -31781,6 +31842,48 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+
+          // ENG-1026: when the model passes CRM lead context, cross-check the live
+          // profile's identity against the lead before spending an invite on the
+          // wrong person. Positive mismatch → structured refusal; no lead context
+          // or unverifiable → unchanged behavior.
+          if (args.list_id && args.lead_id && isUrl && profile_url) {
+            const { crmDb: identityCrmDb } = await import('./db');
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments. Require the same list-access check
+            // every other CRM write in this file uses before reading OR stamping
+            // a lead's identity data — a foreign list_id must never expose or
+            // mutate another tenant's lead. Best-effort skip on denial (mirrors
+            // the CRM-mirror access guard below): this is a side-channel guard,
+            // not the primary user-requested action, so it never blocks the send.
+            const identityList = await identityCrmDb.getLeadListById(args.list_id).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasIdentityAccess = identityList ? await canDestructiveCrmList(userId, identityList) : false;
+            if (!hasIdentityAccess) {
+              console.warn(`[AgentMode] send-invite: skipping identity check — list ${args.list_id} not accessible to user ${userId}`);
+            }
+            const identityLead = hasIdentityAccess
+              ? await identityCrmDb.getLeadById(args.list_id, args.lead_id).catch(() => null)
+              : null;
+            if (identityLead) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: identityLead as any,
+                listId: args.list_id,
+                leadId: args.lead_id,
+                profileUrl: profile_url,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
+              }
+            }
+          }
 
           // ENG-182: cross-check the account's PENDING sent-invitation cache before
           // spending a run's invite quota. A profile with an OUTSTANDING (sent but
@@ -31960,7 +32063,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
             const { crmDb } = await import('./db');
-            sendLead = await crmDb.getLeadById(sendListId, sendLeadId);
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments — require list access before this
+            // fetch, same as every other CRM write in this file, or a foreign
+            // list_id exposes/mutates another tenant's lead identity data via
+            // both the sync-gate/duplicate check below and the identity guard
+            // further down. Best-effort skip on denial: the send itself is not
+            // blocked, only the CRM-linked checks that need this lead's data.
+            const sendList = await crmDb.getLeadListById(sendListId).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasSendAccess = sendList ? await canDestructiveCrmList(userId, sendList) : false;
+            if (!hasSendAccess) {
+              console.warn(`[AgentMode] send-message: skipping CRM-linked checks — list ${sendListId} not accessible to user ${userId}`);
+            }
+            sendLead = hasSendAccess ? await crmDb.getLeadById(sendListId, sendLeadId) : null;
             if (sendLead) {
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -31998,6 +32114,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                     alreadySentAt: duplicateEvent.createdAt,
                   };
                 }
+              }
+            }
+          }
+
+          // ENG-1026: with CRM lead context, cross-check the live profile's identity
+          // against the lead before sending. Positive mismatch → structured refusal.
+          if (sendLead && sendListId && sendLeadId) {
+            const identityUrl = (isUrl && profile_url) || (sendLead.linkedin as string | undefined)?.trim();
+            if (identityUrl) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: sendLead as any,
+                listId: sendListId,
+                leadId: sendLeadId,
+                profileUrl: identityUrl,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
               }
             }
           }
@@ -32137,7 +32277,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileCompanyService.ts.
           const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
           const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
-          return { success: true, data: companyResult.rawData };
+          return { success: true, data: withAccountMeta(companyResult.rawData) };
         }
 
         case 'cancel-invitation': {
@@ -32179,11 +32319,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }));
           return {
             success: true,
-            data: {
+            data: withAccountMeta({
               candidates: trimmedCandidates,
               fromCache: resolveResult.fromCache,
               source: resolveResult.source,
-            },
+            }),
           };
         }
 
