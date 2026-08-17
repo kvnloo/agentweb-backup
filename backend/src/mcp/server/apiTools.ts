@@ -2645,8 +2645,8 @@ mcpToolRegistry.register({
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
 - attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
-- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran; collapses to a single model name when they agree or nothing to contrast. Null only when attributedModels is null.
-- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, byModel: [{model, sessions, share}] }, sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. Null when no session in range has any resolvable attribution.
+- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran; collapses to a single model name when they agree or nothing to contrast. When attributionBasis is 'partial-transcript' it carries its own "(partial — N of M assistant turns unlabelled)" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.
+- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, partialAttributionSessions, truncated, byModel: [{model, sessions, share}] }, byModel sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. partialAttributionSessions counts how many of sessionsWithModelData were only partially labelled (qualify the shares as approximate when this is > 0). truncated (also returned top-level, sibling of sessions) is true when more sessions exist in the requested range beyond the limit parameter — when true, do not present modelMix, or sessions, as covering the full range; say so, or re-run with a higher limit. Null when no session in range has any resolvable attribution.
 
 The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
@@ -2734,8 +2734,12 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // no recorded spend still means the transcript is only partially labelled, and
       // keying that off cost alone let a partial set read as authoritative.
       let unlabelledAssistantTurns = 0;
+      // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
+      // "partial" can be quantified (N of M) rather than just flagged.
+      let assistantTurnCount = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
@@ -2790,10 +2794,22 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // no choice left to make. Only names the picker when it disagrees with
       // what ran — agreement (or selection-only, where there is nothing to
       // contrast) collapses to a single value.
+      //
+      // Greptile P1 (ENG-1313 review): a partial-transcript session's
+      // attributedModels only lists the turns that DID record a model, so
+      // printing it bare (as "the" model line) presents an incomplete list as
+      // complete — a model used only by an unlabelled turn goes unnamed with
+      // no signal that anything is missing. Append an explicit "(partial — N
+      // of M assistant turns unlabelled)" qualifier whenever attributionBasis
+      // is 'partial-transcript', so modelLine can still be printed verbatim
+      // without silently overstating its own completeness.
+      const partialQualifier = attributionBasis === 'partial-transcript'
+        ? ` (partial — ${unlabelledAssistantTurns} of ${assistantTurnCount} assistant turns unlabelled)`
+        : '';
       const modelLine: string | null = attributedModels
         ? (session.llmModel && !attributedModels.includes(session.llmModel)
-            ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}`
-            : attributedModels.join(', '))
+            ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}${partialQualifier}`
+            : `${attributedModels.join(', ')}${partialQualifier}`)
         : null;
 
       return {
@@ -2853,6 +2869,15 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       };
     });
 
+    // Greptile P1 (ENG-1313 review): the admin route paginates with a cursor
+    // (`nextCursor`, non-null when more sessions exist beyond `limit`), but
+    // this tool previously dropped it entirely — so a limit-truncated result
+    // was returned with no signal that it was incomplete. Any range-wide
+    // aggregate computed only over the returned page (modelMix below, but
+    // this also applies to `count`/`sessions`) needs that signal surfaced,
+    // not silently presented as covering the full requested range.
+    const truncated = (data as any)?.nextCursor != null;
+
     // ENG-1313 acceptance criterion 3: the model-mix section must be computed
     // from attributedModels (transcript-derived where available), never from
     // llmModel — otherwise a fleet-wide default-model switch stays invisible
@@ -2861,9 +2886,15 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
     // be pulled toward llmModel by accident.
     const modelMixCounts: Record<string, number> = {};
     let sessionsWithModelData = 0;
+    // Greptile P1 (ENG-1313 review): sessions with only partial transcript
+    // attribution are still counted (their known models are real), but the
+    // count of how many are partial travels with the aggregate so a consumer
+    // can qualify the shares rather than presenting them as exact.
+    let partialAttributionSessions = 0;
     for (const s of formattedSessions) {
       if (!s.attributedModels) continue;
       sessionsWithModelData++;
+      if (s.attributionBasis === 'partial-transcript') partialAttributionSessions++;
       for (const m of s.attributedModels as string[]) {
         modelMixCounts[m] = (modelMixCounts[m] || 0) + 1;
       }
@@ -2871,6 +2902,8 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
     const modelMix = sessionsWithModelData > 0
       ? {
           sessionsWithModelData,
+          partialAttributionSessions,
+          truncated,
           byModel: Object.entries(modelMixCounts)
             .map(([model, sessions]) => ({ model, sessions, share: sessions / sessionsWithModelData }))
             .sort((a, b) => b.sessions - a.sessions || a.model.localeCompare(b.model)),
@@ -2882,6 +2915,7 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      truncated,
       modelMix,
     });
   }

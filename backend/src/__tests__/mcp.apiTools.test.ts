@@ -974,6 +974,66 @@ describe('apiTools', () => {
 
         expect(session.modelLine).toBe('picker: claude-sonnet-4-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
       });
+
+      // Greptile P1 (ENG-1313 review): a partial-transcript modelLine must not
+      // read as complete — it only names the turns that DID record a model.
+      it('appends a "(partial — N of M assistant turns unlabelled)" qualifier when attribution is only partial', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-partial',
+            userId: 'user-11',
+            title: 'Some turns unlabelled',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'b' }, // unlabelled
+              { role: 'assistant', content: 'c' }, // unlabelled
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributionBasis).toBe('partial-transcript');
+        expect(session.modelLine).toBe('anthropic.claude-opus-5 (partial — 2 of 3 assistant turns unlabelled)');
+      });
+
+      it('appends the partial qualifier alongside the picker-mismatch format when both apply', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-partial-mismatch',
+            userId: 'user-12',
+            title: 'Mismatched picker, and only partially labelled',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            messages: [
+              { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'b' }, // unlabelled
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe(
+          'picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5 (partial — 1 of 2 assistant turns unlabelled)'
+        );
+      });
     });
 
     // ENG-1313 acceptance criterion 3: the model-mix section must be computed
@@ -1022,6 +1082,85 @@ describe('apiTools', () => {
           { model: 'anthropic.claude-opus-5', sessions: 2, share: 2 / 3 },
           { model: 'gpt-5-chat-2', sessions: 1, share: 1 / 3 },
         ]);
+      });
+
+      // Greptile P1 (ENG-1313 review): sessions with only partial transcript
+      // attribution are real signal, but the aggregate must say how much of
+      // itself is exact vs partial rather than presenting shares as precise.
+      it('counts partially-labelled sessions in the mix but reports how many via partialAttributionSessions', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [
+            {
+              sessionId: 'sess-full', userId: 'u-f', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'anthropic.claude-opus-5',
+              messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+            },
+            {
+              sessionId: 'sess-partial', userId: 'u-p', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'anthropic.claude-opus-5',
+              messages: [
+                { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' },
+                { role: 'assistant', content: 'b' }, // unlabelled
+              ],
+            },
+          ],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix.sessionsWithModelData).toBe(2);
+        expect(parsed.modelMix.partialAttributionSessions).toBe(1);
+      });
+
+      // Greptile P1 (ENG-1313 review): a limit-truncated range must not present
+      // its aggregate as covering the full requested range.
+      it('flags modelMix (and the top-level response) as truncated when the admin route returns a pagination cursor', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-page-1', userId: 'u-1', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+          }],
+          nextCursor: 'opaque-cursor-more-results-exist',
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+          limit: 1,
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.truncated).toBe(true);
+        expect(parsed.modelMix.truncated).toBe(true);
+      });
+
+      it('reports truncated: false when the admin route has no further pages', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-last-page', userId: 'u-1', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.truncated).toBe(false);
+        expect(parsed.modelMix.truncated).toBe(false);
       });
 
       it('returns null when no session in range has any resolvable model attribution', async () => {
