@@ -151,6 +151,66 @@ describe('crossCheckProfileIdentity (pure)', () => {
     );
     expect(res.verdict).toBe('match');
   });
+
+  // ENG-1026 Greptile P1 (round 3): full-profile work_experience entries (the
+  // ONLY shape getLinkedInProfile ever returns) signal "ongoing" via the
+  // ABSENCE of an `end` field, not a `current` boolean -- that flag only
+  // exists on a different, lighter search-result shape elsewhere in the
+  // codebase. Checking `current === true` here fell through to work[0]
+  // whenever it was unset, and work[0] can be a FORMER job -- letting a
+  // stale/former employer verify and cache as current identity evidence.
+  it('does NOT verify against a former employer when no entry carries current:true, but a LATER entry has no `end` (is genuinely ongoing)', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        // No entry has `current: true`. work[0] is a FORMER job (has `end`)
+        // that happens to match the lead's stored company -- the exact
+        // false-positive shape Greptile flagged.
+        work_experience: [
+          { company: 'Vivian Health', end: '2023-01-01' }, // FORMER — has an end date
+          { company: 'Snowflake' }, // no `end` — genuinely current
+        ],
+      },
+      vivianLead, // lead.company === 'Vivian Health'
+    );
+    // Must check against the genuinely current job (Snowflake), not the
+    // former one (Vivian Health) that happens to sit first in the array.
+    expect(res.verdict).toBe('mismatch');
+  });
+
+  it('correctly matches when the genuinely current entry (no `end`) IS the lead\'s company, even when it is not first in the array', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [
+          { company: 'Snowflake', end: '2022-01-01' }, // FORMER
+          { company: 'Vivian Health' }, // no `end` — genuinely current
+        ],
+      },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('falls back to the first entry only when NO entry is genuinely current (every entry has an `end`)', () => {
+    // No live "current" signal at all -- this is the pre-existing, unchanged
+    // best-effort fallback (not what this finding is about), kept for
+    // regression coverage of that boundary.
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [
+          { company: 'Vivian Health', end: '2023-01-01' },
+          { company: 'Snowflake', end: '2020-01-01' },
+        ],
+      },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
 });
 
 describe('verifyLinkedInIdentityForSend (shared guard)', () => {

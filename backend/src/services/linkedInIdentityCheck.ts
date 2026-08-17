@@ -109,7 +109,18 @@ function extractProfileName(profile: any): string {
 function extractProfileCompanies(profile: any): string[] {
   const companies: string[] = [];
   const work = Array.isArray(profile?.work_experience) ? profile.work_experience : [];
-  const current = work.filter((w: any) => w && w.current === true);
+  // ENG-1026 Greptile P1 (round 3): full-profile work_experience entries --
+  // the ONLY shape this module ever sees, since it exclusively calls
+  // getLinkedInProfile -- signal "ongoing" via the ABSENCE of an `end`
+  // field, not a `current` boolean. That flag only exists on a different,
+  // lighter search-result shape used elsewhere (outreachProspectPreviewService.ts,
+  // agentModeService.ts's own search-sync paths). Matches the established
+  // pattern already used 3x for this exact data source in
+  // enrichmentV3RealDeps.ts (`work_experience.find(e => !e.end)`).
+  // Checking `current === true` here silently fell through to work[0]
+  // whenever it was unset -- and work[0] can be a FORMER job -- letting a
+  // stale employer verify and cache as current identity evidence.
+  const current = work.filter((w: any) => w && !w.end);
   const considered = current.length > 0 ? current : work.slice(0, 1);
   for (const w of considered) {
     if (typeof w?.company === 'string' && w.company.trim()) companies.push(w.company.trim());
