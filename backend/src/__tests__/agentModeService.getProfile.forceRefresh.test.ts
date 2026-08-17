@@ -29,6 +29,8 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: jest.fn(),
+    resolveAccountIdWithSource: jest.fn(),
+    listUserOwnedUnipileAccountIds: jest.fn().mockResolvedValue([]),
     isAccountConnected: jest.fn().mockResolvedValue(true),
     probeAccountSession: jest.fn().mockResolvedValue('connected'),
     clearStatusCache: jest.fn(),
@@ -46,7 +48,7 @@ import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 const mockGetService = unipileProfileServiceFactory.getUnipileProfileService as jest.Mock;
 const mockGetConnection = unipileConnectionsDb.getConnectionByProfileUrlAndAccount as jest.Mock;
-const mockResolveAccountId = linkedInOutreachService.resolveAccountId as jest.Mock;
+const mockResolveAccountIdWithSource = linkedInOutreachService.resolveAccountIdWithSource as jest.Mock;
 
 describe('AgentModeService.linkedinOutreach get-profile — fresh-read + fail-closed (ENG-508)', () => {
   let service: AgentModeService;
@@ -107,7 +109,7 @@ describe('AgentModeService.linkedinOutreach get-profile — fresh-read + fail-cl
 
   it('fails closed with a connect-LinkedIn error and never calls Unipile when no account resolves', async () => {
     stubProfile({ public_identifier: 'nobody', headline: 'should never be read' });
-    mockResolveAccountId.mockResolvedValue(null); // no user account and no site-wide fallback
+    mockResolveAccountIdWithSource.mockResolvedValue({ accountId: null, usedSharedAccount: false }); // no user account and no site-wide fallback
 
     const res = await service.linkedinOutreach(userId, {
       action: 'get-profile',
