@@ -31562,13 +31562,36 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // site-wide Unipile accounts when the user has no personally-connected account.
     // Write actions (send-invite, send-message, etc.) are excluded from this fallback —
     // they already block non-owned accounts above.
+    //
+    // ENG-1198: a shared/site-wide account's network is NOT the user's — its
+    // network_distance and "already connected/pending" signals are computed
+    // relative to a stranger's account. `usedSharedAccount` (+ `sharedAccountId`)
+    // is threaded into every read-action response below so callers can caveat
+    // or refuse degree-based logic instead of silently trusting it.
     const READ_ACTIONS_WITH_FALLBACK = ['get-profile', 'search-people', 'get-company', 'search-parameters'];
-    if (!account_id && READ_ACTIONS_WITH_FALLBACK.includes(action)) {
-      account_id = await linkedInOutreachService.resolveAccountId(userId);
+    let usedSharedAccount = false;
+    if (READ_ACTIONS_WITH_FALLBACK.includes(action)) {
+      if (!account_id) {
+        const resolved = await linkedInOutreachService.resolveAccountIdWithSource(userId);
+        account_id = resolved.accountId;
+        usedSharedAccount = resolved.usedSharedAccount;
+      } else {
+        // ENG-1198: an explicit account_id isn't necessarily the user's own —
+        // it may be a `sharedAccountId` this same endpoint disclosed on a prior
+        // call and the caller echoed back. Check ownership instead of assuming
+        // false whenever the caller supplied an id, so the flag stays accurate.
+        const ownAccountIds = await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+        usedSharedAccount = !ownAccountIds.includes(account_id);
+      }
       if (account_id) {
-        console.log(`[AgentMode] linkedinOutreach: using site-wide account for ${action}`);
+        console.log(`[AgentMode] linkedinOutreach: using ${usedSharedAccount ? 'site-wide' : 'own'} account for ${action}`);
       }
     }
+    const withAccountMeta = (data: any) => (
+      data && typeof data === 'object'
+        ? { ...data, usedSharedAccount, ...(usedSharedAccount ? { sharedAccountId: account_id } : {}) }
+        : data
+    );
 
     // Guard: if no account_id is available at this point, return a clear error
     // instead of forwarding a null account_id to Unipile (which returns a
@@ -31650,7 +31673,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
           if (Array.isArray(searchResult?.items)) {
-            const trimmedItems = searchResult.items.map((item: any) => {
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
+            // public_identifier literally the string 'undefined' — passing those
+            // through yields unusable fake profile URLs like /in/undefined.
+            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
                 public_identifier: item.public_identifier,
@@ -31658,7 +31685,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 last_name: item.last_name,
                 headline: item.headline,
                 location: item.location,
-                network_distance: item.network_distance,
+                // network_distance is relative to whichever account ran the search —
+                // omit it when that account is a shared one, not the user's own
+                // (ENG-1198), so degree-based targeting logic isn't silently corrupted.
+                ...(usedSharedAccount ? {} : { network_distance: item.network_distance }),
                 public_profile_url: item.public_profile_url,
                 is_open_profile: item.is_open_profile,
               };
@@ -31669,9 +31699,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: { ...searchResult, items: trimmedItems } };
+            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
           }
-          return { success: true, data: searchResult };
+          return { success: true, data: withAccountMeta(searchResult) };
         }
 
         case 'get-profile': {
@@ -31709,8 +31739,19 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               (raw.public_identifier
                 ? `https://www.linkedin.com/in/${raw.public_identifier}`
                 : (isUrl ? target : null));
+            // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
+            // with public_identifier literally the string 'undefined' — mirrors
+            // the search-people filtering above. get-profile can't drop the row
+            // (the caller asked for this specific person), so flag it and drop
+            // the fabricated /in/undefined URL instead.
+            const isAnonymized = raw.public_identifier === 'undefined';
             let conn: { connectedAt?: number } | null = null;
-            if (profileUrl) {
+            // A shared/site-wide account's connection state belongs to a
+            // STRANGER, not the user — reconciling is_relationship/connected_at
+            // from it would present that stranger's "already connected/pending"
+            // status as the user's own (ENG-1198). Skip the lookup entirely so
+            // both fields are omitted below, same as network_distance.
+            if (profileUrl && !usedSharedAccount) {
               const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
               conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
             }
@@ -31719,9 +31760,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // BEFORE this change (30-day TTL) can still carry another viewer's stale
             // values — a spread of `raw` would leak them until the row expires. Only a
             // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            // ENG-1198: on a cold (non-cached) response network_distance survives
+            // onto `raw` (see unipileProfileService.ts) — but it's relative to
+            // whichever account was used. Drop it when that account is a shared
+            // one, not the user's own, so a stranger's connection degree isn't
+            // presented as the user's.
             const {
               is_relationship: rawRelationship,
               connected_at: rawConnectedAt,
+              network_distance: rawNetworkDistance,
+              public_profile_url: rawPublicProfileUrl,
               ...viewerIndependentRaw
             } = raw;
             // Reconcile as a union: connected if our per-account cache has a row OR a
@@ -31733,19 +31781,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
               ...viewerIndependentRaw,
-              is_relationship: isConnected,
-              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
-              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
-              // otherwise keep the raw timestamp ONLY from a live response.
-              ...(conn && typeof conn.connectedAt === 'number'
-                ? { connected_at: conn.connectedAt }
-                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
-                  ? { connected_at: rawConnectedAt }
-                  : {}),
+              // Never surface the fabricated /in/undefined URL for an anonymized profile.
+              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              // See ENG-1198 note above: is_relationship/connected_at are the
+              // user's "already connected/pending" signal — only meaningful
+              // relative to the user's own account, not a borrowed shared one.
+              ...(usedSharedAccount ? {} : {
+                is_relationship: isConnected,
+                // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+                // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+                // otherwise keep the raw timestamp ONLY from a live response.
+                ...(conn && typeof conn.connectedAt === 'number'
+                  ? { connected_at: conn.connectedAt }
+                  : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                    ? { connected_at: rawConnectedAt }
+                    : {}),
+              }),
+              // See ENG-1198 note above: only keep network_distance when it's
+              // relative to the user's own account, not a borrowed shared one.
+              ...(!usedSharedAccount && rawNetworkDistance !== undefined
+                ? { network_distance: rawNetworkDistance }
+                : {}),
+              ...(isAnonymized ? { anonymized: true } : {}),
             };
-            return { success: true, data };
+            return { success: true, data: withAccountMeta(data) };
           }
-          return { success: true, data: raw };
+          return { success: true, data: withAccountMeta(raw) };
         }
 
         case 'list-connections': {
@@ -32232,7 +32293,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileCompanyService.ts.
           const { getUnipileCompanyService } = await import('./unipileCompanyServiceFactory');
           const companyResult = await getUnipileCompanyService().getCompany(companyId, account_id);
-          return { success: true, data: companyResult.rawData };
+          return { success: true, data: withAccountMeta(companyResult.rawData) };
         }
 
         case 'cancel-invitation': {
@@ -32274,11 +32335,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }));
           return {
             success: true,
-            data: {
+            data: withAccountMeta({
               candidates: trimmedCandidates,
               fromCache: resolveResult.fromCache,
               source: resolveResult.source,
-            },
+            }),
           };
         }
 
