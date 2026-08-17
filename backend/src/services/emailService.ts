@@ -1049,6 +1049,111 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     }
   },
 
+  /**
+   * Tell an owner their LinkedIn (Unipile) session died and only they can revive it
+   * (ENG-1197).
+   *
+   * Deliberately names what is blocked rather than just "reconnect": the failure is
+   * invisible from the product's surface, because discovery keeps working off a
+   * shared account (ENG-1198) while every send, withdraw and even the read of the
+   * pending queue is dead. An owner told only "reconnect your account" has no way to
+   * tell whether that mattered.
+   */
+  async sendLinkedInAccountDisconnectedEmail(
+    toEmails: string | string[],
+    opts: { accountName: string; disconnectedAt: string; isReminder: boolean; daysDisconnected: number }
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(opts.accountName);
+      const when = new Date(opts.disconnectedAt).toLocaleString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+      const headline = opts.isReminder
+        ? `Still disconnected after ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'}`
+        : 'Your LinkedIn account disconnected';
+      const settingsUrl = `${customerFrontendUrl}/settings/connected-accounts`;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>🔌 ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="error-section">
+                <h3>LinkedIn outreach is paused until you reconnect</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  LinkedIn ended the session for <strong>${safeName}</strong> on <strong>${when}</strong>.
+                  Reconnecting takes about a minute and only you can do it &mdash; it needs your LinkedIn login.
+                </p>
+              </div>
+              <p style="line-height: 1.6;"><strong>What has stopped:</strong></p>
+              <ul style="line-height: 1.6;">
+                <li>Sending connection invitations and messages</li>
+                <li>Withdrawing old pending invitations</li>
+                <li>Reading how many invitations are still pending</li>
+              </ul>
+              <p style="line-height: 1.6;">
+                Any scheduled outreach that needs this account is being skipped rather than run, so nothing is
+                being sent from a broken session. It resumes on its own once you reconnect &mdash; there is
+                nothing to switch back on.
+              </p>
+            </div>
+            <div class="footer">
+              <a class="button" href="${settingsUrl}">Reconnect LinkedIn</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                If reconnecting does not work, remove the connection and add it again as a new connection.
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${opts.accountName}
+
+LinkedIn ended the session for "${opts.accountName}" on ${when}. Reconnecting takes about a minute and only you can do it - it needs your LinkedIn login.
+
+What has stopped:
+- Sending connection invitations and messages
+- Withdrawing old pending invitations
+- Reading how many invitations are still pending
+
+Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.
+
+---
+Reconnect LinkedIn: ${settingsUrl}
+If reconnecting does not work, remove the connection and add it again as a new connection.`;
+
+      const subject = opts.isReminder
+        ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn outreach paused)`
+        : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn outreach paused)`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`LinkedIn disconnect email sent to: ${emailList.join(', ')} (reminder=${opts.isReminder})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending LinkedIn disconnect email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the sync cron.
+    }
+  },
+
   async sendScheduledChatTokenLimitEmail(
     toEmails: string | string[],
     scheduleName: string,
