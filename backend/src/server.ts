@@ -1,5 +1,5 @@
 import app from './app';
-import { isCronEnabled, disableCron } from './utils/instanceState';
+import { isCronEnabled, disableCron, isTestRuntime } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
 import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
@@ -528,6 +528,15 @@ createTestAccount().then(async () => {
     console.log('Enrichment specialists registered');
   } catch (err) {
     console.warn('Failed to register enrichment specialists:', (err as Error).message);
+  }
+
+  // ENG-1286: everything below binds a port and registers ~21 background timers. Under
+  // Jest those timers outlive the environment that created them and poison whichever
+  // unrelated suite runs next in the same worker. Two suites import this module for `io`,
+  // which is created above and unaffected by not listening.
+  if (isTestRuntime()) {
+    console.log('[server] Jest runtime detected — not binding a port or registering background jobs');
+    return;
   }
 
   server.listen(port, async () => {
