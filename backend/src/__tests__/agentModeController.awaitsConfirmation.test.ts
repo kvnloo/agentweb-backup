@@ -81,6 +81,23 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'The customer chose the annual plan; renewal is confirmed. Summary below.',
     'Sent 12 replies across the 2 campaigns. Full log attached.',
     '',
+    // ENG-1256: live production repro. The mandated trailing "👉 Next Step:" line
+    // is a recommendation, not a question to the user, but its wording can still
+    // trip a keyword-shaped pattern — here "confirm ... which" from the pattern
+    // meant to catch "please confirm one of these" style human-directed asks.
+    // The deliverable above this line was already fully delivered; the run is
+    // NOT paused awaiting anyone's reply.
+    "The digest above is complete and accurate — every number, author, and quoted finding comes directly from the `get_pr_digest` result. " +
+      "👉 Next Step: Worth having someone verify click-ID capture on Every.io's lander and confirm which of the two pixels the ads are actually configured against.",
+    // Same shape, different Next Step wording — a recommendation ADDRESSED TO A
+    // THIRD PARTY ("Harsha"), not the user, that happens to contain "confirm ...
+    // before ... creat[es]" — the exact live production repro (ENG-1256 second
+    // recurrence), where "creates AW-LlmChargeEvents" a few clauses later
+    // completed the "confirm … before … creat" pattern meant for genuine
+    // confirm-before-you-build halts.
+    "Filed as #2323 and #2414 — merged and deployed. " +
+      "👉 Next Step: Ask Harsha to confirm whether #2323 and #2414 actually had his data-plane approval before merge — " +
+      "#2414 creates AW-LlmChargeEvents and ships a guarded production reset command, so an unapproved merge there has real billing blast radius.",
   ];
 
   it.each(cleanOrActionable)('does NOT fire on clean/actionable report: %s', (text) => {
