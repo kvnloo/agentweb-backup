@@ -30,6 +30,14 @@ on:
 
 permissions:
   contents: read
+  # CAUGHT LIVE (deep-dive verification, 2026-08-17): without pull-requests:
+  # read, `gh api .../pulls/{n}/files` 403s ("Resource not accessible by
+  # integration") for every real Dependabot PR — verified against three
+  # genuinely open ones (portal#997/#998/#999), all failing identically.
+  # This was never a content-based "declining the bypass" outcome; it was an
+  # unconditional fail-closed caused by a missing scope, indistinguishable
+  # from the intended behavior only by accident (both result in exit 1).
+  pull-requests: read
 
 jobs:
   integrity-check:

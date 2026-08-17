@@ -131,6 +131,35 @@ files_mixed_manifest_and_application_code() {
 EOF
 }
 
+files_renamed_into_manifest_name() {
+  # THE exact gap caught by independent deep-dive verification: an
+  # application file renamed TO a manifest's name. filename alone would pass
+  # the basename allowlist; status=renamed must still fail it closed.
+  cat <<'EOF'
+[
+  {"filename": "package.json", "status": "renamed", "previous_filename": "backend/src/evil.ts"}
+]
+EOF
+}
+
+files_copied_into_manifest_name() {
+  cat <<'EOF'
+[
+  {"filename": "requirements.txt", "status": "copied", "previous_filename": "agent-engine/payload.py"}
+]
+EOF
+}
+
+files_ordinary_manifest_modification() {
+  # The overwhelmingly common real case -- status=modified on a manifest --
+  # must NOT be caught by the new rename/copy check.
+  cat <<'EOF'
+[
+  {"filename": "package.json", "status": "modified"}
+]
+EOF
+}
+
 files_empty() {
   echo '[]'
 }
@@ -216,6 +245,31 @@ files_mixed_manifest_and_application_code >"${WORKDIR}/files.json"
 run_script
 check 'a manifest change alongside an application-code change still fails closed' 1 \
   'not a recognized dependency manifest'
+
+# THE exact gap caught by independent deep-dive verification: filename alone
+# passes the allowlist, but status=renamed/copied must still fail closed --
+# a genuine dependency bump never renames or copies a file into existence.
+files_renamed_into_manifest_name >"${WORKDIR}/files.json"
+run_script
+check 'a file renamed INTO a manifest name fails closed despite the name matching the allowlist' 1 \
+  'status=renamed'
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${LAST_OUTPUT}" == *'package.json'* ]]; then
+  printf 'PASS: %s\n' 'the renamed-to path is named in the failure output'
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  output: %s\n' 'the renamed-to path is named in the failure output' "${LAST_OUTPUT}"
+fi
+
+files_copied_into_manifest_name >"${WORKDIR}/files.json"
+run_script
+check 'a file copied INTO a manifest name also fails closed' 1 \
+  'status=copied'
+
+files_ordinary_manifest_modification >"${WORKDIR}/files.json"
+run_script
+check 'an ordinary modified (not renamed/copied) manifest still passes -- the rename check is not overbroad' 0 \
+  'Untampered'
 
 files_touches_scripts_dir >"${WORKDIR}/files.json"
 run_script
