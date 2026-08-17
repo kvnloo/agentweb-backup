@@ -5,6 +5,12 @@ import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
 import { toCustomerRunway } from '../services/llmUsageForecastService';
 import { resolveUsageDrivers, toCustomerDrivers, previewUsageRunway } from '../services/llmUsageDriversResolverService';
+import {
+  applyModelChange,
+  undoModelChange,
+  ModelChangeNotFoundError,
+  ModelNotAvailableError,
+} from '../services/llmModelChangeService';
 import { resolveBillingUserId } from '../services/tokenUsageService';
 import { usageRecordDb } from '../services/usageRecordDb';
 import { listLlmChargeEvents } from '../services/llmChargeAuditDb';
@@ -120,6 +126,75 @@ router.post('/usage-runway/preview', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Error previewing usage runway:', error);
     res.status(500).json({ error: 'Failed to preview usage runway' });
+  }
+});
+
+/**
+ * ENG-1217 AC6/AC9 — confirm a switch, and undo it.
+ *
+ * Separate from `/usage-runway/preview` on purpose: preview answers a question
+ * and persists nothing, this one writes a model. Keeping them apart means the
+ * read path can never acquire a write by accident, and the write path is the
+ * only thing that needs the audit trail and the stricter validation.
+ *
+ * The service reports an unowned scope as NOT FOUND rather than forbidden, and
+ * that distinction is preserved here: a 403 would confirm the id exists and turn
+ * this into an enumeration oracle for other tenants' schedule ids.
+ */
+router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    const { scope, scopeId, toModel, estimatedDaysRecovered, confidence } = req.body || {};
+    if (typeof scopeId !== 'string' || !scopeId.trim()) {
+      return res.status(400).json({ error: '`scopeId` is required' });
+    }
+    if (typeof toModel !== 'string' || !toModel.trim()) {
+      return res.status(400).json({ error: '`toModel` is required' });
+    }
+
+    const result = await applyModelChange(userId, {
+      scope: scope === 'session' ? 'session' : 'schedule',
+      scopeId: scopeId.trim(),
+      toModel: toModel.trim(),
+      // Recorded as the customer saw it, never recomputed — the point of the
+      // audit is what they agreed to, not what we would estimate now.
+      estimatedDaysRecovered:
+        typeof estimatedDaysRecovered === 'number' ? estimatedDaysRecovered : null,
+      confidence: typeof confidence === 'string' ? confidence : null,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof ModelChangeNotFoundError) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error instanceof ModelNotAvailableError) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Error applying model change:', error);
+    return res.status(500).json({ error: 'Failed to apply the change' });
+  }
+});
+
+router.post('/usage-runway/undo', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    const { changeId } = req.body || {};
+    if (typeof changeId !== 'string' || !changeId.trim()) {
+      return res.status(400).json({ error: '`changeId` is required' });
+    }
+
+    const result = await undoModelChange(userId, changeId.trim());
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof ModelChangeNotFoundError) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Error undoing model change:', error);
+    return res.status(500).json({ error: 'Failed to undo the change' });
   }
 });
 
