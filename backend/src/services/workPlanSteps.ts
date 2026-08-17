@@ -131,20 +131,51 @@ function isEmptyStepValue(value: unknown): boolean {
 }
 
 /**
- * Locate `probe`'s counterpart in `steps`. Title first, then position: a caller
- * reordering a plan renumbers the steps but keeps their titles, so matching on
- * stepCount first would pair up the wrong two.
+ * Pair every step in `before` with its counterpart in `after`, as indices into
+ * `after` (-1 where there is none).
+ *
+ * Title first, then stepCount: a caller reordering a plan renumbers the steps
+ * but keeps their titles, so matching on stepCount first would pair up the
+ * wrong two. A rename that stays in place still pairs, via the second pass.
+ *
+ * Each `after` entry can be claimed once. Without that, a step that was renamed
+ * AND moved matches no title and then falls through to a stepCount now held by
+ * a DIFFERENT incoming step — so its erased fields get compared against that
+ * other step's intact ones and the loss is reported as none.
  */
-function findStepIndex(steps: any[], probe: any): number {
-  if (probe.title !== undefined) {
-    const title = normalizeStepTitle(probe.title);
-    const matches = steps.filter((s: any) => normalizeStepTitle(s.title) === title);
-    // A title shared by two steps identifies neither — fall through to position
-    // rather than pairing everything against the first one.
-    if (matches.length === 1) return steps.indexOf(matches[0]);
-  }
-  if (probe.stepCount === undefined || probe.stepCount === null) return -1;
-  return steps.findIndex((s: any) => Number(s.stepCount) === Number(probe.stepCount));
+function pairSteps(before: any[], after: any[]): number[] {
+  const pairs: number[] = new Array(before.length).fill(-1);
+  const claimed = new Set<number>();
+
+  before.forEach((step: any, i: number) => {
+    if (step.title === undefined) return;
+    const title = normalizeStepTitle(step.title);
+    const matches: number[] = [];
+    after.forEach((candidate: any, j: number) => {
+      if (!claimed.has(j) && normalizeStepTitle(candidate.title) === title) matches.push(j);
+    });
+    // A title shared by two steps identifies neither — leave it to the second
+    // pass rather than pairing everything against the first match.
+    if (matches.length === 1) {
+      pairs[i] = matches[0];
+      claimed.add(matches[0]);
+    }
+  });
+
+  before.forEach((step: any, i: number) => {
+    if (pairs[i] !== -1) return;
+    if (step.stepCount === undefined || step.stepCount === null) return;
+    const j = after.findIndex(
+      (candidate: any, index: number) =>
+        !claimed.has(index) && Number(candidate.stepCount) === Number(step.stepCount),
+    );
+    if (j !== -1) {
+      pairs[i] = j;
+      claimed.add(j);
+    }
+  });
+
+  return pairs;
 }
 
 /**
@@ -214,22 +245,37 @@ export function findConflictingMergeTargets(existingSteps: any[], incomingSteps:
 }
 
 /**
- * Fields a replace would blank on steps the caller plainly meant to keep. A
- * step with no counterpart at all is skipped: that is a removal or a rewrite,
- * which the count guard and the dropped-titles diff already report.
+ * Fields a replace would blank on the steps the caller sent back.
+ *
+ * A step with no counterpart loses everything it had — but only counts as loss
+ * when some OTHER step was recognised. That distinction is the whole rule:
+ *
+ *  - Nothing recognised at all is a deliberate wholesale rewrite. There is no
+ *    step the caller plainly meant to preserve, and droppedStepTitles already
+ *    says what went. Refusing it would make replacing a plan impossible.
+ *  - Something recognised means the caller was amending THIS plan, so a step
+ *    that quietly failed to come back is content they did not mean to drop.
+ *
+ * That second case used to be skipped as "a removal, which the count guard
+ * already reports". The count guard only sees a SHRINK, so a same-length
+ * rewrite — one step renamed and reordered, its fields gutted — slipped past
+ * both checks and blanked the step with nothing said.
  */
 export function findStepContentLoss(before: any[], after: any[]) {
+  const pairs = pairSteps(before, after);
+  const keptAnything = pairs.some((index) => index !== -1);
   const losses: { stepCount: any; title: any; fields: string[] }[] = [];
-  for (const existing of before) {
-    const index = findStepIndex(after, existing);
-    if (index === -1) continue;
-    const fields = STEP_CONTENT_FIELDS.filter(
-      (field) => !isEmptyStepValue(existing[field]) && isEmptyStepValue(after[index][field]),
-    );
+  before.forEach((existing: any, i: number) => {
+    const index = pairs[i];
+    if (index === -1 && !keptAnything) return;
+    const populated = STEP_CONTENT_FIELDS.filter((field) => !isEmptyStepValue(existing[field]));
+    const fields = index === -1
+      ? populated
+      : populated.filter((field) => isEmptyStepValue(after[index][field]));
     if (fields.length > 0) {
       losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields] });
     }
-  }
+  });
   return losses;
 }
 
@@ -253,9 +299,11 @@ function mergeWorkPlanStep(existing: any, incoming: any): any {
 /**
  * Resolve each incoming step to the index it amends, or -1 to append.
  *
- * Deliberately stepCount-before-title, the opposite of findStepIndex: here the
+ * Deliberately stepCount-before-title, the opposite of pairSteps: here the
  * caller has explicitly named the step to amend, and the schema says so.
- * findStepIndex infers identity across two full arrays with no such selector.
+ * pairSteps infers identity across two full arrays with no such selector — and
+ * the route must therefore never hand this function a stepCount the caller did
+ * not actually supply, or the explicit selector is a fabricated one.
  *
  * A shared title resolves to nothing rather than to the first match — the same
  * rule findAmbiguousMergeTargets pre-checks, kept here so the two cannot drift.

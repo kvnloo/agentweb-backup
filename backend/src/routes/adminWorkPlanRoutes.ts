@@ -125,19 +125,68 @@ router.put("/:planId", async (req, res) => {
     // Google Pre-Launch Gate plan and answered HTTP 200 with a null diff.
     // The rules now live where the damage happens, and the tool shares them.
     let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+    // Validated whether or not steps came with it. Nesting this under "steps
+    // were supplied" is accept-and-disregard by another name: the caller is
+    // answered 200 for a mode we never looked at.
+    const rawMode = (req.body as any).steps_mode ?? (req.body as any).stepsMode;
+    if (rawMode !== undefined && rawMode !== 'merge' && rawMode !== 'replace') {
+      return res.status(400).json({
+        message: `Unrecognised steps_mode "${rawMode}". Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
+      });
+    }
     if (normalizedSteps !== undefined) {
-      const rawMode = (req.body as any).steps_mode ?? (req.body as any).stepsMode;
-      if (rawMode !== undefined && rawMode !== 'merge' && rawMode !== 'replace') {
-        // Never accept-and-disregard: the caller believes a merge happened.
-        return res.status(400).json({
-          message: `Unrecognised steps_mode "${rawMode}". Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
-        });
-      }
       const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
       const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
 
       if (mode === 'merge') {
-        const ambiguous = findAmbiguousMergeTargets(existingSteps, normalizedSteps);
+        // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
+        // becomes "Step N", `stepCount` the array position, the two list fields
+        // []. Merging those invented values over real ones is the same data loss
+        // by a different route: it is exactly how the Pre-Launch Gate titles
+        // were truncated from "Step 1: Scope the launch" to "Step 1". A
+        // synthesised stepCount is worse still, because merge resolution trusts
+        // stepCount ahead of title — so a title-only entry would silently amend
+        // whichever step happened to sit at that array position.
+        //
+        // So: normalized VALUES, but the raw payload as the authority on which
+        // keys the caller actually sent. Only camelCase is consulted, because
+        // that is all `normalizeWorkPlanSteps` reads; the MCP tool resolves its
+        // snake_case aliases before it ever reaches this route (ENG-889).
+        // Treating `required_function_calls` as supplied here would merge the
+        // normalizer's default [] over the stored list.
+        const rawSteps: any[] = steps;
+        const supplied = normalizedSteps.map((norm: any, i: number) => {
+          const raw = rawSteps[i] ?? {};
+          const has = (key: string) => raw[key] !== undefined;
+          const out: any = {};
+          if (has('stepCount')) out.stepCount = norm.stepCount;
+          if (has('title')) out.title = norm.title;
+          if (has('description')) out.description = norm.description;
+          if (has('userInstructions')) out.userInstructions = norm.userInstructions;
+          if (has('requiredFunctionCalls')) out.requiredFunctionCalls = norm.requiredFunctionCalls;
+          if (has('skillIds')) out.skillIds = norm.skillIds;
+          if (has('expectedAssetCount')) out.expectedAssetCount = norm.expectedAssetCount;
+          return out;
+        });
+
+        // An entry carrying neither selector names no step. Amending whatever
+        // sits at its array position is the same silent wrong-step edit the
+        // ambiguity check below already refuses to make.
+        const untargeted = supplied
+          .map((s: any, i: number) => ({ s, position: i + 1 }))
+          .filter(({ s }: any) => s.stepCount === undefined && s.title === undefined)
+          .map(({ position }: any) => position);
+        if (untargeted.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: a supplied step names neither stepCount nor title, so there is no way to tell which step it amends.',
+            untargetedStepPositions: untargeted,
+            howToProceed: [
+              'Give each step a stepCount to amend an existing step, or a title to amend it by name (a title matching nothing is appended as a new step).',
+            ],
+          });
+        }
+
+        const ambiguous = findAmbiguousMergeTargets(existingSteps, supplied);
         if (ambiguous.length > 0) {
           return res.status(400).json({
             message: 'Refusing to merge: a step title matches more than one step, so there is no way to tell which one to amend.',
@@ -145,7 +194,7 @@ router.put("/:planId", async (req, res) => {
             howToProceed: ['Retry with stepCount on each ambiguous step to name the one you mean.'],
           });
         }
-        const conflicting = findConflictingMergeTargets(existingSteps, normalizedSteps);
+        const conflicting = findConflictingMergeTargets(existingSteps, supplied);
         if (conflicting.length > 0) {
           return res.status(400).json({
             message: 'Refusing to merge: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.',
@@ -153,27 +202,6 @@ router.put("/:planId", async (req, res) => {
             howToProceed: ['Combine the changes for each step into a single entry, then retry.'],
           });
         }
-        // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
-        // becomes "Step N", the two list fields become []. Merging that would
-        // write those invented values over the real ones, which is the same
-        // data loss by a different route: it is exactly how the Pre-Launch Gate
-        // titles were truncated from "Step 1: Scope the launch" to "Step 1".
-        // So merge only the fields the caller genuinely supplied, using the
-        // normalized values (for alias canonicalisation, ENG-889) but the raw
-        // payload as the authority on which keys were present.
-        const rawSteps: any[] = steps;
-        const supplied = normalizedSteps.map((norm: any, i: number) => {
-          const raw = rawSteps[i] ?? {};
-          const has = (...keys: string[]) => keys.some((k) => raw[k] !== undefined);
-          const out: any = { stepCount: norm.stepCount };
-          if (has('title', 'step_title')) out.title = norm.title;
-          if (has('description')) out.description = norm.description;
-          if (has('userInstructions', 'user_instructions')) out.userInstructions = norm.userInstructions;
-          if (has('requiredFunctionCalls', 'required_function_calls')) out.requiredFunctionCalls = norm.requiredFunctionCalls;
-          if (has('skillIds', 'skill_ids')) out.skillIds = norm.skillIds;
-          if (has('expectedAssetCount', 'expected_asset_count')) out.expectedAssetCount = norm.expectedAssetCount;
-          return out;
-        });
         normalizedSteps = mergeWorkPlanSteps(existingSteps, supplied);
       } else if (req.body.confirm_step_removal !== true) {
         // A replace stores exactly what was sent, so both a shrink and a
