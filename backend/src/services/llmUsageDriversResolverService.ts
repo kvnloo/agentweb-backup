@@ -107,6 +107,25 @@ export interface ScheduleDriver {
   frequency: string | null;
   shareOfTotal: number;
   callCount: number;
+  /**
+   * The model this schedule actually runs on.
+   *
+   * `pinnedModel` is what the schedule stores; NULL means it stores nothing and
+   * inherits the platform default, which is the common case — 66 of 91 active
+   * production schedules carry no `llmModel`. `effectiveModel` resolves that
+   * inheritance so a recommendation can be matched to the schedule, and so the
+   * UI can say what would actually change.
+   *
+   * The distinction survives to the boundary because switching an INHERITING
+   * schedule pins a model where none was set, and undoing that must restore
+   * inheritance rather than write back today's default.
+   */
+  pinnedModel: string | null;
+  effectiveModel: string | null;
+  /** The switch offered for THIS schedule, if its model has one. */
+  recommendedModel: string | null;
+  estimatedDaysRecovered: number | null;
+  confidence: RecommendationConfidence | null;
   /** INTERNAL — stripped before reaching a customer. */
   costMicroUsd: number;
 }
@@ -543,6 +562,10 @@ export async function resolveUsageDrivers(
   // Schedules are read for every POOLED member, not just the root: an org
   // member's schedule is billed to the root, so naming it means reading that
   // member's schedules too. Same reasoning as the pooled ledger read itself.
+  // Ranked BEFORE the schedule join, because each schedule row needs to look up
+  // the recommendation for the model it runs on.
+  const ranked = [...best.values()].sort(byImpact);
+
   let scheduleDrivers: ScheduleDriver[] = [];
   if (attribution.bySchedule?.length) {
     const pooledUserIds = await resolvePooledLedgerUserIds(usage.billingUserId);
@@ -553,10 +576,27 @@ export async function resolveUsageDrivers(
     for (const sched of lists.flat()) {
       if (sched?.scheduleId) byId.set(sched.scheduleId, sched);
     }
+    // Inheriting schedules run the platform default, so resolving it once is
+    // what lets a per-schedule row carry a confirmable recommendation at all.
+    // Without it, two thirds of schedules would show spend and no action.
+    const platformDefault =
+      typeof agentModeService.getDefaultModel === "function"
+        ? await agentModeService.getDefaultModel().catch(() => null)
+        : null;
+    const recByFromModel = new Map(ranked.map((r) => [r.fromModel, r]));
+
     scheduleDrivers = attribution.bySchedule.map((d) => {
       const meta = byId.get(d.key);
+      const pinnedModel = (meta as { llmModel?: string } | undefined)?.llmModel || null;
+      const effectiveModel = pinnedModel || platformDefault;
+      const rec = effectiveModel ? recByFromModel.get(effectiveModel) : undefined;
       return {
         scheduleId: d.key,
+        pinnedModel,
+        effectiveModel,
+        recommendedModel: rec?.toModel ?? null,
+        estimatedDaysRecovered: rec?.estimatedDaysRecovered ?? null,
+        confidence: rec?.confidence ?? null,
         // A schedule deleted mid-cycle still consumed the allowance. Report it
         // under its id with a null title so the UI can say "deleted schedule",
         // rather than dropping spend the customer was charged for.
@@ -568,8 +608,6 @@ export async function resolveUsageDrivers(
       };
     });
   }
-
-  const ranked = [...best.values()].sort(byImpact);
 
   // ENG-1210 AC12: record which recommendation each customer was actually shown,
   // with the model before/after and the driver it was attributed to. Emitted per
@@ -635,13 +673,21 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
           hasUntaggedSourceSpend: resolved.attribution.sourceUnattributedMicroUsd > 0,
         }
       : null,
-    // Named work with its recurrence, and no micro-USD (ENG-1212 AC4).
+    // Named work with its recurrence, and no micro-USD (ENG-1212 AC4). The
+    // model fields cross so a row can offer a confirmable switch that names the
+    // exact schedule (AC8) — the recommendation list alone is per-MODEL and has
+    // no scope to apply to.
     scheduleDrivers: resolved.scheduleDrivers.map((d) => ({
       scheduleId: d.scheduleId,
       title: d.title,
       frequency: d.frequency,
       shareOfTotal: d.shareOfTotal,
       callCount: d.callCount,
+      pinnedModel: d.pinnedModel,
+      effectiveModel: d.effectiveModel,
+      recommendedModel: d.recommendedModel,
+      estimatedDaysRecovered: d.estimatedDaysRecovered,
+      confidence: d.confidence,
     })),
     recommendations: resolved.recommendations.map((r) => ({
       fromModel: r.fromModel,
