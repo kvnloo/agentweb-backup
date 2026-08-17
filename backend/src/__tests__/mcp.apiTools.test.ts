@@ -818,6 +818,236 @@ describe('apiTools', () => {
 
       expect(session.attributedModels).toBeNull();
       expect(session.attributionBasis).toBeNull();
+      expect(session.modelLine).toBeNull();
+    });
+
+    // ENG-1313: the Daily Satisfaction Score Report named the picker
+    // (llmModel) instead of the model that ran, because building the
+    // per-session model line was left to the reporting agent's own judgement
+    // even after ENG-892 pre-resolved attributedModels. Pre-computing the
+    // exact display line — like ENG-892 pre-computed attributedModels itself —
+    // removes that judgement call instead of trusting the agent to make it.
+    describe('modelLine (ENG-1313 per-session model line)', () => {
+      it('shows both picker and the model that ran, in "picker: X · ran: Y" form, when they mismatch', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-picker-mismatch',
+            userId: 'user-4',
+            title: 'Picker says one thing, transcript says another',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            messages: [
+              { role: 'assistant', content: 'Working on it', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Here are the results', llm: 'anthropic.claude-opus-5' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5');
+      });
+
+      // ENG-1313 acceptance criterion 2, replayed against the exact fixture named
+      // in the issue: session f4c58f8e (Ed's xCures/GA4 session from the 08-01
+      // report) recorded 33 assistant turns, all on anthropic.claude-opus-5, while
+      // the picker still held a stale voice selection from before the 07-31
+      // fleet-wide Opus 5 switch.
+      it('replays the 08-01 report fixture (session f4c58f8e): names anthropic.claude-opus-5 as the model that ran', async () => {
+        const assistantTurns = Array.from({ length: 33 }, (_, i) => ({
+          role: 'assistant',
+          content: `Turn ${i + 1}`,
+          llm: 'anthropic.claude-opus-5',
+        }));
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'f4c58f8e',
+            userId: 'user-ed',
+            title: 'xCures GA4 tracking',
+            createdAt: '2026-08-01T00:00:00Z',
+            updatedAt: '2026-08-01T01:00:00Z',
+            llmModel: 'gemini-3.1-flash-live-preview',
+            satisfactionScore: { score: 2, reason: 'stuck', evaluatedAt: '2026-08-01T01:00:00Z', evaluatedMessageIndex: 33 },
+            messages: [
+              { role: 'user', content: 'Why is GA4 not tracking?' },
+              ...assistantTurns,
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributedModels).toEqual(['anthropic.claude-opus-5']);
+        expect(session.attributionBasis).toBe('transcript');
+        expect(session.modelLine).toBe('picker: gemini-3.1-flash-live-preview · ran: anthropic.claude-opus-5');
+      });
+
+      it('shows just the resolved model, with no "picker:" prefix, when the picker agrees with what ran', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-agree',
+            userId: 'user-9',
+            title: 'Picker matches transcript',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'Hi', llm: 'anthropic.claude-opus-5' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('anthropic.claude-opus-5');
+        expect(session.modelLine).not.toContain('picker:');
+      });
+
+      it('shows just the resolved model, with no "picker:" prefix, when attribution is selection-only (nothing to contrast)', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-selection-only',
+            userId: 'user-10',
+            title: 'Legacy session, no transcript provenance',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'gpt-4o',
+            messages: [{ role: 'assistant', content: 'Hi' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributionBasis).toBe('selection-only');
+        expect(session.modelLine).toBe('gpt-4o');
+        expect(session.modelLine).not.toContain('picker:');
+      });
+
+      it('lists every model that ran, comma-joined, on a mid-session backup-model switch', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-backup-switch',
+            userId: 'user-5',
+            title: 'Backup model kicked in',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'claude-sonnet-4-5',
+            messages: [
+              { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.modelLine).toBe('picker: claude-sonnet-4-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
+      });
+    });
+
+    // ENG-1313 acceptance criterion 3: the model-mix section must be computed
+    // from generation models (attributedModels), never llmModel, so a
+    // fleet-wide default-model flip is visible as a step change the next day
+    // instead of being invisible because every session still shows its old
+    // picker selection.
+    describe('modelMix (ENG-1313 model-mix / share-of-sessions section)', () => {
+      it('computes share of sessions per model from attributedModels, not from the picker', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [
+            // Picker is stale on both, but the transcript agrees: both ran opus-5.
+            {
+              sessionId: 'sess-a', userId: 'u-a', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'gemini-3.1-flash-live-preview',
+              messages: [{ role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5' }],
+            },
+            {
+              sessionId: 'sess-b', userId: 'u-b', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'claude-sonnet-4-5',
+              messages: [{ role: 'assistant', content: 'b', llm: 'anthropic.claude-opus-5' }],
+            },
+            // Third session actually ran on a different model.
+            {
+              sessionId: 'sess-c', userId: 'u-c', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+              llmModel: 'gpt-5-chat-2',
+              messages: [{ role: 'assistant', content: 'c', llm: 'gpt-5-chat-2' }],
+            },
+          ],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        // If this were keyed by llmModel (the pre-fix behaviour), the mix would
+        // show 3 distinct picker values with 1 session each — the fleet-wide
+        // move to opus-5 would be invisible. Keyed by attributedModels it is a
+        // clear 2-vs-1 majority.
+        expect(parsed.modelMix.sessionsWithModelData).toBe(3);
+        expect(parsed.modelMix.byModel).toEqual([
+          { model: 'anthropic.claude-opus-5', sessions: 2, share: 2 / 3 },
+          { model: 'gpt-5-chat-2', sessions: 1, share: 1 / 3 },
+        ]);
+      });
+
+      it('returns null when no session in range has any resolvable model attribution', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-empty-2', userId: 'u-e', createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-01T00:00:00Z',
+            messages: [{ role: 'user', content: 'hi' }],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-08-01T00:00:00Z',
+          end_time: '2026-08-02T00:00:00Z',
+        }, context);
+
+        const parsed = JSON.parse((result as any).content[0].text);
+
+        expect(parsed.modelMix).toBeNull();
+      });
+    });
+
+    it('should direct the model-mix section to attributedModels via the precomputed modelMix field', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('modelLine');
+      expect(description).toContain('modelMix');
     });
 
     // Cache tokens are billed but excluded from total_tokens, so cost/token ratios
