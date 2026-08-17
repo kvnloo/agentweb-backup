@@ -150,6 +150,51 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       }
     });
 
+    it('does not merge a synthesized title over a real one', async () => {
+      // `title: null` / `''` is not a title. Normalization replaces it with
+      // "Step N", and merging that invented value renames the step — the exact
+      // truncation that turned "Step 1: Scope the launch" into "Step 1".
+      for (const bad of [null, '']) {
+        jest.clearAllMocks();
+        mockGetWorkPlan.mockResolvedValue(plan);
+        mockUpdateWorkPlan.mockResolvedValue(8);
+        const res = await request(app)
+          .put('/api/admin/work-plans/plan-1')
+          .send({ steps: [{ stepCount: 3, title: bad, description: 'rewritten' }], steps_mode: 'merge' });
+        expect(res.status).toBe(200);
+        const third = mockUpdateWorkPlan.mock.calls[0][0].steps.find((s: any) => s.stepCount === 3);
+        expect(third.title).toBe(TEN[2].title);
+        expect(third.description).toBe('rewritten');
+      }
+    });
+
+    it('does not merge an empty list over a stored one when the list is null', async () => {
+      // `listOf()` turns a null list into [], so a presence check would merge
+      // that emptiness over real data — blanking under the non-destructive mode.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({
+          steps: [{ stepCount: 3, requiredFunctionCalls: null, skillIds: null, description: 'rewritten' }],
+          steps_mode: 'merge',
+        });
+      expect(res.status).toBe(200);
+      const third = mockUpdateWorkPlan.mock.calls[0][0].steps.find((s: any) => s.stepCount === 3);
+      expect(third.requiredFunctionCalls).toEqual(TEN[2].requiredFunctionCalls);
+      expect(third.skillIds).toEqual(TEN[2].skillIds);
+      expect(third.description).toBe('rewritten');
+    });
+
+    it('rejects two supplied modes that contradict each other', async () => {
+      // Both are valid tokens, so neither trips the unrecognised check — and
+      // taking the first silently applies semantics the caller also denied.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: TEN, steps_mode: 'merge', stepsMode: 'replace' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/steps_mode|stepsMode/i);
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
     it('rejects an explicitly supplied null steps_mode instead of defaulting to replace', async () => {
       // Nullish coalescing turned a supplied-but-invalid value back into
       // "absent", so the caller silently got replace semantics.
