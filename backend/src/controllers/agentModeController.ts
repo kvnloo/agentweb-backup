@@ -1681,8 +1681,13 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // anchor to the leading token — otherwise a write like `add_leads_to_list` or
 // `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
 // word. Irregular read names that don't lead with a read verb are listed exactly.
+// perform_data_analysis belongs here too (ENG-1276): it runs code on caller-supplied
+// data with no external side effects — the same as analyze_*/read_* — but its name
+// doesn't lead with a recognized verb, so without this it was misclassified as a
+// write and vetoed a legitimate skip whose FIRST step is calling it to compute
+// today's weekday (real prod session 17834849…, 2026-08-16).
 const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
-const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
 function isReadOnlyToolName(name: string): boolean {
   return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
 }
