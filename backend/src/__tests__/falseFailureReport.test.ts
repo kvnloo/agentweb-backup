@@ -21,6 +21,9 @@ import {
   collectPublishActionsSince,
   appendConfirmedPublishNotice,
   BOOKKEEPING_TOOLS,
+  collectConfirmedArtifactUrls,
+  appendConfirmedArtifactNotice,
+  reconcileFalseArtifactFailure,
 } from '../utils/falseFailureReport';
 
 const FALSE_FAILURE_TEXT =
@@ -497,6 +500,111 @@ describe('falseFailureReport', () => {
       const once = appendConfirmedPublishNotice(GENERIC, ledger);
       expect(appendConfirmedPublishNotice(once, ledger)).toBe(once);
       expect(appendConfirmedPublishNotice('', ledger)).toBe('');
+    });
+  });
+
+  // ENG-1224 (Variant A) / production session 1e9a4fe4: update_html_file had
+  // already returned a live preview URL when a trailing exception threw the turn
+  // into the catch block, and the diagnosis path had no notice for it — neither
+  // CONFIRMED_PUBLISH_TOOLS nor CONFIRMED_DATA_WRITE_TOOLS name an HTML editor
+  // tool, so the user was left with the bare "please try again" fallback and no
+  // link back to the work that had just landed.
+  describe('collectConfirmedArtifactUrls', () => {
+    const T = (name: string, timestamp: string, content: any) => ({ role: 'tool', name, timestamp, content });
+    const SUCCESS = (url: string) => JSON.stringify({ success: true, s3_url: url, message: 'ok' });
+
+    it('collects the URL from a confirmed update_html_file call at or after the turn start', () => {
+      expect(
+        collectConfirmedArtifactUrls(
+          [T('update_html_file', '2026-08-13T02:00:00Z', SUCCESS('https://s3/edited.html'))],
+          Date.parse('2026-08-13T01:00:00Z'),
+        ),
+      ).toEqual(['https://s3/edited.html']);
+    });
+
+    it('parses the URL through the S3-offload header wrapper', () => {
+      const wrapped =
+        '[Full response stored at S3 key: tool-responses/x/y.txt (35100 chars) — use search_tool_response tool to find specific fields]\n\n'
+        + SUCCESS('https://s3/edited.html');
+      expect(
+        collectConfirmedArtifactUrls(
+          [T('update_html_file', '2026-08-13T02:00:00Z', wrapped)],
+          Date.parse('2026-08-13T01:00:00Z'),
+        ),
+      ).toEqual(['https://s3/edited.html']);
+    });
+
+    it('ignores a call before the turn started, a failed call, and a non-artifact tool', () => {
+      expect(
+        collectConfirmedArtifactUrls(
+          [
+            T('update_html_file', '2026-08-13T00:30:00Z', SUCCESS('https://s3/earlier-turn.html')),
+            T('update_html_file', '2026-08-13T02:00:00Z', '⚠️ Tool Error: update_html_file'),
+            T('get_leads', '2026-08-13T02:00:00Z', SUCCESS('https://s3/not-an-artifact-tool.html')),
+          ],
+          Date.parse('2026-08-13T01:00:00Z'),
+        ),
+      ).toEqual([]);
+    });
+
+    it('de-duplicates the same URL and returns nothing for a missing/unusable window', () => {
+      const msgs = [
+        T('update_html_file', '2026-08-13T02:00:00Z', SUCCESS('https://s3/edited.html')),
+        T('update_html_file', '2026-08-13T02:05:00Z', SUCCESS('https://s3/edited.html')),
+      ];
+      expect(collectConfirmedArtifactUrls(msgs, Date.parse('2026-08-13T01:00:00Z'))).toEqual(['https://s3/edited.html']);
+      expect(collectConfirmedArtifactUrls(msgs, null)).toEqual([]);
+      expect(collectConfirmedArtifactUrls(msgs, NaN)).toEqual([]);
+      expect(collectConfirmedArtifactUrls(null, Date.parse('2026-08-13T01:00:00Z'))).toEqual([]);
+    });
+  });
+
+  describe('appendConfirmedArtifactNotice', () => {
+    const GENERIC = 'I encountered an error processing your request. Please try sending your message again.';
+
+    it('adds the preview URL to the generic fallback, and does NOT tell the user not to re-run', () => {
+      const out = appendConfirmedArtifactNotice(GENERIC, ['https://s3/edited.html']);
+      expect(out).toContain(GENERIC);
+      expect(out).toContain('https://s3/edited.html');
+      expect(out).not.toMatch(/do NOT re-run/i);
+    });
+
+    it('leaves the fallback alone when no artifact URL was confirmed', () => {
+      expect(appendConfirmedArtifactNotice(GENERIC, [])).toBe(GENERIC);
+      expect(appendConfirmedArtifactNotice(GENERIC, null)).toBe(GENERIC);
+    });
+
+    it('is idempotent and leaves empty content alone', () => {
+      const once = appendConfirmedArtifactNotice(GENERIC, ['https://s3/edited.html']);
+      expect(appendConfirmedArtifactNotice(once, ['https://s3/edited.html'])).toBe(once);
+      expect(appendConfirmedArtifactNotice('', ['https://s3/edited.html'])).toBe('');
+    });
+
+    it('extends an existing publish/data-write correction rather than dropping it', () => {
+      const withPublish = appendConfirmedPublishNotice(
+        GENERIC,
+        ledgerFromSucceededFunctions({ publish_landing_page_changes: 1 }),
+      );
+      const out = appendConfirmedArtifactNotice(withPublish, ['https://s3/edited.html']);
+      expect(out).toContain('published your landing-page changes');
+      expect(out).toContain('https://s3/edited.html');
+    });
+  });
+
+  describe('reconcileFalseArtifactFailure', () => {
+    it('appends the URL when the message falsely claims the work was not saved', () => {
+      const out = reconcileFalseArtifactFailure(FALSE_FAILURE_TEXT, ['https://s3/edited.html']);
+      expect(out).not.toBe(FALSE_FAILURE_TEXT);
+      expect(out).toContain('https://s3/edited.html');
+    });
+
+    it('leaves a truthful message untouched', () => {
+      const text = 'Your HTML file has been updated successfully.';
+      expect(reconcileFalseArtifactFailure(text, ['https://s3/edited.html'])).toBe(text);
+    });
+
+    it('leaves the message untouched when no artifact URL was confirmed', () => {
+      expect(reconcileFalseArtifactFailure(FALSE_FAILURE_TEXT, [])).toBe(FALSE_FAILURE_TEXT);
     });
   });
 });
