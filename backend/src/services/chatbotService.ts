@@ -299,6 +299,11 @@ export interface ChatSession {
       goalCompletion: number;   // 1-5: did the assistant accomplish what was asked?
       dataAccuracy: number;     // 1-5: plausible/consistent data, no hallucinations?
       outputQuality: number;    // 1-5: well-structured, specific, actionable output?
+      // ENG-1312: optional — a session scored before this shipped, or by a
+      // stale custom judge prompt, simply omits these.
+      concision?: number;               // 0-5: did reply length match the question/instruction?
+      instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
+      unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
   };
   judgeScores?: Record<string, {  // keyed by judge ID
@@ -311,6 +316,10 @@ export interface ChatSession {
       goalCompletion: number;
       dataAccuracy: number;
       outputQuality: number;
+      // ENG-1312: see satisfactionScore.dimensions above.
+      concision?: number;
+      instructionCompliance?: number;
+      unnecessaryPermissionRequest?: boolean;
     };
   }>;
   // Scores retracted because the session turned out to be outside the
