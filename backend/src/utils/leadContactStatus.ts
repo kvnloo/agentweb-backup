@@ -4,6 +4,8 @@
  * with backward compatibility for the legacy `unsubscribedFromGroupEmail` flag.
  */
 
+import { isGroupEmailIneligible } from './validation';
+
 export type ContactStatus = 'active' | 'do-not-contact' | 'unsubscribed';
 export type ContactStatusReason = 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
 
@@ -37,4 +39,15 @@ export function getDoNotContactReason(lead: any): string | null {
 
   // Legacy flag
   return 'Unsubscribed from group email';
+}
+
+/**
+ * Returns true if a lead's email is undeliverable for group-email purposes —
+ * either a provider-reported validation status of 'undeliverable', or a
+ * deterministic syntax/test-domain issue caught by isGroupEmailIneligible.
+ * Shared by the group-email preview and send endpoints (ENG-1194) so the
+ * preview's undeliverable count matches what send actually filters.
+ */
+export function isLeadUndeliverable(lead: any): boolean {
+  return lead?.customFields?.email_validation?.status === 'undeliverable' || isGroupEmailIneligible(lead?.email);
 }
