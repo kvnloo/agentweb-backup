@@ -9,6 +9,7 @@
 import {
   isUnusableSynthesis,
   buildExecutedActionsFallback,
+  buildExecutedActionsFooter,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -230,6 +231,62 @@ describe('buildExecutedActionsFallback', () => {
     expect(text.toLowerCase()).toContain('already');
   });
 
+  // ENG-1188: the root-cause fix recommendation was a ledger "listing every asset
+  // produced (with URLs)" — a truthful recap of tool names is not the same as a
+  // deliverable. extractMinimalToolResult (agentModeService.ts) already preserves
+  // the URL on every asset-producing tool's result (save_file -> file_url,
+  // create_html_file/create_html_from_template -> s3_url, generate_image ->
+  // imageUrl, playwright_browser_take_screenshot -> screenshotUrl, generate_video
+  // -> videoUrl, generate_voiceover -> audioUrl); the ledger just never read it.
+  it('includes the asset URL when a succeeded call carries one', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/xCures-Master-Banners-V2.html' } },
+    ]);
+    expect(text).toContain('https://s3.example.com/xCures-Master-Banners-V2.html');
+  });
+
+  it('includes one URL per call when the same tool succeeds multiple times', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'playwright_browser_take_screenshot', result: { success: true, screenshotUrl: 'https://s3.example.com/a.jpg' } },
+      { name: 'playwright_browser_take_screenshot', result: { success: true, screenshotUrl: 'https://s3.example.com/b.jpg' } },
+    ]);
+    expect(text).toContain('https://s3.example.com/a.jpg');
+    expect(text).toContain('https://s3.example.com/b.jpg');
+  });
+
+  it('recognizes the URL field for every asset-producing tool extractMinimalToolResult preserves one for', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'create_html_file', result: { success: true, s3_url: 'https://s3.example.com/banner.html' } },
+      { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/hero.png' } },
+      { name: 'generate_video', result: { success: true, videoUrl: 'https://s3.example.com/ad.mp4' } },
+      { name: 'generate_voiceover', result: { success: true, audioUrl: 'https://s3.example.com/vo.mp3' } },
+    ]);
+    expect(text).toContain('https://s3.example.com/banner.html');
+    expect(text).toContain('https://s3.example.com/hero.png');
+    expect(text).toContain('https://s3.example.com/ad.mp4');
+    expect(text).toContain('https://s3.example.com/vo.mp3');
+  });
+
+  it('does NOT include a URL for a failed call, even if the result carries a stale one', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'save_file', error: 'boom', result: { file_url: 'https://s3.example.com/stale.html' } },
+    ]);
+    expect(text).not.toContain('https://s3.example.com/stale.html');
+  });
+
+  it('does NOT include a URL for a deferred call', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'generate_image', result: { deferred: true, imageUrl: 'https://s3.example.com/not-yet.png' } },
+    ]);
+    expect(text).not.toContain('https://s3.example.com/not-yet.png');
+  });
+
+  it('omits a tool entirely when it produced no URL (e.g. a non-asset tool call)', () => {
+    const text = buildExecutedActionsFallback([{ name: 'call_meta_marketing_api', result: { success: true } }]);
+    expect(text).toContain('call_meta_marketing_api');
+    expect(text.split('\n').filter((l) => l.trim().startsWith('http'))).toHaveLength(0);
+  });
+
   it('never claims work happened when no tools ran', () => {
     const text = buildExecutedActionsFallback([]);
     expect(text).toContain('No actions were taken');
@@ -240,5 +297,20 @@ describe('buildExecutedActionsFallback', () => {
     const text = buildExecutedActionsFallback([null, undefined, {}, { name: '' }] as any[]);
     expect(typeof text).toBe('string');
     expect(text.length).toBeGreaterThan(0);
+  });
+});
+
+describe('buildExecutedActionsFooter', () => {
+  it('returns null when no tools ran', () => {
+    expect(buildExecutedActionsFooter([])).toBeNull();
+  });
+
+  it('includes the asset URL alongside the succeeded count', () => {
+    const footer = buildExecutedActionsFooter([
+      { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/xCures-Master-Banners-V2.html' } },
+    ]);
+    expect(footer).toContain('save_file');
+    expect(footer).toContain('1 succeeded');
+    expect(footer).toContain('https://s3.example.com/xCures-Master-Banners-V2.html');
   });
 });
