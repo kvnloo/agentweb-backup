@@ -9,6 +9,60 @@ export interface LlmUsagePolicy {
   hardCostThresholdMicroUsd: number;
   optimizedModelIds: string[];
   optimizedDefaultModel: string;
+
+  /**
+   * Percentage of the enforced allowance at which the proactive usage alert
+   * fires (ENG-1214 AC5, ENG-1210 AC9 — tunable without a deploy).
+   *
+   * OPTIONAL, and it has to be: every policy already stored in production
+   * predates this field, and a validator that rejected those would take
+   * admission down for every tier the moment it shipped. Absent means the
+   * default in `resolveAlertThresholds`.
+   */
+  alertUsagePercentThreshold?: number;
+
+  /**
+   * Whether an early-exhaustion FORECAST alerts, independently of the level
+   * above (ENG-1217 AC12). Lets an admin roll forecast alerts out per tier, or
+   * silence them, without touching the usage threshold. Absent means enabled.
+   */
+  alertOnForecastShortfall?: boolean;
+}
+
+/** Defaults applied when a policy predates the alert fields, or omits them. */
+export const DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD = 90;
+export const DEFAULT_ALERT_ON_FORECAST_SHORTFALL = true;
+
+export interface ResolvedAlertThresholds {
+  usagePercent: number;
+  onForecastShortfall: boolean;
+}
+
+/**
+ * The thresholds a client should alert on, with defaults already applied.
+ *
+ * Resolved SERVER-side so there is exactly one place that knows the default. A
+ * client carrying its own fallback would keep alerting at the old number for
+ * anyone whose policy set a different one, and the disagreement would be
+ * invisible — the customer simply gets warned at the wrong time.
+ */
+export function resolveAlertThresholds(
+  policy: LlmUsagePolicy | null | undefined,
+): ResolvedAlertThresholds {
+  const raw = policy?.alertUsagePercentThreshold;
+  return {
+    usagePercent:
+      isAlertPercent(raw) ? (raw as number) : DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD,
+    onForecastShortfall:
+      typeof policy?.alertOnForecastShortfall === "boolean"
+        ? policy.alertOnForecastShortfall
+        : DEFAULT_ALERT_ON_FORECAST_SHORTFALL,
+  };
+}
+
+/** 1..99. Not 100+: at the cap the user is blocked and the at-limit modal owns it. */
+function isAlertPercent(v: unknown): boolean {
+  return Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 99;
 }
 
 export interface LlmUsageModeDecision {
@@ -72,6 +126,17 @@ export function validateLlmUsagePolicy(policy: LlmUsagePolicy): string[] {
     errors.push("optimizedModelIds must contain at least one model");
   }
   if (!policy.optimizedDefaultModel?.trim()) errors.push("optimizedDefaultModel is required");
+  // Both alert fields are optional; only a PRESENT-but-invalid value is an error.
+  // `undefined` has to stay acceptable or every pre-existing stored policy breaks.
+  if (policy.alertUsagePercentThreshold !== undefined && !isAlertPercent(policy.alertUsagePercentThreshold)) {
+    errors.push("alertUsagePercentThreshold must be an integer between 1 and 99");
+  }
+  if (
+    policy.alertOnForecastShortfall !== undefined &&
+    typeof policy.alertOnForecastShortfall !== "boolean"
+  ) {
+    errors.push("alertOnForecastShortfall must be a boolean");
+  }
   if (
     Array.isArray(policy.optimizedModelIds) &&
     policy.optimizedDefaultModel &&

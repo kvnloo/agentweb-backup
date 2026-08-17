@@ -3853,6 +3853,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {
@@ -3888,6 +3890,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleNoEmails = {
@@ -3921,6 +3925,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -3946,6 +3952,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: 40,
         costPercentUsed: 106,
         costEnforced: true,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {

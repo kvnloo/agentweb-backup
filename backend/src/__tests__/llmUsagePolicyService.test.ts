@@ -1,6 +1,9 @@
 import {
   evaluateLlmUsageMode,
   selectPolicyModel,
+  validateLlmUsagePolicy,
+  resolveAlertThresholds,
+  DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD,
   type LlmUsagePolicy,
 } from "../services/llmUsagePolicyService";
 
@@ -229,5 +232,102 @@ describe("ENG-1211 — no forced optimized mode", () => {
     });
     expect(decision.effectiveModel).toBeNull();
     expect(decision.modelSelection).toBe("blocked");
+  });
+});
+
+/**
+ * ENG-1214 AC5 / ENG-1210 AC9 — alert thresholds must be tunable without a deploy.
+ *
+ * They live on `llmUsagePolicy`, which is already admin-editable settings data,
+ * so this is configuration rather than a schema change. Both fields are OPTIONAL:
+ * every policy already stored in production predates them, and a validator that
+ * rejected those would take admission down for every tier the moment it shipped.
+ */
+describe("alert thresholds (ENG-1214 AC5)", () => {
+  const base = () => ({
+    version: "v1",
+    enforcementState: "hard_only" as const,
+    optimizationCostThresholdMicroUsd: 80_000_000,
+    hardCostThresholdMicroUsd: 150_000_000,
+    optimizedModelIds: ["m1"],
+    optimizedDefaultModel: "m1",
+  });
+
+  it("accepts a policy that omits them entirely", () => {
+    expect(validateLlmUsagePolicy(base())).toEqual([]);
+  });
+
+  it("accepts a usage threshold inside 1..99", () => {
+    expect(validateLlmUsagePolicy({ ...base(), alertUsagePercentThreshold: 75 })).toEqual([]);
+  });
+
+  it("rejects a threshold of 100 or more", () => {
+    // At 100 the customer is already blocked and the at-limit modal owns the
+    // screen, so an alert there is both late and duplicated.
+    const errors = validateLlmUsagePolicy({ ...base(), alertUsagePercentThreshold: 100 });
+    expect(errors.join("; ")).toMatch(/alertUsagePercentThreshold/);
+  });
+
+  it("rejects a non-positive or fractional threshold", () => {
+    expect(validateLlmUsagePolicy({ ...base(), alertUsagePercentThreshold: 0 }).length).toBe(1);
+    expect(validateLlmUsagePolicy({ ...base(), alertUsagePercentThreshold: -5 }).length).toBe(1);
+    expect(validateLlmUsagePolicy({ ...base(), alertUsagePercentThreshold: 90.5 }).length).toBe(1);
+  });
+
+  it("rejects a non-boolean forecast flag", () => {
+    const errors = validateLlmUsagePolicy({
+      ...base(),
+      alertOnForecastShortfall: "yes" as unknown as boolean,
+    });
+    expect(errors.join("; ")).toMatch(/alertOnForecastShortfall/);
+  });
+
+  it("accepts the forecast flag switched off", () => {
+    // An admin silencing forecast alerts for a tier is a legitimate rollout
+    // control, so `false` must be distinguishable from absent.
+    expect(validateLlmUsagePolicy({ ...base(), alertOnForecastShortfall: false })).toEqual([]);
+  });
+});
+
+/**
+ * The defaults are resolved SERVER-side on purpose. If the portal kept its own
+ * fallback, a tier whose policy set a different threshold would keep being
+ * warned at the old number and the disagreement would be invisible — both sides
+ * look correct in isolation while the customer is warned at the wrong moment.
+ */
+describe("resolveAlertThresholds", () => {
+  const base = () => ({
+    version: "v1",
+    enforcementState: "hard_only" as const,
+    optimizationCostThresholdMicroUsd: 80_000_000,
+    hardCostThresholdMicroUsd: 150_000_000,
+    optimizedModelIds: ["m1"],
+    optimizedDefaultModel: "m1",
+  });
+
+  it("falls back to the documented defaults with no policy at all", () => {
+    expect(resolveAlertThresholds(null)).toEqual({
+      usagePercent: DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD,
+      onForecastShortfall: true,
+    });
+  });
+
+  it("honours a configured usage threshold", () => {
+    expect(resolveAlertThresholds({ ...base(), alertUsagePercentThreshold: 75 }).usagePercent).toBe(75);
+  });
+
+  it("honours forecast alerts being switched off", () => {
+    // `false` must survive, not be treated as "unset" and defaulted back to true.
+    expect(resolveAlertThresholds({ ...base(), alertOnForecastShortfall: false })).toEqual({
+      usagePercent: DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD,
+      onForecastShortfall: false,
+    });
+  });
+
+  it("ignores a stored value that is out of range rather than trusting it", () => {
+    // A bad value should degrade to the default, not alert at 0% or never.
+    expect(
+      resolveAlertThresholds({ ...base(), alertUsagePercentThreshold: 150 }).usagePercent,
+    ).toBe(DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD);
   });
 });
