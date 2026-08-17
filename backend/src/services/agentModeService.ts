@@ -29530,13 +29530,33 @@ ${strippedHtml}`;
     sessionId: string
   ): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+      // read -- a turn that writes an "Image generated" marker and then
+      // immediately calls set_work_plan_status in the same turn can otherwise race
+      // a stale replica and see too few images, rejecting genuinely-complete work
+      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+      // wrote it, must see it now" shape (agentModeController.ts already uses it
+      // for the analogous timed-out-run read).
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
           message: 'No work plan found in this session. Create one first using create_work_plan.'
         };
       }
+
+      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt,
+      // captured before any update in THIS call runs. workPlan.steps below starts
+      // as the SAME array session.workPlan.steps points at (the spread on the next
+      // line only copies the top-level object), so an in-place
+      // `workPlan.steps[i] = {...}` replacement further down is visible through
+      // both references — reading a "live" cutoff would see this batch's OWN
+      // just-assigned timestamps, collapsing every step resolved together in one
+      // call to the same instant and wrongly excluding assets a later step in that
+      // same batch actually produced in an earlier turn.
+      const originalResolvedAtByStep = new Map<number, string | undefined>(
+        session.workPlan.steps.map((s: any) => [s.stepCount, s.resolvedAt || s.completedAt])
+      );
 
       const workPlan = { ...session.workPlan };
       const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
@@ -29628,21 +29648,33 @@ ${strippedHtml}`;
         // The user can still legitimately reduce scope via modify_work_plan (lowering or
         // clearing expectedAssetCount), so this never becomes an unrecoverable block.
         //
-        // ENG-1188: scoped to images generated SINCE the previous step completed, not
+        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
         // the whole session — otherwise an earlier step's images satisfy a later
         // step's requirement without it producing anything of its own (e.g. step 1's
         // 18 hero images would silently cover step 2's own "3 required" declaration).
-        // No earlier step (or an earlier step with no completedAt yet) means no
-        // cutoff, matching the session-wide count this replaces for step 1.
+        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+        // the session-wide count this replaces for step 1.
+        //
+        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+        // PRE-BATCH resolvedAt (originalResolvedAtByStep, captured before this call
+        // started), walking back to the nearest earlier step that already had one —
+        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+        // SAME batch shares this instant as its live timestamp, which would exclude
+        // assets this step actually produced in an earlier turn; a step resolved
+        // in this same batch simply contributes no cutoff of its own, same as a
+        // step that has never resolved.
         if (update.status === 'completed'
           && typeof step.expectedAssetCount === 'number'
           && step.expectedAssetCount > 0) {
-          const earlierCompletedAts = workPlan.steps
-            .filter((s: any) => s.stepCount < step.stepCount && s.completedAt)
-            .map((s: any) => s.completedAt as string);
-          const sinceIso = earlierCompletedAts.length > 0
-            ? earlierCompletedAts.reduce((latest: string, ts: string) => (ts > latest ? ts : latest))
-            : undefined;
+          const earlierStepCounts = workPlan.steps
+            .filter((s: any) => s.stepCount < step.stepCount)
+            .map((s: any) => s.stepCount as number)
+            .sort((a: number, b: number) => b - a); // nearest first
+          let sinceIso: string | undefined;
+          for (const count of earlierStepCounts) {
+            const preBatch = originalResolvedAtByStep.get(count);
+            if (preBatch) { sinceIso = preBatch; break; }
+          }
           const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
           if (producedAssetCount < step.expectedAssetCount) {
             insufficientAssets.push({
@@ -29656,11 +29688,18 @@ ${strippedHtml}`;
         }
 
         // Update the step status
+        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+          ? new Date().toISOString()
+          : undefined;
         workPlan.steps[stepIndex] = {
           ...workPlan.steps[stepIndex],
           status: update.status,
           notes: update.notes,
-          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
+          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+          // — see the field's doc comment in chatbotService.ts for why this can't
+          // just reuse completedAt.
+          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
         };
 
         updatedSteps.push({
