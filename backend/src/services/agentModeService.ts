@@ -2863,16 +2863,28 @@ export class AgentModeService {
     //   matching the existing convention for other non-default/experimental models
     //   (e.g. anthropic.claude-opus-4-6-v1 above).
     'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true },
+    // 2026-08-17 (third pass): rounded every open-source family + Grok out to a
+    // flagship+efficient pair for genuine cross-price-tier redundancy — same
+    // live-verification bar as above (pricing cited in the request matched this
+    // GET /api/v1/models snapshot exactly). llama-3.3-70b-instruct (first added
+    // in the second pass) is REMOVED here: llama-4-scout is the efficient half of
+    // the SAME generation as the already-registered llama-4-maverick flagship, so
+    // one Llama-4 flagship+efficient pair replaces a Llama-4/Llama-3.3 mismatch.
     'openrouter/x-ai/grok-4.6': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/x-ai/grok-4.3': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/meta-llama/llama-4-maverick': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/meta-llama/llama-3.3-70b-instruct': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/meta-llama/llama-4-scout': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/meta-llama/llama-3.1-8b-instruct': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/deepseek/deepseek-v4-pro': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-flash': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/qwen/qwen3.8-max': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/qwen/qwen3.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/mistralai/mistral-large-2512': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/mistralai/mistral-small-2603': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/moonshotai/kimi-k3': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k2.6': { client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/z-ai/glm-5.2': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-4.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },

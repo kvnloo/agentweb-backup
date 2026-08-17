@@ -136,15 +136,20 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   // live-sourced flags from GET /api/v1/models (see the registry comment).
   const NEW_ROSTER_MODELS = [
     'openrouter/x-ai/grok-4.6',
+    'openrouter/x-ai/grok-4.3',
     'openrouter/meta-llama/llama-4-maverick',
-    'openrouter/meta-llama/llama-3.3-70b-instruct',
+    'openrouter/meta-llama/llama-4-scout',
+    'openrouter/meta-llama/llama-3.1-8b-instruct',
     'openrouter/deepseek/deepseek-v4-pro',
+    'openrouter/deepseek/deepseek-v4-flash',
     'openrouter/qwen/qwen3.8-max',
     'openrouter/qwen/qwen3.7-flash',
     'openrouter/mistralai/mistral-large-2512',
     'openrouter/mistralai/mistral-small-2603',
     'openrouter/moonshotai/kimi-k3',
+    'openrouter/moonshotai/kimi-k2.6',
     'openrouter/z-ai/glm-5.2',
+    'openrouter/z-ai/glm-4.7-flash',
   ];
 
   it.each(NEW_ROSTER_MODELS)('routes %s to the OpenRouter client', async (modelId) => {
