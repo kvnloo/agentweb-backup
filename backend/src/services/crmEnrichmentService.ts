@@ -1,4 +1,5 @@
 import { crmDb } from './db';
+import { usablePublicIdentifier, usableProfileUrl } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
@@ -890,9 +891,7 @@ export class CrmEnrichmentService {
         // the cache-rebuild path in buildLinkedInContextFromCache) synthesize a
         // fake https://www.linkedin.com/in/undefined and hand it to the
         // enrichment LLM as a "Resolved LinkedIn profile URL".
-        publicIdentifier = (profileData?.public_identifier && profileData.public_identifier !== 'undefined')
-          ? profileData.public_identifier
-          : null;
+        publicIdentifier = usablePublicIdentifier(profileData?.public_identifier);
         profileId = profileData?.provider_id ?? null;
 
         if (confidence === 'low') {
@@ -903,7 +902,12 @@ export class CrmEnrichmentService {
           linkedinContext = '';
         } else {
           const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
-          const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
+          // Rejecting the identifier above is only half of it: Unipile builds
+          // `public_profile_url` from that same bad identifier and sends it too, so
+          // this fallback re-created the very /in/undefined URL the identifier check
+          // had just refused, and handed it to the enrichment LLM as a resolved
+          // profile (ENG-1198 follow-up).
+          const cleanUrl = usableProfileUrl(rawUrl);
           const profileUrl = publicIdentifier
             ? `https://www.linkedin.com/in/${publicIdentifier}`
             : cleanUrl;
