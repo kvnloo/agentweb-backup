@@ -61,6 +61,25 @@
 # radius of a successful forgery to dependency manifests only, never
 # arbitrary source or CI config.
 #
+# CAUGHT LIVE A THIRD TIME (independent deep-dive re-verification,
+# 2026-08-17): the allowlist check above only ever inspected the CURRENT
+# filename. GitHub's PR-files API reports a renamed file by its NEW name,
+# with a separate `status: "renamed"` field (and `previous_filename`) — so
+# `git mv backend/src/evil.ts package.json` on a Dependabot branch reports
+# filename=package.json and would have sailed through the basename check
+# untouched, while the actual diff content is arbitrary attacker-controlled
+# code wearing a manifest's name. A genuine automated dependency bump NEVER
+# renames a file — it modifies an existing manifest in place. Fix: reject
+# ANY file with `status` "renamed" or "copied" outright, independent of what
+# its resulting name is.
+#
+# Also caught in the same pass: without `pull-requests: read` in the
+# workflow's `permissions:` block, `gh api .../pulls/{n}/files` 403s for
+# EVERY real Dependabot PR (verified live against three genuinely open ones)
+# — an unconditional fail-closed caused by a missing scope, not a
+# content-based decision, and indistinguishable from the intended behavior
+# only by accident (both paths exit 1). See dependabot-integrity-check.yml.
+#
 # This job is made a REQUIRED branch-protection check. That is what actually
 # closes the gap: even if dependabot-only-pr.sh is fully compromised and
 # reports a false "bypass eligible", this check is independently produced
@@ -157,20 +176,36 @@ main() {
     fail "found zero changed files for ${REPO}#${PR_NUMBER} — cannot confirm an empty diff is untampered (a PR always has at least one changed file; a truly empty result means the fetch itself is suspect)."
   fi
 
-  local filenames
-  filenames="$(printf '%s' "${files_json}" | jq -sr '[.[]] | flatten | .[].filename' 2>/dev/null)"
-  if [ -z "${filenames}" ]; then
-    fail "could not extract filenames from the changed-files list for ${REPO}#${PR_NUMBER}."
+  # Pull filename AND status together (tab-separated), not filename alone —
+  # see the rename check below for why status matters.
+  local file_rows
+  file_rows="$(printf '%s' "${files_json}" | jq -sr '[.[]] | flatten | .[] | [.filename, (.status // "")] | @tsv' 2>/dev/null)"
+  if [ -z "${file_rows}" ]; then
+    fail "could not extract the changed-files list for ${REPO}#${PR_NUMBER}."
   fi
 
   local disallowed_hits=()
-  local f
-  while IFS= read -r f; do
+  local f status
+  while IFS=$'\t' read -r f status; do
     [ -z "${f}" ] && continue
+    # CAUGHT LIVE (deep-dive verification, 2026-08-17): is_allowed() only
+    # ever looked at the CURRENT filename. GitHub's PR-files API reports a
+    # renamed file with its NEW filename and a separate `status: "renamed"`
+    # (plus `previous_filename`) — so `git mv backend/src/evil.ts
+    # package.json` on a Dependabot branch would report filename=package.json
+    # and sail through the basename allowlist untouched, while the actual
+    # content is an arbitrary attacker-controlled file wearing a manifest's
+    # name. A genuine automated dependency bump NEVER renames a file — it
+    # modifies an existing manifest in place — so ANY renamed or copied file
+    # fails closed here, regardless of what its new name is.
+    if [ "${status}" = "renamed" ] || [ "${status}" = "copied" ]; then
+      disallowed_hits+=("${f} (status=${status} — a rename/copy onto any path is never a genuine dependency bump)")
+      continue
+    fi
     if ! is_allowed "${f}"; then
       disallowed_hits+=("${f}")
     fi
-  done <<<"${filenames}"
+  done <<<"${file_rows}"
 
   if [ "${#disallowed_hits[@]}" -gt 0 ]; then
     echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${#disallowed_hits[@]} changed path(s) are not a recognized dependency manifest — not bypass-eligible:"

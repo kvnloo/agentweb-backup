@@ -170,11 +170,31 @@ if [ "$1" = "api" ]; then
 
   case "${path}" in
     */actions/runs\?*)
-      jq -r "${jq_filter}" "${MOCK_DIR}/runs.json"
+      # CAUGHT LIVE (independent deep-dive verification, 2026-08-17): this
+      # used to always serve the SAME runs.json regardless of the head_sha=
+      # query param, which made every head-mismatch test structurally unable
+      # to prove WHICH head's job actually got rerun -- mutation testing
+      # showed reintroducing the exact "rerun against the stale head" bug
+      # still passed 31/31. Parse head_sha= out of the path and, if a
+      # per-head fixture exists, serve THAT one instead -- so a test can
+      # assert the rerun targeted the run/job specific to the NEW head, not
+      # whatever the mock happens to always return.
+      head_sha_param="$(printf '%s' "${path}" | grep -oE 'head_sha=[0-9a-fA-F]+' | cut -d= -f2)"
+      if [ -n "${head_sha_param}" ] && [ -f "${MOCK_DIR}/runs_${head_sha_param}.json" ]; then
+        jq -r "${jq_filter}" "${MOCK_DIR}/runs_${head_sha_param}.json"
+      else
+        jq -r "${jq_filter}" "${MOCK_DIR}/runs.json"
+      fi
       exit 0
       ;;
     */jobs\?*)
-      jq -r "${jq_filter}" "${MOCK_DIR}/jobs.json"
+      # Same fix, keyed by run_id this time: .../actions/runs/<run_id>/jobs
+      run_id_param="$(printf '%s' "${path}" | grep -oE '/runs/[0-9]+/jobs' | grep -oE '[0-9]+')"
+      if [ -n "${run_id_param}" ] && [ -f "${MOCK_DIR}/jobs_${run_id_param}.json" ]; then
+        jq -r "${jq_filter}" "${MOCK_DIR}/jobs_${run_id_param}.json"
+      else
+        jq -r "${jq_filter}" "${MOCK_DIR}/jobs.json"
+      fi
       exit 0
       ;;
     */issues/*/comments\?*)
@@ -466,8 +486,26 @@ NEW_HEAD_SHA='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 # the original request ALSO resolves against this same new head, that's a
 # second, redundant review in an already-rare race — a wasted credit, not a
 # correctness bug.
+# A run/job fixture keyed to NEW_HEAD_SHA specifically, DISTINCT from
+# HEAD_SHA's (JOB_ID) -- this is what makes the assertion below able to
+# actually catch a regression. Under the old mock (one shared runs.json/
+# jobs.json regardless of head_sha=), reintroducing the exact "rerun against
+# the stale head" bug this test is named for still passed 31/31, because the
+# mock returned JOB_ID either way.
+NEW_RUN_ID='31962373999'
+NEW_JOB_ID='95202299999'
 new_mock
 printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
+cat >"${MOCK_DIR}/runs_${NEW_HEAD_SHA}.json" <<EOF
+{"workflow_runs": [
+  {"id": ${NEW_RUN_ID}, "run_number": 3, "name": "Tests", "head_sha": "${NEW_HEAD_SHA}"}
+]}
+EOF
+cat >"${MOCK_DIR}/jobs_${NEW_RUN_ID}.json" <<EOF
+{"jobs": [
+  {"id": ${NEW_JOB_ID}, "name": "Require Greptile Review"}
+]}
+EOF
 run_script
 check 'a head change explicitly requests AND reruns the gate for the NEW head, deterministically' 0 \
   "re-ran 'Require Greptile Review'"
@@ -485,8 +523,21 @@ else
   printf 'FAIL: %s\n  calls.log:\n%s\n' 'two review requests were posted — the original head, then explicitly the new head (the accepted cost)' \
     "$(cat "${MOCK_DIR}/calls.log")"
 fi
-check_call_logged 'the gate was rerun against the NEW head''s job, not the stale one' \
-  "actions/jobs/${JOB_ID}/rerun"
+# THE assertion that used to be vacuous: targets NEW_JOB_ID specifically,
+# not the shared JOB_ID constant. A regression that reruns the STALE head's
+# job (JOB_ID) instead of the new head's (NEW_JOB_ID) now genuinely fails
+# this check, rather than passing by coincidence because both fixtures used
+# to be the same file.
+check_call_logged 'the gate was rerun against the NEW head''s own job id, not the stale head''s' \
+  "actions/jobs/${NEW_JOB_ID}/rerun"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF "actions/jobs/${JOB_ID}/rerun" "${MOCK_DIR}/calls.log" 2>/dev/null; then
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  the stale head''s job id (%s) was reran instead of the new head''s (%s)\n  calls.log:\n%s\n' \
+    'the STALE head''s job id must never be the one rerun' "${JOB_ID}" "${NEW_JOB_ID}" "$(cat "${MOCK_DIR}/calls.log")"
+else
+  printf 'PASS: %s\n' 'the stale head''s job id was never the one rerun'
+fi
 
 # The head-mismatch recovery reuses post_review_request and rerun_gate_job
 # directly, so their own existing failure-mode tests (comment-post failure,
