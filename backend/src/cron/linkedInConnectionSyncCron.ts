@@ -559,14 +559,24 @@ export function __resetSyncSchedulingForTests(): void {
  * otherwise. The first walk after a restart is always full, which is the safe
  * direction: it prunes.
  */
-function takeFullWalkMode(accountId: string): 'full' | 'incremental' {
+function chooseWalkMode(accountId: string): 'full' | 'incremental' {
   const last = lastFullWalkAtByAccount.get(accountId);
-  const now = Date.now();
-  if (last !== undefined && now - last < FULL_INVITATION_WALK_INTERVAL_MS) {
+  if (last !== undefined && Date.now() - last < FULL_INVITATION_WALK_INTERVAL_MS) {
     return 'incremental';
   }
-  lastFullWalkAtByAccount.set(accountId, now);
   return 'full';
+}
+
+/**
+ * Record that a full walk actually completed.
+ *
+ * Kept separate from choosing the mode: stamping at selection time marks the walk
+ * done even when it then throws on a timeout, a 5xx, or a disconnect — and since
+ * only a full walk prunes, one failed attempt would push the next prune out by
+ * another whole interval, doubling the staleness the interval is supposed to bound.
+ */
+function markFullWalkCompleted(accountId: string): void {
+  lastFullWalkAtByAccount.set(accountId, Date.now());
 }
 
 function markRecheckedNow(accountId: string): void {
@@ -700,7 +710,9 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // block connection sync (and vice versa).
       try {
         // Cheap walk most cycles; a full one — which is what prunes — hourly.
-        await syncSentInvitationsForAccount(accountId, { mode: takeFullWalkMode(accountId) });
+        const walkMode = chooseWalkMode(accountId);
+        await syncSentInvitationsForAccount(accountId, { mode: walkMode });
+        if (walkMode === 'full') markFullWalkCompleted(accountId);
         if (observed !== 'disconnected') observed = 'connected';
       } catch (err) {
         // 'disconnected' wins over 'connected': proof of a dead session from either

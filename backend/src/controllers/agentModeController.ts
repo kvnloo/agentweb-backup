@@ -549,7 +549,17 @@ export function zeroAssistantIncompleteMessage(error: unknown): string {
 // run-history panel. getScheduledChats deliberately strips the full runResults array
 // for payload size, so the client can't derive this itself; we compute it server-side.
 export interface ScheduleRunHealth {
-  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  // Widened to the statuses runScheduledChat can actually store: computeScheduleRunHealth
+  // forwards `last.status` verbatim, so any status the run path writes can appear here.
+  // 'skipped_no_content' (ENG-1259) already exceeded the old union; 'skipped_account_disconnected'
+  // (ENG-1197) would have been the second.
+  lastRunStatus:
+    | 'success'
+    | 'failure'
+    | 'pending_user_input'
+    | 'skipped_no_content'
+    | 'skipped_account_disconnected'
+    | null;
   lastRunAt: string | null;
   // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
   // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
@@ -3409,10 +3419,36 @@ async function pauseScheduleForDisconnectedAccount(
     );
     // Unlike the per-run skip, a pause is a state change the owner cannot infer
     // from anything they already received, so it gets its own message.
-    await notifyScheduleOwnerOfFailure(schedule, userId, {
-      failedAttempts: consecutiveSkips,
-      failureClass: 'system',
-    });
+    //
+    // Deliberately NOT notifyScheduleOwnerOfFailure: that sends the generic
+    // run-failed email, which says the schedule "will not be retried until its next
+    // scheduled run" and, for the 'system' class, to contact support. Both are wrong
+    // here — a paused schedule has no next run, and the remedy is a reconnect plus
+    // re-enabling it, not support.
+    try {
+      const recipients: string[] = Array.isArray(schedule.emailNotifications)
+        ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+        : [];
+      let notifyEmails = recipients;
+      if (notifyEmails.length === 0) {
+        const { userDb } = await import('../services/db');
+        const owner = await userDb.getUserById(userId);
+        if (owner?.email) notifyEmails = [owner.email];
+      }
+      if (notifyEmails.length > 0) {
+        const { emailService } = await import('../services/emailService');
+        const disconnectedAt = new Date().toISOString();
+        await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
+          accountName: gate.accountNames[0] || 'your LinkedIn account',
+          disconnectedAt,
+          isReminder: true,
+          daysDisconnected: consecutiveSkips,
+          pausedScheduleName: schedule.scheduleName,
+        });
+      }
+    } catch (notifyError) {
+      console.error(`Failed to send pause notification for ${schedule.scheduleId}:`, notifyError);
+    }
     await sendAgentModeOncallAlert({
       subject: `Schedule paused — LinkedIn account disconnected: ${schedule.scheduleName}`,
       message:
@@ -3701,7 +3737,21 @@ export async function runScheduledChat(
     // had revoked. Each fire loaded skills, paged the CRM, ran discovery against a
     // borrowed shared account, and sent nothing — ~$5 of model spend for a
     // guaranteed no-op, recorded as a SUCCESS so no failure path ever fired.
-    const accountGate = await evaluateLinkedInAccountGate(schedule, userId);
+    //
+    // Never gates a test run or a resume. The ENG-1259 pre-check makes the same
+    // exclusion for the same reason: a human is waiting on a manual test and must
+    // see the flow exercised, not a silent no-op — and worse, a test skip would be
+    // written into runResults and inflate the very streak that triggers the
+    // auto-pause, so repeatedly testing a schedule could pause it. A resume is
+    // excluded because its session is already parked mid-flight; withholding it
+    // strands that session rather than saving anything.
+    const lastRunResult = Array.isArray(schedule.runResults) && schedule.runResults.length > 0
+      ? schedule.runResults[schedule.runResults.length - 1]
+      : null;
+    const isResumingParkedRun = lastRunResult?.status === 'pending_user_input';
+    const accountGate = (isTest || isResumingParkedRun)
+      ? { blocked: false, accountIds: [], accountNames: [] }
+      : await evaluateLinkedInAccountGate(schedule, userId);
     if (accountGate.blocked) {
       console.log(
         `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `

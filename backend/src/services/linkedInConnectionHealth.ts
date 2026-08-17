@@ -222,7 +222,13 @@ export async function recordUnipileAccountHealth(params: {
 
     // Already flagged. Pace a reminder so a session that stays dead for weeks does
     // not simply fall silent after day one.
-    if (!isOwnerNotifyEnabled()) return 'no-op';
+    //
+    // Deliberately NOT gated on the owner-email flag. That flag controls whether the
+    // CUSTOMER is emailed; gating the whole branch on it also silenced the oncall
+    // reminder, so with the flag at its production default a permanently-dead
+    // account would produce exactly one alert ever and then nothing — which is the
+    // 38-day blind spot this was built to close. The flag is applied inside notify()
+    // instead, where it only suppresses the customer's copy.
     const lastNotified = Date.parse(config.disconnect_notified_at || '');
     const due = !Number.isFinite(lastNotified) || now - lastNotified >= DISCONNECT_REMINDER_MS;
     if (!due) return 'no-op';
@@ -246,7 +252,7 @@ export async function recordUnipileAccountHealth(params: {
       disconnectedAt,
       isReminder: true,
       daysDisconnected: daysBetween(disconnectedAt, now),
-      notifyOwner: true,
+      notifyOwner: isOwnerNotifyEnabled(),
     });
     return 'reminded';
   } catch (error) {

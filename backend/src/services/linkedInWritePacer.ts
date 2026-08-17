@@ -43,7 +43,12 @@ export const PACED_WRITE_ACTIONS = new Set([
 ]);
 
 function envInt(name: string, fallback: number): number {
-  const raw = Number(process.env[name]);
+  // Trim-and-reject before Number(): `Number('')` and `Number('  ')` are both 0,
+  // which is finite and >= 0, so an env var set to an empty string would be read as
+  // a deliberate 0 and silently switch pacing off entirely.
+  const configured = (process.env[name] ?? '').trim();
+  if (configured === '') return fallback;
+  const raw = Number(configured);
   return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
 }
 

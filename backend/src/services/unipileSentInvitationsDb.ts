@@ -119,7 +119,12 @@ export async function deleteSentInvitationsByProfileUrls(
   accountId: string,
   publicProfileUrls: string[],
 ): Promise<number> {
-  const urls = Array.from(new Set(publicProfileUrls.filter(Boolean).map(normalizeLinkedInUrl)));
+  // Normalize BEFORE discarding empties: a whitespace-only string is truthy and
+  // survives filter(Boolean), but normalizes to '' — which would then match any
+  // malformed cached row that also normalizes to '' and delete it.
+  const urls = Array.from(
+    new Set(publicProfileUrls.map((u) => (u ? normalizeLinkedInUrl(u) : '')).filter(Boolean)),
+  );
   if (urls.length === 0) return 0;
 
   const rows = (await getAllSentInvitationsByAccount(accountId)).filter((inv) =>

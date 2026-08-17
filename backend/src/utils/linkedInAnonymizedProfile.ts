@@ -35,7 +35,16 @@ export function isAnonymizedIdentifier(publicIdentifier: unknown): boolean {
  */
 export function isFabricatedProfileUrl(url: unknown): boolean {
   if (typeof url !== 'string') return false;
-  return /\/in\/undefined\/?$/i.test(url.split('?')[0].trim());
+  return /\/in\/undefined\/?$/i.test(stripUrlSuffix(url));
+}
+
+/**
+ * Strip query AND fragment. Splitting on '?' alone leaves '#about' attached, which
+ * pushes the path off the end of the anchored match and lets a fabricated URL
+ * through.
+ */
+function stripUrlSuffix(url: string): string {
+  return url.split('?')[0].split('#')[0].trim();
 }
 
 /**
@@ -52,7 +61,7 @@ export function usablePublicIdentifier(publicIdentifier: unknown): string | null
 /** A usable profile URL, or null — rejecting the fabricated `/in/undefined` form. */
 export function usableProfileUrl(url: unknown): string | null {
   if (typeof url !== 'string') return null;
-  const cleaned = url.split('?')[0].trim();
+  const cleaned = stripUrlSuffix(url);
   if (!cleaned || isFabricatedProfileUrl(cleaned)) return null;
   return cleaned;
 }

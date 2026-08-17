@@ -1061,7 +1061,19 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
    */
   async sendLinkedInAccountDisconnectedEmail(
     toEmails: string | string[],
-    opts: { accountName: string; disconnectedAt: string; isReminder: boolean; daysDisconnected: number }
+    opts: {
+      accountName: string;
+      disconnectedAt: string;
+      isReminder: boolean;
+      daysDisconnected: number;
+      /**
+       * Set when a schedule was paused after repeated skips. Changes the remedy:
+       * reconnecting is no longer sufficient on its own, because a paused schedule
+       * does not resume by itself — which is the opposite of what the ordinary skip
+       * copy promises, and the reason this cannot reuse the generic run-failed email.
+       */
+      pausedScheduleName?: string;
+    }
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -1069,10 +1081,28 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const when = new Date(opts.disconnectedAt).toLocaleString('en-US', {
         year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
       });
-      const headline = opts.isReminder
-        ? `Still disconnected after ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'}`
-        : 'Your LinkedIn account disconnected';
-      const settingsUrl = `${customerFrontendUrl}/settings/connected-accounts`;
+      const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
+      const headline = opts.pausedScheduleName
+        ? 'A schedule was paused — LinkedIn still disconnected'
+        : opts.isReminder
+          ? `Still disconnected after ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'}`
+          : 'Your LinkedIn account disconnected';
+      // /settings/:tab — the tab slug is `accounts` (labelled "Connected Accounts"
+      // in the sidebar). `/settings/connected-accounts` is not a real tab, so it
+      // would have sent every recipient of this alert to a dead page. Canonical
+      // source: customer-portal src/config/portalRoutes.ts.
+      const settingsUrl = `${customerFrontendUrl}/settings/accounts`;
+      // A paused schedule needs BOTH actions, and saying only "reconnect" would
+      // leave it stopped indefinitely.
+      const resumeHtml = opts.pausedScheduleName
+        ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong> has been paused after
+             ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'} of skipped runs.
+             Reconnecting is not enough on its own — once the account is back, switch the schedule
+             back on from your schedules page.</p>`
+        : `<p style="line-height: 1.6;">
+             Any scheduled outreach that needs this account is being skipped rather than run, so nothing is
+             being sent from a broken session. It resumes on its own once you reconnect &mdash; there is
+             nothing to switch back on.</p>`;
 
       const html = `
         <html>
@@ -1109,11 +1139,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
                 <li>Withdrawing old pending invitations</li>
                 <li>Reading how many invitations are still pending</li>
               </ul>
-              <p style="line-height: 1.6;">
-                Any scheduled outreach that needs this account is being skipped rather than run, so nothing is
-                being sent from a broken session. It resumes on its own once you reconnect &mdash; there is
-                nothing to switch back on.
-              </p>
+              ${resumeHtml}
             </div>
             <div class="footer">
               <a class="button" href="${settingsUrl}">Reconnect LinkedIn</a>
@@ -1135,15 +1161,19 @@ What has stopped:
 - Withdrawing old pending invitations
 - Reading how many invitations are still pending
 
-Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.
+${opts.pausedScheduleName
+  ? `"${opts.pausedScheduleName}" has been paused after ${opts.daysDisconnected} day(s) of skipped runs. Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
+  : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
 
 ---
 Reconnect LinkedIn: ${settingsUrl}
 If reconnecting does not work, remove the connection and add it again as a new connection.`;
 
-      const subject = opts.isReminder
-        ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn outreach paused)`
-        : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn outreach paused)`;
+      const subject = opts.pausedScheduleName
+        ? `⏸️ Schedule paused: "${opts.pausedScheduleName}" needs ${opts.accountName} reconnected`
+        : opts.isReminder
+          ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn outreach paused)`
+          : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn outreach paused)`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmail(emailList, subject, text, html);
       console.log(`LinkedIn disconnect email sent to: ${emailList.join(', ')} (reminder=${opts.isReminder})`);
