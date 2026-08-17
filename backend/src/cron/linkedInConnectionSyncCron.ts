@@ -517,9 +517,45 @@ export const DISCONNECTED_RECHECK_MS = 30 * 60 * 1000;
 
 const lastRecheckAtByAccount = new Map<string, number>();
 
-/** Test-only: clears the backoff state so each test starts from a clean slate. */
-export function __resetDisconnectBackoffForTests(): void {
+/**
+ * How often the sent-invitation walk is a FULL one.
+ *
+ * Only the full walk prunes, so this also bounds how stale a pending-invitation row
+ * can be: at most this long after the invitation was accepted or withdrawn. An hour
+ * is far tighter than the cache's real consumers need, and it replaces five of every
+ * six full feed walks with a single-page one.
+ */
+export const FULL_INVITATION_WALK_INTERVAL_MS = 60 * 60 * 1000;
+
+const lastFullWalkAtByAccount = new Map<string, number>();
+
+/**
+ * Test-only: clears both pacing maps so each test starts from a clean slate.
+ *
+ * Both are deliberately module-level and per-process, which is right in production
+ * and leaks between cases in a suite that invokes the cron more than once: the first
+ * run takes the full walk, and every later one silently goes incremental and stops
+ * pruning. Call this in `beforeEach` wherever `runLinkedInConnectionSync` is
+ * exercised repeatedly.
+ */
+export function __resetSyncSchedulingForTests(): void {
   lastRecheckAtByAccount.clear();
+  lastFullWalkAtByAccount.clear();
+}
+
+/**
+ * Full walk if this account has not had one within the interval, cheap walk
+ * otherwise. The first walk after a restart is always full, which is the safe
+ * direction: it prunes.
+ */
+function takeFullWalkMode(accountId: string): 'full' | 'incremental' {
+  const last = lastFullWalkAtByAccount.get(accountId);
+  const now = Date.now();
+  if (last !== undefined && now - last < FULL_INVITATION_WALK_INTERVAL_MS) {
+    return 'incremental';
+  }
+  lastFullWalkAtByAccount.set(accountId, now);
+  return 'full';
 }
 
 function markRecheckedNow(accountId: string): void {
@@ -625,7 +661,8 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // Refresh pending sent-invitations independently — a failure here must not
       // block connection sync (and vice versa).
       try {
-        await syncSentInvitationsForAccount(accountId);
+        // Cheap walk most cycles; a full one — which is what prunes — hourly.
+        await syncSentInvitationsForAccount(accountId, { mode: takeFullWalkMode(accountId) });
         if (observed !== 'disconnected') observed = 'connected';
       } catch (err) {
         // 'disconnected' wins over 'connected': proof of a dead session from either
