@@ -139,6 +139,16 @@ export interface AttributedConversionCount {
    * names are surfaced for a human to add.
    */
   unrecognized: string[];
+  /**
+   * WHICH conversion families actually arrived, not just how many conversions in total.
+   *
+   * The total answers "is this account converting at all"; §G Tier 1 asks the narrower
+   * question "is the specific event we are PAYING to optimise for arriving" — and Haven
+   * proves those differ: its `lead` kept flowing all through the outage, so the total was
+   * never zero while `complete_registration` was gone. This map was already being built
+   * here and thrown away.
+   */
+  families: string[];
 }
 
 /**
@@ -183,7 +193,13 @@ export function countAttributedConversions(actions: any[] | undefined | null): A
   let conversions = 0;
   for (const value of perFamily.values()) conversions += value;
 
-  return { conversions, unrecognized };
+  // A family present with a count of ZERO is NOT "arrived". Meta reports the row when the
+  // conversion is configured, not when it happened, so counting configuration as arrival
+  // would make §G's absence check permanently green — the same shape of always-passing
+  // check as "did Meta report any actions".
+  const families = [...perFamily.entries()].filter(([, v]) => v > 0).map(([f]) => f);
+
+  return { conversions, unrecognized, families };
 }
 
 /**
@@ -383,7 +399,7 @@ export async function fetchDailyAdAccountActivity(
         if (!date) continue;
         const objective = typeof row?.objective === 'string' ? row.objective.trim().toUpperCase() : '';
 
-        const day = byDay.get(date) || { date, spend: 0, conversions: 0, unrecognized: [] };
+        const day = byDay.get(date) || { date, spend: 0, conversions: 0, unrecognized: [], families: [] };
         byDay.set(date, day);
 
         if (objective && !isConversionOptimisedObjective(objective)) {
@@ -397,6 +413,9 @@ export async function fetchDailyAdAccountActivity(
         day.conversions += counted.conversions;
         for (const u of counted.unrecognized) {
           if (!day.unrecognized.includes(u)) day.unrecognized.push(u);
+        }
+        for (const f of counted.families) {
+          if (!day.families.includes(f)) day.families.push(f);
         }
       }
 
@@ -459,6 +478,9 @@ export interface AdAccountDay {
   spend: number;
   conversions: number;
   unrecognized: string[];
+  /** Conversion families that actually arrived that day. §G Tier 1 streaks on this;
+   *  `evaluateAdAccountDays` ignores it entirely and still only looks at the total. */
+  families: string[];
 }
 
 export type AdAccountVerdict = {
@@ -545,6 +567,10 @@ export function evaluateAdAccountDays(days: AdAccountDay[]): AdAccountVerdict {
  *  sees every account every day, so it is the same shape at greater volume. */
 export const BLACKOUT_ALERT_CLASS = 'meta-attribution-blackout';
 export const TOKEN_ALERT_CLASS = 'meta-token-invalid';
+/** §G Tier 1. A SEPARATE class from the blackout on purpose: a blackout says "this account
+ *  converts nothing", this says "this account converts, but not the thing it is paying for".
+ *  Haven was healthy by the first measure throughout the outage. */
+export const OPTIMISATION_ALERT_CLASS = 'meta-optimisation-event-missing';
 
 /** Re-alert at most once per account per class per day. A blackout that is still open
  *  tomorrow still matters, so this is a rate limit rather than a one-shot. */
@@ -593,6 +619,10 @@ export interface MonitorDeps {
   ) => Promise<AdAccountActivity>;
   alertTransport?: AlertTransport;
   now?: number;
+  fetchOptimisation?: (
+    adAccountId: string,
+    accessToken: string,
+  ) => Promise<import('./metaOptimisationCoverage').OptimisationInputs>;
 }
 
 export interface MonitorSummary {
@@ -611,6 +641,18 @@ export interface MonitorSummary {
   /** Objectives in neither catalogue, counted as in-scope. Surfaced so the list can be
    *  extended deliberately rather than drifting. */
   unknownObjectives: string[];
+  /** §G Tier 1 — ACTIVE ad sets bidding toward an event that both signals agree is not
+   *  arriving. The only §G state that alerts. */
+  optimisationAlerts: number;
+  /** PAUSED ad sets in the same condition. Logged, never alerted: they cost nothing until
+   *  someone resumes them. Deliberate product decision, 2026-08-17. */
+  optimisationDormant: number;
+  /** ACTIVE and the pixel is silent, but the account's own conversion history contradicts
+   *  it — the low-volume case a 24h pixel window cannot resolve. Logged only. */
+  optimisationUnconfirmed: number;
+  /** No obtainable evidence: no pixel on the promoted object, or an optimisation §F cannot
+   *  count. Logged only, and never allowed to look like a clean pass. */
+  optimisationUnconfirmable: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -633,6 +675,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     unrecognizedActionTypes: [],
     excludedObjectives: [],
     unknownObjectives: [],
+    optimisationAlerts: 0,
+    optimisationDormant: 0,
+    optimisationUnconfirmed: 0,
+    optimisationUnconfirmable: 0,
   };
 
   const fetchActivity =
@@ -710,6 +756,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
 
     (activity.excludedObjectives || []).forEach((o) => excludedObjectives.add(o));
     (activity.unknownObjectives || []).forEach((o) => unknownObjectives.add(o));
+
+    // §G Tier 1 runs BEFORE the blackout verdict's early returns, and independently of it.
+    // Haven's account was `ok` by the blackout measure every single day of its outage —
+    // `lead` never stopped — so gating this behind a blackout would reproduce the exact
+    // blind spot it exists to close.
+    await checkOptimisationCoverage(
+      account, adAccountId, accessToken, activity.days, user, summary, alertTransport, now, deps,
+    );
 
     const verdict = evaluateAdAccountDays(activity.days);
     verdict.unrecognized.forEach((t) => unknownTypes.add(t));
@@ -822,5 +876,138 @@ async function raise(
     await transport(subject, message, context);
   } catch (error: any) {
     console.error(`${TAG} failed to send alert "${subject}": ${error?.message}`);
+  }
+}
+
+/**
+ * ENG-926 §G Tier 1 — is this account PAYING to optimise toward an event that is not
+ * arriving?
+ *
+ * Runs for every readable account on every sweep, independently of the blackout verdict,
+ * because the failure it looks for is invisible to that verdict by construction: Haven kept
+ * producing `lead` throughout its `complete_registration` outage, so it never had a
+ * blackout day and §F was silent for the entire eight days.
+ *
+ * Never throws and never alerts on anything but the confirmed case. Everything else — the
+ * paused, the contradicted, the unprovable — is logged, because a check whose reduced
+ * coverage is invisible reads exactly like a check that passed.
+ */
+async function checkOptimisationCoverage(
+  account: any,
+  adAccountId: string,
+  accessToken: string,
+  days: AdAccountDay[],
+  user: any,
+  summary: MonitorSummary,
+  alertTransport: AlertTransport,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const {
+      fetchOptimisationInputs, evaluateAccountOptimisationCoverage,
+    } = await import('./metaOptimisationCoverage');
+
+    const fetchOptimisation =
+      deps?.fetchOptimisation ?? ((id: string, token: string) => fetchOptimisationInputs(id, token));
+    const inputs = await fetchOptimisation(adAccountId, accessToken);
+    if (inputs.status !== 'ok') {
+      // Transient by definition. Alerting here would train people to ignore the channel
+      // before it ever caught a real one — the same call §F makes on insights failures.
+      console.warn(`${TAG} ${adAccountId}: ad sets unavailable for §G — ${inputs.error}`);
+      return;
+    }
+
+    const verdict = evaluateAccountOptimisationCoverage(
+      inputs.adSets, inputs.receivedEventsByPixel, days,
+    );
+
+    summary.optimisationDormant += verdict.dormant.length;
+    summary.optimisationUnconfirmed += verdict.unconfirmed.length;
+    summary.optimisationUnconfirmable += verdict.unconfirmable.length;
+
+    const describe = (m: { adSetName?: string; adSetId?: string; optimisationEvent: string; pixelId?: string }) =>
+      `"${m.adSetName || m.adSetId}" → ${m.optimisationEvent} (pixel ${m.pixelId})`;
+
+    // PAUSED mismatches are logged and never alerted. Decided deliberately on 2026-08-17:
+    // they cost nothing today, and §F's own history is that alerting on things nobody can
+    // act on is how the channel stops being read. They are one click from costing money,
+    // which is why they stay visible here rather than being dropped.
+    if (verdict.dormant.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.dormant.length} PAUSED ad set(s) optimise for an event ` +
+        `their pixel is not receiving — latent, no spend at risk: ` +
+        verdict.dormant.map(describe).join('; '),
+      );
+    }
+    if (verdict.unconfirmed.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.unconfirmed.length} ad set(s) whose pixel is quiet but ` +
+        `whose conversion history contradicts it — low volume, not alerting: ` +
+        verdict.unconfirmed.map(describe).join('; '),
+      );
+    }
+    if (verdict.unconfirmable.length || verdict.inconclusivePixels.length || inputs.pixelsNotChecked?.length) {
+      console.log(
+        `${TAG} ${adAccountId}: §G could not judge — ${verdict.unconfirmable.length} ad set(s) ` +
+        `without usable evidence, ${verdict.inconclusivePixels.length} silent pixel(s), ` +
+        `${inputs.pixelsNotChecked?.length || 0} pixel(s) past the cap`,
+      );
+    }
+    if (verdict.unrecognisedOptimisations.length) {
+      console.warn(
+        `${TAG} ${adAccountId}: unrecognised optimisation event(s) — add if real: ` +
+        verdict.unrecognisedOptimisations.join(', '),
+      );
+    }
+
+    if (!verdict.alerting.length) return;
+    summary.optimisationAlerts += verdict.alerting.length;
+
+    const worst = verdict.alerting.reduce((a, b) =>
+      b.consecutiveAbsentSpendingDays > a.consecutiveAbsentSpendingDays ? b : a);
+
+    await raise(
+      alertTransport,
+      // One alert per ACCOUNT per day, not per ad set: several ad sets on one pixel are one
+      // fault with one fix, and filing each separately is how a detector becomes a flood.
+      `${OPTIMISATION_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} is paying to optimise for an event it is not receiving`,
+      [
+        `${verdict.alerting.length} ACTIVE ad set(s) on ad account ${adAccountId} are bidding toward`,
+        `a conversion event that two independent signals agree is not arriving:`,
+        '',
+        ...verdict.alerting.map((m) =>
+          `  • ${describe(m)} — no "${m.expectedEventName}" on the pixel in the last 24h, and no ` +
+          `attributed ${m.insightsFamily} on ${m.consecutiveAbsentSpendingDays} consecutive spending day(s)`),
+        '',
+        'This is the failure that cost a managed client 8+ days of spend in August 2026: a',
+        'tracking wrapper was removed, the event it had been firing stopped arriving, nothing',
+        'errored, and the ad sets kept optimising toward it. Ordinary conversion monitoring',
+        'stays silent throughout, because the account\'s OTHER events keep flowing.',
+        '',
+        'Check first whether the event still fires on the site at all, then whether the ad',
+        'set should be repointed. Repointing what an ad set optimises for is an advertising',
+        'decision, not an engineering one.',
+      ].join('\n'),
+      {
+        'Alert Class': OPTIMISATION_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Ad Sets Affected': verdict.alerting.length,
+        'Optimisation Events': [...new Set(verdict.alerting.map((m) => m.optimisationEvent))].join(', '),
+        'Pixels': [...new Set(verdict.alerting.map((m) => m.pixelId).filter(Boolean))].join(', '),
+        'Longest Absence (spending days)': worst.consecutiveAbsentSpendingDays,
+        'Events Manager': `https://business.facebook.com/events_manager2/list/pixel/${worst.pixelId}/overview`,
+        'Ads Manager': `https://business.facebook.com/adsmanager/manage/adsets?act=${adAccountId}`,
+      },
+    );
+  } catch (error: any) {
+    // §G is an ADDITION to an existing sweep. Nothing it can do is worth aborting the
+    // blackout check that was already working.
+    console.warn(`${TAG} ${adAccountId}: §G optimisation check failed — ${error?.message}`);
   }
 }

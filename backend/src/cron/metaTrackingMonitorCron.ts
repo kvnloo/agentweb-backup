@@ -38,6 +38,12 @@ export interface TrackingMonitorCronSummary {
   /** Customers whose relayed CRM conversions are not reaching Meta at all. Zero today by
    *  construction — the check only evaluates accounts with the §C relay switched on. */
   conversionDivergences: number;
+  /** §G Tier 1 — ACTIVE ad sets paying to optimise toward an event that is not arriving. */
+  optimisationAlerts: number;
+  /** The same fault on PAUSED ad sets. Reported in the summary and never alerted: it costs
+   *  nothing today, but a run that stayed completely silent about it would make a latent
+   *  problem indistinguishable from no problem. */
+  optimisationDormant: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -52,6 +58,8 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     healthy: 0,
     unrecognizedActionTypes: [],
     conversionDivergences: 0,
+    optimisationAlerts: 0,
+    optimisationDormant: 0,
   };
 
   let users: any[];
@@ -75,6 +83,8 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.unclassifiable += result.unclassifiable;
       summary.idle += result.idle;
       summary.healthy += result.healthy;
+      summary.optimisationAlerts += result.optimisationAlerts;
+      summary.optimisationDormant += result.optimisationDormant;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -100,6 +110,12 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     `${summary.healthy} healthy, ${summary.idle} idle, ${summary.blackouts} blackout, ` +
     `${summary.tokenErrors} token error, ${summary.unclassifiable} unclassifiable, ` +
     `${summary.fetchErrors} unavailable` +
+    (summary.optimisationAlerts > 0
+      ? `, ${summary.optimisationAlerts} ad set(s) bidding toward an event that is not arriving`
+      : '') +
+    (summary.optimisationDormant > 0
+      ? `, ${summary.optimisationDormant} paused ad set(s) with the same fault (latent)`
+      : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
       : '') +
