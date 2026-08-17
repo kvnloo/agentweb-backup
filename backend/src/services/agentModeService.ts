@@ -29545,17 +29545,26 @@ ${strippedHtml}`;
         };
       }
 
-      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt,
-      // captured before any update in THIS call runs. workPlan.steps below starts
-      // as the SAME array session.workPlan.steps points at (the spread on the next
-      // line only copies the top-level object), so an in-place
-      // `workPlan.steps[i] = {...}` replacement further down is visible through
-      // both references — reading a "live" cutoff would see this batch's OWN
-      // just-assigned timestamps, collapsing every step resolved together in one
-      // call to the same instant and wrongly excluding assets a later step in that
-      // same batch actually produced in an earlier turn.
-      const originalResolvedAtByStep = new Map<number, string | undefined>(
-        session.workPlan.steps.map((s: any) => [s.stepCount, s.resolvedAt || s.completedAt])
+      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+      // AND status, captured before any update in THIS call runs. workPlan.steps
+      // below starts as the SAME array session.workPlan.steps points at (the
+      // spread on the next line only copies the top-level object), so an
+      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+      // through both references — reading a "live" cutoff would see this batch's
+      // OWN just-assigned timestamps, collapsing every step resolved together in
+      // one call to the same instant and wrongly excluding assets a later step in
+      // that same batch actually produced in an earlier turn.
+      //
+      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+      // that was completed/skipped and later reset to 'pending' (e.g. its assets
+      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+      // that stale timestamp as a cutoff for a later step would wrongly widen the
+      // asset-count window with assets from the step's earlier, now-superseded
+      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+      // status routes it to its fresh LIVE timestamp instead.
+      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
       );
 
       const workPlan = { ...session.workPlan };
@@ -29656,13 +29665,30 @@ ${strippedHtml}`;
         // the session-wide count this replaces for step 1.
         //
         // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
-        // PRE-BATCH resolvedAt (originalResolvedAtByStep, captured before this call
+        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
         // started), walking back to the nearest earlier step that already had one —
         // NOT the live in-progress workPlan.steps. A step resolved earlier in this
         // SAME batch shares this instant as its live timestamp, which would exclude
         // assets this step actually produced in an earlier turn; a step resolved
         // in this same batch simply contributes no cutoff of its own, same as a
         // step that has never resolved.
+        //
+        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+        // having been completed/skipped before (e.g. its assets need
+        // regenerating) — only 'completed'/'skipped' transitions stamp
+        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+        // the earlier, now-superseded attempt. The ordering gate above means the
+        // only way we can reach a 'completed' update here with an earlier step's
+        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+        // resolved within this very batch (otherwise it would still be pending
+        // live, too, and the ordering gate would have rejected this update
+        // already). In that case, trust the fresh, just-stamped LIVE timestamp
+        // for that step instead of its stale pre-batch one — that boundary is
+        // exactly "when did this step's redo actually finish," which correctly
+        // excludes both the stale pre-reset attempt's assets AND any redo-work
+        // assets produced leading up to this exact re-completion. A step with NO
+        // prior resolution at all (genuinely first-time-completed within this
+        // batch) still contributes no cutoff, same as the existing behavior.
         if (update.status === 'completed'
           && typeof step.expectedAssetCount === 'number'
           && step.expectedAssetCount > 0) {
@@ -29672,8 +29698,16 @@ ${strippedHtml}`;
             .sort((a: number, b: number) => b - a); // nearest first
           let sinceIso: string | undefined;
           for (const count of earlierStepCounts) {
-            const preBatch = originalResolvedAtByStep.get(count);
-            if (preBatch) { sinceIso = preBatch; break; }
+            const preBatch = originalStepStateByCount.get(count);
+            if (!preBatch) continue;
+            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+              continue;
+            }
+            if (preBatch.resolvedAt) {
+              const live = workPlan.steps.find((s: any) => s.stepCount === count);
+              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
+            }
           }
           const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
           if (producedAssetCount < step.expectedAssetCount) {
