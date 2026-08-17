@@ -66,6 +66,65 @@ describe('findStepContentLoss (ENG-1221)', () => {
   });
 });
 
+describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-1221)', () => {
+  const before = [
+    { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    { stepCount: 2, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+  ];
+
+  it('flags erasure on a step that was renamed and moved in the same replace', () => {
+    // Beta moves to position 1. Alpha is renamed, so it matches no title, and
+    // the old positional fallback then paired it with Beta's entry — which is
+    // fully populated, so the erasure of Alpha's description read as no loss.
+    const after = [
+      { stepCount: 1, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+      { stepCount: 2, title: 'Alpha v2', description: '', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss).toHaveLength(1);
+    expect(loss[0].title).toBe('Alpha');
+    expect(loss[0].fields).toContain('description');
+  });
+
+  it('never pairs one incoming step against two existing ones', () => {
+    // Only Beta is re-sent. Alpha has no counterpart at all, so its content is
+    // gone — reporting nothing here is how a rewrite erases a step silently.
+    const after = [{ stepCount: 1, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] }];
+    const loss = findStepContentLoss(before, after);
+    expect(loss.map((l: any) => l.title)).toEqual(['Alpha']);
+  });
+
+  it('stays silent on a wholesale rewrite where nothing was kept', () => {
+    // The carve-out that makes "replace this plan" possible at all: no step was
+    // recognised, so none was plainly meant to survive, and droppedStepTitles
+    // already reports what went. Only an unpaired step ALONGSIDE a recognised
+    // one is content the caller did not mean to drop.
+    const after = [
+      { title: 'Brand new A', description: 'a' },
+      { title: 'Brand new B', description: 'b' },
+    ];
+    expect(findStepContentLoss(before, after)).toHaveLength(0);
+  });
+
+  it('still reports no loss for a plain reorder that keeps every field', () => {
+    const after = [
+      { stepCount: 1, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+      { stepCount: 2, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    ];
+    expect(findStepContentLoss(before, after)).toHaveLength(0);
+  });
+
+  it('still reports no loss for a rename in place that keeps every field', () => {
+    // The common, harmless case: same order, same content, new wording. The
+    // stepCount fallback must still find it, or every rename trips the guard.
+    const after = [
+      { stepCount: 1, title: 'Alpha v2', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    expect(findStepContentLoss(before, after)).toHaveLength(0);
+  });
+});
+
 describe('summarizeStepChange (ENG-1221 AC3)', () => {
   it('reports a diff when steps actually changed', () => {
     const partial = TEN.map((s) => ({ stepCount: s.stepCount, skillIds: ['skill-b'] }));

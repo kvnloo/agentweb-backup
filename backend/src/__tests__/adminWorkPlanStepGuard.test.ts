@@ -112,6 +112,44 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       expect(written[0].title).toBe(TEN[0].title);
     });
 
+    it('targets a title-only merge entry by its title, not by its array position', async () => {
+      // The route synthesises a stepCount for an entry that carried none —
+      // normalizeWorkPlanSteps fills in the array position — and merge target
+      // resolution trusts stepCount over title. So "amend the step titled
+      // 'Step 7: a real title'", sent alone, landed on step 1 instead.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: [{ title: 'Step 7: a real title', description: 'rewritten' }], steps_mode: 'merge' });
+      expect(res.status).toBe(200);
+      const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+      expect(written).toHaveLength(10);
+      expect(written.find((s: any) => s.stepCount === 7).description).toBe('rewritten');
+      // The step that was NOT named must be untouched.
+      expect(written.find((s: any) => s.stepCount === 1)).toEqual(TEN[0]);
+    });
+
+    it('refuses a merge entry that names no step at all', async () => {
+      // With neither stepCount nor title there is nothing to resolve against.
+      // Silently amending whatever sat at that array position is the same
+      // wrong-step edit the ambiguity check already refuses to make.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ steps: [{ description: 'rewritten' }], steps_mode: 'merge' });
+      expect(res.status).toBe(400);
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unrecognised steps_mode even when no steps are sent', async () => {
+      // Validation nested under "steps were supplied" is accept-and-disregard
+      // by another name: the caller is told 200 for a mode we never honoured.
+      const res = await request(app)
+        .put('/api/admin/work-plans/plan-1')
+        .send({ title: 'Renamed', steps_mode: 'patch' });
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/steps_mode/i);
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
     it('rejects an unrecognised steps_mode rather than silently replacing', async () => {
       // Accept-and-disregard is the failure: the caller believes a merge ran.
       const res = await request(app)
