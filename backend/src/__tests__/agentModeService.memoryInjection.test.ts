@@ -43,7 +43,17 @@ const SAVED_MEMORY = {
   embedding: [],
 };
 
-function mockDeps(overrides: { memories?: any[]; orgId?: string | null } = {}) {
+const SAVED_ORG_MEMORY = {
+  memoryId: 'org-mem-1',
+  category: 'insight',
+  content: 'Shared: Q3 pipeline value $1.2M',
+  createdAt: '2026-07-30T12:00:00.000Z',
+  embedding: [],
+};
+
+function mockDeps(
+  overrides: { memories?: any[]; orgId?: string | null; orgMemories?: any[]; orgName?: string } = {}
+) {
   const mockChatbotService = require('../services/chatbotService');
   mockChatbotService.chatbotDb = {
     getChatSession: jest.fn().mockResolvedValue(makeSession()),
@@ -67,10 +77,16 @@ function mockDeps(overrides: { memories?: any[]; orgId?: string | null } = {}) {
     setMemoryEmbedding: jest.fn().mockResolvedValue(undefined),
   };
   mockDb.orgMemoryDb = {
-    getOrgMemories: jest.fn().mockResolvedValue([]),
+    getOrgMemories: jest.fn().mockResolvedValue(overrides.orgMemories ?? []),
     setMemoryEmbedding: jest.fn().mockResolvedValue(undefined),
   };
-  mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue(null) };
+  mockDb.orgDb = {
+    getOrgById: jest.fn().mockResolvedValue(
+      overrides.orgId
+        ? { orgId: overrides.orgId, name: overrides.orgName ?? 'Acme Co', orgMemoryEnabled: true }
+        : null
+    ),
+  };
 }
 
 function makeLLMResponse(text = 'Done.') {
@@ -116,6 +132,33 @@ describe('AgentModeService — memory injection wiring (ENG-1310 AC1)', () => {
     expect(lastNote).toBeGreaterThan(firstNote);
     // Carries its saved date, so any later reference has a source to attribute (AC1).
     expect(memoryMsg.content).toContain('saved 2026-07-31');
+  });
+
+  it('injects org memory bookended by the staleness caution, never headed "shared facts"', async () => {
+    mockDeps({ orgId: 'org-1', orgName: 'Acme Co', orgMemories: [SAVED_ORG_MEMORY] });
+    const callLLMSpy = jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue(makeLLMResponse());
+
+    await agentModeService.generateMarketingResponse(
+      "What's our Q3 pipeline?",
+      [] as any,
+      'test-user',
+      agentModeService.default_model,
+      'test-session'
+    );
+
+    const messagesArg = callLLMSpy.mock.calls[0][1] as any[];
+    const orgMemoryMsg = messagesArg.find(
+      (m: any) => typeof m.content === 'string' && m.content.includes('Q3 pipeline value')
+    );
+    expect(orgMemoryMsg).toBeDefined();
+    // Never claims the notes are verified "shared facts" for the org either.
+    expect(orgMemoryMsg.content).not.toMatch(/shared facts for/i);
+    expect(orgMemoryMsg.content).toContain('Organization Memory (unverified shared notes for "Acme Co"):');
+    const firstNote = orgMemoryMsg.content.indexOf(MEMORY_STALENESS_NOTE);
+    const lastNote = orgMemoryMsg.content.lastIndexOf(MEMORY_STALENESS_NOTE);
+    expect(firstNote).toBe(0);
+    expect(lastNote).toBeGreaterThan(firstNote);
+    expect(orgMemoryMsg.content).toContain('saved 2026-07-30');
   });
 
   it('injects no memory message when the account has none (no empty block)', async () => {
