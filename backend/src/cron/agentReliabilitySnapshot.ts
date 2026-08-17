@@ -223,7 +223,7 @@ export function computeReliabilitySnapshot(input: ComputeSnapshotInput): Reliabi
         toolFailed++;
         const toolName = strDim(e.dimensions?.toolName) ?? 'unknown';
         const errorClass = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
-        const key = `${toolName} ${errorClass}`;
+        const key = `${toolName} ${errorClass}`;
         const existing = clusterCounts.get(key);
         if (existing) existing.count++;
         else clusterCounts.set(key, { toolName, errorClass, count: 1 });
