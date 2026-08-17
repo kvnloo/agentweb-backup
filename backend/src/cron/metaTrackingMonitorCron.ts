@@ -44,6 +44,8 @@ export interface TrackingMonitorCronSummary {
    *  nothing today, but a run that stayed completely silent about it would make a latent
    *  problem indistinguishable from no problem. */
   optimisationDormant: number;
+  /** Full absence streak but delivery already stopped — past waste, reported not paged. */
+  optimisationStaleDelivery: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -60,6 +62,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     conversionDivergences: 0,
     optimisationAlerts: 0,
     optimisationDormant: 0,
+    optimisationStaleDelivery: 0,
   };
 
   let users: any[];
@@ -88,6 +91,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       // findings forever rather than as broken.
       summary.optimisationAlerts += result.optimisationAlerts ?? 0;
       summary.optimisationDormant += result.optimisationDormant ?? 0;
+      summary.optimisationStaleDelivery += result.optimisationStaleDelivery ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -118,6 +122,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       : '') +
     (summary.optimisationDormant > 0
       ? `, ${summary.optimisationDormant} paused ad set(s) with the same fault (latent)`
+      : '') +
+    (summary.optimisationStaleDelivery > 0
+      ? `, ${summary.optimisationStaleDelivery} ad set(s) wasted spend before delivery stopped`
       : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`

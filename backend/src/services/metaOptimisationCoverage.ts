@@ -107,6 +107,41 @@ export const OPTIMISATION_ABSENCE_DAYS = 3;
  */
 export const ATTRIBUTION_SETTLE_DAYS = 1;
 
+/**
+ * How stale the newest spending day may be before an ad set stops counting as "currently
+ * paying".
+ *
+ * An ad set can hold a full absence streak and then stop delivering. `effective_status`
+ * still says ACTIVE, because that is a configuration rather than a statement about spend.
+ * Alerting on it produces a high-priority message whose first sentence — that the ad set is
+ * PAYING for an event it is not receiving — is false at the moment someone reads it.
+ *
+ * The money that was wasted during the streak is real and stays reported, but as a log
+ * line rather than a page: nobody can act on spend that already stopped, and alerting on
+ * unactionable things is precisely how this channel would lose its credibility.
+ */
+export const OPTIMISATION_RECENCY_DAYS = 2;
+
+/** Whole days from `from` to `to`, both `YYYY-MM-DD`. Null if either is unparseable, so a
+ *  malformed date can never silently read as "recent". */
+function daysBetween(from: string, to: string): number | null {
+  const a = Date.parse(`${from}T00:00:00Z`);
+  const b = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return Math.round((b - a) / 86_400_000);
+}
+
+/** The most recent day the ad set actually spent, or undefined if it never did. */
+export function newestSpendingDay(
+  days: OptimisationSpendingDay[] | null | undefined,
+): string | undefined {
+  const spending = (Array.isArray(days) ? days : [])
+    .filter((d) => d && Number(d.spend) > 0 && typeof d.date === 'string')
+    .map((d) => d.date)
+    .sort();
+  return spending[spending.length - 1];
+}
+
 /** Only a delivering ad set can waste money. A paused one is a latent risk, reported separately. */
 const DELIVERING_STATUSES = new Set(['ACTIVE']);
 
@@ -273,6 +308,12 @@ export type AccountOptimisationVerdict = {
   unconfirmable: OptimisationMismatch[];
   /** Paused/not delivering. Costs nothing today; one click from costing money. Log only. */
   dormant: OptimisationMismatch[];
+  /**
+   * Held a full absence streak, but stopped delivering more than OPTIMISATION_RECENCY_DAYS
+   * ago. The waste already happened and is worth seeing; it is not worth paging about,
+   * because there is no spend left to stop.
+   */
+  staleDelivery: ConfirmedOptimisationMismatch[];
   /** Delivering ad sets whose optimisation event could not be translated at all. */
   unrecognisedOptimisations: string[];
   /** Pixels that reported no events, so nothing can be concluded about them either way. */
@@ -321,9 +362,10 @@ export function evaluateAccountOptimisationCoverage(
   adSets: OptimisationAdSet[] | null | undefined,
   receivedEventsByPixel: Record<string, Iterable<string>> | null | undefined,
   spendingDaysByAdSet: Record<string, OptimisationSpendingDay[]> | null | undefined,
+  asOf?: string,
 ): AccountOptimisationVerdict {
   const verdict: AccountOptimisationVerdict = {
-    alerting: [], unconfirmed: [], unconfirmable: [], dormant: [],
+    alerting: [], unconfirmed: [], unconfirmable: [], dormant: [], staleDelivery: [],
     unrecognisedOptimisations: [], inconclusivePixels: [],
   };
 
@@ -405,7 +447,16 @@ export function evaluateAccountOptimisationCoverage(
     const ownDays = Array.isArray(byAdSet[String(row?.id ?? '')]) ? byAdSet[String(row?.id ?? '')] : [];
     const absent = countTrailingAbsentSpendingDays(ownDays, family, ATTRIBUTION_SETTLE_DAYS);
     if (absent >= OPTIMISATION_ABSENCE_DAYS) {
-      verdict.alerting.push({ ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent });
+      const confirmed = { ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent };
+      // ACTIVE describes configuration, not spend. Only an ad set that was still delivering
+      // recently can be described as paying for anything right now.
+      const lastSpend = asOf ? newestSpendingDay(ownDays) : undefined;
+      const staleBy = asOf && lastSpend ? daysBetween(lastSpend, asOf) : null;
+      if (staleBy !== null && staleBy > OPTIMISATION_RECENCY_DAYS) {
+        verdict.staleDelivery.push(confirmed);
+      } else {
+        verdict.alerting.push(confirmed);
+      }
     } else {
       // Either this ad set converted the family recently — so the pixel's 24h silence is far
       // more likely to be a low-volume window than a fault — or it did not deliver at all.

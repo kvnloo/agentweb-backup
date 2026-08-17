@@ -64,7 +64,9 @@ beforeEach(() => {
     fetchOptimisation: jest.fn().mockResolvedValue({
       status: 'ok', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {},
     }),
-    now: Date.parse('2026-08-15T00:00:00Z'),
+    // Inside OPTIMISATION_RECENCY_DAYS of outageDays()'s newest row (2026-08-09), so the
+    // recency gate treats these ad sets as still delivering rather than as past waste.
+    now: Date.parse('2026-08-10T00:00:00Z'),
   };
 });
 

@@ -571,6 +571,9 @@ export const TOKEN_ALERT_CLASS = 'meta-token-invalid';
  *  converts nothing", this says "this account converts, but not the thing it is paying for".
  *  Haven was healthy by the first measure throughout the outage. */
 export const OPTIMISATION_ALERT_CLASS = 'meta-optimisation-event-missing';
+/** Mirrors OPTIMISATION_RECENCY_DAYS for the log line, without importing the module at
+ *  top level — this file only pulls metaOptimisationCoverage in lazily. */
+const OPTIMISATION_RECENCY_DAYS_LABEL = 2;
 
 /** Re-alert at most once per account per class per day. A blackout that is still open
  *  tomorrow still matters, so this is a rate limit rather than a one-shot. */
@@ -650,6 +653,9 @@ export interface MonitorSummary {
   /** ACTIVE and the pixel is silent, but the account's own conversion history contradicts
    *  it — the low-volume case a 24h pixel window cannot resolve. Logged only. */
   optimisationUnconfirmed: number;
+  /** Held a full absence streak but stopped delivering. Real past waste, nothing left to
+   *  stop, so it is reported without paging anyone. */
+  optimisationStaleDelivery: number;
   /** No obtainable evidence: no pixel on the promoted object, or an optimisation §F cannot
    *  count. Logged only, and never allowed to look like a clean pass. */
   optimisationUnconfirmable: number;
@@ -679,6 +685,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     optimisationDormant: 0,
     optimisationUnconfirmed: 0,
     optimisationUnconfirmable: 0,
+    optimisationStaleDelivery: 0,
   };
 
   const fetchActivity =
@@ -916,11 +923,15 @@ async function checkOptimisationCoverage(
       return;
     }
 
+    // The sweep's own date, so "is this ad set still delivering" is judged against now
+    // rather than against the newest row Meta happened to return.
+    const asOf = new Date(now).toISOString().slice(0, 10);
     const verdict = evaluateAccountOptimisationCoverage(
-      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet,
+      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet, asOf,
     );
 
     summary.optimisationDormant += verdict.dormant.length;
+    summary.optimisationStaleDelivery += verdict.staleDelivery.length;
     summary.optimisationUnconfirmed += verdict.unconfirmed.length;
     summary.optimisationUnconfirmable += verdict.unconfirmable.length;
 
@@ -936,6 +947,14 @@ async function checkOptimisationCoverage(
         `${TAG} ${adAccountId}: ${verdict.dormant.length} PAUSED ad set(s) optimise for an event ` +
         `their pixel is not receiving — latent, no spend at risk: ` +
         verdict.dormant.map(describe).join('; '),
+      );
+    }
+    if (verdict.staleDelivery.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.staleDelivery.length} ad set(s) held a full absence ` +
+        `streak but stopped delivering over ${OPTIMISATION_RECENCY_DAYS_LABEL} days ago — the waste ` +
+        `already happened, no spend left to stop: ` +
+        verdict.staleDelivery.map(describe).join('; '),
       );
     }
     if (verdict.unconfirmed.length) {

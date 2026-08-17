@@ -16,6 +16,8 @@ import {
   IGNORED_OPTIMISATIONS,
   OPTIMISATION_ABSENCE_DAYS,
   ATTRIBUTION_SETTLE_DAYS,
+  OPTIMISATION_RECENCY_DAYS,
+  newestSpendingDay,
 } from '../services/metaOptimisationCoverage';
 
 const adSet = (o: Partial<any> = {}) => ({
@@ -628,29 +630,29 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
     expect(v.unconfirmed).toHaveLength(1);
   });
 
-  it('DOES still alert when delivery ended after a full streak — documented, not intended', () => {
+  it('reports a full streak behind a zero-spend tail as stale rather than paging on it', () => {
     // Zero-spend rows neither break nor extend a streak, inherited from
     // evaluateAdAccountDays so an outage spanning a weekend pause stays one outage. The
-    // consequence is that an ad set which stopped delivering after three absent spending
-    // days still alerts, and the alert says it is "paying" for an event when it is no
-    // longer spending. Pinned here because it is real current behaviour; whether it wants
-    // a recency gate on the newest spending day is a product call, not a test change.
+    // waste was real and stays reported — but with delivery stopped there is no spend left
+    // to stop, so it goes to staleDelivery rather than paging someone.
     const v = evaluateAccountOptimisationCoverage(
       [{ id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
       { p: ['PageView'] },
       { as_x: [
-        { date: '1', spend: 100, families: [] },
-        { date: '2', spend: 100, families: [] },
-        { date: '3', spend: 100, families: [] },
-        { date: '4', spend: 100, families: [] },
-        { date: '5', spend: 0, families: [] },
-        { date: '6', spend: 0, families: [] },
+        { date: '2026-08-01', spend: 100, families: [] },
+        { date: '2026-08-02', spend: 100, families: [] },
+        { date: '2026-08-03', spend: 100, families: [] },
+        { date: '2026-08-04', spend: 100, families: [] },
+        { date: '2026-08-05', spend: 100, families: [] },
+        { date: '2026-08-06', spend: 0, families: [] },
       ] },
+      '2026-08-12',   // twelve days on, delivery long since stopped
     );
-    expect(v.alerting).toHaveLength(1);
-    // Four, not three: the settle window drops day 6, day 5 is zero-spend so it is skipped
-    // without breaking the run, and days 1-4 all count.
-    expect(v.alerting[0].consecutiveAbsentSpendingDays).toBe(4);
+    expect(v.alerting).toEqual([]);
+    expect(v.staleDelivery).toHaveLength(1);
+    // Five spending days, all absent; the trailing zero-spend row is dropped by the settle
+    // window and would not have broken the run anyway.
+    expect(v.staleDelivery[0].consecutiveAbsentSpendingDays).toBe(5);
   });
 });
 
@@ -717,5 +719,74 @@ describe('evaluateAccountOptimisationCoverage — the settle window is applied',
     );
     expect(v.alerting).toHaveLength(1);
     expect(v.alerting[0].consecutiveAbsentSpendingDays).toBe(3);
+  });
+});
+
+describe('the recency gate — ACTIVE is a configuration, not a statement about spend', () => {
+  const adSet = { id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } };
+  const fourAbsentDays = [
+    { date: '2026-08-01', spend: 100, families: [] as string[] },
+    { date: '2026-08-02', spend: 100, families: [] as string[] },
+    { date: '2026-08-03', spend: 100, families: [] as string[] },
+    { date: '2026-08-04', spend: 100, families: [] as string[] },
+  ];
+
+  it('alerts while the ad set is still delivering', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet], { p: ['PageView'] }, { as_x: fourAbsentDays }, '2026-08-05',
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.staleDelivery).toEqual([]);
+  });
+
+  it('still alerts at exactly the recency boundary', () => {
+    expect(OPTIMISATION_RECENCY_DAYS).toBe(2);
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet], { p: ['PageView'] }, { as_x: fourAbsentDays }, '2026-08-06', // 2 days on
+    );
+    expect(v.alerting).toHaveLength(1);
+  });
+
+  it('stops paging one day past the boundary — nothing is being spent to stop', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet], { p: ['PageView'] }, { as_x: fourAbsentDays }, '2026-08-07', // 3 days on
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.staleDelivery).toHaveLength(1);
+    // The finding keeps its evidence — this is a demotion, not a deletion.
+    expect(v.staleDelivery[0].consecutiveAbsentSpendingDays).toBe(3);
+    expect(v.staleDelivery[0].insightsFamily).toBe('lead');
+  });
+
+  it('alerts as before when no asOf is supplied, so the gate cannot fail closed by omission', () => {
+    const v = evaluateAccountOptimisationCoverage([adSet], { p: ['PageView'] }, { as_x: fourAbsentDays });
+    expect(v.alerting).toHaveLength(1);
+  });
+
+  it('alerts rather than silently demoting when a date is unparseable', () => {
+    // A malformed date must never read as "recent" OR as "stale" by accident. Falling back
+    // to alerting keeps a real finding visible instead of hiding it behind a parse bug.
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet], { p: ['PageView'] },
+      { as_x: [...fourAbsentDays.slice(0, 3), { date: 'not-a-date', spend: 100, families: [] }] },
+      '2026-08-20',
+    );
+    expect(v.alerting.length + v.staleDelivery.length).toBe(1);
+  });
+});
+
+describe('newestSpendingDay', () => {
+  it('ignores zero-spend rows and returns the latest by date, unsorted input included', () => {
+    expect(newestSpendingDay([
+      { date: '2026-08-03', spend: 0, families: [] },
+      { date: '2026-08-01', spend: 50, families: [] },
+      { date: '2026-08-02', spend: 50, families: [] },
+    ])).toBe('2026-08-02');
+  });
+
+  it('is undefined when nothing ever spent', () => {
+    expect(newestSpendingDay([{ date: '2026-08-01', spend: 0, families: [] }])).toBeUndefined();
+    expect(newestSpendingDay([])).toBeUndefined();
+    expect(newestSpendingDay(null)).toBeUndefined();
   });
 });
