@@ -223,3 +223,22 @@ describe('resilience', () => {
     expect(minGapMs()).toBe(2500);
   });
 });
+
+describe('default dependencies', () => {
+  it('paces with a real timer when no deps are injected', async () => {
+    // Everything above injects a virtual clock, which leaves the production
+    // sleep/now/random path unexercised. A 20ms gap makes it real but instant.
+    process.env.LINKEDIN_WRITE_MIN_GAP_MS = '20';
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '10';
+
+    const startedAt = Date.now();
+    const first = await reserveWriteSlot(ACCOUNT);
+    const second = await reserveWriteSlot(ACCOUNT);
+    const elapsed = Date.now() - startedAt;
+
+    expect(first.allowed).toBe(true);
+    expect(second.allowed).toBe(true);
+    // The second call really waited, using setTimeout and Math.random jitter.
+    expect(elapsed).toBeGreaterThanOrEqual(10);
+  });
+});

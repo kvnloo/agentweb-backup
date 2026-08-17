@@ -387,6 +387,15 @@ describe('clearDisconnectFlag', () => {
     expect(updateAccountConfig).not.toHaveBeenCalled();
   });
 
+  it('writes nothing when the account is no longer on the user record', async () => {
+    // A reconnect callback can race a disconnect that removed the row entirely.
+    getAccountsByUserId.mockResolvedValue([]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(updateAccountConfig).not.toHaveBeenCalled();
+  });
+
   it('swallows a write failure rather than breaking the reconnect callback', async () => {
     givenAccount({ needs_reconnect: true });
     updateAccountConfig.mockRejectedValue(new Error('ConnectedAccountChanged'));
@@ -416,5 +425,55 @@ describe('getUnipileHealth', () => {
     getAccountsByUserId.mockRejectedValue(new Error('dynamo unavailable'));
 
     await expect(getUnipileHealth(ACCOUNT_ID, OWNER)).resolves.toBeNull();
+  });
+});
+
+describe('notification delivery failures', () => {
+  it('still records the flag when the owner has no email on file', async () => {
+    givenAccount({});
+    userDb.getUserById.mockResolvedValue({ email: undefined });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    // The state change is what the schedule gate and the cron read; it must not
+    // depend on our being able to reach the owner.
+    expect(outcome).toBe('marked-disconnected');
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('still emails the owner when the oncall alert fails', async () => {
+    givenAccount({});
+    sendAgentModeOncallAlert.mockRejectedValue(new Error('notion down'));
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(outcome).toBe('marked-disconnected');
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('still notifies when the owner lookup itself fails', async () => {
+    givenAccount({});
+    userDb.getUserById.mockRejectedValue(new Error('dynamo unavailable'));
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(outcome).toBe('marked-disconnected');
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
   });
 });
