@@ -48,3 +48,19 @@ export function pickResumeBase(cs, { cwd, agentRoot, pipelineSid = null, resumeP
   if (resumePipeline && cwd !== agentRoot && pipelineSid) return { kind: 'session', sid: pipelineSid };
   return { kind: 'fresh' };
 }
+
+// Did a turn fail because the prompt exceeded the model's context window (as opposed to a usage cap, a
+// dead resume, or a server error)? This is the one failure /compact can recover from on its own: a
+// session at the window ceiling cannot be compacted BY RESUMING IT — the compaction turn reloads the
+// same oversized transcript and dies identically, so the only tool that shrinks a session needs the
+// session to already fit (ENG-1188 deadlocked this way at 974k of a 1M window). On a match the caller
+// re-runs the compaction against the saved display transcript instead, with no session to resume.
+//
+// Deliberately narrow: a usage/session limit or a 5xx must NOT match. Those are the failures the
+// compaction bail-out exists to catch, and treating one as a summary destroys the conversation.
+export function isContextOverflowError(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  if (/usage limit|session limit|rate limit/.test(t)) return false;
+  return /prompt is too long|too long:\s*\d+\s*tokens|exceed(s)? context limit|context length exceeded|maximum context length/.test(t);
+}

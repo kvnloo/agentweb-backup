@@ -3,7 +3,7 @@
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { transcriptContextUsed, pickResumeBase } from '../chat/context-usage.mjs';
+import { transcriptContextUsed, pickResumeBase, isContextOverflowError } from '../chat/context-usage.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -87,6 +87,26 @@ console.log('pickResumeBase');
   // an existing chat session is always continued, regardless of the flag
   const r7 = pickResumeBase({ sessions: { chat: 'C1' }, cwd: WT }, opt({ pipelineSid: 'FIX' }));
   ok(r7.kind === 'session' && r7.sid === 'C1', 'existing chat session is continued (not the pipeline)');
+}
+
+// A session that has already reached the model's window cannot be compacted by RESUMING it: the
+// compaction turn reloads the whole transcript, so it overflows exactly like the turn that prompted
+// the compaction. That deadlocked ENG-1188 at 974k/1M — /compact was the one tool that could shrink
+// the session, and it needed the session to fit before it would run.
+console.log('CONTEXT-OVERFLOW DETECTION');
+{
+  ok(isContextOverflowError('Prompt is too long'), 'the exact CLI text is detected');
+  ok(isContextOverflowError('API Error: 400 {"message":"prompt is too long: 1048576 tokens > 1000000"}'), 'the API 400 body is detected');
+  ok(isContextOverflowError('input length and `max_tokens` exceed context limit'), 'the context-limit phrasing is detected');
+  ok(isContextOverflowError('  PROMPT IS TOO LONG  '), 'case and padding insensitive');
+  // Must NOT swallow the failures the compaction bail-out exists to protect: storing one of these as a
+  // summary (and dropping the live session) is what destroys a conversation.
+  ok(!isContextOverflowError('You have hit your session limit'), 'a session/usage limit is NOT an overflow');
+  ok(!isContextOverflowError('Claude AI usage limit reached'), 'a usage limit is NOT an overflow');
+  ok(!isContextOverflowError('API Error: 500 internal server error'), 'a 500 is NOT an overflow');
+  ok(!isContextOverflowError('the model turn errored'), 'a generic error is NOT an overflow');
+  ok(!isContextOverflowError(''), 'empty text is NOT an overflow');
+  ok(!isContextOverflowError(null), 'null is NOT an overflow');
 }
 
 console.log(`\n${fail === 0 ? '✅ ALL PASSED' : '❌ FAILURES'} — ${pass} passed, ${fail} failed`);

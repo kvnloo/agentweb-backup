@@ -23,7 +23,7 @@ import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import { acquireLock, releaseLock } from '../lock.mjs';
 import { gitRepoOp } from '../repo-lock.mjs';
-import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
+import { transcriptContextUsed, pickResumeBase, isContextOverflowError } from './context-usage.mjs';
 import { usageSnapshot, contextWindowFor } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import { computeMetrics } from './metrics.mjs';
@@ -1919,12 +1919,12 @@ async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instruct
 
     const cs0 = loadChatState()[identifier] || {};
     const sameCwd = !cs0.cwd || cs0.cwd === cwd;
-    const sid = (sameCwd && cs0.sessions?.chat) || pipelineSessionId(entry) || null;
+    let sid = (sameCwd && cs0.sessions?.chat) || pipelineSessionId(entry) || null;
     // With a live session, resume it for native full context; otherwise summarize the display
     // transcript we have (fresh turn with the messages re-injected as text).
-    const prompt = sid
-      ? COMPACT_MSG(instructions)
-      : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, COMPACT_MSG(instructions), historyBlock(cs0.messages));
+    const transcriptPrompt = async () =>
+      freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, COMPACT_MSG(instructions), historyBlock(cs0.messages));
+    let prompt = sid ? COMPACT_MSG(instructions) : await transcriptPrompt();
 
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
     tee = createWriteStream(path.join(logsDir, identifier, `compact-${Date.now()}.txt`));
@@ -1932,8 +1932,23 @@ async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instruct
     const onEvent = (e) => { tee.write(JSON.stringify(e) + '\n'); if (e.type === 'result' && e.isError) return; emit(e); };
     const register = (child) => { const t = activeTurns.get(identifier); if (t) t.child = child; };
 
-    const out = await runClaudeStream(chatArgs(cap, sid), prompt, cwd, m.timeoutMs, onEvent, register, agentEnv(entry, null));
+    let out = await runClaudeStream(chatArgs(cap, sid), prompt, cwd, m.timeoutMs, onEvent, register, agentEnv(entry, null));
     if (aborted(identifier, turnId)) return;
+
+    // The session is already at/over the model's window, so resuming it to summarize it overflows too —
+    // the deadlock where the only tool that can shrink a chat needs the chat to already fit (ENG-1188).
+    // Retry ONCE without a session, summarizing the saved display transcript instead. That path was
+    // always here; it was just unreachable whenever a session id existed.
+    const errOf = (o) => String(o.result?.result || o.stderr || '').trim();
+    if (sid && (out.result?.is_error || !out.gotInit) && isContextOverflowError(errOf(out))) {
+      emit({ type: 'status', text: 'Session is too large to reload — summarizing from the saved transcript instead…' });
+      tee.write(`# retry: context overflow on resume (${errOf(out).slice(0, 200)}) — falling back to the transcript\n`);
+      sid = null;
+      prompt = await transcriptPrompt();
+      out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register, agentEnv(entry, null));
+      if (aborted(identifier, turnId)) return;
+    }
+
     if (out.timedOut) { emit({ type: 'error', error: `compaction timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` }); return; }
 
     // If the CLI turn errored (usage/session-limit hit, API error, dead resume), its "result" text is
