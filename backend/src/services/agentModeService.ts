@@ -3518,8 +3518,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3539,7 +3542,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );

@@ -141,21 +141,37 @@ export function formatMemoryLine(memory: FormattableMemory, now: Date): string {
 }
 
 /**
- * Caution appended to injected memory so the model treats it as historical, not live, state —
+ * Caution attached to injected memory (both before and after the list — see
+ * buildMemoryContextMessage) so the model treats it as historical, not live, state —
  * the guard against a stale memory silently disabling a configured channel (ENG-305).
+ *
+ * ENG-1310: a caution placed only AFTER a list of "facts" was not enough — a saved GA4
+ * figure ("416 form_starts → 91 submits") got restated to a customer as a current
+ * measurement despite this note already existing, because nothing forced a concrete,
+ * checkable form for the fallback. The note now says explicitly WHAT to say instead of
+ * re-verifying: label the figure "unverified — from <saved date> notes: …", not silence
+ * or a bare guess dressed as an answer.
  */
 export const MEMORY_STALENESS_NOTE =
-  'These are historical notes from previous sessions, not live state. Before acting on — or ' +
-  'repeating to the user as current — any time-sensitive fact (e.g. a channel/account being ' +
-  'disabled, a token or connection having expired, a specific date, or a stated metric, count, ' +
-  'or KPI such as a conversion count, session number, or funnel figure), re-verify it with the ' +
-  'relevant tool in THIS session rather than assuming an older note still holds — never ' +
-  'silently skip a configured action, and never quote a number, based on a memory alone.';
+  'These are historical notes from previous sessions, NOT live state and NOT a substitute for ' +
+  'checking current data yourself. Before acting on — or repeating to the user as current — any ' +
+  'time-sensitive fact below (e.g. a channel/account being disabled, a token or connection having ' +
+  'expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session ' +
+  'number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot ' +
+  're-verify it before answering, you MUST NOT state it as current: label it exactly as ' +
+  '"unverified — from <saved date> notes: <the figure>" instead. Never silently skip a configured ' +
+  'action, and never quote a number from memory alone as though it were a fresh measurement.';
 
 /**
- * Build the memory-context message injected into the agent conversation: a header, one dated
- * line per memory, and the staleness caution. Returns null when there are no memories so the
- * caller can skip injecting an empty block.
+ * Build the memory-context message injected into the agent conversation: the staleness
+ * caution, a header, one dated line per memory, and the caution again. Returns null when
+ * there are no memories so the caller can skip injecting an empty block.
+ *
+ * ENG-1310: the caution now BOOKENDS the list (before AND after) instead of trailing a
+ * block of lines headed "facts" — a caution that only ever followed content headed
+ * "facts from previous sessions" lost to the header's own framing on a long memory list.
+ * The header itself no longer claims these are verified "facts" (see the call sites in
+ * agentModeService.ts), and this function does not assume any particular header wording.
  */
 export function buildMemoryContextMessage(
   header: string,
@@ -164,5 +180,5 @@ export function buildMemoryContextMessage(
 ): string | null {
   if (!memories || memories.length === 0) return null;
   const lines = memories.map((m) => formatMemoryLine(m, now));
-  return `${header}\n${lines.join('\n')}\n\n${MEMORY_STALENESS_NOTE}`;
+  return `${MEMORY_STALENESS_NOTE}\n\n${header}\n${lines.join('\n')}\n\n${MEMORY_STALENESS_NOTE}`;
 }

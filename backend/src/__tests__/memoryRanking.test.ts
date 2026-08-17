@@ -188,6 +188,28 @@ describe('buildMemoryContextMessage', () => {
     expect(msg).toContain('- [preference] (saved 2026-07-13, today) Post to LinkedIn and Instagram daily');
     expect(msg).toContain(MEMORY_STALENESS_NOTE);
   });
+
+  // ENG-1310: a caution that only ever trailed the list lost to the list's own "facts"
+  // framing on a long memory block — the note now bookends the content so it is the
+  // first and last thing the model reads, not just an afterthought at the bottom.
+  it('bookends the memory list with the staleness caution (ENG-1310)', () => {
+    const msg = buildMemoryContextMessage(
+      'Account Memory (unverified notes from previous sessions):',
+      [{ category: 'insight', content: 'GA4: 416 form_starts, 91 submits', createdAt: '2026-07-31T12:00:00Z' }],
+      now
+    ) as string;
+
+    const firstNoteIdx = msg.indexOf(MEMORY_STALENESS_NOTE);
+    const headerIdx = msg.indexOf('Account Memory (unverified notes from previous sessions):');
+    const lastNoteIdx = msg.lastIndexOf(MEMORY_STALENESS_NOTE);
+
+    expect(firstNoteIdx).toBeGreaterThanOrEqual(0);
+    // The caution appears BEFORE the header/list...
+    expect(firstNoteIdx).toBeLessThan(headerIdx);
+    // ...and again AFTER it, so it is not lost at the end of a long block.
+    expect(lastNoteIdx).toBeGreaterThan(headerIdx);
+    expect(lastNoteIdx).not.toBe(firstNoteIdx);
+  });
 });
 
 describe('MEMORY_STALENESS_NOTE', () => {
@@ -200,6 +222,15 @@ describe('MEMORY_STALENESS_NOTE', () => {
 
   it('still warns against silently skipping a configured action from stale state (ENG-305)', () => {
     expect(MEMORY_STALENESS_NOTE).toMatch(/disabled|expired/i);
+  });
+
+  // ENG-1310 AC1: "A remembered figure is never presented as a current measurement... it
+  // carries its date and source." The note existed before (ENG-305/1187) but only said
+  // "re-verify" with no concrete fallback wording — the model still had to invent how to
+  // hedge. It now names the exact label to use when it cannot re-verify before answering.
+  it('gives a concrete "unverified — from <date> notes:" fallback label when re-verification is not possible (ENG-1310 AC1)', () => {
+    expect(MEMORY_STALENESS_NOTE).toMatch(/unverified — from <saved date> notes:/i);
+    expect(MEMORY_STALENESS_NOTE).toMatch(/must not state it as current/i);
   });
 });
 
