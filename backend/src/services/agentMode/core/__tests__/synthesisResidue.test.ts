@@ -10,7 +10,7 @@ import {
   isUnusableSynthesis,
   buildExecutedActionsFallback,
 } from '../synthesisResidue';
-import { SYNTHESIS_NUDGE } from '../termination';
+import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 
 describe('isUnusableSynthesis', () => {
   it('flags the exact production residue "}]"', () => {
@@ -123,6 +123,39 @@ describe('isUnusableSynthesis', () => {
   it('does NOT flag a single quoted mention of the nudge text', () => {
     expect(
       isUnusableSynthesis(`I saw the system message "${SYNTHESIS_NUDGE}" and then finished the export.`)
+    ).toBe(false);
+  });
+
+  // ENG-1188 follow-up: `isUnusableSynthesis` is the single choke point for every
+  // terminating turn (agentModeService.ts calls it once, on whatever content is
+  // about to ship), and CONTINUE_PROMPT / ANTI_LOOP_STOP_MESSAGE are injected by the
+  // exact same "push a system nudge, let the model respond again" mechanism as
+  // SYNTHESIS_NUDGE — a max_tokens continuation and a same-tool-calls anti-loop
+  // warning. A model that echoes either of THOSE back instead of answering is just
+  // as unrecoverable and just as unguarded before this, since only SYNTHESIS_NUDGE
+  // was recognized.
+  it('flags a reply that echoes the continuation nudge back verbatim', () => {
+    expect(isUnusableSynthesis(`${CONTINUE_PROMPT} ${CONTINUE_PROMPT}`)).toBe(true);
+  });
+
+  it('flags a reply that is exactly one bare copy of the continuation nudge', () => {
+    expect(isUnusableSynthesis(CONTINUE_PROMPT)).toBe(true);
+  });
+
+  it('flags a reply that echoes the anti-loop STOP message back verbatim', () => {
+    expect(isUnusableSynthesis(`${ANTI_LOOP_STOP_MESSAGE} ${ANTI_LOOP_STOP_MESSAGE}`)).toBe(true);
+  });
+
+  it('flags a reply that is exactly one bare copy of the anti-loop STOP message', () => {
+    expect(isUnusableSynthesis(ANTI_LOOP_STOP_MESSAGE)).toBe(true);
+  });
+
+  it('does NOT flag a single quoted mention of the continuation or anti-loop nudges', () => {
+    expect(
+      isUnusableSynthesis(`I saw the system message "${CONTINUE_PROMPT}" and then finished the export.`)
+    ).toBe(false);
+    expect(
+      isUnusableSynthesis(`I saw the system message "${ANTI_LOOP_STOP_MESSAGE}" and then finished the export.`)
     ).toBe(false);
   });
 
