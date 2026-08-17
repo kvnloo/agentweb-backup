@@ -108,6 +108,19 @@ describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-
     expect(loss.map((l: any) => l.title)).toEqual(['Alpha']);
   });
 
+  it('flags a step replaced in place by a different, fully populated step', () => {
+    // Alpha is kept; Beta is deleted and a brand-new step takes its stepCount.
+    // Positional fallback pairs Beta with the newcomer, whose fields are all
+    // populated, so nothing reads as "blanked" — and the count is unchanged, so
+    // the removal guard never fires either. Beta's content is simply gone.
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Gamma', description: 'GAMMA', skillIds: ['c'], requiredFunctionCalls: ['h'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss.map((l: any) => l.title)).toEqual(['Beta']);
+  });
+
   it('stays silent on a wholesale rewrite where nothing was kept', () => {
     // The carve-out that makes "replace this plan" possible at all: no step was
     // recognised, so none was plainly meant to survive, and droppedStepTitles
