@@ -92,6 +92,21 @@ export const IGNORED_OPTIMISATIONS = new Set(['OTHER']);
  */
 export const OPTIMISATION_ABSENCE_DAYS = 3;
 
+/**
+ * Most recent days excluded from the evidence, because their conversions may not have
+ * finished being attributed.
+ *
+ * Meta attributes a conversion back to the ad interaction, and that assignment keeps
+ * arriving for a while after the day itself. So the newest row systematically UNDER-reports
+ * conversions, and an absence there is not yet evidence of anything. Counting it inflates
+ * every streak by one and lets the threshold be reached a day early — a false alert of
+ * exactly the kind this check is built to avoid.
+ *
+ * Cost: one day of detection latency. Haven's outage would still have been caught on day 4
+ * instead of day 3, against the 8 days it actually took a human.
+ */
+export const ATTRIBUTION_SETTLE_DAYS = 1;
+
 /** Only a delivering ad set can waste money. A paused one is a latent risk, reported separately. */
 const DELIVERING_STATUSES = new Set(['ACTIVE']);
 
@@ -218,11 +233,19 @@ export interface OptimisationSpendingDay {
 export function countTrailingAbsentSpendingDays(
   days: OptimisationSpendingDay[] | null | undefined,
   family: string,
+  ignoreMostRecent = 0,
 ): number {
-  const rows = (Array.isArray(days) ? days : []).filter(Boolean);
+  // Sorted defensively rather than trusting the caller: "counted back from the most recent"
+  // is meaningless on an unordered array, and the failure would be silent — a plausible
+  // number computed from the wrong end of the window.
+  const rows = (Array.isArray(days) ? days : [])
+    .filter(Boolean)
+    .slice()
+    .sort((a, b) => String(a?.date ?? '').localeCompare(String(b?.date ?? '')));
+  const judged = ignoreMostRecent > 0 ? rows.slice(0, -ignoreMostRecent) : rows;
   let streak = 0;
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i];
+  for (let i = judged.length - 1; i >= 0; i--) {
+    const row = judged[i];
     if (!(Number(row?.spend) > 0)) continue; // no delivery — neither evidence nor a reset
     const present = (Array.isArray(row?.families) ? row.families : []).some(
       (f) => typeof f === 'string' && f.trim().toLowerCase() === family,
@@ -380,7 +403,7 @@ export function evaluateAccountOptimisationCoverage(
     // deliver, so `countTrailingAbsentSpendingDays` returns 0 and it cannot alert — which is
     // the correct outcome: no delivery means no money at risk and nothing to diagnose.
     const ownDays = Array.isArray(byAdSet[String(row?.id ?? '')]) ? byAdSet[String(row?.id ?? '')] : [];
-    const absent = countTrailingAbsentSpendingDays(ownDays, family);
+    const absent = countTrailingAbsentSpendingDays(ownDays, family, ATTRIBUTION_SETTLE_DAYS);
     if (absent >= OPTIMISATION_ABSENCE_DAYS) {
       verdict.alerting.push({ ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent });
     } else {

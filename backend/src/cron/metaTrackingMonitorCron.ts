@@ -83,8 +83,11 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.unclassifiable += result.unclassifiable;
       summary.idle += result.idle;
       summary.healthy += result.healthy;
-      summary.optimisationAlerts += result.optimisationAlerts;
-      summary.optimisationDormant += result.optimisationDormant;
+      // Defaulted because `+= undefined` is NaN, and every downstream guard here is a
+      // `> 0` comparison, which NaN fails silently — the counter would read as zero
+      // findings forever rather than as broken.
+      summary.optimisationAlerts += result.optimisationAlerts ?? 0;
+      summary.optimisationDormant += result.optimisationDormant ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts

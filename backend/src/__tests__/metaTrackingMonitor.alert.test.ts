@@ -329,11 +329,14 @@ const havenAdSets = (status = 'ACTIVE') => [
   },
 ];
 
-/** Haven's real shape during the outage: lead every day, complete_registration never. */
+/** Haven's real shape during the outage: lead every day, complete_registration never.
+ *  Four days, not three — the newest is dropped as unsettled (ATTRIBUTION_SETTLE_DAYS),
+ *  so three SETTLED absent days are needed to reach the threshold. */
 const outageDays = () => [
   { date: '2026-08-06', spend: 223.93, conversions: 4, unrecognized: [], families: ['lead'] },
   { date: '2026-08-07', spend: 229.62, conversions: 9, unrecognized: [], families: ['lead'] },
   { date: '2026-08-08', spend: 214.85, conversions: 6, unrecognized: [], families: ['lead'] },
+  { date: '2026-08-09', spend: 250.85, conversions: 8, unrecognized: [], families: ['lead'] },
 ];
 
 /** The same days, attributed to the AD SET that is making the claim. Account totals cannot

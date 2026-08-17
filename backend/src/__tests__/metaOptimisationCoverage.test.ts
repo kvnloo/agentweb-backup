@@ -15,6 +15,7 @@ import {
   INSIGHTS_FAMILY_BY_OPTIMISATION,
   IGNORED_OPTIMISATIONS,
   OPTIMISATION_ABSENCE_DAYS,
+  ATTRIBUTION_SETTLE_DAYS,
 } from '../services/metaOptimisationCoverage';
 
 const adSet = (o: Partial<any> = {}) => ({
@@ -269,7 +270,7 @@ describe('evaluateAccountOptimisationCoverage', () => {
     const v = evaluateAccountOptimisationCoverage(
       [havenAdSet()],
       { '646256265203090': ['PageView', 'Lead'] },   // what the pixel reported while dark
-      { as_haven_cr: HAVEN_DAYS.slice(0, 4) },       // through 08-08
+      { as_haven_cr: HAVEN_DAYS.slice(0, 5) },       // through 08-09; newest is dropped as unsettled
     );
 
     expect(v.alerting).toHaveLength(1);
@@ -331,6 +332,7 @@ describe('evaluateAccountOptimisationCoverage', () => {
           { date: '1', spend: 50, families: [] },
           { date: '2', spend: 50, families: [] },
           { date: '3', spend: 50, families: [] },
+          { date: '4', spend: 50, families: [] },
         ],
       },
     );
@@ -383,7 +385,7 @@ describe('evaluateAccountOptimisationCoverage', () => {
     const v = evaluateAccountOptimisationCoverage(
       [havenAdSet()],
       { '646256265203090': [] },
-      { as_haven_cr: HAVEN_DAYS.slice(0, 4) },
+      { as_haven_cr: HAVEN_DAYS.slice(0, 5) },
     );
     expect(v.alerting).toEqual([]);
     expect(v.inconclusivePixels).toEqual(['646256265203090']);
@@ -562,12 +564,14 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
           { date: '1', spend: 100, families: [] },
           { date: '2', spend: 100, families: [] },
           { date: '3', spend: 100, families: [] },
+          { date: '4', spend: 100, families: [] },
         ],
         // The healthy one, converting throughout. Must not vouch for the other.
         as_live: [
           { date: '1', spend: 100, families: ['lead'] },
           { date: '2', spend: 100, families: ['lead'] },
           { date: '3', spend: 100, families: ['lead'] },
+          { date: '4', spend: 100, families: ['lead'] },
         ],
       },
     );
@@ -595,6 +599,7 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
           { date: '1', spend: 80, families: [] },
           { date: '2', spend: 80, families: [] },
           { date: '3', spend: 80, families: [] },
+          { date: '4', spend: 80, families: [] },
         ],
       },
     );
@@ -618,5 +623,71 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
     );
     expect(v.alerting).toEqual([]);
     expect(v.unconfirmed).toHaveLength(1);
+  });
+});
+
+/**
+ * CodeRabbit findings on #2435. Both are about evidence that looks settled and is not.
+ */
+describe('countTrailingAbsentSpendingDays — unsettled and unordered input', () => {
+  it('excludes the most recent rows when asked, so a partial day cannot inflate the streak', () => {
+    // Meta keeps attributing conversions after the day ends, so the newest row
+    // under-reports. Counting it reaches the threshold a day early.
+    const days = [
+      { date: '2026-08-06', spend: 100, families: ['lead'] },
+      { date: '2026-08-07', spend: 100, families: [] as string[] },
+      { date: '2026-08-08', spend: 100, families: [] as string[] },
+    ];
+    expect(countTrailingAbsentSpendingDays(days, 'lead')).toBe(2);      // counts the unsettled day
+    expect(countTrailingAbsentSpendingDays(days, 'lead', 1)).toBe(1);   // drops it
+  });
+
+  it('does not go negative or throw when every row is excluded', () => {
+    const days = [{ date: '1', spend: 10, families: [] as string[] }];
+    expect(countTrailingAbsentSpendingDays(days, 'lead', 1)).toBe(0);
+    expect(countTrailingAbsentSpendingDays(days, 'lead', 5)).toBe(0);
+  });
+
+  it('sorts defensively — "most recent" is meaningless on an unordered array', () => {
+    // Same rows, shuffled. Counting from the end of an unsorted array yields a plausible
+    // number computed from the wrong end of the window, which fails silently.
+    const shuffled = [
+      { date: '2026-08-08', spend: 100, families: [] as string[] },
+      { date: '2026-08-06', spend: 100, families: ['lead'] },
+      { date: '2026-08-07', spend: 100, families: [] as string[] },
+    ];
+    expect(countTrailingAbsentSpendingDays(shuffled, 'lead')).toBe(2);
+  });
+});
+
+describe('evaluateAccountOptimisationCoverage — the settle window is applied', () => {
+  it('will not alert on a streak that only reaches the threshold via the unsettled day', () => {
+    expect(ATTRIBUTION_SETTLE_DAYS).toBe(1);
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
+      { p: ['PageView'] },
+      { as_x: [
+        { date: '1', spend: 50, families: [] },
+        { date: '2', spend: 50, families: [] },
+        { date: '3', spend: 50, families: [] },   // dropped as unsettled -> only 2 count
+      ] },
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('alerts once a fourth day makes three SETTLED absent days', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
+      { p: ['PageView'] },
+      { as_x: [
+        { date: '1', spend: 50, families: [] },
+        { date: '2', spend: 50, families: [] },
+        { date: '3', spend: 50, families: [] },
+        { date: '4', spend: 50, families: [] },
+      ] },
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0].consecutiveAbsentSpendingDays).toBe(3);
   });
 });
