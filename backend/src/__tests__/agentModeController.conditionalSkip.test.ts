@@ -274,6 +274,38 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     );
   });
 
+  it('fires on the REAL 2026-08-16 prod regression: perform_data_analysis used to check the weekday (ENG-1276, session 17834849…)', () => {
+    // The LUCAS prompt's FIRST instruction is "check today's actual weekday" — the
+    // agent complied by calling perform_data_analysis to compute the weekday via
+    // Python, THEN reported the clean skip with zero write calls. perform_data_analysis
+    // is a pure compute/read tool (runs code on caller-supplied data, no external
+    // side effects) but its name doesn't lead with any READ_ONLY_TOOL verb
+    // (get/read/list/fetch/search/describe/analyze/…), so the fail-safe allowlist
+    // misclassified it as a WRITE call, tripped the non-required-write veto (step 3),
+    // and the run was pressed with "Make sure to generate_image (1 more time needed),
+    // post_on_connected_account (1 more time needed)" despite a correct, documented
+    // skip.
+    const SUNDAY_1616 = new Date('2026-08-16T13:26:36Z');
+    expect(SUNDAY_1616.getUTCDay()).toBe(0);
+    const instruction =
+      'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+      'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped." Only proceed on Monday, Wednesday, or Friday.';
+    const realSkip =
+      '<strong>LUCAS: non-publishing day, skipped.</strong>\n\n' +
+      '<p>Weekday check ran first, as instructed:</p>\n' +
+      '<ul>\n' +
+      '<li><strong>Date:</strong> 2026-08-16</li>\n' +
+      '<li><strong>Weekday:</strong> Sunday (verified via date computation this session, not assumed)</li>\n' +
+      '<li><strong>Publishing days:</strong> Monday / Wednesday / Friday only</li>\n' +
+      '</ul>\n\n' +
+      '<p><strong>Actions taken this run: none.</strong> No post drafted, no image generated, nothing published to any of the four destinations.</p>';
+    expect(scheduledRunSignalsConditionalSkip(realSkip, {
+      now: SUNDAY_1616,
+      instruction,
+      toolCalls: [{ name: 'perform_data_analysis' }],
+    })).toBe(true);
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
@@ -459,7 +491,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
 
     // Read/context tool calls do not make it a non-skip.
     for (const readTool of ['read_brand_guidelines', 'read_market_strategy', 'you_search_web',
-      'get_leads', 'describe_image', 'analyze_crm_data', 'ask_crm', 'audit_ad_utm_coverage', 'account_summary']) {
+      'get_leads', 'describe_image', 'analyze_crm_data', 'ask_crm', 'audit_ad_utm_coverage', 'account_summary',
+      'perform_data_analysis']) {
       expect(scheduledRunSignalsConditionalSkip(skipProse, {
         now: sunday, instruction: instr, toolCalls: [{ name: readTool }],
       })).toBe(true);
