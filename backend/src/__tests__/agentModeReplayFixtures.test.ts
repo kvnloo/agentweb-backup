@@ -72,6 +72,19 @@ describe('agentModeReplayFixtures (ENG-1312 criterion 3)', () => {
     expect(result.reason).toMatch(/700.*600|exceeds/i);
   });
 
+  it('checkReplayFixture treats an empty assistant reply as 0 words, not a threshold violation', () => {
+    const fixture: JudgeReplayFixture = {
+      id: 'test-empty',
+      label: 'test',
+      thresholdSource: 'ENG-1309 test',
+      isPlaceholder: true,
+      pending: false,
+      turns: [{ role: 'assistant', content: '   ' }],
+      assertion: { maxWords: 150, maxChars: 600 },
+    };
+    expect(checkReplayFixture(fixture).pass).toBe(true);
+  });
+
   it('checkReplayFixture fails a fixture whose reply exceeds its maxWords threshold', () => {
     const fixture: JudgeReplayFixture = {
       id: 'test-words',
