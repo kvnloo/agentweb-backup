@@ -134,6 +134,54 @@ describe('usageRecorderService', () => {
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-700 AC #1: an unpriced model is reported as unpriced, not as costing $0.
+    it('tags an unpriced model costSource "unpriced", not "allocated"', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await recordUsage({ ...baseCtx, model: 'mystery-model-x' });
+      expect(mockIncrement.mock.calls[0][0].costSource).toBe('unpriced');
+    });
+
+    // ENG-700 AC #2: an unpriced model's usage entry still records full token counts.
+    it('still records full token counts for an unpriced model', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await recordUsage({
+        ...baseCtx,
+        model: 'mystery-model-x',
+        inputTokens: 1234,
+        outputTokens: 567,
+        cacheReadTokens: 12,
+        cacheWriteTokens: 34,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.inputTokens).toBe(1234);
+      expect(inc.outputTokens).toBe(567);
+      expect(inc.cacheReadTokens).toBe(12);
+      expect(inc.cacheWriteTokens).toBe(34);
+    });
+
+    // ENG-700 AC #6: cost for an existing priced model is unchanged (still "allocated",
+    // including when the priced call happens to cost exactly $0 in tokens billed).
+    it('tags a priced model costSource "allocated"', async () => {
+      await recordUsage(baseCtx);
+      expect(mockIncrement.mock.calls[0][0].costSource).toBe('allocated');
+      expect(mockIncrement.mock.calls[0][0].costMicroUsd).toBe(
+        computeCostMicroUsd(baseCtx.model, baseCtx.inputTokens, baseCtx.outputTokens)
+      );
+    });
+
+    // An explicit costUsdOverride is real allocated spend even for a model with
+    // no token price (image/video), never "unpriced".
+    it('tags an explicit costUsdOverride costSource "allocated"', async () => {
+      await recordUsage({
+        ...baseCtx,
+        model: 'gemini-2.5-flash-image',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsdOverride: 0.039,
+      });
+      expect(mockIncrement.mock.calls[0][0].costSource).toBe('allocated');
+    });
+
     it('records an explicit costUsdOverride verbatim (per-generation image/video, not token-priced)', async () => {
       // gemini image model: getModelPrice returns null → token cost would be 0.
       await recordUsage({
