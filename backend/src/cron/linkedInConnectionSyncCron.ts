@@ -577,24 +577,32 @@ async function shouldSkipDisconnectedAccount(
   // skipped — they also aren't anyone's to notify about.
   if (!ownerUserId) return false;
 
-  const health = await getUnipileHealth(accountId, ownerUserId);
-  if (!health?.needs_reconnect) return false;
+  try {
+    const health = await getUnipileHealth(accountId, ownerUserId);
+    if (!health?.needs_reconnect) return false;
 
-  const lastRecheck = lastRecheckAtByAccount.get(accountId);
-  if (lastRecheck !== undefined && Date.now() - lastRecheck < DISCONNECTED_RECHECK_MS) {
+    const lastRecheck = lastRecheckAtByAccount.get(accountId);
+    if (lastRecheck !== undefined && Date.now() - lastRecheck < DISCONNECTED_RECHECK_MS) {
+      return true;
+    }
+
+    markRecheckedNow(accountId);
+    const state = await linkedInOutreachService.probeAccountSession(accountId);
+    await recordUnipileAccountHealth({ accountId, ownerUserId, state });
+    if (state === 'connected') {
+      console.log(`${TAG} account=${accountId} reconnected — resuming full sync`);
+      return false;
+    }
+    // 'unknown' skips too: an indeterminate probe is no reason to spend a full sync
+    // on an account we already have proof is dead.
     return true;
-  }
-
-  markRecheckedNow(accountId);
-  const state = await linkedInOutreachService.probeAccountSession(accountId);
-  await recordUnipileAccountHealth({ accountId, ownerUserId, state });
-  if (state === 'connected') {
-    console.log(`${TAG} account=${accountId} reconnected — resuming full sync`);
+  } catch (err) {
+    // This runs OUTSIDE the per-account try blocks below, so an unexpected throw
+    // here would abort the whole cycle for every remaining account rather than one.
+    // Fail toward syncing: a wasted sync is cheaper than a stalled sweep.
+    console.error(`${TAG} health pre-check failed for account ${accountId}; syncing anyway:`, err);
     return false;
   }
-  // 'unknown' skips too: an indeterminate probe is no reason to spend a full sync
-  // on an account we already have proof is dead.
-  return true;
 }
 
 // ─── Main cron entry point ────────────────────────────────────────────────────
