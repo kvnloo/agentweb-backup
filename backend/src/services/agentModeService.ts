@@ -1577,8 +1577,10 @@ export class AgentModeService {
   // Model for the internal dedup judge (report_product_issues duplicate detection).
   // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
   // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
-  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
-  // model choice becomes gateway/routing config rather than provider-specific.
+  // configurable default model. ENG-9: this already becomes gateway/routing config
+  // for free — setting this to an `openrouter/<provider>/<model>` id routes through
+  // OpenRouter the same as any other prefix (see getClientForModel), no code change
+  // needed at this call site.
   async getDedupJudgeModel(): Promise<string> {
     return (
       (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
@@ -1784,6 +1786,8 @@ export class AgentModeService {
 
   private gemini_client: OpenAI | null = null;
   private gemini_client_promise: Promise<OpenAI> | null = null;
+  private openrouter_client: OpenAI | null = null;
+  private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
@@ -1856,6 +1860,51 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  // ENG-9: OpenRouter is an OpenAI-compatible endpoint, so it uses the exact same
+  // lazy-load/cache shape as getGeminiClient — no new abstraction, just another
+  // baseURL. HTTP-Referer/X-Title identify the app for OpenRouter's own analytics
+  // (openrouter.ai/docs/app-attribution); they carry no auth meaning.
+  public async getOpenRouterClient(): Promise<OpenAI> {
+    if (this.openrouter_client) {
+      return this.openrouter_client;
+    }
+    if (this.openrouter_client_promise) {
+      return this.openrouter_client_promise;
+    }
+
+    this.openrouter_client_promise = (async () => {
+      try {
+        let openRouterApiKey = process.env.OPENROUTER_API_KEY;
+
+        if (!openRouterApiKey) {
+          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          openRouterApiKey = await getSecret(`${environment}/AgentWeb/OpenRouter`);
+        }
+
+        if (!openRouterApiKey || !openRouterApiKey.trim()) {
+          throw new Error('OpenRouter API key is empty or not found in env/secrets');
+        }
+
+        this.openrouter_client = new OpenAI({
+          apiKey: openRouterApiKey.trim(),
+          baseURL: 'https://openrouter.ai/api/v1',
+          defaultHeaders: {
+            'HTTP-Referer': 'https://app.agentweb.pro',
+            'X-Title': 'AgentWeb',
+          },
+        });
+
+        return this.openrouter_client;
+      } catch (error) {
+        console.error('Error initializing OpenRouter client:', error);
+        this.openrouter_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.openrouter_client_promise;
   }
 
   /**
@@ -2092,6 +2141,12 @@ export class AgentModeService {
     }
     if (model.startsWith('claude-')) {
       return this.getVertexClient(model);
+    }
+    // ENG-9: openrouter/<provider>/<model> — the suffix after the prefix passes
+    // straight through as OpenRouter's own model id, so no per-model registry
+    // churn is needed to reach a new upstream model.
+    if (model.startsWith('openrouter/')) {
+      return this.getOpenRouterClient();
     }
     return this.getGeminiClient();
   }
@@ -2784,6 +2839,11 @@ export class AgentModeService {
     'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
+    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
+    // the suffix after the prefix passed straight through as OpenRouter's own model
+    // string, so a new upstream model is one registry line, not new routing code.
+    // First entry mirrors the model already smoke-tested live against this account.
+    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true, maxTools: 128 },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
@@ -3009,6 +3069,15 @@ export class AgentModeService {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
       }
+    } else if (model.startsWith('openrouter/')) {
+      // ENG-9: lazy-loaded and cached on the registry, same as Bedrock/Vertex —
+      // must be its own branch, not the azure-openai fallback below, since an
+      // openrouter/* entry is registered with client: null (see llmModels).
+      providerLabel = 'openrouter';
+      if (!client) {
+        client = await this.getOpenRouterClient();
+        this.llmModels[model].client = client;
+      }
     } else {
       providerLabel = 'azure-openai';
       if (!client) {
@@ -3060,6 +3129,16 @@ export class AgentModeService {
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
+              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
+              // present, not opt-in) — ground truth from the vendor that actually
+              // billed us, not a static per-token guess our own price table (which
+              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
+              // otherwise have to estimate. Omitted for every other provider, so
+              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              costUsdOverride:
+                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
             });
           }
         } catch {
