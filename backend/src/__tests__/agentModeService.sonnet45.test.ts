@@ -708,9 +708,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const client = await agentModeService.getClientForModel('xai.grok-4.3');
 
       expect(client).toBe(mockMantleClient);
+      // ENG-1202: metered:false — getClientForModel callers (CRM enrichment,
+      // field alias, cluster services) meter explicitly via
+      // meterUsageFromResponse; the factory's own auto-metering must stay off
+      // here or usage double-records.
       expect(getBedrockMantleClient).toHaveBeenCalledWith(
         { feature: 'agent_task' },
         'xai.grok-4.3',
+        { metered: false },
       );
     });
   });

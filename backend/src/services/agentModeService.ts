@@ -2085,7 +2085,10 @@ export class AgentModeService {
 
   public async getClientForModel(model: string): Promise<any> {
     if (model.startsWith('xai.')) {
-      return getBedrockMantleClient({ feature: 'agent_task' }, model as 'xai.grok-4.3');
+      // metered:false — every getClientForModel caller (CRM enrichment, field
+      // alias, cluster services) meters explicitly via meterUsageFromResponse;
+      // leaving the factory's own auto-metering on would double-record.
+      return getBedrockMantleClient({ feature: 'agent_task' }, model as 'xai.grok-4.3', { metered: false });
     }
     if (model.startsWith('anthropic.')) {
       return this.getBedrockClient(model);
@@ -8133,7 +8136,11 @@ export class AgentModeService {
       if (
         (llmModel.startsWith('anthropic.') ||
           llmModel.startsWith('claude-') ||
-          llmModel.startsWith('gemini-')) &&
+          llmModel.startsWith('gemini-') ||
+          // ENG-1202: Grok 4.3 (xai.*) is registered supportsVision:true but,
+          // like anthropic./claude-*, cannot reach our private S3 objects —
+          // it needs the same download+presign+inline treatment.
+          llmModel.startsWith('xai.')) &&
         !imageUrl.startsWith('data:')
       ) {
         try {
