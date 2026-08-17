@@ -23,7 +23,8 @@
 // ./prepush/logic.mjs and is unit-tested there (`node --test backend/scripts/prepush/logic.test.mjs`).
 // This file is intentionally thin: it wires that logic to real git/tsc/jest processes.
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { parsePushLine, isBackendPath, resolveBaseSha, classifyChangedFiles, selectJestSuites, evaluateListTestsResult, parseDiffRaw, mergeStatusByPathAcrossRefs, findForeignBackendRefs, basesForDeletedPaths } from './prepush/logic.mjs';
@@ -108,130 +109,117 @@ function changedFilesForRefs(refs) {
   return { statusByPath: merged.statusByPath, basesForPath };
 }
 
-// ENG-1277 / Greptile P1 #2 and #3: a deleted source file must still have its
-// dependent tests discovered — jest's `--findRelatedTests` needs the file to exist
-// on disk to resolve who imports it, so this materializes the file's PRE-deletion
-// content (via `git show <base>:<path>`) back at its real path just long enough for
-// jest to compute relatedness, then reverts the path to its exact pre-call state —
-// removed if nothing was there, restored byte-for-byte if something was — before
-// any test actually executes. Reverting rather than unconditionally deleting matters
-// because the path being git-truth-"deleted" does not mean the path is empty on
-// disk: an uncommitted file having nothing to do with this push could legitimately
-// sit there (leftover scratch work, a stale build artifact, anything), and this must
-// never destroy it — only borrow the path for the duration of discovery. Tests
-// themselves still run against the true, post-deletion tree; only *discovery* sees
-// the old file. Returns revert callbacks so the caller can restore correctly even if
-// something downstream throws.
-function materializeDeletedForDiscovery(deletedRelPaths, basesForPath) {
-  const revert = [];
-  const revertAll = () => { while (revert.length) revert.pop()(); };
-  try {
-    for (const relPath of deletedRelPaths) {
-      const absPath = path.join(backend, relPath);
-      // ENG-1277 / Greptile: the directory-containment check below only covers
-      // path.dirname(absPath) — an ancestor. It says nothing about absPath's
-      // OWN final path component. If a symlink sits at the exact deleted path
-      // (not one of its ancestors), the directory check passes cleanly (the
-      // directory itself is real and contained) while writeFileSync still
-      // follows that final symlink and writes through it — to an existing
-      // external file (silently overwriting it, "restored" on revert by
-      // writing the external file's own prior content back, which is still a
-      // real write to something outside the repo in between), or, worse, to a
-      // DANGLING symlink's target: writeFileSync's open() follows the link and
-      // creates a brand-new file at the external, nonexistent target, but the
-      // revert path only knows to `rmSync` the symlink itself (POSIX unlink
-      // never follows a symlink to remove its target) — leaving that newly
-      // created external file permanently orphaned once the symlink pointing
-      // to it is gone. `lstatSync` (unlike `existsSync`/`statSync`) does not
-      // follow the final symlink, so it sees the symlink itself regardless of
-      // whether its target exists — refuse outright rather than write through
-      // it: a legitimately git-deleted path should have nothing sitting there
-      // at all, so anything already there (let alone a symlink) is foreign.
-      let existingEntry = null;
-      try {
-        existingEntry = lstatSync(absPath);
-      } catch (e) {
-        if (e.code !== 'ENOENT') throw e; // anything other than "nothing there" is a real stat failure, not the expected case.
-      }
-      if (existingEntry && existingEntry.isSymbolicLink()) {
-        throw new Error(`refusing to materialize ${relPath} for test discovery — a symlink already sits at that exact path (${absPath}). Writing through it could overwrite or create content outside the repository, and cleanup cannot safely undo that for a dangling symlink. Remove the stray symlink before pushing, or bypass with --no-verify.`);
-      }
-      const hadLocalContent = existsSync(absPath);
-      const localContent = hadLocalContent ? readFileSync(absPath) : null;
-      let content = null;
-      // ENG-1277 / Greptile P1: only try bases from refs that actually
-      // reported THIS path deleted — never a base belonging to some other,
-      // unrelated ref in the same multi-ref push. See basesForDeletedPaths's
-      // doc comment.
-      const fullPath = path.posix.join('backend', relPath);
-      const candidateBases = basesForPath[fullPath] || [];
-      for (const base of candidateBases) {
-        const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
-        if (r.status === 0) { content = r.stdout; break; }
-      }
-      if (content === null) {
-        // Could not recover pre-deletion content from any resolved base. Throw
-        // (not `fail()`, which exits immediately) so the catch below can revert
-        // any paths THIS loop already touched before this one failed — leaving a
-        // half-materialized path behind on a failed push would either pollute the
-        // developer's working tree with an untracked file they never created, or
-        // worse, leave their own pre-existing file overwritten.
-        throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
-      }
-      // ENG-1277 / Greptile P1 #5, and P1 "containment check runs too late":
-      // check containment BEFORE creating any directories, not after. The
-      // original guard called `mkdirSync(dir, {recursive:true})` first and
-      // only checked containment afterward — if a missing intermediate
-      // directory sits beneath an ancestor symlink pointing outside
-      // `backend/` (the ENG-731 borrowed-node_modules pattern, one level
-      // deeper), `mkdirSync` recursive would have already CREATED the missing
-      // remainder on the external filesystem, through the symlink, before the
-      // check ever ran — real directories left behind outside the repo even
-      // though the subsequent check correctly refused the file write. Instead,
-      // walk up from the deleted path's directory to the nearest ALREADY-
-      // EXISTING ancestor and check only that one's real path: if it's
-      // contained, everything `mkdirSync` would create beneath it is brand-new
-      // and necessarily contained too (nothing new is a symlink); if it's not
-      // contained, refuse before creating anything at all.
-      const dir = path.dirname(absPath);
-      let nearestExisting = dir;
-      while (!existsSync(nearestExisting)) {
-        const parent = path.dirname(nearestExisting);
-        if (parent === nearestExisting) break; // filesystem root — should be unreachable under backend/, but never loop forever.
-        nearestExisting = parent;
-      }
-      const realNearestExisting = realpathSync(nearestExisting);
-      const realBackend = realpathSync(backend);
-      if (realNearestExisting !== realBackend && !realNearestExisting.startsWith(realBackend + path.sep)) {
-        throw new Error(`refusing to materialize ${relPath} for test discovery — its nearest existing ancestor directory (${nearestExisting}) resolves to ${realNearestExisting}, outside backend/ (${realBackend}), likely via a symlink. Creating directories there would escape the repository.`);
-      }
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(absPath, content);
-      // ENG-1277 / Greptile P1: "cleanup destroys concurrent worktree
-      // changes" — this revert used to unconditionally restore the
-      // pre-materialization snapshot (or unconditionally rmSync), regardless
-      // of anything that touched absPath DURING the discovery window in
-      // between (an editor, a watcher, a genuinely concurrent process). Only
-      // revert if the content is still exactly what we just wrote — i.e.
-      // nothing else touched this path since. If something else changed it,
-      // leave it alone and warn loudly rather than silently destroying that
-      // change; the developer can `git status` and sort it out themselves.
-      revert.push(() => {
-        let current = null;
-        try { current = readFileSync(absPath, 'utf8'); } catch { /* nothing there now */ }
-        if (current !== content) {
-          log(`WARNING: ${relPath} changed (by something other than this hook) while test discovery ran — leaving it as-is rather than overwriting or deleting that change. Check \`git status\` for ${relPath} before pushing again.`);
-          return;
-        }
-        if (hadLocalContent) writeFileSync(absPath, localContent);
-        else rmSync(absPath, { force: true });
-      });
-    }
-  } catch (e) {
-    revertAll();
-    fail(e.message);
+// ENG-1277 / Greptile: rounds 5, 7c (x2), and 8 each found a real way for
+// deleted-file materialization to escape or race the developer's REAL
+// working tree — a symlink follow (twice, once via an ancestor directory and
+// once via the deleted path's own final component), a stale base's content
+// winning over the correct one, an unconditional revert destroying a
+// genuinely concurrent edit, and directory creation happening before the
+// containment check that was meant to prevent it. Patching each new shape of
+// "something touched the real tree" individually was chasing symptoms of one
+// root cause: discovery was writing into a place other things can see and
+// touch. Materializing into an ISOLATED, ephemeral `git worktree` instead of
+// `backend/` removes the root cause rather than the next symptom — nothing
+// else on the machine knows this worktree exists, so there is no concurrent
+// process to race and nothing of the developer's to preserve. It is torn
+// down unconditionally when the process exits (success, a `fail()`-triggered
+// exit, or an uncaught throw), via the `process.on('exit', ...)` handler
+// registered below — Node guarantees that fires synchronously for every exit
+// path, so no manual try/finally bookkeeping is needed at each call site.
+// Tests themselves still run against the REAL, post-deletion `backend/` tree
+// afterward, entirely unaffected by any of this — only *discovery* is isolated.
+function createIsolatedWorktreeForDiscovery() {
+  const rawTmpDir = mkdtempSync(path.join(os.tmpdir(), 'agentweb-prepush-'));
+  // Resolve BEFORE removing (while it still exists to resolve): macOS
+  // symlinks /tmp -> /private/tmp and /var -> /private/var, so
+  // os.tmpdir()'s string form and what a spawned child process reports as
+  // its own cwd (which the OS resolves) can differ for the SAME real
+  // location. Comparing or `path.relative()`-ing between the two silently
+  // produces garbage (a long `../../..` climb back out instead of the
+  // short, correct relative path) rather than an error — caught live via a
+  // stubbed jest reporting its real `process.cwd()`. Resolve once, use the
+  // resolved form everywhere downstream, so every later string comparison
+  // and relative-path computation stays valid.
+  const tmpDir = realpathSync(rawTmpDir);
+  rmdirSync(tmpDir); // `git worktree add` creates its own target directory; it must not already exist.
+  const r = spawnSync('git', ['worktree', 'add', '--detach', '--quiet', tmpDir, 'HEAD'], { cwd: root, encoding: 'utf8' });
+  if (r.status !== 0) {
+    throw new Error(`could not create an isolated worktree for safe test discovery: ${r.stderr}`);
   }
-  return revertAll;
+  const cleanup = () => {
+    spawnSync('git', ['worktree', 'remove', '--force', tmpDir], { cwd: root });
+    spawnSync('git', ['worktree', 'prune'], { cwd: root });
+  };
+  process.on('exit', cleanup);
+  const tmpBackend = path.join(tmpDir, 'backend');
+  const realNodeModules = path.join(backend, 'node_modules');
+  const tmpNodeModules = path.join(tmpBackend, 'node_modules');
+  // node_modules is gitignored in this repo, so a fresh worktree checkout
+  // normally never has it — but don't assume that; if the checkout somehow
+  // already produced something at that path (an unusual repo state), leave
+  // it alone rather than let symlinkSync throw EEXIST.
+  if (existsSync(realNodeModules) && !existsSync(tmpNodeModules)) {
+    // Symlink the real one in (read-only reuse, no reinstall) so jest can
+    // actually run there. This is the ONE symlink the isolated worktree ever
+    // has, and it's ours, expected, and points at a known-safe location.
+    symlinkSync(realNodeModules, tmpNodeModules, 'dir');
+  }
+  return { tmpBackend, cleanup };
+}
+
+// Writes each deleted path's pre-deletion content into the isolated
+// worktree's copy of backend/ (never the real one) so jest can resolve who
+// imports it. Keeps the same symlink/containment guards from rounds 5 and 8
+// as defense-in-depth — a fresh checkout would faithfully reproduce a
+// git-TRACKED symlink if this repo ever commits one under backend/src (it
+// does not today; grep `git ls-files -s backend/src | awk '$1==120000'`) —
+// scoped to the isolated worktree's own boundary instead of the real one.
+function materializeDeletedInWorktree(deletedRelPaths, basesForPath, tmpBackend) {
+  for (const relPath of deletedRelPaths) {
+    const absPath = path.join(tmpBackend, relPath);
+    let existingEntry = null;
+    try {
+      existingEntry = lstatSync(absPath);
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e; // anything other than "nothing there" is a real stat failure, not the expected case.
+    }
+    if (existingEntry && existingEntry.isSymbolicLink()) {
+      throw new Error(`refusing to materialize ${relPath} for test discovery — a symlink already sits at that exact path in the isolated worktree (${absPath}). A fresh checkout should never produce one unless it's git-tracked; investigate before pushing.`);
+    }
+    let content = null;
+    // ENG-1277 / Greptile P1: only try bases from refs that actually
+    // reported THIS path deleted — never a base belonging to some other,
+    // unrelated ref in the same multi-ref push. See basesForDeletedPaths's
+    // doc comment.
+    const fullPath = path.posix.join('backend', relPath);
+    const candidateBases = basesForPath[fullPath] || [];
+    for (const base of candidateBases) {
+      const r = spawnSync('git', ['show', `${base}:${fullPath}`], { cwd: root, encoding: 'utf8' });
+      if (r.status === 0) { content = r.stdout; break; }
+    }
+    if (content === null) {
+      throw new Error(`could not recover the pre-deletion content of ${relPath} from any base commit that actually reports it deleted (tried: ${candidateBases.join(', ') || '(none)'}) — cannot check for tests that depended on it.`);
+    }
+    // Check containment BEFORE creating any directories, not after — see the
+    // ENG-1277 round-8 "containment check runs too late" fix this preserves.
+    const dir = path.dirname(absPath);
+    let nearestExisting = dir;
+    while (!existsSync(nearestExisting)) {
+      const parent = path.dirname(nearestExisting);
+      if (parent === nearestExisting) break; // filesystem root — should be unreachable under the worktree's backend/, but never loop forever.
+      nearestExisting = parent;
+    }
+    const realNearestExisting = realpathSync(nearestExisting);
+    const realTmpBackend = realpathSync(tmpBackend);
+    if (realNearestExisting !== realTmpBackend && !realNearestExisting.startsWith(realTmpBackend + path.sep)) {
+      throw new Error(`refusing to materialize ${relPath} for test discovery — its nearest existing ancestor directory (${nearestExisting}) resolves to ${realNearestExisting}, outside the isolated worktree's backend/ (${realTmpBackend}), likely via a git-tracked symlink. Creating directories there would escape it.`);
+    }
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(absPath, content);
+    // No revert/restore logic needed: the whole worktree is disposable and
+    // exclusively ours, torn down unconditionally by the caller. There is
+    // nothing of the developer's to preserve here.
+  }
 }
 
 function run(label, cmd, args, { cwd, budgetMs }) {
@@ -280,8 +268,8 @@ run('tsc --noEmit (backend)', process.execPath,
 const rel = (f) => path.relative(backend, path.join(root, f));
 const { testChanged: testChangedAbs, nonTestChanged: nonTestChangedAbs } = classifyChangedFiles(backendFiles);
 // ENG-1277 / Greptile P1 #3: deleted-ness comes from `statusByPath` (git truth),
-// never from `existsSync` (filesystem truth) — see parseDiffNameStatus and
-// materializeDeletedForDiscovery's doc comments for why the filesystem can lie.
+// never from `existsSync` (filesystem truth) — see parseDiffRaw's doc comment
+// for why the filesystem can lie.
 const isDeleted = (f) => statusByPath[f] === 'D';
 const testChanged = testChangedAbs.filter((f) => !isDeleted(f)).map(rel);
 const nonTestChanged = nonTestChangedAbs.filter((f) => !isDeleted(f)).map(rel);
@@ -289,17 +277,27 @@ const deletedNonTest = nonTestChangedAbs.filter(isDeleted).map(rel);
 
 let relatedSuites = null;
 if (nonTestChanged.length || deletedNonTest.length) {
-  const revertMaterialized = materializeDeletedForDiscovery(deletedNonTest, basesForPath);
-  let list;
-  try {
-    list = spawnSync(process.execPath, ['--max-old-space-size=4096', bin('jest'), '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],
-      { cwd: backend, encoding: 'utf8', timeout: 60_000 });
-  } finally {
-    // Discovery is the only step allowed to see the pre-deletion content — the tests
-    // themselves must run against the real, post-deletion tree. Revert even if the
-    // spawnSync above threw.
-    revertMaterialized();
+  // Only deletions need isolation — if nothing is deleted, the real backend/
+  // tree is already exactly correct for discovery and nothing is written to
+  // it, so there's no reason to pay for a worktree. See
+  // createIsolatedWorktreeForDiscovery's doc comment for why deletions do.
+  let discoveryCwd = backend;
+  let jestBin = bin('jest');
+  if (deletedNonTest.length) {
+    let wt;
+    try {
+      wt = createIsolatedWorktreeForDiscovery();
+      materializeDeletedInWorktree(deletedNonTest, basesForPath, wt.tmpBackend);
+    } catch (e) {
+      // wt's cleanup (if it was created) runs automatically via its
+      // registered `process.on('exit', ...)` handler when fail() exits below.
+      fail(e.message);
+    }
+    discoveryCwd = wt.tmpBackend;
+    jestBin = path.join(wt.tmpBackend, 'node_modules', '.bin', 'jest');
   }
+  const list = spawnSync(process.execPath, ['--max-old-space-size=4096', jestBin, '--listTests', '--findRelatedTests', ...nonTestChanged, ...deletedNonTest],
+    { cwd: discoveryCwd, encoding: 'utf8', timeout: 60_000 });
   // ENG-1277 / Greptile: fail loud, not silently empty — see evaluateListTestsResult.
   const evaluated = evaluateListTestsResult(list);
   if (!evaluated.ok && evaluated.reason === 'timeout') {
@@ -308,7 +306,7 @@ if (nonTestChanged.length || deletedNonTest.length) {
   if (!evaluated.ok && evaluated.reason === 'nonzero-exit') {
     fail(`jest --listTests --findRelatedTests failed (exit ${evaluated.status}) — cannot determine which suites this change touches.\n${(list.stderr || '').slice(-2000)}`);
   }
-  relatedSuites = evaluated.suites.map((a) => path.relative(backend, a));
+  relatedSuites = evaluated.suites.map((a) => path.relative(discoveryCwd, a));
 }
 
 const { suites, capped, namedMatched } = selectJestSuites({ testChanged, relatedSuites, nonTestChanged: [...nonTestChanged, ...deletedNonTest], cap: RELATED_CAP });
