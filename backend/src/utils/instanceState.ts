@@ -33,8 +33,11 @@ export const disableCron = (): void => {
  *
  * Deliberately two independent signals rather than one with a fallback: the
  * worker id catches a runner that leaves NODE_ENV unset or lying. And
- * deliberately `!== undefined` on the id, because worker '0' is a real worker
- * whose id is falsy as a string.
+ * deliberately compared against `undefined` rather than tested for truthiness,
+ * so that ANY defined value means "inside a worker". Truthiness would read
+ * `JEST_WORKER_ID=''` as "not a worker" and bootstrap anyway; only an absent
+ * variable should qualify. ('0' is a non-empty string and therefore truthy —
+ * it is not the case that distinguishes the two, '' is.)
  *
  * The unset-NODE_ENV case must stay TRUE: a bare `node dist/server.js` has to
  * keep running its crons. Failing closed there would silently kill every

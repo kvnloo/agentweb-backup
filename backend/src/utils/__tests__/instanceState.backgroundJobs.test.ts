@@ -62,8 +62,18 @@ describe('shouldBootstrapBackgroundJobs (ENG-1286)', () => {
       expect(load().shouldBootstrapBackgroundJobs()).toBe(false);
     });
 
-    it('is false inside worker 0, which is falsy as a string but is still a worker', () => {
-      // A plain truthiness check on the id would read '0' as "not a worker".
+    it('is false when the worker id is set but empty', () => {
+      // The case that actually distinguishes `=== undefined` from a truthiness
+      // check: '' is falsy, so `!process.env.JEST_WORKER_ID` would call this
+      // "not a worker" and bootstrap anyway. Only an ABSENT variable qualifies.
+      setEnv('production', '');
+      expect(load().shouldBootstrapBackgroundJobs()).toBe(false);
+    });
+
+    it('is false inside worker 0', () => {
+      // '0' is a non-empty string and therefore truthy, so this passes under
+      // either implementation — kept because worker 0 is a real worker and the
+      // rule is "any defined value means inside a worker".
       setEnv('production', '0');
       expect(load().shouldBootstrapBackgroundJobs()).toBe(false);
     });
