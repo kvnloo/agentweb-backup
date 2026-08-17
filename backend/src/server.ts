@@ -1,5 +1,5 @@
 import app from './app';
-import { isCronEnabled, disableCron } from './utils/instanceState';
+import { isCronEnabled, disableCron, shouldBootstrapBackgroundJobs } from './utils/instanceState';
 import { cronJobRegistry } from './utils/cronJobRegistry';
 import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
@@ -534,6 +534,20 @@ createTestAccount().then(async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
+
+    // ENG-1286: everything below this line either schedules a timer or awaits a
+    // dynamic import, and under Jest both outlive the test that triggered them.
+    // Nothing asks for this — `app.ts` registers `routes/crm.ts`, which imports
+    // `../server`, so merely touching `app` boots the real server. The 30-second
+    // cron bootstrap then fires long after that file's environment is torn down,
+    // resolves every `await import(...)` against a dead module registry, and
+    // throws `TypeError: <fn> is not a function` inside an unrelated suite.
+    // Returning here — rather than guarding each cron — is deliberate: a guard
+    // per job is a list that the next background job will be added without.
+    if (!shouldBootstrapBackgroundJobs()) {
+      console.log('[server] Test runtime — background jobs not started (ENG-1286)');
+      return;
+    }
 
     // ENG-764: an EB deploy terminates this instance without waiting for the
     // drain, killing any in-flight scheduled run. Watch for the ASG's termination

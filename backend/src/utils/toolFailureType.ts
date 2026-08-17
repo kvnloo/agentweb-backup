@@ -63,8 +63,12 @@ const SCHEMA_RE =
 // is depleted (X shared app, ENG-664) — a billing/quota config gap, not a tool
 // bug. The 402 alternation is anchored to an HTTP-status context (not a bare
 // "402" number, which could appear in an unrelated id/line-number message).
+// "insufficient_quota" / "exceeded your current quota" / "check your plan and
+// billing details" = hard OpenAI/Azure quota exhaustion (ENG-1220) — same
+// wording toolErrorClassifier's quota_exceeded branch matches, kept in sync so
+// pre-classifier events (no errorClass yet) still land in 'config', not 'bug'.
 const CONFIG_RE =
-  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
+  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|insufficient_quota|exceeded your current quota|check your plan and billing details|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
 
 /**
  * @param errorClass  output of classifyToolErrorClass (may be '', undefined)
@@ -96,7 +100,10 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   //    'payment_required' — a metered vendor wallet out of credits (X shared app,
   //    ENG-664) is a billing/quota gap fixable without touching tool logic, NOT a
   //    tool bug, so it stays out of the tool-bug rate while still being visible.
-  if (cls === 'rate_limit' || cls === 'auth' || cls === 'not_found' || cls === 'payment_required') return 'config';
+  //    'quota_exceeded' (ENG-1220) — hard OpenAI/Azure quota exhaustion, split out
+  //    from 'rate_limit' so the session-wide media budget still counts it, but it
+  //    is the same "resolve the account, not the code" gap as payment_required.
+  if (cls === 'rate_limit' || cls === 'auth' || cls === 'not_found' || cls === 'payment_required' || cls === 'quota_exceeded') return 'config';
   if (CONFIG_RE.test(msg)) return 'config';
 
   // 5. Genuine or transient failure to investigate (network, generic timeout,
