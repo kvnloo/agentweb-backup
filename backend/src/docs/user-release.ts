@@ -23,6 +23,20 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-08-09',
+    changes: [
+      'Changed: Organizations Can Now Have More Than One Owner',
+      '- An organization used to support exactly one owner, so handing over or sharing responsibility meant routing everything through a single person',
+      '- There are now three roles — owner, admin and member — and an organization can have multiple owners and multiple admins',
+      '- Owners can do everything inside the organization except billing: manage people and roles, edit all organization settings and shared content, and delete the organization. Changing the plan or the card stays with the one member whose subscription pays for the organization (see below)',
+      '- Billing is the one thing that is not shared. One member’s own subscription pays for the organization, and only that person can change the plan or the card — another owner subscribing changes their own subscription, not the organization’s. A paying owner cannot be removed or leave while their subscription is paying for the organization. They must end their own subscription before leaving or being removed; for continuity, set up a successor owner/subscriber path with support before the billing root departs',
+      '- Admins can invite and remove members, change organization settings, manage shared content, and promote members to admin. Only an owner can grant or revoke the owner role, remove an owner, or delete the organization',
+      '- Members use every platform feature for their own work and see whatever the organization has shared. Brand Guidelines, Market Strategy, the knowledge base, templates and landing pages are read-only for them unless an owner or admin adds them as an editor for that area',
+      '- An organization must always keep at least one owner: the last owner cannot be removed, demoted, or leave until someone else is promoted to owner. To hand an organization over, promote the new owner first, then leave — there is no separate transfer step',
+      '- This supersedes the 2026-05-12 note stating that only one owner is supported and that co-owner roles do not exist',
+    ],
+  },
+  {
     date: '2026-08-05',
     changes: [
       'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',
