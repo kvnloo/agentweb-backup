@@ -52,6 +52,22 @@ console.log('2. WITHDRAWAL ABORT');
   ok(admissionWithdrawal(admit, issue({ state: { name: 'Blocked', type: 'started' } }), CFG).withdrawn, 'state NAMED Blocked → withdrawn');
   ok(admissionWithdrawal(admit, issue({ labels: { nodes: [{ name: 'autofix' }, { name: 'autofix:blocked' }] } }), CFG).withdrawn, 'blocked label added → withdrawn');
 
+  // ENG-1272: the reason must name the CONDITION that actually fired. A blocked LABEL on a healthy
+  // In Progress card used to report "issue moved to In Progress" — a nonsensical message that made a
+  // legitimate abort look like a bug, and hid that a board automation had re-applied the label.
+  const labelled = issue({ labels: { nodes: [{ name: 'autofix' }, { name: 'autofix:blocked' }] } });
+  const wl = admissionWithdrawal(admit, labelled, CFG);
+  ok(/autofix:blocked/.test(wl.reason), 'blocked-label reason names the label');
+  ok(!/moved to In Progress/.test(wl.reason), 'blocked-label reason does NOT claim the issue moved to its current state');
+  const wd = admissionWithdrawal(admit, issue({ state: { name: 'Done', type: 'completed' } }), CFG);
+  ok(/moved to Done/.test(wd.reason), 'terminal-state reason still names the state');
+  ok(!/autofix:blocked/.test(wd.reason), 'terminal-state reason does not mention the label');
+  const wb = admissionWithdrawal(admit, issue({ state: { name: 'Blocked', type: 'started' } }), CFG);
+  ok(/moved to Blocked/.test(wb.reason), 'state-named-Blocked reason names the state, not the label');
+  // Both at once → the label is the more actionable of the two, and must not be masked by the state.
+  const wboth = admissionWithdrawal(admit, issue({ state: { name: 'Done', type: 'completed' }, labels: { nodes: [{ name: 'autofix' }, { name: 'autofix:blocked' }] } }), CFG);
+  ok(/autofix:blocked/.test(wboth.reason) && /Done/.test(wboth.reason), 'label + terminal state → reason reports both');
+
   // reassigned away
   const reassigned = issue({ assignee: { name: 'Anurag', email: 'aseth@x.com' } });
   ok(admissionWithdrawal(admit, reassigned, CFG).withdrawn, 'reassigned to a different person → withdrawn');

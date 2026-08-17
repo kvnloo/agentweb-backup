@@ -47,8 +47,16 @@ export function admissionWithdrawal(admit, liveIssue, config = {}) {
   const name = norm(liveIssue.state?.name);
   const hasBlockedLabel = blockedLabel
     && (liveIssue.labels?.nodes || []).some((l) => norm(l.name) === norm(blockedLabel));
-  if (WITHDRAWN_STATE_TYPES.has(type) || name === 'blocked' || hasBlockedLabel) {
-    return { withdrawn: true, reason: `issue moved to ${liveIssue.state?.name || type || 'a terminal/blocked state'}` };
+  // Report the condition that ACTUALLY fired, not just the current state. These are independent triggers
+  // and the label one is invisible in the state name: a blocked LABEL on a healthy In Progress card used
+  // to be reported as "issue moved to In Progress", which reads as nonsense and hides the real cause —
+  // some other actor (a board automation, ENG-1272) re-applying the label mid-run.
+  const stateWithdrawn = WITHDRAWN_STATE_TYPES.has(type) || name === 'blocked';
+  if (stateWithdrawn || hasBlockedLabel) {
+    const causes = [];
+    if (hasBlockedLabel) causes.push(`the "${blockedLabel}" label is on the issue`);
+    if (stateWithdrawn) causes.push(`issue moved to ${liveIssue.state?.name || type || 'a terminal/blocked state'}`);
+    return { withdrawn: true, reason: causes.join(' and ') };
   }
   const admitEmail = norm(admit.assignee?.email);
   const liveEmail = norm(liveIssue.assignee?.email);
