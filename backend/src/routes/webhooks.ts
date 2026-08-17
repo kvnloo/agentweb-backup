@@ -18,6 +18,7 @@ import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { pruneClickIds } from '../utils/leadSchema';
+import { resolveClientIdentity } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
@@ -547,12 +548,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // needs them too and re-deriving the same value twice is how the two drift apart.
     // ENG-493 is still deferred (flipping Express's global `trust proxy` would also change
     // auth.ts's IP-keyed rate limiters), so the x-forwarded-for read stays scoped to this
-    // handler. 'unknown' is a sentinel for the CAPI call, never something to store.
-    const capturedClientIp = (
+    // handler.
+    //
+    // ⚠ Landing pages do NOT reach this route from the browser — they POST to their own
+    // Next.js route, which calls us server-side from Vercel (both `hireemma.ai`'s
+    // /api/lead and the platform's own generated /api/capture). So this resolution is
+    // frequently the FORWARDER, not the visitor: a real end-to-end run recorded
+    // `44.202.76.171` + `node` for a lead that came from an actual iPhone. A wrong IP is
+    // worse than no IP — Meta reads it as a match signal and a datacenter address matches
+    // nobody — and these attributes are WRITE-ONCE in db.ts, so a wrong one is permanent.
+    // resolveClientIdentity drops BOTH when the caller is not a browser.
+    const rawClientIp = (
       req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? ''
     ).trim();
-    const capturedUserAgent =
-      typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].trim() : '';
+    const { clientIp: capturedClientIp, clientUserAgent: capturedUserAgent } =
+      resolveClientIdentity(req.headers['user-agent'], rawClientIp);
     if (capturedClientIp) leadData.clientIp = capturedClientIp;
     if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
@@ -791,15 +801,20 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
           // Resolved once at capture (see the ENG-926 §B block above) so the value sent here
           // and the value stored on the lead are the same one, not two independent reads.
-          const clientIp = capturedClientIp || 'unknown';
+          //
+          // OMITTED rather than defaulted when the caller was a forwarding server. This
+          // previously passed `'unknown'`, which metaService treats as truthy and sends
+          // verbatim as `client_ip_address` — a literal placeholder string presented to
+          // Meta as a match signal. Before that it sent the forwarder's real datacenter IP,
+          // which is worse: it looks valid and matches nobody. Sending neither is correct.
           const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
             eventId,
             email: leadData.email,
             firstName: leadData.firstName,
             lastName: leadData.lastName,
             phone: leadData.phone,
-            clientIp,
-            userAgent: capturedUserAgent || undefined,
+            clientIp: capturedClientIp,
+            userAgent: capturedUserAgent,
             sourceUrl: req.headers['referer'],
             fbp: typeof fbp === 'string' ? fbp : undefined,
             fbc: typeof fbc === 'string' ? fbc : undefined,

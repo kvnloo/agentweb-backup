@@ -440,6 +440,12 @@ export interface GeneratedLandingPage {
   templateHtml?: string;
   isRootPage?: boolean;
   /**
+   * Per-lander UTM override (ENG-724, slice B). Wins over the customer-level
+   * default in the slice-A resolver; absent means "inherit the default".
+   * Read/write only via landerUtmStore.
+   */
+  utmOverride?: import("../utils/landerUtm").UtmConfig;
+  /**
    * The site this page belongs to. A site = the repo/Vercel project/subdomain a
    * page is deployed into. The site's root record has `siteId === id`; sub-pages
    * carry their root's id. Explicit identity that replaces the old "guess the
