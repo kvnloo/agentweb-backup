@@ -128,12 +128,23 @@ router.put("/:planId", async (req, res) => {
     // Validated whether or not steps came with it. Nesting this under "steps
     // were supplied" is accept-and-disregard by another name: the caller is
     // answered 200 for a mode we never looked at.
-    const rawMode = (req.body as any).steps_mode ?? (req.body as any).stepsMode;
-    if (rawMode !== undefined && rawMode !== 'merge' && rawMode !== 'replace') {
+    // BOTH spellings are validated, not just whichever wins. `steps_mode ??
+    // stepsMode` never looks at the second key once the first is set, so a
+    // request carrying a good mode and a garbage one had the garbage accepted
+    // and disregarded — the behaviour this check exists to eliminate. `null` is
+    // rejected rather than coalesced away for the same reason: it was supplied,
+    // so answering 200 with replace semantics is a silent downgrade of what the
+    // caller asked for.
+    const suppliedModes = ['steps_mode', 'stepsMode']
+      .filter((key) => key in (req.body as any))
+      .map((key) => (req.body as any)[key]);
+    const badMode = suppliedModes.find((m) => m !== 'merge' && m !== 'replace');
+    if (badMode !== undefined || suppliedModes.some((m) => m === undefined)) {
       return res.status(400).json({
-        message: `Unrecognised steps_mode "${rawMode}". Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
+        message: `Unrecognised steps_mode ${JSON.stringify(badMode)}. Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
       });
     }
+    const rawMode = suppliedModes[0];
     if (normalizedSteps !== undefined) {
       const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
       const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
@@ -159,7 +170,13 @@ router.put("/:planId", async (req, res) => {
           const raw = rawSteps[i] ?? {};
           const has = (key: string) => raw[key] !== undefined;
           const out: any = {};
-          if (has('stepCount')) out.stepCount = norm.stepCount;
+          // Truthiness, not presence, and deliberately so: normalization turns
+          // a null / 0 / '' stepCount into the array position, and merge
+          // resolution trusts stepCount ahead of title. Treating those as
+          // "supplied" promotes a non-selector into an invented one that then
+          // outranks the title the caller actually gave. Same `||` rule
+          // normalizeWorkPlanSteps applies, so the two cannot disagree.
+          if (raw.stepCount) out.stepCount = norm.stepCount;
           if (has('title')) out.title = norm.title;
           if (has('description')) out.description = norm.description;
           if (has('userInstructions')) out.userInstructions = norm.userInstructions;

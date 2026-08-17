@@ -162,13 +162,29 @@ function pairSteps(before: any[], after: any[]): number[] {
     }
   });
 
+  // Titles that belong to some OTHER existing step. An `after` entry carrying
+  // one of these is that step's counterpart, however the numbers line up, so
+  // positional matching must not hand it to a different step. Without this a
+  // caller could erase step A and send a second copy of step B in its place:
+  // the duplicated title makes pass 1 ambiguous, position then pairs A with a
+  // fully-populated B, every field reads "changed, not blanked", and A's
+  // destruction is reported as no loss at all.
+  const titlesOf = (steps: any[]) =>
+    new Set(steps.map((s: any) => normalizeStepTitle(s.title)).filter((t) => t !== ''));
+  const beforeTitles = titlesOf(before);
+
   before.forEach((step: any, i: number) => {
     if (pairs[i] !== -1) return;
     if (step.stepCount === undefined || step.stepCount === null) return;
-    const j = after.findIndex(
-      (candidate: any, index: number) =>
-        !claimed.has(index) && Number(candidate.stepCount) === Number(step.stepCount),
-    );
+    const ownTitle = normalizeStepTitle(step.title);
+    const j = after.findIndex((candidate: any, index: number) => {
+      if (claimed.has(index)) return false;
+      if (Number(candidate.stepCount) !== Number(step.stepCount)) return false;
+      const candidateTitle = normalizeStepTitle(candidate.title);
+      // A renamed step is fine — its new title belongs to nobody. A title that
+      // is another existing step's is not ours to take.
+      return candidateTitle === ownTitle || !beforeTitles.has(candidateTitle);
+    });
     if (j !== -1) {
       pairs[i] = j;
       claimed.add(j);
