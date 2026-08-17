@@ -34,7 +34,7 @@ import {
   type AttributionRow,
   type CostAttribution,
 } from "./llmUsageAttributionService";
-import { computeUsageRunway } from "./llmUsageForecastService";
+import { computeUsageRunway, TRAILING_WINDOW_DAYS } from "./llmUsageForecastService";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
 export interface UsageRecommendationAlternative {
@@ -44,6 +44,30 @@ export interface UsageRecommendationAlternative {
   estimatedSavingsMicroUsd: number;
 }
 
+/**
+ * How much to trust one recommendation's day figure (ENG-1217 AC6).
+ *
+ * Four levels because the AC names four. `insufficient_data` is not "a bit
+ * unsure" — it means no forecast could be produced at all, so there is no number
+ * to qualify.
+ */
+export type RecommendationConfidence = "insufficient_data" | "low" | "medium" | "high";
+
+/**
+ * What we know about the cheaper model doing the same job (ENG-1217 AC5).
+ *
+ * `status` is a closed set with one member today, and that is the point. AC5
+ * forbids representing a cheaper model as equivalent in quality without
+ * task-specific evaluation evidence, and no eval harness exists yet (open
+ * question `OQ:okareo`). Modelling it as a field rather than omitting it forces
+ * the UI to render "quality: unknown" instead of silently implying parity, and
+ * gives the eventual harness a slot to fill rather than a schema change.
+ */
+export interface RecommendationQuality {
+  status: "unknown";
+  reason: string;
+}
+
 export interface UsageRecommendation {
   fromModel: string;
   toModel: string;
@@ -51,6 +75,12 @@ export interface UsageRecommendation {
   estimatedDaysRecovered: number | null;
   /** INTERNAL — stripped before reaching a customer. */
   estimatedSavingsMicroUsd: number;
+  /** This driver's share of the cycle's cost, so the estimate can be weighed (AC4). */
+  shareOfTotal: number;
+  /** Complete cycle days the estimate was computed over (AC6's "window"). */
+  completeDaysObserved: number;
+  confidence: RecommendationConfidence;
+  quality: RecommendationQuality;
   isEstimate: true;
   requiresConfirmation: true;
   basis: string;
@@ -344,6 +374,59 @@ export async function resolveUsageDrivers(
   );
   const catalog = (usage.policy.optimizedModelIds || []).filter((m) => supported.has(m));
 
+  /**
+   * The recommendation's confidence, capped by the forecast's own (AC6).
+   *
+   * The days figure IS `computeUsageRunway` re-run over repriced history, so
+   * claiming more certainty about the difference than about either endpoint
+   * would be incoherent. The cap makes that structural rather than a convention
+   * someone has to remember.
+   *
+   * With today's thresholds the cap never actually binds — the forecast drops to
+   * `low` below three complete days, and the rule below cannot reach `medium`
+   * until three either. It is kept because the two rules live in different files
+   * and are free to drift; the day one of them moves, this stays coherent
+   * instead of quietly emitting a confident recommendation about an unconfident
+   * forecast.
+   *
+   * Below the cap it reads two things the customer would ask about anyway: how
+   * many complete days we watched, and how many calls that driver actually made.
+   * A week of steady traffic is a different claim from two days and five calls,
+   * and both can produce the same arithmetic.
+   */
+  const forecastCap: RecommendationConfidence =
+    baseline.confidence === "insufficient_data"
+      ? "insufficient_data"
+      : baseline.confidence === "low"
+        ? "low"
+        : "high";
+  const RANK: Record<RecommendationConfidence, number> = {
+    insufficient_data: 0,
+    low: 1,
+    medium: 2,
+    high: 3,
+  };
+  const confidenceFor = (callCount: number): RecommendationConfidence => {
+    const own: RecommendationConfidence =
+      baseline.completeDaysElapsed >= TRAILING_WINDOW_DAYS && callCount >= 20
+        ? "high"
+        : baseline.completeDaysElapsed >= 3 && callCount >= 5
+          ? "medium"
+          : "low";
+    return RANK[own] <= RANK[forecastCap] ? own : forecastCap;
+  };
+
+  /**
+   * AC5. One value, deliberately: we have no task-specific evaluation evidence
+   * for any of these targets, so `unknown` is the only claim we are entitled to
+   * make. The wording avoids "similar"/"equivalent" for the same reason.
+   */
+  const UNKNOWN_QUALITY: RecommendationQuality = {
+    status: "unknown",
+    reason:
+      "No task-specific evaluation evidence exists for this model on your work, so its output quality is unknown.",
+  };
+
   const recommendations: UsageRecommendation[] = [];
   for (const driver of attribution.byModel) {
     for (const candidate of catalog) {
@@ -389,6 +472,11 @@ export async function resolveUsageDrivers(
         toModel: candidate,
         estimatedDaysRecovered,
         estimatedSavingsMicroUsd: est.estimatedSavingsMicroUsd,
+        shareOfTotal: driver.shareOfTotal,
+        completeDaysObserved: baseline.completeDaysElapsed,
+        confidence:
+          estimatedDaysRecovered === null ? "insufficient_data" : confidenceFor(driver.callCount),
+        quality: UNKNOWN_QUALITY,
         isEstimate: true,
         requiresConfirmation: true,
         basis: est.basis,
@@ -516,6 +604,13 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
       fromModel: r.fromModel,
       toModel: r.toModel,
       estimatedDaysRecovered: r.estimatedDaysRecovered,
+      // The qualifiers travel WITH the number they qualify. Sending the days
+      // figure alone would leave a UI free to render it as a promise, which is
+      // exactly what ENG-1217 AC4/AC5/AC6 exist to prevent.
+      shareOfTotal: r.shareOfTotal,
+      completeDaysObserved: r.completeDaysObserved,
+      confidence: r.confidence,
+      quality: r.quality,
       isEstimate: r.isEstimate,
       requiresConfirmation: r.requiresConfirmation,
       basis: r.basis,

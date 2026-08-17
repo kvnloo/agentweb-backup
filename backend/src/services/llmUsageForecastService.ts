@@ -48,7 +48,11 @@ export const USAGE_RUNWAY_VERSION = "runway-2026-08-v1";
 
 /** At least this many complete days before the trailing window is meaningful. */
 const MIN_DAYS_FOR_TRAILING_WINDOW = 3;
-const TRAILING_WINDOW_DAYS = 7;
+/**
+ * Exported so a caller reasoning about "enough history" uses the SAME window the
+ * forecast does, rather than a second 7 that can drift away from this one.
+ */
+export const TRAILING_WINDOW_DAYS = 7;
 /**
  * Below this, daily burn is treated as zero. One micro-USD per day would
  * otherwise project a runway of centuries and render as a confident "on track".

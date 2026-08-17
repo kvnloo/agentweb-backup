@@ -99,6 +99,124 @@ const opusLedger = () =>
     billingUserId: "billing-root",
   }));
 
+/**
+ * ENG-1217 AC4/AC5/AC6 — a recommendation must carry its own honesty.
+ *
+ * The days figure is the persuasive part of this screen, so what qualifies it
+ * has to travel with it: how much history produced it, how confident we are,
+ * what share of the bill the driver actually is, and — the one that constrains
+ * the copy — whether we have any evidence the cheaper model does the job.
+ *
+ * AC5 is a prohibition, not a feature: we may not call a cheaper model
+ * equivalent in quality without task-specific evaluation evidence. No eval
+ * harness exists (open question `OQ:okareo`), so the only compliant answer today
+ * is `unknown`, stated explicitly rather than left absent for a UI to fill in
+ * optimistically.
+ */
+describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    soloAccount();
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+    // Without this the catalog intersects to empty and no recommendation is
+    // produced at all, which would make every assertion below vacuous.
+    mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);
+  });
+
+  it("labels quality unknown, because no evaluation evidence exists", async () => {
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    expect(recommendations.length).toBeGreaterThan(0);
+    for (const r of recommendations) {
+      expect(r.quality.status).toBe("unknown");
+      expect(r.quality.reason).toMatch(/evaluation/i);
+    }
+  });
+
+  it("never claims equivalence anywhere in the payload", async () => {
+    // Guards the copy as well as the flag: a reason string that said "similar"
+    // or "equivalent" would make the claim AC5 forbids while the status field
+    // still read `unknown`.
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const blob = JSON.stringify(recommendations).toLowerCase();
+    expect(blob).not.toMatch(/equivalent|same quality|as good as|no differ/);
+  });
+
+  it("carries the driver's share so the estimate can be weighed", async () => {
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const { recommendations, attribution } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    const opusShare = attribution!.byModel.find((d) => d.key === OPUS)!.shareOfTotal;
+    expect(recommendations[0].shareOfTotal).toBeCloseTo(opusShare, 6);
+  });
+
+  it("states the window that produced the estimate", async () => {
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    // 2026-08-01..2026-08-10 inclusive are complete; the 11th is still accruing.
+    expect(recommendations[0].completeDaysObserved).toBe(10);
+  });
+
+  it("is confident only with enough history and enough calls", async () => {
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger()); // 10 days, 4 calls/day = 40 calls
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations[0].confidence).toBe("high");
+  });
+
+  it("drops to low confidence on a thin ledger", async () => {
+    // Two complete days is enough to compute a number and nowhere near enough to
+    // trust it. Saying so is the whole point of AC6.
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger().slice(0, 2));
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-03" });
+    for (const r of recommendations) {
+      expect(["low", "insufficient_data"]).toContain(r.confidence);
+      expect(r.confidence).not.toBe("high");
+    }
+  });
+
+  it("will not call a long but thinly-sampled history high confidence", async () => {
+    // The discriminating case for the two-factor rule. Ten complete days would
+    // pass a days-only test, but one call a day is a handful of observations to
+    // reprice — plenty to compute an average, far too few to trust the shape of
+    // the token mix that average rests on.
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger().map((r) => ({ ...r, callCount: 1 })));
+
+    const { recommendations } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(recommendations.length).toBeGreaterThan(0);
+    for (const r of recommendations) {
+      expect(r.confidence).not.toBe("high");
+    }
+  });
+
+  it("keeps the honesty fields at the customer boundary, minus the dollars", async () => {
+    mockPolicy.mockResolvedValue(policyFor());
+    mockQuery.mockResolvedValue(opusLedger());
+
+    const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
+    const r = customer.recommendations[0];
+    expect(r).toHaveProperty("confidence");
+    expect(r).toHaveProperty("quality");
+    expect(r).toHaveProperty("shareOfTotal");
+    expect(r).toHaveProperty("completeDaysObserved");
+    expect(r).not.toHaveProperty("estimatedSavingsMicroUsd");
+  });
+});
+
 describe("resolveUsageDrivers", () => {
   beforeEach(() => {
     jest.clearAllMocks();
