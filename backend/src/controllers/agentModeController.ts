@@ -3499,6 +3499,7 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
   attempt: number;
@@ -4500,7 +4501,14 @@ export async function runScheduledChat(
     filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
       .forEach((functionName: string) => {
         finalFunctionCallDetails[functionName] = {
-          actual: countCallsSatisfyingRequirement(functionName, result.toolCalls),
+          // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
+          // made in the ABANDONED portion, carried in via `resumePriorToolCalls` — the
+          // same list `runVerifiedChat` folded in above to decide functionCallMatches.
+          // Recounting from `result.toolCalls` alone here reintroduces the same
+          // self-contradicting record the surrounding comment warns about: `passed:
+          // true` next to `actual: 0` for a requirement functionCallMatches already
+          // credits.
+          actual: countCallsSatisfyingRequirement(functionName, [...resumePriorToolCalls, ...result.toolCalls]),
           required: functionCallMinCalls[functionName] || 1
         };
       });
