@@ -11,6 +11,11 @@ import {
   buildExecutedActionsFallback,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
+import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
+
+function timeBudgetState(remainingSeconds: number): TurnTimeBudgetState {
+  return { phase: 'wrap_up', elapsedMs: 0, remainingMs: remainingSeconds * 1000, reserveMs: 0 };
+}
 
 describe('isUnusableSynthesis', () => {
   it('flags the exact production residue "}]"', () => {
@@ -157,6 +162,32 @@ describe('isUnusableSynthesis', () => {
     expect(
       isUnusableSynthesis(`I saw the system message "${ANTI_LOOP_STOP_MESSAGE}" and then finished the export.`)
     ).toBe(false);
+  });
+
+  // ENG-1188 follow-up: ENG-907's wall-clock nudges (buildTurnTimeBudgetNudge) are
+  // injected by the same mechanism as the fixed-string nudges above, but each embeds
+  // a live remaining-seconds count, so no injection is byte-identical to another —
+  // an exact-string check would never match. A bare echo (or repeat) of either phase
+  // is just as unrecoverable a failure as the fixed-string nudges.
+  it('flags a reply that is exactly one bare copy of the wrap_up time-budget nudge', () => {
+    const nudge = buildTurnTimeBudgetNudge(timeBudgetState(42), 'wrap_up');
+    expect(isUnusableSynthesis(nudge)).toBe(true);
+  });
+
+  it('flags a reply that is exactly one bare copy of the final_synthesis time-budget nudge', () => {
+    const nudge = buildTurnTimeBudgetNudge(timeBudgetState(17), 'final_synthesis');
+    expect(isUnusableSynthesis(nudge)).toBe(true);
+  });
+
+  it('flags a reply that echoes the time-budget nudge twice, even with drifting seconds counts', () => {
+    const first = buildTurnTimeBudgetNudge(timeBudgetState(42), 'final_synthesis');
+    const second = buildTurnTimeBudgetNudge(timeBudgetState(41), 'final_synthesis');
+    expect(isUnusableSynthesis(`${first} ${second}`)).toBe(true);
+  });
+
+  it('does NOT flag a single quoted mention of the time-budget nudge', () => {
+    const nudge = buildTurnTimeBudgetNudge(timeBudgetState(42), 'wrap_up');
+    expect(isUnusableSynthesis(`I saw the system message "${nudge}" and then finished the export.`)).toBe(false);
   });
 
   it('does NOT flag prose that merely mentions a tool result', () => {
