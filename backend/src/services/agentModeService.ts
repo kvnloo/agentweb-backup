@@ -31782,6 +31782,48 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
 
+          // ENG-1026: when the model passes CRM lead context, cross-check the live
+          // profile's identity against the lead before spending an invite on the
+          // wrong person. Positive mismatch → structured refusal; no lead context
+          // or unverifiable → unchanged behavior.
+          if (args.list_id && args.lead_id && isUrl && profile_url) {
+            const { crmDb: identityCrmDb } = await import('./db');
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments. Require the same list-access check
+            // every other CRM write in this file uses before reading OR stamping
+            // a lead's identity data — a foreign list_id must never expose or
+            // mutate another tenant's lead. Best-effort skip on denial (mirrors
+            // the CRM-mirror access guard below): this is a side-channel guard,
+            // not the primary user-requested action, so it never blocks the send.
+            const identityList = await identityCrmDb.getLeadListById(args.list_id).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasIdentityAccess = identityList ? await canDestructiveCrmList(userId, identityList) : false;
+            if (!hasIdentityAccess) {
+              console.warn(`[AgentMode] send-invite: skipping identity check — list ${args.list_id} not accessible to user ${userId}`);
+            }
+            const identityLead = hasIdentityAccess
+              ? await identityCrmDb.getLeadById(args.list_id, args.lead_id).catch(() => null)
+              : null;
+            if (identityLead) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: identityLead as any,
+                listId: args.list_id,
+                leadId: args.lead_id,
+                profileUrl: profile_url,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
+              }
+            }
+          }
+
           // ENG-182: cross-check the account's PENDING sent-invitation cache before
           // spending a run's invite quota. A profile with an OUTSTANDING (sent but
           // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
@@ -31960,7 +32002,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           let sendLead: any = null;
           if (sendListId && sendLeadId) {
             const { crmDb } = await import('./db');
-            sendLead = await crmDb.getLeadById(sendListId, sendLeadId);
+            // ENG-1026 Greptile P1 ("agent-tool authorization gap"): list_id/lead_id
+            // are LLM-supplied tool arguments — require list access before this
+            // fetch, same as every other CRM write in this file, or a foreign
+            // list_id exposes/mutates another tenant's lead identity data via
+            // both the sync-gate/duplicate check below and the identity guard
+            // further down. Best-effort skip on denial: the send itself is not
+            // blocked, only the CRM-linked checks that need this lead's data.
+            const sendList = await crmDb.getLeadListById(sendListId).catch(() => null);
+            const { canDestructiveCrmList } = await import('./crmAccessControl');
+            const hasSendAccess = sendList ? await canDestructiveCrmList(userId, sendList) : false;
+            if (!hasSendAccess) {
+              console.warn(`[AgentMode] send-message: skipping CRM-linked checks — list ${sendListId} not accessible to user ${userId}`);
+            }
+            sendLead = hasSendAccess ? await crmDb.getLeadById(sendListId, sendLeadId) : null;
             if (sendLead) {
               const syncAt = (sendLead as any).linkedinMessageSyncAt as string | undefined;
               const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -31998,6 +32053,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                     alreadySentAt: duplicateEvent.createdAt,
                   };
                 }
+              }
+            }
+          }
+
+          // ENG-1026: with CRM lead context, cross-check the live profile's identity
+          // against the lead before sending. Positive mismatch → structured refusal.
+          if (sendLead && sendListId && sendLeadId) {
+            const identityUrl = (isUrl && profile_url) || (sendLead.linkedin as string | undefined)?.trim();
+            if (identityUrl) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: sendLead as any,
+                listId: sendListId,
+                leadId: sendLeadId,
+                profileUrl: identityUrl,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
               }
             }
           }

@@ -4511,6 +4511,20 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
     }
 
+    // ENG-1026: cross-check the live profile's identity against the lead before
+    // sending. Positive mismatch (wrong person behind the stored URL) → 409.
+    const { verifyLinkedInIdentityForSend } = await import('../services/linkedInIdentityCheck');
+    const identity = await verifyLinkedInIdentityForSend({
+      lead: lead as any,
+      listId,
+      leadId,
+      profileUrl: leadLinkedIn,
+      accountId,
+    });
+    if (!identity.allowed) {
+      return res.status(409).json(identity.refusal);
+    }
+
     await linkedInOutreachService.sendMessage(accountId, leadLinkedIn, true, message.trim());
 
     // Record the engagement
@@ -4580,6 +4594,20 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       : ((list as any).linkedInAccountId || await linkedInOutreachService.resolveUserOwnedAccountId(userId));
     if (!accountId) {
       return res.status(400).json({ message: 'No LinkedIn account connected. Connect LinkedIn outreach in Settings first.' });
+    }
+
+    // ENG-1026: cross-check the live profile's identity against the lead before
+    // sending the invite. Positive mismatch → 409, nothing sent.
+    const { verifyLinkedInIdentityForSend } = await import('../services/linkedInIdentityCheck');
+    const identity = await verifyLinkedInIdentityForSend({
+      lead: lead as any,
+      listId,
+      leadId,
+      profileUrl: leadLinkedIn,
+      accountId,
+    });
+    if (!identity.allowed) {
+      return res.status(409).json(identity.refusal);
     }
 
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
