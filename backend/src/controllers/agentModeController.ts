@@ -2039,7 +2039,22 @@ function stripMarkdownEmphasis(content: string): string {
 // A genuine mid-run halt asks its actual question in the message BODY, before
 // this trailer (see the ENG-480 scope-clarification tests), so excluding the
 // trailer from detection does not blind it to a real confirmation request.
-const NEXT_STEP_TRAILER = /👉?\s*next\s*step\s*:[\s\S]*$/i;
+//
+// The mandated trailer is required to be the FINAL line of every message, but
+// live transcripts don't reliably preserve a literal newline before it (see
+// the ENG-1256 repro strings below), so this can't anchor on "^|\n". Instead
+// the trailing `(?:(?!👉?\s*next\s*step\s*:)[\s\S])*$` clause forbids the
+// matched suffix from containing another "next step:" occurrence, which
+// forces the regex engine to land on the LAST occurrence in the string (a
+// standard "match the final instance" technique for a non-global pattern).
+// Without it, a message that quotes/echoes an earlier "👉 Next Step:" line
+// before its real halt question would match at that EARLIER occurrence and
+// strip everything from there to end-of-string — silently deleting the
+// genuine halt question that follows it. The /u flag makes `👉?` optional as
+// a whole code point (👉 is a surrogate pair); without /u, only the trailing
+// low-surrogate code unit is optional and the high surrogate is a mandatory
+// literal, so a trailer without the emoji would fail to strip at all.
+const NEXT_STEP_TRAILER = /👉?\s*next\s*step\s*:(?:(?!👉?\s*next\s*step\s*:)[\s\S])*$/iu;
 
 function stripNextStepTrailer(content: string): string {
   return content.replace(NEXT_STEP_TRAILER, '');
@@ -2178,12 +2193,15 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   // Fast path: the regex catches the common forms with zero LLM cost/latency.
   if (scheduledRunAwaitsConfirmation(content)) return true;
   // ENG-1256: same exclusion as the regex path — the mandated "👉 Next Step:"
-  // trailer is a recommendation, not a question to the user, so it must not be
-  // handed to the judge as if it were the closing of the message. A message
-  // that is ONLY the trailer (no body left after stripping it) has nothing left
-  // to judge as a halt.
-  const judgeableContent = stripNextStepTrailer(content).trim();
-  if (!judgeableContent) return false;
+  // trailer is USUALLY a recommendation, not a question to the user. But the
+  // system prompt's own scheduling-suggestion example (agentModeSystemPrompt.ts
+  // ~183-184) shows a genuine user-directed question CAN live entirely inside
+  // that line ("👉 Next Step: Want this to run automatically every week?...").
+  // So when stripping the trailer leaves nothing, any halt in this message can
+  // only be inside the trailer itself — judge the ORIGINAL unstripped content
+  // instead of short-circuiting to "no halt", or that whole class of halt goes
+  // permanently undetected by both the regex and this judge fallback.
+  const judgeableContent = stripNextStepTrailer(content).trim() || content;
   try {
     const llmPromise = agentModeService.callLLM(
       CONFIRMATION_JUDGE_MODEL,
