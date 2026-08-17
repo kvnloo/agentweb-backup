@@ -64,6 +64,39 @@ describe('isUnusableSynthesis', () => {
     expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
   });
 
+  // ENG-1224 Variant B / production session d5898ffd: the model echoed the
+  // loop's own wall-clock budget nudge ("Do not call any more tools. Write
+  // your final answer NOW...") back as its answer instead of following it —
+  // the persisted final message was the literal string below.
+  describe('leaked internal directive (ENG-1224)', () => {
+    it('flags the exact production leak "Do not call any more tools."', () => {
+      expect(isUnusableSynthesis(' Do not call any more tools.')).toBe(true);
+    });
+
+    it('flags other phrasings of the same injected directive', () => {
+      for (const leak of [
+        'Do not call any more tools.',
+        "don't call any more tools",
+        'DO NOT CALL ANY MORE TOOLS.',
+        'Stop calling tools.',
+        'No more tool calls.',
+        'Stop all searching/pagination immediately.',
+        '[SYSTEM WARNING] Do not call any more tools. Write your final answer now.',
+      ]) {
+        expect(isUnusableSynthesis(leak)).toBe(true);
+      }
+    });
+
+    it('does NOT flag genuine prose that merely discusses tool-calling policy', () => {
+      for (const real of [
+        'I have finished the task and will not call any more tools unless you ask me to continue.',
+        'As requested, here is a summary of what I found — no further tools were needed.',
+      ]) {
+        expect(isUnusableSynthesis(real)).toBe(false);
+      }
+    });
+  });
+
   // Observed live: driving the synthesis retry into a failure state made the model
   // collapse into a repetition loop and ship 180,180 chars — 30,791 words built
   // from 65 unique tokens — straight into the transcript.
