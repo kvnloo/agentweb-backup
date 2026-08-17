@@ -306,6 +306,11 @@ describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scop
     await request(rateLimitTestServer)
       .post('/api/webhooks/forward-lead')
       .set('X-Forwarded-For', '203.0.113.7, 10.0.0.1')
+      // A browser User-Agent is now a precondition for keeping the IP at all: landing pages
+      // reach this route via a server-side forward, so a non-browser caller's address is the
+      // forwarder's rather than the visitor's (utils/clientIdentity.ts). The x-forwarded-for
+      // preference this test asserts is unchanged.
+      .set('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36')
       .send({
         listId: 'list_ip_test',
         email: 'ip-test@example.com',
@@ -325,6 +330,7 @@ describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scop
   it('SUCCESS: falls back to req.ip when x-forwarded-for is absent', async () => {
     await request(rateLimitTestServer)
       .post('/api/webhooks/forward-lead')
+      .set('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36')
       .send({
         listId: 'list_ip_test_2',
         email: 'ip-test-2@example.com',

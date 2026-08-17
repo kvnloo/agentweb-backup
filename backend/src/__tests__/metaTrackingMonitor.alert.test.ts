@@ -9,6 +9,11 @@
  * with more accounts.
  */
 
+const buildAlertContextForAccount = jest.fn();
+jest.mock('../services/metaAlertContext', () => ({
+  buildAlertContextForAccount: (...a: any[]) => buildAlertContextForAccount(...a),
+}));
+
 import {
   monitorUserTracking,
   __resetTrackingAlertStateForTests,
@@ -44,6 +49,7 @@ let deps: any;
 
 beforeEach(() => {
   __resetTrackingAlertStateForTests();
+  buildAlertContextForAccount.mockResolvedValue({ 'Lead Click-ID Coverage': '0 of 8612' });
   alerts = [];
   deps = {
     alertTransport: async (subject: string, message: string, context: any) => {
@@ -202,5 +208,96 @@ describe('monitorUserTracking — scope and resilience', () => {
     deps.alertTransport = jest.fn().mockRejectedValue(new Error('smtp down'));
 
     await expect(monitorUserTracking(metaUser('u1', ['acct1']), deps)).resolves.toBeDefined();
+  });
+});
+
+describe('monitorUserTracking — the alert carries its diagnosis', () => {
+  it('folds the enriched context into the blackout alert', async () => {
+    // The first real alert of this kind cost ~10 API calls to interpret. Everything needed
+    // was available when it fired, so it now travels with the alert.
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(alerts[0].context['Lead Click-ID Coverage']).toBe('0 of 8612');
+  });
+
+  it('enriches ONLY for an account that is actually alerting', async () => {
+    // A lead walk and two Graph calls per account per sweep would be pure waste across a
+    // healthy fleet; once a day for a broken account is nothing.
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: healthyDays() });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(buildAlertContextForAccount).not.toHaveBeenCalled();
+  });
+
+  it('still alerts when enrichment throws — a richer ticket is never worth the ticket', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
+    buildAlertContextForAccount.mockRejectedValue(new Error('graph down'));
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(summary.blackouts).toBe(1);
+    expect(alerts).toHaveLength(1);
+    // Degraded to what today's alert already carries, rather than lost.
+    expect(alerts[0].context['Ad Account']).toBe('acct1');
+    expect(alerts[0].context['Alert Class']).toBe(BLACKOUT_ALERT_CLASS);
+  });
+
+  it('keeps the alert class and priority even when enrichment supplies keys', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
+    buildAlertContextForAccount.mockResolvedValue({ 'Alert Priority': 'low', Extra: 'x' });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    // Enrichment is spread last, so this documents that it CAN override — the dedupe class
+    // is what the intake gate keys on and must survive.
+    expect(alerts[0].context['Alert Class']).toBe(BLACKOUT_ALERT_CLASS);
+  });
+});
+
+describe('monitorUserTracking — the objective filter must be observable', () => {
+  it('rolls excluded objectives into the summary', async () => {
+    // A filter nobody can see is indistinguishable from a broken detector. Someone asking
+    // "why does this spending account never alert" must find the answer without reading
+    // the source (Greptile P2 on #2420).
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: ['OUTCOME_ENGAGEMENT'], unknownObjectives: [],
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(summary.excludedObjectives).toEqual(['OUTCOME_ENGAGEMENT']);
+  });
+
+  it('surfaces unknown objectives so the catalogue can be extended deliberately', async () => {
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: [], unknownObjectives: ['OUTCOME_NEW_2027'],
+    });
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.unknownObjectives).toEqual(['OUTCOME_NEW_2027']);
+  });
+
+  it('passes excluded objectives into the alert context', async () => {
+    // The ticket's spend figure is smaller than Ads Manager's for this account; the reader
+    // needs to know why rather than assume the number is wrong.
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: blackoutDays(), excludedObjectives: ['LINK_CLICKS'], unknownObjectives: [],
+    });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(buildAlertContextForAccount).toHaveBeenCalledWith(
+      expect.anything(), 'acct1', expect.any(String), expect.any(Array), ['LINK_CLICKS'],
+    );
+  });
+
+  it('de-duplicates excluded objectives across accounts', async () => {
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok', days: [], excludedObjectives: ['OUTCOME_ENGAGEMENT'], unknownObjectives: [],
+    });
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1', 'acct2']), deps);
+    expect(summary.excludedObjectives).toEqual(['OUTCOME_ENGAGEMENT']);
   });
 });

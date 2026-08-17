@@ -142,6 +142,12 @@ export interface User {
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
   funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
+  // ENG-720: set when a hard (5.x.x) bounce hits this account's own address.
+  // Flag only — never gates login or deactivates the account.
+  emailUndeliverable?: boolean;
+  emailUndeliverableReason?: string;
+  emailUndeliverableSource?: string;
+  emailUndeliverableAt?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
   stripe_customer_id?: string;
@@ -155,6 +161,7 @@ export interface User {
   slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
+  landerUtmDefault?: import("../utils/landerUtm").UtmConfig; // Customer-level UTM default for generated landers (ENG-724); read/write only via landerUtmStore
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
   googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>; // Array of GA4 properties with labels
@@ -1356,14 +1363,20 @@ export class UserDB {
   ): Promise<any[]> {
     const combinedFilter = `NOT begins_with(userId, :_tombstone_prefix) AND (${filterExpression})`;
     const combinedValues = { ...expressionAttributeValues, ':_tombstone_prefix': 'deleted_' };
-    const result = await this.docClient
-      .scan({
+    const items: any[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const params: AWS.DynamoDB.DocumentClient.ScanInput = {
         TableName: this.tableName,
         FilterExpression: combinedFilter,
         ExpressionAttributeValues: combinedValues,
-      })
-      .promise();
-    return result.Items || [];
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      };
+      const result = await this.docClient.scan(params).promise();
+      items.push(...(result.Items || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return items;
   }
 
   async getUserAnalytics(startDate: string, endDate: string) {
@@ -1793,6 +1806,149 @@ export class UserDB {
         return null;
       }
       handleDynamoDbError(error, "incrementTokenUsageForMonth");
+      throw error;
+    }
+  }
+
+  /**
+   * Apply a monthly LLM charge to the user's counter AND mark the matching
+   * `AW-LlmChargeEvents` row `counterAppliedAt` in ONE DynamoDB transaction.
+   *
+   * Root-cause fix for ENG-1251 Greptile P1s: the previous two-call sequence
+   * (update the counter, then separately call markLlmChargeApplied) let the
+   * two diverge — a counter update could succeed while the audit marker
+   * write failed (charge applied but invisible to itemization), or the
+   * marker could be set even when the counter update lost a concurrency
+   * race (itemization shows a charge that was never actually counted).
+   * TransactWriteItems makes both writes succeed or fail together.
+   *
+   * Returns:
+   *  - "applied": both writes landed this call.
+   *  - "already_applied": the audit event already had counterAppliedAt set
+   *    (a prior attempt's transaction already completed) — safe no-op.
+   *  - "lost_race": the users-table condition failed (someone else rolled
+   *    the month, or this increment's assumed prior month no longer
+   *    matches) — caller should re-read the user and retry with fresh state.
+   */
+  async applyMonthlyChargeAtomic(args: {
+    userId: string;
+    userEmail: string;
+    month: string;
+    tokens: number;
+    cost: number;
+    resetDate: string;
+    isNewMonth: boolean;
+    history?: Array<{ month: string; totalTokens: number; totalCost: number }>;
+    auditTableName: string;
+    billingUserId: string;
+    eventId: string;
+  }): Promise<"applied" | "already_applied" | "lost_race"> {
+    const userItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = args.isNewMonth
+      ? {
+          Update: {
+            TableName: this.tableName,
+            Key: { email: args.userEmail },
+            UpdateExpression:
+              "SET #tokenUsage = :usage, #history = :history, #bonus = :zero",
+            // Same guard as resetTokenUsageForMonth: succeeds only while the
+            // stored month is still NOT the new one.
+            ConditionExpression:
+              "#userId = :userId AND (attribute_not_exists(#tokenUsage) OR #tokenUsage.#month <> :month)",
+            ExpressionAttributeNames: {
+              "#userId": "userId",
+              "#tokenUsage": "tokenUsage",
+              "#month": "month",
+              "#history": "tokenUsageHistory",
+              "#bonus": "tokenAllowanceBonus",
+            },
+            ExpressionAttributeValues: {
+              ":userId": args.userId,
+              ":month": args.month,
+              ":usage": {
+                month: args.month,
+                totalTokens: args.tokens,
+                totalCost: args.cost,
+                resetDate: args.resetDate,
+              },
+              ":history": args.history || [],
+              ":zero": 0,
+            },
+          },
+        }
+      : {
+          Update: {
+            TableName: this.tableName,
+            Key: { email: args.userEmail },
+            UpdateExpression:
+              "SET #tokenUsage.#month = :month, " +
+              "#tokenUsage.#totalTokens = if_not_exists(#tokenUsage.#totalTokens, :zero) + :tokens, " +
+              "#tokenUsage.#totalCost = if_not_exists(#tokenUsage.#totalCost, :zero) + :cost, " +
+              "#tokenUsage.#resetDate = if_not_exists(#tokenUsage.#resetDate, :resetDate)",
+            ConditionExpression: "#userId = :userId AND #tokenUsage.#month = :month",
+            ExpressionAttributeNames: {
+              "#userId": "userId",
+              "#tokenUsage": "tokenUsage",
+              "#month": "month",
+              "#totalTokens": "totalTokens",
+              "#totalCost": "totalCost",
+              "#resetDate": "resetDate",
+            },
+            ExpressionAttributeValues: {
+              ":userId": args.userId,
+              ":month": args.month,
+              ":tokens": args.tokens,
+              ":cost": args.cost,
+              ":zero": 0,
+              ":resetDate": args.resetDate,
+            },
+          },
+        };
+
+    const auditItem: AWS.DynamoDB.DocumentClient.TransactWriteItem = {
+      Update: {
+        TableName: args.auditTableName,
+        Key: { billingUserId: args.billingUserId, eventId: args.eventId },
+        UpdateExpression: "SET counterAppliedAt = :now",
+        // Idempotency: a retried transaction that already landed must not
+        // re-apply — this condition is what turns a duplicate transaction
+        // attempt into a clean "already_applied" instead of a second charge.
+        ConditionExpression: "attribute_not_exists(counterAppliedAt)",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      },
+    };
+
+    try {
+      await this.docClient
+        .transactWrite({ TransactItems: [userItem, auditItem] })
+        .promise();
+      return "applied";
+    } catch (error: any) {
+      const reasons = error?.CancellationReasons as Array<{ Code?: string }> | undefined;
+      // Greptile P1: concurrent charge transactions on the same billing user
+      // (e.g. an org-pooled account, or several task executions charging in
+      // parallel) can fail with a transaction CONFLICT rather than a
+      // condition failure -- either the whole transaction rejected outright
+      // with TransactionConflictException, or TransactionCanceledException
+      // cancelled every item for "TransactionConflict" (DynamoDB's code for
+      // "another transaction is touching this item right now", distinct
+      // from ConditionalCheckFailed). Neither is a real "already applied" or
+      // a genuine business-condition failure -- both are transient and must
+      // map to "lost_race" so the caller's bounded retry loop re-reads and
+      // retries, the same as it already does for a lost condition race.
+      // Previously these fell through to the generic handler and were
+      // rethrown, which the fire-and-forget caller only logs -- silently
+      // dropping a real charge under contention.
+      if (error?.code === "TransactionConflictException") return "lost_race";
+      if (error?.code === "TransactionCanceledException" && reasons) {
+        // Index order matches TransactItems above: 0 = users table, 1 = audit table.
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_applied";
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return "lost_race";
+        const isPureConflict =
+          reasons.some((reason) => reason?.Code === "TransactionConflict") &&
+          reasons.every((reason) => reason?.Code === "TransactionConflict" || reason?.Code === "None");
+        if (isPureConflict) return "lost_race";
+      }
+      handleDynamoDbError(error, "applyMonthlyChargeAtomic");
       throw error;
     }
   }
@@ -5649,6 +5805,14 @@ export const crmDb = {
      *  firstTouch.clickIds: every visitor has an fbp, including organic ones, so filing it
      *  under click IDs would make an organic lead read as paid-attributed. */
     metaFbp?: string;
+    /** ENG-926 §B: client IP at capture (Meta `client_ip_address`). Read off the request in
+     *  routes/webhooks.ts, where it was previously used for the immediate Lead event and then
+     *  discarded — so a conversion relayed weeks later reached Meta with weaker identity than
+     *  we held at capture. Persisted for the same reason as metaFbp. */
+    clientIp?: string;
+    /** ENG-926 §B: client user-agent at capture (Meta `client_user_agent`). Paired with
+     *  clientIp; Meta treats the two together as a match signal. */
+    clientUserAgent?: string;
     contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
     contactStatusReason?: 'opted-out' | 'bounced' | 'complained' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
     contactStatusNote?: string;
@@ -5776,6 +5940,12 @@ export const crmDb = {
       }
       if (leadData.metaFbp) {
         item.metaFbp = leadData.metaFbp;
+      }
+      if (leadData.clientIp) {
+        item.clientIp = leadData.clientIp;
+      }
+      if (leadData.clientUserAgent) {
+        item.clientUserAgent = leadData.clientUserAgent;
       }
       if (leadData.contactStatus) {
         item.contactStatus = leadData.contactStatus;
@@ -6582,10 +6752,26 @@ export const crmDb = {
     utmMedium?: string;
     /** Explicit override for the denormalized click IDs; derived from firstTouch when omitted. */
     clickIds?: Record<string, string>;
+    /**
+     * ENG-926 §B — Meta Event Match Quality signals, captured once and kept so a conversion
+     * relayed weeks later still carries them.
+     *
+     * `metaFbp` was previously accepted by createLead ONLY. A lead that first arrived without
+     * an fbp and later submitted with one never received it — the silent-drop failure this
+     * function's own comment describes. Present here so the webhook merge path can backfill it.
+     */
+    metaFbp?: string;
+    /** Client IP at capture. Meta `client_ip_address`; among the strongest match signals. */
+    clientIp?: string;
+    /** Client user-agent at capture. Meta `client_user_agent`; paired with clientIp. */
+    clientUserAgent?: string;
     /** Enrichment metadata sidecar — keyed by field name (custom or standard). See utils/enrichedFieldValue.ts. */
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
+    linkedinIdentityVerifiedAt?: string | null;
+    linkedinIdentityVerifiedUrl?: string | null;
     /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
      *  icpSource). Sidecar map distinct from customFields so it does NOT
      *  leak into CSV exports, email-template variables, or the
@@ -6758,6 +6944,18 @@ export const crmDb = {
           expressionAttributeValues[':companyLinkedin'] = trimmedCompanyLinkedin;
         } else {
           removeExpressions.push('companyLinkedin');
+        }
+      }
+
+      // ENG-1026: verified-identity stamp fields
+      for (const field of ['linkedinIdentityVerifiedAt', 'linkedinIdentityVerifiedUrl'] as const) {
+        if (updates[field] !== undefined) {
+          if (updates[field] === null) {
+            removeExpressions.push(field);
+          } else {
+            setExpressions.push(`${field} = :${field}`);
+            expressionAttributeValues[`:${field}`] = updates[field];
+          }
         }
       }
 
@@ -6956,6 +7154,40 @@ export const crmDb = {
       if (updates.clickIds !== undefined) {
         setExpressions.push('clickIds = :clickIds');
         expressionAttributeValues[':clickIds'] = updates.clickIds;
+      }
+
+      // ENG-926 §B: Meta Event Match Quality signals, WRITE-ONCE BY CONSTRUCTION.
+      //
+      // `if_not_exists` rather than a plain SET, and that is the whole point: a caller
+      // read-then-write (routes/webhooks.ts checks the lead before deciding to backfill)
+      // is TOCTOU. Two repeat submissions racing while the field is absent both observe
+      // the absence and both issue a SET, and the later one replaces the acquisition
+      // identity Meta will be asked to match on months later. The condition belongs in the
+      // write, where it is atomic, not in a check the caller performs beforehand.
+      //
+      // Deliberately NOT a ConditionExpression: that guards the whole UpdateExpression, so
+      // a lost race would reject the caller's legitimate user-visible edits too. Per-
+      // attribute if_not_exists lets the rest of the update land and only this value hold.
+      //
+      // The consequence, stated plainly: these three attributes cannot be overwritten
+      // through updateLead by anyone. That is the intended contract — the value that
+      // matters is the one from the touch that ACQUIRED the lead. A deliberate correction
+      // needs its own path rather than quietly riding on a lead update.
+      //
+      // metaFbp is here because it was added to createLead alone, which is precisely the
+      // silent-drop this function's comment above warns about; a field the merge path
+      // cannot write is a field a repeat-touch lead never gets.
+      if (updates.metaFbp !== undefined) {
+        setExpressions.push('metaFbp = if_not_exists(metaFbp, :metaFbp)');
+        expressionAttributeValues[':metaFbp'] = updates.metaFbp;
+      }
+      if (updates.clientIp !== undefined) {
+        setExpressions.push('clientIp = if_not_exists(clientIp, :clientIp)');
+        expressionAttributeValues[':clientIp'] = updates.clientIp;
+      }
+      if (updates.clientUserAgent !== undefined) {
+        setExpressions.push('clientUserAgent = if_not_exists(clientUserAgent, :clientUserAgent)');
+        expressionAttributeValues[':clientUserAgent'] = updates.clientUserAgent;
       }
 
       // Always update updatedAt

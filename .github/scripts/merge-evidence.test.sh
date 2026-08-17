@@ -229,7 +229,9 @@ check() {
       "${desc}" "${expected_exit}" "${LAST_EXIT}" "${LAST_OUTPUT}"
     return
   fi
-  if [ -n "${expected_substr}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${expected_substr}"; then
+  # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+  # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+  if [ -n "${expected_substr}" ] && ! grep -qF "${expected_substr}" <<<"${LAST_OUTPUT}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf 'FAIL  %s\n      expected output to contain: %s\n      output: %s\n' \
       "${desc}" "${expected_substr}" "${LAST_OUTPUT}"
@@ -1139,11 +1141,24 @@ check 'ENG-1003: a PR rename of a file the base edits is caught via the PR previ
 # ---------------------------------------------------------------------------
 #
 # The gate's ability to tell a draft skip from a path-filter skip rests entirely
-# on `Require Greptile Review` being conditioned on draft state and nothing else.
-# Add a path filter to that job and every assertion above still passes while the
-# real gate quietly stops working, because a path-skipped discriminator is
-# indistinguishable from a draft-skipped one. Assert the workflow here so the
-# invariant breaks loudly, in CI, in the PR that breaks it.
+# on `Require Greptile Review` being conditioned on draft state and nothing else
+# that can vary independently of draft state. Add a path filter to that job and
+# every assertion above still passes while the real gate quietly stops working,
+# because a path-skipped discriminator is indistinguishable from a
+# draft-skipped one. Assert the workflow here so the invariant breaks loudly,
+# in CI, in the PR that breaks it.
+#
+# ENG-1277 added `always() &&` in front of the draft check when it reordered
+# this job to run after backend-tests-a/b (needs: [detect-changes,
+# backend-tests-a, backend-tests-b]). Without `always()`, GitHub implicitly
+# ANDs an `if:` with `success()` whenever the expression names no status-check
+# function, so a path-filtered skip of backend-tests-a/b on a non-backend PR
+# would silently skip this job too — reintroducing exactly the ambiguity this
+# invariant exists to prevent. `always()` is a status-check function, not a
+# condition on paths or draft state, so it does not weaken the invariant: the
+# expression still reduces to "skip iff draft" for every PR, backend or not.
+# The expected string below is therefore `always() && <draft check>`, not the
+# draft check alone.
 
 WORKFLOW="$(cd "${SCRIPT_DIR}/../.." && pwd)/.github/workflows/tests.yml"
 DISCRIMINATOR_IF="$(awk '
@@ -1153,12 +1168,12 @@ DISCRIMINATOR_IF="$(awk '
 ' "${WORKFLOW}")"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ "${DISCRIMINATOR_IF}" = "github.event.pull_request.draft == false" ]; then
-  printf "ok    invariant: the 'Require Greptile Review' job is gated on draft state alone\n"
+if [ "${DISCRIMINATOR_IF}" = "always() && github.event.pull_request.draft == false" ]; then
+  printf "ok    invariant: the 'Require Greptile Review' job is gated on draft state alone (plus always())\n"
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf "FAIL  invariant: 'Require Greptile Review' must be gated on draft state ALONE for the\n"
-  printf "      draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
+  printf "FAIL  invariant: 'Require Greptile Review' must be gated on 'always() && draft == false'\n"
+  printf "      for the draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
   printf "      If this job legitimately gained a path filter, merge-evidence.sh needs a new\n"
   printf "      discriminator — it can no longer tell a draft run from a path-skipped one.\n"
 fi
@@ -1192,7 +1207,8 @@ for job_key in backend-tests-a backend-tests-b; do
   ' "${WORKFLOW}" | tr '\n' ' ')"
 
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_HEADER}" | grep -q "greptile"; then
+  # ENG-1277: here-string, not a pipe — see the check() fix above for why.
+  if grep -q "greptile" <<<"${JOB_HEADER}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s references greptile-review in needs/if.\n" "${job_key}"
     printf "      Found: '%s'\n" "${JOB_HEADER}"
@@ -1206,8 +1222,8 @@ for job_key in backend-tests-a backend-tests-b; do
   # The suite must still be draft-gated and path-gated — decoupling from the
   # reviewer check must not turn into running on every draft push.
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_HEADER}" | grep -qF "github.event.pull_request.draft == false" \
-     && printf '%s' "${JOB_HEADER}" | grep -qF "needs.detect-changes.outputs.backend == 'true'"; then
+  if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
+     && grep -qF "needs.detect-changes.outputs.backend == 'true'" <<<"${JOB_HEADER}"; then
     printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))

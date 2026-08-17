@@ -186,6 +186,110 @@ export function countAttributedConversions(actions: any[] | undefined | null): A
   return { conversions, unrecognized };
 }
 
+/**
+ * Campaign objectives that actually optimise for a conversion.
+ *
+ * Established on production 2026-08-16, and the reason this filter exists: of the three
+ * accounts the blackout check flagged, TWO were running campaigns that were never trying
+ * to convert.
+ *
+ *   Every.io      $557.39  OUTCOME_ENGAGEMENT — boosted posts, NO destination URL
+ *   Kraftersland  $ 60.59  LINK_CLICKS + OUTCOME_ENGAGEMENT
+ *   AgentWeb own  $175.57  OUTCOME_LEADS — a real blackout
+ *
+ * A boosted post with no link cannot produce an attributed conversion however perfect the
+ * tracking is. Alerting on it trains people to ignore the channel, which is the outcome
+ * §F exists to prevent — reached from the opposite direction.
+ *
+ * Both the outcome-era names and the legacy ones, because older campaigns still carry the
+ * old values.
+ */
+export const CONVERSION_OBJECTIVES = new Set([
+  'OUTCOME_LEADS',
+  'OUTCOME_SALES',
+  'CONVERSIONS',
+  'LEAD_GENERATION',
+  'PRODUCT_CATALOG_SALES',
+  'APP_INSTALLS',
+  'OUTCOME_APP_PROMOTION',
+  'STORE_VISITS',
+]);
+
+/**
+ * Whether spend under this objective should be judged for conversions.
+ *
+ * An UNKNOWN objective counts as YES, deliberately. Meta adds objectives over time, and a
+ * name this list has not caught up with must never silently suppress a real blackout — a
+ * false alert is recoverable, silence is the failure this card exists to end. So the
+ * filter can only ever REMOVE noise it positively recognises.
+ */
+export function isConversionOptimisedObjective(objective?: string | null): boolean {
+  const name = typeof objective === 'string' ? objective.trim().toUpperCase() : '';
+  if (!name) return true;
+  if (CONVERSION_OBJECTIVES.has(name)) return true;
+  return !NON_CONVERSION_OBJECTIVES.has(name);
+}
+
+/** Objectives positively known NOT to optimise for conversions. Everything here was seen
+ *  on a real account that this check wrongly flagged, or is documented alongside them. */
+const NON_CONVERSION_OBJECTIVES = new Set([
+  'OUTCOME_ENGAGEMENT',
+  'OUTCOME_AWARENESS',
+  'OUTCOME_TRAFFIC',
+  'LINK_CLICKS',
+  'BRAND_AWARENESS',
+  'REACH',
+  'VIDEO_VIEWS',
+  'POST_ENGAGEMENT',
+  'PAGE_LIKES',
+  'EVENT_RESPONSES',
+  'MESSAGES',
+  'OUTCOME_MESSAGES',
+  'LOCAL_AWARENESS',
+]);
+
+export interface SpendByObjective {
+  /** Spend under objectives that are trying to convert — the only spend a blackout judges. */
+  conversionSpend: number;
+  /** Spend explicitly excluded, reported so an operator can see WHY nothing alerted. */
+  nonConversionSpend: number;
+  excludedObjectives: string[];
+  /** Objectives not in either list. Counted as conversion spend (fail loud) and surfaced
+   *  so the catalogue can be extended rather than silently drifting. */
+  unknownObjectives: string[];
+}
+
+/** Split a window's campaign rows into spend that was trying to convert and spend that
+ *  never was. */
+export function splitSpendByObjective(rows: any[]): SpendByObjective {
+  let conversionSpend = 0;
+  let nonConversionSpend = 0;
+  const excluded = new Set<string>();
+  const unknown = new Set<string>();
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row) continue;
+    const spend = Number.parseFloat(row.spend);
+    if (!Number.isFinite(spend)) continue;
+    const raw = typeof row.objective === 'string' ? row.objective.trim().toUpperCase() : '';
+
+    if (raw && NON_CONVERSION_OBJECTIVES.has(raw)) {
+      nonConversionSpend += spend;
+      excluded.add(raw);
+      continue;
+    }
+    if (raw && !CONVERSION_OBJECTIVES.has(raw)) unknown.add(raw);
+    conversionSpend += spend;
+  }
+
+  return {
+    conversionSpend,
+    nonConversionSpend,
+    excludedObjectives: [...excluded],
+    unknownObjectives: [...unknown],
+  };
+}
+
 export interface MonitorFetchDeps {
   fetchImpl: typeof fetch;
 }
@@ -201,6 +305,12 @@ export type AdAccountActivity = {
   status: 'ok' | 'token_error' | 'fetch_error';
   days: AdAccountDay[];
   error?: string;
+  /** Objectives whose spend was excluded from the judgement, so an operator can see WHY
+   *  an account that is visibly spending did not alert. */
+  excludedObjectives?: string[];
+  /** Objectives in neither catalogue. Counted as in-scope (fail loud) and surfaced so the
+   *  list can be extended rather than drifting silently. */
+  unknownObjectives?: string[];
 };
 
 /**
@@ -220,53 +330,111 @@ export async function fetchDailyAdAccountActivity(
 ): Promise<AdAccountActivity> {
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
+  // CAMPAIGN level, not account: `objective` is only available per campaign, and without
+  // it the check cannot tell spend that was trying to convert from spend that never was.
+  // Two of the three accounts this flagged on 2026-08-16 were running engagement campaigns
+  // where zero attributed conversions is the CORRECT outcome (§28).
   const params = new URLSearchParams({
-    fields: 'spend,actions,date_start',
-    level: 'account',
+    fields: 'spend,actions,date_start,objective,campaign_name',
+    level: 'campaign',
     time_increment: '1',
     date_preset: dayWindowToPreset(days),
   });
   // The token goes in a header-shaped query param only at call time and is never part of
   // the string retained for logging: this URL reaches error logs on failure, and a
   // credential in a log is a leak that outlives the incident.
-  const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?${params}`;
+  const baseUrl = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?${params}`;
+
+  // Campaign rows collapse into one row per DAY, counting only campaigns that were trying
+  // to convert. A non-conversion campaign contributes neither its spend nor its
+  // conversions: its spend would manufacture a blackout, and its conversions would let
+  // engagement traffic mask a real one on the same account.
+  const byDay = new Map<string, AdAccountDay>();
+  const excluded = new Set<string>();
+  const unknown = new Set<string>();
+
+  // Campaign level multiplies rows by the campaign count, so a real account spills past
+  // Meta's page size where the old account-level query (7 rows a week) never did. Reading
+  // only the first page silently drops spend AND conversions — a wrong verdict in either
+  // direction rather than a missing one (Greptile P1 on #2420).
+  let url: string = `${baseUrl}&access_token=${encodeURIComponent(accessToken)}`;
 
   try {
-    const response = await fetchImpl(`${url}&access_token=${encodeURIComponent(accessToken)}`);
-    const body: any = await response.json();
+    for (let page = 0; page < MAX_INSIGHTS_PAGES && url; page++) {
+      const response = await fetchImpl(url);
+      const body: any = await response.json();
 
-    if (!response.ok || body?.error) {
-      const error = body?.error || {};
-      // Code 190 is Meta's "this token is no longer usable" — expired, revoked, or
-      // invalidated by a password change. Every other OAuthException (17 is the user
-      // request limit) is transient and resolves without anyone re-authorising, so
-      // reporting it as a dead token would send a human to fix nothing.
-      const isDeadToken = error?.code === 190;
-      return {
-        status: isDeadToken ? 'token_error' : 'fetch_error',
-        days: [],
-        error: typeof error?.message === 'string' ? error.message : `HTTP ${response.status}`,
-      };
-    }
-
-    const rows: any[] = Array.isArray(body?.data) ? body.data : [];
-    return {
-      status: 'ok',
-      days: rows.map((row) => {
-        const counted = countAttributedConversions(row?.actions);
+      if (!response.ok || body?.error) {
+        const error = body?.error || {};
+        // Code 190 is Meta's "this token is no longer usable" — expired, revoked, or
+        // invalidated by a password change. Every other OAuthException (17 is the user
+        // request limit) is transient and resolves without anyone re-authorising, so
+        // reporting it as a dead token would send a human to fix nothing.
+        const isDeadToken = error?.code === 190;
         return {
-          date: String(row?.date_start ?? ''),
-          spend: Number.parseFloat(row?.spend ?? '0') || 0,
-          conversions: counted.conversions,
-          unrecognized: counted.unrecognized,
+          status: isDeadToken ? 'token_error' : 'fetch_error',
+          days: [],
+          error: typeof error?.message === 'string' ? error.message : `HTTP ${response.status}`,
         };
-      }),
-    };
+      }
+
+      for (const row of Array.isArray(body?.data) ? body.data : []) {
+        const date = String(row?.date_start ?? '');
+        if (!date) continue;
+        const objective = typeof row?.objective === 'string' ? row.objective.trim().toUpperCase() : '';
+
+        const day = byDay.get(date) || { date, spend: 0, conversions: 0, unrecognized: [] };
+        byDay.set(date, day);
+
+        if (objective && !isConversionOptimisedObjective(objective)) {
+          excluded.add(objective);
+          continue;
+        }
+        if (objective && !CONVERSION_OBJECTIVES.has(objective)) unknown.add(objective);
+
+        const counted = countAttributedConversions(row?.actions);
+        day.spend += Number.parseFloat(row?.spend ?? '0') || 0;
+        day.conversions += counted.conversions;
+        for (const u of counted.unrecognized) {
+          if (!day.unrecognized.includes(u)) day.unrecognized.push(u);
+        }
+      }
+
+      url = typeof body?.paging?.next === 'string' ? body.paging.next : '';
+
+      // Exhausting the cap with pages still outstanding is NOT a complete read. Returning
+      // what we have would present a truncated window as a whole one — indistinguishable
+      // from genuinely reduced spend, and able to produce either a false blackout or a
+      // missed one. Same rule as a failure on a later page: no answer beats a partial one
+      // dressed as complete (Greptile P1 on #2420, second pass).
+      if (url && page === MAX_INSIGHTS_PAGES - 1) {
+        console.warn(
+          `${TAG} ${adAccountId}: campaign insights still paging after ${MAX_INSIGHTS_PAGES} ` +
+          `pages — refusing to judge a truncated window`,
+        );
+        return {
+          status: 'fetch_error',
+          days: [],
+          error: `insights exceeded ${MAX_INSIGHTS_PAGES} pages; window incomplete`,
+        };
+      }
+    }
   } catch (error: any) {
     // A network failure must never abort the sweep — the next account still needs checking.
     return { status: 'fetch_error', days: [], error: error?.message || 'request failed' };
   }
+
+  return {
+    status: 'ok',
+    days: [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date)),
+    excludedObjectives: [...excluded],
+    unknownObjectives: [...unknown],
+  };
 }
+
+/** Bound on insight pages followed per account. Seven days across a normal campaign count
+ *  is a handful of pages; the cap only exists so a pathological `paging.next` cannot loop. */
+const MAX_INSIGHTS_PAGES = 20;
 
 /** Meta accepts only a fixed set of presets; map the requested window onto the smallest
  *  one that covers it rather than computing explicit dates, which drift across timezones. */
@@ -436,6 +604,13 @@ export interface MonitorSummary {
   idle: number;
   healthy: number;
   unrecognizedActionTypes: string[];
+  /** Objectives whose spend was excluded from judgement. Surfaced so an operator can see
+   *  WHY an account that is visibly spending did not alert — a filter nobody can observe
+   *  is indistinguishable from a detector that is broken. */
+  excludedObjectives: string[];
+  /** Objectives in neither catalogue, counted as in-scope. Surfaced so the list can be
+   *  extended deliberately rather than drifting. */
+  unknownObjectives: string[];
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -456,6 +631,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     idle: 0,
     healthy: 0,
     unrecognizedActionTypes: [],
+    excludedObjectives: [],
+    unknownObjectives: [],
   };
 
   const fetchActivity =
@@ -474,6 +651,8 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   );
 
   const unknownTypes = new Set<string>();
+  const excludedObjectives = new Set<string>();
+  const unknownObjectives = new Set<string>();
 
   for (const account of accounts) {
     const adAccountId = account?.account_id;
@@ -529,8 +708,21 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       continue;
     }
 
+    (activity.excludedObjectives || []).forEach((o) => excludedObjectives.add(o));
+    (activity.unknownObjectives || []).forEach((o) => unknownObjectives.add(o));
+
     const verdict = evaluateAdAccountDays(activity.days);
     verdict.unrecognized.forEach((t) => unknownTypes.add(t));
+
+    // An account whose spend was ENTIRELY excluded is worth saying out loud. It looks
+    // identical to a dormant account in the summary, and someone checking why a visibly
+    // spending customer never alerts needs to find the answer without reading this code.
+    if (verdict.status === 'idle' && (activity.excludedObjectives || []).length > 0) {
+      console.log(
+        `${TAG} ${adAccountId}: spending, but only on non-converting objectives ` +
+        `(${activity.excludedObjectives!.join(', ')}) — not judged for conversions`,
+      );
+    }
 
     if (verdict.status === 'idle') {
       summary.idle++;
@@ -551,6 +743,16 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     }
 
     summary.blackouts++;
+
+    // Enrichment is deliberately gathered HERE — only for an account that is actually
+    // alerting — rather than for every account on every sweep. It costs a lead walk and
+    // two Graph calls, which is trivial once a day for a handful of broken accounts and
+    // wasteful across a healthy fleet. It is also best-effort: buildAlertContext swallows
+    // its own failures, so a lookup problem drops a field and never the alert.
+    const enriched = await buildAccountAlertContext(
+      user, adAccountId, accessToken, activity.days, activity.excludedObjectives,
+    );
+
     await raise(
       alertTransport,
       `${BLACKOUT_ALERT_CLASS}:${adAccountId}`,
@@ -569,17 +771,39 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       {
         'Alert Class': BLACKOUT_ALERT_CLASS,
         'Alert Priority': 'high',
-        'Ad Account': adAccountId,
-        'Owner User Id': user?.userId,
-        'Owner Email': user?.email,
         'Consecutive Days': verdict.consecutiveBlackoutDays,
         'Spend In Blackout': verdict.spendInBlackout.toFixed(2),
+        // Identity, click-ID coverage, the account's pixels and Meta's match keys. The
+        // first real alert of this kind took ~10 API calls to interpret; all of it was
+        // available at the moment it fired.
+        ...enriched,
       },
     );
   }
 
   summary.unrecognizedActionTypes = [...unknownTypes];
+  summary.excludedObjectives = [...excludedObjectives];
+  summary.unknownObjectives = [...unknownObjectives];
   return summary;
+}
+
+/** Best-effort enrichment for an alerting account. Isolated behind its own try/catch as
+ *  well as the builder's, because nothing about a richer ticket is worth risking the
+ *  ticket itself. */
+async function buildAccountAlertContext(
+  user: any,
+  adAccountId: string,
+  accessToken: string,
+  days: AdAccountDay[],
+  excludedObjectives?: string[],
+): Promise<Record<string, any>> {
+  try {
+    const { buildAlertContextForAccount } = await import('./metaAlertContext');
+    return await buildAlertContextForAccount(user, adAccountId, accessToken, days, excludedObjectives);
+  } catch (error: any) {
+    console.warn(`${TAG} alert enrichment failed for ${adAccountId}: ${error?.message}`);
+    return { 'Ad Account': adAccountId, 'Owner User Id': user?.userId, 'Owner Email': user?.email };
+  }
 }
 
 /** Send an alert unless one for this key already went out inside the window. A transport
