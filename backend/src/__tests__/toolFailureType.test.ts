@@ -179,3 +179,20 @@ describe('402 alternation is HTTP-status-anchored, not a bare number (ENG-664)',
     expect(classifyToolFailureType('', 'status code 402 payment required')).toBe('config');
   });
 });
+
+describe('quota_exceeded → config, not bug (ENG-1220)', () => {
+  it('treats hard quota exhaustion as a config/billing gap, not a tool bug', () => {
+    expect(classifyToolFailureType('quota_exceeded')).toBe('config');
+  });
+
+  it('classifies a real OpenAI/Azure quota message as config even without the class (message-only fallback)', () => {
+    expect(
+      classifyToolFailureType('', 'gpt-image-2 API failed: You exceeded your current quota, please check your plan and billing details.'),
+    ).toBe('config');
+    expect(classifyToolFailureType('', 'insufficient_quota')).toBe('config');
+  });
+
+  it('does NOT fall through to bug — the automated tool-failure proposal system reads failureType to decide "investigate the handler" vs. "resolve the account"', () => {
+    expect(classifyToolFailureType('quota_exceeded', 'gpt-image-2 API failed: Request failed with status code 429')).not.toBe('bug');
+  });
+});
