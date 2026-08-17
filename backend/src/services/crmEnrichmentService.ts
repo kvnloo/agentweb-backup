@@ -885,7 +885,15 @@ export class CrmEnrichmentService {
 
       if (profileData) {
         rawProfile = profileData as Record<string, unknown>;
-        publicIdentifier = profileData?.public_identifier ?? null;
+        // ENG-1198: Unipile anonymizes out-of-network profiles with
+        // public_identifier literally the string 'undefined' — that string is
+        // truthy, so leaving it here would make the URL construction below (and
+        // the cache-rebuild path in buildLinkedInContextFromCache) synthesize a
+        // fake https://www.linkedin.com/in/undefined and hand it to the
+        // enrichment LLM as a "Resolved LinkedIn profile URL".
+        publicIdentifier = (profileData?.public_identifier && profileData.public_identifier !== 'undefined')
+          ? profileData.public_identifier
+          : null;
         profileId = profileData?.provider_id ?? null;
 
         if (confidence === 'low') {

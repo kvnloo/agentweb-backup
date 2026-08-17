@@ -653,6 +653,49 @@ describe('CrmEnrichmentService', () => {
       expect(allUserMsgs).toContain('LinkedIn');
     });
 
+    it('should not synthesize a fake /in/undefined URL when get-profile returns an anonymized profile (ENG-1198)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        linkedin: 'https://www.linkedin.com/in/existing-url',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: 'Acme',
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // Mirrors what agentModeService's get-profile now returns for an out-of-network
+      // profile viewed via a shared account: public_identifier is Unipile's literal
+      // 'undefined' sentinel, flagged anonymized:true, and public_profile_url dropped.
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({
+        success: true,
+        data: { public_identifier: 'undefined', anonymized: true, headline: 'CTO', usedSharedAccount: true, sharedAccountId: 'shared-1' },
+      });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/existing-url' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find the personal LinkedIn profile URL for {{firstName}} {{lastName}} at {{company}}',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      const allUserMsgs = mockGeminiCreate.mock.calls
+        .map(call => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+        .join('\n---\n');
+      expect(allUserMsgs).not.toContain('in/undefined');
+    });
+
     it('should re-process already-enriched leads when forceOverwrite=true', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [
