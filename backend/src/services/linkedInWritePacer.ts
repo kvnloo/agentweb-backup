@@ -136,6 +136,18 @@ function pruneWindow(accountId: string, now: number): number[] {
   return recent;
 }
 
+/** The refusal returned when an account is at its rolling hourly ceiling. */
+function overHourlyCeiling(recent: number[], at: number): WriteSlot {
+  return {
+    allowed: false,
+    reason:
+      `This LinkedIn account has already performed ${recent.length} write actions in the last hour, ` +
+      `which is the safety ceiling that keeps LinkedIn from revoking the account's session. ` +
+      `Remaining actions should be left for a later run.`,
+    retryAfterMs: Math.max(0, (recent[0] ?? at) + HOUR_MS - at),
+  };
+}
+
 /**
  * Wait for this account's turn to perform a write action.
  *
@@ -165,16 +177,7 @@ export async function reserveWriteSlot(
   const recentAtEntry = pruneWindow(accountId, startedAt);
   const hourlyCap = maxWritesPerHour();
   if (hourlyCap > 0 && recentAtEntry.length >= hourlyCap) {
-    const oldest = recentAtEntry[0];
-    const retryAfterMs = Math.max(0, oldest + HOUR_MS - startedAt);
-    return {
-      allowed: false,
-      reason:
-        `This LinkedIn account has already performed ${recentAtEntry.length} write actions in the last hour, ` +
-        `which is the safety ceiling that keeps LinkedIn from revoking the account's session. ` +
-        `Remaining actions should be left for a later run.`,
-      retryAfterMs,
-    };
+    return overHourlyCeiling(recentAtEntry, startedAt);
   }
 
   // Estimate the queue wait before committing, so an over-long queue refuses rather
@@ -207,6 +210,19 @@ export async function reserveWriteSlot(
 
     const arrivedAt = now();
     const recent = pruneWindow(accountId, arrivedAt);
+
+    // Re-check the ceiling now that we hold the account's turn.
+    //
+    // The entry-time check above runs BEFORE queueing, so with the cap one write
+    // away, ten concurrent callers all read the same under-cap history and all pass
+    // it — then each records a write on its way through, overshooting by nine. Only
+    // a check taken while holding the turn can see what the callers ahead actually
+    // recorded. Deliberately before the sleep: a call that is going to be refused
+    // should not first spend the gap waiting.
+    if (hourlyCap > 0 && recent.length >= hourlyCap) {
+      return overHourlyCeiling(recent, arrivedAt);
+    }
+
     const lastWrite = recent.length > 0 ? recent[recent.length - 1] : 0;
     // Jitter so the spacing is not metronomic — perfectly regular timing is itself
     // an automation signal.

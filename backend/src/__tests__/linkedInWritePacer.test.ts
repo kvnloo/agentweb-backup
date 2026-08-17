@@ -242,3 +242,53 @@ describe('default dependencies', () => {
     expect(elapsed).toBeGreaterThanOrEqual(10);
   });
 });
+
+describe('the hourly ceiling under concurrency (Greptile P1)', () => {
+  it('does not let a simultaneous batch overshoot the ceiling', async () => {
+    // The entry-time check runs BEFORE queueing, so with the cap one write away
+    // every concurrent caller reads the same under-cap history and passes it. Only
+    // a re-check taken while holding the turn sees what the callers ahead recorded.
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '3';
+    process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = '600000';
+    const clock = makeClock();
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => reserveWriteSlot(ACCOUNT, clock)),
+    );
+
+    expect(results.filter((r) => r.allowed)).toHaveLength(3);
+    expect(results.filter((r) => !r.allowed)).toHaveLength(7);
+  });
+
+  it('refuses an over-cap caller without making it wait out the gap first', async () => {
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '2';
+    process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = '600000';
+    const clock = makeClock();
+
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => reserveWriteSlot(ACCOUNT, clock)),
+    );
+    const refused = results.filter((r) => !r.allowed);
+
+    expect(refused).toHaveLength(2);
+    for (const r of refused) {
+      if (!r.allowed) expect(r.reason).toContain('safety ceiling');
+    }
+    // Two grants means exactly one gap elapsed, not four.
+    expect(clock.now()).toBe(1_000_000 + 5000);
+  });
+
+  it('still allows the full quota when calls arrive one at a time', async () => {
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '3';
+    const clock = makeClock();
+
+    const outcomes = [];
+    for (let i = 0; i < 3; i++) {
+      clock.advance(6000);
+      outcomes.push((await reserveWriteSlot(ACCOUNT, clock)).allowed);
+    }
+
+    // The re-check must not cost a legitimate caller its slot.
+    expect(outcomes).toEqual([true, true, true]);
+  });
+});

@@ -31650,7 +31650,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             '',
             'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
           ].join('\n'),
-          throttled: true,
         };
       }
     }
