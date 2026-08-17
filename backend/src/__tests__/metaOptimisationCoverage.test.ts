@@ -520,8 +520,11 @@ describe('evaluateAccountOptimisationCoverage — the defensive paths', () => {
     expect(v.inconclusivePixels).toEqual(['p']); // deduplicated, not ['p','p']
   });
 
-  it('counts a family present only with a positive value', () => {
-    // A family reported at zero is configuration, not arrival.
+  it('matches family NAMES case-insensitively, ignoring unusable entries', () => {
+    // This function reads names only — it never inspects a count. The "present with a
+    // positive value" rule lives upstream in countAttributedConversions, which drops
+    // zero-valued action rows before a family reaches this array. Naming that rule here
+    // would describe a filter this code does not contain.
     expect(countTrailingAbsentSpendingDays(
       [{ date: '1', spend: 10, families: ['LEAD'] }], 'lead',
     )).toBe(0);
@@ -608,9 +611,9 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
     expect(v.unconfirmed.map((m) => m.adSetId)).toEqual(['as_idle']);
   });
 
-  it('an ad set that stopped delivering days ago cannot alert on its stale history', () => {
-    // Trailing zero-spend days are excluded from the evidence, so an ad set whose delivery
-    // ended before the streak could complete is not accused of ongoing waste.
+  it('does not alert on two absent spending days, whatever follows them', () => {
+    // Two absent days is short of the threshold. The trailing zero-spend rows are
+    // incidental here — see the next case for what they actually do.
     const v = evaluateAccountOptimisationCoverage(
       [{ id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
       { p: ['PageView'] },
@@ -623,6 +626,31 @@ describe('evaluateAccountOptimisationCoverage — evidence must belong to the ad
     );
     expect(v.alerting).toEqual([]);
     expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('DOES still alert when delivery ended after a full streak — documented, not intended', () => {
+    // Zero-spend rows neither break nor extend a streak, inherited from
+    // evaluateAdAccountDays so an outage spanning a weekend pause stays one outage. The
+    // consequence is that an ad set which stopped delivering after three absent spending
+    // days still alerts, and the alert says it is "paying" for an event when it is no
+    // longer spending. Pinned here because it is real current behaviour; whether it wants
+    // a recency gate on the newest spending day is a product call, not a test change.
+    const v = evaluateAccountOptimisationCoverage(
+      [{ id: 'as_x', effective_status: 'ACTIVE', promoted_object: { custom_event_type: 'LEAD', pixel_id: 'p' } }],
+      { p: ['PageView'] },
+      { as_x: [
+        { date: '1', spend: 100, families: [] },
+        { date: '2', spend: 100, families: [] },
+        { date: '3', spend: 100, families: [] },
+        { date: '4', spend: 100, families: [] },
+        { date: '5', spend: 0, families: [] },
+        { date: '6', spend: 0, families: [] },
+      ] },
+    );
+    expect(v.alerting).toHaveLength(1);
+    // Four, not three: the settle window drops day 6, day 5 is zero-spend so it is skipped
+    // without breaking the run, and days 1-4 all count.
+    expect(v.alerting[0].consecutiveAbsentSpendingDays).toBe(4);
   });
 });
 
