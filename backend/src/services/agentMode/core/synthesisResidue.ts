@@ -17,6 +17,7 @@
  */
 
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
+import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
 
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
@@ -82,15 +83,57 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /**
+ * ENG-907's wall-clock nudges (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) are
+ * injected by this exact same mechanism, but each embeds a live remaining-seconds
+ * count, so no two injections are byte-identical — the plain-string check above can
+ * never match one. Rather than hand-copy the wording into a second, driftable
+ * constant, generate a sample with a sentinel duration and turn IT into a pattern:
+ * escape the sample for regex use, then widen the sentinel's digits back into
+ * `\d+`. If the wording in turnTimeBudget.ts ever changes, this pattern changes
+ * with it automatically.
+ */
+const TIME_BUDGET_SENTINEL_SECONDS = 918273;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildTimeBudgetNudgePattern(kind: 'wrap_up' | 'final_synthesis'): RegExp {
+  const sample = buildTurnTimeBudgetNudge(
+    { phase: kind, elapsedMs: 0, remainingMs: TIME_BUDGET_SENTINEL_SECONDS * 1000, reserveMs: 0 },
+    kind,
+  );
+  const source = escapeRegExp(sample).replace(String(TIME_BUDGET_SENTINEL_SECONDS), '\\d+');
+  return new RegExp(source);
+}
+
+const TIME_BUDGET_NUDGE_PATTERNS = [
+  buildTimeBudgetNudgePattern('wrap_up'),
+  buildTimeBudgetNudgePattern('final_synthesis'),
+];
+
+/** Count non-overlapping matches of an anchorless pattern within `haystack`. */
+function countPatternOccurrences(haystack: string, pattern: RegExp): number {
+  const matches = haystack.match(new RegExp(pattern.source, 'g'));
+  return matches ? matches.length : 0;
+}
+
+/**
  * True when `trimmed` is mostly one of our own injected nudges, echoed back. An
  * exact match — the entire turn is one bare copy of a nudge — is non-empty, so it
  * never re-triggers the retry ladder that injected it in the first place, and it
  * ships as a real final answer unless caught here alongside the 2+-repeat case.
  */
 function isNudgeEcho(trimmed: string): boolean {
-  return INJECTED_NUDGES.some(
-    (nudge) => trimmed === nudge || countOccurrences(trimmed, nudge) >= 2,
-  );
+  if (
+    INJECTED_NUDGES.some((nudge) => trimmed === nudge || countOccurrences(trimmed, nudge) >= 2)
+  ) {
+    return true;
+  }
+  return TIME_BUDGET_NUDGE_PATTERNS.some((pattern) => {
+    const anchored = new RegExp(`^${pattern.source}$`);
+    return anchored.test(trimmed) || countPatternOccurrences(trimmed, pattern) >= 2;
+  });
 }
 
 /**
