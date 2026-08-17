@@ -98,6 +98,32 @@ async function resolveSwitchableModels(userId: string): Promise<{
   return { billingUserId: usage.billingUserId, catalog };
 }
 
+/**
+ * Arguments that put a schedule's model back to exactly what it was.
+ *
+ * NULL means the schedule INHERITED the platform default rather than pinning a
+ * model, and restoring that means REMOVING the attribute — not writing a blank
+ * and not writing today's resolved default. The distinction is load-bearing: an
+ * absent `llmModel` follows the default as it moves, while any stored value stops
+ * following it, so writing one would leave the account in a third state nobody
+ * asked for.
+ *
+ * Removal is requested explicitly. Passing `{ llmModel: undefined }` looks like it
+ * ought to work and does not: `Object.entries` still yields the key, so it emitted
+ * `SET #llmModel = :llmModel` while the marshaller dropped the value, and DynamoDB
+ * rejected the whole write. That failed for the majority of real schedules — 66 of
+ * 91 active ones inherit — and it failed AFTER the audit row was stamped undone,
+ * leaving the trail claiming a revert that had not happened.
+ */
+function restoreModelArgs(
+  scheduleId: string,
+  modelBefore: string | null,
+): [string, Record<string, unknown>, undefined, undefined, string[] | undefined] {
+  return modelBefore === null
+    ? [scheduleId, {}, undefined, undefined, ['llmModel']]
+    : [scheduleId, { llmModel: modelBefore }, undefined, undefined, undefined];
+}
+
 /** Load a scope the caller owns, or throw not-found. */
 async function loadOwnedSchedule(userId: string, scheduleId: string) {
   const schedule = await scheduleDb.getScheduleById(scheduleId);
@@ -169,10 +195,8 @@ export async function applyModelChange(
   } catch (error) {
     // Compensate. An unaudited change cannot be explained or undone through the
     // UI, so the customer is better served by the switch simply not happening.
-    // `undefined` REMOVES the attribute, which is how inheritance is restored —
-    // writing an empty string would leave the schedule pinned to nothing.
     await scheduleDb
-      .updateSchedule(input.scopeId, { llmModel: modelBefore ?? undefined } as never)
+      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore))
       .catch((revertError: unknown) => {
         // Both writes failed. Say so loudly — the schedule is now on a model the
         // customer chose but we have no record of, and only a human can
@@ -243,13 +267,7 @@ export async function undoModelChange(
   const stamped = await markModelChangeUndone(billingUserId, changeId, userId);
   if (!stamped) return { undone: false, restoredModel: null };
 
-  // `undefined` removes the attribute, restoring INHERITANCE. Writing back a
-  // resolved default instead would silently pin the schedule to today's default
-  // forever, so a later admin change would stop reaching it — an undo that
-  // leaves the account in a third state neither side asked for.
-  await scheduleDb.updateSchedule(change.scopeId, {
-    llmModel: change.modelBefore ?? undefined,
-  } as never);
+  await scheduleDb.updateSchedule(...restoreModelArgs(change.scopeId, change.modelBefore));
 
   await recordUsageTelemetry(billingUserId, USAGE_TELEMETRY_EVENTS.changeUndone, {
     scope: change.scope,

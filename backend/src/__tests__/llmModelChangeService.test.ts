@@ -157,7 +157,14 @@ describe("applyModelChange", () => {
     mockRecord.mockRejectedValue(new Error("dynamo down"));
     await expect(apply()).rejects.toThrow(/dynamo down/);
     expect(mockUpdateSchedule).toHaveBeenNthCalledWith(1, "sched-a", { llmModel: SONNET });
-    expect(mockUpdateSchedule).toHaveBeenNthCalledWith(2, "sched-a", { llmModel: OPUS });
+    expect(mockUpdateSchedule).toHaveBeenNthCalledWith(
+      2,
+      "sched-a",
+      { llmModel: OPUS },
+      undefined,
+      undefined,
+      undefined,
+    );
   });
 
   it("records the schedule's name as it read at the time", async () => {
@@ -205,9 +212,44 @@ describe("undoModelChange", () => {
 
   it("restores the model that was there before", async () => {
     const result = await undoModelChange("member-a", changeSk);
-    expect(mockUpdateSchedule).toHaveBeenCalledWith("sched-a", { llmModel: OPUS });
+    expect(mockUpdateSchedule).toHaveBeenCalledWith(
+      "sched-a",
+      { llmModel: OPUS },
+      undefined,
+      undefined,
+      undefined,
+    );
     expect(mockUndone).toHaveBeenCalledWith("billing-root", changeSk, "member-a");
     expect(result.undone).toBe(true);
+  });
+
+  it("restores INHERITANCE by removing the attribute, not by writing a value", async () => {
+    // The majority case: 66 of 91 active production schedules store no model and
+    // follow the platform default. `modelBefore: null` records that, and undoing
+    // it has to REMOVE the attribute -- an absent value keeps following the
+    // default as it moves, where any stored value stops following it.
+    //
+    // This previously passed `{ llmModel: undefined }`, which looks equivalent and
+    // is not: the key survives `Object.entries`, so it emitted an unresolvable
+    // SET and DynamoDB rejected the whole write. Undo therefore failed for two
+    // thirds of real schedules, AFTER the audit row had been stamped undone.
+    mockList.mockResolvedValue([
+      { ...stored, modelBefore: null, modelAfter: SONNET },
+    ]);
+    mockGetSchedule.mockResolvedValue({
+      scheduleId: "sched-a",
+      userId: "member-a",
+      llmModel: SONNET,
+    });
+
+    const result = await undoModelChange("member-a", changeSk);
+
+    expect(result.undone).toBe(true);
+    const [scheduleId, updates, , , removeAttributes] = mockUpdateSchedule.mock.calls[0];
+    expect(scheduleId).toBe("sched-a");
+    expect(removeAttributes).toEqual(["llmModel"]);
+    // Neither a blank nor today's default may be written in place of absence.
+    expect(updates).toEqual({});
   });
 
   it("refuses to undo a change the caller does not own", async () => {
