@@ -11,7 +11,8 @@ const STRICT_EMAIL_SYNTAX_REGEX =
   /^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
 
 export const isEmailSyntaxValid = (email: string): boolean => {
-  return STRICT_EMAIL_SYNTAX_REGEX.test((email || '').trim());
+  if (typeof email !== 'string') return false;
+  return STRICT_EMAIL_SYNTAX_REGEX.test(email.trim());
 };
 
 // RFC 2606 domains/TLDs reserved for documentation/testing — providers like
@@ -22,7 +23,8 @@ const RESERVED_TEST_DOMAINS = new Set(['example.com', 'example.net', 'example.or
 const RESERVED_TEST_TLDS = ['.test', '.example', '.invalid', '.localhost'];
 
 export const isReservedTestDomainEmail = (email: string): boolean => {
-  const trimmed = (email || '').trim().toLowerCase();
+  if (typeof email !== 'string') return false;
+  const trimmed = email.trim().toLowerCase();
   const atIdx = trimmed.lastIndexOf('@');
   if (atIdx < 0) return false;
   const domain = trimmed.slice(atIdx + 1);
