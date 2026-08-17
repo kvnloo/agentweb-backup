@@ -129,4 +129,35 @@ The best-effort approach is an aggregate summary. Should I proceed with that ins
       })
     ).toBe(true);
   });
+
+  // ── ENG-1256: trailer-stripping must only remove the LAST occurrence ────────
+  describe('Next Step trailer stripping only removes the LAST occurrence', () => {
+    it('does NOT delete a genuine halt that follows a quoted/echoed earlier trailer', () => {
+      const msg =
+        "Last run's 👉 Next Step: was to confirm the sender domain. " +
+        'That is done. Should I proceed with sending the campaign now? ' +
+        '👉 Next Step: Reply to confirm and I will send it.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(true);
+    });
+
+    it('still excludes a single mandated trailer at the end (no regression)', () => {
+      const msg =
+        'The digest is complete and delivered above. ' +
+        '👉 Next Step: Ask Harsha to confirm whether this shipped with approval.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(false);
+    });
+
+    it('strips the trailer even when it lacks the 👉 emoji (surrogate-pair-safe optional match)', () => {
+      // Without the /u flag, `👉?` treats the emoji's mandatory high-surrogate
+      // code unit as a required literal, so a trailer missing the emoji entirely
+      // fails to match — stripping is inert, and the trailer's own "confirm ...
+      // before ... creat[es]" wording (mirroring the live ENG-1256 repro) then
+      // falls straight into the confirmation-halt pattern below.
+      const msg =
+        'The digest is complete and delivered above. ' +
+        'Next Step: Ask Harsha to confirm whether this shipped with approval before merge — ' +
+        'it creates AW-LlmChargeEvents and ships a guarded reset command.';
+      expect(scheduledRunAwaitsConfirmation(msg)).toBe(false);
+    });
+  });
 });

@@ -73,6 +73,51 @@ describe('scheduledTurnDefersToUser — LLM-judge fallback', () => {
     expect(reason).toBe('budget');
     expect(callLLM).not.toHaveBeenCalled();
   });
+
+  // ENG-1256: the system prompt's own scheduling-suggestion example
+  // (agentModeSystemPrompt.ts ~183-184) shows a genuine user-directed question
+  // can live ENTIRELY inside the mandated "👉 Next Step:" trailer, with no body
+  // text before it. Stripping the trailer for the judge must not blind it to
+  // this class of halt by short-circuiting to "no" without ever asking the judge.
+  describe('a halt phrased entirely inside the Next Step trailer', () => {
+    const trailerOnlyHalt =
+      "👉 Next Step: Want this to run automatically every week? I can set up a scheduled chat for you — just say 'schedule this' and I'll configure it.";
+
+    it('is invisible to the regex fast-path (expected — the trailer is excluded from it)', () => {
+      expect(scheduledRunAwaitsConfirmation(trailerOnlyHalt)).toBe(false);
+    });
+
+    it('still invokes the LLM judge on the ORIGINAL unstripped content, not an empty string', async () => {
+      callLLM.mockResolvedValue(judge('yes'));
+      const result = await scheduledTurnDefersToUser(trailerOnlyHalt);
+      expect(result).toBe(true);
+      expect(callLLM).toHaveBeenCalledTimes(1);
+      const [, messages] = callLLM.mock.calls[0];
+      const judgedContent = messages[1].content;
+      expect(judgedContent).toContain('Want this to run automatically every week?');
+    });
+
+    it('classifyScheduledContinuationAsync still returns "confirmation" for a trailer-only halt', async () => {
+      callLLM.mockResolvedValue(judge('yes'));
+      expect(await classifyScheduledContinuationAsync({ content: trailerOnlyHalt })).toBe('confirmation');
+    });
+  });
+
+  // ENG-1256: a genuine body-level halt with a benign trailer must still judge
+  // with the trailer excluded — the trailer should never reach the judge as if
+  // it were part of the message's closing content.
+  it('judges a genuine body halt with the benign trailer excluded from the judged content', async () => {
+    const bodyHaltWithTrailer =
+      `${novelHalt} 👉 Next Step: Ask Harsha to confirm whether this shipped with data-plane approval.`;
+    callLLM.mockResolvedValue(judge('yes'));
+    const result = await scheduledTurnDefersToUser(bodyHaltWithTrailer);
+    expect(result).toBe(true);
+    expect(callLLM).toHaveBeenCalledTimes(1);
+    const [, messages] = callLLM.mock.calls[0];
+    const judgedContent = messages[1].content;
+    expect(judgedContent).not.toContain('Ask Harsha to confirm');
+    expect(judgedContent).toContain(novelHalt);
+  });
 });
 
 // ENG-480: a live scheduled run reframed the impossible per-item pattern correctly
