@@ -48,6 +48,26 @@ files_untouched() {
 EOF
 }
 
+files_manifests_at_depth() {
+  # Manifests are matched by basename regardless of directory depth.
+  cat <<'EOF'
+[
+  {"filename": "backend/package.json"},
+  {"filename": "backend/package-lock.json"},
+  {"filename": "partner-portal/package-lock.json"},
+  {"filename": "agent-engine/requirements.txt"}
+]
+EOF
+}
+
+files_requirements_variant() {
+  cat <<'EOF'
+[
+  {"filename": "agent-engine/requirements-dev.txt"}
+]
+EOF
+}
+
 files_touches_scripts_dir() {
   cat <<'EOF'
 [
@@ -58,9 +78,14 @@ EOF
 }
 
 files_touches_workflow() {
+  # The REAL shape of a genuine GitHub-Actions-ecosystem Dependabot update
+  # (verified live against agentweb#2276) -- must still fail, deliberately:
+  # this check declines the bypass for that PR class rather than try to
+  # verify the diff is a pure action-SHA bump.
   cat <<'EOF'
 [
-  {"filename": ".github/workflows/tests.yml"}
+  {"filename": ".github/workflows/tests.yml"},
+  {"filename": ".github/workflows/deploy.yml"}
 ]
 EOF
 }
@@ -75,10 +100,33 @@ EOF
 
 files_touches_unrelated_dotgithub_file() {
   # A path that merely STARTS with a similar string but isn't actually under
-  # .github/ must not be a false positive (prefix matching, not substring).
+  # .github/ must still fail -- it's not a recognized manifest either way,
+  # so this is really just confirming basename matching doesn't accidentally
+  # treat an unrelated file as safe.
   cat <<'EOF'
 [
   {"filename": ".github-actions-notes.md"}
+]
+EOF
+}
+
+files_application_code() {
+  # THE exact scenario Greptile named: a forged-identity commit touching
+  # application source, not a dependency manifest at all.
+  cat <<'EOF'
+[
+  {"filename": "backend/src/services/authService.ts"}
+]
+EOF
+}
+
+files_mixed_manifest_and_application_code() {
+  # A manifest change ALONGSIDE an application-code change must still fail
+  # -- one allowed file does not excuse a disallowed one riding along.
+  cat <<'EOF'
+[
+  {"filename": "package.json"},
+  {"filename": "backend/src/routes/webhooks.ts"}
 ]
 EOF
 }
@@ -139,34 +187,67 @@ check 'missing PR_NUMBER fails loudly' 1 'PR_NUMBER'
 TEST_PR_NUMBER='2427'
 files_untouched >"${WORKDIR}/files.json"
 run_script
-check 'an ordinary dependency-bump diff (no .github/ touched) passes' 0 'Untampered'
+check 'an ordinary dependency-bump diff (only recognized manifests) passes' 0 'Untampered'
+
+files_manifests_at_depth >"${WORKDIR}/files.json"
+run_script
+check 'manifests at any directory depth pass (matched by basename)' 0 'Untampered'
+
+files_requirements_variant >"${WORKDIR}/files.json"
+run_script
+check 'a requirements-dev.txt variant passes' 0 'Untampered'
+
+# THE exact scenario Greptile named (3/5, portal#1037, "Verified signer is
+# not identity-bound"): a forged-identity commit touching application
+# source must fail closed, regardless of what commit metadata claims.
+files_application_code >"${WORKDIR}/files.json"
+run_script
+check 'application source code (the forged-identity scenario) fails closed' 1 \
+  'not a recognized dependency manifest'
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${LAST_OUTPUT}" == *'backend/src/services/authService.ts'* ]]; then
+  printf 'PASS: %s\n' 'the specific disallowed path is named in the failure output'
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: %s\n  output: %s\n' 'the specific disallowed path is named in the failure output' "${LAST_OUTPUT}"
+fi
+
+files_mixed_manifest_and_application_code >"${WORKDIR}/files.json"
+run_script
+check 'a manifest change alongside an application-code change still fails closed' 1 \
+  'not a recognized dependency manifest'
 
 files_touches_scripts_dir >"${WORKDIR}/files.json"
 run_script
 check 'a diff touching .github/scripts/ fails closed' 1 \
-  'a Dependabot-authored PR modified CI-security-relevant path'
+  'not a recognized dependency manifest'
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "${LAST_OUTPUT}" == *'.github/scripts/dependabot-only-pr.sh'* ]]; then
-  printf 'PASS: %s\n' 'the specific guarded path is named in the failure output'
+  printf 'PASS: %s\n' 'the specific disallowed path is named in the failure output'
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf 'FAIL: %s\n  output: %s\n' 'the specific guarded path is named in the failure output' "${LAST_OUTPUT}"
+  printf 'FAIL: %s\n  output: %s\n' 'the specific disallowed path is named in the failure output' "${LAST_OUTPUT}"
 fi
 
+# The REAL shape of a genuine GitHub-Actions-ecosystem Dependabot update
+# (verified live, agentweb#2276) must STILL fail this check, deliberately —
+# declining the bypass for that PR class (it still gets a full, real
+# Greptile review) rather than attempt to verify the diff is a pure
+# action-SHA bump.
 files_touches_workflow >"${WORKDIR}/files.json"
 run_script
-check 'a diff touching .github/workflows/ fails closed' 1 \
-  'a Dependabot-authored PR modified CI-security-relevant path'
+check 'a diff touching .github/workflows/ fails closed, even though this is what a real GH-Actions Dependabot bump looks like' 1 \
+  'not a recognized dependency manifest'
 
 files_touches_greptile_json >"${WORKDIR}/files.json"
 run_script
 check 'a diff touching greptile.json fails closed' 1 \
-  'a Dependabot-authored PR modified CI-security-relevant path'
+  'not a recognized dependency manifest'
 
 files_touches_unrelated_dotgithub_file >"${WORKDIR}/files.json"
 run_script
-check 'a filename that merely starts with a similar string (not actually under .github/) is NOT a false positive' 0 \
-  'Untampered'
+check 'an unrecognized file that merely starts with a similar string also fails closed (not a manifest either way)' 1 \
+  'not a recognized dependency manifest'
 
 files_empty >"${WORKDIR}/files.json"
 run_script

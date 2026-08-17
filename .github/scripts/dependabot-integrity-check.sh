@@ -22,12 +22,44 @@
 # `pull_request_target` normally carries when a workflow checks out and
 # builds/tests untrusted PR content.
 #
-# Why "any file under .github/ or greptile.json changed" is the right,
-# narrow signal: a genuine automated Dependabot dependency bump NEVER
-# touches CI configuration or scripts — only a hand-pushed commit onto a
-# Dependabot branch would. Guarding the whole `.github/` tree (rather than
-# enumerating specific scripts) means a NEW script this bypass comes to rely
-# on later is covered automatically, with no separate list to keep in sync.
+# CAUGHT LIVE A SECOND TIME (Greptile 3/5, portal#1037, "Verified signer is
+# not identity-bound", reviewing the first version of this check): a human
+# with write access can sign a commit with their OWN valid key while setting
+# its author email to Dependabot's mapped noreply address — `.author.login`
+# resolves to `dependabot[bot]` and `commit.verification.verified` is true
+# even though the signer is human (tested live against real commit history,
+# see dependabot-only-pr.sh's own header). dependabot-only-pr.sh's check
+# cannot tell this apart from the real thing — no GitHub API field binds a
+# signature to Dependabot's identity specifically, only to "some registered
+# key". The first version of THIS check (a blocklist of `.github/` +
+# `greptile.json`) didn't help: a forged commit disguised as Dependabot could
+# still carry an arbitrary APPLICATION code change and sail through, since
+# nothing here looked at anything other than the CI-relevant paths.
+#
+# Also discovered live, checking a REAL Dependabot PR on this repo
+# (agentweb#2276): it touched `.github/workflows/tests.yml` and
+# `.github/workflows/deploy.yml` directly — a genuine GitHub-Actions-
+# ecosystem Dependabot update bumping pinned action SHAs. So blocking
+# `.github/` outright (the first version's behavior) was actually already
+# correct and safe for THAT PR type: it just declines the bypass for it
+# (that PR still gets a full, real Greptile review — a foregone cost saving,
+# not a broken or unsafe outcome), which is the right conservative default
+# for a file class that is also, legitimately, CI-security-relevant.
+#
+# The fix that actually closes the identity-binding gap: flip from a
+# blocklist to an ALLOWLIST. A forged-identity commit can claim to be
+# Dependabot, but it cannot hide WHAT FILES it touched — that's visible
+# through this trusted, base-ref-sourced check regardless of any commit
+# metadata. So instead of asking "did a suspicious path change", ask "does
+# EVERY changed path match a recognized dependency-manifest file" (by
+# basename, any depth). `.github/` is deliberately NOT on the allowlist
+# either, per the discovery above — declining the bypass there too. ANY
+# changed path outside the manifest allowlist — which is exactly what "an
+# application-only change" (the scenario Greptile named) would require —
+# fails closed. This does not attempt to verify manifest-file CONTENT is a
+# pure version bump (a harder, separate problem); it bounds the blast
+# radius of a successful forgery to dependency manifests only, never
+# arbitrary source or CI config.
 #
 # This job is made a REQUIRED branch-protection check. That is what actually
 # closes the gap: even if dependabot-only-pr.sh is fully compromised and
@@ -42,17 +74,35 @@
 #   GH_TOKEN     token for `gh api` (contents: read is sufficient)
 #
 # Exit status:
-#   0   no CI-security-relevant path differs from the PR's base — untampered.
-#   1   at least one CI-security-relevant path differs, OR the check itself
-#       could not be completed (API failure, unparseable response, zero
-#       files found for a nonzero-commit PR). Fails CLOSED: any ambiguity is
-#       "cannot confirm untampered", never treated as safe.
+#   0   every changed path is a recognized dependency manifest — untampered.
+#   1   at least one changed path is not, OR the check itself could not
+#       be completed (API failure, unparseable response, zero files found
+#       for a nonzero-commit PR). Fails CLOSED: any ambiguity is "cannot
+#       confirm untampered", never treated as safe.
 
 set -euo pipefail
 
-# Guarded prefixes/paths — anything starting with one of these, changed on a
-# Dependabot-authored PR, fails this check.
-GUARDED_PATHS=(".github/" "greptile.json")
+# Recognized dependency-manifest basenames across the ecosystems Dependabot
+# supports that this org could plausibly use. Matched by basename so any
+# depth (root, backend/, partner-portal/, agent-engine/, etc.) is covered
+# without enumerating every directory. Deliberately does NOT include
+# anything under .github/: a genuine GitHub-Actions-ecosystem Dependabot
+# update DOES touch .github/workflows/*.yml (verified live against
+# agentweb#2276), but that same path is also the most CI-security-relevant
+# one in the repo — the conservative, safe choice is to decline the bypass
+# for that PR class (it still gets a full, real Greptile review) rather than
+# try to distinguish "Dependabot bumped a pinned SHA" from "a line was
+# tampered with" via a content-level diff check, which is a harder, separate
+# problem this does not attempt to solve.
+ALLOWED_BASENAMES=(
+  "package.json" "package-lock.json" "npm-shrinkwrap.json"
+  "yarn.lock" "pnpm-lock.yaml"
+  "requirements.txt" "Pipfile" "Pipfile.lock" "pyproject.toml" "poetry.lock"
+  "go.mod" "go.sum"
+  "Gemfile" "Gemfile.lock"
+  "composer.json" "composer.lock"
+  "Cargo.toml" "Cargo.lock"
+)
 
 fail() {
   echo "::error::DEPENDABOT_INTEGRITY_CHECK_FAILED: $*" >&2
@@ -67,11 +117,14 @@ require_env() {
   fi
 }
 
-is_guarded() {
-  local path="$1" prefix
-  for prefix in "${GUARDED_PATHS[@]}"; do
-    case "${path}" in
-      "${prefix}"*) return 0 ;;
+is_allowed() {
+  local path="$1" base name
+  base="$(basename -- "${path}")"
+  for name in "${ALLOWED_BASENAMES[@]}"; do
+    [ "${base}" = "${name}" ] && return 0
+    # requirements-*.txt / requirements_*.txt variants (e.g. requirements-dev.txt)
+    case "${base}" in
+      requirements-*.txt|requirements_*.txt) return 0 ;;
     esac
   done
   return 1
@@ -110,22 +163,22 @@ main() {
     fail "could not extract filenames from the changed-files list for ${REPO}#${PR_NUMBER}."
   fi
 
-  local guarded_hits=()
+  local disallowed_hits=()
   local f
   while IFS= read -r f; do
     [ -z "${f}" ] && continue
-    if is_guarded "${f}"; then
-      guarded_hits+=("${f}")
+    if ! is_allowed "${f}"; then
+      disallowed_hits+=("${f}")
     fi
   done <<<"${filenames}"
 
-  if [ "${#guarded_hits[@]}" -gt 0 ]; then
-    echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${#guarded_hits[@]} CI-security-relevant path(s) changed on a Dependabot-authored PR — not untampered:"
-    printf '  %s\n' "${guarded_hits[@]}"
-    fail "a Dependabot-authored PR modified CI-security-relevant path(s): ${guarded_hits[*]}. A genuine automated dependency bump never touches these — this fails closed regardless of what the Dependabot-only-commit classifier itself reports."
+  if [ "${#disallowed_hits[@]}" -gt 0 ]; then
+    echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${#disallowed_hits[@]} changed path(s) are not a recognized dependency manifest — not bypass-eligible:"
+    printf '  %s\n' "${disallowed_hits[@]}"
+    fail "a Dependabot-authored PR changed path(s) outside the recognized dependency-manifest allowlist: ${disallowed_hits[*]}. A genuine automated dependency bump only ever touches manifest files — this fails closed regardless of what the Dependabot-only-commit classifier itself reports, and regardless of how convincingly commit metadata claims Dependabot authorship."
   fi
 
-  echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: none of ${total} changed file(s) touch a guarded CI-security path. Untampered."
+  echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: all ${total} changed file(s) are recognized dependency manifests. Untampered."
 }
 
 main "$@"

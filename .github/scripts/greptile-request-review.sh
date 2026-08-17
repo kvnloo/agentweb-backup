@@ -114,23 +114,39 @@
 # by treating "not yet covered" as equivalent to "will never be covered" and
 # advising a fresh request anyway, which can still turn out to be a paid
 # duplicate if the original, still-in-flight request resolves against the new
-# head moments later. Distinguishing "never requested" from "requested and
-# still in flight" is not observable from this script's vantage point at all
-# — Greptile exposes no "in progress" signal, only a landed verdict once one
-# exists.
+# head moments later. The attempted fix: stop distinguishing them, and just
+# hand the whole question to greptile-gate.sh's own poll loop (up to
+# GREPTILE_GATE_TIMEOUT_SECONDS) — wait for a verdict matching the new head,
+# and rely on its documented UNAVAILABLE-on-timeout outcome as the "nothing
+# ever landed, safe to re-request" signal.
 #
-# The actual fix: STOP TRYING TO DISTINGUISH THEM. On any head mismatch —
-# covered, not-yet-covered, or the lookup itself failing — post nothing new.
-# Just rerun the gate job against the new head and hand the whole question to
-# greptile-gate.sh's OWN poll loop, which is already correct and already
-# tested for exactly this shape of ambiguity: it waits (up to
-# GREPTILE_GATE_TIMEOUT_SECONDS) for a verdict matching the CURRENT head and
-# treats any verdict for a different commit as pending, not a failure. Either
-# the in-flight request resolves against the new head (the gate catches it,
-# scores it normally) or it doesn't (the gate times out to UNAVAILABLE — exit
-# 75 — which is PROOF no verdict for this head ever landed, and only then is
-# re-running this script fresh the correct next step, not a guess). This
-# branch itself can never pay for a duplicate again: it posts nothing.
+# CAUGHT LIVE A SIXTH TIME (Greptile 4/5, agentweb#2427, THREE findings
+# reviewing THAT fix): the "UNAVAILABLE on timeout" premise missed a real
+# third outcome — the original, un-pinned request can resolve against the
+# OLD head instead of the new one. greptile-gate.sh then sees a landed
+# verdict for SOME commit on the PR (correctly, by its own design) and
+# concludes Greptile is alive-but-slow, so a timeout reports REFUSED, not
+# UNAVAILABLE — and REFUSED's own message ("address the findings and push")
+# is actively misleading when no review of the new head was ever requested.
+# A second, independent finding on the same commit: the exit-2 retry path
+# (`--rerun-only` after "already running") assumed a marker would exist for
+# the new head, which that fix deliberately never posted — broken in a
+# second way for the same underlying reason.
+#
+# The actual fix: stop trying to infer what an un-pinned mention will
+# resolve against. On ANY head mismatch, explicitly request AND rerun for
+# the new head — exactly the same two calls a clean run already makes, just
+# retargeted (see main()). Deterministic: there is always a marker and
+# always a review requested for whatever head the gate ends up polling, so
+# the exit-2 `--rerun-only` retry path has exactly the state it expects too.
+# The one accepted cost, on purpose: if the original, still-in-flight
+# request ALSO resolves against this same new head, that's a second,
+# redundant review — a wasted credit in an already-rare race, not a
+# correctness bug. Two fix attempts in a row each traded that small, bounded
+# cost for a NEW class of correctness bug instead — proof this is the wrong
+# shape of fix to keep attempting, not that this particular version was
+# unlucky. Do not try a cleverer version of this again without new evidence
+# that changes the underlying trade-off.
 #
 # ONE KNOWN, DELIBERATE LIMIT, flagged in the same portal#1035 review (3/5)
 # and left as-is rather than chased further: the window between the final
@@ -149,9 +165,7 @@
 # and the case statement in main() for why conflating the two was the actual
 # bug, not the retry count. A network blip lasting longer than the retry
 # window still ends the script; that's the correct failure mode (loud, not a
-# duplicate request), not a bug to fix by retrying harder. The same
-# lookup-failure-is-not-absence distinction applies to
-# greptile_reviewed_head() below, for the same reason.
+# duplicate request), not a bug to fix by retrying harder.
 
 set -euo pipefail
 
@@ -264,55 +278,6 @@ request_marker_exists_for() {
   return 2
 }
 
-# Exit 0: a landed Greptile verdict's "Last reviewed commit" footer already
-# names ${1}. Exit 1: comments were fetched fine and no landed verdict names
-# it (still pending, or genuinely never requested). Exit 2: the lookup itself
-# failed after retries — same three-way split as request_marker_exists_for,
-# for the same reason: a transient failure must never read as "not covered".
-#
-# Mirrors greptile-gate.sh's own comment selection exactly (same query, same
-# reply-thread-avoidance), because that is the one place in this repo that
-# has already been proven correct against Greptile's actual comment-editing
-# behavior — re-deriving different selection logic here risks re-introducing
-# a bug that file's own header describes fixing.
-greptile_reviewed_head() {
-  local head_sha="$1" comments_json rc body reviewed_sha
-  for attempt in 1 2 3; do
-    if comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>/dev/null)"; then
-      rc=0
-    else
-      rc=$?
-    fi
-    if [ "${rc}" -eq 0 ]; then
-      body="$(printf '%s' "${comments_json}" | jq -r '
-          [ .[]
-            | select((.user.type // "") == "Bot")
-            | select(((.user.login // "") | ascii_downcase | startswith("greptile")))
-            | (.body // "")
-          ] as $bodies
-          | ( [ $bodies[] | select(test("last reviewed commit"; "i")) ] | last )
-            // ""
-        ' 2>/dev/null || true)"
-      if [ -z "${body}" ]; then
-        return 1
-      fi
-      reviewed_sha="$(printf '%s' "${body}" \
-        | grep -oiE 'commit/[0-9a-f]{40}' \
-        | head -n 1 \
-        | cut -d/ -f2 \
-        | tr '[:upper:]' '[:lower:]')"
-      if [ -n "${reviewed_sha}" ] && [ "${reviewed_sha}" = "${head_sha}" ]; then
-        return 0
-      fi
-      return 1
-    fi
-    if [ "${attempt}" -lt 3 ]; then
-      sleep 3
-    fi
-  done
-  return 2
-}
-
 # Finds the job to rerun. Deliberately errors loudly rather than silently
 # skipping the rerun on any ambiguity — a skipped rerun leaves the gate stuck
 # on a stale refusal with no visible sign anything is wrong.
@@ -401,48 +366,45 @@ main() {
   local head_sha_before_rerun
   head_sha_before_rerun="$(resolve_head_sha)"
   if [ "${head_sha_before_rerun}" != "${head_sha}" ]; then
-    # CAUGHT LIVE A FIFTH TIME (Greptile 4/5, agentweb#2427, reviewing the
-    # FOURTH fix — "head-race recovery can still duplicate a review when the
-    # original request is in-flight, not yet landed, for the new head"):
-    # the fourth fix only handled "a landed verdict already names the new
-    # head". It still FAILED (advising a fresh request) whenever the new
-    # head wasn't YET covered — but "not yet covered" and "will never be
-    # covered" look identical from here, and Greptile has no SHA pin on our
-    # mention, so the original, still-in-flight request MAY resolve against
-    # this exact new head moments later. Trying to tell those two states
-    # apart from this script is exactly the mistake the previous four fixes
-    # made, one narrower version at a time (see the trap list above).
+    # CAUGHT LIVE A SIXTH TIME (Greptile 4/5, agentweb#2427, THREE separate
+    # findings reviewing the FIFTH fix — "always defer to the gate's poll
+    # loop"): that fix assumed only two outcomes for the original,
+    # SHA-unscoped request — it resolves against the NEW head (gate catches
+    # it), or it never resolves for either head (gate times out to
+    # UNAVAILABLE, the documented recovery signal). Greptile found the third,
+    # real outcome that design missed: the original request can resolve
+    # against the OLD head instead. When that happens, greptile-gate.sh's
+    # OWN poll loop (correctly, by its own design — see its header on
+    # `greptile_alive`) sees a landed verdict for SOME commit on the PR and
+    # concludes Greptile is alive and merely slow, so a timeout reports
+    # REFUSED, never UNAVAILABLE. The fifth fix's whole recovery path — "wait
+    # for UNAVAILABLE, then re-run fresh" — never fires, and REFUSED's own
+    # message ("address the findings and push") is actively misleading here:
+    # there are no findings for the new head, because no review of it was
+    # ever requested. Two more findings on the same commit showed this isn't
+    # an isolated gap: the exit-2 retry path (`--rerun-only` after "already
+    # running") ALSO assumed a marker would exist for the new head, which the
+    # fifth fix deliberately never posts — so that recovery path was ALSO
+    # broken, in a second, independent way.
     #
-    # Fix: stop guessing. On ANY head mismatch — covered, not-yet-covered,
-    # or the lookup itself failing — never post a second request from here.
-    # Just rerun the gate job against the new head and let greptile-gate.sh's
-    # OWN poll loop (already correct, already tested, up to
-    # GREPTILE_GATE_TIMEOUT_SECONDS) do what it already does for exactly this
-    # situation: wait for a verdict matching the CURRENT head, and treat any
-    # verdict for a DIFFERENT commit as pending, not a failure. Two outcomes,
-    # both correct, neither guessed:
-    #   - the in-flight request DOES resolve against the new head → the gate
-    #     sees a matching verdict and passes/fails on score, same as always.
-    #   - it does NOT → the gate times out to UNAVAILABLE (exit 75), which is
-    #     PROOF no verdict for this head ever landed within the window. Only
-    #     THEN does re-running this script fresh (without --rerun-only) become
-    #     the correct, no-longer-a-guess next step for a human/agent watching
-    #     the gate's outcome — not something this script decides preemptively.
-    # This can never itself pay for a duplicate: it posts nothing.
-    local covered_rc
-    if greptile_reviewed_head "${head_sha_before_rerun}"; then
-      covered_rc=0
-    else
-      covered_rc=$?
-    fi
-    case "${covered_rc}" in
-      0)
-        log "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, but Greptile already has a landed verdict for ${head_sha_before_rerun} — no duplicate request needed. Rerunning the gate against the new head." ;;
-      2)
-        log "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, and checking whether Greptile already covered the new head failed after retries — proceeding to rerun the gate anyway; its own poll loop resolves this correctly regardless (see above)." ;;
-      *)
-        log "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running, and no landed verdict covers the new head yet. NOT guessing by posting a second request — the original request may still resolve against this head. Rerunning the gate against the new head; its own poll loop will catch a late-landing verdict or time out to UNAVAILABLE if none arrives, which is the correct signal to re-run this script fresh." ;;
-    esac
+    # Six iterations across two designs, both of which traded a simple
+    # "occasionally pay for a duplicate" cost for a NEW class of correctness
+    # bug — proof that trying to infer what Greptile's un-pinned mention will
+    # resolve against, from outside, is the wrong shape of fix, not this
+    # particular attempt at it. Stop trying. On ANY head mismatch, always
+    # explicitly request AND rerun for the new head — exactly the same two
+    # calls main() already makes on a clean run, just retargeted. This is
+    # deterministic: there is always a marker and always a review requested
+    # for whatever head the gate ends up polling, so every downstream
+    # recovery path (the exit-2 --rerun-only retry included) has exactly the
+    # state it already expects. The one accepted cost, on purpose: if the
+    # original, still-in-flight request ALSO happens to resolve against this
+    # same new head, that's a second, redundant review — a wasted credit in
+    # an already-rare race, not a correctness bug, and a far cheaper price
+    # than a sixth attempt at cleverness that CI has now shown twice cannot
+    # be gotten right in one pass.
+    log "the PR head changed from ${head_sha} to ${head_sha_before_rerun} while this script was running. Not guessing whether the original request will resolve against the new head — requesting one explicitly instead, so every downstream recovery path has the state it expects."
+    post_review_request "${head_sha_before_rerun}"
     rerun_gate_job "${head_sha_before_rerun}"
     return
   fi

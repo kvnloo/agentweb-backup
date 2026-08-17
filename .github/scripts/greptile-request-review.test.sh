@@ -447,80 +447,52 @@ fi
 # gets rerun.
 NEW_HEAD_SHA='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 
-# CAUGHT LIVE A FIFTH TIME (Greptile 4/5, agentweb#2427, reviewing the fix
-# that only handled "already covered"): the case where the new head is NOT
-# yet covered — no verdict landed either way — used to fail loudly and
-# advise a fresh request, which can still be a paid duplicate if the
-# original, still-in-flight request resolves against this exact head a
-# moment later. The fix: never guess here. Rerun the gate against the new
-# head (never post a second request) and let greptile-gate.sh's own poll
-# loop — already correct for exactly this ambiguity — resolve it. This test
-# is the "not yet covered" case: `comments.json` carries only the original
-# User-authored request marker, no Bot verdict at all, so
-# greptile_reviewed_head returns "not covered".
+# CAUGHT LIVE A SIXTH TIME (Greptile 4/5, agentweb#2427, THREE findings
+# reviewing the "defer to the gate's poll loop" fix): that design assumed
+# the original request either resolves against the new head, or never
+# resolves at all (timing out to UNAVAILABLE, the documented recovery
+# signal). Greptile found the real third case it missed — the original
+# request resolving against the OLD head — which makes greptile-gate.sh
+# report REFUSED instead of UNAVAILABLE, with no working recovery signal. A
+# second, independent finding on the same commit: the exit-2 `--rerun-only`
+# retry path assumed a marker would exist for the new head, which that
+# design deliberately never posted.
+#
+# The fix: stop trying to infer what an un-pinned mention will resolve
+# against. On ANY head mismatch, request AND rerun the new head explicitly
+# — the exact same two calls a clean run makes, just retargeted. This is
+# deterministic, so every downstream recovery path (the exit-2 retry
+# included) has exactly the state it expects. Accepted cost, on purpose: if
+# the original request ALSO resolves against this same new head, that's a
+# second, redundant review in an already-rare race — a wasted credit, not a
+# correctness bug.
 new_mock
 printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
 run_script
-check 'a head change with no verdict yet reruns the gate against the NEW head rather than guessing' 0 \
-  'NOT guessing by posting a second request'
+check 'a head change explicitly requests AND reruns the gate for the NEW head, deterministically' 0 \
+  "re-ran 'Require Greptile Review'"
+check_call_logged 'the request comment was posted for the NEW head, not the stale one' \
+  "greptile-request-review: head=${NEW_HEAD_SHA}"
+# Deliberately TWO comments here, not one: the original head's request was
+# already posted by main()'s normal flow before the mismatch was detected,
+# and the mismatch branch explicitly posts a second, targeted request for
+# the new head — that's the accepted cost documented above, not a bug.
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ "$(grep -cF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null || echo 0)" = "1" ]; then
-  printf 'PASS: %s\n' 'exactly one review request comment was posted (the original, before the race) — no second one'
+if [ "$(grep -cF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null || echo 0)" = "2" ]; then
+  printf 'PASS: %s\n' 'two review requests were posted — the original head, then explicitly the new head (the accepted cost)'
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf 'FAIL: %s\n  calls.log:\n%s\n' 'exactly one review request comment was posted (the original, before the race) — no second one' \
-    "$(cat "${MOCK_DIR}/calls.log")"
-fi
-check_call_logged 'the gate was rerun despite no confirmed coverage — greptile-gate.sh''s own poll loop is the safety net' \
-  "actions/jobs/${JOB_ID}/rerun"
-
-# CAUGHT LIVE (Greptile P1, agentweb#2427, "Head-race recovery duplicates
-# reviews"): the unconditional fail above pays for a second review even when
-# Greptile's SHA-unscoped mention already landed against the new head (it has
-# no pin on our side; it reviews whatever the PR's head is when it processes
-# the webhook). If a landed verdict already names the new head, no duplicate
-# request is warranted — just rerun the gate against it.
-new_mock
-printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
-greptile_verdict_comment_for "${NEW_HEAD_SHA}" >"${MOCK_DIR}/comments.json"
-run_script
-check 'a head change is NOT a duplicate-request case when Greptile already covered the new head' 0 \
-  'already has a landed verdict'
-check_call_logged 'exactly one review request comment was posted (for the original head, before the race)' \
-  "greptile-request-review: head=${HEAD_SHA}"
-TESTS_RUN=$((TESTS_RUN + 1))
-if [ "$(grep -cF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null || echo 0)" = "1" ]; then
-  printf 'PASS: %s\n' 'no second review request comment was posted for the new head'
-else
-  TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf 'FAIL: %s\n  calls.log:\n%s\n' 'no second review request comment was posted for the new head' \
+  printf 'FAIL: %s\n  calls.log:\n%s\n' 'two review requests were posted — the original head, then explicitly the new head (the accepted cost)' \
     "$(cat "${MOCK_DIR}/calls.log")"
 fi
 check_call_logged 'the gate was rerun against the NEW head''s job, not the stale one' \
   "actions/jobs/${JOB_ID}/rerun"
 
-# The lookup for "did Greptile already cover the new head" can itself fail
-# (same class of transient GitHub API error every other lookup in this file
-# already handles). Under the new design this must NOT be fatal either —
-# still no second request posted, still hands off to the gate's poll loop —
-# since guessing wrong in either direction is the actual bug, not the lookup
-# failure itself.
-new_mock
-printf '%s\n%s\n' "${HEAD_SHA}" "${NEW_HEAD_SHA}" >"${MOCK_DIR}/pull_sha_sequence.txt"
-echo 1 >"${MOCK_DIR}/comments_exit"
-run_script
-check 'a failed lookup for new-head coverage still reruns the gate rather than failing or guessing' 0 \
-  'proceeding to rerun the gate anyway'
-TESTS_RUN=$((TESTS_RUN + 1))
-if [ "$(grep -cF 'pr comment' "${MOCK_DIR}/calls.log" 2>/dev/null || echo 0)" = "1" ]; then
-  printf 'PASS: %s\n' 'no second review request comment was posted when the coverage lookup itself failed'
-else
-  TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf 'FAIL: %s\n  calls.log:\n%s\n' 'no second review request comment was posted when the coverage lookup itself failed' \
-    "$(cat "${MOCK_DIR}/calls.log")"
-fi
-check_call_logged 'the gate was rerun even though the coverage lookup itself failed' \
-  "actions/jobs/${JOB_ID}/rerun"
+# The head-mismatch recovery reuses post_review_request and rerun_gate_job
+# directly, so their own existing failure-mode tests (comment-post failure,
+# no matching run, no matching job, the exit-2 retryable rerun case) already
+# cover this path's failure modes without needing separate mismatch-specific
+# duplicates of each.
 
 new_mock
 echo 1 >"${MOCK_DIR}/comment_exit"
