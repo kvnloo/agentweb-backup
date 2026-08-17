@@ -93,6 +93,53 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     ).not.toBeNull();
   });
 
+  // ENG-1045 follow-up. Before this, a grant for post_on_connected_account alone hard
+  // -refused twitter_manage_post outright — so the completion checker's equivalence
+  // route (a thread satisfies the requirement) was correct but unreachable: the model
+  // was refused before it ever got a chance to publish the thread. Live-verified on
+  // preview 2026-08-17.
+  describe('outcome-equivalent publish routes (ENG-1045)', () => {
+    it('ALLOWS a thread through twitter_manage_post on a grant scoped to post_on_connected_account', async () => {
+      const d = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+      expect(
+        await refuseUnauthorizedScheduledPublish(
+          'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'post_thread' }
+        )
+      ).toBeNull();
+    });
+
+    it('ALLOWS a reply and a quote-tweet through the same equivalence route', async () => {
+      const d1 = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+      expect(
+        await refuseUnauthorizedScheduledPublish('twitter_manage_post', { sessionId: 'sess-1' }, d1, { action: 'reply' })
+      ).toBeNull();
+      const d2 = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+      expect(
+        await refuseUnauthorizedScheduledPublish('twitter_manage_post', { sessionId: 'sess-1' }, d2, { action: 'quote_tweet' })
+      ).toBeNull();
+    });
+
+    // retweet is NOT in post_on_connected_account's equivalence list — resharing
+    // someone else's content is a different act the owner never approved. Granting
+    // the whole tool name would authorize more than the literal consent covers.
+    it('still REFUSES a retweet through the same tool — that action is not an equivalent route', async () => {
+      const d = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'retweet' }
+      );
+      expect(refusal).not.toBeNull();
+      expect(refusal!.error).toContain('post_on_connected_account');
+    });
+
+    it('still REFUSES once consent is revoked, even for an equivalent route', async () => {
+      const d = deps(SCHEDULED_SESSION, WITHHELD_SCHEDULE);
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'post_thread' }
+      );
+      expect(refusal).not.toBeNull();
+    });
+  });
+
   // Greptile (security): re-reading live state closes the revocation window, but on
   // its own it also OPENS one in the other direction — a grant landing mid-run would
   // publish content that a draft-only run had already generated under a prompt

@@ -4,6 +4,7 @@ import {
   narrowPublishAuthorization,
   isPublishCall,
   isPublishCapableTool,
+  isPublishCallWithinAuthorizedScope,
   ACTION_SCOPED_PUBLISH_TOOLS,
 } from '../utils/schedulePublishAuthorization';
 import { emmaToolRegistry } from '../emma/registry';
@@ -444,5 +445,53 @@ describe('isPublishCall — action-scoped publishing tools (ENG-827)', () => {
       expect(declared.length).toBeGreaterThan(0);
       expect([...spec.publishing, ...spec.nonPublishing].sort()).toEqual([...declared].sort());
     }
+  });
+});
+
+/**
+ * ENG-1045 follow-up — without this, a grant for `post_on_connected_account` alone
+ * hard-refused the model from ever calling `twitter_manage_post`, even for a thread
+ * that satisfies the exact same requirement via ENG-1045's equivalence route. The
+ * completion checker's fix was technically correct but practically unreachable
+ * (live-verified on preview 2026-08-17): the model narrated that it was "only
+ * pre-authorized to publish using post_on_connected_account" and silently collapsed
+ * a requested 2-tweet thread into one tweet instead of posting the thread.
+ */
+describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
+  it('authorizes the exact granted tool with no action restriction', () => {
+    expect(isPublishCallWithinAuthorizedScope('post_on_connected_account', undefined, ['post_on_connected_account'])).toBe(true);
+  });
+
+  it('authorizes an equivalent-route tool+action for a granted requirement', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'post_thread' }, ['post_on_connected_account'])
+    ).toBe(true);
+    expect(
+      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'reply' }, ['post_on_connected_account'])
+    ).toBe(true);
+    expect(
+      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'quote_tweet' }, ['post_on_connected_account'])
+    ).toBe(true);
+  });
+
+  it('normalizes a hyphenated action spelling the same way the completion checker does', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'post-thread' }, ['post_on_connected_account'])
+    ).toBe(true);
+  });
+
+  it('does NOT authorize an equivalent-route tool for an action outside the equivalence list (retweet is a different act)', () => {
+    expect(
+      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'retweet' }, ['post_on_connected_account'])
+    ).toBe(false);
+  });
+
+  it('does NOT authorize an unrelated tool the grant never named or has no equivalence route to', () => {
+    expect(isPublishCallWithinAuthorizedScope('linkedin_manage_post', { action: 'repost' }, ['post_on_connected_account'])).toBe(false);
+    expect(isPublishCallWithinAuthorizedScope('publish_landing_page_changes', undefined, ['post_on_connected_account'])).toBe(false);
+  });
+
+  it('is false on an empty grant', () => {
+    expect(isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'post_thread' }, [])).toBe(false);
   });
 });
