@@ -189,6 +189,40 @@ describe('CRM Group Email Endpoints', () => {
       });
     });
 
+    // ENG-1194: malformed/test-domain addresses were reported as "eligible" by
+    // preview but rejected by the provider (Resend 422) at send time.
+    it('should treat malformed/test-domain addresses as undeliverable, not eligible', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@acmecorp.com' },
+          { leadId: '2', email: 'user@example.com' }, // provider-disallowed test domain
+          { leadId: '3', email: 'user@localhost' }, // missing/invalid TLD
+          { leadId: '4', email: 'john..doe@acmecorp.com' }, // repeated-dot local part
+          { leadId: '5', email: 'user@acmecorp..com' }, // repeated-dot domain
+        ],
+        lastEvaluatedKey: undefined,
+      });
+
+      const handler = findHandler('/lists/:listId/group-email/preview', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith({
+        totalLeads: 5,
+        eligibleLeads: 1,
+        unsubscribedCount: 0,
+        doNotContactCount: 0,
+        noEmailCount: 0,
+        undeliverableCount: 4,
+        riskyCount: 0,
+        undeliverableEmails: ['user@example.com', 'user@localhost', 'john..doe@acmecorp.com', 'user@acmecorp..com'],
+        riskyEmails: [],
+      });
+    });
+
     it('should filter by leadIds when provided', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
         listId: 'list-1',
@@ -369,6 +403,45 @@ describe('CRM Group Email Endpoints', () => {
       const response = (mockRes.json as jest.Mock).mock.calls[0][0];
       expect(response.sent).toBe(1);
       expect(response.skippedUnsubscribed).toBe(1);
+    });
+
+    // ENG-1194: send must skip malformed/test-domain addresses by default,
+    // using the same eligibility function as preview, instead of attempting
+    // them and letting the provider reject them with a 422.
+    it('should skip malformed and test-domain addresses by default', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: '1', email: 'valid@acmecorp.com' },
+          { leadId: '2', email: 'user@example.com' },
+          { leadId: '3', email: 'user@localhost' },
+          { leadId: '4', email: 'john..doe@acmecorp.com' },
+        ],
+        lastEvaluatedKey: undefined,
+      });
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+
+      mockReq.body = {
+        senderEmail: 'me@test.com',
+        senderName: 'Me',
+        subject: 'Hi',
+        htmlContent: '<p>Hello</p>',
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/send', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
+      const call = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      expect(call.to).toBe('valid@acmecorp.com');
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.total).toBe(1);
+      expect(response.sent).toBe(1);
+      expect(response.skippedUndeliverable).toBe(3);
     });
 
     it('should emit progress via socket when socketId provided', async () => {
