@@ -475,6 +475,42 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
   });
 
+  it('NEGATION AUDIT #2: the negation-to-failure span tolerates intervening words, but stays clause-bounded (ENG-1276 follow-up)', () => {
+    // The original NEGATED_FAILURE_MENTION only caught the negation word landing
+    // DIRECTLY on the failure noun (an optional article/"by" in between, nothing
+    // more) — "not by failure" but not "not a SINGLE failure" or "no REAL error".
+    // Real English negation isn't that rigid, so this generalizes to a tempered
+    // greedy token: the negation cue, then ANY text that doesn't cross a clause
+    // boundary (a contrastive conjunction, or a sentence/semicolon break), then
+    // the failure word. The bug class this closes is the SAME one that broke
+    // "not by failure" (session 7f95530d) — just a different specific wording
+    // that hadn't happened to occur yet.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // Phrasings the OLD adjacency-only regex missed — negation and failure word
+    // share a clause, just with more words between them than a bare article/"by".
+    [
+      'Non-publishing day, skipped. Not a single failure occurred today.',
+      'Non-publishing day, skipped. There was never any failure to report.',
+      'Non-publishing day, skipped. No real error happened on our end.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // Widening the span must stay fail-CLOSED: a negation cue must NOT reach
+    // across a real clause break (a semicolon, or a contrastive conjunction like
+    // "but"/"though") to neutralize an UNRELATED, genuine failure that follows it.
+    [
+      'Non-publishing day, skipped. No post today; auth failed.',
+      'Non-publishing day, skipped. This was not a great day, but the LinkedIn post failed to publish.',
+      'Non-publishing day, skipped. Not without effort, but the post failed to publish.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
