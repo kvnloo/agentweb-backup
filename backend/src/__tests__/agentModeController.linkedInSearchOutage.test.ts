@@ -28,6 +28,7 @@ jest.mock('../services/db', () => ({
 import {
   computeScheduleRunHealth,
   detectRunBlockedReason,
+  didSourcingBlockStateChange,
   LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON,
 } from '../controllers/agentModeController';
 
@@ -109,5 +110,55 @@ describe('computeScheduleRunHealth blocked-reason passthrough (ENG-1131)', () =>
 
   it('stays null-safe with no runs', () => {
     expect(computeScheduleRunHealth([]).lastRunBlockedBy).toBeNull();
+  });
+});
+
+describe('didSourcingBlockStateChange (ENG-1131 follow-up: proactive transition alert)', () => {
+  it('is a transition when a schedule with no prior runs comes back blocked', () => {
+    expect(didSourcingBlockStateChange([], LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(true);
+  });
+
+  it('is NOT a transition when a schedule with no prior runs comes back healthy', () => {
+    expect(didSourcingBlockStateChange([], null)).toBe(false);
+    expect(didSourcingBlockStateChange(undefined, null)).toBe(false);
+    expect(didSourcingBlockStateChange(null, null)).toBe(false);
+  });
+
+  it('is a transition when the previous run was healthy and this one is blocked', () => {
+    const prior = [{ status: 'success', blockedBy: undefined }];
+    expect(didSourcingBlockStateChange(prior, LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(true);
+  });
+
+  it('is a transition when the previous run was blocked and this one recovered', () => {
+    const prior = [{ status: 'success', blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON }];
+    expect(didSourcingBlockStateChange(prior, null)).toBe(true);
+  });
+
+  it('is NOT a transition on the second consecutive blocked run of a multi-day outage (no alert spam)', () => {
+    const prior = [
+      { status: 'success', blockedBy: undefined },
+      { status: 'success', blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON },
+    ];
+    expect(didSourcingBlockStateChange(prior, LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(false);
+  });
+
+  it('is NOT a transition when consecutive runs are both healthy', () => {
+    const prior = [{ status: 'success' }, { status: 'success' }];
+    expect(didSourcingBlockStateChange(prior, null)).toBe(false);
+  });
+
+  it('only looks at the IMMEDIATELY PRECEDING run, not the whole history', () => {
+    // Blocked two runs ago, healthy last run, blocked again now — still a transition
+    // (healthy -> blocked), not "already alerted for this outage".
+    const prior = [
+      { status: 'success', blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON },
+      { status: 'success', blockedBy: undefined },
+    ];
+    expect(didSourcingBlockStateChange(prior, LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(true);
+  });
+
+  it('tolerates a malformed last entry without throwing', () => {
+    expect(didSourcingBlockStateChange([null as any], LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(true);
+    expect(didSourcingBlockStateChange(['nonsense' as any], null)).toBe(false);
   });
 });

@@ -161,3 +161,74 @@ describe('emailService.sendDailyDigestEmail — ENG-1131 blocked-sourcing state'
     expect(htmlContent.toLowerCase()).not.toContain('unavailable for the connected account');
   });
 });
+
+describe('emailService.sendScheduleSourcingBlockTransitionEmail (ENG-1131 follow-up: proactive alert)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('sends a "just became blocked" alert explaining the outage, not a plain failure', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduleSourcingBlockTransitionEmail(
+      'owner@example.com',
+      'DTC Founder Prospecting',
+      'schedule-123',
+      true,
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(recipients).toEqual(['owner@example.com']);
+    expect(subject.toLowerCase()).toContain('linkedin search');
+    expect(htmlContent).toContain('DTC Founder Prospecting');
+    expect(htmlContent.toLowerCase()).toContain('unavailable');
+    expect(htmlContent.toLowerCase()).toContain('nobody matched your filters');
+    expect(htmlContent.toLowerCase()).toContain('reconnecting will not help');
+    expect(htmlContent).not.toContain('failed');
+    expect(textContent.toLowerCase()).toContain('unavailable');
+  });
+
+  it('sends a "resolved" alert when sourcing recovers', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduleSourcingBlockTransitionEmail(
+      'owner@example.com',
+      'DTC Founder Prospecting',
+      'schedule-123',
+      false,
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject.toLowerCase()).toContain('back');
+    expect(htmlContent.toLowerCase()).toContain('working again');
+    expect(textContent.toLowerCase()).toContain('working again');
+  });
+
+  it('normalizes a single recipient string to a one-element list', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    await emailService.sendScheduleSourcingBlockTransitionEmail('solo@example.com', 'S', 'sched-2', true);
+    expect(spy.mock.calls[0][0]).toEqual(['solo@example.com']);
+  });
+
+  it('HTML-escapes the schedule name', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    await emailService.sendScheduleSourcingBlockTransitionEmail(
+      ['x@example.com'],
+      'Evil <img src=x onerror=alert(1)> Schedule',
+      'sched-4',
+      true,
+    );
+    const html = spy.mock.calls[0][3];
+    expect(html).not.toContain('<img src=x onerror');
+    expect(html).toContain('&lt;img src=x onerror');
+  });
+
+  it('never throws when the transport fails (best-effort)', async () => {
+    jest.spyOn(emailService, 'sendEmail').mockRejectedValue(new Error('SMTP down'));
+    await expect(
+      emailService.sendScheduleSourcingBlockTransitionEmail(['x@example.com'], 'S', 'sched-5', true),
+    ).resolves.toBeUndefined();
+  });
+});
