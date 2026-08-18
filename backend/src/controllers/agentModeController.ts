@@ -1878,24 +1878,39 @@ export function scheduledRunSignalsConditionalSkip(
   //       today" is a genuine failure report (the hedge is about the CAUSE,
   //       not a denial it happened) that must NOT get silently waived.
   //
-  // KNOWN, DELIBERATELY UNHANDLED LIMITATION (found on the same review, not a
-  // production incident): double negation. "It is not true that there was no
-  // failure today" re-asserts a real failure, but this pattern only sees the
-  // inner "no failure" and neutralizes it, so the outer negation's flip is
-  // lost. This phrasing register (nested logical negation) is a mismatch for
-  // what an LLM writes in a terse scheduled-run status line — every real
-  // production transcript behind this function's other tests is direct
-  // ("Sunday. No.", "not by failure") — so detecting it would mean tracking
-  // negation-of-negation depth, a materially bigger and riskier change than
-  // the pattern-matching this function already does, for a case with no
-  // observed real-world occurrence. Documented rather than fixed.
+  // DOUBLE NEGATION (found on the same review, not a production incident):
+  // "It is not true that there was no failure today" re-asserts a real
+  // failure, but a single-pass regex only sees the INNER "no failure" and has
+  // no concept of the OUTER negation flipping it back. Properly PARSING this
+  // would mean tracking negation-of-negation depth — a materially bigger,
+  // riskier change bolted onto an already-layered pattern, for phrasing that
+  // doesn't match any real production transcript behind this function's other
+  // tests (every one is direct: "Sunday. No.", "not by failure"). Instead this
+  // FAILS CLOSED: neutralizeNegatedFailureMentions() below skips any SENTENCE
+  // that itself negates a truth claim ("it is not true that...", "that's
+  // false...") entirely — a failure word inside such a sentence is left
+  // untouched and still vetoes via the normal HARD_FAILURE_PATTERNS check.
+  // Safe because it doesn't need to understand the sentence, only recognize
+  // the shape and decline to be clever about it — the dangerous direction
+  // (silently waiving a real failure) is closed even without real parsing.
   const NEGATED_FAILURE_MENTION =
     /\b(?:no(?!\s*,)|not|never|without)\b(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+  const META_NEGATION_OF_TRUTH =
+    /\b(?:is|was|isn['’]?t|wasn['’]?t)\s+(?:not\s+)?(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:that['’]?s|that\s+is|it['’]?s|it\s+is)\s+false\b|\bfalse\s+that\b/i;
+  function neutralizeNegatedFailureMentions(input: string): string {
+    return input
+      .split(/([.;!?\n]+)/)
+      .map((segment, i) =>
+        i % 2 === 1 || META_NEGATION_OF_TRUTH.test(segment) ? segment : segment.replace(NEGATED_FAILURE_MENTION, ' ')
+      )
+      .join('');
+  }
   const failureScan = expandContractions(
-    text
-      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
-      .replace(NEGATED_FAILURE_MENTION, ' ')
+    neutralizeNegatedFailureMentions(
+      text
+        .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+        .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    )
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
