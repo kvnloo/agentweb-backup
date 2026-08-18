@@ -29,6 +29,12 @@
  * and the bursts come from one session's parallel tool calls — so a distributed
  * lease would be cost without a matching risk. Revisit if writes ever fan out
  * across instances.
+ *
+ * Second gap, same honesty: this paces the AGENT TOOL path only. The CRM route
+ * `POST /lists/:listId/leads/:leadId/send-linkedin-invite` calls `sendInvitation`
+ * directly, so its writes are invisible to the rolling window here. It is
+ * single-lead and user-driven, so it cannot burst — but the hourly ceiling
+ * under-counts by however many invites a customer sends by hand during a drain.
  */
 
 const TAG = '[linkedInWritePacer]';
@@ -98,7 +104,10 @@ export const maxWritesPerHour = (): number =>
   envInt('LINKEDIN_WRITE_MAX_PER_HOUR', isTestEnv() ? 0 : 120);
 
 /**
- * Longest a single call will sit in the queue before being refused instead.
+ * Longest a call will sit BEHIND OTHER CALLERS before being refused instead.
+ *
+ * Not a bound on the caller's own spacing gap: a lone caller still waits up to one
+ * `minGapMs` after the previous write, which is the mechanism, not a queue.
  *
  * Sleeping without a bound would let a 40-invite drain hold a request open for
  * minutes and blow the run's own timeouts. Past this, the honest answer to the agent
@@ -150,11 +159,14 @@ export function __resetWritePacerForTests(): void {
 
 function pruneWindow(accountId: string, now: number): number[] {
   const recent = (recentWritesByAccount.get(accountId) || []).filter((ts) => now - ts < HOUR_MS);
-  // Drop the key entirely once its window is empty rather than parking an empty
-  // array under it forever. `chainByAccount`/`queueDepthByAccount` already clean up
-  // this way; without it, a long-lived process accumulates one permanent entry per
-  // account it has ever written for, including one-off accounts that never return.
-  // The grant path below re-sets the key, so an active account is unaffected.
+  // Drop the key once its window is empty rather than parking an empty array under
+  // it, matching how `chainByAccount`/`queueDepthByAccount` clean up.
+  //
+  // Stated precisely, because the obvious claim is wrong: this runs only when the
+  // account is reserved AGAIN, so a one-off account's entry is exactly the one never
+  // removed. What it fixes is the narrower case of an account that returns after its
+  // window expired. Growth is bounded by the number of connected Unipile accounts
+  // either way — this is hygiene, not a leak fix.
   if (recent.length === 0) {
     recentWritesByAccount.delete(accountId);
   } else {
@@ -219,6 +231,12 @@ export async function reserveWriteSlot(
   const queuedAhead = queueDepthByAccount.get(accountId) ?? 0;
   const worstCaseSlotMs = Math.ceil(gap * 1.2);
   const projectedWait = (queuedAhead + 1) * worstCaseSlotMs;
+  // The `queuedAhead > 0` term is deliberate. This cap bounds time spent QUEUED
+  // BEHIND other callers; a lone caller is not queued behind anyone, and the single
+  // gap it may still wait is `minGapMs` — a separate, deliberately-configured cost,
+  // not a queue. Dropping the term would also make `LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS=0`
+  // refuse every write rather than meaning "never queue", which is a much larger
+  // behaviour change than the wording it would fix.
   if (queuedAhead > 0 && projectedWait > maxQueueWaitMs()) {
     return {
       allowed: false,
@@ -259,9 +277,12 @@ export async function reserveWriteSlot(
     }
 
     const lastWrite = recent.length > 0 ? recent[recent.length - 1] : 0;
-    // Jitter so the spacing is not metronomic — perfectly regular timing is itself
-    // an automation signal.
-    const jittered = gap + Math.floor(gap * 0.2 * (random() - 0.5) * 2);
+    // Jitter so the spacing is not metronomic — perfectly regular timing is itself an
+    // automation signal. UPWARD only: symmetric jitter put the real floor at 0.8x the
+    // configured gap, which made `minGapMs` — documented as a minimum, and the number
+    // the whole safety argument rests on — untrue by 20%. Widening is always safe;
+    // narrowing is the thing being defended against.
+    const jittered = gap + Math.floor(gap * 0.2 * random());
     const waitMs = Math.max(0, lastWrite + jittered - arrivedAt);
     if (waitMs > 0) await sleep(waitMs);
 

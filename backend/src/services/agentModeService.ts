@@ -31666,8 +31666,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account that is either owned by the calling user or
     // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
     // reusing a shared enrichment account_id from a prior get-profile call.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
-    if (WRITE_ACTIONS.includes(action)) {
+    // Same set the pacer uses, deliberately not a second hand-maintained copy: a
+    // sixth write action added to one list and not the other would be either
+    // silently unpaced or silently unauthorized.
+    if (PACED_WRITE_ACTIONS.has(action)) {
       const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
       const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
@@ -32166,8 +32168,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
-          // Past every skip path (already-pending, identity mismatch): this call is
-          // going to reach LinkedIn, so now is when it should cost a pacing slot.
+          // ENG-126's account-level cooldown short-circuits the network call inside
+          // sendInvitation, so a paced caller would sleep a full gap and burn one of
+          // the account's hourly writes for a request that never leaves the process —
+          // for the whole hour the breaker is armed, on every queued invite. Check it
+          // here, before the slot is taken.
+          if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
+            return {
+              success: false,
+              error:
+                'Cannot resend yet — this LinkedIn account is under an active account-level '
+                + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
+                + 'Skip the remaining invites and report what was completed.',
+            };
+          }
+          // Past every skip path (already-pending, identity mismatch, cooldown): this
+          // call is going to reach LinkedIn, so now is when it should cost a slot.
           const invitePaced = await paceWrite();
           if (invitePaced) return invitePaced.refusal;
           try {
