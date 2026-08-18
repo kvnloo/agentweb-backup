@@ -1109,6 +1109,52 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     // Schedule timezone Asia/Tokyo → Monday (a publish day) → rejected.
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF, timezone: 'Asia/Tokyo' })).toBe(false);
   });
+
+  it('recognizes PLURAL weekday names in the cadence, not just singular (live-verification follow-up, ENG-1276)', () => {
+    // A production live-verification run for ENG-1276 used "This schedule only
+    // publishes on Wednesdays" — the WEEKDAY_TOKEN regex only matched singular day
+    // names, so the cadence clause parsed to zero days, publishDays stayed empty,
+    // and the run fell through to the (unrelated) negated-conditional skip clause,
+    // which named Wednesday for the WRONG reason and rejected the skip on Tuesday.
+    // Net effect: the run hit the full 20-attempt retry press this ticket exists to
+    // prevent, on live phrasing an owner would naturally write.
+    const sunday = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
+    const monday = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+    const tuesday = new Date('2026-08-04T12:00:00Z'); // getUTCDay() === 2
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
+    // Weekday-agnostic content (names no day itself) so it stays valid across every
+    // `now` used below without tripping the separate model-asserted-weekday cross-
+    // check in step (4), which is orthogonal to what this test targets.
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+
+    // Positive cadence, multi-day, written with plural day names.
+    const publishOnlyPluralMWF = 'This schedule only publishes on Mondays, Wednesdays, and Fridays.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: publishOnlyPluralMWF })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: publishOnlyPluralMWF })).toBe(false);
+
+    // Skip-day list written with plural day names.
+    const skipListPlural = 'If today is a Saturday or a Sunday, publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: skipListPlural })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: skipListPlural })).toBe(false);
+
+    // The exact live-verification shape: a single plural publish day, plus a
+    // negated-conditional skip clause that ALSO names that same weekday (for the
+    // opposite reason). The positive publish-day cadence must win.
+    const singlePluralPublishDay =
+      'This test schedule only publishes on Wednesdays. If today is NOT Wednesday: create and publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: tuesday, instruction: singlePluralPublishDay })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: singlePluralPublishDay })).toBe(false);
+  });
+
+  it('recognizes a plural weekday RANGE ("Mondays through Fridays") in the cadence', () => {
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3, inside the range
+    const saturday = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6, outside the range
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+    for (const instr of ['Publish only on Mondays through Fridays.', 'Publish only on Mondays to Fridays.']) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: instr })).toBe(false);
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: instr })).toBe(true);
+    }
+  });
 });
 
 describe('reconstructPriorToolCalls (ENG-844)', () => {
