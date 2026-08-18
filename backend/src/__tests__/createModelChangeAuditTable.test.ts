@@ -18,10 +18,12 @@
  */
 
 const createTable = jest.fn(() => ({ promise: async () => ({}) }));
+const updateTimeToLive = jest.fn(() => ({ promise: async () => ({}) }));
 
 jest.mock('aws-sdk', () => {
   class DynamoDB {
     createTable = createTable;
+    updateTimeToLive = updateTimeToLive;
     static DocumentClient = class {
       put() {
         return { promise: async () => ({}) };
@@ -40,6 +42,7 @@ import { MODEL_CHANGE_AUDIT_TABLE } from '../services/llmModelChangeAuditDb';
 
 beforeEach(() => {
   createTable.mockClear();
+  updateTimeToLive.mockClear();
 });
 
 describe('createModelChangeAuditTable', () => {
@@ -118,5 +121,64 @@ describe('createModelChangeAuditTable', () => {
     } as never);
 
     await expect(createModelChangeAuditTable()).rejects.toThrow(/no permission/);
+  });
+});
+
+/**
+ * The TTL step. `recordModelChange` writes a 365-day `ttl`, and CreateTable does
+ * not switch expiry on -- so without this call the attribute is decorative and the
+ * table keeps every customer billing decision forever. Nothing at runtime reports
+ * it missing, which is exactly why it needs a test rather than a runbook line.
+ */
+describe('createModelChangeAuditTable — retention', () => {
+  it('enables native TTL on the attribute the rows actually carry', async () => {
+    await createModelChangeAuditTable();
+
+    expect(updateTimeToLive).toHaveBeenCalledTimes(1);
+    const params = (updateTimeToLive.mock.calls[0] as unknown as [AWS.DynamoDB.UpdateTimeToLiveInput])[0];
+    expect(params.TableName).toBe(MODEL_CHANGE_AUDIT_TABLE);
+    // The attribute name must match what the writer sets, or expiry silently
+    // never fires — the same class of miss as configuring no TTL at all.
+    expect(params.TimeToLiveSpecification).toEqual({ Enabled: true, AttributeName: 'ttl' });
+  });
+
+  it('still enables TTL when the table already exists', async () => {
+    // The common case in every environment after the first run. A table created
+    // before this shipped has TTL off, and skipping the call on the
+    // already-exists path would leave it off forever.
+    createTable.mockReturnValueOnce({
+      promise: async () => {
+        throw Object.assign(new Error('Table already exists'), { code: 'ResourceInUseException' });
+      },
+    } as never);
+
+    await createModelChangeAuditTable();
+    expect(updateTimeToLive).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fail table setup when the role cannot enable TTL', async () => {
+    // dynamodb:UpdateTimeToLive is not always granted. Refusing to finish setup
+    // over a retention setting would be the wrong trade; the warning carries the
+    // exact command instead.
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    updateTimeToLive.mockReturnValueOnce({
+      promise: async () => {
+        throw Object.assign(new Error('not authorized'), { code: 'AccessDeniedException' });
+      },
+    } as never);
+
+    await expect(createModelChangeAuditTable()).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('update-time-to-live'));
+    warn.mockRestore();
+  });
+
+  it('treats an already-enabled TTL as success', async () => {
+    updateTimeToLive.mockReturnValueOnce({
+      promise: async () => {
+        throw Object.assign(new Error('TimeToLive is already enabled'), { code: 'ValidationException' });
+      },
+    } as never);
+
+    await expect(createModelChangeAuditTable()).resolves.toBeUndefined();
   });
 });

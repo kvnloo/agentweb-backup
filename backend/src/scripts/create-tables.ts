@@ -1927,6 +1927,33 @@ export const createModelChangeAuditTable = async () => {
   };
   try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
   catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+
+  // `recordModelChange` writes a 365-day `ttl`, but CreateTable does not enable
+  // expiry -- so without this the attribute is decorative and audit rows are kept
+  // forever. Attempted here rather than left to a runbook line because nothing at
+  // runtime reports it missing: the failure mode is silent, indefinite retention
+  // of customer billing decisions.
+  //
+  // Run unconditionally, including on the already-exists path, since a table
+  // created before this shipped has TTL off.
+  //
+  // Never fatal. `dynamodb:UpdateTimeToLive` is not always granted to the role
+  // running setup, and refusing to finish table creation over a retention setting
+  // would be the wrong trade -- so it says plainly what is left to do instead.
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (error.code === 'ValidationException' && /already enabled/i.test(error.message || '')) return;
+    console.warn(
+      `[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. ` +
+      `Audit rows are retained indefinitely until someone runs: aws dynamodb update-time-to-live ` +
+      `--table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`,
+    );
+  }
 };
 
 // Create Agent Runs table (run-survival core — durable run records +
