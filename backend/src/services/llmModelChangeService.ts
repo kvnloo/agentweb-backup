@@ -52,6 +52,31 @@ export class ModelNotAvailableError extends Error {
   }
 }
 
+/**
+ * The schedule moved between reading its model and writing the new one, and it
+ * did NOT move to the model being confirmed.
+ *
+ * Distinct from a double-click, which resolves to a plain no-op: this is two
+ * different intentions racing, and the loser's choice must not be written over
+ * the winner's. Silently proceeding would leave the customer on a model nobody
+ * selected last, with an audit row asserting otherwise.
+ */
+export class ModelChangeConflictError extends Error {
+  constructor(message = "That schedule was changed a moment ago. Reload and try again.") {
+    super(message);
+    this.name = "ModelChangeConflictError";
+  }
+}
+
+/** Both spellings: the v2 SDK sets `code`, wrapped/rethrown errors keep `name`. */
+function isConditionalCheckFailure(error: unknown): boolean {
+  const err = error as { code?: string; name?: string } | null | undefined;
+  return (
+    err?.code === "ConditionalCheckFailedException" ||
+    err?.name === "ConditionalCheckFailedException"
+  );
+}
+
 export interface ApplyModelChangeInput {
   scope: ModelChangeScope;
   scopeId: string;
@@ -173,7 +198,40 @@ export async function applyModelChange(
     };
   }
 
-  await scheduleDb.updateSchedule(input.scopeId, { llmModel: input.toModel });
+  // Bind the write to the state the decision was read from. The guard above is
+  // otherwise a read-then-write across three awaits: two confirms arriving before
+  // either write lands BOTH see the old model, both pass the guard, and both
+  // record an audit row claiming a switch. The schedule survives that (the writes
+  // agree) but the trail does not, and the customer's Undo can only stamp the one
+  // change id the UI holds — leaving the duplicate permanently un-undone,
+  // asserting a switch that was already reverted.
+  //
+  // `undefined` here means "still absent", which is the condition for a schedule
+  // that was INHERITING — a different assertion from "still equals X", and the
+  // majority case.
+  try {
+    await scheduleDb.updateSchedule(
+      input.scopeId,
+      { llmModel: input.toModel },
+      { llmModel: modelBefore ?? undefined },
+    );
+  } catch (error) {
+    if (!isConditionalCheckFailure(error)) throw error;
+    // It moved. WHY decides the answer, so re-read rather than assume: another
+    // confirm of the SAME model is the idempotent double-click, and anything else
+    // is a genuine conflict.
+    const current = await loadOwnedSchedule(userId, input.scopeId);
+    if ((current.llmModel || null) === input.toModel) {
+      return {
+        applied: false,
+        changeId: null,
+        modelBefore,
+        modelAfter: input.toModel,
+        pinnedFromInherited: false,
+      };
+    }
+    throw new ModelChangeConflictError();
+  }
 
   const changedAt = new Date().toISOString();
   let changeId: string;

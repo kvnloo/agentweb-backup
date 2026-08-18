@@ -8,6 +8,7 @@ import { resolveUsageDrivers, toCustomerDrivers, previewUsageRunway } from '../s
 import {
   applyModelChange,
   undoModelChange,
+  ModelChangeConflictError,
   ModelChangeNotFoundError,
   ModelNotAvailableError,
 } from '../services/llmModelChangeService';
@@ -171,6 +172,12 @@ router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
     }
     if (error instanceof ModelNotAvailableError) {
       return res.status(400).json({ error: error.message });
+    }
+    // 409, not 500: nothing failed. Someone else changed the schedule first, so
+    // the client's own view is stale — reload-and-retry is the fix, which a 500
+    // does not communicate and which invites a blind retry that loses again.
+    if (error instanceof ModelChangeConflictError) {
+      return res.status(409).json({ error: error.message });
     }
     console.error('Error applying model change:', error);
     return res.status(500).json({ error: 'Failed to apply the change' });
