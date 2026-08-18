@@ -1,5 +1,8 @@
 import { crmDb } from './db';
-import { withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
+import {
+  usablePublicIdentifier,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
 import {
   FIELD_GROUPS,
   buildCompanyCanonicalKey,
@@ -211,8 +214,16 @@ export function buildLinkedInContextFromCache(
   );
   let linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(rawProfile, null, 2)}`;
 
-  if (isEnrichingLinkedin && rawData.linkedinData.publicIdentifier) {
-    const profileUrl = `https://www.linkedin.com/in/${rawData.linkedinData.publicIdentifier}`;
+  // `publicIdentifier` is persisted as its OWN cache attribute, not read back out of
+  // `rawProfile` — so sanitizing the blob above does not cover it. Rows written before
+  // the sentinel was rejected on the write path hold the literal string 'undefined',
+  // which is truthy, and this line would label the resulting dead link as the RESOLVED
+  // profile URL. That is a stronger claim to the LLM than anything in the blob, and
+  // `person_identity` caches for 90 days, so those rows are exactly the population this
+  // function's sanitization exists to protect.
+  const cachedIdentifier = usablePublicIdentifier(rawData.linkedinData.publicIdentifier);
+  if (isEnrichingLinkedin && cachedIdentifier) {
+    const profileUrl = `https://www.linkedin.com/in/${cachedIdentifier}`;
     linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
   }
 

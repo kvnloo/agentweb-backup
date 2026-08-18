@@ -23,7 +23,12 @@ const ANONYMIZED_IDENTIFIER = 'undefined';
  * than a real profile slug.
  */
 export function isAnonymizedIdentifier(publicIdentifier: unknown): boolean {
-  return publicIdentifier === ANONYMIZED_IDENTIFIER;
+  // Case-insensitive to agree with `isFabricatedProfileUrl`'s `/i` regex. When the two
+  // disagreed, `{ public_identifier: 'Undefined', public_profile_url: '.../in/Undefined' }`
+  // had its URL deleted and its identifier kept — and the caller then rebuilt the same
+  // dead link from the identifier it had just been told to trust.
+  return typeof publicIdentifier === 'string'
+    && publicIdentifier.toLowerCase() === ANONYMIZED_IDENTIFIER;
 }
 
 /**
@@ -84,7 +89,7 @@ const PROFILE_URL_FIELDS = ['public_profile_url', 'url', 'profile_url'] as const
  * than "present but empty". Valid values are left exactly as they arrived — this
  * removes fabrications, it does not normalize.
  */
-export function withoutFabricatedProfileFields<T extends Record<string, any>>(profile: T): T {
+export function withoutFabricatedProfileFields<T extends Record<string, any>>(profile: T): Partial<T> {
   const sanitized: Record<string, any> = { ...profile };
   if (!usablePublicIdentifier(sanitized.public_identifier)) {
     delete sanitized.public_identifier;
@@ -93,5 +98,5 @@ export function withoutFabricatedProfileFields<T extends Record<string, any>>(pr
     if (!(field in sanitized)) continue;
     if (!usableProfileUrl(sanitized[field])) delete sanitized[field];
   }
-  return sanitized as T;
+  return sanitized as Partial<T>;
 }

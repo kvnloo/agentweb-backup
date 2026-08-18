@@ -907,7 +907,10 @@ export class CrmEnrichmentService {
           // enrichLead) are independent and survive.
           linkedinContext = '';
         } else {
-          const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
+          // Read from the SANITIZED copy: on the raw object a fabricated
+          // `public_profile_url` short-circuits this `||` chain and masks a legitimate
+          // `url`/`profile_url` that would otherwise have been used.
+          const rawUrl = sanitizedProfile?.public_profile_url || sanitizedProfile?.url || sanitizedProfile?.profile_url || null;
           // Rejecting the identifier above is only half of it: Unipile builds
           // `public_profile_url` from that same bad identifier and sends it too, so
           // this fallback re-created the very /in/undefined URL the identifier check
@@ -923,7 +926,15 @@ export class CrmEnrichmentService {
           }
         }
       } else if (isEnrichingLinkedin && isValidLinkedInUrl && confidence !== 'low') {
-        linkedinContext = `\n\nResolved LinkedIn profile URL: ${linkedinUrl}`;
+        // `isValidLinkedInUrl` is only a `/in/` substring test, so the lead's own
+        // stored URL can BE the fabricated one — earlier enrichment runs wrote
+        // `/in/undefined` back onto `lead.linkedin`, which makes this self-perpetuating.
+        // Citation verification cannot catch it either: it accepts a URL whose slug
+        // appears in the source context, and the slug here is the word "undefined".
+        const storedUrl = usableProfileUrl(linkedinUrl);
+        if (storedUrl) {
+          linkedinContext = `\n\nResolved LinkedIn profile URL: ${storedUrl}`;
+        }
       }
     } catch (err: any) {
       console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);
