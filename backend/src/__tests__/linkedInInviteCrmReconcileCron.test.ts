@@ -62,7 +62,7 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 jest.mock('../services/leadListAlertService', () => ({ leadListAlertService: {} }));
 
-import { runLinkedInConnectionSync } from '../cron/linkedInConnectionSyncCron';
+import { runLinkedInConnectionSync, __resetDisconnectBackoffForTests } from '../cron/linkedInConnectionSyncCron';
 
 const ACCOUNT = 'tMgX8uZJTZWTG_mFY1aI2A';
 const OWNER = 'user_1';
@@ -74,6 +74,8 @@ describe('sync cron → invite CRM reconciliation', () => {
   const originalFlag = process.env.LINKEDIN_INVITE_CRM_RECONCILE;
 
   beforeEach(() => {
+  // ENG-1197: the cron paces dead-account re-checks in module state.
+  __resetDisconnectBackoffForTests();
     jest.clearAllMocks();
     process.env.LINKEDIN_INVITE_CRM_RECONCILE = 'true';
     // One per-user Unipile account, no site-wide accounts.
