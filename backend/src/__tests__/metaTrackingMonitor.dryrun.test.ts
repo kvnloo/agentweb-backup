@@ -74,6 +74,40 @@ describe('dry run does not send', () => {
   });
 });
 
+describe('dry run is safe WITHOUT an injected transport', () => {
+  it('never reaches the real oncall transport when no transport is supplied', async () => {
+    // The original shipped `transport: deps?.alertTransport ?? defaultAlertTransport`, so the
+    // entire no-side-effects contract rested on every caller remembering to inject a capture
+    // transport. And because a dry run also SKIPS suppression, a caller who forgot would have
+    // sent real oncall email unsuppressed, on every account — worse than before dry-run existed.
+    const emailService = require('../services/emailService').emailService;
+    const send = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined as any);
+
+    const deps: any = tokenErrorDeps({ dryRun: true });
+    delete deps.alertTransport; // the caller forgets — this must still be harmless
+
+    const summary = await monitorUserTracking(user(), deps);
+
+    expect(summary.tokenErrors).toBe(1);   // it still DETECTED the problem
+    expect(send).not.toHaveBeenCalled();   // and told nobody
+    send.mockRestore();
+  });
+
+  it('a REAL run with no injected transport still uses the real path', async () => {
+    // The capture fallback must apply to dry runs only, or the cron would go silent.
+    const emailService = require('../services/emailService').emailService;
+    const send = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined as any);
+
+    const deps: any = tokenErrorDeps();
+    delete deps.alertTransport;
+
+    await monitorUserTracking(user(), deps);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    send.mockRestore();
+  });
+});
+
 describe('dry run and the suppression map', () => {
   it('does NOT read it — an account the real sweep already alerted on still reports', async () => {
     // A real sweep alerts first, which records suppression for this account+class.

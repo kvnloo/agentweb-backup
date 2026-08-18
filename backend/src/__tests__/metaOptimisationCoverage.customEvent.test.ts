@@ -18,6 +18,7 @@ import {
   resolveOptimisationEvent,
   pixelReceivedEvent,
   evaluateOptimisationCoverage,
+  evaluateAccountOptimisationCoverage,
 } from '../services/metaOptimisationCoverage';
 
 const adSet = (over: any = {}) => ({
@@ -153,5 +154,47 @@ describe('evaluateOptimisationCoverage with custom conversions', () => {
       received,
     );
     expect(v.unrecognisedOptimisations).toEqual([]);
+  });
+});
+
+describe('the ACCOUNT-level evaluator uses the same matcher as its sibling', () => {
+  // Regression: pixelReceivedEvent was introduced for evaluateOptimisationCoverage and this
+  // evaluator was left on a raw `received.has(expected)`, so a custom event reported ONLY in
+  // percent-encoded form read as missing here while reading as present there. Two evaluators,
+  // one question, two answers — the fix-one-of-a-pair defect §48 records.
+  const adSet = {
+    id: 'as-pct',
+    name: 'HubSpot MQL',
+    effective_status: 'ACTIVE',
+    promoted_object: {
+      pixel_id: 'px-1',
+      custom_event_type: 'OTHER',
+      custom_event_str: 'Hubspot Form Completed $25k+',
+    },
+  };
+
+  it('treats a percent-encoded custom event as ARRIVING, not as unconfirmable', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet],
+      { 'px-1': ['PageView', 'Hubspot%20Form%20Completed%20%2425k%2B'] },
+      { 'as-pct': [{ date: '2026-08-16', spend: 100, families: [] }] },
+      '2026-08-18',
+    );
+    expect(v.alerting).toHaveLength(0);
+    expect(v.unconfirmable).toHaveLength(0);
+    expect(v.unconfirmed).toHaveLength(0);
+    expect(v.dormant).toHaveLength(0);
+  });
+
+  it('still reports it when the pixel genuinely never receives it', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet],
+      { 'px-1': ['PageView', 'SomethingElse'] },
+      { 'as-pct': [{ date: '2026-08-16', spend: 100, families: [] }] },
+      '2026-08-18',
+    );
+    const total =
+      v.alerting.length + v.unconfirmed.length + v.unconfirmable.length + v.staleDelivery.length;
+    expect(total).toBeGreaterThan(0);
   });
 });

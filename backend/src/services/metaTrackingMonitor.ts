@@ -781,9 +781,24 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   const fetchActivity =
     deps?.fetchActivity ??
     ((id: string, token: string, days: number) => fetchDailyAdAccountActivity(id, token, days));
+  const dryRun = deps?.dryRun === true;
+  // A dry run NEVER falls back to the real transport. Defaulting to `defaultAlertTransport`
+  // here made the whole no-side-effects contract depend on every caller remembering to inject
+  // a capture transport — and because a dry run also skips suppression, a caller who forgot
+  // would have sent real oncall email UNSUPPRESSED, on every account, which is worse than the
+  // behaviour before dry-run existed. The cron does inject one, so production was never
+  // exposed; the contract was, and a contract that only holds when callers are careful is not
+  // a contract. Capture-only is now the floor, and an injected transport merely observes.
+  const captured: Array<{ subject: string; message: string; context?: Record<string, any> }> = [];
   const alertSink: AlertSink = {
-    transport: deps?.alertTransport ?? defaultAlertTransport,
-    dryRun: deps?.dryRun === true,
+    transport:
+      deps?.alertTransport ??
+      (dryRun
+        ? async (subject, message, context) => {
+            captured.push({ subject, message, context });
+          }
+        : defaultAlertTransport),
+    dryRun,
   };
   const now = deps?.now ?? Date.now();
 
