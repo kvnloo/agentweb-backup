@@ -14,9 +14,9 @@ describe('resolveCrmEnrichmentModel', () => {
     expect(resolveCrmEnrichmentModel({ requestedModel: 'gpt-5-chat-2', systemDefaultModel: 'gpt-5-chat-2', supportedModelIds: ['gpt-5-chat-2'], policy, usageMode: 'full_choice' }).effectiveModel).toBe('gpt-5-chat-2');
   });
 
-  it('corrects a disallowed model to the policy optimized default', () => {
-    const result = resolveCrmEnrichmentModel({ requestedModel: 'gpt-5-chat-2', systemDefaultModel: 'gpt-5-chat-2', supportedModelIds: ['gpt-5-chat-2', 'gemini-2.5-flash'], policy, usageMode: 'optimized' });
-    expect(result.effectiveModel).toBe('gemini-2.5-flash');
+  it('corrects an unsupported requested model to the system default (ENG-1211: no optimized substitution)', () => {
+    const result = resolveCrmEnrichmentModel({ requestedModel: 'unsupported-model', systemDefaultModel: 'gpt-5-chat-2', supportedModelIds: ['gpt-5-chat-2', 'gemini-2.5-flash'], policy, usageMode: 'full_choice' });
+    expect(result.effectiveModel).toBe('gpt-5-chat-2');
     expect(result.modelSelection).toBe('corrected');
   });
 
