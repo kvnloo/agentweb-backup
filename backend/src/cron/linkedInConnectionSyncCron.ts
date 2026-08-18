@@ -30,6 +30,7 @@ import {
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
 import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
+import { deleteSentInvitationsByProfileUrls } from '../services/unipileSentInvitationsDb';
 
 export {
   sentInvitationChanged,
@@ -564,6 +565,52 @@ async function shouldSkipDisconnectedAccount(
   }
 }
 
+// ─── Invite-feed walk pacing (ENG-1197) ──────────────────────────────────────
+
+/**
+ * How often the sent-invitation walk is a FULL one.
+ *
+ * This is a BACKSTOP, not the freshness mechanism. The two ways an invitation
+ * actually stops being pending — the recipient accepts, or we withdraw it — each
+ * delete their own row the moment we observe them, so an accepted invite still
+ * clears within one 10-minute connection sync exactly as it did before, and one we
+ * withdraw clears immediately. The full walk only catches the residue: invites that
+ * expired on LinkedIn's side, or were withdrawn outside this product.
+ *
+ * Env-tunable so the interval can be tightened without a deploy.
+ */
+export const FULL_INVITATION_WALK_INTERVAL_MS = (() => {
+  const raw = Number(process.env.LINKEDIN_FULL_INVITE_WALK_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60 * 60 * 1000;
+})();
+
+const lastFullWalkAtByAccount = new Map<string, number>();
+
+/** Test-only: clears the walk pacing so each test starts from a clean slate. */
+export function __resetWalkPacingForTests(): void {
+  lastFullWalkAtByAccount.clear();
+}
+
+function chooseWalkMode(accountId: string): 'full' | 'incremental' {
+  const last = lastFullWalkAtByAccount.get(accountId);
+  if (last !== undefined && Date.now() - last < FULL_INVITATION_WALK_INTERVAL_MS) {
+    return 'incremental';
+  }
+  return 'full';
+}
+
+/**
+ * Record that a full walk actually completed.
+ *
+ * Kept separate from choosing the mode: stamping at selection time marks the walk
+ * done even when it then throws on a timeout or a 5xx — and since only a full walk
+ * prunes, one failed attempt would push the next prune out by another whole
+ * interval, doubling the staleness the interval is supposed to bound.
+ */
+function markFullWalkCompleted(accountId: string): void {
+  lastFullWalkAtByAccount.set(accountId, Date.now());
+}
+
 // ─── Main cron entry point ────────────────────────────────────────────────────
 
 let isRunning = false;
@@ -593,6 +640,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // Health is derived from the calls this loop already makes; adding a probe
       // per account per cycle would undo the saving above.
       let observed: SessionState = 'unknown';
+      let acceptedProfileUrls: string[] = [];
       try {
         // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
         // forces a full backfill (then sets the __fullsync__ marker) whenever that
@@ -607,6 +655,11 @@ export async function runLinkedInConnectionSync(): Promise<void> {
 
         const newConns = await syncConnectionsForAccount(accountId);
         observed = 'connected';
+        // Only on a NON-backfill run. A backfill returns the account's entire
+        // connection history, and feeding thousands of URLs into the cleanup below
+        // turns a tidy-up into a full scan of the cache on the cron path — for
+        // people who were connected long before any invitation we track.
+        if (!wasBackfill) acceptedProfileUrls = newConns.map((c) => c.publicProfileUrl);
         if (wasBackfill) {
           console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
         } else {
@@ -619,10 +672,29 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }
+      // A newly-detected connection means that person's invitation was accepted, so
+      // it is no longer pending. Drop it now rather than leaving it for the hourly
+      // full walk — the CRM reads this cache to show "invite pending" on a lead, and
+      // an hour of showing that after they accepted is a visible lie (ENG-1197).
+      //
+      // Deliberately OUTSIDE the sync try/catch above: a failure to tidy our own
+      // cache says nothing about the LinkedIn session, and that catch is where
+      // session health is judged.
+      if (acceptedProfileUrls.length > 0) {
+        try {
+          await deleteSentInvitationsByProfileUrls(accountId, acceptedProfileUrls);
+        } catch (err) {
+          console.error(`${TAG} Failed to drop accepted invitations for ${accountId}:`, err);
+        }
+      }
+
       // Refresh pending sent-invitations independently — a failure here must not
       // block connection sync (and vice versa).
       try {
-        await syncSentInvitationsForAccount(accountId);
+        // Cheap walk most cycles; a full one — which is what prunes — hourly.
+        const walkMode = chooseWalkMode(accountId);
+        await syncSentInvitationsForAccount(accountId, { mode: walkMode });
+        if (walkMode === 'full') markFullWalkCompleted(accountId);
         if (observed !== 'disconnected') observed = 'connected';
       } catch (err) {
         // 'disconnected' wins over 'connected': proof of a dead session from either

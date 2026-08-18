@@ -42,10 +42,12 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 
 const mockUpsertSentInvitations = jest.fn().mockResolvedValue(undefined);
 const mockPruneStaleSentInvitations = jest.fn().mockResolvedValue(0);
+const mockDeleteSentInvitationsByProfileUrls = jest.fn().mockResolvedValue(0);
 jest.mock('../services/unipileSentInvitationsDb', () => ({
   upsertSentInvitations: (...a: any[]) => mockUpsertSentInvitations(...a),
   pruneStaleSentInvitations: (...a: any[]) => mockPruneStaleSentInvitations(...a),
   profileUrlFromPublicId: (id: string) => `https://www.linkedin.com/in/${id}/`,
+  deleteSentInvitationsByProfileUrls: (...a: any[]) => mockDeleteSentInvitationsByProfileUrls(...a),
 }));
 
 const mockGetAllSequencesByTriggerType = jest.fn().mockResolvedValue([]);
@@ -70,7 +72,11 @@ jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: { notifyLinkedInConnectionAccepted: (...a: any[]) => mockNotifyLinkedInConnectionAccepted(...a) },
 }));
 
-import { runLinkedInConnectionSync, __resetDisconnectBackoffForTests } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetDisconnectBackoffForTests,
+  __resetWalkPacingForTests,
+} from '../cron/linkedInConnectionSyncCron';
 
 const onePageOfConnections = () =>
   jest.fn().mockResolvedValueOnce({
@@ -82,8 +88,10 @@ const onePageOfConnections = () =>
   });
 
 beforeEach(() => {
-  // ENG-1197: the cron paces dead-account re-checks in module state.
+  // ENG-1197: the cron paces both its dead-account re-checks and its full
+  // walk in module state.
   __resetDisconnectBackoffForTests();
+  __resetWalkPacingForTests();
   jest.clearAllMocks();
   // Single site-wide account to sync.
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([{ account_id: 'acct-1', enabled: true }]) });

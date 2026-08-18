@@ -301,6 +301,7 @@ import {
   usableProfileUrl,
   withoutFabricatedProfileFields,
 } from '../utils/linkedInAnonymizedProfile';
+import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -3541,8 +3542,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3562,7 +3566,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );
@@ -3691,7 +3695,7 @@ export class AgentModeService {
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
 3. If that context is enough to complete the task, do so using it.
 4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
 5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
@@ -6268,6 +6272,22 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
+    // can raise it (`linkedin_outreach` search-people/search-parameters and the
+    // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
+    // this method, which erased the only machine-readable evidence that a run
+    // sourced zero prospects because LinkedIn search was DOWN for the account
+    // rather than because nobody matched. The scheduled-run recorder reads it back
+    // off the tool ledger (detectRunBlockedReason) to record the run as blocked
+    // instead of as a clean success the owner reads as "no one matched".
+    //
+    // Deliberately keyed on the flag, not the tool name, so it survives wherever
+    // the guard is raised. The marker is stamped ONLY after the broad control
+    // query has confirmed the outage, so it can never fire on an honest empty.
+    if (result && result.searchUnavailable === true) {
+      return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -23989,7 +24009,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
@@ -31687,8 +31717,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account that is either owned by the calling user or
     // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
     // reusing a shared enrichment account_id from a prior get-profile call.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
-    if (WRITE_ACTIONS.includes(action)) {
+    // Same set the pacer uses, deliberately not a second hand-maintained copy: a
+    // sixth write action added to one list and not the other would be either
+    // silently unpaced or silently unauthorized.
+    if (PACED_WRITE_ACTIONS.has(action)) {
       const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
       const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
@@ -31778,6 +31810,44 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
+
+    // ENG-1197: pace write actions so a drain cannot burst the session to death.
+    //
+    // Twice this schedule fired ten cancel-invitation calls in one parallel batch
+    // and LinkedIn revoked the account's session ~17 seconds later, locking the
+    // customer out for days. The model emits parallel tool calls because that is the
+    // efficient shape of the work, and an unattended run has nobody to notice it
+    // ignoring an instruction not to — so the spacing has to be structural, not
+    // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
+    // Deliberately NOT taken here, up front, for the whole action. Several paced
+    // actions return before they ever reach Unipile — send-invite skips a profile
+    // whose invite is already pending or whose identity fails the ENG-1026 check,
+    // send-message skips a stale-sync or duplicate-text send. Reserving at the top
+    // would spend a slot (and sleep the caller a full gap) on those no-ops, so a
+    // batch of already-invited leads would both crawl and eat the hourly ceiling
+    // that the genuinely-new invites later in the same run need. Each case below
+    // therefore calls this immediately before its own Unipile write.
+    const paceWrite = async (): Promise<{ refusal: any } | null> => {
+      if (!PACED_WRITE_ACTIONS.has(action)) return null;
+      const slot = await reserveWriteSlot(account_id);
+      if (slot.allowed) return null;
+      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+      return {
+        refusal: {
+          success: false,
+          message: 'LinkedIn write actions are being paced',
+          error: [
+            slot.reason,
+            '',
+            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
+            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
+            'blocks ALL outreach until the account owner manually reconnects.',
+            '',
+            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+          ].join('\n'),
+        },
+      };
+    };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -32038,6 +32108,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptPaced = await paceWrite();
+          if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
           return { success: true, data: acceptResult };
         }
@@ -32194,6 +32266,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          // ENG-126's account-level cooldown short-circuits the network call inside
+          // sendInvitation, so a paced caller would sleep a full gap and burn one of
+          // the account's hourly writes for a request that never leaves the process —
+          // for the whole hour the breaker is armed, on every queued invite. Check it
+          // here, before the slot is taken.
+          if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
+            return {
+              success: false,
+              error:
+                'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
+                + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
+                + 'Skip the remaining invites and report what was completed.',
+            };
+          }
+          // Past every skip path (already-pending, identity mismatch, cooldown): this
+          // call is going to reach LinkedIn, so now is when it should cost a slot.
+          const invitePaced = await paceWrite();
+          if (invitePaced) return invitePaced.refusal;
           try {
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
@@ -32344,6 +32434,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
+          const messagePaced = await paceWrite();
+          if (messagePaced) return messagePaced.refusal;
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
 
           // Persist the sent message to the CRM so it shows up in engagement history.
@@ -32382,6 +32474,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { subject } = args;
           if (!subject) throw new Error('subject is required for send-inmail action');
 
+          const inmailPaced = await paceWrite();
+          if (inmailPaced) return inmailPaced.refusal;
           const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
 
           // Persist the sent InMail to the CRM so it shows up in engagement history.
@@ -32485,7 +32579,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'cancel-invitation': {
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelPaced = await paceWrite();
+          if (cancelPaced) return cancelPaced.refusal;
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 

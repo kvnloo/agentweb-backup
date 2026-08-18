@@ -32,6 +32,7 @@ import { AGENT_MODE_LOOP_ID } from '../loops/instances/agent-mode/eventTypes';
 import {
   computeReliabilitySnapshot,
   type ReliabilitySnapshot,
+  type SatisfactionDimensionSample,
 } from './agentReliabilitySnapshot';
 
 /** The loop partition the daily snapshot rows are stored under (distinct from
@@ -131,6 +132,72 @@ export function itemToSnapshot(item: Record<string, unknown>): ReliabilitySnapsh
 export interface SnapshotCronDeps {
   dynamo: DynamoPort;
   clock: ClockPort;
+  /**
+   * ENG-1312: optional source of satisfaction-judge dimension samples for the
+   * same window. Deliberately OPT-IN — when omitted, no chatbotDb/DynamoDB
+   * call is made at all, so every existing caller of writeReliabilitySnapshots
+   * (this whole file's existing test suite included) keeps behaving as a
+   * pure, network-free unit run. Only the production entry point
+   * (runAgentReliabilitySnapshot) wires in
+   * `readSatisfactionDimensionSamplesFromChatbotDb` below.
+   */
+  readSatisfactionSamples?: (range: { startTime: string; endTime: string }) => Promise<SatisfactionDimensionSample[]>;
+}
+
+/**
+ * Bound on how many recent sessions to scan for satisfaction-dimension
+ * samples per snapshot run. Matches the existing admin sync-mode ceiling
+ * (routes/admin.ts `maxLimit`) — generous enough for a daily/weekly trend
+ * signal without turning this best-effort telemetry read into an unbounded
+ * scan.
+ */
+const SATISFACTION_SAMPLE_READ_LIMIT = 1000;
+
+/**
+ * Real production reader: pulls recently-updated ChatSessions (via the
+ * existing AdminUpdatedAtIndex-backed `getRecentSessionsPage`, the same path
+ * routes/admin.ts's chat-history sync mode already uses — no new DB access
+ * pattern) and maps each session's `satisfactionScore.dimensions` into a
+ * timestamped sample.
+ *
+ * Approximation, documented rather than hidden: this windows by session
+ * `updatedAt`, not the score's own `evaluatedAt` — a session scored inside the
+ * window but touched again afterward could be missed by a later run's window,
+ * or a session updated in-window whose score is slightly stale could be
+ * included. That's an acceptable trade for a "visible within a day" fleet
+ * trend signal (the bar ENG-1312 sets), not a per-session audit.
+ *
+ * Best-effort and lazy-imported like every other DB dependency in this file's
+ * sibling services: a failure here must never break the tool/run-verdict
+ * metrics that already work, so errors are swallowed to an empty list.
+ */
+export async function readSatisfactionDimensionSamplesFromChatbotDb(range: {
+  startTime: string;
+  endTime: string;
+}): Promise<SatisfactionDimensionSample[]> {
+  try {
+    const { chatbotDb } = await import('../services/chatbotService');
+    const { sessions } = await chatbotDb.getRecentSessionsPage(SATISFACTION_SAMPLE_READ_LIMIT, undefined, range);
+    const samples: SatisfactionDimensionSample[] = [];
+    for (const session of sessions) {
+      const score = session.satisfactionScore;
+      const dims = score?.dimensions;
+      if (!score || !dims) continue;
+      const tsStr = score.evaluatedAt || session.updatedAt;
+      const ts = tsStr ? new Date(tsStr) : undefined;
+      if (!ts || Number.isNaN(ts.getTime())) continue;
+      samples.push({
+        ts,
+        concision: dims.concision,
+        instructionCompliance: dims.instructionCompliance,
+        unnecessaryPermissionRequest: dims.unnecessaryPermissionRequest,
+      });
+    }
+    return samples;
+  } catch (err) {
+    console.error('[AgentReliabilitySnapshot] readSatisfactionDimensionSamplesFromChatbotDb failed (swallowed):', err);
+    return [];
+  }
 }
 
 export interface WriteSnapshotOptions {
@@ -188,6 +255,26 @@ export async function writeReliabilitySnapshots(
   const catchUpDays = Math.max(1, Math.floor(opts.catchUpDays ?? 1));
   const existing = catchUpDays > 1 ? await existingSnapshotKeys(deps.dynamo) : new Set<string>();
 
+  // ENG-1312: read satisfaction-dimension samples ONCE, covering the widest
+  // span any (date, window) pair in this run needs — the oldest catch-up
+  // day's 7d window reaches furthest back — then let computeReliabilitySnapshot
+  // subset per (date, window) exactly like the reused `events` array above.
+  // Opt-in and best-effort: an omitted dep or a failed read never blocks the
+  // tool/run-verdict metrics that already work.
+  let satisfactionSamples: SatisfactionDimensionSample[] = [];
+  if (deps.readSatisfactionSamples) {
+    try {
+      const widestStart = new Date(now.getTime() - (catchUpDays - 1) * MS_PER_DAY - 7 * MS_PER_DAY);
+      satisfactionSamples = await deps.readSatisfactionSamples({
+        startTime: widestStart.toISOString(),
+        endTime: now.toISOString(),
+      });
+    } catch (err) {
+      console.error('[AgentReliabilitySnapshot] readSatisfactionSamples failed (swallowed):', err);
+      satisfactionSamples = [];
+    }
+  }
+
   const windows: Array<{ label: string; spanMs: number }> = [
     { label: '24h', spanMs: MS_PER_DAY },
     { label: '7d', spanMs: 7 * MS_PER_DAY },
@@ -218,6 +305,7 @@ export async function writeReliabilitySnapshots(
         windowEnd: dayEnd,
         windowLabel: w.label,
         now,
+        satisfactionSamples,
       });
       // putItem on the same PK+SK overwrites — re-running the same day yields
       // ONE row per (date, window), never a duplicate.
@@ -289,7 +377,11 @@ export async function seedReliabilitySnapshotsIfEmpty(): Promise<boolean> {
 
     const catchUpDays = resolveCatchUpDays(process.env.AGENT_RELIABILITY_SNAPSHOT_CATCHUP_DAYS);
     const written = await writeReliabilitySnapshots(
-      { dynamo: ports.dynamo, clock: ports.clock },
+      {
+        dynamo: ports.dynamo,
+        clock: ports.clock,
+        readSatisfactionSamples: readSatisfactionDimensionSamplesFromChatbotDb,
+      },
       { catchUpDays },
     );
     console.log(
@@ -319,7 +411,11 @@ export async function runAgentReliabilitySnapshot(): Promise<void> {
     const ports = productionLoopPorts();
     const catchUpDays = resolveCatchUpDays(process.env.AGENT_RELIABILITY_SNAPSHOT_CATCHUP_DAYS);
     const written = await writeReliabilitySnapshots(
-      { dynamo: ports.dynamo, clock: ports.clock },
+      {
+        dynamo: ports.dynamo,
+        clock: ports.clock,
+        readSatisfactionSamples: readSatisfactionDimensionSamplesFromChatbotDb,
+      },
       { catchUpDays },
     );
     const day = written[written.length - 1];
