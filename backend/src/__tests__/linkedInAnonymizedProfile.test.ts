@@ -39,6 +39,21 @@ describe('isFabricatedProfileUrl', () => {
     expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined?trk=x')).toBe(true);
   });
 
+  it('catches a fabricated URL carrying a fragment', () => {
+    // split('?') alone leaves '#about' attached, which pushes the path off the end
+    // of the anchored match — so the fake URL passed validation and could reach
+    // enrichment context as a resolved profile.
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined#about')).toBe(true);
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined/?x=1#exp')).toBe(true);
+    expect(usableProfileUrl('https://www.linkedin.com/in/undefined#about')).toBeNull();
+  });
+
+  it('strips a fragment from a real URL too', () => {
+    expect(usableProfileUrl('https://www.linkedin.com/in/jian-liang#experience')).toBe(
+      'https://www.linkedin.com/in/jian-liang',
+    );
+  });
+
   it('leaves a real profile URL alone, including a slug ending in the word', () => {
     expect(isFabricatedProfileUrl('https://www.linkedin.com/in/li-wang-cpa-5035b311')).toBe(false);
     // Guards the regex: only the WHOLE final segment counts, not a suffix.
