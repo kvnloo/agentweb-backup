@@ -101,6 +101,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatErrorEmail: jest.fn(),
     sendScheduledChatTokenLimitEmail: jest.fn(),
     sendScheduledRunFailedEmail: jest.fn(),
+    sendScheduleSourcingBlockTransitionEmail: jest.fn(),
   },
 }));
 
@@ -4308,6 +4309,64 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           emailNotifications: ['admin@example.com'],
         })
       );
+    });
+  });
+
+  // ENG-1131 follow-up: end-to-end proof that the sourcing-block transition alert
+  // actually wires up through the real runScheduledChat flow, not just the pure
+  // helper functions it's built from in isolation. This is the exact gap that let
+  // a real bug (the alert firing on manual "Test this schedule" runs, with no
+  // !isTest guard) ship unnoticed — every other coverage for this feature tested
+  // detectRunBlockedReason/didSourcingBlockStateChange/the email template as
+  // isolated pure functions, never the actual wiring inside runScheduledChat.
+  describe('sourcing-block transition alert wiring (ENG-1131 follow-up)', () => {
+    const blockedToolCallsResponse = {
+      ...mockResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: {}, result: { searchUnavailable: true } },
+      ],
+    };
+
+    it('fires the transition alert on a REAL scheduled run when sourcing just became blocked', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      // Prior run was healthy (no blockedBy) — the schedule re-fetched mid-run must
+      // see this via getScheduleById, since that's what the transition check reads.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false); // isTest=false: a real run
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [, , , isNowBlocked] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(isNowBlocked).toBe(true);
+    });
+
+    it('does NOT fire the transition alert on a manual "Test this schedule" run (isTest=true)', async () => {
+      // Same blocked-transition shape as the test above — the ONLY difference is
+      // isTest=true. A manual test click must never send this unsolicited alert.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, true); // isTest=true
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('does NOT fire the alert on a real run when there is no transition (already blocked last run too)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: 'linkedin_search_unavailable', createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
   });
 });
