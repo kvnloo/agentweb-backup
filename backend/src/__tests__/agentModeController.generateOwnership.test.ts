@@ -107,6 +107,18 @@ jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: jest.fn().mockResolvedValue([]),
 }));
 
+jest.mock('../services/usageBlockMessageService', () => ({
+  buildUsageBlockInfoForUser: jest.fn().mockResolvedValue({
+    exhausted: 'cost',
+    usedLabel: '$60.00 of your $60.00 monthly AI budget',
+    resetsAt: '2026-09-01T00:00:00.000Z',
+    resetsAutomatically: true,
+    hasNextTier: false,
+    upgradeUrl: null,
+    supportUrl: 'https://www.hireemma.ai/support',
+  }),
+}));
+
 jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));

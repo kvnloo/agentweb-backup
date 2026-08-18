@@ -83,6 +83,7 @@ import {
   type SubscriptionFeatureId,
 } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
+import { buildUsageBlockInfoForUser } from '../services/usageBlockMessageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { emmaToolRegistry } from '../emma/registry';
@@ -6720,6 +6721,7 @@ export const agentModeController = {
             session.llmModel || agentModeService.default_model,
             toStoredModelPolicyDecision(modelPolicyDecision),
           );
+          const usageBlockInfo = await buildUsageBlockInfoForUser(user.userId, usageStatus);
           return res.status(429).json({
             error: 'AI usage is paused until your next reset or additional usage is added.',
             code: 'usage_paused',
@@ -6731,12 +6733,15 @@ export const agentModeController = {
             modelSelection: modelPolicyDecision.modelSelection,
             modelSelectionReason: modelPolicyDecision.reason,
             usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+            usageBlockInfo,
           });
         }
+        const usageBlockInfo = await buildUsageBlockInfoForUser(user.userId, usageStatus);
         return res.status(429).json({
           error: 'AI usage is paused until your next reset or additional usage is added.',
           code: 'usage_paused',
           usageMode: 'paused',
+          usageBlockInfo,
         });
       }
 
@@ -6797,6 +6802,7 @@ export const agentModeController = {
           modelSelection: modelPolicyDecision.modelSelection,
           modelSelectionReason: modelPolicyDecision.reason,
           usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+          usageBlockInfo: await buildUsageBlockInfoForUser(user.userId, usageStatus),
         });
       }
       const modelToUse = modelPolicyDecision.effectiveModel;
