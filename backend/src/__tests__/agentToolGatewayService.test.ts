@@ -2220,6 +2220,104 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-1220: gpt-image-2 rate-limits a batch of generate_image calls with 429s.
+    // The model is told "[Retryable: yes — wait, then retry]" for a rate_limit-class
+    // error, but the session-scoped expensive-media budget (2) counted every failure
+    // uniformly, so two transient 429s permanently locked generate_image for the rest
+    // of the chat session even after the rate-limit window had cleared.
+    it('ENG-1220: does not permanently lock generate_image after repeated transient 429 rate-limit failures', async () => {
+      const sessionScope = 'session-eng1220-ratelimit';
+      for (const runId of ['run-rl-a', 'run-rl-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'batch variation' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('gpt-image-2 API failed: Request failed with status code 429'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'one more variation after waiting' },
+        runId: 'run-rl-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    // A rate-limit-exempt session budget must still trip on genuinely permanent
+    // media failures (e.g. repeated content-policy rejections), so the breaker
+    // keeps protecting against real retry spirals.
+    it('ENG-1220: still locks generate_image after two non-retryable failures (rate-limit exemption is class-specific)', async () => {
+      const sessionScope = 'session-eng1220-permanent';
+      for (const runId of ['run-perm-a', 'run-perm-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'blocked prompt' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('Safety filter rejected image prompt'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'try again' },
+        runId: 'run-perm-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    // Hard-quota exhaustion (OpenAI/Azure `insufficient_quota`, "exceeded your
+    // current quota") is 429-shaped like transient rate limiting, but permanent —
+    // classifyToolErrorClass buckets it as 'quota_exceeded', distinct from
+    // 'rate_limit', so shouldTrackInSessionScope must NOT exempt it: a hard-quota
+    // account should still trip the session-wide media budget instead of retrying
+    // generate_image indefinitely for the rest of the session.
+    it('ENG-1220: still locks generate_image after two hard-quota-exhaustion failures (quota_exceeded is not rate-limit-exempt)', async () => {
+      const sessionScope = 'session-eng1220-quota';
+      for (const runId of ['run-quota-a', 'run-quota-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'generate_image',
+          args: { prompt: 'quota exhausted prompt' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('gpt-image-2 API failed: You exceeded your current quota, please check your plan and billing details.'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'generate_image',
+        args: { prompt: 'try again' },
+        runId: 'run-quota-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('isolates failure counts between runs', async () => {
       await failNTimes('run-d', 'linkedin_outreach', 'Invalid parameters', 3);
 
