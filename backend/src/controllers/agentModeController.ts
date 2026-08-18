@@ -2656,6 +2656,26 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
+  //
+  // CodeRabbit review (ENG-1276) also flagged that `requiredFunctions` — and so
+  // this derived name list, used only for the ENG-1276 alias double-credit
+  // suppression — is captured ONCE here and does not shrink if consent narrows
+  // mid-run (`livePublishAuthorization`/`effectivePublishAuthorization` below).
+  // Investigated and left as-is: the FINAL persisted record already re-derives
+  // its own held-to list fresh from `effectivePublishAuthorization` at the end
+  // of the run (see `heldToFunctionNames` in runScheduledChat) — that is the
+  // value that actually reaches the schedule owner, and it is not stale. The
+  // only consumer of THIS list is the alias suppression, and a stale (wider)
+  // list there can only make suppression MORE likely to apply, never less —
+  // i.e. it can under-credit a name nobody ends up requiring, never
+  // double-credit one. Safe direction, and currently unreachable in practice
+  // besides: no evidenced schedule requires both names of any alias pair to
+  // begin with, so this is two unevidenced conditions compounded. Making it
+  // fully live would mean re-deriving this list at each of the three
+  // requirementEvidenceNames call sites from whatever authorization is active
+  // AT THAT MOMENT — a real change to a part of this function's mid-run
+  // consent-narrowing plumbing, not a quick win, for a currently-unreachable
+  // gap in the safe direction.
   const requiredFunctionNames = requiredFunctions.map((reqFunc) => reqFunc.functionName);
   const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? [], requiredFunctionNames);
 
@@ -3509,6 +3529,11 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  // Pre-existing at runtime (finalFunctionCallDetails, ENG-947) but missing from
+  // this type until a test needed to assert on it directly (CodeRabbit review,
+  // ENG-1276) — declaring it changes no behavior, only lets TS see a field the
+  // object has always returned.
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
   attempt: number;
@@ -4505,7 +4530,17 @@ export async function runScheduledChat(
     // the run FINISHED under, which differs from the admitted one when the owner
     // revoked consent mid-run.
     const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
-    requirementEvidenceNames(result.toolCalls, heldToFunctionNames).forEach((call: string) => {
+    // ENG-657, applied here too (CodeRabbit review, ENG-1276): a RESUMED run's
+    // verification already seeds its evidence with resumePriorToolCalls (see
+    // `priorToolCalls: resumePriorToolCalls` passed into runVerifiedChat below),
+    // so the pass/fail DECISION correctly counts the abandoned portion's calls.
+    // This persisted record was built from `result.toolCalls` alone — only the
+    // calls made in the resumed portion — so a resumed run that passed because
+    // an EARLIER call satisfied a requirement could still write
+    // `{required: 1, actual: 0}` here: a self-contradicting record next to an
+    // empty functionCallMisses, the exact false-failure shape ENG-479/ENG-764/
+    // ENG-827 already had to unpick for a different stale-snapshot cause.
+    requirementEvidenceNames([...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
     heldToFunctionNames.forEach((functionName: string) => {
