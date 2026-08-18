@@ -56,6 +56,10 @@ beforeEach(() => {
       status: 'ok', ads: [], ownedPixelIds: [], observations: {},
       urlsNotChecked: [], attributedConversionsByAd: {},
     }),
+    // §G Tier 2 makes its own 30-day Graph read. Without this every test here reaches
+    // graph.facebook.com for real — the ENG-1111 guard blocks it, so the suite still passes
+    // while silently exercising a different path from production.
+    fetchEventMix: jest.fn().mockResolvedValue({ status: 'ok', days: [] }),
     now: Date.parse('2026-08-18T09:00:00Z'),
     sweptAccountIds,
   };

@@ -63,6 +63,14 @@ export interface TrackingMonitorCronSummary {
    *  21 production connection rows resolve to 15 distinct accounts, so this is ~6 full account
    *  sweeps saved per day — and it is what stops per-user counters double-counting. */
   duplicateAccountsSkipped: number;
+  /** §G Tier 2 — conversion families that were arriving reliably and have stopped. The only
+   *  check of the four that can see an event dropped with nobody optimising for it. */
+  eventMixRegressions: number;
+  /** Families reliably present and still arriving. Printed even at zero, because "nothing to
+   *  watch" and "watching and healthy" are different states. */
+  eventMixWatched: number;
+  /** Families absent too long to still count as a regression. Logged, never paged. */
+  eventMixStale: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -85,6 +93,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     destinationOk: 0,
     destinationUnconfirmed: 0,
     duplicateAccountsSkipped: 0,
+    eventMixRegressions: 0,
+    eventMixWatched: 0,
+    eventMixStale: 0,
   };
 
   // ONE set for the whole sweep. An ad account connected under several user records is one
@@ -124,6 +135,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.destinationOk += result.destinationOk ?? 0;
       summary.destinationUnconfirmed += result.destinationUnconfirmed ?? 0;
       summary.duplicateAccountsSkipped += result.duplicateAccountsSkipped ?? 0;
+      summary.eventMixRegressions += result.eventMixRegressions ?? 0;
+      summary.eventMixWatched += result.eventMixWatched ?? 0;
+      summary.eventMixStale += result.eventMixStale ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -169,6 +183,15 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       : '') +
     (summary.destinationUnconfirmed > 0
       ? `, ${summary.destinationUnconfirmed} converting despite reading as uninstrumented`
+      : '') +
+    (summary.eventMixRegressions > 0
+      ? `, ${summary.eventMixRegressions} conversion famil(ies) that used to arrive reliably have stopped`
+      : '') +
+    // Printed even at zero: an account with nothing to watch and an account watched and found
+    // healthy both report zero regressions, and only this number separates them.
+    `, ${summary.eventMixWatched} conversion famil(ies) watched` +
+    (summary.eventMixStale > 0
+      ? `, ${summary.eventMixStale} long-dead conversion famil(ies) (not alerting)`
       : '') +
     (summary.duplicateAccountsSkipped > 0
       ? `, ${summary.duplicateAccountsSkipped} duplicate connection(s) skipped`
