@@ -152,6 +152,34 @@ Include it in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
 
 /**
+ * ENG-1312: the judge originally scored only goalCompletion / dataAccuracy /
+ * outputQuality, so it had no way to flag a reply that was technically correct
+ * but drastically over length, ignored an explicit instruction, or asked
+ * permission for a safe (read-only/draft/test) action — exactly the shape of
+ * the regression Ed (xCures) and Phoenix (Vince) reported on 08-17. This adds
+ * three signals plus a rule against rewarding pushback.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE: production
+ * carries a live `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to these fields — the same masking failure (ENG-392)
+ * that let the judge miss this regression for two weeks in the first place.
+ */
+export const VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE = `
+
+ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object as goalCompletion/dataAccuracy/outputQuality:
+- "concision" (0-5): Did the reply's length match what the question or the user's explicit length instruction called for? 5 = tightly matched; lower scores = further from the target length (too long is the common case, but an answer too short to actually answer the question also scores low). A short, correct, complete answer to a short question scores 5 even though it is short. A multi-page answer to a request for "a couple sentences", "one page", or "keep it brief" scores low regardless of how well-written it is.
+- "instructionCompliance" (0-5): When the user gave an explicit, unambiguous instruction — a length limit, a yes/no question, "don't guess", "do X now", a specific format — was it followed on the FIRST attempt, without the user having to repeat or correct it? 5 = followed immediately; 0 = ignored or contradicted. If the user gave no explicit instruction of this kind in the turn(s) being evaluated, score 5 — do not penalize for an instruction that was never given.
+- "unnecessaryPermissionRequest" (true/false): Did the assistant ask the user to confirm or approve a read-only, draft-only, or test/simulation action (e.g. "should I go ahead and run this test?", "want me to draft this for you?") where nothing was spent, nothing was published or sent, and no irreversible action was taken? Set true only when such an unnecessary confirmation prompt actually occurred. Set false otherwise — including when confirmation was correctly requested for a spend change, a publish/send action, or an irreversible action, since that confirmation is NOT unnecessary.
+
+ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
+When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5.
+
+Include the new fields in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
+
+/**
  * Read the judge's zero-task verdict, failing OPEN.
  *
  * Only a literal boolean `false` counts as "no task was requested". A missing,
@@ -592,7 +620,19 @@ type ScoringResult = {
   score: number;
   reason: string;
   evaluatedMessageIndex: number;
-  dimensions?: { goalCompletion: number; dataAccuracy: number; outputQuality: number };
+  dimensions?: {
+    goalCompletion: number;
+    dataAccuracy: number;
+    outputQuality: number;
+    /**
+     * ENG-1312 additions. Optional and parsed independently of the base three:
+     * a stale custom judge prompt (predating this change) will never populate
+     * them, and that must not invalidate goalCompletion/dataAccuracy/outputQuality.
+     */
+    concision?: number; // 0-5: did reply length match the question/instruction?
+    instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
+    unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+  };
   /**
    * `false` when the judge reported that the user never requested anything, so
    * the session belongs outside the satisfaction cohort. `undefined` means the
@@ -602,16 +642,43 @@ type ScoringResult = {
   taskRequested?: boolean;
 };
 
+/** A finite number in `raw`, or undefined if missing/non-numeric. Distinguishes
+ * "the judge didn't answer" (leave undefined, fail open) from "the judge
+ * answered 0" (a real, in-range score). */
+function finiteNumber(v: any): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   const d = raw?.dimensions;
   if (!d || typeof d !== "object") return undefined;
-  const clamp = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
+  const clamp1to5 = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
   if (!d.goalCompletion || !d.dataAccuracy || !d.outputQuality) return undefined;
-  return {
-    goalCompletion: clamp(d.goalCompletion),
-    dataAccuracy: clamp(d.dataAccuracy),
-    outputQuality: clamp(d.outputQuality),
+
+  const dimensions: NonNullable<ScoringResult["dimensions"]> = {
+    goalCompletion: clamp1to5(d.goalCompletion),
+    dataAccuracy: clamp1to5(d.dataAccuracy),
+    outputQuality: clamp1to5(d.outputQuality),
   };
+
+  // ENG-1312: each new field is optional and parsed independently — a missing
+  // or malformed one is simply omitted, never falls back to a default value
+  // that would masquerade as a real judge answer, and never invalidates the
+  // base three dimensions parsed above.
+  const clamp0to5 = (v: number) => Math.max(0, Math.min(5, Math.round(v)));
+  const concision = finiteNumber(d.concision);
+  if (concision !== undefined) dimensions.concision = clamp0to5(concision);
+  const instructionCompliance = finiteNumber(d.instructionCompliance);
+  if (instructionCompliance !== undefined) {
+    dimensions.instructionCompliance = clamp0to5(instructionCompliance);
+  }
+  if (typeof d.unnecessaryPermissionRequest === "boolean") {
+    dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+
+  return dimensions;
 }
 
 const SESSION_TYPE_HEADERS: Record<string, string> = {
@@ -647,9 +714,11 @@ export async function scoreSession(
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  // Append the zero-task clause to whatever prompt is configured — the stored
-  // override, if any, would otherwise mask it entirely (ENG-392/ENG-830).
-  const systemPrompt = (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE;
+  // Append the zero-task clause and the ENG-1312 verbosity/permission clause to
+  // whatever prompt is configured — the stored override, if any, would
+  // otherwise mask them entirely (ENG-392/ENG-830).
+  const systemPrompt =
+    (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE + VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -719,10 +788,12 @@ export async function scoreSessionWithJudge(
   const llmPromise = agentModeService.callLLM(
     judgeModel,
     [
-      // Same appended clause as the general scorer, so a custom judge cannot
+      // Same appended clauses as the general scorer, so a custom judge cannot
       // disagree with it about whether a zero-task session is in the cohort
-      // (the Matt-5 vs Fangfang-3 split in ENG-830).
-      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE },
+      // (the Matt-5 vs Fangfang-3 split in ENG-830), nor go blind to the
+      // ENG-1312 verbosity/permission dimensions just because its own prompt
+      // predates them.
+      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE + VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
