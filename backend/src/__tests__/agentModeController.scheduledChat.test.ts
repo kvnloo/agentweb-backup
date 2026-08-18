@@ -541,6 +541,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(result.passed).toBe(true);
         // ...and the verify loop does NOT retry (which could have re-driven the tool).
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+        // CodeRabbit review (ENG-1276): the PERSISTED functionCallDetails record
+        // must agree with the pass/fail decision above — result.toolCalls alone
+        // (the resumed portion only) would report actual:0 next to a passing run
+        // with no functionCallMisses entry, the exact self-contradicting shape
+        // ENG-479/ENG-764/ENG-827 already had to unpick for a different cause.
+        expect(result.functionCallDetails?.[priorCall]).toEqual({ actual: 1, required: 1 });
       });
 
       it('DEFERS when it loses the atomic claim (another dispatcher won) — no resume AND no fresh restart', async () => {
