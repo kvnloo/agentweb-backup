@@ -84,6 +84,7 @@ import {
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
+import { emmaToolRegistry } from '../emma/registry';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import {
@@ -1688,8 +1689,18 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // today's weekday (real prod session 17834849…, 2026-08-16).
 const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
 const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
+// ENG-1276 follow-up: the exact-name allowlist above is reactive — it only grows
+// once a new read-only tool's odd name has ALREADY broken a real schedule
+// (perform_data_analysis was one such case). perform_deep_research is a live,
+// still-unpatched analog: same "no external side effects" shape, same
+// non-read-verb name, just not yet observed breaking a run. Rather than wait for
+// that, the tool's OWN registration can declare `readOnly: true` (see
+// McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
+// side-effect-free, and this consults it. Checked last, after the free name
+// checks — cheaper and requires no registry state for the common case.
 function isReadOnlyToolName(name: string): boolean {
-  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+  if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
+  return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
 function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
