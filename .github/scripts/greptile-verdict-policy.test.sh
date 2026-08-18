@@ -102,6 +102,18 @@ set -e
 check 'no argument at all -> exit 1 with a usage message' 1 'usage:'
 
 # ---------------------------------------------------------------------------
+# Extra arguments — the contract is exactly one verdict string. Silently
+# accepting and ignoring extras would hide a caller bug that passes the wrong
+# thing alongside the real verdict.
+# ---------------------------------------------------------------------------
+
+set +e
+LAST_OUTPUT="$(bash "${SCRIPT}" 'pass' 'extra' 2>&1)"
+LAST_EXIT=$?
+set -e
+check 'more than one argument -> exit 1 with a usage message' 1 'usage:'
+
+# ---------------------------------------------------------------------------
 
 printf '\n%s test(s), %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

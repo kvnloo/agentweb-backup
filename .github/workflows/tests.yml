@@ -484,9 +484,10 @@ jobs:
   # leaves this job polling for a review that will never arrive until someone
   # deliberately asks for one via `.github/scripts/greptile-request-review.sh`
   # — call it once per batch of fixes, not once per push, or this reintroduces
-  # the exact cost it removes. Until that's called, this job fails closed
-  # (unavailable) exactly as it did for any other missing review — that is the
-  # existing, correct behavior, not a regression.
+  # the exact cost it removes. Until that's called, this job polls and finds
+  # no verdict (unavailable) — which, per greptile-verdict-policy.sh above,
+  # now PASSES with a loud warning rather than failing closed; see that
+  # script's header for the full policy and the incident that prompted it.
   # ENG-1277: reordered to run AFTER the two backend test jobs, not in
   # parallel with them — the reverse of what ENG-915/ENG-1039 fought over.
   # ENG-915 made TESTS wait on Greptile (skip tests if Greptile refused);

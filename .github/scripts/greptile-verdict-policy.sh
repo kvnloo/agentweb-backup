@@ -39,7 +39,7 @@
 # gate here to loosen.
 set -euo pipefail
 
-if [ "$#" -lt 1 ]; then
+if [ "$#" -ne 1 ]; then
   printf '::error::greptile-verdict-policy: usage: greptile-verdict-policy.sh <pass|refused|unavailable>\n' >&2
   exit 1
 fi
