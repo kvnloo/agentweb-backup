@@ -92,6 +92,14 @@ describe('SessionScoring - verbosity/permission judge dimensions (ENG-1312)', ()
     expect(VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE).toMatch(/spend|publish|send/i);
   });
 
+  it('VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE exempts a required safety refusal from the pushback cap (CodeRabbit, PR #2443)', () => {
+    // The pushback rule targets arguing with an ordinary instruction, not a
+    // correct refusal of a harmful/illegal/privacy-violating request — that
+    // refusal must remain eligible for outputQuality 5.
+    expect(VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE).toMatch(/harmful|illegal|privacy/i);
+    expect(VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE).toMatch(/safety/i);
+  });
+
   it('scoreSession appends the clause to the system prompt sent to the LLM', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(4, {
       goalCompletion: 4, dataAccuracy: 4, outputQuality: 4,
