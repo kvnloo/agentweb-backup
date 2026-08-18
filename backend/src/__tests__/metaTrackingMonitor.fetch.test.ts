@@ -311,3 +311,20 @@ describe('fetchDailyAdAccountActivity — pagination', () => {
     expect(result.days).toEqual([]);
   });
 });
+
+describe('ENG-1326 — the insights read is bounded', () => {
+  it('passes an abort deadline on every insights request', async () => {
+    // §F's own read had the same unbounded-fetch gap as §G Tier 1's. It is awaited inside the
+    // per-account loop, so a non-settling response stalls every account after it.
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: true, status: 200, json: async () => ({ data: [] }),
+    });
+
+    await fetchDailyAdAccountActivity('act1', 'tok', 7, { fetchImpl: fetchImpl as any });
+
+    expect(fetchImpl).toHaveBeenCalled();
+    for (const call of fetchImpl.mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+});

@@ -4,6 +4,28 @@
  */
 
 /**
+ * Deadline for a single Meta Graph request made by the tracking-monitor sweep.
+ *
+ * Node's `fetch` applies no default deadline. The sweep's Graph reads are awaited inside a
+ * loop over every user and every connected ad account, so one connection that accepts a
+ * request and never completes the response does not fail one account — it stalls every
+ * account after it. That surfaces in the logs as "the cron did not run", which is close to
+ * the hardest shape to diagnose, rather than as a network fault.
+ *
+ * Lives here, in the leaf module with no dependencies, so `metaTrackingMonitor`,
+ * `metaOptimisationCoverage` and `metaDestinationCoverage` share ONE value rather than three
+ * copies that drift — the ENG-683 mistake, where a duplicated map diverged across four files.
+ *
+ * 15s is comfortably above a healthy Graph response and far below the point where a stalled
+ * read threatens the sweep's completion.
+ *
+ * ⚠ NOT applied to `fetchWithRetry` below, deliberately. That helper is used by `metaService`
+ * across the whole backend, including insights queries that can legitimately run long, so
+ * imposing this ceiling there is a separate change with a much wider blast radius.
+ */
+export const META_GRAPH_TIMEOUT_MS = 15_000;
+
+/**
  * Fetch with retry logic for handling transient errors
  * @param url - The URL to fetch
  * @param retries - Number of retry attempts (default: 3)

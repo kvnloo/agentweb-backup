@@ -59,6 +59,10 @@ export interface TrackingMonitorCronSummary {
   /** Destinations that look uninstrumented but whose ads Meta is crediting with conversions.
    *  Logged, never paged — the second signal outranks our HTML inference. */
   destinationUnconfirmed: number;
+  /** Connections skipped because the same ad account was already swept successfully this run.
+   *  21 production connection rows resolve to 15 distinct accounts, so this is ~6 full account
+   *  sweeps saved per day — and it is what stops per-user counters double-counting. */
+  duplicateAccountsSkipped: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -80,7 +84,13 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     destinationUnverifiable: 0,
     destinationOk: 0,
     destinationUnconfirmed: 0,
+    duplicateAccountsSkipped: 0,
   };
+
+  // ONE set for the whole sweep. An ad account connected under several user records is one
+  // account with one set of Meta data and one fix, so it is read once — and findings are
+  // filed once, rather than once per user record that happens to hold the connection.
+  const sweptAccountIds = new Set<string>();
 
   let users: any[];
   try {
@@ -95,7 +105,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
   for (const user of users) {
     summary.usersScanned++;
     try {
-      const result = await monitorUserTracking(user);
+      const result = await monitorUserTracking(user, { sweptAccountIds });
       summary.accountsChecked += result.accountsChecked;
       summary.blackouts += result.blackouts;
       summary.tokenErrors += result.tokenErrors;
@@ -113,6 +123,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
       summary.destinationOk += result.destinationOk ?? 0;
       summary.destinationUnconfirmed += result.destinationUnconfirmed ?? 0;
+      summary.duplicateAccountsSkipped += result.duplicateAccountsSkipped ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -158,6 +169,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       : '') +
     (summary.destinationUnconfirmed > 0
       ? `, ${summary.destinationUnconfirmed} converting despite reading as uninstrumented`
+      : '') +
+    (summary.duplicateAccountsSkipped > 0
+      ? `, ${summary.duplicateAccountsSkipped} duplicate connection(s) skipped`
       : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
