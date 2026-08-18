@@ -26,6 +26,7 @@ import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secur
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
+import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
@@ -5594,6 +5595,16 @@ router.get("/revenue-metrics", async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching revenue metrics:", error.message);
     res.status(500).json({ message: "Failed to fetch revenue metrics" });
+  }
+});
+
+router.get("/revenue-collection-gaps", async (req, res) => {
+  try {
+    const flags = await detectMrrCollectionGaps();
+    res.json({ flags, count: flags.length });
+  } catch (error: any) {
+    console.error("Error detecting MRR collection gaps:", error.message);
+    res.status(500).json({ message: "Failed to detect MRR collection gaps" });
   }
 });
 
