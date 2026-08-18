@@ -572,7 +572,13 @@ export async function resolveUsageDrivers(
     const lists = await Promise.all(
       pooledUserIds.map((id) => scheduleDb.getSchedulesByUserId(id)),
     );
-    const byId = new Map<string, { title?: string; frequency?: string }>();
+    // `scheduleName` is the field a schedule actually stores its name in. This
+    // map was typed with `title`, which no schedule record has, so `meta?.title`
+    // was always undefined and every driver rendered as "Untitled scheduled task"
+    // — defeating AC6, whose whole point is that the customer can see WHICH named
+    // task is spending their allowance. The optional property is why nothing
+    // caught it: reading an absent optional field is not a type error.
+    const byId = new Map<string, { scheduleName?: string; frequency?: string }>();
     for (const sched of lists.flat()) {
       if (sched?.scheduleId) byId.set(sched.scheduleId, sched);
     }
@@ -600,7 +606,7 @@ export async function resolveUsageDrivers(
         // A schedule deleted mid-cycle still consumed the allowance. Report it
         // under its id with a null title so the UI can say "deleted schedule",
         // rather than dropping spend the customer was charged for.
-        title: meta?.title ?? null,
+        title: meta?.scheduleName ?? null,
         frequency: meta?.frequency ?? null,
         shareOfTotal: d.shareOfTotal,
         callCount: d.callCount,
