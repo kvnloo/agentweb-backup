@@ -134,16 +134,21 @@ describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-
     expect(findStepContentLoss(before, after).length).toBeGreaterThan(0);
   });
 
-  it('stays silent on a wholesale rewrite where nothing was kept', () => {
-    // The carve-out that makes "replace this plan" possible at all: no step was
-    // recognised, so none was plainly meant to survive, and droppedStepTitles
-    // already reports what went. Only an unpaired step ALONGSIDE a recognised
-    // one is content the caller did not mean to drop.
+  it('refuses a wholesale rewrite too — nothing unrecognised passes unconfirmed', () => {
+    // Reversed deliberately (Anurag, 2026-08-18). There used to be a carve-out:
+    // if NOTHING paired, the write was read as "replace this plan" and every
+    // unpaired loss was suppressed. Greptile kept finding ways through it, and
+    // each patch only narrowed the hole rather than closing it — the last one
+    // still let an all-new-prose rewrite drop skillIds on a silent 200.
+    //
+    // A replace that cannot recognise a single step is now refused, and the
+    // caller says confirm_step_removal=true to mean it. Replacing a plan stays
+    // possible; it just stops being something you can do by accident.
     const after = [
       { title: 'Brand new A', description: 'a' },
       { title: 'Brand new B', description: 'b' },
     ];
-    expect(findStepContentLoss(before, after)).toHaveLength(0);
+    expect(findStepContentLoss(before, after).length).toBeGreaterThan(0);
   });
 
   it('still reports no loss for a plain reorder that keeps every field', () => {
@@ -317,25 +322,30 @@ describe('findStepContentLoss — the rewrite carve-out must not swallow an amen
     expect(JSON.stringify(loss)).toContain('skillIds');
   });
 
-  it('still stays silent on a genuinely new plan that supplies no skillIds', () => {
-    // The capability the carve-out exists for. A fresh plan whose steps carry
-    // only descriptions must not be refused, or replacing a plan becomes
-    // impossible without confirm_step_removal.
+  it('names the dropped skillIds on a new plan that omits them', () => {
+    // Now refused rather than silent — and the report has to be specific, since
+    // the caller's next move is to decide whether losing these is intended.
     const after = [
       { stepCount: 1, title: 'New One', description: 'brand new text 1', skillIds: [], requiredFunctionCalls: [] },
       { stepCount: 2, title: 'New Two', description: 'brand new text 2', skillIds: [], requiredFunctionCalls: [] },
     ];
-    expect(findStepContentLoss(before, after)).toHaveLength(0);
+    const loss = findStepContentLoss(before, after);
+    expect(loss.length).toBeGreaterThan(0);
+    expect(loss[0].fields).toContain('skillIds');
   });
 
-  it('does not treat a reused skillId as evidence of an amendment', () => {
-    // A new plan may legitimately drive the same skill. If low-cardinality
-    // fields counted, this ordinary rewrite would be refused.
+  it('refuses an all-new rewrite even when it carries full content', () => {
+    // The case Greptile would not let go of. Every step is new by title, number
+    // and prose, and every field is populated — so nothing is technically
+    // blanked — but no step of the old plan was recognised, and that alone now
+    // requires the caller to confirm.
     const after = [
-      { stepCount: 1, title: 'New One', description: 'brand new text 1', skillIds: ['a'], requiredFunctionCalls: ['f'] },
-      { stepCount: 2, title: 'New Two', description: 'brand new text 2', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+      { stepCount: 1, title: 'New One', description: 'brand new text 1', skillIds: ['x'], requiredFunctionCalls: ['p'] },
+      { stepCount: 2, title: 'New Two', description: 'brand new text 2', skillIds: ['y'], requiredFunctionCalls: ['q'] },
     ];
-    expect(findStepContentLoss(before, after)).toHaveLength(0);
+    const loss = findStepContentLoss(before, after);
+    expect(loss.length).toBeGreaterThan(0);
+    expect(loss.every((l: any) => l.kind === 'unpaired')).toBe(true);
   });
 
   it('flags reuse of userInstructions just as it flags a reused description', () => {

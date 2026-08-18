@@ -809,7 +809,17 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(payload.stepsChange.stepContentLoss).toHaveLength(2);
     });
 
-    it('does NOT refuse a deliberate rewrite whose steps are all new', async () => {
+    it('refuses a deliberate rewrite whose steps are all new, until it is confirmed', async () => {
+      // Reversed on 2026-08-18 (Anurag's call, ENG-1221). This used to pass the
+      // write through: nothing was kept, so it read as "replace this plan" and
+      // droppedStepTitles was considered notice enough. The carve-out leaked
+      // three separate ways under review — a hollow replacement step, a renumber
+      // that kept the prose and dropped the skillIds, then an all-new rewrite
+      // dropping them on a silent 200 — and each patch only narrowed it.
+      //
+      // Replacing a plan is still supported; it now costs one explicit
+      // confirm_step_removal, which is the difference between doing it and doing
+      // it by accident.
       mockPlanFetches();
 
       const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
@@ -821,11 +831,29 @@ describe('Predefined Work Plan MCP Tools', () => {
         ],
       }, context);
 
-      // Nothing was kept, so there is no step the caller plainly meant to
-      // preserve — the dropped titles in stepsChange already say what happened.
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepContentLoss).toHaveLength(2);
+      expect(payload.stepContentLoss.every((l: any) => l.kind === 'unpaired')).toBe(true);
+    });
+
+    it('performs that same all-new rewrite once confirm_step_removal is set', async () => {
+      // The refusal must be a speed bump, not a wall — the capability has to
+      // survive, or plans become unreplaceable through the tool.
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        confirm_step_removal: true,
+        steps: [
+          { title: 'Brand new step A', description: 'a' },
+          { title: 'Brand new step B', description: 'b' },
+        ],
+      }, context);
+
       expect(putCalls()).toHaveLength(1);
       const payload = JSON.parse(result.content[0].text);
-      expect(payload.stepsChange.stepContentLoss).toBeUndefined();
       expect(payload.stepsChange.droppedStepTitles).toEqual(['Step 1: Scope', 'Step 2: Inventory']);
     });
 
