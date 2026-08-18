@@ -718,6 +718,50 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
   });
 
+  it('NEGATION AUDIT #5: a double negation ("not true that there was no failure") must not silently waive a real failure', () => {
+    // The independent review that found audit #4 also found this: "It is not
+    // true that there was no failure today" re-asserts a REAL failure, but
+    // NEGATED_FAILURE_MENTION only sees the INNER "no failure" — it has no
+    // concept of the OUTER "not true that" flipping the meaning back. This is
+    // the dangerous direction (a genuine failure silently waived as a clean
+    // skip), so unlike audit #4's elaborate-but-safe cases, this one is worth
+    // closing even though the phrasing is unnatural for a scheduled-run status
+    // line — there's no evidence it has happened, but the failure mode if it
+    // did would be worse than an extra retry.
+    //
+    // Properly PARSING the double negation would need real negation-depth
+    // tracking — a much bigger, riskier change bolted onto an already-layered
+    // regex. Instead this FAILS CLOSED: a sentence that itself negates a TRUTH
+    // CLAIM ("it is not true that...", "that's false...", "it is false
+    // that...") is INELIGIBLE for the neutralization entirely — skip it, so
+    // any failure word inside that sentence stays intact and still vetoes via
+    // the normal HARD_FAILURE_PATTERNS check. Safe because it doesn't need to
+    // understand the sentence, only recognize the shape and decline to be
+    // clever about it.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. It is not true that there was no failure today.',
+      "Non-publishing day, skipped. That's false — there was no failure today.",
+      'Non-publishing day, skipped. It is false that no failure occurred.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // Must not regress any legitimate single-negation case from audits #1-#4 —
+    // none of them contain a truth-negating construction, so the guard never
+    // engages for them.
+    [
+      'Non-publishing day, skipped. Not by failure.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Without, admittedly, any failure occurring, the run completed cleanly.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
