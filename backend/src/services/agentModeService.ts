@@ -823,6 +823,20 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Usage/cost tier for the model picker UI, ordered most- to least-expensive. Unset defaults to 'medium'. */
+  tier?: ModelTier;
+  /** Short, user-facing one-line description shown next to the model name in the picker. */
+  description?: string;
+}
+
+/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
+export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/** Metadata for a model as returned to the frontend picker. */
+export interface SupportedModelInfo {
+  id: string;
+  tier: ModelTier;
+  description: string;
 }
 
 // Type for LLM call options
@@ -2829,11 +2843,11 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.2-chat': { tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.4': { tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.4-nano': { tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.5': { tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2842,10 +2856,10 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3-flash-preview': { tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-pro-preview': { tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-flash-lite': { tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.5-flash': { tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2871,7 +2885,7 @@ export class AgentModeService {
     //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
     //   matching the existing convention for other non-default/experimental models
     //   (e.g. anthropic.claude-opus-4-6-v1 above).
-    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true },
+    'openrouter/openai/gpt-4o-mini': { tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -2893,31 +2907,31 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
-    'openrouter/x-ai/grok-4.6': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-pro': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-flash': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/qwen/qwen3.8-max': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/mistralai/mistral-small-2603': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k3': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k2.7-code': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-5.2': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-4.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/x-ai/grok-4.6': { tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-pro': { tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-flash': { tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.8-max': { tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-small-2603': { tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k3': { tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k2.7-code': { tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-5.2': { tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-4.7-flash': { tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-6': { tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-opus-4-6-v1': { tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
-    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-5': { tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2928,6 +2942,27 @@ export class AgentModeService {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * Same entitlement/ordering as getSupportedModels, decorated with tier + description
+   * for the model-picker UI. Excludes live-voice models (isLive) — they are never
+   * selectable through the HTTP generate picker (see callLLM's isLive guard).
+   * Untiered entries default to 'medium' with a generic description rather than being
+   * dropped, so a newly-added model is never silently invisible in the picker.
+   */
+  async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
+    const ids = await this.getSupportedModels(isAdmin);
+    return ids
+      .filter(id => !this.llmModels[id]?.isLive)
+      .map(id => {
+        const config = this.llmModels[id];
+        return {
+          id,
+          tier: config?.tier ?? 'medium',
+          description: config?.description ?? 'General-purpose model',
+        };
+      });
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
