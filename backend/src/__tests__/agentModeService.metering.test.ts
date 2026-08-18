@@ -152,3 +152,101 @@ describe('makeToolUsageCallback no longer double-charges (ENG-200)', () => {
     expect(chatbotDb.addToolCostToSession).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () => {
+  let svc: AgentModeService;
+  let create: jest.Mock;
+  const OR_MODEL = 'openrouter/openai/gpt-4o-mini';
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = new AgentModeService();
+    create = jest.fn();
+    (svc as any).llmModels[OR_MODEL] = { client: null, supportsTemperature: true };
+  });
+
+  it('labels the provider "openrouter" and forwards real usage.cost as costUsdOverride', async () => {
+    create.mockResolvedValue({
+      id: 'gen-123',
+      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0.00000315 },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: OR_MODEL,
+        provider: 'openrouter',
+        costUsdOverride: 0.00000315,
+      })
+    );
+  });
+
+  it('does not fabricate a costUsdOverride when a response has no usage.cost', async () => {
+    create.mockResolvedValue({
+      id: 'gen-124',
+      usage: { prompt_tokens: 9, completion_tokens: 3 }, // no cost field
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: undefined })
+    );
+  });
+
+  it('does not send costUsdOverride for a non-openrouter provider (bedrock unaffected)', async () => {
+    const bedrockCreate = jest.fn().mockResolvedValue(fakeResponse);
+    (svc as any).llmModels[MODEL].client = { chat: { completions: { create: bedrockCreate } } };
+
+    await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'bedrock', costUsdOverride: undefined })
+    );
+  });
+
+  it('retries a transient 429 from OpenRouter and succeeds on the next attempt', async () => {
+    const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
+    create
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce({
+        id: 'gen-125',
+        usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0.000001 },
+        choices: [{ message: { content: 'ok' } }],
+      });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+    (svc as any).sleep = jest.fn().mockResolvedValue(undefined); // skip real backoff delay
+
+    const res: any = await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(res.id).toBe('gen-125');
+  });
+
+  it('does not retry a non-transient 402 (exhausted balance) — fails immediately', async () => {
+    const balanceErr = Object.assign(new Error('Insufficient credits'), { status: 402 });
+    create.mockRejectedValue(balanceErr);
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await expect(
+      svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+        usageContext: { userId: 'u1', feature: 'agent_task' },
+      })
+    ).rejects.toThrow('Insufficient credits');
+
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+});
