@@ -107,13 +107,46 @@ export function reconcileItemizedUsage(
     coverageByKey.set(key, entry);
   }
 
-  const aggregateItems: ItemizedUsageItem[] = rows.flatMap((row) => {
+  // Rows sharing a slot are COMBINED before coverage is netted, because coverage
+  // is per slot and subtracting it from each row would remove it more than once.
+  //
+  // One row per slot was guaranteed until the payer joined the sort key
+  // (ENG-1210). Now a day that was accumulating under `date#model#feature` stops
+  // there and a new row starts at `date#model#feature#payer`, so for as long as a
+  // cycle spans the cutover a slot holds two rows with the SAME payer. Netting
+  // each independently understated the bill by a full day's coverage -- an
+  // undercount, which is the direction a customer cannot see.
+  //
+  // With one row per slot this is arithmetically identical to the previous
+  // behaviour, so the ordinary case is unchanged.
+  const slots = new Map<
+    string,
+    { row: UsageRecordRow; microUsd: number; tokens: number; calls: number }
+  >();
+  for (const row of rows) {
     const key = aggregateKey(row.userId, row.billingUserId, row.date, row.model, row.feature);
+    const slot = slots.get(key);
+    if (slot) {
+      slot.microUsd += row.costMicroUsd || 0;
+      slot.tokens += row.totalTokens || 0;
+      slot.calls += row.callCount || 0;
+      continue;
+    }
+    slots.set(key, {
+      row,
+      microUsd: row.costMicroUsd || 0,
+      tokens: row.totalTokens || 0,
+      calls: row.callCount || 0,
+    });
+  }
+
+  const aggregateItems: ItemizedUsageItem[] = [...slots.entries()].flatMap(([key, slot]) => {
+    const row = slot.row;
     const coverage = coverageByKey.get(key);
-    // row.costMicroUsd is already micro-USD, same unit as the charge events summed above.
-    const rowMicroUsd = row.costMicroUsd || 0;
-    const rowTokens = row.totalTokens || 0;
-    const rowCalls = row.callCount || 0;
+    // Already micro-USD, same unit as the charge events summed above.
+    const rowMicroUsd = slot.microUsd;
+    const rowTokens = slot.tokens;
+    const rowCalls = slot.calls;
 
     if (!coverage) {
       // No charge-event coverage exists for this (date, model, feature) at
