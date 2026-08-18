@@ -295,6 +295,51 @@ describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
 });
 
 describe("resolveUsageDrivers", () => {
+  it("caps recommendation confidence when the ledger cannot account for the counter", async () => {
+    // Greptile, PR #2407: the driver resolver "consumes that incomplete ledger
+    // without detecting the discrepancy against the pooled billing counter."
+    //
+    // A departed member's unstamped rows are unreachable, so their spend silently
+    // vanishes from the ledger while every row that IS found looks perfect. The
+    // authoritative counter is the only witness. Recommendations and their "days
+    // recovered" figures are derived from that ledger and must not be shown at
+    // full confidence.
+    //
+    // Sized so the answer is NOT already low: 8 complete days and 40 calls a day
+    // reaches `high` on the driver's own rule, so this can only pass if the
+    // completeness signal actually caps it.
+    // Token counts matter: without them `estimateModelSavings` cannot reprice the
+    // workload, every recommendation reports null days, and confidence collapses
+    // to `insufficient_data` for a reason that has nothing to do with this test.
+    const days = Array.from({ length: 8 }, (_, i) => ({
+      date: `2026-08-0${i + 1}`,
+      model: OPUS,
+      feature: "agent_task",
+      inputTokens: 500_000,
+      outputTokens: 100_000,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costMicroUsd: 10 * USD,
+      callCount: 40,
+    }));
+
+    mockQuery.mockResolvedValue(days);
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 80 * USD }));
+    const complete = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    // Control: with the ledger accounting for the counter, this IS a confident
+    // recommendation. Without this the test below would prove nothing.
+    expect(complete.recommendations.some((r) => r.confidence === "high")).toBe(true);
+
+    // Same ledger, but the counter says five times more was billed here.
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 400 * USD }));
+    const incomplete = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+
+    expect(incomplete.recommendations.length).toBeGreaterThan(0);
+    for (const rec of incomplete.recommendations) {
+      expect(["insufficient_data", "low"]).toContain(rec.confidence);
+    }
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     // The scan half of the union: empty unless a case is specifically about a

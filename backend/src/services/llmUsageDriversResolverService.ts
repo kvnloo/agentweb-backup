@@ -25,7 +25,11 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
-import { readBilledLedgerRows, resolvePooledLedgerUserIds } from "./llmUsageLedgerReader";
+import {
+  readBilledLedgerRows,
+  resolvePooledLedgerUserIds,
+  hasInferredAttribution,
+} from "./llmUsageLedgerReader";
 import { scheduleDb } from "./db";
 import { agentModeService } from "./agentModeService";
 import {
@@ -35,6 +39,37 @@ import {
   type CostAttribution,
 } from "./llmUsageAttributionService";
 import { computeUsageRunway, TRAILING_WINDOW_DAYS } from "./llmUsageForecastService";
+
+/**
+ * How much of the authoritative counter the reconstructed ledger must account for
+ * before it is treated as complete. Mirrors the runway resolver deliberately: two
+ * different numbers would let the same account read as trustworthy on one screen
+ * and not the other.
+ */
+const LEDGER_COMPLETENESS_TOLERANCE = 0.95;
+
+/**
+ * Is this ledger a complete picture of what was billed to the subject?
+ *
+ * Raised by Greptile on PR #2407: the driver resolver "consumes that incomplete
+ * ledger without detecting the discrepancy against the pooled billing counter."
+ * The runway resolver already made this check; drivers did not, so recommendations
+ * and their day estimates were computed from possibly-missing spend and presented
+ * with full confidence.
+ *
+ * `costUsedMicroUsd` is incremented against the billing root at write time, so it
+ * includes spend by members who have since left the org -- whose unstamped rows
+ * the partition fan-out can never reach. A ledger materially below it is proof
+ * that spend is missing, even when every row we DID find looks correct.
+ */
+function ledgerIsIncomplete(
+  rows: readonly { costMicroUsd?: number }[],
+  costUsedMicroUsd: number,
+): boolean {
+  if (!(costUsedMicroUsd > 0)) return false;
+  const total = rows.reduce((sum, r) => sum + (r.costMicroUsd || 0), 0);
+  return total < costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
+}
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 
 /** A different target for the SAME driver — an alternative, never an extra win. */
@@ -277,8 +312,14 @@ export async function previewUsageRunway(
     cycleStartDate,
     cycleResetDate,
     today,
+    // Every recommendation's confidence is capped by this baseline's, so feeding
+    // the signal here propagates it to the whole preview without a second rule.
+    attributionInferred:
+      hasInferredAttribution(rows) || ledgerIsIncomplete(rows, usage.costUsedMicroUsd),
   };
   const baseline = computeUsageRunway({
+    // `forecastInput` already carries `attributionInferred`; repeating it here
+    // would be a second place to keep in step for no gain.
     ...forecastInput,
     dailyCostMicroUsd: [...observedByDate.entries()].map(([date, costMicroUsd]) => ({ date, costMicroUsd })),
   });
@@ -398,6 +439,10 @@ export async function resolveUsageDrivers(
     cycleStartDate,
     cycleResetDate,
     today,
+    // The existing `forecastCap` already holds every recommendation to the
+    // baseline's confidence, so the honest signal only has to be supplied once.
+    attributionInferred:
+      hasInferredAttribution(rows) || ledgerIsIncomplete(rows, usage.costUsedMicroUsd),
   });
 
   // AC5: only admin-configured, priced, invocable models may be offered. The
