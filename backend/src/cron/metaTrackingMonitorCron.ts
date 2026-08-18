@@ -56,6 +56,9 @@ export interface TrackingMonitorCronSummary {
    *  checked NOTHING and one that checked everything and found it healthy both report zero
    *  alerts — this is the only number that separates them. */
   destinationOk: number;
+  /** Destinations that look uninstrumented but whose ads Meta is crediting with conversions.
+   *  Logged, never paged — the second signal outranks our HTML inference. */
+  destinationUnconfirmed: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -76,6 +79,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
+    destinationUnconfirmed: 0,
   };
 
   let users: any[];
@@ -108,6 +112,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.destinationAlerts += result.destinationAlerts ?? 0;
       summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
       summary.destinationOk += result.destinationOk ?? 0;
+      summary.destinationUnconfirmed += result.destinationUnconfirmed ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -150,6 +155,9 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     `, ${summary.destinationOk} destination(s) verified` +
     (summary.destinationUnverifiable > 0
       ? `, ${summary.destinationUnverifiable} unreadable`
+      : '') +
+    (summary.destinationUnconfirmed > 0
+      ? `, ${summary.destinationUnconfirmed} converting despite reading as uninstrumented`
       : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`

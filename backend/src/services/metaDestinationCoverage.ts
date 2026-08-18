@@ -141,6 +141,9 @@ export type DestinationCoverageVerdict = {
   /** The only state that pages anyone: paid, conversion-optimised traffic to a page that
    *  cannot report back to the account paying for it. */
   alerting: DestinationFinding[];
+  /** The page LOOKS uninstrumented, but Meta is attributing conversions to this very ad, so
+   *  something is evidently reporting. Logged, never paged — see `attributedConversionsByAd`. */
+  unconfirmed: DestinationFinding[];
   /** Read failures and accounts with nothing to compare against. Logged, never paged. */
   unverifiable: Array<{ adId: string; url: string; error?: string }>;
   /** Correct configuration that merely has no page to check. Never a fault. */
@@ -176,15 +179,27 @@ export function collectCheckableUrls(
  *
  * Ordering is the design. Every "not a finding" case is decided BEFORE anything can alert,
  * so a new failure mode can only ever make this quieter, never noisier.
+ *
+ * @param attributedConversionsByAd conversions Meta attributed to each ad over the window.
+ *   The SECOND signal, and the reason this can be trusted to page someone. Reading HTML is
+ *   an inference: we fetch without executing JavaScript, so a page that installs its pixel
+ *   client-side reads as uninstrumented when it is fine. Meta attributing conversions to
+ *   that exact ad is direct evidence something reports, and it outranks our inference.
+ *   Same discipline as Tier 1, which alerts only when the pixel AND the insights history
+ *   agree. Omitted/empty means "no second signal available", which cannot suppress anything.
  */
 export function evaluateDestinationCoverage(
   ads: DestinationAd[],
   observations: Record<string, DestinationObservation>,
   ownedPixelIds: string[],
+  attributedConversionsByAd: Record<string, number> = {},
 ): DestinationCoverageVerdict {
   const verdict: DestinationCoverageVerdict = {
-    alerting: [], unverifiable: [], notApplicable: [], okCount: 0,
+    alerting: [], unconfirmed: [], unverifiable: [], notApplicable: [], okCount: 0,
   };
+  const conversionsByAd =
+    attributedConversionsByAd && typeof attributedConversionsByAd === 'object'
+      ? attributedConversionsByAd : {};
   const owned = new Set(
     (Array.isArray(ownedPixelIds) ? ownedPixelIds : []).filter(Boolean).map(String),
   );
@@ -244,7 +259,7 @@ export function evaluateDestinationCoverage(
         ? observation.detectedPixelIds : []).map(String).filter(Boolean);
 
       if (!detected.length) {
-        verdict.alerting.push({
+        file(verdict, conversionsByAd, {
           adId: ad.adId, adName: ad.adName, campaignName: ad.campaignName,
           url, reason: 'no_pixel', detectedPixelIds: [],
         });
@@ -257,7 +272,7 @@ export function evaluateDestinationCoverage(
       // Instrumented, and reporting to somebody else. A naive "is there any tracking?" check
       // passes this — which is exactly how `hireemma.ai` ran against a pixel its own ad
       // account did not own.
-      verdict.alerting.push({
+      file(verdict, conversionsByAd, {
         adId: ad.adId, adName: ad.adName, campaignName: ad.campaignName,
         url, reason: 'foreign_pixel', detectedPixelIds: detected,
       });
@@ -265,6 +280,27 @@ export function evaluateDestinationCoverage(
   }
 
   return verdict;
+}
+
+/**
+ * Alert only when BOTH signals agree, otherwise log.
+ *
+ * An ad Meta is crediting with conversions is being measured, whatever our read of its HTML
+ * suggests — so the finding is recorded and nobody is woken up. Kept as one function so the
+ * two finding paths cannot drift apart, which is how the `ph`/`fn` normalisation defect
+ * survived 24 days (§42): fields written together, then fixed one at a time.
+ */
+function file(
+  verdict: DestinationCoverageVerdict,
+  conversionsByAd: Record<string, number>,
+  finding: DestinationFinding,
+): void {
+  const attributed = conversionsByAd[finding.adId];
+  if (typeof attributed === 'number' && attributed > 0) {
+    verdict.unconfirmed.push(finding);
+    return;
+  }
+  verdict.alerting.push(finding);
 }
 
 /**
@@ -279,6 +315,28 @@ export const DESTINATION_ADS_PAGE_SIZE = 50;
 /** Paging backstop. An account needing more than this has bigger problems than this check. */
 export const MAX_AD_PAGES = 10;
 
+/**
+ * Per-request ceiling on the Meta reads.
+ *
+ * These are awaited inside a loop over every account, so a single hung connection stalls the
+ * daily sweep for every account after it — the sweep would simply never finish, which reads
+ * in the logs as "the cron did not run" rather than as a network fault. Node's fetch applies
+ * no default deadline of its own.
+ *
+ * The destination HTML fetches are already bounded at 10s inside `metaTrackingPreflight`;
+ * this closes the same gap on the Graph side.
+ */
+export const DESTINATION_META_TIMEOUT_MS = 15_000;
+
+/**
+ * Days of attributed-conversion history used as the corroborating signal.
+ *
+ * Matches `MONITOR_WINDOW_DAYS`, so the second signal covers the same span the rest of the
+ * sweep reasons over. Long enough that a low-volume ad converting twice a week still counts
+ * as reporting, which is precisely the ad a one-day window would wrongly accuse.
+ */
+export const DESTINATION_CONVERSION_WINDOW_DAYS = 7;
+
 export interface DestinationFetchDeps {
   fetchImpl?: typeof fetch;
   /** HTML boundary, forwarded to the ENG-941 checker so tests never touch the network. */
@@ -289,6 +347,10 @@ export type DestinationInputs = {
   status: 'ok' | 'fetch_error';
   ads: DestinationAd[];
   ownedPixelIds: string[];
+  /** Conversions Meta attributed to each ad over the window — the second signal. Read at
+   *  `level=ad` so its scope matches the claim exactly; Tier 1's first P1 was account-scoped
+   *  evidence supporting an ad-set-scoped accusation, in both directions. */
+  attributedConversionsByAd: Record<string, number>;
   observations: Record<string, DestinationObservation>;
   /** Destinations past the cap. Surfaced so a reduced check cannot pass for a complete one. */
   urlsNotChecked: string[];
@@ -314,10 +376,16 @@ export async function fetchDestinationInputs(
 ): Promise<DestinationInputs> {
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
-  const empty = { ads: [], ownedPixelIds: [], observations: {}, urlsNotChecked: [] };
+  const empty = {
+    ads: [], ownedPixelIds: [], observations: {}, urlsNotChecked: [],
+    attributedConversionsByAd: {},
+  };
 
   const readJson = async (url: string): Promise<any> => {
-    const response = await fetchImpl(url);
+    // AbortSignal.timeout rather than a manual controller: it needs no clearTimeout, so it
+    // cannot leak a live timer into whatever jest worker runs next — the ENG-1286 failure
+    // mode, which surfaces as a TypeError inside an unrelated suite.
+    const response = await fetchImpl(url, { signal: AbortSignal.timeout(DESTINATION_META_TIMEOUT_MS) });
     const parsed: any = await response.json();
     // Graph answers some failures with HTTP 200 and an `error` object in the body, so the
     // status alone is not the verdict. A body that is not an object at all is normalised
@@ -331,6 +399,7 @@ export async function fetchDestinationInputs(
 
   const ads: DestinationAd[] = [];
   const ownedPixelIds: string[] = [];
+  const attributedConversionsByAd: Record<string, number> = {};
 
   try {
     const { MetaService } = await import('./metaService');
@@ -376,6 +445,32 @@ export async function fetchDestinationInputs(
     for (const row of Array.isArray(pixelBody.data) ? pixelBody.data : []) {
       if (row && typeof row === 'object' && row.id != null) ownedPixelIds.push(String(row.id));
     }
+
+    // The second signal. ONE call at `level=ad`, aggregated over the window rather than per
+    // day, because the question is only "is this ad reporting at all" — not when.
+    const { countAttributedConversions } = await import('./metaTrackingMonitor');
+    const until = new Date(Date.now());
+    const since = new Date(until.getTime() - DESTINATION_CONVERSION_WINDOW_DAYS * 86400_000);
+    const day = (d: Date) => d.toISOString().slice(0, 10);
+    const insightsParams = new URLSearchParams({
+      level: 'ad',
+      fields: 'ad_id,actions',
+      time_range: JSON.stringify({ since: day(since), until: day(until) }),
+      limit: String(DESTINATION_ADS_PAGE_SIZE),
+    });
+    let insightsUrl: string =
+      `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/insights?${insightsParams}` +
+      `&access_token=${encodeURIComponent(accessToken)}`;
+    for (let page = 0; page < MAX_AD_PAGES && insightsUrl; page++) {
+      const body = await readJson(insightsUrl);
+      for (const row of Array.isArray(body.data) ? body.data : []) {
+        if (!row || typeof row !== 'object' || row.ad_id == null) continue;
+        const adId = String(row.ad_id);
+        const { conversions } = countAttributedConversions(row.actions);
+        attributedConversionsByAd[adId] = (attributedConversionsByAd[adId] || 0) + conversions;
+      }
+      insightsUrl = typeof body.paging?.next === 'string' ? body.paging.next : '';
+    }
   } catch (error: any) {
     return { status: 'fetch_error', ...empty, error: error?.message || 'request failed' };
   }
@@ -407,5 +502,5 @@ export async function fetchDestinationInputs(
     }
   }
 
-  return { status: 'ok', ads, ownedPixelIds, observations, urlsNotChecked };
+  return { status: 'ok', ads, ownedPixelIds, observations, urlsNotChecked, attributedConversionsByAd };
 }

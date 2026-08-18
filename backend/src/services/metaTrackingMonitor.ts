@@ -677,6 +677,10 @@ export interface MonitorSummary {
    *  that checked NOTHING is distinguishable from one that checked everything and found it
    *  healthy — those look identical in an alert count alone. */
   destinationOk: number;
+  /** The page read as uninstrumented, but Meta is attributing conversions to that exact ad,
+   *  so something IS reporting. Logged, never paged: our HTML read is an inference and
+   *  Meta's attribution is direct evidence. Usually a client-side pixel injection. */
+  destinationUnconfirmed: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -707,6 +711,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
+    destinationUnconfirmed: 0,
   };
 
   const fetchActivity =
@@ -1089,11 +1094,21 @@ async function checkDestinationCoverage(
     }
 
     const verdict = evaluateDestinationCoverage(
-      inputs.ads, inputs.observations, inputs.ownedPixelIds,
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd,
     );
 
     summary.destinationOk += verdict.okCount;
     summary.destinationUnverifiable += verdict.unverifiable.length;
+    summary.destinationUnconfirmed += verdict.unconfirmed.length;
+
+    if (verdict.unconfirmed.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.unconfirmed.length} destination(s) read as ` +
+        `uninstrumented but their ads ARE being credited with conversions — most likely a ` +
+        `client-side pixel our HTML read cannot see, not alerting: ` +
+        verdict.unconfirmed.map((f) => `"${f.adName || f.adId}" -> ${f.url}`).join('; '),
+      );
+    }
 
     if (verdict.unverifiable.length || inputs.urlsNotChecked.length) {
       console.log(
