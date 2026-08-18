@@ -103,7 +103,17 @@ const apply = (over: Record<string, unknown> = {}) =>
 describe("applyModelChange", () => {
   it("writes the new model and records the change", async () => {
     const result = await apply();
-    expect(mockUpdateSchedule).toHaveBeenCalledWith("sched-a", { llmModel: SONNET });
+    // The third argument is the ENG-1217 concurrency guard, not incidental: it
+    // binds the write to the model this decision was read from, so a second
+    // confirm racing the first is rejected by DynamoDB instead of writing a
+    // duplicate audit row. Asserted by meaning rather than by arity — the value
+    // has to be the model observed BEFORE the switch, and a guard pinned to the
+    // wrong model would pass an arity check while defeating its own purpose.
+    expect(mockUpdateSchedule).toHaveBeenCalledWith(
+      "sched-a",
+      { llmModel: SONNET },
+      { llmModel: OPUS },
+    );
     expect(mockRecord).toHaveBeenCalledWith(
       expect.objectContaining({
         billingUserId: "billing-root",
@@ -156,7 +166,17 @@ describe("applyModelChange", () => {
     // worse than one that did not happen, so the write is compensated.
     mockRecord.mockRejectedValue(new Error("dynamo down"));
     await expect(apply()).rejects.toThrow(/dynamo down/);
-    expect(mockUpdateSchedule).toHaveBeenNthCalledWith(1, "sched-a", { llmModel: SONNET });
+    // The forward write carries the concurrency guard; the compensating write
+    // below deliberately does NOT. Restoring what we just changed is not a
+    // decision derived from a stale read, and guarding it would leave the
+    // schedule on an unaudited model whenever the restore lost a race — the one
+    // outcome the compensation exists to prevent.
+    expect(mockUpdateSchedule).toHaveBeenNthCalledWith(
+      1,
+      "sched-a",
+      { llmModel: SONNET },
+      { llmModel: OPUS },
+    );
     expect(mockUpdateSchedule).toHaveBeenNthCalledWith(
       2,
       "sched-a",

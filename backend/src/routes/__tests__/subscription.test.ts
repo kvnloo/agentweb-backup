@@ -38,6 +38,15 @@ jest.mock('../../services/llmChargeAuditDb', () => ({
   listLlmChargeEvents: jest.fn(),
 }));
 
+// ENG-1217: the apply endpoint's error mapping is the unit under test here, so
+// the service is stubbed while its REAL error classes are kept — a mapping test
+// that matched on a hand-made error would pass even if the class it maps on were
+// renamed out from under it.
+jest.mock('../../services/llmModelChangeService', () => {
+  const actual = jest.requireActual('../../services/llmModelChangeService') as Record<string, unknown>;
+  return { ...actual, applyModelChange: jest.fn(), undoModelChange: jest.fn() };
+});
+
 // ENG-1251: the itemized endpoint now reads the UNION of the per-member
 // partition fan-out and the billingUserId attribute scan, so the seam under
 // test is the ledger reader rather than one raw table query.
@@ -342,5 +351,72 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
 
   it('returns 400 for a malformed month', async () => {
     await request(app).get('/api/subscription/usage/itemized?month=not-a-month').expect(400);
+  });
+});
+
+
+/**
+ * ENG-1217 — a lost race is a CONFLICT, not a server error.
+ *
+ * `applyModelChange` binds its write to the model it read, so a second confirm
+ * that arrives after the schedule moved is rejected rather than allowed to write
+ * a stale choice. The client needs to be told which of those happened: a 409 says
+ * "your view is out of date, reload", where a 500 says "we broke" and invites a
+ * blind retry that will lose the same race again.
+ */
+describe('POST /api/subscription/usage-runway/apply — error mapping', () => {
+  // Typed by the surface used rather than as `jest.Mock`: under @jest/globals an
+  // un-parameterised jest.Mock infers its argument as `never`, so every
+  // mockRejectedValue below would be a type error.
+  const { applyModelChange } = jest.requireMock('../../services/llmModelChangeService') as {
+    applyModelChange: {
+      mockReset: () => void;
+      mockRejectedValue: (value: unknown) => void;
+      mockResolvedValue: (value: unknown) => void;
+    };
+  };
+  const {
+    ModelChangeConflictError,
+    ModelChangeNotFoundError,
+    ModelNotAvailableError,
+  } = jest.requireActual('../../services/llmModelChangeService') as Record<string, new (m?: string) => Error>;
+
+  const body = { scope: 'schedule', scopeId: 'sched-a', toModel: 'anthropic.claude-haiku-4-5' };
+
+  beforeEach(() => {
+    applyModelChange.mockReset();
+  });
+
+  it('maps a concurrent-change conflict to 409, not 500', async () => {
+    applyModelChange.mockRejectedValue(new ModelChangeConflictError());
+
+    const res = await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(409);
+    expect(res.body.error).toMatch(/changed a moment ago/i);
+  });
+
+  it('still maps an unknown schedule to 404', async () => {
+    applyModelChange.mockRejectedValue(new ModelChangeNotFoundError('Scheduled chat not found'));
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(404);
+  });
+
+  it('still maps an ineligible model to 400', async () => {
+    applyModelChange.mockRejectedValue(new ModelNotAvailableError());
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(400);
+  });
+
+  it('leaves an unexpected failure as a 500', async () => {
+    // The conflict path must not swallow real errors into a reassuring status.
+    applyModelChange.mockRejectedValue(new Error('dynamo exploded'));
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(500);
+  });
+
+  it('returns the result unchanged on success', async () => {
+    applyModelChange.mockResolvedValue({
+      applied: true, changeId: 'chg-1', modelBefore: null,
+      modelAfter: body.toModel, pinnedFromInherited: true,
+    });
+
+    const res = await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(200);
+    expect(res.body).toMatchObject({ applied: true, changeId: 'chg-1', pinnedFromInherited: true });
   });
 });
