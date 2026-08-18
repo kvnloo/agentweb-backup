@@ -676,6 +676,16 @@ createTestAccount().then(async () => {
       // or simply empty) is completely normal, not an error.
       try {
         const { pollAndProcessOnce } = await import('./services/asyncJobQueue');
+        // Verify the binding BEFORE scheduling the timer. The import is captured
+        // once, and calling an undefined binding throws SYNCHRONOUSLY inside the
+        // interval callback — past this try/catch and past the `.catch()` below,
+        // which only sees rejected promises. That error then surfaces 30s later
+        // against whichever unrelated suite happens to be running, which is how
+        // `settings.replaySessions` and `securityHeaders` failed on a PR that
+        // touches neither. Failing here instead keeps it to one init-time log.
+        if (typeof pollAndProcessOnce !== 'function') {
+          throw new Error('asyncJobQueue.pollAndProcessOnce is unavailable — poller not started');
+        }
         const QUEUE_POLL_INTERVAL_MS = 30 * 1000;
         setInterval(() => {
           if (!isCronEnabled()) return;
