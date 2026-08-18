@@ -420,3 +420,49 @@ describe('POST /api/subscription/usage-runway/apply — error mapping', () => {
     expect(res.body).toMatchObject({ applied: true, changeId: 'chg-1', pinnedFromInherited: true });
   });
 });
+
+describe('POST /api/subscription/usage-runway/undo — error mapping', () => {
+  const { undoModelChange } = jest.requireMock('../../services/llmModelChangeService') as {
+    undoModelChange: {
+      mockReset: () => void;
+      mockRejectedValue: (value: unknown) => void;
+      mockResolvedValue: (value: unknown) => void;
+    };
+  };
+  const { ModelChangeConflictError, ModelChangeNotFoundError } = jest.requireActual(
+    '../../services/llmModelChangeService',
+  ) as Record<string, new (m?: string) => Error>;
+
+  const body = { changeId: '2026-08-18T10:00:00.000Z#chg-1' };
+
+  beforeEach(() => {
+    undoModelChange.mockReset();
+  });
+
+  it('maps a superseded change to 409, not 500', async () => {
+    // Reachable only since the restore became conditional. A 500 here would tell
+    // the customer we broke, when in fact their schedule simply moved on.
+    undoModelChange.mockRejectedValue(new ModelChangeConflictError('That schedule has changed since.'));
+
+    const res = await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(409);
+    expect(res.body.error).toMatch(/changed since/i);
+  });
+
+  it('still maps an unknown change to 404', async () => {
+    undoModelChange.mockRejectedValue(new ModelChangeNotFoundError('Change not found'));
+    await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(404);
+  });
+
+  it('leaves an unexpected failure as a 500', async () => {
+    undoModelChange.mockRejectedValue(new Error('dynamo exploded'));
+    await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(500);
+  });
+
+  it('returns a plain no-op result unchanged', async () => {
+    // "Already undone" is a 200 with undone:false, not an error — the customer
+    // asked for a state that already holds.
+    undoModelChange.mockResolvedValue({ undone: false, restoredModel: null });
+    const res = await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(200);
+    expect(res.body).toMatchObject({ undone: false });
+  });
+});

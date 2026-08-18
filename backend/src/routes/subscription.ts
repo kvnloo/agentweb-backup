@@ -200,6 +200,13 @@ router.post('/usage-runway/undo', authenticateToken, async (req, res) => {
     if (error instanceof ModelChangeNotFoundError) {
       return res.status(404).json({ error: error.message });
     }
+    // Same reasoning as apply, and it arrives here too now that the restore is
+    // conditional: an undo whose schedule has moved on is not a failure, it is a
+    // change that can no longer be undone. A 500 would say "we broke" and invite
+    // a retry that cannot succeed.
+    if (error instanceof ModelChangeConflictError) {
+      return res.status(409).json({ error: error.message });
+    }
     console.error('Error undoing model change:', error);
     return res.status(500).json({ error: 'Failed to undo the change' });
   }
