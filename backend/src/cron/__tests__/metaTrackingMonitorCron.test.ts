@@ -42,6 +42,50 @@ beforeEach(() => {
   checkConversionDivergenceForUser.mockResolvedValue({ status: 'skipped' });
 });
 
+describe('metaTrackingMonitorCron — §G destination counters', () => {
+  it('aggregates destination counters across users', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+    monitorUserTracking
+      .mockResolvedValueOnce(summary({ destinationAlerts: 2, destinationUnverifiable: 1, destinationOk: 5, destinationUnconfirmed: 1 }))
+      .mockResolvedValueOnce(summary({ destinationAlerts: 1, destinationUnverifiable: 0, destinationOk: 7, destinationUnconfirmed: 2 }));
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.destinationAlerts).toBe(3);
+    expect(result.destinationUnverifiable).toBe(1);
+    expect(result.destinationOk).toBe(12);
+    expect(result.destinationUnconfirmed).toBe(3);
+  });
+
+  it('treats a monitor result missing the counters as zero, not NaN', async () => {
+    // Every downstream guard is a `> 0` comparison, and NaN fails all of them silently — the
+    // counter would read as "no findings" forever rather than as broken. A per-user summary
+    // predating these fields (an older worker mid-deploy) must not poison the fleet total.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary());
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.destinationAlerts).toBe(0);
+    expect(result.destinationOk).toBe(0);
+    expect(Number.isNaN(result.destinationAlerts)).toBe(false);
+  });
+
+  it('always reports destinations verified, so a check that ran is distinguishable from one that did not', async () => {
+    // Zero alerts is ambiguous alone: it reads identically whether every destination was
+    // healthy or none was ever fetched. The verified count is the only thing separating them.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary({ destinationOk: 4 }));
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    await runMetaTrackingMonitor();
+
+    const swept = log.mock.calls.map((c) => String(c[0])).find((l) => l.includes('swept'))!;
+    expect(swept).toContain('4 destination(s) verified');
+    log.mockRestore();
+  });
+});
+
 describe('metaTrackingMonitorCron', () => {
   it('sweeps every user', async () => {
     getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }, { userId: 'u3' }]);

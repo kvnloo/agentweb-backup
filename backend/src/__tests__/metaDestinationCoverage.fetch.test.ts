@@ -191,19 +191,32 @@ describe('fetchDestinationInputs — the ENG-941 seam', () => {
     ]);
   });
 
-  it('a total failure of the HTML checker still returns ok, and alerts nobody', async () => {
-    const { impl } = metaFetch([ADS_PAGE]);
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    const inputs = await fetchDestinationInputs('123', 'tok', {
-      fetchImpl: impl as any,
-      // Throwing synchronously from the boundary is caught per-URL by the gate, so force a
-      // failure of the gate call itself by making the URL list unusable downstream.
-      fetchHtml: (() => { throw new Error('checker exploded'); }) as any,
-    });
-    expect(inputs.status).toBe('ok');
-    const verdict = evaluateDestinationCoverage(inputs.ads, inputs.observations, inputs.ownedPixelIds);
-    expect(verdict.alerting).toEqual([]);
-    warn.mockRestore();
+  it('a throwing HTML boundary makes every destination unverifiable, alerting nobody', () => {
+    // CodeRabbit was right about the previous version of this test: it was NAMED for a
+    // gate-level failure it never produced. `preflightMetaTrackingGate` try/catches each
+    // fetchHtml call per URL, so a throwing boundary is absorbed there and the catch in
+    // `fetchDestinationInputs` is never reached — the assertions passed through a completely
+    // different path from the one the name claimed.
+    //
+    // A gate that REJECTS outright is covered properly in metaDestinationCoverage.gate.test.ts,
+    // where the module is mocked. This case now asserts what it actually exercises.
+    return (async () => {
+      const { impl } = metaFetch([ADS_PAGE]);
+      const inputs = await fetchDestinationInputs('123', 'tok', {
+        fetchImpl: impl as any,
+        fetchHtml: async () => { throw new Error('boundary exploded'); },
+      });
+
+      expect(inputs.status).toBe('ok');
+      const observation = inputs.observations['https://lander.test/lp'];
+      expect(observation.status).toBe('unverifiable');
+      expect(observation.error).toContain('boundary exploded');
+
+      const verdict = evaluateDestinationCoverage(
+        inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+      expect(verdict.alerting).toEqual([]);
+      expect(verdict.unverifiable).toHaveLength(1);
+    })();
   });
 });
 
@@ -467,6 +480,97 @@ describe('Meta reads are bounded', () => {
       expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
     }
     expect(DESTINATION_META_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
+  });
+});
+
+
+describe('incomplete reads never produce a finding', () => {
+  it('an ad whose campaign objective was not returned is unverifiable, NOT alerted', async () => {
+    // isConversionOptimisedObjective answers `true` for an unknown name on purpose, which is
+    // right for §F's blackout and exactly wrong here: it would let OUR missing data page a human.
+    const noCampaign = {
+      data: [{
+        id: '111', name: 'No Campaign Data',
+        creative: { object_story_spec: { link_data: { link: 'https://lander.test/lp' } } },
+      }],
+    };
+    const { impl } = metaFetch([noCampaign]);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html(),
+    });
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+    expect(verdict.alerting).toEqual([]);
+    expect(verdict.unverifiable).toEqual([
+      expect.objectContaining({ adId: '111', error: 'campaign objective could not be read' }),
+    ]);
+  });
+
+  it('an unrecognised but PRESENT objective is still judged', async () => {
+    // The distinction that matters: absent data is withheld, an unknown-but-real objective
+    // is judged, so a new Meta objective cannot silently suppress a finding.
+    const verdict = evaluateDestinationCoverage(
+      [{ adId: 'a', objective: 'OUTCOME_SOMETHING_NEW', destinationUrls: ['https://x.test/lp'] }],
+      { 'https://x.test/lp': { url: 'https://x.test/lp', status: 'unmeasured', detectedPixelIds: [] } },
+      ['910841031004192'], {});
+    expect(verdict.alerting).toHaveLength(1);
+  });
+
+  it('follows paging on the owned-pixel read, so a partial list cannot invent a foreign_pixel', async () => {
+    // An account with >100 pixels would otherwise get a truncated owned set, and a page
+    // carrying pixel 101 would be alerted as foreign — a false alert made by our own read.
+    let pixelCalls = 0;
+    const impl = jest.fn(async (url: string) => {
+      if (url.includes('/adspixels')) {
+        const body = pixelCalls++ === 0
+          ? { data: [{ id: '111111111111111' }], paging: { next: 'https://graph.facebook.com/v25.0/act_123/adspixels?after=CUR' } }
+          : { data: [{ id: '910841031004192' }] };
+        return { ok: true, status: 200, json: async () => body } as any;
+      }
+      if (url.includes('/insights')) return { ok: true, status: 200, json: async () => ({ data: [] }) } as any;
+      return { ok: true, status: 200, json: async () => ADS_PAGE } as any;
+    }) as any;
+
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl, fetchHtml: async () => html('910841031004192'),
+    });
+
+    expect(pixelCalls).toBe(2);
+    expect(inputs.ownedPixelIds).toEqual(['111111111111111', '910841031004192']);
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+    expect(verdict.alerting).toEqual([]);
+  });
+
+  it('refuses to judge a truncated AD list rather than reporting it as clean', async () => {
+    // Mirrors fetchDailyAdAccountActivity, which returns a fetch error rather than judging a
+    // truncated window. "Nothing wrong" from half an account's ads is a false clean bill.
+    const endless = {
+      data: [{ id: 'x', campaign: { objective: 'OUTCOME_LEADS' }, creative: {} }],
+      paging: { next: 'https://graph.facebook.com/v25.0/act_123/ads?after=FOREVER' },
+    };
+    const { impl } = metaFetch([endless]);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html('910841031004192'),
+    });
+    expect(inputs.status).toBe('fetch_error');
+    expect(inputs.error).toContain('truncated ad list');
+  });
+
+  it('refuses to judge against a truncated OWNED-PIXEL list', async () => {
+    const impl = jest.fn(async (url: string) => {
+      if (url.includes('/adspixels')) {
+        return { ok: true, status: 200, json: async () => ({
+          data: [{ id: '1' }],
+          paging: { next: 'https://graph.facebook.com/v25.0/act_123/adspixels?after=FOREVER' },
+        }) } as any;
+      }
+      if (url.includes('/insights')) return { ok: true, status: 200, json: async () => ({ data: [] }) } as any;
+      return { ok: true, status: 200, json: async () => ADS_PAGE } as any;
+    }) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs.status).toBe('fetch_error');
+    expect(inputs.error).toContain('truncated set of owned pixels');
   });
 });
 
