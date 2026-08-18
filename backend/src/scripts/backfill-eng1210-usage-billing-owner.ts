@@ -154,7 +154,7 @@ async function main() {
   for (const o of owners.values()) byReason[o.reason] = (byReason[o.reason] || 0) + 1;
   console.log('actors by resolution:', byReason);
 
-  let repaired = 0, alreadyCorrect = 0, unattributable = 0, skippedOrg = 0;
+  let repaired = 0, alreadyCorrect = 0, unattributable = 0, skippedOrg = 0, mergedIntoExisting = 0;
   const perOrg: Record<string, number> = {};
 
   for (const row of rows) {
@@ -186,17 +186,60 @@ async function main() {
       // PUT the new row BEFORE deleting the old one. A crash between the two
       // leaves a duplicate, which readers dedupe on {userId, sk}; deleting first
       // would lose the spend outright.
-      await doc.put({
-        TableName: USAGE_TABLE,
-        Item: { ...row, sk: targetSk, billingUserId: res.owner },
-        // Never clobber a row the new write path already created for this key.
-        ConditionExpression: 'attribute_not_exists(sk)',
-      }).promise().catch((e: any) => {
+      let merged = false;
+      try {
+        await doc.put({
+          TableName: USAGE_TABLE,
+          Item: { ...row, sk: targetSk, billingUserId: res.owner },
+          // Never clobber a row the new write path already created for this key.
+          ConditionExpression: 'attribute_not_exists(sk)',
+        }).promise();
+      } catch (e: any) {
         if (e?.code !== 'ConditionalCheckFailedException') throw e;
-      });
+        // The destination already exists, so this row's counters have to be ADDED
+        // to it. Swallowing the collision and deleting the source anyway -- which
+        // is what this did first -- destroys that spend permanently.
+        //
+        // Not an edge case: once the payer-keyed write path is live, any actor
+        // still recording usage already HAS the destination row for that day, so
+        // the collision is the normal outcome for every active account rather
+        // than a rare race.
+        //
+        // ADD is atomic and additive, so a re-run after an interrupted merge
+        // cannot double-count: the source is deleted in the same iteration, and a
+        // row that no longer exists is never merged twice.
+        const counters: Record<string, number> = {};
+        for (const k of [
+          'costMicroUsd', 'callCount', 'inputTokens', 'outputTokens',
+          'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'quantity',
+        ]) {
+          const v = row[k];
+          if (typeof v === 'number' && v !== 0) counters[k] = v;
+        }
+        if (Object.keys(counters).length > 0) {
+          const names: Record<string, string> = {};
+          const values: Record<string, number> = {};
+          const adds = Object.keys(counters).map((k, i) => {
+            names[`#c${i}`] = k;
+            values[`:c${i}`] = counters[k];
+            return `#c${i} :c${i}`;
+          });
+          await doc.update({
+            TableName: USAGE_TABLE,
+            Key: { userId: row.userId, sk: targetSk },
+            UpdateExpression: `ADD ${adds.join(', ')}`,
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: values,
+          }).promise();
+        }
+        merged = true;
+      }
+      // Only ever delete the source once its counters are provably somewhere else
+      // -- either copied into a new row, or added into the existing one.
       if (targetSk !== row.sk) {
         await doc.delete({ TableName: USAGE_TABLE, Key: { userId: row.userId, sk: row.sk } }).promise();
       }
+      if (merged) mergedIntoExisting++;
     }
     repaired++;
   }
@@ -204,6 +247,7 @@ async function main() {
   console.log('\n--- summary ---');
   console.log(`rows ${apply ? 'repaired' : 'to repair'} : ${repaired}`);
   console.log(`already correctly attributed : ${alreadyCorrect}  (left untouched, old key format and all)`);
+  console.log(`merged into existing  : ${mergedIntoExisting}  (destination already held that day's payer-keyed row)`);
   console.log(`unattributable        : ${unattributable}  (no user record -- left before any stamp existed)`);
   if (onlyOrg) console.log(`skipped (other orgs)  : ${skippedOrg}`);
   console.log('rows by org           :', perOrg);
