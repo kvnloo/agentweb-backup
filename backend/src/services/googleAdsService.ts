@@ -755,6 +755,7 @@ export class GoogleAdsService {
     name: string;
     campaignResourceName: string;
     type: 'SEARCH_STANDARD' | 'DISPLAY_STANDARD';
+    status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
   }): Promise<{ resourceName: string }> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
@@ -762,7 +763,7 @@ export class GoogleAdsService {
       create: {
         name: params.name,
         campaign: params.campaignResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         type: params.type,
         ...(params.cpcBidMicros !== undefined && { cpcBidMicros: String(params.cpcBidMicros) }),
       },
@@ -1120,6 +1121,7 @@ export class GoogleAdsService {
     headlines: string[];
     descriptions: string[];
     finalUrl: string;
+    status?: 'ENABLED' | 'PAUSED';
     imageAssetResourceNames?: string[];
     /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
     finalUrlSuffix?: string;
@@ -1166,7 +1168,7 @@ export class GoogleAdsService {
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
         adGroup: params.adGroupResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         ad: {
           ...adContent,
           finalUrls: [params.finalUrl],
