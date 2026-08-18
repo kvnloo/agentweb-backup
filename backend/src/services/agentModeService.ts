@@ -295,6 +295,12 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import {
+  isAnonymizedIdentifier,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -31793,7 +31799,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
             // public_identifier literally the string 'undefined' — passing those
             // through yields unusable fake profile URLs like /in/undefined.
-            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const usableItems = searchResult.items.filter((item: any) => !isAnonymizedIdentifier(item.public_identifier));
+            // How many the filter removed. ENG-1198 dropped them silently, which
+            // turned "every match was out-of-network" into an empty list
+            // indistinguishable from "nobody matches" — and from the ENG-975
+            // account-cannot-search outage. The ENG-975 canary deliberately does not
+            // cover this case: it only fires when the RAW page was empty, and here
+            // the account searched fine and returned rows we then discarded. So the
+            // count has to be reported, or the agent is left guessing which of three
+            // very different situations it is in.
+            const anonymizedFiltered = searchResult.items.length - usableItems.length;
             const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
@@ -31816,7 +31831,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
+            const searchData = withAccountMeta({
+              ...searchResult,
+              items: trimmedItems,
+              ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+            });
+            if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
+              // Say plainly what happened, so this does not get reported to the
+              // user as "no prospects match" or escalated as a broken search.
+              return {
+                success: true,
+                message:
+                  `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
+                  `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
+                  `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            return { success: true, data: searchData };
           }
           return { success: true, data: withAccountMeta(searchResult) };
         }
@@ -31851,17 +31883,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // viewer's connection state back into the shared cache and re-introduce the
           // very cross-viewer leak this fix closes.
           if (raw && typeof raw === 'object') {
+            // Both halves must reject the sentinel, because this URL is used as a
+            // DynamoDB GSI lookup key below. Unfiltered, EVERY anonymized profile
+            // queries the same `/in/undefined` key — and the connection-sync cron
+            // writes rows under exactly that key — so the lookup returns an
+            // unrelated person's connection row and their is_relationship /
+            // connected_at get presented as this user's, driving the agent's
+            // invite-vs-message decision off a stranger's state.
             const profileUrl =
-              raw.public_profile_url ||
-              (raw.public_identifier
-                ? `https://www.linkedin.com/in/${raw.public_identifier}`
-                : (isUrl ? target : null));
+              usableProfileUrl(raw.public_profile_url) ||
+              (usablePublicIdentifier(raw.public_identifier)
+                ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                : (isUrl ? usableProfileUrl(target) : null));
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
             // with public_identifier literally the string 'undefined' — mirrors
             // the search-people filtering above. get-profile can't drop the row
             // (the caller asked for this specific person), so flag it and drop
             // the fabricated /in/undefined URL instead.
-            const isAnonymized = raw.public_identifier === 'undefined';
+            const isAnonymized = isAnonymizedIdentifier(raw.public_identifier);
             let conn: { connectedAt?: number } | null = null;
             // A shared/site-wide account's connection state belongs to a
             // STRANGER, not the user — reconciling is_relationship/connected_at
@@ -31897,9 +31936,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const isConnected =
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
-              ...viewerIndependentRaw,
+              // Dropping the fabricated URL alone was not enough: `public_identifier`
+              // stayed on the object as the literal string 'undefined', so the agent
+              // was handed the exact slug needed to rebuild the dead link itself.
+              ...withoutFabricatedProfileFields(viewerIndependentRaw),
               // Never surface the fabricated /in/undefined URL for an anonymized profile.
-              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              ...(isAnonymized || !usableProfileUrl(rawPublicProfileUrl)
+                ? {}
+                : { public_profile_url: rawPublicProfileUrl }),
               // See ENG-1198 note above: is_relationship/connected_at are the
               // user's "already connected/pending" signal — only meaningful
               // relative to the user's own account, not a borrowed shared one.

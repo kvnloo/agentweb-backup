@@ -1,5 +1,9 @@
 import { crmDb } from './db';
 import {
+  usablePublicIdentifier,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
+import {
   FIELD_GROUPS,
   buildCompanyCanonicalKey,
   buildPersonCanonicalKey,
@@ -200,10 +204,26 @@ export function buildLinkedInContextFromCache(
 ): string {
   if (!rawData.linkedinData) return '';
 
-  let linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(rawData.linkedinData.rawProfile, null, 2)}`;
+  // Sanitize on the way out as well as on the way in. Rows cached before the
+  // write-side fix still hold `"public_identifier": "undefined"` and the
+  // `/in/undefined` URL built from it, and a cache hit replays the blob verbatim —
+  // so without this the fabricated URL keeps reaching the LLM until every existing
+  // row expires.
+  const rawProfile = withoutFabricatedProfileFields(
+    (rawData.linkedinData.rawProfile ?? {}) as Record<string, unknown>,
+  );
+  let linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(rawProfile, null, 2)}`;
 
-  if (isEnrichingLinkedin && rawData.linkedinData.publicIdentifier) {
-    const profileUrl = `https://www.linkedin.com/in/${rawData.linkedinData.publicIdentifier}`;
+  // `publicIdentifier` is persisted as its OWN cache attribute, not read back out of
+  // `rawProfile` — so sanitizing the blob above does not cover it. Rows written before
+  // the sentinel was rejected on the write path hold the literal string 'undefined',
+  // which is truthy, and this line would label the resulting dead link as the RESOLVED
+  // profile URL. That is a stronger claim to the LLM than anything in the blob, and
+  // `person_identity` caches for 90 days, so those rows are exactly the population this
+  // function's sanitization exists to protect.
+  const cachedIdentifier = usablePublicIdentifier(rawData.linkedinData.publicIdentifier);
+  if (isEnrichingLinkedin && cachedIdentifier) {
+    const profileUrl = `https://www.linkedin.com/in/${cachedIdentifier}`;
     linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
   }
 
