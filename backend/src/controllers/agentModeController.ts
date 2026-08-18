@@ -1812,10 +1812,25 @@ export function scheduledRunSignalsConditionalSkip(
   // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  // A NEGATED failure/error mention — "not by failure", "no errors", "without any
+  // failure", "was not a failure" — DENIES a failure happened; it is not evidence
+  // of one. HARD_FAILURE_PATTERNS below matches these words ANYWHERE in the turn
+  // with no negation awareness, so a clean skip that merely denies a failure
+  // ("Posts published: 0 (by design, not by failure)") tripped the veto exactly
+  // like a real failure would (real prod regression, session 7f95530d,
+  // 2026-08-15 — the run made ZERO tool calls and still hit the 20-attempt nudge
+  // cap, ENG-1276 follow-up). Scoped tightly to the negation word landing
+  // directly on the failure/error noun (with only an optional article/"by"
+  // between), so it cannot swallow an unrelated failure named later in the same
+  // sentence — "not a failure of the schedule, but image generation failed"
+  // leaves "failed" intact and still vetoes.
+  const NEGATED_FAILURE_MENTION =
+    /\b(?:not|no|never|without)\s+(?:(?:a|an|any|the)\s+)?(?:by\s+)?(?:failed|failures?|errors?|errored)\b/gi;
   const failureScan = expandContractions(
     text
       .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
       .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+      .replace(NEGATED_FAILURE_MENTION, ' ')
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
