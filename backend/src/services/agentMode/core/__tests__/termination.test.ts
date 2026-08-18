@@ -130,3 +130,108 @@ describe('decideTermination', () => {
     });
   });
 });
+
+describe('decideTermination — ENG-946: the terminating turn owns the empty-synthesis decision', () => {
+  // Prod signature (scheduled X Reply Guy runs): the model narrates mid-run
+  // ("I'll scan his roster…"), runs tools, then its FINAL turn comes back with
+  // zero text. The loop's accumulated `content` still holds the stale narration,
+  // so the empty-synthesis nudge never fired and the run shipped the narration
+  // as if it were the report.
+  it('nudges when THIS turn produced no text, even though earlier narration is still accumulated', () => {
+    const d = decideTermination({
+      ...base,
+      content: "I'll scan his roster and check what he's already engaged with today.",
+      currentTurnText: '',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 0,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(true);
+    expect(d.reason).toBe('empty_synthesis_retry');
+    expect(d.counterDelta.emptySynthesisRetries).toBe(1);
+  });
+
+  it('nudges when THIS turn produced only whitespace', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      currentTurnText: '   \n\t ',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 0,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(true);
+    expect(d.reason).toBe('empty_synthesis_retry');
+    expect(d.counterDelta.emptySynthesisRetries).toBe(1);
+  });
+
+  it('nudges when the accumulated content fallback is whitespace-only', () => {
+    const d = decideTermination({
+      ...base,
+      content: '  \n ',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 0,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(true);
+    expect(d.reason).toBe('empty_synthesis_retry');
+  });
+
+  it('does NOT nudge when THIS turn produced real text (accumulated content irrelevant)', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      currentTurnText: 'Here is the full report.',
+      toolCallsSoFar: 9,
+    });
+    expect(d.shouldContinue).toBe(false);
+    expect(d.reason).toBe('final_response');
+  });
+
+  it('still respects the retry budget when the terminating turn is empty', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      currentTurnText: '',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 1,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(false);
+    expect(d.reason).toBe('final_response');
+  });
+
+  it('does not nudge on an empty terminating turn when no tools ever ran', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      currentTurnText: '',
+      toolCallsSoFar: 0,
+    });
+    expect(d.shouldContinue).toBe(false);
+    expect(d.reason).toBe('final_response');
+  });
+
+  it('keeps the content-filter path free of synthesis retries even with an empty turn text', () => {
+    const d = decideTermination({
+      ...base,
+      finishReason: 'content_filter',
+      content: '',
+      currentTurnText: '',
+      toolCallsSoFar: 5,
+    });
+    expect(d.shouldContinue).toBe(false);
+    expect(d.reason).toBe('content_filtered');
+    expect(d.contentIfEmpty).toContain('content safety guidelines');
+  });
+
+  it('omitting currentTurnText preserves the pre-fix behavior (accumulated content decides)', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      toolCallsSoFar: 9,
+    });
+    expect(d.shouldContinue).toBe(false);
+    expect(d.reason).toBe('final_response');
+  });
+});

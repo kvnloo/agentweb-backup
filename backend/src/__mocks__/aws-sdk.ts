@@ -11,6 +11,10 @@ const mockDocumentClient = jest.fn(() => ({
   delete: jest.fn().mockReturnValue({ promise: mockPromise }),
   scan: jest.fn().mockReturnValue({ promise: mockPromise }),
   query: jest.fn().mockReturnValue({ promise: mockPromise }),
+  transactWrite: jest.fn().mockReturnValue({ promise: mockPromise }),
+  transactGet: jest.fn().mockReturnValue({ promise: mockPromise }),
+  batchGet: jest.fn().mockReturnValue({ promise: mockPromise }),
+  batchWrite: jest.fn().mockReturnValue({ promise: mockPromise }),
 }));
 
 const mockS3 = jest.fn(() => ({

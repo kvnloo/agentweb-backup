@@ -135,6 +135,26 @@ describe('mirrorOnboardingEventToLead', () => {
     );
   });
 
+  it('mirrors a lateral voice event without changing Lead lifecycle stage', async () => {
+    const voiceEvent = { event: 'voice_onboarding_presented', ts: '2026-04-23T00:00:00Z' };
+    await mirrorOnboardingEventToLead(
+      {
+        userId: 'u-1',
+        email: 'user@example.com',
+        event: voiceEvent,
+        allEvents: [voiceEvent],
+        onboardingStage: null,
+      },
+      { crmDb: mockCrmDb as any, logger: silentLogger },
+    );
+
+    expect(mockUpdateLeadOnboarding).toHaveBeenCalledWith(
+      FOUNDERS_LIST.listId,
+      'lead-abc',
+      expect.not.objectContaining({ [ONBOARDING_STAGE_FIELD]: expect.anything() }),
+    );
+  });
+
   it('creates the Lead when no match exists, then mirrors the event to it', async () => {
     mockGetLeadByEmail.mockResolvedValueOnce(null);
     const allEvents = [{ event: 'goal_selected', ts: '2026-04-23T00:00:00Z' }];

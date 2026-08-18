@@ -37,9 +37,11 @@ jest.mock('../services/agentModeService', () => ({
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
     getScheduledChatsDefaultModel: jest.fn(),
+    getSupportedModels: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateScheduledChatSummary: jest.fn(),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set(['install_skills', 'search_web'])),
     getAdminToolNames: jest.fn().mockReturnValue([]),
     // Mirrors the real resolver, including its fallback for unserved ids.
@@ -54,7 +56,7 @@ jest.mock('../services/agentModeService', () => ({
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
-  generateMarketingResponseWorkerService: { runInWorker: jest.fn() },
+  generateMarketingResponseWorkerService: { runInWorker: jest.fn(), releaseSessionClients: jest.fn() },
 }));
 
 jest.mock('../services/db', () => ({
@@ -69,6 +71,7 @@ jest.mock('../services/db', () => ({
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
     updateSchedule: jest.fn(),
+    attachSessionToRunInFlight: jest.fn().mockResolvedValue(undefined),
   },
   taskDb: {
     getTaskExecutionById: jest.fn(),
@@ -102,14 +105,21 @@ jest.mock('../services/tokenUsageService', () => ({
     allowed: true, warning: false, used: 1, allowance: 1000000,
     bonus: 0, effectiveAllowance: 1000000, percentUsed: 0, month: '2026-07',
   })),
+  deriveBlockedByCost: jest.fn((status: any) => ({ blockedByCost: status.usageMode === 'paused' })),
+}));
+
+jest.mock('../services/llmUsagePolicyResolverService', () => ({
+  getEffectiveLlmUsagePolicy: jest.fn(),
 }));
 
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { runScheduledChat } from '../controllers/agentModeController';
+import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { checkTokenUsage } from '../services/tokenUsageService';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 
 const mockAlert = sendAgentModeOncallAlert as jest.MockedFunction<typeof sendAgentModeOncallAlert>;
 
@@ -117,6 +127,8 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockCheckTokenUsage = checkTokenUsage as jest.MockedFunction<typeof checkTokenUsage>;
+const mockGetEffectiveLlmUsagePolicy = getEffectiveLlmUsagePolicy as jest.MockedFunction<typeof getEffectiveLlmUsagePolicy>;
 
 const SESSION_ID = 'test-session-123';
 
@@ -146,6 +158,11 @@ const stampedModel = () => {
   return call?.[1];
 };
 
+const stampedPolicyDecision = () => {
+  const call = mockChatbotDb.updateSessionLlmModel.mock.calls.find(([id]) => id === SESSION_ID);
+  return call?.[2];
+};
+
 describe('runScheduledChat — stamps the model that will actually run (ENG-892)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -157,6 +174,18 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     mockChatbotDb.addMessageToSession.mockResolvedValue(session as any);
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2' as any);
     mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue('anthropic.claude-opus-5' as any);
+    mockAgentModeService.getSupportedModels.mockResolvedValue(REGISTRY as any);
+    mockCheckTokenUsage.mockResolvedValue({
+      allowed: true, warning: false, used: 1, allowance: 1000000,
+      bonus: 0, effectiveAllowance: 1000000, percentUsed: 0, month: '2026-07',
+    } as any);
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123',
+      policy: null,
+      costUsedMicroUsd: 0,
+      tokenUsed: 1,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'policy_not_enforced' },
+    });
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt' as any);
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Title' as any);
     (mockAgentModeService as any).generateScheduledChatSummary.mockResolvedValue('Summary');
@@ -215,5 +244,97 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     await runScheduledChat({ ...baseSchedule, llmModel: 'anthropic.claude-opus-5' } as any, 'test-user-123', false);
 
     expect(mockAlert).not.toHaveBeenCalled();
+  });
+
+  it('uses the user-selected eligible backup after the optimization threshold', async () => {
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123',
+      policy: {
+        version: 'pro-v1',
+        enforcementState: 'enforce',
+        optimizationCostThresholdMicroUsd: 80_000_000,
+        hardCostThresholdMicroUsd: 150_000_000,
+        optimizedModelIds: ['gpt-5-chat-2'],
+        optimizedDefaultModel: 'gpt-5-chat-2',
+      },
+      costUsedMicroUsd: 80_000_000,
+      tokenUsed: 300_000_000,
+      mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
+    });
+
+    await runScheduledChat({
+      ...baseSchedule,
+      llmModel: 'anthropic.claude-opus-5',
+      llmBackupModel: 'gpt-5-chat-2',
+      llmBackupSource: 'user',
+    } as any, 'test-user-123', false);
+
+    expect(stampedModel()).toBe('gpt-5-chat-2');
+    expect(stampedPolicyDecision()).toEqual(expect.objectContaining({
+      requestedModel: 'anthropic.claude-opus-5',
+      effectiveModel: 'gpt-5-chat-2',
+      backupModel: 'gpt-5-chat-2',
+      backupSource: 'user',
+      modelSelection: 'corrected',
+      modelSelectionReason: 'requested_model_blocked_using_user_backup',
+      usageMode: 'optimized',
+      usagePolicyVersion: 'pro-v1',
+      recordedAt: expect.any(String),
+    }));
+    expect(mockWorker.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ llmModel: 'gpt-5-chat-2' }),
+      expect.any(Function),
+    );
+  });
+
+  it('performs zero model dispatch when the hard cost cap is reached', async () => {
+    mockCheckTokenUsage.mockResolvedValue({
+      allowed: false, warning: true, used: 1, allowance: 1,
+      bonus: 0, effectiveAllowance: 1, percentUsed: 100, month: '2026-07',
+      usageMode: 'paused', usagePolicyVersion: 'pro-v1',
+    } as any);
+
+    const result = await runScheduledChat({ ...baseSchedule, llmModel: 'anthropic.claude-opus-5' } as any, 'test-user-123', false);
+
+    expect(result.status).toBe('failure');
+    expect(result.actualResponse).toContain('AI usage is paused');
+    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(mockWorker.runInWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('getModelOptions — authoritative model discovery', () => {
+  it('returns only optimized models as selectable after the optimization threshold', async () => {
+    mockAgentModeService.getSupportedModels.mockResolvedValue([
+      'anthropic.claude-opus-5', 'gpt-5-chat-2',
+    ] as any);
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123',
+      policy: {
+        version: 'pro-v1', enforcementState: 'enforce',
+        optimizationCostThresholdMicroUsd: 80_000_000,
+        hardCostThresholdMicroUsd: 150_000_000,
+        optimizedModelIds: ['gpt-5-chat-2'],
+        optimizedDefaultModel: 'gpt-5-chat-2',
+      },
+      costUsedMicroUsd: 80_000_000,
+      tokenUsed: 1,
+      mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
+    });
+    const json = jest.fn();
+    const status = jest.fn(() => ({ json }));
+
+    await agentModeController.getModelOptions(
+      { user: { userId: 'test-user-123', isAdmin: false } } as any,
+      { json, status } as any,
+    );
+
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({
+      usageMode: 'optimized',
+      canGenerate: true,
+      selectableModels: ['gpt-5-chat-2'],
+      allModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
+      scheduleBackupModels: ['gpt-5-chat-2'],
+    }));
   });
 });
