@@ -43,6 +43,7 @@ import {
   ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
+  ATTR_GEN_AI_RESPONSE_MODEL,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
   ATTR_RUN_ID,
@@ -191,13 +192,24 @@ export function getRunTraceId(runId: string): string | undefined {
   }
 }
 
-/** Close the run span with its outcome verdict (and error, on the failed path). */
-export function endInvokeAgentSpan(runId: string, outcome: { verdict?: string; error?: unknown }): void {
+/**
+ * Close the run span with its outcome verdict (and error, on the failed path).
+ *
+ * `responseModel` is the model that actually served the run. The span opens with
+ * `gen_ai.request.model`, which is the model as REQUESTED — before legacy-id
+ * resolution and before any backup substitution — so without this the trace and
+ * the `agent_run_verdict` row could disagree about which model to credit.
+ */
+export function endInvokeAgentSpan(
+  runId: string,
+  outcome: { verdict?: string; error?: unknown; responseModel?: string },
+): void {
   try {
     const span = activeRunSpans.get(runId);
     if (!span) return;
     activeRunSpans.delete(runId);
     if (outcome.verdict) span.setAttribute(ATTR_RUN_VERDICT, outcome.verdict);
+    if (outcome.responseModel) span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, outcome.responseModel);
     if (outcome.error !== undefined) {
       span.recordException(outcome.error instanceof Error ? outcome.error : String(outcome.error));
       span.setStatus({
