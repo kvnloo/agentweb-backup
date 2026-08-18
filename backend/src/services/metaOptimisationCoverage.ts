@@ -23,6 +23,9 @@
  * Tier 2 (see §39). Do not let this module's existence imply that coverage.
  */
 
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+
+
 /**
  * Meta's `promoted_object.custom_event_type` values mapped to the standard event NAME the
  * pixel actually reports. The two vocabularies differ (`COMPLETE_REGISTRATION` vs
@@ -533,7 +536,7 @@ export async function fetchOptimisationInputs(
 
   try {
     for (let page = 0; page < MAX_ADSET_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) {
         return {
@@ -576,7 +579,7 @@ export async function fetchOptimisationInputs(
       const statsUrl =
         `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(pixelId)}/stats` +
         `?aggregation=event&access_token=${encodeURIComponent(accessToken)}`;
-      const response = await fetchImpl(statsUrl);
+      const response = await fetchImpl(statsUrl, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) continue; // omitted → inconclusive, never "nothing arrives"
 
@@ -637,7 +640,7 @@ async function fetchAdSetSpendingDays(
     // only the first page would silently drop delivery evidence and turn real alerts into
     // silence — the same pagination trap #2420 hit moving account level to campaign.
     for (let page = 0; page < MAX_INSIGHT_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) return {};
 

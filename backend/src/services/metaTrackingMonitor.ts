@@ -34,6 +34,9 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+
+
 const TAG = '[Tracking Monitor]';
 
 /** Meta's deduplicated conversion rollups. Each is a FAMILY: the bare name plus the
@@ -377,7 +380,7 @@ export async function fetchDailyAdAccountActivity(
 
   try {
     for (let page = 0; page < MAX_INSIGHTS_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
 
       if (!response.ok || body?.error) {
@@ -575,6 +578,12 @@ export const OPTIMISATION_ALERT_CLASS = 'meta-optimisation-event-missing';
  *  conversion arrived, this asks whether the page could ever have sent one. An account can be
  *  perfectly healthy on both other measures while one ad points at an uninstrumented lander. */
 export const DESTINATION_ALERT_CLASS = 'meta-destination-unmeasured';
+/** §G Tier 2. A FOURTH class, and the most general: the blackout says "this account converts
+ *  nothing", Tier 1 says "not the thing it pays for", destinations say "this page could never
+ *  send anything", and this says "something that used to arrive reliably has stopped" —
+ *  including events nobody optimises for, which is the only one of the four that can catch a
+ *  silently dropped event with no spend pointed at it. */
+export const EVENT_MIX_ALERT_CLASS = 'meta-event-mix-regression';
 /** Mirrors OPTIMISATION_RECENCY_DAYS for the log line, without importing the module at
  *  top level — this file only pulls metaOptimisationCoverage in lazily. */
 const OPTIMISATION_RECENCY_DAYS_LABEL = 2;
@@ -634,6 +643,22 @@ export interface MonitorDeps {
     adAccountId: string,
     accessToken: string,
   ) => Promise<import('./metaDestinationCoverage').DestinationInputs>;
+  fetchEventMix?: (
+    adAccountId: string,
+    accessToken: string,
+  ) => Promise<AdAccountActivity>;
+  /**
+   * Ad accounts already swept SUCCESSFULLY this run, shared across every user in the sweep.
+   *
+   * The same ad account is connected under several user records in production — 21 connection
+   * rows resolve to 15 distinct accounts, two of them held by three user records each.
+   * Without this, each duplicate is swept in full again: the Meta reads repeat, §G re-fetches
+   * the customer's landing pages, and every per-user counter double-counts (the "2 blackout
+   * but 1 card" discrepancy §40 left unexplained).
+   *
+   * Omit it and nothing dedupes, which is the previous behaviour.
+   */
+  sweptAccountIds?: Set<string>;
 }
 
 export interface MonitorSummary {
@@ -681,6 +706,18 @@ export interface MonitorSummary {
    *  so something IS reporting. Logged, never paged: our HTML read is an inference and
    *  Meta's attribution is direct evidence. Usually a client-side pixel injection. */
   destinationUnconfirmed: number;
+  /** Connections skipped because another user record already swept that ad account
+   *  successfully this run. Surfaced so the saving is visible and a dedupe that starts
+   *  skipping too much cannot hide. */
+  duplicateAccountsSkipped: number;
+  /** §G Tier 2 — conversion families that were reliably arriving and have now stopped. */
+  eventMixRegressions: number;
+  /** Families reliably present AND still arriving. Reported so an account with nothing to
+   *  watch is distinguishable from one being watched and found healthy. */
+  eventMixWatched: number;
+  /** Families absent so long they are the established state rather than a regression.
+   *  Logged every sweep, never paged — the bound on an ambiguity we cannot resolve. */
+  eventMixStale: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -712,6 +749,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     destinationUnverifiable: 0,
     destinationOk: 0,
     destinationUnconfirmed: 0,
+    duplicateAccountsSkipped: 0,
+    eventMixRegressions: 0,
+    eventMixWatched: 0,
+    eventMixStale: 0,
   };
 
   const fetchActivity =
@@ -740,6 +781,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // Calling Meta with `undefined` would return a token error and alert a human about a
     // connection that does not exist.
     if (!adAccountId || !accessToken) continue;
+
+    // Another user record already swept this exact ad account, successfully, this run. The
+    // second pass would read the same Meta data, re-fetch the same landing pages, and file
+    // findings under a different owner email for the same underlying account.
+    if (deps?.sweptAccountIds?.has(String(adAccountId))) {
+      summary.duplicateAccountsSkipped++;
+      continue;
+    }
 
     summary.accountsChecked++;
 
@@ -787,6 +836,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       continue;
     }
 
+    // Marked only once the read SUCCEEDED. Marking on sight would let the first connection
+    // encountered claim the account even when its token is dead — and production has exactly
+    // that shape: one ad account is connected under a user record whose token lacks
+    // `ads_read` AND under another whose token works. Claiming it on the broken connection
+    // would hide the account from the working one and take it dark, which is strictly worse
+    // than the duplication being removed.
+    deps?.sweptAccountIds?.add(String(adAccountId));
+
     (activity.excludedObjectives || []).forEach((o) => excludedObjectives.add(o));
     (activity.unknownObjectives || []).forEach((o) => unknownObjectives.add(o));
 
@@ -803,6 +860,13 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // sends paid traffic to a page that cannot report anything. Gating this behind a blackout
     // verdict would hide exactly the case it exists to find.
     await checkDestinationCoverage(
+      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+    );
+
+    // Also before the blackout early returns. Tier 2's whole point is the event that stops
+    // while the account's OTHER conversions keep flowing — which reads as perfectly healthy
+    // to the blackout check, exactly as the August outage did for eight days.
+    await checkEventMixCoverage(
       adAccountId, accessToken, user, summary, alertTransport, now, deps,
     );
 
@@ -1173,5 +1237,134 @@ async function checkDestinationCoverage(
   } catch (error: any) {
     // Same containment as Tier 1: this is an addition to a sweep that already works.
     console.warn(`${TAG} ${adAccountId}: §G destination check failed — ${error?.message}`);
+  }
+}
+
+/**
+ * §G Tier 2 — has a conversion family that used to arrive reliably stopped arriving?
+ *
+ * The one check of the four that can see an event dropped with NOBODY optimising for it.
+ * Tier 1 reads `promoted_object`, so it is structurally blind to that; the blackout check
+ * reads totals, so an account whose other conversions keep flowing looks healthy throughout.
+ * That is exactly how a managed client's `CompleteRegistration` ran dark for 8+ days.
+ *
+ * Its own 30-day read, separate from the blackout's 7-day one. Widening the shared window
+ * instead would silently change what `evaluateAdAccountDays` streaks over, and that function
+ * decides whether a customer gets paged.
+ */
+async function checkEventMixCoverage(
+  adAccountId: string,
+  accessToken: string,
+  user: any,
+  summary: MonitorSummary,
+  alertTransport: AlertTransport,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const { evaluateEventMix, EVENT_MIX_WINDOW_DAYS, EVENT_MIX_ABSENCE_DAYS } =
+      await import('./metaEventMixCoverage');
+
+    const fetchEventMix =
+      deps?.fetchEventMix ??
+      ((id: string, token: string) => fetchDailyAdAccountActivity(id, token, EVENT_MIX_WINDOW_DAYS));
+    const activity = await fetchEventMix(adAccountId, accessToken);
+    if (activity.status !== 'ok') {
+      // Transient by definition — the same call every other read failure in this file makes.
+      console.warn(`${TAG} ${adAccountId}: event-mix history unavailable — ${activity.error}`);
+      return;
+    }
+
+    // The sweep's own date, so "has it stopped" is judged against today rather than against
+    // whatever the newest row Meta happened to return is.
+    const asOf = new Date(now).toISOString().slice(0, 10);
+    const verdict = evaluateEventMix(activity.days, asOf);
+
+    summary.eventMixWatched += verdict.healthy.length;
+
+    if (verdict.insufficientHistory) {
+      // Said out loud rather than passed over in silence: "no history to judge" and "judged
+      // and healthy" are different states, and only one of them is reassuring.
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 has too little spending history to judge ` +
+        `(${verdict.spendingDaysConsidered} spending day(s) in the window)`,
+      );
+      return;
+    }
+    if (verdict.tooSparse.length) {
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 not watching ${verdict.tooSparse.length} family(ies) — ` +
+        `too sparse to have a baseline: ${verdict.tooSparse.join(', ')}`,
+      );
+    }
+    if (verdict.stale.length) {
+      // Long-dead families. Reported on EVERY sweep so they never quietly disappear, and
+      // never paged: past the cap this is the established state rather than a regression,
+      // and most often a deliberately retired funnel we cannot distinguish from a break.
+      summary.eventMixStale += verdict.stale.length;
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 — ${verdict.stale.length} family(ies) absent too long ` +
+        `to still be a regression, not alerting: ` +
+        verdict.stale.map((f) => `${f.family} (last seen ${f.lastSeen})`).join('; '),
+      );
+    }
+
+    if (!verdict.alerting.length) return;
+    summary.eventMixRegressions += verdict.alerting.length;
+
+    const worst = verdict.alerting.reduce((a, b) =>
+      b.spendDuringAbsence > a.spendDuringAbsence ? b : a);
+
+    await raise(
+      alertTransport,
+      // One alert per ACCOUNT per day. Several families stopping together is almost always
+      // ONE cause — a removed snippet, a broken deploy — and filing each separately is how a
+      // detector becomes a flood.
+      `${EVENT_MIX_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} has stopped receiving ${verdict.alerting.length} conversion event(s) it used to receive reliably`,
+      [
+        `${verdict.alerting.length} conversion family(ies) that arrived reliably on this account`,
+        `have now been absent for ${EVENT_MIX_ABSENCE_DAYS}+ consecutive SPENDING days:`,
+        '',
+        ...verdict.alerting.map((f) =>
+          `  • ${f.family} — present on ${f.presentDays} of ${f.spendingDays} spending day(s), ` +
+          `last seen ${f.lastSeen}, absent ${f.consecutiveAbsentSpendingDays} spending day(s) since, ` +
+          `$${f.spendDuringAbsence} spent meanwhile`),
+        '',
+        'This is the failure that ran for 8+ days on a managed client in August 2026: a',
+        'tracking wrapper was removed, one event stopped arriving, and NOTHING could see it —',
+        'the account kept converting on its other events, so the blackout check stayed green,',
+        'and no ad set optimised for the dropped one, so §G Tier 1 stayed silent too.',
+        '',
+        'Check whether the event still fires on the site at all. A deploy, a tag-manager',
+        'change, or a removed snippet are the usual causes. NOTE: this is measured from',
+        'ad-ATTRIBUTED conversions, so an event that still fires for organic visitors but has',
+        'stopped for ad traffic looks identical here.',
+      ].join('\n'),
+      {
+        'Alert Class': EVENT_MIX_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Families Affected': verdict.alerting.map((f) => f.family).join(', '),
+        'Longest Absence (spending days)': worst.consecutiveAbsentSpendingDays,
+        // The UNION across families, not the sum. Each finding's own figure is account spend
+        // over ITS absent days, so adding them counts the same days once per family — three
+        // families absent on the same five days would report triple what the account spent.
+        'Spend During Absence': `$${verdict.combinedSpendDuringAbsence.toFixed(2)}`,
+        'Still Watching': verdict.healthy.join(', ') || 'none',
+        // If Meta RENAMES an action type, the old family vanishes on every account at once and
+        // each looks like a regression. Putting the unknown names next to the missing one makes
+        // that obvious at a glance instead of after an investigation.
+        'Unrecognised Action Types Seen': summary.unrecognizedActionTypes.join(', ') || 'none',
+        'Events Manager': 'https://business.facebook.com/events_manager2/list/dataset',
+        'Ads Manager': `https://business.facebook.com/adsmanager/manage/campaigns?act=${adAccountId}`,
+      },
+    );
+  } catch (error: any) {
+    // Same containment as the other three: an addition must never abort a sweep that works.
+    console.warn(`${TAG} ${adAccountId}: §G Tier 2 check failed — ${error?.message}`);
   }
 }

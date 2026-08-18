@@ -74,6 +74,7 @@ beforeEach(() => {
     fetchOptimisation: jest.fn().mockResolvedValue({
       status: 'ok', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {},
     }),
+    fetchEventMix: jest.fn().mockResolvedValue({ status: 'ok', days: [] }),
     fetchDestinations: jest.fn().mockResolvedValue(destinations()),
     now: Date.parse('2026-08-18T09:00:00Z'),
   };
