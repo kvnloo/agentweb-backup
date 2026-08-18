@@ -4622,13 +4622,13 @@ export async function runScheduledChat(
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
 
-    // ENG-1131 follow-up: re-fetch the schedule's run history immediately before
-    // deciding on a sourcing-block transition, instead of using `schedule` as
-    // loaded at the top of this (often multi-minute) function. Two runs of the
-    // same schedule racing concurrently — e.g. a manual Test click overlapping a
-    // cron trigger — would otherwise both read the SAME stale prior-run snapshot
-    // and both fire the alert. This doesn't eliminate the race (a true fix needs
-    // a DB-level conditional write), but narrows the window from run-duration
+    // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
+    // sourcing-block transition, instead of using `schedule` as loaded at the
+    // top of this (often multi-minute) function. Two runs of the same schedule
+    // racing concurrently — e.g. a manual Test click overlapping a cron trigger
+    // — would otherwise both read the SAME stale prior-run snapshot and both
+    // fire the alert. This doesn't eliminate the race (a true fix needs a
+    // DB-level conditional write), but narrows the window from run-duration
     // down to a single DB round-trip. Deliberately NOT a persisted "already
     // alerted" flag: that write can't be atomic with the email send either, and
     // would trade a rare, harmless duplicate for the strictly worse failure mode
@@ -4643,19 +4643,24 @@ export async function runScheduledChat(
     // otherwise spam an email they didn't ask for. Also skips the re-fetch
     // entirely on a test run, since it would go unused.
     if (!isTest) {
-      let priorRunResultsForTransitionCheck: any[] | undefined = schedule.runResults;
+      let freshSchedule: any = null;
       try {
-        const freshSchedule: any = await scheduleDb.getScheduleById(schedule.scheduleId);
-        if (freshSchedule) priorRunResultsForTransitionCheck = freshSchedule.runResults;
+        freshSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
       } catch (refetchError) {
         console.error(
           `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
         );
-        // Fall back to the (possibly stale) schedule.runResults already in scope.
+        // Fall back to the (possibly stale) `schedule` already in scope below.
       }
+      const priorRunResultsForTransitionCheck: any[] | undefined =
+        freshSchedule ? freshSchedule.runResults : schedule.runResults;
 
       if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
-        await notifyScheduleOwnerOfSourcingBlockTransition(schedule, userId, {
+        // Notify using the freshly re-fetched schedule, not the function-entry
+        // copy — we already paid for this read, so a mid-run edit to
+        // emailNotifications or disableSourcingBlockAlerts is honored at zero
+        // extra cost, rather than ignored until the schedule's next run.
+        await notifyScheduleOwnerOfSourcingBlockTransition(freshSchedule || schedule, userId, {
           isNowBlocked: Boolean(blockedBy),
         });
       }
