@@ -46,6 +46,31 @@ export interface TrackingMonitorCronSummary {
   optimisationDormant: number;
   /** Full absence streak but delivery already stopped — past waste, reported not paged. */
   optimisationStaleDelivery: number;
+  /** §G destinations — ACTIVE ads pointing at a page with no pixel, or a pixel the paying
+   *  account does not own. */
+  destinationAlerts: number;
+  /** Destinations that could not be read or compared. Logged: a site that blocks our fetch
+   *  is not a defect, and one that answers 403 every day must not page anyone daily. */
+  destinationUnverifiable: number;
+  /** Destinations confirmed carrying a pixel the account owns. Surfaced because a sweep that
+   *  checked NOTHING and one that checked everything and found it healthy both report zero
+   *  alerts — this is the only number that separates them. */
+  destinationOk: number;
+  /** Destinations that look uninstrumented but whose ads Meta is crediting with conversions.
+   *  Logged, never paged — the second signal outranks our HTML inference. */
+  destinationUnconfirmed: number;
+  /** Connections skipped because the same ad account was already swept successfully this run.
+   *  21 production connection rows resolve to 15 distinct accounts, so this is ~6 full account
+   *  sweeps saved per day — and it is what stops per-user counters double-counting. */
+  duplicateAccountsSkipped: number;
+  /** §G Tier 2 — conversion families that were arriving reliably and have stopped. The only
+   *  check of the four that can see an event dropped with nobody optimising for it. */
+  eventMixRegressions: number;
+  /** Families reliably present and still arriving. Printed even at zero, because "nothing to
+   *  watch" and "watching and healthy" are different states. */
+  eventMixWatched: number;
+  /** Families absent too long to still count as a regression. Logged, never paged. */
+  eventMixStale: number;
 }
 
 export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
@@ -63,7 +88,20 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     optimisationAlerts: 0,
     optimisationDormant: 0,
     optimisationStaleDelivery: 0,
+    destinationAlerts: 0,
+    destinationUnverifiable: 0,
+    destinationOk: 0,
+    destinationUnconfirmed: 0,
+    duplicateAccountsSkipped: 0,
+    eventMixRegressions: 0,
+    eventMixWatched: 0,
+    eventMixStale: 0,
   };
+
+  // ONE set for the whole sweep. An ad account connected under several user records is one
+  // account with one set of Meta data and one fix, so it is read once — and findings are
+  // filed once, rather than once per user record that happens to hold the connection.
+  const sweptAccountIds = new Set<string>();
 
   let users: any[];
   try {
@@ -78,7 +116,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
   for (const user of users) {
     summary.usersScanned++;
     try {
-      const result = await monitorUserTracking(user);
+      const result = await monitorUserTracking(user, { sweptAccountIds });
       summary.accountsChecked += result.accountsChecked;
       summary.blackouts += result.blackouts;
       summary.tokenErrors += result.tokenErrors;
@@ -92,6 +130,14 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.optimisationAlerts += result.optimisationAlerts ?? 0;
       summary.optimisationDormant += result.optimisationDormant ?? 0;
       summary.optimisationStaleDelivery += result.optimisationStaleDelivery ?? 0;
+      summary.destinationAlerts += result.destinationAlerts ?? 0;
+      summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
+      summary.destinationOk += result.destinationOk ?? 0;
+      summary.destinationUnconfirmed += result.destinationUnconfirmed ?? 0;
+      summary.duplicateAccountsSkipped += result.duplicateAccountsSkipped ?? 0;
+      summary.eventMixRegressions += result.eventMixRegressions ?? 0;
+      summary.eventMixWatched += result.eventMixWatched ?? 0;
+      summary.eventMixStale += result.eventMixStale ?? 0;
       result.unrecognizedActionTypes.forEach((t: string) => unknownTypes.add(t));
     } catch (error: any) {
       // One user's bad data must never stop the fleet being checked. A sweep that aborts
@@ -125,6 +171,30 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       : '') +
     (summary.optimisationStaleDelivery > 0
       ? `, ${summary.optimisationStaleDelivery} ad set(s) wasted spend before delivery stopped`
+      : '') +
+    (summary.destinationAlerts > 0
+      ? `, ${summary.destinationAlerts} ad destination(s) that cannot report a conversion`
+      : '') +
+    // Printed even at zero, unlike the alert counters. Zero alerts is ambiguous on its own —
+    // it reads the same whether every destination was healthy or none was ever fetched.
+    `, ${summary.destinationOk} destination(s) verified` +
+    (summary.destinationUnverifiable > 0
+      ? `, ${summary.destinationUnverifiable} unreadable`
+      : '') +
+    (summary.destinationUnconfirmed > 0
+      ? `, ${summary.destinationUnconfirmed} converting despite reading as uninstrumented`
+      : '') +
+    (summary.eventMixRegressions > 0
+      ? `, ${summary.eventMixRegressions} conversion famil(ies) that used to arrive reliably have stopped`
+      : '') +
+    // Printed even at zero: an account with nothing to watch and an account watched and found
+    // healthy both report zero regressions, and only this number separates them.
+    `, ${summary.eventMixWatched} conversion famil(ies) watched` +
+    (summary.eventMixStale > 0
+      ? `, ${summary.eventMixStale} long-dead conversion famil(ies) (not alerting)`
+      : '') +
+    (summary.duplicateAccountsSkipped > 0
+      ? `, ${summary.duplicateAccountsSkipped} duplicate connection(s) skipped`
       : '') +
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
