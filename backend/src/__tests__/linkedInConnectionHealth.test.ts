@@ -96,7 +96,7 @@ describe('recordUnipileAccountHealth — signals that must not flag an account',
     expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
   });
 
-  it('ignores an account with no owner (site-wide/shared)', async () => {
+  it('persists nothing for an account with no owner (site-wide/shared)', async () => {
     const outcome = await recordUnipileAccountHealth({
       accountId: 'mLJm4hlsQ2eVsqqA6mlTVA',
       ownerUserId: undefined,
@@ -104,8 +104,40 @@ describe('recordUnipileAccountHealth — signals that must not flag an account',
       now: NOW,
     });
 
+    // No user record to write to and nobody whose inbox this belongs in.
     expect(outcome).toBe('no-op');
     expect(getAccountsByUserId).not.toHaveBeenCalled();
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+
+  it('still pages oncall for an ownerless account — nobody to email is not nobody to tell', async () => {
+    // These are the widest-blast-radius accounts: discovery for many customers runs
+    // through them. Returning before the alert meant one could die and emit no signal
+    // at all — no flag, no page, no gate — which is the same blind spot this module
+    // exists to close.
+    await recordUnipileAccountHealth({
+      accountId: 'mLJm4hlsQ2eVsqqA6mlTVA',
+      ownerUserId: undefined,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dedupeKey: 'linkedin-disconnected-ownerless:mLJm4hlsQ2eVsqqA6mlTVA',
+      }),
+    );
+  });
+
+  it('does not page oncall for an ownerless account on a merely indeterminate probe', async () => {
+    await recordUnipileAccountHealth({
+      accountId: 'mLJm4hlsQ2eVsqqA6mlTVA',
+      ownerUserId: undefined,
+      state: 'unknown',
+      now: NOW,
+    });
+
     expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
   });
 
@@ -751,5 +783,69 @@ describe('an org-shared account belongs to its owner, not its user', () => {
     // Writing to the caller's record would corrupt an unrelated user's account.
     expect(outcome).toBe('no-op');
     expect(updateAccountConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('reconnect must resume a schedule the gate paused', () => {
+  // The route calls `createAccount` BEFORE `clearDisconnectFlag`, and `createAccount`
+  // replaces `config` wholesale — so by the time the flag is read it is already gone.
+  // Guarding the resume on that flag meant an auto-paused schedule stayed paused
+  // forever, which is the one state a reconnect could not undo on its own and the
+  // entire reason the resume exists. The cron could not save it either: it derives
+  // `wasDisconnected` from the same wiped flag.
+  //
+  // It was also non-deterministic — the account read goes through an eventually
+  // consistent GSI, so a lagging read sometimes still saw the flag and did resume,
+  // which is exactly how this survives a manual test.
+  const PAUSED_SCHEDULE = {
+    scheduleId: 'sched-1',
+    status: 'paused',
+    pausedReason: 'linkedin_disconnected',
+    startingMessage: `Run outreach with ${ACCOUNT_ID}`,
+  };
+
+  it('resumes even when createAccount already wiped the flag', async () => {
+    givenAccount({}); // config as it looks AFTER createAccount: no needs_reconnect
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([PAUSED_SCHEDULE]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'sched-1',
+      expect.objectContaining({ status: 'active', pausedReason: null }),
+    );
+  });
+
+  it('still clears the flag when it IS present', async () => {
+    givenAccount({ needs_reconnect: true, disconnected_at: '2026-08-13T23:44:00.000Z' });
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(updateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'unipile', ACCOUNT_ID, expect.any(Function),
+    );
+  });
+
+  it('does not touch a schedule a human paused deliberately', async () => {
+    givenAccount({});
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { ...PAUSED_SCHEDULE, pausedReason: undefined },
+    ]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(scheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  it('does not touch a schedule pinning a different account', async () => {
+    givenAccount({});
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { ...PAUSED_SCHEDULE, startingMessage: 'Run outreach with someOtherAccountId' },
+    ]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(scheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
 });

@@ -257,3 +257,70 @@ describe('evaluateAccountGate — the decision itself', () => {
     expect(result.accountNames).toEqual([JENNIFER]);
   });
 });
+
+describe('a legacy row can be named by either of its two ids', () => {
+  // A connected-account row carries our `account_id` AND Unipile's own
+  // `config.unipile_account_id`. Usually equal; on legacy rows they differ. The sync
+  // cron already resolves `config?.unipile_account_id || account_id`, and the health
+  // module matches either — but this gate matched `account_id` alone, so a schedule
+  // naming the Unipile token pinned nothing and the flag written on that very row was
+  // never read. It fails open, so the cost is continued waste rather than an outage —
+  // but withholding that run is the gate's whole job.
+  const legacyRow = {
+    account_id: 'legacy-row-id',
+    account_name: 'Jennifer Sun',
+    config: { needs_reconnect: true, unipile_account_id: 'tMgX8uZJTZWTG_mFY1aI2A' },
+  };
+
+  const deps = (probe: 'connected' | 'disconnected' | 'unknown') => ({
+    listUnipileAccounts: async () => [legacyRow],
+    probeSession: jest.fn(async () => probe),
+  });
+
+  it('blocks when the schedule names the Unipile id', async () => {
+    const result = await evaluateAccountGate(
+      'Run outreach using tMgX8uZJTZWTG_mFY1aI2A against the list.',
+      'user-1',
+      deps('disconnected'),
+    );
+
+    expect(result.blocked).toBe(true);
+  });
+
+  it('blocks when the schedule names our own account_id instead', async () => {
+    const result = await evaluateAccountGate(
+      'Run outreach using legacy-row-id against the list.',
+      'user-1',
+      deps('disconnected'),
+    );
+
+    expect(result.blocked).toBe(true);
+  });
+
+  it('probes the id Unipile actually knows, not our row id', async () => {
+    const d = deps('disconnected');
+    await evaluateAccountGate('Run outreach using legacy-row-id.', 'user-1', d);
+
+    expect(d.probeSession).toHaveBeenCalledWith('tMgX8uZJTZWTG_mFY1aI2A');
+  });
+
+  it('reports the Unipile id, so the skip message and the pause lookup agree', async () => {
+    const result = await evaluateAccountGate(
+      'Run outreach using legacy-row-id.',
+      'user-1',
+      deps('disconnected'),
+    );
+
+    expect(result.accountIds).toEqual(['tMgX8uZJTZWTG_mFY1aI2A']);
+  });
+
+  it('still runs when a live probe contradicts the stored flag', async () => {
+    const result = await evaluateAccountGate(
+      'Run outreach using tMgX8uZJTZWTG_mFY1aI2A.',
+      'user-1',
+      deps('connected'),
+    );
+
+    expect(result.blocked).toBe(false);
+  });
+});
