@@ -419,6 +419,49 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
 
+# ---------------------------------------------------------------------------
+# Greptile retired 2026-08-17 (org-wide usage cap exhausted, ENG-1315) — the
+# discriminator job now fails on every PR, not because the code is bad but
+# because the third-party service is unavailable. It must keep working as the
+# draft/ready discriminator (any conclusion at all proves a real run happened),
+# but it must NOT block the verdict the way a genuine test failure does — that
+# was Harsha's explicit call ("don't be hard blocked by code rabbit tho"),
+# applied here to Greptile's own now-permanent failure state rather than
+# resurrecting the same fragility under CodeRabbit's name.
+# ---------------------------------------------------------------------------
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'a failing discriminator job alone (Greptile quota exhausted) does not block a real PASS' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"failure"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'a genuinely failing OTHER check still FAILs even while the discriminator is also failing' 1 'VERDICT: FAIL'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'the failing-discriminator exclusion names the actually-failing job, not Greptile' 1 'Backend tests (agentMode)'
+
 # A ready flip and a synchronize event can race and schedule two workflow runs
 # for the same head. GitHub's commit check-runs endpoint returns both suites,
 # newest first. The older run is then cancelled by workflow concurrency while
@@ -904,9 +947,15 @@ changed_files "${d}" 'backend/src/server.ts'
 run_gate "${d}"
 check 'a draft backend PR reports DRAFT, not the backend-suite block' 3 'is a draft'
 
-# Greptile refused: the failure is the reason, and it is named. Reporting
-# NO_EVIDENCE here would send the reader looking for a missing run when the
-# actual problem is a review that said no.
+# Greptile refused, gating the suite off entirely (ENG-915's original design,
+# since decoupled per the "runs independently of the Greptile gate" invariant
+# below — this fixture is now a defensive/legacy path, not live behaviour).
+# Before 2026-08-17 this correctly reported FAIL naming Greptile's refusal as
+# the reason. Greptile is now retired (ENG-1315, org-wide quota exhausted) and
+# its own failure conclusion carries no actionable meaning — relaying it as
+# "the reason" would be reporting a cause that isn't one. NO_EVIDENCE naming
+# the actually-skipped backend jobs is the more honest verdict: nothing was
+# tested is still caught, just without crediting a broken reviewer's opinion.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
@@ -917,7 +966,7 @@ checkruns "${d}" '[
 ]'
 changed_files "${d}" 'backend/src/server.ts'
 run_gate "${d}"
-check 'a refused-Greptile backend PR reports FAIL, not the backend-suite block' 1 'FAIL'
+check 'a failing-discriminator backend PR with the suite skipped is NO_EVIDENCE naming the real jobs, not a Greptile-blamed FAIL' 3 'Backend tests (agentMode) (skipped)'
 
 # Mid-suite: PENDING. This is the one that would bite hardest if the ordering
 # regressed, because it is the normal state of every backend PR for ~15 min.

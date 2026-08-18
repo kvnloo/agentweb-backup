@@ -115,8 +115,14 @@
 #   REPO                        owner/repo
 #   PR_NUMBER                   pull request number
 #   GH_TOKEN                    token for `gh`
-#   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
-#                               (default "Require Greptile Review")
+#   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name — proves a real
+#                               (non-draft) run happened at this head; its own
+#                               conclusion is never treated as a blocking
+#                               failure (see the classifier comment below).
+#                               (default "Require Greptile Review" — kept as
+#                               the discriminator even though Greptile itself
+#                               retired 2026-08-17; the job still runs and its
+#                               mere presence still proves a real run happened)
 #   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
 #                               `success` when the diff touches the backend
 #                               paths (ENG-915)
@@ -477,17 +483,34 @@ fi
 # Adding "neutral" to the list would fix that one value and leave the shape
 # intact for the next conclusion GitHub introduces. Instead anything outside the
 # known sets is counted, named, and blocks. Unknown is not benign.
-classified="$(printf '%s' "${runs_json}" | jq -r '
+#
+# ONE exception, added 2026-08-17 when Greptile's own monthly usage quota was
+# exhausted org-wide (ENG-1315) and Harsha retired it in favour of Code Rabbit,
+# explicitly declining to let a review tool's own availability hard-block merges
+# ("don't be hard blocked by code rabbit tho" — applied here to Greptile's now-
+# permanent failure state, not just to its successor): the discriminator job
+# ($DRAFT_JOB) is excluded from the bad/unknown counts below. It still proves a
+# real (non-draft) run happened via the separate discriminator query further
+# down, which only needs its conclusion to be present, not successful — that
+# check is untouched. What changes is that ITS OWN failure conclusion can no
+# longer, by itself, fail an otherwise-clean PR. This does not weaken section 7
+# below: if the discriminator's failure caused the real backend suite to be
+# SKIPPED (ENG-915's original gate-behind-review design), section 7 still
+# reports NO_EVIDENCE naming exactly that — nothing was tested is still caught,
+# just under the more accurate verdict now that the discriminator's own verdict
+# carries no meaning to relay.
+classified="$(printf '%s' "${runs_json}" | jq -r --arg draft_job "${DRAFT_JOB}" '
     def bad: ["failure","neutral","cancelled","timed_out","action_required","stale"];
     def known: bad + ["success","skipped"];
+    def not_draft_job: select(.name != $draft_job);
     def done_: select(.status == "completed");
-    def unknown_: done_ | select(.conclusion as $c | known | index($c) | not);
+    def unknown_: not_draft_job | done_ | select(.conclusion as $c | known | index($c) | not);
     [ ([ .check_runs[] | select(.status != "completed") ] | length),
-      ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) ] | length),
+      ([ .check_runs[] | not_draft_job | done_ | select(.conclusion as $c | bad | index($c)) ] | length),
       ([ .check_runs[] | select(.conclusion == "success") ] | length),
       ([ .check_runs[] | unknown_ ] | length),
       ([ .check_runs[] | select(.status != "completed") | .name ] | join(", ")),
-      ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
+      ([ .check_runs[] | not_draft_job | done_ | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
       ([ .check_runs[] | select(.conclusion == "skipped") | .name ] | join(", ")),
       ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", ")),
       ([ .check_runs[] | unknown_ | "\(.name) (\(.conclusion // "null"))" ] | join(", "))
