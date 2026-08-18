@@ -1846,7 +1846,12 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
         creatives: args.creatives,
       }
     );
-  }
+  },
+  // ENG-1276 follow-up: only fetches analytics (getAdAnalytics) — no
+  // write-capable action in this tool's schema at all, unlike its sibling
+  // call_linkedin_marketing_api (CREATE/UPDATE/UPLOAD/SEND), which stays
+  // unflagged on purpose.
+  readOnly: true
 });
 
 emmaToolRegistry.register({
@@ -2147,7 +2152,11 @@ emmaToolRegistry.register({
       args.focus_areas,
       context?.userId
     );
-  }
+  },
+  // ENG-1276 follow-up: performDeepResearchTool only calls Gemini Deep Research
+  // and uploads the result to internal S3 — no external publish, no CRM write,
+  // no third-party account action. Same shape as perform_data_analysis.
+  readOnly: true
 });
 
 // --- Tools from contentTools.ts ---
@@ -8728,6 +8737,11 @@ GAQL EXAMPLES:
   execute: async (args: any, context: any) => {
     return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
   },
+  // ENG-1276 follow-up: only fetches metrics/GAQL results (getQuickMetrics,
+  // queryReporting) — no write-capable action in this tool's schema at all,
+  // unlike its sibling call_google_ads_api (CREATE/UPDATE/REMOVE), which stays
+  // unflagged on purpose.
+  readOnly: true,
 });
 
 // ─── HubSpot ──────────────────────────────────────────────────────────────────
