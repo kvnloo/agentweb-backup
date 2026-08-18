@@ -147,6 +147,52 @@ describe("resolveUsageRunway", () => {
     );
   });
 
+  it("reports LOW confidence when the burn is built on inferred attribution", async () => {
+    // ENG-1210, from review on PR #2407. A pooled member's untagged row carries no
+    // payer, so it is attributed by who is a member NOW. Two consequences follow
+    // and neither is fixable in code: the row may hold counters for more than one
+    // payer, and an untagged row belonging to someone who has since left is
+    // unreachable entirely.
+    //
+    // The forecast therefore cannot claim precision. AC5 forbids presenting
+    // volatile data as a confident date, so the honest output is `low` -- not a
+    // withheld forecast, which would leave the customer with nothing.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root", orgId: "org-1" },
+      { userId: "member-a", orgId: "org-1" },
+    ]);
+    // SELF-stamped, which is what every pre-ENG-1217 row looks like: the payer
+    // field holds the acting user, so it says nothing about who actually paid and
+    // the row is ours only by current-membership inference.
+    mockQuery.mockImplementation(async (uid: string) =>
+      ledgerDays(10, 5, "2026-08", uid).map((r) => ({ ...r, billingUserId: uid })),
+    );
+
+    const { runway } = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+    expect(runway!.confidence).toBe("low");
+  });
+
+  it("reports NORMAL confidence when every row states its own payer", async () => {
+    // The control: same history, same shape, but the rows are stamped. Without
+    // this the test above would pass for a resolver that always said "low", which
+    // would be its own dishonesty -- a permanent hedge is not a confidence signal.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([
+      { userId: "billing-root", orgId: "org-1" },
+      { userId: "member-a", orgId: "org-1" },
+    ]);
+    // Stamped: each row names the root as payer, so nothing is inferred.
+    mockQuery.mockImplementation(async (uid: string) =>
+      ledgerDays(10, 5, "2026-08", uid).map((r) => ({ ...r, billingUserId: "billing-root" })),
+    );
+
+    const { runway } = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+    expect(runway!.confidence).toBe("normal");
+  });
+
   it("counts a member who LEFT mid-cycle, whose partition no longer exists to fan out to", async () => {
     // Raised by Greptile on PR #2407. The partition fan-out can only ask about
     // people who are members NOW, so a member who leaves takes their spend out of

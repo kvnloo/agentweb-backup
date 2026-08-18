@@ -32,7 +32,7 @@
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
-import { readBilledLedgerRows } from "./llmUsageLedgerReader";
+import { readBilledLedgerRows, hasInferredAttribution } from "./llmUsageLedgerReader";
 import {
   computeUsageRunway,
   type UsageRunway,
@@ -91,11 +91,16 @@ export async function resolveUsageRunway(
   // surprise this whole feature exists to prevent.
   const rows = await readBilledLedgerRows(usage.billingUserId, cycleStartDate, today);
 
+  // Tell the forecast when its inputs are only approximately ours, so it reports
+  // `low` confidence rather than a precise-looking date built on inference.
+  const attributionInferred = hasInferredAttribution(rows);
+
   const runway = computeUsageRunway({
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —
     // re-applying credits here would double-count them.
     costUsedMicroUsd: usage.costUsedMicroUsd,
     hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
+    attributionInferred,
     dailyCostMicroUsd: rows.map((row) => ({
       date: row.date,
       costMicroUsd: row.costMicroUsd || 0,

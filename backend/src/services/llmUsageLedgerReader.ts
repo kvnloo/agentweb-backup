@@ -173,11 +173,33 @@ function isBilledTo(
   actor: string,
   subject: string,
   inheritingMembers: ReadonlySet<string>,
-): boolean {
-  if (actor === subject) return true;
+): { billed: boolean; inferred: boolean } {
+  // The subject's own partition is theirs by definition -- not an inference.
+  if (actor === subject) return { billed: true, inferred: false };
   const recorded = row.billingUserId;
-  if (recorded && recorded !== actor) return recorded === subject;
-  return inheritingMembers.has(actor);
+  // The row states who paid. Evidence, not inference.
+  if (recorded && recorded !== actor) return { billed: recorded === subject, inferred: false };
+  // Nothing on the row says who paid, so this is decided by who is a member NOW.
+  return { billed: inheritingMembers.has(actor), inferred: true };
+}
+
+/**
+ * A read-time annotation, never persisted: this row's attribution was INFERRED
+ * from current org membership because the row itself does not record a payer.
+ *
+ * It exists so the forecast can stop claiming precision it does not have
+ * (ENG-1210 AC5), and it marks exactly the rows both remaining review findings
+ * are about: an untagged row can hold counters from more than one payer, and an
+ * untagged row belonging to someone who has since LEFT is not reachable at all.
+ * Neither is recoverable -- membership is not versioned anywhere -- so the honest
+ * response is to tell the caller the number is approximate rather than to imply
+ * a precision the stored data cannot support.
+ */
+export const ATTRIBUTION_INFERRED = Symbol.for("agentweb.ledger.attributionInferred");
+
+/** True when any row in the set was attributed by membership inference. */
+export function hasInferredAttribution(rows: readonly UsageRecordRow[]): boolean {
+  return rows.some((r) => (r as unknown as Record<symbol, unknown>)[ATTRIBUTION_INFERRED] === true);
 }
 
 /**
@@ -203,9 +225,15 @@ export async function readPooledLedgerRows(
   const perUser = await Promise.all(
     candidateUserIds.map(async (userId) => {
       const rows = await usageRecordDb.queryByUserDateRange(userId, startDate, endDate);
-      return (rows || []).filter((row) =>
-        isBilledTo(row, userId, billingUserId, inheritingUserIds),
-      );
+      const kept: UsageRecordRow[] = [];
+      for (const row of rows || []) {
+        const { billed, inferred } = isBilledTo(row, userId, billingUserId, inheritingUserIds);
+        if (!billed) continue;
+        // Annotated on a copy so the caller's row object is never mutated and the
+        // marker cannot be mistaken for a stored attribute.
+        kept.push(inferred ? Object.assign({}, row, { [ATTRIBUTION_INFERRED]: true }) : row);
+      }
+      return kept;
     }),
   );
   return perUser.flat();

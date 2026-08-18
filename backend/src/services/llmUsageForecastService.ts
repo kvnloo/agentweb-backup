@@ -78,6 +78,20 @@ export interface UsageRunwayInput {
   cycleResetDate: string;
   /** The in-progress (incomplete) day, `YYYY-MM-DD`. */
   today: string;
+  /**
+   * Some rows in this window were attributed by CURRENT org membership because
+   * they carry no payer of their own (ENG-1210).
+   *
+   * Two things follow, and neither is recoverable in code: an untagged row can
+   * hold counters from more than one payer, and an untagged row belonging to
+   * someone who has since left the org is not reachable at all -- so the burn
+   * this forecast is built from may be both misattributed and incomplete.
+   *
+   * AC5 requires insufficient or volatile data to be presented honestly and
+   * forbids a false-precision date. A number derived from inferred attribution is
+   * exactly that, so it is reported as `low` confidence rather than `normal`.
+   */
+  attributionInferred?: boolean;
 }
 
 export type RunwayConfidence = "insufficient_data" | "low" | "normal";
@@ -189,6 +203,11 @@ export function computeUsageRunway(input: UsageRunwayInput): UsageRunway {
   let confidence: RunwayConfidence;
   if (!hasForecast) confidence = "insufficient_data";
   else if (trailingSevenBurn === null) confidence = "low";
+  // Enough history, but the history itself is only approximately ours. Capped at
+  // `low` rather than downgraded to `insufficient_data`: the forecast is still the
+  // best available answer, and withholding it entirely would leave the customer
+  // with nothing -- worse than an uncertain figure honestly labelled.
+  else if (input.attributionInferred) confidence = "low";
   else confidence = "normal";
 
   return {
