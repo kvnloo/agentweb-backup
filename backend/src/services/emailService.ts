@@ -1063,7 +1063,8 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     toEmails: string | string[],
     opts: {
       accountName: string;
-      disconnectedAt: string;
+      /** Omit when the real disconnect time is unknown — better silent than invented. */
+      disconnectedAt?: string;
       isReminder: boolean;
       daysDisconnected: number;
       /**
@@ -1087,10 +1088,13 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       // Name the zone. Without it this renders in the server's zone with no label, so
       // "Aug 17, 2026, 12:00 PM" tells the customer nothing they can act on.
       // sendScheduledChatVariableRequestEmail already does this for the same reason.
-      const when = new Date(opts.disconnectedAt).toLocaleString('en-US', {
-        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-        timeZoneName: 'short',
-      });
+      const whenParsed = opts.disconnectedAt ? new Date(opts.disconnectedAt) : null;
+      const when = whenParsed && !Number.isNaN(whenParsed.getTime())
+        ? whenParsed.toLocaleString('en-US', {
+            year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            timeZoneName: 'short',
+          })
+        : null;
       const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
       const headline = opts.pausedScheduleName
         ? 'A schedule was paused — LinkedIn still disconnected'
@@ -1104,10 +1108,16 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const settingsUrl = `${customerFrontendUrl}/settings/accounts`;
       // A paused schedule needs BOTH actions, and saying only "reconnect" would
       // leave it stopped indefinitely.
-      const skippedRuns = opts.skippedRunCount ?? opts.daysDisconnected;
+      // NOT `?? opts.daysDisconnected`: that fallback re-created the units bug it was
+      // added to remove, silently, for any caller that sets `pausedScheduleName`
+      // without a run count.
+      const skippedRuns = opts.skippedRunCount;
+      const pausedAfter = typeof skippedRuns === 'number'
+        ? ` after ${skippedRuns} skipped run${skippedRuns === 1 ? '' : 's'}`
+        : '';
       const resumeHtml = opts.pausedScheduleName
-        ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong> has been paused after
-             ${skippedRuns} skipped run${skippedRuns === 1 ? '' : 's'}.
+        ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong>
+             has been paused${pausedAfter}.
              Reconnecting is not enough on its own — once the account is back, switch the schedule
              back on from your schedules page.</p>`
         : `<p style="line-height: 1.6;">
@@ -1140,7 +1150,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
               <div class="error-section">
                 <h3>LinkedIn outreach is paused until you reconnect</h3>
                 <p style="margin: 0; line-height: 1.6;">
-                  LinkedIn ended the session for <strong>${safeName}</strong> on <strong>${when}</strong>.
+                  LinkedIn ended the session for <strong>${safeName}</strong>${when ? ` on <strong>${when}</strong>` : ''}.
                   Reconnecting takes about a minute and only you can do it &mdash; it needs your LinkedIn login.
                 </p>
               </div>
@@ -1173,7 +1183,7 @@ What has stopped:
 - Reading how many invitations are still pending
 
 ${opts.pausedScheduleName
-  ? `"${opts.pausedScheduleName}" has been paused after ${skippedRuns} skipped run(s). Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
+  ? `"${opts.pausedScheduleName}" has been paused${pausedAfter}. Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
   : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
 
 ---

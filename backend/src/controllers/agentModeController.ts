@@ -3432,12 +3432,15 @@ async function pauseScheduleForDisconnectedAccount(
       const recipients: string[] = Array.isArray(schedule.emailNotifications)
         ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
         : [];
-      let notifyEmails = recipients;
-      if (notifyEmails.length === 0) {
-        const { userDb } = await import('../services/db');
-        const owner = await userDb.getUserById(userId);
-        if (owner?.email) notifyEmails = [owner.email];
-      }
+      // The owner is UNIONED in, not used as a fallback. Only the account owner can
+      // re-authenticate and re-enable the schedule, so a schedule configured to
+      // report to, say, marketing@company.com would otherwise stop permanently
+      // without the one person who can restart it ever being told.
+      const { userDb } = await import('../services/db');
+      const owner = await userDb.getUserById(userId).catch(() => null);
+      const notifyEmails = Array.from(new Set(
+        [...recipients, owner?.email].filter((e): e is string => typeof e === 'string' && !!e.trim()),
+      ));
       if (notifyEmails.length > 0) {
         const { emailService } = await import('../services/emailService');
         // Read the real disconnect time rather than stamping "now": the account has
@@ -3447,14 +3450,24 @@ async function pauseScheduleForDisconnectedAccount(
         const health = gate.accountIds[0]
           ? await getUnipileHealth(gate.accountIds[0], userId).catch(() => null)
           : null;
-        const disconnectedAt = health?.disconnected_at || new Date().toISOString();
-        const since = Date.parse(disconnectedAt);
+        // Falling back to "now" would say the account dropped this instant, which is
+        // the opposite of true by the time five runs have been skipped — and is
+        // exactly what the comment above says this email must not do. The oldest
+        // trailing skip is a real lower bound on how long this has been broken.
+        const trailingSkipResults = Array.isArray(schedule.runResults)
+          ? schedule.runResults.filter((r: any) => r?.status === ACCOUNT_DISCONNECTED_STATUS)
+          : [];
+        const oldestSkipAt = trailingSkipResults.length > 0
+          ? trailingSkipResults[0]?.createdAt
+          : undefined;
+        const disconnectedAt = health?.disconnected_at || oldestSkipAt || undefined;
+        const since = disconnectedAt ? Date.parse(disconnectedAt) : NaN;
         const daysDisconnected = Number.isFinite(since)
           ? Math.max(0, Math.floor((Date.now() - since) / (24 * 60 * 60 * 1000)))
           : 0;
         await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
           accountName: gate.accountNames[0] || 'your LinkedIn account',
-          disconnectedAt,
+          disconnectedAt,  // may be undefined — the email omits the line rather than inventing one
           isReminder: true,
           // These are different units and were previously conflated: the copy read
           // "N days of skipped runs" off a RUN count. A schedule firing every 3 days
