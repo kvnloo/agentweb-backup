@@ -289,6 +289,68 @@ describe('findStepContentLoss — a refusal must say which KIND of loss it saw (
   });
 });
 
+describe('findStepContentLoss — the rewrite carve-out must not swallow an amendment (Greptile round 3)', () => {
+  // `replacementCarriesContent` asked only whether each incoming step had SOME
+  // content. A payload that renamed and renumbered every step — so nothing
+  // paired — while keeping the descriptions and dropping the skillIds therefore
+  // read as a deliberate wholesale rewrite, and every loss was suppressed. The
+  // endpoint persisted the blanked field with HTTP 200 and no stepContentLoss.
+  //
+  // What separates the two is whether the incoming plan REUSES the prose of the
+  // one it replaces. Nobody writes a genuinely new plan whose step description
+  // is byte-identical to the old one's; that is an amendment that lost its
+  // footing. Only prose counts — skillIds and requiredFunctionCalls repeat
+  // across unrelated plans all the time, so treating those as evidence of
+  // amendment would refuse ordinary rewrites.
+  const before = [
+    { stepCount: 1, title: 'Alpha', description: 'SHARED-A', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    { stepCount: 2, title: 'Beta', description: 'SHARED-B', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+  ];
+
+  it('flags a renumbered rewrite that keeps the prose but drops the skillIds', () => {
+    const after = [
+      { stepCount: 3, title: 'Gamma', description: 'SHARED-A', skillIds: [], requiredFunctionCalls: [] },
+      { stepCount: 4, title: 'Delta', description: 'SHARED-B', skillIds: [], requiredFunctionCalls: [] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss.length).toBeGreaterThan(0);
+    expect(JSON.stringify(loss)).toContain('skillIds');
+  });
+
+  it('still stays silent on a genuinely new plan that supplies no skillIds', () => {
+    // The capability the carve-out exists for. A fresh plan whose steps carry
+    // only descriptions must not be refused, or replacing a plan becomes
+    // impossible without confirm_step_removal.
+    const after = [
+      { stepCount: 1, title: 'New One', description: 'brand new text 1', skillIds: [], requiredFunctionCalls: [] },
+      { stepCount: 2, title: 'New Two', description: 'brand new text 2', skillIds: [], requiredFunctionCalls: [] },
+    ];
+    expect(findStepContentLoss(before, after)).toHaveLength(0);
+  });
+
+  it('does not treat a reused skillId as evidence of an amendment', () => {
+    // A new plan may legitimately drive the same skill. If low-cardinality
+    // fields counted, this ordinary rewrite would be refused.
+    const after = [
+      { stepCount: 1, title: 'New One', description: 'brand new text 1', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'New Two', description: 'brand new text 2', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    expect(findStepContentLoss(before, after)).toHaveLength(0);
+  });
+
+  it('flags reuse of userInstructions just as it flags a reused description', () => {
+    const withInstructions = [
+      { stepCount: 1, title: 'Alpha', userInstructions: 'DO THE THING', skillIds: ['a'] },
+      { stepCount: 2, title: 'Beta', userInstructions: 'DO THE OTHER', skillIds: ['b'] },
+    ];
+    const after = [
+      { stepCount: 3, title: 'Gamma', userInstructions: 'DO THE THING', skillIds: [] },
+      { stepCount: 4, title: 'Delta', userInstructions: 'DO THE OTHER', skillIds: [] },
+    ];
+    expect(findStepContentLoss(withInstructions, after).length).toBeGreaterThan(0);
+  });
+});
+
 describe('summarizeStepChange (ENG-1221 AC3)', () => {
   it('reports a diff when steps actually changed', () => {
     const partial = TEN.map((s) => ({ stepCount: s.stepCount, skillIds: ['skill-b'] }));
