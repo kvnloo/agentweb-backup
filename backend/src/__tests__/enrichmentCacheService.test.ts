@@ -335,4 +335,29 @@ describe('buildLinkedInContextFromCache', () => {
     const ctx = buildLinkedInContextFromCache(MOCK_PERSON_RAW_DATA, false);
     expect(ctx).not.toContain('Resolved LinkedIn profile URL');
   });
+
+  it('strips the fabricated /in/undefined out of a row cached before the write-side fix', () => {
+    // A cache hit replays the stored blob verbatim, so rows written while the
+    // anonymized sentinel was still being persisted would keep handing the LLM a
+    // profile URL that resolves to nobody — long after the write path stopped
+    // producing them.
+    const poisoned = {
+      ...MOCK_PERSON_RAW_DATA,
+      linkedinData: {
+        ...(MOCK_PERSON_RAW_DATA as any).linkedinData,
+        rawProfile: {
+          public_identifier: 'undefined',
+          public_profile_url: 'https://www.linkedin.com/in/undefined',
+          headline: 'CEO at Acme',
+        },
+      },
+    } as any;
+
+    const ctx = buildLinkedInContextFromCache(poisoned, true);
+
+    expect(ctx).not.toContain('/in/undefined');
+    expect(ctx).not.toContain('"public_identifier"');
+    // The genuine content of the row still survives.
+    expect(ctx).toContain('CEO at Acme');
+  });
 });
