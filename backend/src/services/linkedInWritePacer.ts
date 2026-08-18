@@ -150,7 +150,16 @@ export function __resetWritePacerForTests(): void {
 
 function pruneWindow(accountId: string, now: number): number[] {
   const recent = (recentWritesByAccount.get(accountId) || []).filter((ts) => now - ts < HOUR_MS);
-  recentWritesByAccount.set(accountId, recent);
+  // Drop the key entirely once its window is empty rather than parking an empty
+  // array under it forever. `chainByAccount`/`queueDepthByAccount` already clean up
+  // this way; without it, a long-lived process accumulates one permanent entry per
+  // account it has ever written for, including one-off accounts that never return.
+  // The grant path below re-sets the key, so an active account is unaffected.
+  if (recent.length === 0) {
+    recentWritesByAccount.delete(accountId);
+  } else {
+    recentWritesByAccount.set(accountId, recent);
+  }
   return recent;
 }
 
@@ -199,9 +208,17 @@ export async function reserveWriteSlot(
   }
 
   // Estimate the queue wait before committing, so an over-long queue refuses rather
-  // than parking the caller for minutes. Each call ahead of us costs one gap.
+  // than parking the caller for minutes.
+  //
+  // The estimate has to be an UPPER bound or the cap does not hold: `maxQueueWaitMs`
+  // is a promise that an admitted caller will not sit longer than that. Each call
+  // ahead of us costs up to one gap, and so does our own turn after the last of them
+  // — hence `queuedAhead + 1`, not `queuedAhead`. The jitter below is ±20% of the
+  // gap (`0.2 * (random() - 0.5) * 2`), so the worst case per slot is 1.2 gaps.
+  // Under-estimating both terms let a caller be admitted and then wait past the cap.
   const queuedAhead = queueDepthByAccount.get(accountId) ?? 0;
-  const projectedWait = queuedAhead * gap;
+  const worstCaseSlotMs = Math.ceil(gap * 1.2);
+  const projectedWait = (queuedAhead + 1) * worstCaseSlotMs;
   if (queuedAhead > 0 && projectedWait > maxQueueWaitMs()) {
     return {
       allowed: false,
