@@ -2823,6 +2823,24 @@ export class MetaService {
         return { success: false, error: message, usage };
       }
 
+      // The ONLY record of what identity actually left this process, and the reason it exists
+      // is specific: Meta's `/stats?aggregation=match_keys` does NOT report `fbc` or `fbp`.
+      // Verified 2026-08-18 across three production pixels carrying real paid traffic and ~15
+      // distinct event types — zero occurrences of either, including on a lander proven to set
+      // both cookies. So an absent `fbc` there is NOT evidence it was never sent, and ENG-926's
+      // AC2 was once judged failed on exactly that inference (§50, corrected in §55).
+      //
+      // Until someone has Business Manager access, this line is the only send-side proof
+      // available — §42 recorded the gap as "nothing logs it".
+      //
+      // KEY NAMES ONLY, never values: every entry here is PII (`em`/`ph`/`fn`/`ln` hashes,
+      // `client_ip_address`, `client_user_agent`) or a click identifier (`fbc`/`fbp`).
+      console.log(
+        `[MetaService] CAPI ${event.eventName || 'Lead'} accepted — pixel ${pixelId} ` +
+        `event_id=${event.eventId} user_data keys: ` +
+        `${Object.keys(userData).sort().join(',') || '(none)'}`,
+      );
+
       return { success: true, fbtraceId: data.fbtrace_id, usage };
     } catch (error: any) {
       console.error(`[MetaService] sendCapiLeadEvent threw for pixel ${pixelId}: ${error?.message}`);
