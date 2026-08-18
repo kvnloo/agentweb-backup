@@ -41,6 +41,20 @@ describe('AgentMode system prompt — answer directness & length contract (ENG-1
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('on your FIRST attempt');
   });
 
+  // CodeRabbit (PR #2468): the mandatory "Every message must end with:
+  // 👉 Next Step: ..." closing (Content Quality Standard, above) is
+  // unconditional elsewhere in the prompt and would make a tight explicit
+  // length (e.g. "ten words") structurally impossible to honor unless the
+  // length rule explicitly takes precedence over it.
+  it('makes an explicit stated length override the mandatory Next Step closing when both cannot fit', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'That budget covers the ENTIRE visible response, including the mandatory 👉 Next Step closing',
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'drop the Next Step line for that reply rather than exceed the length the user asked for',
+    );
+  });
+
   // Criterion 3: terse by default (~150 words) on factual/config questions,
   // and a compact per-claim tag replacing the old two-separate-lists format.
   it('requires factual/config answers to stay under ~150 words unless depth is requested', () => {
