@@ -11,7 +11,12 @@
  */
 
 import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
-import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { linkedInOutreachService, isProvenDisconnectError } from '../services/linkedInOutreachService';
+import {
+  getUnipileHealth,
+  recordUnipileAccountHealth,
+  SessionState,
+} from '../services/linkedInConnectionHealth';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
@@ -498,6 +503,68 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
   }
 }
 
+// ─── Disconnected-account backoff (ENG-1197) ─────────────────────────────────
+
+/**
+ * How long a known-dead account waits between liveness re-checks.
+ *
+ * Deliberately in memory rather than persisted: pacing a probe is not state worth a
+ * DynamoDB write on every cycle, and the worst a process restart can cost is one
+ * extra probe.
+ */
+export const DISCONNECTED_RECHECK_MS = 30 * 60 * 1000;
+
+const lastRecheckAtByAccount = new Map<string, number>();
+
+/** Test-only: clears the backoff state so each test starts from a clean slate. */
+export function __resetDisconnectBackoffForTests(): void {
+  lastRecheckAtByAccount.clear();
+}
+
+/**
+ * True when this account is known dead and its next re-check is not due yet.
+ *
+ * A dead account used to cost exactly as much to poll as a live one, every ten
+ * minutes, on both instances, forever. Two accounts have been in that state for
+ * weeks. When the re-check IS due this runs the cheap session probe rather than a
+ * full sync — a live session then clears the flag and the next cycle syncs normally.
+ */
+async function shouldSkipDisconnectedAccount(
+  accountId: string,
+  ownerUserId: string | undefined,
+): Promise<boolean> {
+  // Site-wide accounts have no owner record to carry a flag, so they are never
+  // skipped — they also aren't anyone's to notify about.
+  if (!ownerUserId) return false;
+
+  try {
+    const health = await getUnipileHealth(accountId, ownerUserId);
+    if (!health?.needs_reconnect) return false;
+
+    const lastRecheck = lastRecheckAtByAccount.get(accountId);
+    if (lastRecheck !== undefined && Date.now() - lastRecheck < DISCONNECTED_RECHECK_MS) {
+      return true;
+    }
+
+    lastRecheckAtByAccount.set(accountId, Date.now());
+    const state = await linkedInOutreachService.probeAccountSession(accountId);
+    await recordUnipileAccountHealth({ accountId, ownerUserId, state });
+    if (state === 'connected') {
+      console.log(`${TAG} account=${accountId} reconnected — resuming full sync`);
+      return false;
+    }
+    // 'unknown' skips too: an indeterminate probe is no reason to spend a full sync
+    // on an account we already have proof is dead.
+    return true;
+  } catch (err) {
+    // This runs OUTSIDE the per-account try blocks below, so an unexpected throw
+    // here would abort the whole cycle for every remaining account rather than one.
+    // Fail toward syncing: a wasted sync is cheaper than a stalled sweep.
+    console.error(`${TAG} health pre-check failed for account ${accountId}; syncing anyway:`, err);
+    return false;
+  }
+}
+
 // ─── Invite-feed walk pacing (ENG-1197) ──────────────────────────────────────
 
 /**
@@ -567,6 +634,12 @@ export async function runLinkedInConnectionSync(): Promise<void> {
 
     const allNewConnections: UnipileConnection[] = [];
     for (const accountId of accountIds) {
+      const ownerUserId = ownerByAccountId.get(accountId);
+      if (await shouldSkipDisconnectedAccount(accountId, ownerUserId)) continue;
+
+      // Health is derived from the calls this loop already makes; adding a probe
+      // per account per cycle would undo the saving above.
+      let observed: SessionState = 'unknown';
       let acceptedProfileUrls: string[] = [];
       try {
         // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
@@ -581,6 +654,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         const wasBackfill = (await getFullSyncCompletedAt(accountId).catch(() => null)) === null;
 
         const newConns = await syncConnectionsForAccount(accountId);
+        observed = 'connected';
         // Only on a NON-backfill run. A backfill returns the account's entire
         // connection history, and feeding thousands of URLs into the cleanup below
         // turns a tidy-up into a full scan of the cache on the cron path — for
@@ -592,6 +666,10 @@ export async function runLinkedInConnectionSync(): Promise<void> {
           allNewConnections.push(...newConns);
         }
       } catch (err) {
+        // Only a proven-dead signal downgrades health. A timeout or 5xx here must
+        // stay 'unknown', or a brief Unipile wobble would flag a live account and
+        // email its owner to reconnect for nothing.
+        if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
       }
       // A newly-detected connection means that person's invitation was accepted, so
@@ -617,8 +695,20 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         const walkMode = chooseWalkMode(accountId);
         await syncSentInvitationsForAccount(accountId, { mode: walkMode });
         if (walkMode === 'full') markFullWalkCompleted(accountId);
+        if (observed !== 'disconnected') observed = 'connected';
       } catch (err) {
+        // 'disconnected' wins over 'connected': proof of a dead session from either
+        // call outranks the other having succeeded before it died.
+        if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sent-invitation sync failed for account ${accountId}:`, err);
+      }
+      await recordUnipileAccountHealth({ accountId, ownerUserId, state: observed });
+      if (observed === 'disconnected') {
+        // Nothing below can succeed against a dead session, and reconciling a
+        // half-read invitation feed into a customer's CRM would be worse than
+        // skipping it.
+        lastRecheckAtByAccount.set(accountId, Date.now());
+        continue;
       }
       // Then mirror those pending invitations into the CRM (ENG-787). Runs here, right
       // after the refresh, because a pending invitation is the ONLY window in which an
@@ -626,7 +716,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // feed and is pruned from the cache. Attribution that depends on a manual backfill
       // therefore races acceptance, and loses for invites sent outside this product,
       // sent without a resolvable list, or whose send-time mirror write failed.
-      await reconcileInvitesToCrmForAccount(accountId, ownerByAccountId.get(accountId));
+      await reconcileInvitesToCrmForAccount(accountId, ownerUserId);
     }
 
     // Auto-enroll leads and send email notifications for newly accepted connections

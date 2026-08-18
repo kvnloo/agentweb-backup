@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { clearDisconnectFlag } from '../services/linkedInConnectionHealth';
 
 const router = express.Router();
 
@@ -114,7 +115,14 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
 
     // Invalidate the cached connectivity status so the next GET /connected-accounts
     // re-checks Unipile rather than returning the stale "disconnected" result.
+    //
+    // That cache is per-process, and production runs more than one instance, so this
+    // alone only convinces whichever instance happened to serve the reconnect. Clear
+    // the persisted flag too (ENG-1197) — that is the copy the other instance and the
+    // scheduled runner read, and leaving it set is how an account stays "disconnected"
+    // in-app after the customer has genuinely reconnected it.
     linkedInOutreachService.clearStatusCache(unipileAccountId);
+    await clearDisconnectFlag(userId, unipileAccountId);
 
     console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} (name: "${accountName}") for user ${userId}`);
     res.json({ success: true, account });

@@ -63,7 +63,11 @@ jest.mock('../services/dripSequenceDb', () => ({
 }));
 jest.mock('../services/leadListAlertService', () => ({ leadListAlertService: {} }));
 
-import { runLinkedInConnectionSync, __resetWalkPacingForTests } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetDisconnectBackoffForTests,
+  __resetWalkPacingForTests,
+} from '../cron/linkedInConnectionSyncCron';
 
 const ACCOUNT = 'tMgX8uZJTZWTG_mFY1aI2A';
 const OWNER = 'user_1';
@@ -75,7 +79,9 @@ describe('sync cron → invite CRM reconciliation', () => {
   const originalFlag = process.env.LINKEDIN_INVITE_CRM_RECONCILE;
 
   beforeEach(() => {
-  // ENG-1197: the cron paces its full walk per account in module state.
+  // ENG-1197: the cron paces both its dead-account re-checks and its full
+  // walk in module state.
+  __resetDisconnectBackoffForTests();
   __resetWalkPacingForTests();
     jest.clearAllMocks();
     process.env.LINKEDIN_INVITE_CRM_RECONCILE = 'true';
