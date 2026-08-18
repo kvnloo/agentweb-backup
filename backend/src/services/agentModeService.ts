@@ -295,6 +295,12 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import {
+  isAnonymizedIdentifier,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -2983,20 +2989,36 @@ export class AgentModeService {
       throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
     }
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
+    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed.
+    // ENG-700: providerLabel is set in the SAME model-id branch that decides
+    // which resolver produces `client`, so the metering label below can never
+    // independently drift from the resolver that actually serves the call —
+    // it is NOT derived from whether `client` happens to be cached yet (a
+    // Bedrock/Vertex client is cached on the registry after its first call,
+    // same as an Azure client is pre-populated at construction time, so
+    // "client is already set" cannot distinguish the providers).
     let client = this.llmModels[model].client;
+    let providerLabel: string;
     if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
-    } else if (!client) {
-      if (model.startsWith('anthropic.')) {
+      providerLabel = 'gemini';
+    } else if (model.startsWith('anthropic.')) {
+      providerLabel = 'bedrock';
+      if (!client) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
-      } else if (model.startsWith('claude-')) {
+      }
+    } else if (model.startsWith('claude-')) {
+      providerLabel = 'vertex';
+      if (!client) {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
-      } else {
+      }
+    } else {
+      providerLabel = 'azure-openai';
+      if (!client) {
         throw new Error(`Client not initialized for model: ${model}`);
       }
     }
@@ -3029,10 +3051,10 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
-                : model.startsWith('anthropic.') ? 'bedrock'
-                : model.startsWith('claude-') ? 'vertex'
-                : 'azure-openai',
+              // ENG-700: the label of the client that actually served this call
+              // (set above, alongside client resolution) — not re-derived from
+              // the model id, which can diverge for a vendor/model-namespaced id.
+              provider: providerLabel,
               feature: usageContext?.feature || 'agent_task',
               // ENG-1251: the response's own id is stable across a retried/
               // re-processed response and distinct across real calls — closes
@@ -31793,7 +31815,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
             // public_identifier literally the string 'undefined' — passing those
             // through yields unusable fake profile URLs like /in/undefined.
-            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const usableItems = searchResult.items.filter((item: any) => !isAnonymizedIdentifier(item.public_identifier));
+            // How many the filter removed. ENG-1198 dropped them silently, which
+            // turned "every match was out-of-network" into an empty list
+            // indistinguishable from "nobody matches" — and from the ENG-975
+            // account-cannot-search outage. The ENG-975 canary deliberately does not
+            // cover this case: it only fires when the RAW page was empty, and here
+            // the account searched fine and returned rows we then discarded. So the
+            // count has to be reported, or the agent is left guessing which of three
+            // very different situations it is in.
+            const anonymizedFiltered = searchResult.items.length - usableItems.length;
             const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
@@ -31816,7 +31847,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
+            const searchData = withAccountMeta({
+              ...searchResult,
+              items: trimmedItems,
+              ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+            });
+            if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
+              // Say plainly what happened, so this does not get reported to the
+              // user as "no prospects match" or escalated as a broken search.
+              return {
+                success: true,
+                message:
+                  `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
+                  `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
+                  `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            return { success: true, data: searchData };
           }
           return { success: true, data: withAccountMeta(searchResult) };
         }
@@ -31851,17 +31899,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // viewer's connection state back into the shared cache and re-introduce the
           // very cross-viewer leak this fix closes.
           if (raw && typeof raw === 'object') {
+            // Both halves must reject the sentinel, because this URL is used as a
+            // DynamoDB GSI lookup key below. Unfiltered, EVERY anonymized profile
+            // queries the same `/in/undefined` key — and the connection-sync cron
+            // writes rows under exactly that key — so the lookup returns an
+            // unrelated person's connection row and their is_relationship /
+            // connected_at get presented as this user's, driving the agent's
+            // invite-vs-message decision off a stranger's state.
             const profileUrl =
-              raw.public_profile_url ||
-              (raw.public_identifier
-                ? `https://www.linkedin.com/in/${raw.public_identifier}`
-                : (isUrl ? target : null));
+              usableProfileUrl(raw.public_profile_url) ||
+              (usablePublicIdentifier(raw.public_identifier)
+                ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                : (isUrl ? usableProfileUrl(target) : null));
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
             // with public_identifier literally the string 'undefined' — mirrors
             // the search-people filtering above. get-profile can't drop the row
             // (the caller asked for this specific person), so flag it and drop
             // the fabricated /in/undefined URL instead.
-            const isAnonymized = raw.public_identifier === 'undefined';
+            const isAnonymized = isAnonymizedIdentifier(raw.public_identifier);
             let conn: { connectedAt?: number } | null = null;
             // A shared/site-wide account's connection state belongs to a
             // STRANGER, not the user — reconciling is_relationship/connected_at
@@ -31897,9 +31952,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const isConnected =
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
-              ...viewerIndependentRaw,
+              // Dropping the fabricated URL alone was not enough: `public_identifier`
+              // stayed on the object as the literal string 'undefined', so the agent
+              // was handed the exact slug needed to rebuild the dead link itself.
+              ...withoutFabricatedProfileFields(viewerIndependentRaw),
               // Never surface the fabricated /in/undefined URL for an anonymized profile.
-              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              ...(isAnonymized || !usableProfileUrl(rawPublicProfileUrl)
+                ? {}
+                : { public_profile_url: rawPublicProfileUrl }),
               // See ENG-1198 note above: is_relationship/connected_at are the
               // user's "already connected/pending" signal — only meaningful
               // relative to the user's own account, not a borrowed shared one.
