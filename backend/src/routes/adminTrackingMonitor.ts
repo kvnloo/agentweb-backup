@@ -37,21 +37,36 @@ router.post('/run', async (req: Request, res: Response) => {
   // FLEET-WIDE run. With `dryRun: false` that is a full sweep with real oncall alerts from a
   // request that asked for one account. A request that names a scope and does not get it must
   // fail, not do something larger.
-  for (const field of ['userId', 'adAccountId'] as const) {
-    const value = body[field];
-    if (value === undefined) continue; // genuinely omitted — unscoped is the intent
-    if (typeof value !== 'string' || !value.trim()) {
-      return res.status(400).json({
-        message: `${field} must be a non-empty string when provided`,
-      });
-    }
+  //
+  // ⚠ Validation happens AFTER normalisation, and that ordering is the whole point. A first
+  // version checked the RECEIVED value and normalised afterwards, which left `"act_"` — a
+  // non-empty string — passing validation and then becoming `''` once the prefix was stripped,
+  // reinstating the exact fleet-wide widening this block exists to prevent. Validate the value
+  // you are going to USE, never the one you were handed.
+  const readScope = (field: 'userId' | 'adAccountId'): string | undefined | null => {
+    const raw = body[field];
+    if (raw === undefined) return undefined; // genuinely omitted — unscoped is the intent
+    if (typeof raw !== 'string') return null;
+    let value = raw.trim();
+    if (field === 'adAccountId') value = value.replace(/^act_/, '').trim();
+    return value === '' ? null : value;
+  };
+
+  // Checked one at a time rather than in a loop, so the COMPILER narrows `null` away before
+  // these reach the options object. A loop reads tidier and leaves the type as
+  // `string | null | undefined`, which would put the burden back on a reader to notice the
+  // rejection already happened.
+  const userId = readScope('userId');
+  if (userId === null) {
+    return res.status(400).json({ message: 'userId must be a non-empty string when provided' });
   }
 
-  const userId = typeof body.userId === 'string' && body.userId.trim() ? body.userId.trim() : undefined;
-  const adAccountId =
-    typeof body.adAccountId === 'string' && body.adAccountId.trim()
-      ? body.adAccountId.trim().replace(/^act_/, '')
-      : undefined;
+  const adAccountId = readScope('adAccountId');
+  if (adAccountId === null) {
+    return res.status(400).json({
+      message: 'adAccountId must be a non-empty account id when provided (an "act_" prefix alone is not one)',
+    });
+  }
 
   const options: TrackingMonitorRunOptions = { dryRun, userId, adAccountId };
 

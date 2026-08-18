@@ -47,6 +47,17 @@ describe('invalid scope is REJECTED, never silently widened', () => {
     expect(runMetaTrackingMonitor).not.toHaveBeenCalled();
   });
 
+  it('400s on a bare "act_" — non-empty on arrival, EMPTY after prefix stripping', async () => {
+    // The gap the first version of this validation left: `"act_"` passed the non-empty check,
+    // then became `''` once the prefix was removed, fell back to `undefined`, and reinstated
+    // the fleet-wide widening the check exists to prevent. Validate what you USE.
+    for (const value of ['act_', 'act_   ', '  act_  ', 'act_\t']) {
+      const res = await request(app).post('/api/admin/tracking-monitor/run').send({ adAccountId: value });
+      expect(res.status).toBe(400);
+    }
+    expect(runMetaTrackingMonitor).not.toHaveBeenCalled();
+  });
+
   it('400s on a structured value that would stringify into nonsense', async () => {
     const res = await request(app)
       .post('/api/admin/tracking-monitor/run')
