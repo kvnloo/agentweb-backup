@@ -1350,7 +1350,10 @@ async function checkEventMixCoverage(
         'Owner Email': user?.email,
         'Families Affected': verdict.alerting.map((f) => f.family).join(', '),
         'Longest Absence (spending days)': worst.consecutiveAbsentSpendingDays,
-        'Spend During Absence': `$${verdict.alerting.reduce((n, f) => n + f.spendDuringAbsence, 0).toFixed(2)}`,
+        // The UNION across families, not the sum. Each finding's own figure is account spend
+        // over ITS absent days, so adding them counts the same days once per family — three
+        // families absent on the same five days would report triple what the account spent.
+        'Spend During Absence': `$${verdict.combinedSpendDuringAbsence.toFixed(2)}`,
         'Still Watching': verdict.healthy.join(', ') || 'none',
         // If Meta RENAMES an action type, the old family vanishes on every account at once and
         // each looks like a regression. Putting the unknown names next to the missing one makes

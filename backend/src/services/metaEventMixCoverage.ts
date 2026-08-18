@@ -147,6 +147,15 @@ export type EventMixVerdict = {
   /** Not enough spending days in the window to judge anything at all. */
   insufficientHistory: boolean;
   spendingDaysConsidered: number;
+  /**
+   * Account spend across the UNION of every alerting family's absent days.
+   *
+   * NOT the sum of `spendDuringAbsence`. Each finding reports ACCOUNT spend over its own
+   * absent days, so three families absent on the same five days each report the same money —
+   * summing them triples it. The alert cites this figure as the reason to page a human, and
+   * an inflated one damages trust in the channel faster than a missed alert does.
+   */
+  combinedSpendDuringAbsence: number;
 };
 
 /**
@@ -160,7 +169,7 @@ export type EventMixVerdict = {
 export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVerdict {
   const verdict: EventMixVerdict = {
     alerting: [], stale: [], healthy: [], tooSparse: [], insufficientHistory: false,
-    spendingDaysConsidered: 0,
+    spendingDaysConsidered: 0, combinedSpendDuringAbsence: 0,
   };
 
   const rows = (Array.isArray(days) ? days : [])
@@ -184,6 +193,9 @@ export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVe
     verdict.insufficientHistory = true;
     return verdict;
   }
+
+  /** date -> that day's account spend, deduplicated across families. */
+  const absentDates = new Map<string, number>();
 
   const allFamilies = new Set<string>();
   for (const d of spendingDays) for (const f of familiesOf(d)) allFamilies.add(f);
@@ -233,9 +245,17 @@ export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVe
     // Past the point where this is still news. Recorded, never paged — a retired funnel must
     // not page a human daily forever just because we cannot tell it from a broken one.
     const absenceCalendarDays = daysBetween(spendingDays[lastSeenIndex].date, absent[absent.length - 1].date);
-    if (absenceCalendarDays > EVENT_MIX_MAX_ABSENCE_DAYS) verdict.stale.push(finding);
-    else verdict.alerting.push(finding);
+    if (absenceCalendarDays > EVENT_MIX_MAX_ABSENCE_DAYS) {
+      verdict.stale.push(finding);
+    } else {
+      verdict.alerting.push(finding);
+      // Union, not sum — each day's spend counts ONCE however many families were absent on it.
+      for (const d of absent) absentDates.set(d.date, Number(d.spend));
+    }
   }
+
+  verdict.combinedSpendDuringAbsence =
+    Math.round([...absentDates.values()].reduce((sum, v) => sum + v, 0) * 100) / 100;
 
   return verdict;
 }

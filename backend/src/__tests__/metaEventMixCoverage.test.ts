@@ -238,3 +238,50 @@ describe('a weekend cannot trip the streak, because non-spending days are exclud
     expect(v.healthy).toContain('cr');
   });
 });
+
+describe('combined spend across families is a UNION, not a sum', () => {
+  it('three families absent on the same days report the account spend ONCE', () => {
+    // CodeRabbit's Major: each finding's spendDuringAbsence is ACCOUNT spend over ITS absent
+    // days, so summing across families counts the same days repeatedly. Three families absent
+    // on the same five $200 days reported $3000 while the account spent $1000. That figure is
+    // the stated reason to page a human, and inflating it damages trust in the channel faster
+    // than a missed alert would.
+    const days: EventMixDay[] = [];
+    for (let i = 1; i <= 12; i++) {
+      days.push(day(`2026-08-${String(i).padStart(2, '0')}`, 200, ['lead', 'cr', 'purchase']));
+    }
+    for (let i = 13; i <= 17; i++) days.push(day(`2026-08-${i}`, 200, []));
+
+    const v = evaluateEventMix(days, '2026-08-18');
+
+    expect(v.alerting).toHaveLength(3);
+    // Each finding still reports its own account-spend figure...
+    for (const f of v.alerting) expect(f.spendDuringAbsence).toBeCloseTo(1000, 2);
+    // ...but the combined figure counts each DAY once: 08-13..08-17 = 5 x $200 = $1000,
+    // which is exactly what the account actually spent across the outage.
+    expect(v.combinedSpendDuringAbsence).toBeCloseTo(1000, 2);
+    // The naive sum would have reported TRIPLE the real spend.
+    const naive = v.alerting.reduce((n, f) => n + f.spendDuringAbsence, 0);
+    expect(naive).toBeCloseTo(3000, 2);
+    expect(v.combinedSpendDuringAbsence).toBeLessThan(naive);
+  });
+
+  it('is zero when nothing is alerting', () => {
+    const days = Array.from({ length: 12 }, (_, i) =>
+      day(`2026-08-${String(i + 1).padStart(2, '0')}`, 200, ['lead']));
+    expect(evaluateEventMix(days, '2026-08-14').combinedSpendDuringAbsence).toBe(0);
+  });
+
+  it('counts a STALE family\'s days not at all — they are not being paged about', () => {
+    const days: EventMixDay[] = [];
+    for (let i = 1; i <= 12; i++) days.push(day(`2026-06-${String(i + 10).padStart(2, '0')}`, 200, ['lead', 'cr']));
+    for (let i = 0; i < 25; i++) {
+      const d = new Date(Date.UTC(2026, 6, 1) + i * 86400000).toISOString().slice(0, 10);
+      days.push(day(d, 200, ['lead']));
+    }
+    const v = evaluateEventMix(days, days[days.length - 1].date);
+    expect(v.stale).toHaveLength(1);
+    expect(v.alerting).toEqual([]);
+    expect(v.combinedSpendDuringAbsence).toBe(0);
+  });
+});

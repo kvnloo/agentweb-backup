@@ -185,13 +185,13 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       ? `, ${summary.destinationUnconfirmed} converting despite reading as uninstrumented`
       : '') +
     (summary.eventMixRegressions > 0
-      ? `, ${summary.eventMixRegressions} event(s) that used to arrive reliably have stopped`
+      ? `, ${summary.eventMixRegressions} conversion famil(ies) that used to arrive reliably have stopped`
       : '') +
     // Printed even at zero: an account with nothing to watch and an account watched and found
     // healthy both report zero regressions, and only this number separates them.
-    `, ${summary.eventMixWatched} event(s) watched` +
+    `, ${summary.eventMixWatched} conversion famil(ies) watched` +
     (summary.eventMixStale > 0
-      ? `, ${summary.eventMixStale} long-dead event(s) (not alerting)`
+      ? `, ${summary.eventMixStale} long-dead conversion famil(ies) (not alerting)`
       : '') +
     (summary.duplicateAccountsSkipped > 0
       ? `, ${summary.duplicateAccountsSkipped} duplicate connection(s) skipped`
