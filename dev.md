@@ -1,9 +1,9 @@
 ## ENG-1312: the satisfaction judge's blind spot, and a real fixture is a data-exposure decision, not a code one (2026-08-17)
 
-Ed (xCures) and Phoenix (Vince) both reported the judge rewarding exactly the
-behavior they were complaining about — a 20-page reply to a 2-page ask
-scored 4/5 with 5/5/5 dimensions, and pushback against a direct instruction
-scored 5 for "excellent reasoning." Findings, because the shape generalizes:
+Two customers both reported the judge rewarding exactly the behavior they
+were complaining about — a 20-page reply to a 2-page ask scored 4/5 with
+5/5/5 dimensions, and pushback against a direct instruction scored 5 for
+"excellent reasoning." Findings, because the shape generalizes:
 
 - **The judge only had 3 dimensions and none of them measured length,
   instruction-following, or unnecessary caution.** `goalCompletion`/
@@ -26,21 +26,25 @@ scored 5 for "excellent reasoning." Findings, because the shape generalizes:
 
 - **"Replay fixtures with hard thresholds" sounds MOCKABLE and is, right up
   until the fixture needs real content.** All five session IDs named in this
-  issue's own acceptance criteria (`51674765`, `822c1ed4`, `68c9a8fb`,
-  `9481f94e`, `eecb6d31`) are real, existing production `AW-ChatSessions`
-  rows — verified read-only, the 8-char IDs are just the first UUID segment.
-  The mechanism (`loops/eval/agentModeReplayFixtures.ts`) is fully built and
-  tested, but populating it with the REAL transcripts means copying real,
-  named customers' verbatim conversation content into permanently-committed,
-  CI-gating git history, readable by every future clone and by Argusoft's
-  external contractors forever. That's a data-exposure call under
-  `autonomous-execution-and-merge.md`'s database/data-plane gate ("a change
-  that can... expose... existing stored data"), not a code call — filed as
-  ENG-1314 (blocks ENG-1312) with three concrete options + a recommendation
-  rather than decided unilaterally. The lesson: "no live third party" and
-  "no data-plane change" are necessary but not sufficient for MOCKABLE —
-  check whether the fixture DATA ITSELF is a live customer's content before
-  assuming the classification holds.
+  issue's own acceptance criteria (kept out of this file — see the Linear
+  issue text, not git) are real, existing production `AW-ChatSessions` rows —
+  verified read-only. The mechanism (`loops/eval/agentModeReplayFixtures.ts`)
+  is fully built and tested, but populating it with the REAL transcripts
+  means copying a real customer's verbatim conversation content into
+  permanently-committed, CI-gating git history, readable by every future
+  clone and by Argusoft's external contractors forever. That's a
+  data-exposure call under `autonomous-execution-and-merge.md`'s
+  database/data-plane gate ("a change that can... expose... existing stored
+  data"), not a code call — filed as ENG-1314 (blocks ENG-1312) with three
+  concrete options + a recommendation rather than decided unilaterally. The
+  lesson: "no live third party" and "no data-plane change" are necessary but
+  not sufficient for MOCKABLE — check whether the fixture DATA ITSELF is a
+  live customer's content before assuming the classification holds.
+  Separately (CodeRabbit, PR #2443): the real session IDs, customer/org
+  names, and quoted request text don't need to wait on that decision either
+  — they aren't the transcript content ENG-1314 is scoping, so
+  `agentModeReplayFixtures.ts`'s fixtures use neutral synthetic `id`/`label`
+  values instead, independent of how ENG-1314 resolves.
 
 ## ENG-973: the quota gate was one layer above what MCP actually calls (2026-08-08)
 

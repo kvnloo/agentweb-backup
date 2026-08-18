@@ -1,6 +1,7 @@
 /**
  * ENG-1312 criterion 3 — deterministic replay fixtures with hard char/word
- * thresholds (NOT judge score) for the named real customer sessions.
+ * thresholds (NOT judge score) for the five named real production sessions
+ * in ENG-1312/ENG-1309's own acceptance criteria.
  *
  * Pure and IO-free by design (no chatbotDb/DynamoDB dependency): this module
  * only defines fixtures and evaluates them against a transcript already in
@@ -9,24 +10,17 @@
  * below) fully separable from the mechanism that checks it.
  *
  * ============================================================================
- * SCOPE NOTE — why `turns` below is synthetic, not the real transcript
+ * SCOPE NOTE — why `turns` below is synthetic, and `id`/`label` are neutral
  * ============================================================================
- * Every session ID named in ENG-1312's own acceptance criteria was verified
- * (read-only) to be a real, existing production AW-ChatSessions row:
- *   51674765, 822c1ed4, 68c9a8fb, 9481f94e, eecb6d31
- * ("the four Ed sessions" per criterion 3's own wording — only three of those
- * five are attributed to Ed elsewhere in this issue and ENG-1309, and
- * eecb6d31 is attributed to "mvarma" in ENG-1312 but to Ed's own words in
- * ENG-1309; that inconsistency is in the human-drafted text and is not this
- * module's place to resolve — all five are registered below regardless).
- *
- * Building the REAL replay fixture means copying those real customers'
- * (Ed/xCures, Phoenix/Vince) verbatim conversation content into this
- * permanently-committed, CI-gating file — readable by every future clone and
- * by Argusoft's external contractors, forever. That is a data-exposure
- * decision, not a code decision (autonomous-execution-and-merge.md's
- * database/data-plane gate: "a change that can... expose... existing stored
- * data"), tracked on ENG-1314 (blocks ENG-1312) with three concrete options.
+ * Every real session ID named in ENG-1312's own acceptance criteria was
+ * verified (read-only) to be a real, existing production AW-ChatSessions row.
+ * Building the REAL replay fixture means copying that real customer's
+ * verbatim conversation content into this permanently-committed, CI-gating
+ * file — readable by every future clone and by Argusoft's external
+ * contractors, forever. That is a data-exposure decision, not a code
+ * decision (autonomous-execution-and-merge.md's database/data-plane gate:
+ * "a change that can... expose... existing stored data"), tracked on
+ * ENG-1314 (blocks ENG-1312) with three concrete options.
  *
  * Until ENG-1314 resolves, `turns` holds synthetic placeholder content sized
  * to demonstrate the mechanism (pass on today's placeholder, fail on an
@@ -35,12 +29,23 @@
  * mistake a placeholder pass for real evidence. Swapping in real content is a
  * data change to this file only — the checker functions never change.
  *
+ * Separately (CodeRabbit, PR #2443): the real production session IDs,
+ * customer/organization names, and verbatim quoted request text do NOT need
+ * to wait on ENG-1314 — they aren't the transcript content ENG-1314 is
+ * deciding where to store, `assistantContent()` never reads the `user` turn
+ * or `label`, and redacting them only REDUCES exposure versus the prior
+ * revision of this file. So `id` below is a neutral, synthetic slug (not a
+ * production identifier) and `label`/`turns[].content` name no customer or
+ * organization — traceability back to the real session is via
+ * `thresholdSource`'s ENG-1309/1310/1311 criterion reference plus the
+ * private Linear issue text, not via anything committed here.
+ *
  * Only 3 of the 5 sessions have an explicit NUMERIC threshold in the
  * human-written text (ENG-1309's own acceptance criteria — see
- * thresholdSource on each). The other two (822c1ed4: unnecessaryPermissionRequest,
- * 9481f94e: pushback/outputQuality) are judge-dimension assertions, not
- * char/token ones, and ENG-1309/1310/1311 give no number for them — they are
- * registered with `pending: true` (proves CI awareness of every named
+ * thresholdSource on each). The other two are judge-dimension assertions
+ * (unnecessary-permission-request and pushback/outputQuality respectively),
+ * not char/token ones, and ENG-1309/1310/1311 give no number for them — they
+ * are registered with `pending: true` (proves CI awareness of every named
  * session) rather than gated on a fabricated threshold.
  */
 
@@ -50,7 +55,8 @@ export interface ReplayFixtureAssertion {
 }
 
 export interface JudgeReplayFixture {
-  /** The (possibly abbreviated) session ID as named in the Linear issue text. */
+  /** A neutral, synthetic fixture slug — deliberately NOT the real production
+   * session ID (see the module scope note: redacted independent of ENG-1314). */
   id: string;
   label: string;
   /** Where the numeric threshold came from, or why there isn't one yet. */
@@ -147,61 +153,61 @@ export function checkAllReplayFixtures(
  */
 export const REPLAY_FIXTURES: JudgeReplayFixture[] = [
   {
-    id: '51674765',
-    label: '"2 pages → 20 pages" — Ed (xCures), 08-14, "Condense this down to maximum of 2 pages… Leave your opinions out."',
+    id: 'length-limit-ignored-1',
+    label: 'Explicit page-limit instruction ignored — reply ran far past the requested length',
     thresholdSource: 'ENG-1309 criterion 2: ≤ ~6,000 chars (today 10,524)',
     isPlaceholder: true,
     pending: false,
     turns: [
-      { role: 'user', content: 'Condense this down to maximum of 2 pages. Leave your opinions out. Leave all of the rhetoric out.' },
+      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314]' },
       { role: 'assistant', content: '[PLACEHOLDER — real content pending ENG-1314] ' + 'x'.repeat(400) },
     ],
     assertion: { maxChars: 6000 },
   },
   {
-    id: '68c9a8fb',
-    label: 'Ed (xCures) yes/no turns [15]/[25] — "Are you sure they\'re US members?" / audience-usage correction',
+    id: 'yesno-terse-1',
+    label: 'Yes/no question answered with an over-long reply instead of a terse first-attempt answer',
     thresholdSource: 'ENG-1309 criterion 1: total reply ≤ 600 chars (today 2,982 / 3,285)',
     isPlaceholder: true,
     pending: false,
     turns: [
-      { role: 'user', content: "Are you sure they're US members?" },
+      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314]' },
       { role: 'assistant', content: '[PLACEHOLDER — real content pending ENG-1314] Yes — ' + 'x'.repeat(200) },
     ],
     assertion: { maxChars: 600 },
   },
   {
-    id: 'eecb6d31',
-    label: '"Yes or no: are page_view and scroll marked as Key Events?" (attributed to mvarma in ENG-1312, to Ed in ENG-1309 — see scope note)',
+    id: 'yesno-terse-2',
+    label: 'Yes/no question answered with an over-long reply instead of a terse first-attempt answer',
     thresholdSource: 'ENG-1309 criterion 3: ≤ 150 words (today "I don\'t know" in 1,326 chars)',
     isPlaceholder: true,
     pending: false,
     turns: [
-      { role: 'user', content: 'Yes or no: are page_view and scroll marked as Key Events?' },
+      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314]' },
       { role: 'assistant', content: '[PLACEHOLDER — real content pending ENG-1314] Yes — ' + Array.from({ length: 30 }, () => 'word').join(' ') },
     ],
     assertion: { maxWords: 150 },
   },
   {
-    id: '822c1ed4',
-    label: 'Phoenix kickoff (Vince), 08-14, 48K completion tokens — "I didn\'t ask for a lecture… asking for permission to run a test"',
+    id: 'unnecessary-permission-1',
+    label: 'Assistant asked for permission to run a safe, read-only/test action instead of just doing it',
     thresholdSource: 'no numeric char/token threshold given in ENG-1309/1310/1311 — this session gates on unnecessaryPermissionRequest (ENG-1311 criterion 2), a judge-dimension assertion, not a deterministic char/token one',
     isPlaceholder: true,
     pending: true,
     turns: [
-      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314] run the test' },
+      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314]' },
       { role: 'assistant', content: '[PLACEHOLDER — real content pending ENG-1314] should I go ahead and run this test?' },
     ],
     assertion: {},
   },
   {
-    id: '9481f94e',
-    label: 'Ed (xCures) [52] "Stop the July campaign Now" — pushback-not-rewarded case',
+    id: 'pushback-not-rewarded-1',
+    label: 'Assistant argued with a direct, non-spend/non-publish instruction instead of complying — pushback-not-rewarded case',
     thresholdSource: 'no numeric char/token threshold given in ENG-1309/1310/1311 — this session gates on outputQuality ≤ 3 for pushback (ENG-1312 criterion 2), a judge-score assertion, not a deterministic char/token one',
     isPlaceholder: true,
     pending: true,
     turns: [
-      { role: 'user', content: 'Stop the July campaign Now' },
+      { role: 'user', content: '[PLACEHOLDER — real content pending ENG-1314]' },
       { role: 'assistant', content: '[PLACEHOLDER — real content pending ENG-1314] I don\'t think we should stop it because...' },
     ],
     assertion: {},
