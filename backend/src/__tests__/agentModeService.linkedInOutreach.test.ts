@@ -114,6 +114,7 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
+import { __resetWritePacerForTests } from '../services/linkedInWritePacer';
 
 describe('AgentModeService - LinkedIn Outreach', () => {
   let service: AgentModeService;
@@ -1803,6 +1804,94 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(mockGetLeadById).toHaveBeenCalled();
       expect(result.success).toBe(false);
       expect(result.code).toBe('linkedin_identity_mismatch');
+    });
+  });
+
+  describe('write pacing spends slots only on real Unipile writes (ENG-1197)', () => {
+    // The pacer's budget exists to stop a drain bursting the session to death. If a
+    // slot is taken before the action's own skip checks, the paths that never reach
+    // LinkedIn — an already-pending invite, a duplicate message — spend that budget
+    // anyway, and the genuinely-new sends later in the same run get refused for
+    // writes that never happened.
+    //
+    // Ceiling of 1 with a zero gap makes that visible without any wall-clock waiting:
+    // under the old placement the SECOND call through a skip path was refused.
+    beforeEach(() => {
+      __resetWritePacerForTests();
+      process.env.LINKEDIN_WRITE_MIN_GAP_MS = '0';
+      process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '1';
+    });
+
+    afterEach(() => {
+      delete process.env.LINKEDIN_WRITE_MIN_GAP_MS;
+      delete process.env.LINKEDIN_WRITE_MAX_PER_HOUR;
+      __resetWritePacerForTests();
+    });
+
+    const inviteArgs = {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/chang-liu/',
+      message: 'Great to connect!',
+    };
+
+    it('does not spend a slot on an already-pending invite', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue({ sentAt: null });
+
+      const results = [
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+      ];
+
+      // All three skip; none is refused by the pacer despite a ceiling of one.
+      for (const result of results) {
+        expect(result.alreadyInvited).toBe(true);
+        expect(result.message).not.toBe('LinkedIn write actions are being paced');
+      }
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('does not spend a slot on a duplicate message', async () => {
+      mockGetLeadById.mockResolvedValue({
+        leadId: 'lead_test456',
+        listId: 'list_test123',
+        linkedin: 'https://www.linkedin.com/in/johndoe/',
+        linkedinMessageSyncAt: new Date().toISOString(),
+      });
+      mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([
+        { eventType: 'linkedin.message.sent', data: { text: 'Hello, let us connect!' }, createdAt: '2026-08-01T00:00:00.000Z' },
+      ]);
+      const dupeArgs = {
+        action: 'send-message',
+        account_id: 'test-account-id',
+        provider_id: 'li-provider-123',
+        message: 'Hello, let us connect!',
+        list_id: 'list_test123',
+        lead_id: 'lead_test456',
+      };
+
+      const first = await service.linkedinOutreach('user-1', dupeArgs);
+      const second = await service.linkedinOutreach('user-1', dupeArgs);
+
+      expect(first.duplicate).toBe(true);
+      expect(second.duplicate).toBe(true);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('still spends a slot on a send that does reach Unipile', async () => {
+      // The control: without this the test above would also pass if pacing were
+      // simply switched off.
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockSendInvitation.mockResolvedValue({ id: 'inv-xyz' });
+
+      const first = await service.linkedinOutreach('user-1', inviteArgs);
+      const second = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(false);
+      expect(second.message).toBe('LinkedIn write actions are being paced');
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
     });
   });
 });

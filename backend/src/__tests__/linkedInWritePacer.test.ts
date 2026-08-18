@@ -165,6 +165,32 @@ describe('refusals', () => {
     await Promise.all(inFlight);
   });
 
+  it('counts its own slot and the jitter, so an admitted caller cannot wait past the cap', async () => {
+    // `maxQueueWaitMs` is a promise: a call that is ADMITTED will not sit longer
+    // than that. Estimating the wait as `queuedAhead * gap` broke that promise
+    // twice over — it ignored the caller's own turn, and it used the nominal gap
+    // when jitter can add 20%.
+    process.env.LINKEDIN_WRITE_MIN_GAP_MS = '5000';
+    process.env.LINKEDIN_WRITE_MAX_QUEUE_WAIT_MS = '30000';
+    process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '100';
+    const clock = makeClock();
+    // Maximum positive jitter: gap becomes 5000 + floor(5000 * 0.2 * 0.998) = 5998.
+    const maxJitter = { ...clock, random: () => 0.999 };
+
+    // A write already sits in the window, so EVERY queued call — the one at the
+    // head included — must wait a full gap. Then five more queue up.
+    await reserveWriteSlot(ACCOUNT, maxJitter);
+    const inFlight = Array.from({ length: 5 }, () => reserveWriteSlot(ACCOUNT, maxJitter));
+
+    const late = await reserveWriteSlot(ACCOUNT, maxJitter);
+
+    // Counting only the five ahead at the nominal gap gives 25,000ms and admits it.
+    // The real worst case is six jittered gaps — 35,988ms, well past the 30,000ms cap.
+    expect(late.allowed).toBe(false);
+    if (!late.allowed) expect(late.reason).toContain('already queued');
+    await Promise.all(inFlight);
+  });
+
   it('reports the hourly refusal before the queue refusal', async () => {
     // Both can be true at once; the ceiling is the more informative answer.
     process.env.LINKEDIN_WRITE_MAX_PER_HOUR = '1';
