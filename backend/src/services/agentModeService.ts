@@ -22,6 +22,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
+import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
@@ -294,6 +295,13 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import {
+  isAnonymizedIdentifier,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
+import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -2982,20 +2990,36 @@ export class AgentModeService {
       throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
     }
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
+    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed.
+    // ENG-700: providerLabel is set in the SAME model-id branch that decides
+    // which resolver produces `client`, so the metering label below can never
+    // independently drift from the resolver that actually serves the call —
+    // it is NOT derived from whether `client` happens to be cached yet (a
+    // Bedrock/Vertex client is cached on the registry after its first call,
+    // same as an Azure client is pre-populated at construction time, so
+    // "client is already set" cannot distinguish the providers).
     let client = this.llmModels[model].client;
+    let providerLabel: string;
     if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
-    } else if (!client) {
-      if (model.startsWith('anthropic.')) {
+      providerLabel = 'gemini';
+    } else if (model.startsWith('anthropic.')) {
+      providerLabel = 'bedrock';
+      if (!client) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
-      } else if (model.startsWith('claude-')) {
+      }
+    } else if (model.startsWith('claude-')) {
+      providerLabel = 'vertex';
+      if (!client) {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
-      } else {
+      }
+    } else {
+      providerLabel = 'azure-openai';
+      if (!client) {
         throw new Error(`Client not initialized for model: ${model}`);
       }
     }
@@ -3028,10 +3052,10 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
-                : model.startsWith('anthropic.') ? 'bedrock'
-                : model.startsWith('claude-') ? 'vertex'
-                : 'azure-openai',
+              // ENG-700: the label of the client that actually served this call
+              // (set above, alongside client resolution) — not re-derived from
+              // the model id, which can diverge for a vendor/model-namespaced id.
+              provider: providerLabel,
               feature: usageContext?.feature || 'agent_task',
               // ENG-1251: the response's own id is stable across a retried/
               // re-processed response and distinct across real calls — closes
@@ -3518,8 +3542,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3539,7 +3566,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );
@@ -3668,7 +3695,7 @@ export class AgentModeService {
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
 3. If that context is enough to complete the task, do so using it.
 4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
 5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
@@ -4661,7 +4688,7 @@ export class AgentModeService {
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
               role: 'user',
-              content: '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.'
+              content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
         } else {
@@ -5301,7 +5328,15 @@ export class AgentModeService {
    * scratch — an expensive, non-converging loop. Surfacing the existing filenames
    * lets the model generate only what's missing and then advance the step.
    */
-  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+  /**
+   * `sinceIso` (ENG-1188): when set, only images generated at or after this
+   * timestamp count — used to scope a work-plan step's produced-asset count to
+   * that step alone rather than the whole session (see setWorkPlanStatus). A
+   * marker with no timestamp (only possible on messages from before the
+   * `metadata.timestamp` field existed) is counted regardless, so this can never
+   * make an old in-flight session's count go DOWN relative to the unscoped call.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[], sinceIso?: string): string[] {
     if (!Array.isArray(sessionHistory)) return [];
     const seen = new Set<string>();
     const filenames: string[] = [];
@@ -5317,6 +5352,8 @@ export class AgentModeService {
         if (match) filename = match[1].trim();
       }
       if (!filename || seen.has(filename)) continue;
+      const timestamp = typeof msg.metadata?.timestamp === 'string' ? msg.metadata.timestamp : undefined;
+      if (sinceIso && timestamp && timestamp < sinceIso) continue;
       seen.add(filename);
       filenames.push(filename);
     }
@@ -6235,6 +6272,22 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
+    // can raise it (`linkedin_outreach` search-people/search-parameters and the
+    // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
+    // this method, which erased the only machine-readable evidence that a run
+    // sourced zero prospects because LinkedIn search was DOWN for the account
+    // rather than because nobody matched. The scheduled-run recorder reads it back
+    // off the tool ledger (detectRunBlockedReason) to record the run as blocked
+    // instead of as a clean success the owner reads as "no one matched".
+    //
+    // Deliberately keyed on the flag, not the tool name, so it survives wherever
+    // the guard is raised. The marker is stamped ONLY after the broad control
+    // query has confirmed the outage, so it can never fire on an honest empty.
+    if (result && result.searchUnavailable === true) {
+      return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -23956,7 +24009,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
@@ -29519,7 +29582,14 @@ ${strippedHtml}`;
     sessionId: string
   ): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+      // read -- a turn that writes an "Image generated" marker and then
+      // immediately calls set_work_plan_status in the same turn can otherwise race
+      // a stale replica and see too few images, rejecting genuinely-complete work
+      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+      // wrote it, must see it now" shape (agentModeController.ts already uses it
+      // for the analogous timed-out-run read).
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -29527,21 +29597,38 @@ ${strippedHtml}`;
         };
       }
 
+      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+      // AND status, captured before any update in THIS call runs. workPlan.steps
+      // below starts as the SAME array session.workPlan.steps points at (the
+      // spread on the next line only copies the top-level object), so an
+      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+      // through both references — reading a "live" cutoff would see this batch's
+      // OWN just-assigned timestamps, collapsing every step resolved together in
+      // one call to the same instant and wrongly excluding assets a later step in
+      // that same batch actually produced in an earlier turn.
+      //
+      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+      // that was completed/skipped and later reset to 'pending' (e.g. its assets
+      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+      // that stale timestamp as a cutoff for a later step would wrongly widen the
+      // asset-count window with assets from the step's earlier, now-superseded
+      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+      // status routes it to its fresh LIVE timestamp instead.
+      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+      );
+
       const workPlan = { ...session.workPlan };
       const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
       const notFoundSteps: number[] = [];
       const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
       // Get function call counts from session (make a copy to modify)
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
       let countsModified = false;
 
-      // Count media assets actually produced this session (distinct "Image generated:"
-      // markers), used by the expectedAssetCount completion gate below. This is ground
-      // truth from the message history — independent of the calledFunctions counter,
-      // which can be inflated by non-producing generate_image returns (confirmation
-      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
-      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
       const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
 
       // Process each update
@@ -29554,6 +29641,29 @@ ${strippedHtml}`;
         }
 
         const step = workPlan.steps[stepIndex];
+
+        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+        // the Full Size Matrix" — an earlier step — was still pending, so delivery
+        // never actually gated on the rendering it claimed to deliver. Neither gate
+        // below catches this: both only look at the step being completed, never at
+        // whether the steps before it are actually done. Checked against the
+        // in-progress workPlan.steps (not a snapshot from before the loop), so
+        // several steps completed in the same batch, in order, chain correctly —
+        // and a batch that completes them out of order is caught per-step.
+        if (update.status === 'completed') {
+          const pendingEarlierSteps = workPlan.steps.filter(
+            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+          );
+          if (pendingEarlierSteps.length > 0) {
+            outOfOrderSteps.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+            });
+            continue; // Skip updating this step
+          }
+        }
 
         // Validate required function calls if marking as completed
         if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
@@ -29589,8 +29699,8 @@ ${strippedHtml}`;
         }
 
         // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until the session has actually produced that many
-        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+        // not be marked completed until IT has actually produced that many media
+        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
         // Hook — 18 total" step being marked done with only 3 images produced (the model
         // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
         // required-function-calls gate above could not catch this — it only checked that
@@ -29598,25 +29708,84 @@ ${strippedHtml}`;
         // non-producing confirmation-gate returns. Counting real assets is the fix.
         // The user can still legitimately reduce scope via modify_work_plan (lowering or
         // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        //
+        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+        // the whole session — otherwise an earlier step's images satisfy a later
+        // step's requirement without it producing anything of its own (e.g. step 1's
+        // 18 hero images would silently cover step 2's own "3 required" declaration).
+        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+        // the session-wide count this replaces for step 1.
+        //
+        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+        // started), walking back to the nearest earlier step that already had one —
+        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+        // SAME batch shares this instant as its live timestamp, which would exclude
+        // assets this step actually produced in an earlier turn; a step resolved
+        // in this same batch simply contributes no cutoff of its own, same as a
+        // step that has never resolved.
+        //
+        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+        // having been completed/skipped before (e.g. its assets need
+        // regenerating) — only 'completed'/'skipped' transitions stamp
+        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+        // the earlier, now-superseded attempt. The ordering gate above means the
+        // only way we can reach a 'completed' update here with an earlier step's
+        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+        // resolved within this very batch (otherwise it would still be pending
+        // live, too, and the ordering gate would have rejected this update
+        // already). In that case, trust the fresh, just-stamped LIVE timestamp
+        // for that step instead of its stale pre-batch one — that boundary is
+        // exactly "when did this step's redo actually finish," which correctly
+        // excludes both the stale pre-reset attempt's assets AND any redo-work
+        // assets produced leading up to this exact re-completion. A step with NO
+        // prior resolution at all (genuinely first-time-completed within this
+        // batch) still contributes no cutoff, same as the existing behavior.
         if (update.status === 'completed'
           && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0
-          && producedAssetCount < step.expectedAssetCount) {
-          insufficientAssets.push({
-            stepCount: update.stepCount,
-            title: step.title,
-            expected: step.expectedAssetCount,
-            produced: producedAssetCount,
-          });
-          continue; // Skip updating this step
+          && step.expectedAssetCount > 0) {
+          const earlierStepCounts = workPlan.steps
+            .filter((s: any) => s.stepCount < step.stepCount)
+            .map((s: any) => s.stepCount as number)
+            .sort((a: number, b: number) => b - a); // nearest first
+          let sinceIso: string | undefined;
+          for (const count of earlierStepCounts) {
+            const preBatch = originalStepStateByCount.get(count);
+            if (!preBatch) continue;
+            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+              continue;
+            }
+            if (preBatch.resolvedAt) {
+              const live = workPlan.steps.find((s: any) => s.stepCount === count);
+              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
+            }
+          }
+          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          if (producedAssetCount < step.expectedAssetCount) {
+            insufficientAssets.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              expected: step.expectedAssetCount,
+              produced: producedAssetCount,
+            });
+            continue; // Skip updating this step
+          }
         }
 
         // Update the step status
+        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+          ? new Date().toISOString()
+          : undefined;
         workPlan.steps[stepIndex] = {
           ...workPlan.steps[stepIndex],
           status: update.status,
           notes: update.notes,
-          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
+          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+          // — see the field's doc comment in chatbotService.ts for why this can't
+          // just reuse completedAt.
+          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
         };
 
         updatedSteps.push({
@@ -29624,6 +29793,22 @@ ${strippedHtml}`;
           title: workPlan.steps[stepIndex].title,
           status: update.status
         });
+      }
+
+      // Ordering gate failure — a step was completed while an earlier step in the
+      // plan is still pending. Same all-or-nothing shape as the two gates below:
+      // the caller can just resend the batch in the correct order.
+      if (outOfOrderSteps.length > 0) {
+        const errorDetails = outOfOrderSteps.map(oos =>
+          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
+        ).join('\n');
+
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+          outOfOrderSteps,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
+        };
       }
 
       // Check if there are missing function calls - this is a critical error
@@ -31532,8 +31717,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account that is either owned by the calling user or
     // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
     // reusing a shared enrichment account_id from a prior get-profile call.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
-    if (WRITE_ACTIONS.includes(action)) {
+    // Same set the pacer uses, deliberately not a second hand-maintained copy: a
+    // sixth write action added to one list and not the other would be either
+    // silently unpaced or silently unauthorized.
+    if (PACED_WRITE_ACTIONS.has(action)) {
       const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
       const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
@@ -31615,6 +31802,44 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
+    // ENG-1197: pace write actions so a drain cannot burst the session to death.
+    //
+    // Twice this schedule fired ten cancel-invitation calls in one parallel batch
+    // and LinkedIn revoked the account's session ~17 seconds later, locking the
+    // customer out for days. The model emits parallel tool calls because that is the
+    // efficient shape of the work, and an unattended run has nobody to notice it
+    // ignoring an instruction not to — so the spacing has to be structural, not
+    // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
+    // Deliberately NOT taken here, up front, for the whole action. Several paced
+    // actions return before they ever reach Unipile — send-invite skips a profile
+    // whose invite is already pending or whose identity fails the ENG-1026 check,
+    // send-message skips a stale-sync or duplicate-text send. Reserving at the top
+    // would spend a slot (and sleep the caller a full gap) on those no-ops, so a
+    // batch of already-invited leads would both crawl and eat the hourly ceiling
+    // that the genuinely-new invites later in the same run need. Each case below
+    // therefore calls this immediately before its own Unipile write.
+    const paceWrite = async (): Promise<{ refusal: any } | null> => {
+      if (!PACED_WRITE_ACTIONS.has(action)) return null;
+      const slot = await reserveWriteSlot(account_id);
+      if (slot.allowed) return null;
+      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+      return {
+        refusal: {
+          success: false,
+          message: 'LinkedIn write actions are being paced',
+          error: [
+            slot.reason,
+            '',
+            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
+            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
+            'blocks ALL outreach until the account owner manually reconnects.',
+            '',
+            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+          ].join('\n'),
+        },
+      };
+    };
+
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
     const isUrl = !!profile_url;
@@ -31660,7 +31885,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
             // public_identifier literally the string 'undefined' — passing those
             // through yields unusable fake profile URLs like /in/undefined.
-            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const usableItems = searchResult.items.filter((item: any) => !isAnonymizedIdentifier(item.public_identifier));
+            // How many the filter removed. ENG-1198 dropped them silently, which
+            // turned "every match was out-of-network" into an empty list
+            // indistinguishable from "nobody matches" — and from the ENG-975
+            // account-cannot-search outage. The ENG-975 canary deliberately does not
+            // cover this case: it only fires when the RAW page was empty, and here
+            // the account searched fine and returned rows we then discarded. So the
+            // count has to be reported, or the agent is left guessing which of three
+            // very different situations it is in.
+            const anonymizedFiltered = searchResult.items.length - usableItems.length;
             const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
@@ -31683,7 +31917,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
+            const searchData = withAccountMeta({
+              ...searchResult,
+              items: trimmedItems,
+              ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+            });
+            if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
+              // Say plainly what happened, so this does not get reported to the
+              // user as "no prospects match" or escalated as a broken search.
+              return {
+                success: true,
+                message:
+                  `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
+                  `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
+                  `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            return { success: true, data: searchData };
           }
           return { success: true, data: withAccountMeta(searchResult) };
         }
@@ -31718,17 +31969,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // viewer's connection state back into the shared cache and re-introduce the
           // very cross-viewer leak this fix closes.
           if (raw && typeof raw === 'object') {
+            // Both halves must reject the sentinel, because this URL is used as a
+            // DynamoDB GSI lookup key below. Unfiltered, EVERY anonymized profile
+            // queries the same `/in/undefined` key — and the connection-sync cron
+            // writes rows under exactly that key — so the lookup returns an
+            // unrelated person's connection row and their is_relationship /
+            // connected_at get presented as this user's, driving the agent's
+            // invite-vs-message decision off a stranger's state.
             const profileUrl =
-              raw.public_profile_url ||
-              (raw.public_identifier
-                ? `https://www.linkedin.com/in/${raw.public_identifier}`
-                : (isUrl ? target : null));
+              usableProfileUrl(raw.public_profile_url) ||
+              (usablePublicIdentifier(raw.public_identifier)
+                ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                : (isUrl ? usableProfileUrl(target) : null));
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
             // with public_identifier literally the string 'undefined' — mirrors
             // the search-people filtering above. get-profile can't drop the row
             // (the caller asked for this specific person), so flag it and drop
             // the fabricated /in/undefined URL instead.
-            const isAnonymized = raw.public_identifier === 'undefined';
+            const isAnonymized = isAnonymizedIdentifier(raw.public_identifier);
             let conn: { connectedAt?: number } | null = null;
             // A shared/site-wide account's connection state belongs to a
             // STRANGER, not the user — reconciling is_relationship/connected_at
@@ -31764,9 +32022,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const isConnected =
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
-              ...viewerIndependentRaw,
+              // Dropping the fabricated URL alone was not enough: `public_identifier`
+              // stayed on the object as the literal string 'undefined', so the agent
+              // was handed the exact slug needed to rebuild the dead link itself.
+              ...withoutFabricatedProfileFields(viewerIndependentRaw),
               // Never surface the fabricated /in/undefined URL for an anonymized profile.
-              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              ...(isAnonymized || !usableProfileUrl(rawPublicProfileUrl)
+                ? {}
+                : { public_profile_url: rawPublicProfileUrl }),
               // See ENG-1198 note above: is_relationship/connected_at are the
               // user's "already connected/pending" signal — only meaningful
               // relative to the user's own account, not a borrowed shared one.
@@ -31836,6 +32099,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptPaced = await paceWrite();
+          if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
           return { success: true, data: acceptResult };
         }
@@ -31992,6 +32257,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          // ENG-126's account-level cooldown short-circuits the network call inside
+          // sendInvitation, so a paced caller would sleep a full gap and burn one of
+          // the account's hourly writes for a request that never leaves the process —
+          // for the whole hour the breaker is armed, on every queued invite. Check it
+          // here, before the slot is taken.
+          if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
+            return {
+              success: false,
+              error:
+                'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
+                + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
+                + 'Skip the remaining invites and report what was completed.',
+            };
+          }
+          // Past every skip path (already-pending, identity mismatch, cooldown): this
+          // call is going to reach LinkedIn, so now is when it should cost a slot.
+          const invitePaced = await paceWrite();
+          if (invitePaced) return invitePaced.refusal;
           try {
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
@@ -32142,6 +32425,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
+          const messagePaced = await paceWrite();
+          if (messagePaced) return messagePaced.refusal;
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
 
           // Persist the sent message to the CRM so it shows up in engagement history.
@@ -32180,6 +32465,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { subject } = args;
           if (!subject) throw new Error('subject is required for send-inmail action');
 
+          const inmailPaced = await paceWrite();
+          if (inmailPaced) return inmailPaced.refusal;
           const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
 
           // Persist the sent InMail to the CRM so it shows up in engagement history.
@@ -32283,7 +32570,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'cancel-invitation': {
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelPaced = await paceWrite();
+          if (cancelPaced) return cancelPaced.refusal;
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 
