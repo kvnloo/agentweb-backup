@@ -177,3 +177,47 @@ describe('requirementEvidenceNames aliases the thread-post substitute (ENG-1276 
     }
   });
 });
+
+/**
+ * ENG-1276 follow-up #2 — a schedule that requires BOTH post_on_connected_account
+ * AND twitter_manage_post as SEPARATE line items wants two distinct actions, not
+ * one thread-post call silently satisfying both. No evidenced schedule does this
+ * today, but the alias must not blindly double-credit if one ever does: the
+ * caller can pass the schedule's own requiredFunctionCalls, and the alias is
+ * suppressed exactly when the schedule ALSO separately requires the alias's
+ * SOURCE tool name (twitter_manage_post) as its own requirement.
+ */
+describe('requirementEvidenceNames suppresses the alias when both names are separately required (ENG-1276 follow-up)', () => {
+  const succeededPostThread = [
+    { name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['one', 'two'] }, result: { success: true } },
+  ];
+
+  it('still aliases when the caller passes NO requirement list (legacy callers keep today\'s fix)', () => {
+    expect(requirementEvidenceNames(succeededPostThread)).toEqual(['twitter_manage_post', 'post_on_connected_account']);
+  });
+
+  it('still aliases when the schedule requires ONLY post_on_connected_account (the evidenced Kevin case)', () => {
+    expect(requirementEvidenceNames(succeededPostThread, ['post_on_connected_account', 'generate_image'])).toEqual([
+      'twitter_manage_post',
+      'post_on_connected_account',
+    ]);
+  });
+
+  it('still aliases when the schedule requires ONLY twitter_manage_post (nothing to double-credit against)', () => {
+    expect(requirementEvidenceNames(succeededPostThread, ['twitter_manage_post'])).toEqual([
+      'twitter_manage_post',
+      'post_on_connected_account',
+    ]);
+  });
+
+  it('SUPPRESSES the alias when the schedule requires BOTH names as separate line items', () => {
+    expect(requirementEvidenceNames(succeededPostThread, ['post_on_connected_account', 'twitter_manage_post'])).toEqual([
+      'twitter_manage_post',
+    ]);
+  });
+
+  it('accepts a Set as well as an array for the requirement list', () => {
+    const required = new Set(['post_on_connected_account', 'twitter_manage_post']);
+    expect(requirementEvidenceNames(succeededPostThread, required)).toEqual(['twitter_manage_post']);
+  });
+});
