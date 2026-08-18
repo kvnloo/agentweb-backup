@@ -31757,11 +31757,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // efficient shape of the work, and an unattended run has nobody to notice it
     // ignoring an instruction not to — so the spacing has to be structural, not
     // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
-    if (PACED_WRITE_ACTIONS.has(action)) {
+    // Deliberately NOT taken here, up front, for the whole action. Several paced
+    // actions return before they ever reach Unipile — send-invite skips a profile
+    // whose invite is already pending or whose identity fails the ENG-1026 check,
+    // send-message skips a stale-sync or duplicate-text send. Reserving at the top
+    // would spend a slot (and sleep the caller a full gap) on those no-ops, so a
+    // batch of already-invited leads would both crawl and eat the hourly ceiling
+    // that the genuinely-new invites later in the same run need. Each case below
+    // therefore calls this immediately before its own Unipile write.
+    const paceWrite = async (): Promise<{ refusal: any } | null> => {
+      if (!PACED_WRITE_ACTIONS.has(action)) return null;
       const slot = await reserveWriteSlot(account_id);
-      if (!slot.allowed) {
-        console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
-        return {
+      if (slot.allowed) return null;
+      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+      return {
+        refusal: {
           success: false,
           message: 'LinkedIn write actions are being paced',
           error: [
@@ -31773,9 +31783,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             '',
             'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
           ].join('\n'),
-        };
-      }
-    }
+        },
+      };
+    };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -31998,6 +32008,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptPaced = await paceWrite();
+          if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
           return { success: true, data: acceptResult };
         }
@@ -32154,6 +32166,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          // Past every skip path (already-pending, identity mismatch): this call is
+          // going to reach LinkedIn, so now is when it should cost a pacing slot.
+          const invitePaced = await paceWrite();
+          if (invitePaced) return invitePaced.refusal;
           try {
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
@@ -32304,6 +32320,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
+          const messagePaced = await paceWrite();
+          if (messagePaced) return messagePaced.refusal;
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
 
           // Persist the sent message to the CRM so it shows up in engagement history.
@@ -32342,6 +32360,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { subject } = args;
           if (!subject) throw new Error('subject is required for send-inmail action');
 
+          const inmailPaced = await paceWrite();
+          if (inmailPaced) return inmailPaced.refusal;
           const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
 
           // Persist the sent InMail to the CRM so it shows up in engagement history.
@@ -32445,6 +32465,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'cancel-invitation': {
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelPaced = await paceWrite();
+          if (cancelPaced) return cancelPaced.refusal;
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
           // We just ended this invitation, so we know it is no longer pending —
           // don't make the cache wait for the next full-feed prune to find out
