@@ -35,6 +35,7 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
       api_url: await linkedInOutreachService.getApiUrl(),
     });
 
+    console.log(`[LinkedIn Outreach] Hosted auth link generated (type=create) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
 
   } catch (error: any) {
@@ -159,11 +160,37 @@ router.post('/reconnect', authenticateToken, async (req: any, res: any) => {
       api_url: await linkedInOutreachService.getApiUrl(),
     } as any);
 
+    console.log(`[LinkedIn Outreach] Hosted auth link generated (type=reconnect, account=${unipileAccountId}) for user ${req.user.userId}`);
     res.json({ success: true, url: authLink.url });
   } catch (error: any) {
     console.error('[LinkedIn Outreach] Error generating reconnect link:', error);
     res.status(500).json({ error: 'Failed to generate reconnect link', details: error.message });
   }
+});
+
+/**
+ * POST /callback-event
+ * ENG-1272: fired by the hosted-auth popup (UnipileLinkedInCallback) the moment it
+ * lands, before it postMessages the opener and closes — regardless of whether the
+ * connection succeeded or failed. Best-effort and silent by design: a customer
+ * dispute about whether they reconnected currently has no trace to check either way,
+ * and this is the only point where Unipile's own success/failure verdict ever
+ * reaches our backend at all (the popup gets it via redirect query params; nothing
+ * about that redirect is otherwise visible to us).
+ */
+router.post('/callback-event', authenticateToken, async (req: any, res: any) => {
+  const { status, unipileAccountId, error } = req.body;
+  const userId = req.user.userId;
+
+  if (status !== 'success' && status !== 'failure') {
+    return res.status(400).json({ error: 'Missing or invalid status' });
+  }
+
+  console.log(
+    `[LinkedIn Outreach] Callback observed: status=${status} user=${userId} `
+    + `account=${unipileAccountId || 'n/a'} error=${error || 'n/a'}`,
+  );
+  res.json({ success: true });
 });
 
 export default router;

@@ -149,4 +149,50 @@ describe('LinkedIn Outreach Auth Router', () => {
       jest.restoreAllMocks();
     }, 10000);
   });
+
+  describe('POST /callback-event', () => {
+    it('should return 400 when status is missing', async () => {
+      const response = await request(app).post('/callback-event').send({});
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'Missing or invalid status' });
+    });
+
+    it('should return 400 when status is neither success nor failure', async () => {
+      const response = await request(app).post('/callback-event').send({ status: 'pending' });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'Missing or invalid status' });
+    });
+
+    it('should record a success event with the account id', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+      const response = await request(app)
+        .post('/callback-event')
+        .send({ status: 'success', unipileAccountId: 'acc-123' });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ success: true });
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('status=success user=user-123 account=acc-123'),
+      );
+      logSpy.mockRestore();
+    });
+
+    it('should record a failure event with the error reason, no account id required', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+      const response = await request(app)
+        .post('/callback-event')
+        .send({ status: 'failure', error: 'connection_failed' });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ success: true });
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('status=failure user=user-123 account=n/a error=connection_failed'),
+      );
+      logSpy.mockRestore();
+    });
+  });
 });
