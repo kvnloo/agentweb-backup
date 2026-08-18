@@ -505,6 +505,17 @@ export async function fetchDestinationInputs(
         attributedConversionsByAd[adId] = (attributedConversionsByAd[adId] || 0) + conversions;
       }
       insightsUrl = typeof body.paging?.next === 'string' ? body.paging.next : '';
+      // The SAME rule as the ads and owned-pixel loops, and the one place it was missed.
+      // A truncated second signal is worse than no second signal: ads whose rows were never
+      // read look like they have zero conversions, which PROMOTES their finding from
+      // `unconfirmed` to `alerting` — our own short read manufacturing the page-out that the
+      // corroboration exists to prevent.
+      if (insightsUrl && page === MAX_AD_PAGES - 1) {
+        throw new Error(
+          `ad insights still paging after ${MAX_AD_PAGES} pages — refusing to judge against a ` +
+          'truncated conversion signal',
+        );
+      }
     }
   } catch (error: any) {
     return { status: 'fetch_error', ...empty, error: error?.message || 'request failed' };

@@ -557,6 +557,32 @@ describe('incomplete reads never produce a finding', () => {
     expect(inputs.error).toContain('truncated ad list');
   });
 
+  it('refuses to judge against a truncated CONVERSION signal', async () => {
+    // The nastiest of the three truncations: a short insights read makes ads look like they
+    // have zero attributed conversions, which promotes their finding from `unconfirmed` to
+    // `alerting` — our own incomplete read manufacturing the exact page-out the second signal
+    // exists to prevent.
+    const impl = jest.fn(async (url: string) => {
+      if (url.includes('/adspixels')) {
+        return { ok: true, status: 200, json: async () => PIXELS_PAGE } as any;
+      }
+      if (url.includes('/insights')) {
+        return { ok: true, status: 200, json: async () => ({
+          data: [{ ad_id: '111', actions: [] }],
+          paging: { next: 'https://graph.facebook.com/v25.0/act_123/insights?after=FOREVER' },
+        }) } as any;
+      }
+      return { ok: true, status: 200, json: async () => ADS_PAGE } as any;
+    }) as any;
+
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl, fetchHtml: async () => html('910841031004192'),
+    });
+
+    expect(inputs.status).toBe('fetch_error');
+    expect(inputs.error).toContain('truncated conversion signal');
+  });
+
   it('refuses to judge against a truncated OWNED-PIXEL list', async () => {
     const impl = jest.fn(async (url: string) => {
       if (url.includes('/adspixels')) {
