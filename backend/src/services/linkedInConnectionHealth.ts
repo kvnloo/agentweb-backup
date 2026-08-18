@@ -199,7 +199,7 @@ export async function recordUnipileAccountHealth(params: {
   if (!viewerUserId) {
     if (state === 'disconnected') {
       await sendAgentModeOncallAlert({
-        subject: 'Site-wide LinkedIn account disconnected',
+        subject: 'Site-wide LinkedIn Outreach account disconnected',
         message:
           `Unipile account ${accountId} has a dead LinkedIn session and no owner record, `
           + `so there is no customer to ask to reconnect it. Needs an operator.`,
@@ -395,8 +395,8 @@ async function notify(params: {
   // customer knows about is how one of these ran for 38 days.
   await sendAgentModeOncallAlert({
     subject: params.isReminder
-      ? `LinkedIn account still disconnected (${params.daysDisconnected}d): ${params.accountName}`
-      : `LinkedIn account disconnected: ${params.accountName}`,
+      ? `LinkedIn Outreach account still disconnected (${params.daysDisconnected}d): ${params.accountName}`
+      : `LinkedIn Outreach account disconnected: ${params.accountName}`,
     message:
       `Unipile account ${params.accountId} (${params.accountName}) has no live LinkedIn session. ` +
       `All outreach writes — send-invite, cancel-invitation — and the pending-invite read are blocked ` +
