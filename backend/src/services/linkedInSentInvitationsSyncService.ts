@@ -146,6 +146,19 @@ export async function syncSentInvitationsForAccount(
     }
   } while (cursor && page < MAX_PAGES);
 
+  // Truncation is an incomplete walk too. Hitting MAX_PAGES with a cursor still in
+  // hand means there are pages we never read, so `stillPendingPublicIds` is partial —
+  // and pruning against a partial set deletes real pending invitations. The
+  // two-known-pages exit already sets this; the page cap has exactly the same
+  // consequence and was not covered.
+  if (cursor && page >= MAX_PAGES) {
+    stoppedEarly = true;
+    console.warn(
+      `${TAG} account=${accountId} stopped at the ${MAX_PAGES}-page cap with more feed remaining — ` +
+      `prune skipped (an incomplete set cannot say what is stale)`,
+    );
+  }
+
   await upsertSentInvitations(toUpsert);
 
   if (stoppedEarly) {

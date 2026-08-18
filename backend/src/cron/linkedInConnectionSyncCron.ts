@@ -581,7 +581,11 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         const wasBackfill = (await getFullSyncCompletedAt(accountId).catch(() => null)) === null;
 
         const newConns = await syncConnectionsForAccount(accountId);
-        acceptedProfileUrls = newConns.map((c) => c.publicProfileUrl);
+        // Only on a NON-backfill run. A backfill returns the account's entire
+        // connection history, and feeding thousands of URLs into the cleanup below
+        // turns a tidy-up into a full scan of the cache on the cron path — for
+        // people who were connected long before any invitation we track.
+        if (!wasBackfill) acceptedProfileUrls = newConns.map((c) => c.publicProfileUrl);
         if (wasBackfill) {
           console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
         } else {

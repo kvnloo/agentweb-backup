@@ -122,13 +122,15 @@ export async function deleteSentInvitationsByProfileUrls(
   // Normalize BEFORE discarding empties: a whitespace-only string is truthy and
   // survives filter(Boolean), but normalizes to '' — which would then match any
   // malformed cached row that also normalizes to '' and delete it.
-  const urls = Array.from(
-    new Set(publicProfileUrls.map((u) => (u ? normalizeLinkedInUrl(u) : '')).filter(Boolean)),
+  // Keep the Set: `includes` on an array made this O(rows x urls), and both sides
+  // scale with the account's backlog — the reported account had 1,540 pending rows.
+  const urls = new Set(
+    publicProfileUrls.map((u) => (u ? normalizeLinkedInUrl(u) : '')).filter(Boolean),
   );
-  if (urls.length === 0) return 0;
+  if (urls.size === 0) return 0;
 
   const rows = (await getAllSentInvitationsByAccount(accountId)).filter((inv) =>
-    urls.includes(normalizeLinkedInUrl(inv.publicProfileUrl)),
+    urls.has(normalizeLinkedInUrl(inv.publicProfileUrl)),
   );
   return deleteRows(accountId, rows.map((r) => r.invitedUserPublicId));
 }
