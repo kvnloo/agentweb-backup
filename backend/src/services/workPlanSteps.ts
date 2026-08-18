@@ -303,39 +303,21 @@ export function findConflictingMergeTargets(existingSteps: any[], incomingSteps:
  */
 export function findStepContentLoss(before: any[], after: any[]) {
   const pairs = pairSteps(before, after);
-  const keptAnything = pairs.some((index) => index !== -1);
-  // A wholesale rewrite brings its own content. If the replacement contains a
-  // step with no content of its own, this is not "a new plan" — it is erasure,
-  // and the carve-out must not cover it. Without this, renaming AND reordering
-  // every step at once pairs nothing, `keptAnything` stays false, and a
-  // same-length write blanks a step with neither guard firing.
-  const replacementCarriesContent = after.length > 0
-    && after.every((step: any) => STEP_CONTENT_FIELDS.some((field) => !isEmptyStepValue(step[field])));
-  // "Carries content" only asks whether each step has SOME content, so a payload
-  // that renamed and renumbered everything while keeping the descriptions and
-  // dropping the skillIds still looked like a new plan, and every loss was
-  // suppressed into a silent 200.
+  // No wholesale-rewrite carve-out. There used to be one: if NOTHING paired, the
+  // write was read as "replace this plan" and every unpaired loss was suppressed.
+  // It leaked repeatedly — a hollow step among the replacements, then a renumber
+  // that kept the prose and dropped the skillIds, then an all-new rewrite that
+  // dropped them on a silent 200 — and each patch only narrowed the hole.
   //
-  // A genuinely new plan does not reuse the prose of the one it replaces. A step
-  // description repeated byte for byte is an amendment that lost its footing, not
-  // a rewrite. Only prose counts: skillIds and requiredFunctionCalls recur across
-  // unrelated plans, so reading those as evidence would refuse ordinary rewrites.
-  const REWRITE_IDENTITY_FIELDS = ['description', 'userInstructions'] as const;
-  const existingProse = new Set<string>();
-  before.forEach((step: any) => {
-    REWRITE_IDENTITY_FIELDS.forEach((field) => {
-      if (!isEmptyStepValue(step[field])) existingProse.add(`${field}:${JSON.stringify(step[field])}`);
-    });
-  });
-  const reusesExistingProse = after.some((step: any) =>
-    REWRITE_IDENTITY_FIELDS.some((field) =>
-      !isEmptyStepValue(step[field]) && existingProse.has(`${field}:${JSON.stringify(step[field])}`)));
-  const isWholesaleRewrite = !keptAnything && replacementCarriesContent && !reusesExistingProse;
+  // A replace that cannot recognise a single step is now reported, and the caller
+  // passes confirm_step_removal=true to mean it. Replacing a plan is still
+  // possible; it has stopped being possible by accident. (Decision: Anurag,
+  // 2026-08-18, ENG-1221.)
   const claimed = new Set(pairs.filter((index) => index !== -1));
   const losses: { stepCount: any; title: any; fields: string[]; kind: 'blanked' | 'unpaired' }[] = [];
   before.forEach((existing: any, i: number) => {
     const index = pairs[i];
-    if (index === -1 && isWholesaleRewrite) return;
+
     const populated = STEP_CONTENT_FIELDS.filter((field) => !isEmptyStepValue(existing[field]));
     if (index !== -1) {
       const fields = populated.filter((field) => isEmptyStepValue(after[index][field]));
