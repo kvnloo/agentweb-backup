@@ -186,9 +186,16 @@ router.post('/callback-event', authenticateToken, async (req: any, res: any) => 
     return res.status(400).json({ error: 'Missing or invalid status' });
   }
 
+  // This log is meant to be a trustworthy evidence trail for exactly the kind
+  // of "did the customer actually reconnect" dispute ENG-1272 raised, so the
+  // caller-supplied fields are JSON-encoded rather than interpolated raw —
+  // stringifying a string still just prints the string, but it also fixes
+  // width, escapes newlines, and defuses a non-string payload, so an
+  // authenticated caller can't forge what looks like a second, separate log
+  // line or corrupt the format others may grep against.
   console.log(
     `[LinkedIn Outreach] Callback observed: status=${status} user=${userId} `
-    + `account=${unipileAccountId || 'n/a'} error=${error || 'n/a'}`,
+    + `account=${JSON.stringify(unipileAccountId ?? 'n/a')} error=${JSON.stringify(error ?? 'n/a')}`,
   );
   res.json({ success: true });
 });
