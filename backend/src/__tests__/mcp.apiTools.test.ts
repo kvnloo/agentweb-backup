@@ -975,6 +975,40 @@ describe('apiTools', () => {
         expect(session.modelLine).toBe('picker: claude-sonnet-4-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
       });
 
+      // CodeRabbit (ENG-1313 review): the picker being one of several models
+      // that ran is NOT "agreement" — a naive `attributedModels.includes(llmModel)`
+      // check would wrongly collapse this to a bare "anthropic.claude-opus-5,
+      // gpt-5-chat-2" and drop the fact that a backup model also fired,
+      // because the picker happens to be the FIRST model in the list rather
+      // than absent from it entirely (the case the prior test covers).
+      it('still shows "picker: X · ran: Y" when the picker is the first of two models that ran, not absent from the list', async () => {
+        mockMcpFetch.mockResolvedValue({
+          sessions: [{
+            sessionId: 'sess-picker-also-ran',
+            userId: 'user-6',
+            title: 'Picker ran, then a backup model also ran',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            llmModel: 'anthropic.claude-opus-5',
+            messages: [
+              { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+              { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            ],
+          }],
+          nextCursor: null,
+        });
+
+        const result = await mcpToolRegistry.execute('get_chat_history', {
+          start_time: '2026-03-28T00:00:00Z',
+          end_time: '2026-03-29T00:00:00Z',
+        }, context);
+
+        const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+        expect(session.attributedModels).toEqual(['anthropic.claude-opus-5', 'gpt-5-chat-2']);
+        expect(session.modelLine).toBe('picker: anthropic.claude-opus-5 · ran: anthropic.claude-opus-5, gpt-5-chat-2');
+      });
+
       // Greptile P1 (ENG-1313 review): a partial-transcript modelLine must not
       // read as complete — it only names the turns that DID record a model.
       it('appends a "(partial — N of M assistant turns unlabelled)" qualifier when attribution is only partial', async () => {

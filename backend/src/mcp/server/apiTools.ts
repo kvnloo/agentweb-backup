@@ -2437,7 +2437,7 @@ mcpToolRegistry.register({
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
 - attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
-- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran; collapses to a single model name when they agree or nothing to contrast. When attributionBasis is 'partial-transcript' it carries its own "(partial — N of M assistant turns unlabelled)" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.
+- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran, INCLUDING when the picker is one of several models that ran (a multi-model run is never "agreement" — it is never equal to the single-value picker, so the picker's involvement doesn't collapse it); collapses to a single model name only when exactly one model ran and it is the picker, or when there is nothing to contrast (selection-only). When attributionBasis is 'partial-transcript' it carries its own "(partial — N of M assistant turns unlabelled)" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.
 - modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, partialAttributionSessions, truncated, byModel: [{model, sessions, share}] }, byModel sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. partialAttributionSessions counts how many of sessionsWithModelData were only partially labelled (qualify the shares as approximate when this is > 0). truncated (also returned top-level, sibling of sessions) is true when more sessions exist in the requested range beyond the limit parameter — when true, do not present modelMix, or sessions, as covering the full range; say so, or re-run with a higher limit. Null when no session in range has any resolvable attribution.
 
 The two underlying fields are also returned, and they are NOT interchangeable:
@@ -2598,8 +2598,19 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       const partialQualifier = attributionBasis === 'partial-transcript'
         ? ` (partial — ${unlabelledAssistantTurns} of ${assistantTurnCount} assistant turns unlabelled)`
         : '';
+      // CodeRabbit (ENG-1313 review): "agreement" must mean the picker is the
+      // WHOLE story — exactly one model ran and it is the picker — not merely
+      // that the picker is somewhere among several models that ran. The old
+      // `!includes()` check treated a picker-plus-backup run (picker ran, and
+      // so did another model) as agreement, dropping the "picker:" label even
+      // though a second model's involvement is exactly the kind of fact this
+      // field exists to surface. Per acceptance criterion 1 (ENG-1313):
+      // "when picker ≠ generation it shows both" — a multi-model
+      // `attributedModels` is never equal to the single-value picker, so it
+      // must take the "picker: X · ran: Y" form regardless of whether the
+      // picker happens to be one of the models that ran.
       const modelLine: string | null = attributedModels
-        ? (session.llmModel && !attributedModels.includes(session.llmModel)
+        ? (session.llmModel && (attributedModels.length !== 1 || attributedModels[0] !== session.llmModel)
             ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}${partialQualifier}`
             : `${attributedModels.join(', ')}${partialQualifier}`)
         : null;
