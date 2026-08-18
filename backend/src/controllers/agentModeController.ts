@@ -1824,19 +1824,34 @@ export function scheduledRunSignalsConditionalSkip(
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
   // A NEGATED failure/error mention — "not by failure", "no errors", "without any
-  // failure", "was not a failure" — DENIES a failure happened; it is not evidence
-  // of one. HARD_FAILURE_PATTERNS below matches these words ANYWHERE in the turn
-  // with no negation awareness, so a clean skip that merely denies a failure
-  // ("Posts published: 0 (by design, not by failure)") tripped the veto exactly
-  // like a real failure would (real prod regression, session 7f95530d,
-  // 2026-08-15 — the run made ZERO tool calls and still hit the 20-attempt nudge
-  // cap, ENG-1276 follow-up). Scoped tightly to the negation word landing
-  // directly on the failure/error noun (with only an optional article/"by"
-  // between), so it cannot swallow an unrelated failure named later in the same
-  // sentence — "not a failure of the schedule, but image generation failed"
-  // leaves "failed" intact and still vetoes.
+  // failure", "not a single failure", "never any failure" — DENIES a failure
+  // happened; it is not evidence of one. HARD_FAILURE_PATTERNS below matches
+  // these words ANYWHERE in the turn with no negation awareness, so a clean skip
+  // that merely denies a failure ("Posts published: 0 (by design, not by
+  // failure)") tripped the veto exactly like a real failure would (real prod
+  // regression, session 7f95530d, 2026-08-15 — the run made ZERO tool calls and
+  // still hit the 20-attempt nudge cap, ENG-1276 follow-up).
+  //
+  // A tempered greedy token, not a fixed adjacency pattern: the negation cue,
+  // then any run of text that does NOT cross a clause boundary, then the
+  // failure/error word. An earlier version only matched the cue landing
+  // DIRECTLY on the noun (an optional article/"by", nothing else), which caught
+  // "not by failure" but missed equally natural phrasings like "not a SINGLE
+  // failure" or "no REAL error" — the same underlying bug, just a wording the
+  // model hadn't happened to use yet (ENG-1276 follow-up #2).
+  //
+  // The clause-boundary exclusion is what keeps this fail-CLOSED as the span
+  // widens: a negation cue must never reach ACROSS a semicolon/sentence break or
+  // a contrastive conjunction ("but"/"however"/"though"/"yet"/"except") to
+  // neutralize an unrelated, genuine failure on the far side — "not a great day,
+  // BUT the post failed to publish" and "no post today; auth failed" both stop
+  // the match before reaching "failed", so it stays intact and still vetoes.
+  // Matching is also non-overlapping and left-to-right, so once a match
+  // consumes up to its NEAREST failure word, a later, un-negated failure word in
+  // the same sentence (no cue of its own) is untouched — "not a failure of the
+  // schedule, but image generation failed" neutralizes only the first mention.
   const NEGATED_FAILURE_MENTION =
-    /\b(?:not|no|never|without)\s+(?:(?:a|an|any|the)\s+)?(?:by\s+)?(?:failed|failures?|errors?|errored)\b/gi;
+    /\b(?:not|no|never|without)\b(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:])*?\b(?:failed|failures?|errors?|errored)\b/gi;
   const failureScan = expandContractions(
     text
       .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
