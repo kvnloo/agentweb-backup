@@ -589,6 +589,29 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
   return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
 }
 
+/**
+ * ENG-1131 follow-up: true when this run's blocked-state differs from the
+ * IMMEDIATELY PRECEDING run's — i.e. an edge, not a level. `priorRunResults`
+ * is the schedule's history from BEFORE this run (its last element is the
+ * previous run); `currentBlockedBy` is this run's own `detectRunBlockedReason`
+ * result.
+ *
+ * Deliberately edge-triggered so a schedule can proactively alert its owner
+ * the moment sourcing breaks or recovers, without alerting again on every
+ * subsequent run of a multi-day outage — that would just be spam once the
+ * owner already knows. A schedule's very first run counts as a transition
+ * into the blocked state (no prior run = treated as previously healthy), but
+ * not a transition if its first run is healthy.
+ */
+export function didSourcingBlockStateChange(
+  priorRunResults: any[] | undefined | null,
+  currentBlockedBy: string | null,
+): boolean {
+  const results = Array.isArray(priorRunResults) ? priorRunResults : [];
+  const previousBlockedBy = results.length > 0 ? results[results.length - 1]?.blockedBy : undefined;
+  return Boolean(currentBlockedBy) !== Boolean(previousBlockedBy);
+}
+
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
@@ -3398,6 +3421,41 @@ async function notifyScheduleOwnerOfFailure(
   }
 }
 
+/**
+ * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+ * schedule's LinkedIn sourcing capability changes state — call only when
+ * `didSourcingBlockStateChange` is true, so this fires once per transition,
+ * not once per run of a multi-day outage. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort
+ * by design — a notification failure must never break the run.
+ */
+async function notifyScheduleOwnerOfSourcingBlockTransition(
+  schedule: any,
+  userId: string,
+  detail: { isNowBlocked: boolean }
+): Promise<void> {
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduleSourcingBlockTransitionEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; sourcing-block transition alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send sourcing-block transition alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -4518,6 +4576,18 @@ export async function runScheduledChat(
     } catch (error) {
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
+    }
+
+    // ENG-1131 follow-up: alert the owner the MOMENT sourcing breaks or recovers,
+    // instead of only reporting it passively via the schedule-card badge / per-run
+    // emails the next time they happen to check. `schedule.runResults` here is the
+    // history from BEFORE this run, so didSourcingBlockStateChange compares against
+    // the immediately preceding run — fires once per transition, not once per run
+    // of a multi-day outage.
+    if (didSourcingBlockStateChange(schedule.runResults, blockedBy)) {
+      await notifyScheduleOwnerOfSourcingBlockTransition(schedule, userId, {
+        isNowBlocked: Boolean(blockedBy),
+      });
     }
 
     // Self-improve: when enabled, run a reflection turn in the same session that may

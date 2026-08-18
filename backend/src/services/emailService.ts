@@ -1050,6 +1050,100 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     }
   },
 
+  /**
+   * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+   * schedule's LinkedIn sourcing capability changes state, rather than only
+   * reporting it passively via the schedule-card badge / per-run emails the
+   * next time they happen to check. Called on the EDGE (see
+   * didSourcingBlockStateChange in agentModeController.ts) — once when a run
+   * first comes back blocked, once when a later run recovers — never on every
+   * run of a multi-day outage.
+   */
+  async sendScheduleSourcingBlockTransitionEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    isNowBlocked: boolean,
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(scheduleName);
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+
+      const headline = isNowBlocked
+        ? 'LinkedIn search is currently unavailable for this schedule'
+        : 'LinkedIn search is working again for this schedule';
+      const bodyHtml = isNowBlocked
+        ? `Your scheduled prospecting chat <strong>"${safeName}"</strong> could not source any prospects on its most recent ` +
+          `run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. ` +
+          `This is <strong>not</strong> "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is ` +
+          `account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; ` +
+          `we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to <strong>"${safeName}"</strong>, ` +
+          `and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+      const bodyText = isNowBlocked
+        ? `Your scheduled prospecting chat "${scheduleName}" could not source any prospects on its most recent run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. This is NOT "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to "${scheduleName}", and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+
+      const headerColor = isNowBlocked ? '#ffc107' : '#28a745';
+      const icon = isNowBlocked ? '⚠️' : '✅';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: ${headerColor}; color: ${isNowBlocked ? '#664d03' : 'white'}; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .info-section { background-color: ${isNowBlocked ? '#fff3cd' : '#e8f5e8'}; border-left: 4px solid ${headerColor}; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>${icon} ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="info-section">
+                <p style="margin: 0; line-height: 1.6;">${bodyHtml}</p>
+              </div>
+            </div>
+            <div class="footer">
+              <a class="button" href="${customerFrontendUrl}/agent-mode?tab=scheduled">Review your schedules</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">This is an automated email from your scheduled chat.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${scheduleName}
+
+${bodyText}
+
+---
+Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
+
+      const subject = isNowBlocked
+        ? `⚠️ LinkedIn search unavailable: ${scheduleName}`
+        : `✅ LinkedIn search is back: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Sourcing-block transition email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId}, isNowBlocked=${isNowBlocked})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending sourcing-block transition email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the scheduled chat flow.
+    }
+  },
+
   async sendScheduledChatTokenLimitEmail(
     toEmails: string | string[],
     scheduleName: string,
