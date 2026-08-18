@@ -67,6 +67,7 @@ export async function syncSentInvitationsForAccount(
   const now = new Date().toISOString();
   let unchanged = 0;
   let stoppedEarly = false;
+  let consecutiveKnownPages = 0;
 
   // Unipile occasionally omits parsed_datetime. Carry the first-observed value
   // forward instead of moving sentAt on every sync. Keep the whole cached row so
@@ -131,7 +132,15 @@ export async function syncSentInvitationsForAccount(
     // Newest-first ordering means a page we already knew in full implies every page
     // behind it is known too. Requires a trustworthy cache: if the preload failed we
     // have no basis for "unchanged" and must keep walking.
-    if (mode === 'incremental' && cachePreloaded && pageWasEntirelyKnown) {
+    //
+    // Two CONSECUTIVE known pages, not one. The early exit rests on Unipile ordering
+    // the feed newest-first, which is observed behaviour rather than a documented
+    // contract — and the cost of that assumption being wrong is not a slow sync, it
+    // is a pending invitation missing from the cache, which reads as "never invited"
+    // and can re-invite someone. One extra page is cheap insurance against a single
+    // out-of-order page ending the walk early.
+    consecutiveKnownPages = pageWasEntirelyKnown ? consecutiveKnownPages + 1 : 0;
+    if (mode === 'incremental' && cachePreloaded && consecutiveKnownPages >= 2) {
       stoppedEarly = true;
       break;
     }

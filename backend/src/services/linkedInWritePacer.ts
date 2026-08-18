@@ -80,9 +80,22 @@ const isTestEnv = (): boolean =>
 export const minGapMs = (): number =>
   envInt('LINKEDIN_WRITE_MIN_GAP_MS', isTestEnv() ? 0 : 5_000);
 
-/** Rolling per-account ceiling, so a long run cannot creep up on the limit. */
+/**
+ * Rolling per-account ceiling — a backstop against sustained hammering, NOT the
+ * primary guard.
+ *
+ * The evidence indicts BURST, not volume: ~10 writes inside one second killed the
+ * session, twice. The minimum gap above is what fixes that, and at 5s the ceiling
+ * is already an implicit ~720/hour.
+ *
+ * Set to 30 originally, which was a mistake: a legitimate stale-invite drain
+ * targets 40 withdrawals in a run, and Fangfang's and Hannah's invite schedules are
+ * the same shape — so the ceiling would have refused ordinary work that the gap had
+ * already made safe, converting a fix into an outage of its own. 120 sits far above
+ * realistic per-account use while still catching a runaway loop.
+ */
 export const maxWritesPerHour = (): number =>
-  envInt('LINKEDIN_WRITE_MAX_PER_HOUR', isTestEnv() ? 0 : 30);
+  envInt('LINKEDIN_WRITE_MAX_PER_HOUR', isTestEnv() ? 0 : 120);
 
 /**
  * Longest a single call will sit in the queue before being refused instead.

@@ -44,6 +44,16 @@ export type HealthOutcome =
 export const DISCONNECT_REMINDER_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
+ * How long a disconnect must persist before the OWNER is emailed about it.
+ *
+ * Sized to straddle one cron cycle (10 min), so a disconnect seen once and gone by
+ * the next sweep never reaches the customer. Internal handling — the flag, the
+ * oncall alert, the schedule gate — is immediate and unaffected; only the
+ * irreversible, customer-visible action waits for a second opinion.
+ */
+export const DISCONNECT_CONFIRM_MS = 9 * 60 * 1000;
+
+/**
  * Only refresh `last_verified_at` this often. Without a floor, a healthy account
  * would take a DynamoDB write on all 288 daily cycles per instance purely to move a
  * timestamp nobody reads that precisely.
@@ -51,22 +61,27 @@ export const DISCONNECT_REMINDER_MS = 7 * 24 * 60 * 60 * 1000;
 export const VERIFY_STAMP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 /**
- * Owner-facing email is OFF unless explicitly enabled.
+ * Owner-facing email is ON by default, and can be killed with
+ * LINKEDIN_DISCONNECT_NOTIFY=false.
  *
- * Not timidity — precedent. `docs/postmortem-2026-06-03-linkedin-connection-notification-flood.md`
- * records a one-time backfill that mailed thousands of customers about historical
- * state it had just discovered for the first time. The first sweep after this ships
- * is exactly that shape: every already-dead account looks like a brand-new edge. Two
- * are dead today, and at least one of them (Sue Xu, ENG-281/CS-18) has an outreach
- * decision attached that is a comms call, not an engineering one.
+ * The default started OFF, on the precedent of
+ * `docs/postmortem-2026-06-03-linkedin-connection-notification-flood.md` — a one-time
+ * backfill that mailed thousands of customers about historical state it had just
+ * discovered. Enabled deliberately (Manan, 2026-08-17) because the shape here is not
+ * that shape: this sends ONE email per disconnect EVENT, not one per connection, and
+ * a disconnect is already a total outage of the thing the customer is paying for.
+ * Telling them within ten minutes is the entire point of the ticket; two accounts are
+ * affected today, not thousands.
  *
- * The oncall alert below is deliberately NOT gated the same way: it is internal,
- * deduped, and its absence is why a disconnected account once sat unnoticed for 38
- * days.
+ * Note the blast radius on first deploy: every already-dead account reads as a fresh
+ * edge and is mailed on the next cycle.
  *
- * Read at call time so it can be flipped via the EB environment without a redeploy.
+ * The oncall alert is not gated by this at all — it is internal, deduped, and its
+ * absence is why a disconnected account once sat unnoticed for 38 days.
+ *
+ * Read at call time so it can be killed via the EB environment without a redeploy.
  */
-const isOwnerNotifyEnabled = (): boolean => process.env.LINKEDIN_DISCONNECT_NOTIFY === 'true';
+const isOwnerNotifyEnabled = (): boolean => process.env.LINKEDIN_DISCONNECT_NOTIFY !== 'false';
 
 function daysBetween(fromIso: string, now: number): number {
   const started = Date.parse(fromIso);
@@ -167,6 +182,7 @@ export async function recordUnipileAccountHealth(params: {
 
       if (wasDisconnected) {
         console.log(`${TAG} account=${accountId} recovered — session is live again`);
+        await resumeSchedulesPausedForAccount(ownerUserId, account.accountId);
         return 'cleared';
       }
       return 'verified';
@@ -184,7 +200,6 @@ export async function recordUnipileAccountHealth(params: {
       // verdict we already computed rather than silent suppression of every alert.
       let wonTransition = true;
       const disconnectedAt = new Date(now).toISOString();
-      const willNotifyOwner = isOwnerNotifyEnabled();
 
       await updateAccountConfig(ownerUserId, 'unipile', account.accountId, (freshConfig) => {
         wonTransition = !freshConfig.needs_reconnect;
@@ -192,13 +207,10 @@ export async function recordUnipileAccountHealth(params: {
           updates: {
             needs_reconnect: true,
             disconnected_at: freshConfig.disconnected_at || disconnectedAt,
-            // Only claim we notified when we are actually going to. Stamping this
-            // while the flag is off would make the reminder path believe an email
-            // already went out, and the owner would hear nothing for a week after
-            // someone enables it.
-            ...(willNotifyOwner && wonTransition
-              ? { disconnect_notified_at: disconnectedAt }
-              : {}),
+            // Never stamped here: the transition deliberately does not email the
+            // owner (see below), and `disconnect_notified_at` means "last time we
+            // emailed the owner". Stamping it for an email that never went out is
+            // what would silence the customer for a full reminder window.
           },
         };
       });
@@ -208,6 +220,16 @@ export async function recordUnipileAccountHealth(params: {
       console.warn(
         `${TAG} account=${accountId} owner=${ownerUserId} transitioned connected -> disconnected`,
       );
+      // Oncall hears immediately; the CUSTOMER does not.
+      //
+      // A single proven-disconnected signal is enough to flag the account and gate
+      // its schedules — both of those are internal and self-correcting, and the
+      // schedule gate re-probes before it withholds anything. Emailing is neither:
+      // a transient Unipile 401 would tell a paying customer their account is broken
+      // when it is not, and an email cannot be unsent. So the owner's copy waits for
+      // the disconnect to still be true on a later observation (see the confirmation
+      // branch below), which costs about ten minutes and removes single-blip false
+      // alarms entirely.
       await notify({
         ownerUserId,
         accountId,
@@ -215,7 +237,7 @@ export async function recordUnipileAccountHealth(params: {
         disconnectedAt,
         isReminder: false,
         daysDisconnected: 0,
-        notifyOwner: willNotifyOwner,
+        notifyOwner: false,
       });
       return 'marked-disconnected';
     }
@@ -229,6 +251,45 @@ export async function recordUnipileAccountHealth(params: {
     // account would produce exactly one alert ever and then nothing — which is the
     // 38-day blind spot this was built to close. The flag is applied inside notify()
     // instead, where it only suppresses the customer's copy.
+    // Two independent cadences, and conflating them is what made this subtle:
+    //
+    //  - ONCALL is paced by sendAgentModeOncallAlert's own dedupeKey/window, so it
+    //    needs no stamp of its own and can fire whether or not the customer is
+    //    being emailed.
+    //  - THE OWNER EMAIL is paced by `disconnect_notified_at` — which therefore has
+    //    to mean "last time we actually emailed the owner", nothing looser.
+    //
+    // Stamping it while the owner email is suppressed breaks that meaning and costs
+    // the customer a week: the stamp lands seconds after the disconnect, so whoever
+    // later enables LINKEDIN_DISCONNECT_NOTIFY finds the reminder "not due" and the
+    // customer hears nothing until a full window has passed. Same defect the
+    // transition branch above already guards against.
+    const ownerNotify = isOwnerNotifyEnabled();
+
+    // First owner email waits for CONFIRMATION: the disconnect must still be true
+    // on an observation at least this long after it was first seen. A transient
+    // Unipile 401 clears on the next probe and never reaches the customer.
+    const firstNotifyPending = !config.disconnect_notified_at;
+    const seenAt = Date.parse(config.disconnected_at || '');
+    const confirmed =
+      !Number.isFinite(seenAt) || now - seenAt >= DISCONNECT_CONFIRM_MS;
+    if (ownerNotify && firstNotifyPending && !confirmed) {
+      return 'no-op';
+    }
+
+    if (!ownerNotify) {
+      await notify({
+        ownerUserId,
+        accountId,
+        accountName,
+        disconnectedAt: config.disconnected_at || new Date(now).toISOString(),
+        isReminder: true,
+        daysDisconnected: daysBetween(config.disconnected_at || '', now),
+        notifyOwner: false,
+      });
+      return 'reminded';
+    }
+
     const lastNotified = Date.parse(config.disconnect_notified_at || '');
     const due = !Number.isFinite(lastNotified) || now - lastNotified >= DISCONNECT_REMINDER_MS;
     if (!due) return 'no-op';
@@ -252,7 +313,7 @@ export async function recordUnipileAccountHealth(params: {
       disconnectedAt,
       isReminder: true,
       daysDisconnected: daysBetween(disconnectedAt, now),
-      notifyOwner: isOwnerNotifyEnabled(),
+      notifyOwner: true,
     });
     return 'reminded';
   } catch (error) {
@@ -327,7 +388,49 @@ export async function clearDisconnectFlag(ownerUserId: string, accountId: string
       unset: ['needs_reconnect', 'disconnected_at', 'disconnect_notified_at'],
     }));
     console.log(`${TAG} account=${accountId} disconnect flag cleared after reconnect`);
+    await resumeSchedulesPausedForAccount(ownerUserId, account.accountId);
   } catch (error) {
     console.error(`${TAG} Failed to clear disconnect flag for ${accountId}:`, error);
+  }
+}
+
+/**
+ * Resume schedules this account's disconnect had paused (ENG-1197).
+ *
+ * The per-run skip is self-healing by design — it leaves the schedule active, so a
+ * reconnect brings it straight back. The auto-pause after five skips is the one
+ * state a reconnect could NOT undo on its own, which turns a temporary outage into
+ * an indefinitely stopped schedule that the customer has to notice and restart by
+ * hand. Resuming here closes that.
+ *
+ * Deliberately narrow: only schedules carrying `pausedReason: 'linkedin_disconnected'`
+ * AND pinning this account are touched, so a schedule a human paused on purpose is
+ * never silently restarted.
+ */
+export async function resumeSchedulesPausedForAccount(
+  ownerUserId: string,
+  accountId: string,
+): Promise<number> {
+  try {
+    const { scheduleDb } = await import('./db');
+    const schedules = (await scheduleDb.getSchedulesByUserId(ownerUserId)) || [];
+    let resumed = 0;
+    for (const s of schedules as any[]) {
+      if (s?.status !== 'paused') continue;
+      if (s?.pausedReason !== 'linkedin_disconnected') continue;
+      if (!String(s?.startingMessage || '').includes(accountId)) continue;
+      await scheduleDb.updateSchedule(s.scheduleId, {
+        status: 'active',
+        pausedReason: null,
+        updatedAt: new Date().toISOString(),
+      } as any);
+      resumed += 1;
+      console.log(`${TAG} resumed schedule ${s.scheduleId} after ${accountId} reconnected`);
+    }
+    return resumed;
+  } catch (error) {
+    // Never let this break the reconnect callback — the account is back either way.
+    console.error(`${TAG} Failed to resume schedules for ${accountId}:`, error);
+    return 0;
   }
 }

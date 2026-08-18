@@ -3411,8 +3411,11 @@ async function pauseScheduleForDisconnectedAccount(
   try {
     await scheduleDb.updateSchedule(schedule.scheduleId, {
       status: 'paused',
+      // Marks WHY, so a later reconnect can resume exactly the schedules this gate
+      // stopped and nothing a human paused deliberately (ENG-1197).
+      pausedReason: 'linkedin_disconnected',
       updatedAt: new Date().toISOString(),
-    });
+    } as any);
     console.error(
       `runScheduledChat: PAUSED schedule ${schedule.scheduleId} — ${consecutiveSkips} consecutive runs `
       + `skipped for disconnected LinkedIn account(s) ${gate.accountIds.join(', ')}.`,
