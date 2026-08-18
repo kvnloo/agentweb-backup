@@ -420,6 +420,120 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     });
   });
 
+  // ENG-1276 follow-up #3 — a full audit of the tool-substitution class of bug,
+  // not just the one instance (twitter_manage_post/post_on_connected_account)
+  // that had already broken production. Every tool whose description tells the
+  // model to use, or prefer, a DIFFERENT registered tool is a candidate for the
+  // same bug: a schedule's requiredFunctionCalls names one, the model
+  // legitimately uses the other, and the requirement never gets credited.
+  //
+  // This is a PINNED, REVIEWED catalog, not a live "is this safe" classifier —
+  // classifying "is tool B really a substitute for tool A" requires reading
+  // each pair's actual execute() implementation (name/description text lies,
+  // that is the whole premise of ENG-1276), which is a human judgment call each
+  // time. What this test buys: the judgment only has to happen ONCE per pair,
+  // and it happens LOUDLY — a NEW pair appearing (a new tool registered, or an
+  // existing description edited to add a redirect) fails this test and forces
+  // the same review before it can ship silently.
+  //
+  // Disposition of every pair found as of this audit:
+  //   - twitter_manage_post -> post_on_connected_account: REAL bug (Kevin's
+  //     three schedules, 10+ Linear duplicates 2026-08-03..08-12). FIXED —
+  //     aliased (post_thread action only).
+  //   - email -> send_email_from_sender, send_email_from_sender -> email: same
+  //     shape, verified via both execute() paths (email's send action is a real
+  //     write through resolveEmailAccount(..., 'send'); send_email_from_sender
+  //     has no action param, every call sends). No production incident yet, but
+  //     the mechanism is identical and verified, so FIXED proactively —
+  //     aliased bidirectionally.
+  //   - create_work_plan -> modify_work_plan: INVESTIGATED, NOT a valid alias.
+  //     modifyWorkPlan requires a PRE-EXISTING work plan and returns
+  //     `{success: false}` with no plan — it can never substitute for
+  //     create_work_plan, so aliasing it would credit a call that (if it ever
+  //     happens with no plan) represents a FAILURE to do what was needed.
+  //   - call_meta_ads_insights_api <-> get_meta_ads_metrics: both READ-ONLY
+  //     reporting tools that redirect to each other by query shape (custom GAQL
+  //     vs quick dashboard). Real analog in SHAPE, but not in STAKES — even a
+  //     false negative here nudges toward a redundant read, not an off-cadence
+  //     publish. Not aliased; logged here so it isn't silently missed.
+  //   - delete_leads_by_filter -> delete_leads (+ -> search_leads): a real
+  //     destructive action, but delete_leads_by_filter carries its OWN
+  //     confirm-gated two-phase workflow (preview, then confirm=true) — a
+  //     different shape than a simple action-flag alias, and unlike email/
+  //     twitter there is no evidence any schedule requires delete_leads.
+  //     Deprioritized, not aliased; logged so it isn't silently missed either.
+  //   - ask_crm <-> get_leads/search_leads: ask_crm is a free-form NL query tool
+  //     that redirects to get_leads/search_leads "for single-list browsing" —
+  //     different QUERY SHAPES over the same data, not an account-state-driven
+  //     substitute. All three already classify as read-only by name (ask_/get_/
+  //     search_ all match READ_ONLY_TOOL), so even a miss here can only nudge
+  //     toward a redundant read, never a false-skip or a missed publish.
+  //   - describe_image/describe_video <-> read_file_content, get_deployment_status
+  //     -> coding_agent, remove_image_background -> generate_image/
+  //     update_html_file, and every other pair (compose_video<->generate_video,
+  //     create_blog_article<->create_html_file, create_html_file<->
+  //     create_html_template, create_html_file->generate_landing_page,
+  //     create_image_task_from_prompt->generate_image, create_revision->
+  //     generate_image/update_html_file, perform_deep_research->
+  //     create_blog_article, remove_c2pa_from_image->remove_image_background,
+  //     update_book_content->generate_book_content): routes between DIFFERENT
+  //     deliverable types/content types/scopes, not a same-outcome substitute
+  //     for the SAME requirement — aliasing any of these would credit a call
+  //     that did not produce what was required. create_image_task_from_prompt
+  //     and create_revision are also [DEPRECATED], further lowering their
+  //     real-world likelihood.
+  it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
+    const allTools = emmaToolRegistry.getAllTools();
+    const allNames = allTools.map((t) => t.name);
+    const pairs = new Set<string>();
+    for (const tool of allTools) {
+      const desc = tool.definition?.description ?? '';
+      for (const otherName of allNames) {
+        if (otherName === tool.name) continue;
+        const mentionsRedirect = new RegExp(
+          `\\b${otherName}\\b[^.]{0,40}\\b(?:instead|prefer)\\b|\\b(?:instead|prefer)\\b[^.]{0,40}\\b${otherName}\\b`,
+          'i'
+        );
+        if (mentionsRedirect.test(desc)) pairs.add(`${tool.name} -> ${otherName}`);
+      }
+    }
+    expect([...pairs].sort()).toEqual(
+      [
+        'ask_crm -> get_leads',
+        'ask_crm -> search_leads',
+        'call_meta_ads_insights_api -> get_meta_ads_metrics',
+        'compose_video -> generate_video',
+        'create_blog_article -> create_html_file',
+        'create_html_file -> create_blog_article',
+        'create_html_file -> create_html_template',
+        'create_html_file -> generate_landing_page',
+        'create_html_template -> create_html_file',
+        'create_image_task_from_prompt -> generate_image',
+        'create_revision -> generate_image',
+        'create_revision -> update_html_file',
+        'create_work_plan -> modify_work_plan',
+        'delete_leads_by_filter -> delete_leads',
+        'delete_leads_by_filter -> search_leads',
+        'describe_image -> read_file_content',
+        'describe_video -> read_file_content',
+        'email -> send_email_from_sender',
+        'generate_video -> compose_video',
+        'get_deployment_status -> coding_agent',
+        'get_meta_ads_metrics -> call_meta_ads_insights_api',
+        'perform_deep_research -> create_blog_article',
+        'read_file_content -> describe_image',
+        'read_file_content -> describe_video',
+        'remove_c2pa_from_image -> remove_image_background',
+        'remove_image_background -> generate_image',
+        'remove_image_background -> update_html_file',
+        'search_leads -> ask_crm',
+        'send_email_from_sender -> email',
+        'twitter_manage_post -> post_on_connected_account',
+        'update_book_content -> generate_book_content',
+      ].sort()
+    );
+  });
+
   it('fires on the REAL 2026-08-15 prod regression: a NEGATED "failure" mention read as hard failure evidence (ENG-1276 follow-up, session 7f95530d…)', () => {
     // The day BEFORE the perform_data_analysis regression above, the SAME schedule
     // hit the SAME 20-attempt nudge trap through a completely different mechanism:
