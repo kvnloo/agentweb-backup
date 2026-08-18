@@ -191,6 +191,14 @@ export interface ChatSession {
       description?: string;
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
+      // ENG-1188 (Greptile): set alongside completedAt for 'completed' AND ALSO for
+      // 'skipped' -- unlike completedAt, this exists purely so setWorkPlanStatus's
+      // asset-count gate has a real "this step left pending" marker for a skipped
+      // step to scope a later step's asset count against, instead of silently
+      // falling through to counting the whole session. Internal bookkeeping only;
+      // never rendered (PlanProgress/HorizontalPlanProgress key off completedAt +
+      // status === 'completed', which reusing completedAt here would have broken).
+      resolvedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
@@ -299,6 +307,11 @@ export interface ChatSession {
       goalCompletion: number;   // 1-5: did the assistant accomplish what was asked?
       dataAccuracy: number;     // 1-5: plausible/consistent data, no hallucinations?
       outputQuality: number;    // 1-5: well-structured, specific, actionable output?
+      // ENG-1312: optional — a session scored before this shipped, or by a
+      // stale custom judge prompt, simply omits these.
+      concision?: number;               // 0-5: did reply length match the question/instruction?
+      instructionCompliance?: number;   // 0-5: explicit instruction followed on first attempt?
+      unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
     };
   };
   judgeScores?: Record<string, {  // keyed by judge ID
@@ -311,6 +324,10 @@ export interface ChatSession {
       goalCompletion: number;
       dataAccuracy: number;
       outputQuality: number;
+      // ENG-1312: see satisfactionScore.dimensions above.
+      concision?: number;
+      instructionCompliance?: number;
+      unnecessaryPermissionRequest?: boolean;
     };
   }>;
   // Scores retracted because the session turned out to be outside the
@@ -3084,6 +3101,8 @@ export class ChatbotDB {
         userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
+        /** ENG-1188: see the matching field on the read-side workPlan type above. */
+        resolvedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
