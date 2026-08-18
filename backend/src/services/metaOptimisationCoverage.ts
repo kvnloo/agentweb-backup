@@ -507,7 +507,11 @@ export function evaluateAccountOptimisationCoverage(
       continue;
     }
 
-    if (received.has(expected)) continue; // arriving — no claim to make
+    // pixelReceivedEvent, NOT received.has: /stats returns a custom event under BOTH its
+    // decoded and percent-encoded names, and a raw Set lookup sees only one of them. This
+    // evaluator was left on the raw check when the helper was introduced for its sibling —
+    // the same fix-one-of-a-pair defect §48 records, in the commit that cited §48.
+    if (pixelReceivedEvent(received, expected)) continue; // arriving — no claim to make
 
     // Paused: real, but costs nothing until someone resumes it. Never alerted, by decision.
     if (!delivering) {
