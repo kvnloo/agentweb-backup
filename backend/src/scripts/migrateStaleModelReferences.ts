@@ -61,6 +61,42 @@ export const SAME_FAMILY_MODEL_REPLACEMENTS: Record<string, string> = {
   // (checked live 2026-08-17, no meta-llama/llama-5* listed). Records referencing
   // these fall through to 'orphan' below and are left for the existing
   // fallback+alert mechanism, per the explicit no-cross-family-substitution rule.
+
+  // Added 2026-08-17 after the ENG-9 dry-run surfaced 837 UNRELATED pre-existing
+  // stale records (not OpenRouter — found because detection is registry-driven,
+  // not a hardcoded list). Both grounded in git history, not guessed:
+  //
+  // gemini-3-pro-preview: removed from the registry in a35d82457d (ENG-744,
+  // 2026-07-29) — Google shut the model down server-side 2026-03-09; the
+  // commit's own comment names the documented successor, confirmed still
+  // live in the current registry.
+  'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
+  // claude-sonnet-4-5: NEVER a valid registry key — git blame on the commit
+  // that introduced Sonnet 4.5 support (f4c50a9f4) shows the real key was
+  // always the full Bedrock inference-profile id below. This is the exact bug
+  // ENG-892 fixed at the write site (see agentModeController.ts:11053 —
+  // "the picker used to persist whatever string arrived, so ids that are not
+  // served at all (e.g. 'claude-sonnet-4-5') were stored"); that write-time
+  // guard already shipped, so these are leftover PRE-fix records, not an
+  // active ongoing bug. The mapped value canonicalizes to the SAME model
+  // generation the user actually picked, not an upgrade.
+  'claude-sonnet-4-5': 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+
+  // Discovered mid-apply-run 2026-08-17 (registry-driven detection surfaced
+  // these live, not anticipated ahead of time) — same rigor, each grounded
+  // before mapping:
+  // anthropic.claude-opus-4-7: real, removed model (894a35dcb, "Remove Opus
+  // 4.7 from the model registry and routing" — "Only Opus 4.8 remains on the
+  // cross-account bearer-token path").
+  'anthropic.claude-opus-4-7': 'anthropic.claude-opus-4-8',
+  // gemini-3.1-flash-lite-preview: explicit GA graduation (5f9e01cff, "The
+  // preview model is being discontinued on May 25, 2026 ... use the GA
+  // identifier gemini-3.1-flash-lite per Google's migration notice").
+  'gemini-3.1-flash-lite-preview': 'gemini-3.1-flash-lite',
+  // anthropic.claude.sonnet.4-6 (dots, not dashes): never appears anywhere in
+  // registry history (checked) — same malformed-client-write bug class as
+  // claude-sonnet-4-5, canonicalizing to the real dashed key for the same model.
+  'anthropic.claude.sonnet.4-6': 'anthropic.claude-sonnet-4-6',
 };
 
 export type MigrationPlan =

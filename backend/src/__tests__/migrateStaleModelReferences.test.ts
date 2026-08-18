@@ -71,12 +71,37 @@ describe('planModelMigration (pure, ENG-9)', () => {
     });
   });
 
-  it('SAME_FAMILY_MODEL_REPLACEMENTS covers exactly the four mapped ENG-9 drops, no Llama entries', () => {
+  it('SAME_FAMILY_MODEL_REPLACEMENTS covers exactly the four mapped ENG-9 drops plus the five grounded legacy fixes, no Llama entries', () => {
     expect(SAME_FAMILY_MODEL_REPLACEMENTS).toEqual({
       'openrouter/x-ai/grok-4.3': 'openrouter/x-ai/grok-4.6',
       'openrouter/mistralai/mistral-large-2512': 'openrouter/mistralai/mistral-small-2603',
       'openrouter/moonshotai/kimi-k2.6': 'openrouter/moonshotai/kimi-k2.7-code',
       'openrouter/qwen/qwen3.7-flash': 'openrouter/qwen/qwen3.8-max',
+      'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
+      'claude-sonnet-4-5': 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+      'anthropic.claude-opus-4-7': 'anthropic.claude-opus-4-8',
+      'gemini-3.1-flash-lite-preview': 'gemini-3.1-flash-lite',
+      'anthropic.claude.sonnet.4-6': 'anthropic.claude-sonnet-4-6',
+    });
+  });
+
+  it('maps the root-caused legacy stale ids to their grounded replacements', () => {
+    const validModelIds = new Set(['gemini-3.1-pro-preview', 'anthropic.claude-sonnet-4-5-20250929-v1:0']);
+    const identity = (id: string) => id;
+
+    // ENG-744: Google shut down gemini-3-pro-preview server-side; commit
+    // a35d82457d names gemini-3.1-pro-preview as the successor.
+    expect(planModelMigration('gemini-3-pro-preview', validModelIds, identity)).toEqual({
+      action: 'migrate',
+      newModel: 'gemini-3.1-pro-preview',
+    });
+
+    // ENG-892: 'claude-sonnet-4-5' was never a valid registry key (git blame on
+    // f4c50a9f4 shows the real key was always the full Bedrock id) — this
+    // canonicalizes to the SAME model generation, not an upgrade.
+    expect(planModelMigration('claude-sonnet-4-5', validModelIds, identity)).toEqual({
+      action: 'migrate',
+      newModel: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
     });
   });
 });
