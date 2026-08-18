@@ -65,3 +65,33 @@ export function usableProfileUrl(url: unknown): string | null {
   if (!cleaned || isFabricatedProfileUrl(cleaned)) return null;
   return cleaned;
 }
+
+/** The fields Unipile derives from `public_identifier`, so all inherit its sentinel. */
+const PROFILE_URL_FIELDS = ['public_profile_url', 'url', 'profile_url'] as const;
+
+/**
+ * A copy of a Unipile profile with the anonymized sentinel — and every URL built
+ * from it — removed.
+ *
+ * Rejecting the identifier at the point a URL is *constructed* is only half the job:
+ * the profile object itself gets serialized wholesale into the enrichment LLM's
+ * context and into the enrichment cache, carrying `"public_identifier": "undefined"`
+ * and `"public_profile_url": ".../in/undefined"` with it. The model can then emit
+ * that URL as the lead's LinkedIn, and citation verification accepts it precisely
+ * because the slug does appear in the source context.
+ *
+ * Deletes rather than blanks, so a downstream truthiness check reads "absent" rather
+ * than "present but empty". Valid values are left exactly as they arrived — this
+ * removes fabrications, it does not normalize.
+ */
+export function withoutFabricatedProfileFields<T extends Record<string, any>>(profile: T): T {
+  const sanitized: Record<string, any> = { ...profile };
+  if (!usablePublicIdentifier(sanitized.public_identifier)) {
+    delete sanitized.public_identifier;
+  }
+  for (const field of PROFILE_URL_FIELDS) {
+    if (!(field in sanitized)) continue;
+    if (!usableProfileUrl(sanitized[field])) delete sanitized[field];
+  }
+  return sanitized as T;
+}

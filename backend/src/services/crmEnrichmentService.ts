@@ -1,5 +1,5 @@
 import { crmDb } from './db';
-import { usablePublicIdentifier, usableProfileUrl } from '../utils/linkedInAnonymizedProfile';
+import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
@@ -884,7 +884,13 @@ export class CrmEnrichmentService {
       }
 
       if (profileData) {
-        rawProfile = profileData as Record<string, unknown>;
+        // The whole profile object is serialized into the LLM's context below and
+        // stored for the cache-replay path, so rejecting the sentinel only where a
+        // URL gets built leaves the fabricated `/in/undefined` reachable anyway —
+        // the model can read it straight out of the blob, and citation verification
+        // then accepts it because the slug really is in the source context.
+        const sanitizedProfile = withoutFabricatedProfileFields(profileData as Record<string, unknown>);
+        rawProfile = sanitizedProfile;
         // ENG-1198: Unipile anonymizes out-of-network profiles with
         // public_identifier literally the string 'undefined' — that string is
         // truthy, so leaving it here would make the URL construction below (and
@@ -911,7 +917,7 @@ export class CrmEnrichmentService {
           const profileUrl = publicIdentifier
             ? `https://www.linkedin.com/in/${publicIdentifier}`
             : cleanUrl;
-          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
+          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(sanitizedProfile, null, 2)}`;
           if (profileUrl && isEnrichingLinkedin) {
             linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
           }

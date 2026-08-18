@@ -1,4 +1,5 @@
 import { crmDb } from './db';
+import { withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import {
   FIELD_GROUPS,
   buildCompanyCanonicalKey,
@@ -200,7 +201,15 @@ export function buildLinkedInContextFromCache(
 ): string {
   if (!rawData.linkedinData) return '';
 
-  let linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(rawData.linkedinData.rawProfile, null, 2)}`;
+  // Sanitize on the way out as well as on the way in. Rows cached before the
+  // write-side fix still hold `"public_identifier": "undefined"` and the
+  // `/in/undefined` URL built from it, and a cache hit replays the blob verbatim —
+  // so without this the fabricated URL keeps reaching the LLM until every existing
+  // row expires.
+  const rawProfile = withoutFabricatedProfileFields(
+    (rawData.linkedinData.rawProfile ?? {}) as Record<string, unknown>,
+  );
+  let linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(rawProfile, null, 2)}`;
 
   if (isEnrichingLinkedin && rawData.linkedinData.publicIdentifier) {
     const profileUrl = `https://www.linkedin.com/in/${rawData.linkedinData.publicIdentifier}`;
