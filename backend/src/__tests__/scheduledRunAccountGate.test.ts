@@ -13,6 +13,8 @@ import {
   countTrailingAccountSkips,
   evaluateAccountGate,
   findPinnedUnipileAccountIds,
+  probeIdForAccount,
+  unipileIdsForAccount,
 } from '../utils/scheduledRunAccountGate';
 
 const JENNIFER = 'tMgX8uZJTZWTG_mFY1aI2A';
@@ -91,6 +93,13 @@ describe('countTrailingAccountSkips', () => {
     expect(countTrailingAccountSkips(null)).toBe(0);
     expect(countTrailingAccountSkips([])).toBe(0);
     expect(countTrailingAccountSkips([{}, { status: null }])).toBe(0);
+  });
+
+  it('does not throw on a literal undefined entry in the history array', () => {
+    // Distinct from `{}` above: an actual hole/undefined element hits the `?.`
+    // short-circuit itself, not just an object whose `status` is absent.
+    expect(countTrailingAccountSkips([undefined as any, { status: ACCOUNT_DISCONNECTED_STATUS }])).toBe(1);
+    expect(countTrailingAccountSkips([{ status: ACCOUNT_DISCONNECTED_STATUS }, undefined as any])).toBe(0);
   });
 
   it('reaches the pause threshold only after that many consecutive skips', () => {
@@ -255,6 +264,28 @@ describe('evaluateAccountGate — the decision itself', () => {
     const result = await evaluateAccountGate(PINNED, USER, d);
 
     expect(result.accountNames).toEqual([JENNIFER]);
+  });
+
+  it('treats a row with no config object at all as live, not flagged', async () => {
+    // Every other fixture in this file supplies `config: {...}`, even when empty.
+    // A real DynamoDB row can omit the attribute entirely — distinct from `{}` —
+    // and the gate must still default to "not known dead" rather than throw.
+    const d = deps([{ account_id: JENNIFER } as any]);
+
+    const result = await evaluateAccountGate(PINNED, USER, d);
+
+    expect(result.blocked).toBe(false);
+    expect(d.probeSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('unipileIdsForAccount / probeIdForAccount — a row with no config at all', () => {
+  it('unipileIdsForAccount falls back to just the account_id', () => {
+    expect(unipileIdsForAccount({ account_id: JENNIFER } as any)).toEqual([JENNIFER]);
+  });
+
+  it('probeIdForAccount falls back to the account_id', () => {
+    expect(probeIdForAccount({ account_id: JENNIFER } as any)).toBe(JENNIFER);
   });
 });
 

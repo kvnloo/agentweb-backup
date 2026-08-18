@@ -151,10 +151,12 @@ export async function evaluateAccountGate(
     );
     if (pinnedIds.length === 0) return NOT_BLOCKED;
 
+    // `pinned` cannot be empty here: every id in `pinnedIds` was drawn from
+    // `accounts.flatMap(unipileIdsForAccount)` in the first place, so each one
+    // necessarily matches the account it came from.
     const pinned = accounts.filter((acc) =>
       unipileIdsForAccount(acc).some((id) => pinnedIds.includes(id)),
     );
-    if (pinned.length === 0) return NOT_BLOCKED;
     // One live pinned account is enough for the run to have something to work with.
     if (pinned.some((acc) => !acc.config?.needs_reconnect)) return NOT_BLOCKED;
 
