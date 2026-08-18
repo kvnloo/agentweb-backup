@@ -33,6 +33,13 @@
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
 import { readBilledLedgerRows, hasInferredAttribution } from "./llmUsageLedgerReader";
+
+/**
+ * How much of the authoritative counter the reconstructed ledger must account for
+ * before the forecast is treated as built on complete data. Below this, spend was
+ * billed to this subject that the ledger could not find.
+ */
+const LEDGER_COMPLETENESS_TOLERANCE = 0.95;
 import {
   computeUsageRunway,
   type UsageRunway,
@@ -95,12 +102,39 @@ export async function resolveUsageRunway(
   // `low` confidence rather than a precise-looking date built on inference.
   const attributionInferred = hasInferredAttribution(rows);
 
+  // A second, independent signal that attribution is incomplete.
+  //
+  // `costUsedMicroUsd` is the AUTHORITATIVE cycle-to-date counter: it is
+  // incremented against the billing root at write time, so it already includes
+  // spend by people who have since left the org. The ledger is reconstructed by
+  // finding partitions, which cannot reach a departed member's unstamped rows --
+  // they have no user record, the org record keeps no member history, and nothing
+  // on the row links it to an org.
+  //
+  // So we cannot recover those rows, but we CAN notice they are gone: a ledger
+  // materially below the counter means spend was billed here that the forecast
+  // never saw. That matters because the shortfall understates burn, and
+  // understating burn LENGTHENS the projected runway -- the direction that
+  // reassures a customer shortly before they run out.
+  //
+  // The `attributionInferred` flag alone does not catch this case: if every row
+  // that IS visible carries a payer stamp, nothing is marked inferred even though
+  // an entire departed member is missing.
+  //
+  // Tolerance is deliberate rather than exact. The two are written by different
+  // paths at different moments, so small skew is normal and must not permanently
+  // pin every account to `low`; only a material gap is treated as evidence.
+  const ledgerTotalMicroUsd = rows.reduce((sum, row) => sum + (row.costMicroUsd || 0), 0);
+  const ledgerIsIncomplete =
+    usage.costUsedMicroUsd > 0 &&
+    ledgerTotalMicroUsd < usage.costUsedMicroUsd * LEDGER_COMPLETENESS_TOLERANCE;
+
   const runway = computeUsageRunway({
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —
     // re-applying credits here would double-count them.
     costUsedMicroUsd: usage.costUsedMicroUsd,
     hardThresholdMicroUsd: usage.policy.hardCostThresholdMicroUsd,
-    attributionInferred,
+    attributionInferred: attributionInferred || ledgerIsIncomplete,
     dailyCostMicroUsd: rows.map((row) => ({
       date: row.date,
       costMicroUsd: row.costMicroUsd || 0,

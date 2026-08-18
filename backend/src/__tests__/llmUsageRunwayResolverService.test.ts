@@ -181,6 +181,45 @@ describe("resolveUsageRunway", () => {
     expect(runway!.confidence).toBe("low");
   });
 
+  it("reports LOW confidence when the ledger cannot account for the counter", async () => {
+    // The departed-member case, which the `inferred` flag alone cannot catch: every
+    // row that IS visible is properly stamped, so nothing is marked inferred --
+    // but an entire former member's spend is missing from the reconstruction.
+    //
+    // Their rows are unreachable by construction (no user record, no member
+    // history on the org, nothing on the row linking it to an org), so we cannot
+    // recover them. We CAN notice the authoritative counter is higher than
+    // anything we found, and refuse to call the resulting forecast confident.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([{ userId: "billing-root", orgId: "org-1" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      ledgerDays(10, 5, "2026-08", uid).map((r) => ({ ...r, billingUserId: "billing-root" })),
+    );
+    // The counter says far more was billed here than the ledger accounts for.
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 500 * USD }));
+
+    const { runway } = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+    expect(runway!.confidence).toBe("low");
+  });
+
+  it("tolerates small ledger/counter skew without hedging every forecast", async () => {
+    // The two are written by different paths at different moments, so a little
+    // skew is normal. Treating any gap as evidence would pin every account to
+    // `low` permanently, which is not a confidence signal -- it is noise.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([{ userId: "billing-root", orgId: "org-1" }]);
+    mockQuery.mockImplementation(async (uid: string) =>
+      ledgerDays(10, 5, "2026-08", uid).map((r) => ({ ...r, billingUserId: "billing-root" })),
+    );
+    // Ledger totals 50 USD; counter is 51 -- a 2% gap, within tolerance.
+    mockPolicy.mockResolvedValue(policyFor({ costUsedMicroUsd: 51 * USD }));
+
+    const { runway } = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+    expect(runway!.confidence).toBe("normal");
+  });
+
   it("reports NORMAL confidence when every row states its own payer", async () => {
     // The control: same history, same shape, but the rows are stamped. Without
     // this the test above would pass for a resolver that always said "low", which
