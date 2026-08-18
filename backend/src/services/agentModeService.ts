@@ -294,6 +294,7 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -31615,6 +31616,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
+    // ENG-1197: pace write actions so a drain cannot burst the session to death.
+    //
+    // Twice this schedule fired ten cancel-invitation calls in one parallel batch
+    // and LinkedIn revoked the account's session ~17 seconds later, locking the
+    // customer out for days. The model emits parallel tool calls because that is the
+    // efficient shape of the work, and an unattended run has nobody to notice it
+    // ignoring an instruction not to — so the spacing has to be structural, not
+    // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
+    if (PACED_WRITE_ACTIONS.has(action)) {
+      const slot = await reserveWriteSlot(account_id);
+      if (!slot.allowed) {
+        console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+        return {
+          success: false,
+          message: 'LinkedIn write actions are being paced',
+          error: [
+            slot.reason,
+            '',
+            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
+            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
+            'blocks ALL outreach until the account owner manually reconnects.',
+            '',
+            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+          ].join('\n'),
+        };
+      }
+    }
+
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
     const isUrl = !!profile_url;
@@ -32284,6 +32313,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 
