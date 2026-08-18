@@ -62,6 +62,9 @@ interface SubscriptionType {
     hardCostThresholdMicroUsd: number;
     optimizedModelIds: string[];
     optimizedDefaultModel: string;
+    /** Absent = follow the platform default rather than a value pinned here. */
+    alertUsagePercentThreshold?: number;
+    alertOnForecastShortfall?: boolean;
   };
   llmUsageTopUp?: {
     enabled: boolean;
@@ -141,6 +144,10 @@ const SubscriptionTypesTab: React.FC = () => {
   const [hardThresholdInput, setHardThresholdInput] = useState('');
   const [optimizedModelsInput, setOptimizedModelsInput] = useState('');
   const [optimizedDefaultInput, setOptimizedDefaultInput] = useState('');
+  // Empty string means "not configured", which is NOT the same as the default
+  // value. Storing 90 explicitly would freeze today's default onto the tier.
+  const [alertPercentInput, setAlertPercentInput] = useState('');
+  const [forecastAlertsEnabled, setForecastAlertsEnabled] = useState(true);
   const [topUpEnabled, setTopUpEnabled] = useState(false);
   const [topUpMinimumMarkupInput, setTopUpMinimumMarkupInput] = useState('2.5');
   const [topUpPackagesInput, setTopUpPackagesInput] = useState('');
@@ -301,6 +308,12 @@ const SubscriptionTypesTab: React.FC = () => {
       setHardThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000) : '');
       setOptimizedModelsInput(type.llmUsagePolicy?.optimizedModelIds.join(', ') || '');
       setOptimizedDefaultInput(type.llmUsagePolicy?.optimizedDefaultModel || '');
+      setAlertPercentInput(
+        type.llmUsagePolicy?.alertUsagePercentThreshold != null
+          ? String(type.llmUsagePolicy.alertUsagePercentThreshold)
+          : ''
+      );
+      setForecastAlertsEnabled(type.llmUsagePolicy?.alertOnForecastShortfall !== false);
       setTopUpEnabled(type.llmUsageTopUp?.enabled === true);
       setTopUpMinimumMarkupInput(type.llmUsageTopUp ? String(type.llmUsageTopUp.minimumMarkupBps / 10_000) : '2.5');
       setTopUpPackagesInput(type.llmUsageTopUp?.packages.map((item) => [
@@ -331,6 +344,8 @@ const SubscriptionTypesTab: React.FC = () => {
       setHardThresholdInput('');
       setOptimizedModelsInput('');
       setOptimizedDefaultInput('');
+      setAlertPercentInput('');
+      setForecastAlertsEnabled(true);
       setTopUpEnabled(false);
       setTopUpMinimumMarkupInput('2.5');
       setTopUpPackagesInput('');
@@ -360,6 +375,8 @@ const SubscriptionTypesTab: React.FC = () => {
     setHardThresholdInput('');
     setOptimizedModelsInput('');
     setOptimizedDefaultInput('');
+    setAlertPercentInput('');
+    setForecastAlertsEnabled(true);
     setTopUpEnabled(false);
     setTopUpMinimumMarkupInput('2.5');
     setTopUpPackagesInput('');
@@ -410,6 +427,12 @@ const SubscriptionTypesTab: React.FC = () => {
           setError('Choose at least one optimized model and make sure the optimized default is in that list');
           return;
         }
+        const alertPercentRaw = alertPercentInput.trim();
+        const alertPercent = alertPercentRaw === '' ? null : Number(alertPercentRaw);
+        if (alertPercent !== null && (!Number.isInteger(alertPercent) || alertPercent < 1 || alertPercent > 99)) {
+          setError('Usage alert threshold must be a whole number between 1 and 99, or blank to use the default');
+          return;
+        }
         const optimizationCostThresholdMicroUsd = Math.round(optimizationUsd * 1_000_000);
         const hardCostThresholdMicroUsd = Math.round(hardUsd * 1_000_000);
         const previousPolicy = editingType?.llmUsagePolicy;
@@ -428,6 +451,11 @@ const SubscriptionTypesTab: React.FC = () => {
           hardCostThresholdMicroUsd,
           optimizedModelIds,
           optimizedDefaultModel,
+          // Omitted when blank so the tier keeps following the platform default
+          // rather than pinning today's value. The server rejects a present
+          // out-of-range value rather than clamping it.
+          ...(alertPercent !== null ? { alertUsagePercentThreshold: alertPercent } : {}),
+          ...(forecastAlertsEnabled ? {} : { alertOnForecastShortfall: false }),
         };
       }
 
@@ -878,6 +906,25 @@ const SubscriptionTypesTab: React.FC = () => {
                   value={optimizedDefaultInput}
                   onChange={(e) => setOptimizedDefaultInput(e.target.value)}
                   helperText="Used when the preferred model and user backup are unavailable or restricted."
+                  sx={{ mb: 2 }}
+                />
+                <TextField
+                  fullWidth
+                  label="Usage alert threshold (%)"
+                  value={alertPercentInput}
+                  onChange={(e) => setAlertPercentInput(e.target.value)}
+                  placeholder="90"
+                  helperText="Percent of the allowance at which customers are warned. Leave blank to follow the platform default (90%)."
+                  sx={{ mb: 1 }}
+                />
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={forecastAlertsEnabled}
+                      onChange={(e) => setForecastAlertsEnabled(e.target.checked)}
+                    />
+                  }
+                  label="Warn when usage is forecast to run out before reset"
                 />
               </Collapse>
             </Paper>

@@ -13,6 +13,7 @@ import { getEnrichSoService } from './enrichSoService';
 import type { MappedPerson, MappedOrganization } from './apolloFieldMapper';
 import type { OrchestratorDeps } from './crmEnrichmentServiceV3';
 import { CrmEnrichmentService, type LeadRecord } from './crmEnrichmentService';
+import { usablePublicIdentifier } from '../utils/linkedInAnonymizedProfile';
 import { sanitizePhone } from '../utils/phoneValidation';
 import { nameTokensMatch, unipileNameMatches } from '../utils/nameMatch';
 import type { IdentityResolverDeps } from './enrichmentIdentityResolver';
@@ -956,9 +957,12 @@ export async function findLinkedInUrlImpl(
       chosen = nameMatched[0];
     }
 
-    if (!chosen?.public_identifier) return null;
-    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosen.public_identifier}`);
-    return `https://www.linkedin.com/in/${chosen.public_identifier}`;
+    // The sentinel is truthy, so a bare presence check let an anonymized result
+    // resolve to /in/undefined and be returned as this lead's LinkedIn URL.
+    const chosenSlug = usablePublicIdentifier(chosen?.public_identifier);
+    if (!chosenSlug) return null;
+    console.log(`[v3 linkedin-search] HIT url=https://www.linkedin.com/in/${chosenSlug}`);
+    return `https://www.linkedin.com/in/${chosenSlug}`;
   } catch (err) {
     // Any failure after accountId was resolved — purge both caches so next call
     // re-resolves to a live account (covers NOT_FOUND + newly-connected replacements).
@@ -1311,7 +1315,10 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
               const result = {
                 first_name:   profileFirst,
                 last_name:    profileLast,
-                linkedin_url: raw.public_identifier ? `https://www.linkedin.com/in/${raw.public_identifier}` : undefined,
+                // Same sentinel guard as the search path above.
+                linkedin_url: usablePublicIdentifier(raw.public_identifier)
+                  ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                  : undefined,
                 title:        trimStr(current?.position),
                 fromCache:    profileResult.fromCache,
               };

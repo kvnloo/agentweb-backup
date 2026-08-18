@@ -1,3 +1,5 @@
+import { usablePublicIdentifier, usableProfileUrl } from './linkedInAnonymizedProfile';
+
 /**
  * ENG-1002: recognising LinkedIn's anonymized people-search results.
  *
@@ -98,9 +100,17 @@ export function isAnonymizedSearchItem(item: any): boolean {
   const fullName = typeof safe.name === 'string' && safe.name.trim()
     ? safe.name
     : `${safe.first_name ?? ''} ${safe.last_name ?? ''}`;
-  const linkedin = safe.public_identifier
-    ? `https://www.linkedin.com/in/${safe.public_identifier}`
-    : (typeof safe.profile_url === 'string' ? safe.profile_url.split('?')[0] : undefined);
+  // The sentinel must not produce a URL here. `isAnonymizedSearchLead` returns
+  // early on any truthy `linkedin`, so a fabricated `/in/undefined` short-circuits
+  // the brand-token and empty-name rules below it — keeping precisely the
+  // anonymized rows this function exists to reject, whenever the placeholder name
+  // is not the exact English spelling (a localized one, or no name at all). Worse,
+  // every such row normalizes to the SAME lookup key, so the CRM write boundary
+  // can merge distinct real people into a single lead.
+  const usableId = usablePublicIdentifier(safe.public_identifier);
+  const linkedin = usableId
+    ? `https://www.linkedin.com/in/${usableId}`
+    : usableProfileUrl(safe.profile_url) ?? undefined;
   const parts = String(fullName).trim().split(/\s+/);
   return isAnonymizedSearchLead({
     firstName: parts[0] || undefined,
