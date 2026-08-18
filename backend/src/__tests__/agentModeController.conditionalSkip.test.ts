@@ -312,6 +312,15 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     const SUNDAY = new Date('2026-08-02T12:00:00Z');
     const skipContent = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
 
+    // emmaToolRegistry is a process-wide singleton — a fake tool registered by
+    // one test leaks into every test that runs after it in this file (no public
+    // unregister API), which would otherwise break the drift guard's exact-set
+    // assertion below the moment test order changes it runs after these.
+    afterEach(() => {
+      (emmaToolRegistry as any).tools?.delete('fake_registry_readonly_tool');
+      (emmaToolRegistry as any).tools?.delete('fake_registry_write_tool');
+    });
+
     it('treats a tool the registry declares readOnly:true as read, not write', () => {
       emmaToolRegistry.register({
         name: 'fake_registry_readonly_tool',
@@ -365,6 +374,48 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       for (const name of writeNames) {
         expect([name, emmaToolRegistry.getTool(name)?.readOnly]).toEqual([name, undefined]);
         expect([name, scheduledRunSignalsConditionalSkip(skipContent, { now: SUNDAY, toolCalls: [{ name }] })]).toEqual([name, false]);
+      }
+    });
+
+    // DRIFT GUARD — readOnly:true is a manual, point-in-time judgment call, made
+    // by reading each tool's actual execute() implementation (see the comments
+    // beside each registration in emma/tools.ts). Nothing else re-checks that
+    // judgment as the tool evolves: if a future edit adds a write-capable action
+    // to one of these three tools, the flag goes stale SILENTLY and creates a
+    // new false-skip bug — the exact same category that caused ENG-1276 in the
+    // first place, just relocated from a tool NAME to a tool FLAG. This walks
+    // every enum in each readOnly tool's inputSchema (that's how every write
+    // action in this codebase's tools is expressed — CREATE/UPDATE/DELETE/POST/
+    // etc., see call_google_ads_api, call_hubspot_api, twitter_manage_post) and
+    // fails loudly if one ever appears. It also pins the exact readOnly SET, so
+    // adding or removing a flag is a deliberate, reviewed edit to this test —
+    // not an incidental side effect of an unrelated change.
+    it('drift guard: no readOnly-flagged tool schema exposes a write-shaped action value', () => {
+      // \w* trails EVERY verb, not just the ones with a known compound today
+      // (SEND_TEST, ADD_ASSET, CREATE_INLINE, ...) — a bare trailing \b would
+      // miss a FUTURE compound like PUBLISH_RESULTS, since \w includes the
+      // underscore and there is no boundary between PUBLISH and _RESULTS.
+      const WRITE_SHAPED_VALUE = /\b(?:CREATE|UPDATE|DELETE|REMOVE|POST|PUBLISH|SEND|UPLOAD|ADD|ATTACH|REPOST|COMMENT|REACT|LIKE|UNLIKE|RETWEET|UNRETWEET|PAUSE|RESUME|ENABLE|DISABLE|WRITE|SET|MODIFY|EDIT|RETAG_UTM)\w*/i;
+
+      function collectEnumValues(schema: any, out: string[] = []): string[] {
+        if (!schema || typeof schema !== 'object') return out;
+        if (Array.isArray(schema.enum)) out.push(...schema.enum);
+        for (const value of Object.values(schema)) {
+          if (value && typeof value === 'object') collectEnumValues(value, out);
+        }
+        return out;
+      }
+
+      const readOnlyTools = emmaToolRegistry.getAllTools().filter((t) => t.readOnly === true);
+      expect(readOnlyTools.map((t) => t.name).sort()).toEqual([
+        'call_google_ads_reporting_api',
+        'call_linkedin_ads_insights_api',
+        'perform_deep_research',
+      ]);
+      for (const tool of readOnlyTools) {
+        const enumValues = collectEnumValues(tool.definition?.inputSchema);
+        const suspicious = enumValues.filter((v) => typeof v === 'string' && WRITE_SHAPED_VALUE.test(v));
+        expect([tool.name, suspicious]).toEqual([tool.name, []]);
       }
     });
   });
