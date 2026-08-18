@@ -35,6 +35,35 @@ const row = (overrides: Partial<UsageRecordRow> = {}): UsageRecordRow => ({
 });
 
 describe("reconcileItemizedUsage", () => {
+  it("matches coverage for a LEGACY row stamped with the actor, not the root", () => {
+    // Greptile, PR #2407: "payer-aware itemization separates legacy actor-stamped
+    // rows from correctly root-stamped coverage."
+    //
+    // `recordUsage` defaulted the payer to `ctx.billingUserId || userId`, so every
+    // row written before ENG-1217 tagged the agent path carries the ACTING user --
+    // measured on production, 0 of 4,629 rows carry a payer that differs from the
+    // actor. Charge events carry the real billing ROOT, because that is their
+    // partition key.
+    //
+    // Key the coverage map on the payer and those two stop hashing together: the
+    // coverage is silently lost and the whole aggregate is reported alongside the
+    // charge events that already itemise it. That is an OVERCOUNT on a customer's
+    // bill, which is why the coverage key must stay payer-free.
+    const events = [
+      event({ billingUserId: "root-1", actingUserId: "member-a", costMicroUsd: 5000 }),
+    ];
+    const rows = [
+      row({ userId: "member-a", billingUserId: "member-a", costMicroUsd: 5000,
+            sk: "2026-08-15#gpt-4o#chat" }),
+    ];
+
+    const result = reconcileItemizedUsage(events, rows);
+    const total = result.items.reduce((sum, i) => sum + i.costMicroUsd, 0);
+
+    // The row is fully covered by its charge event. Only the event's 5000 counts.
+    expect(total).toBe(5000);
+  });
+
   it("nets a slot's coverage ONCE when the day holds an old- and new-format row", () => {
     // The deploy-day case for the payer sort-key change. A day that was already
     // accumulating under `date#model#feature` stops there and a new row starts at

@@ -49,26 +49,23 @@ export interface ItemizedUsageResult {
 // the OTHER member's aggregate row, since both hash to the same key. Every
 // charge event carries actingUserId and every aggregate row carries userId,
 // so both sides can always be scoped correctly.
+// Deliberately NOT keyed on the payer, and that is load-bearing (ENG-1210,
+// Greptile PR #2407).
 //
-// ENG-1210 (Greptile, PR #2407): the PAYER is in the key too, now that the payer
-// is part of the aggregate row's own sort key. A billing transition mid-day
-// produces two rows for one (actor, date, model, feature) slot, and in the
-// subject's OWN partition both are read. Keyed without the payer they would hash
-// together, so one slot's charge-event coverage would be subtracted from BOTH
-// rows -- understating the itemized total by a whole day's coverage, which is the
-// same undercount direction this area keeps failing in.
+// Keying it on `billingUserId` looked safer and was strictly worse. Legacy rows
+// stored the ACTING user as their payer -- `recordUsage` defaulted
+// `ctx.billingUserId || userId`, and measured on production 0 of 4,629 rows carry
+// a payer that differs from the actor -- while charge events carry the real
+// billing ROOT. Keyed on the payer those two stop hashing together, coverage
+// silently stops matching, and the full aggregate is reported alongside the
+// charge events that already itemise it: an OVERCOUNT on a customer's bill.
 //
-// Both sides can be scoped: every charge event carries billingUserId (it is the
-// events table's partition key) and every aggregate row carries it as an
-// attribute. Rows written before the key change carry their last-writer value,
-// which is what they were already reconciled against.
-const aggregateKey = (
-  actingUserId: string,
-  billingUserId: string,
-  date: string,
-  model: string,
-  feature: string,
-) => `${actingUserId}#${billingUserId}#${date}#${model}#${feature}`;
+// The cross-payer leakage that motivated adding it is already handled by grouping
+// rows into slots below: two rows for one slot are combined and their coverage is
+// netted once, which gives the same total whether or not the payer is in the key.
+// Grouping was the fix; the payer was redundant, and its redundancy cost money.
+const aggregateKey = (actingUserId: string, date: string, model: string, feature: string) =>
+  `${actingUserId}#${date}#${model}#${feature}`;
 
 export function reconcileItemizedUsage(
   events: LlmChargeAuditEvent[],
@@ -95,7 +92,6 @@ export function reconcileItemizedUsage(
   for (const event of events) {
     const key = aggregateKey(
       event.actingUserId,
-      event.billingUserId,
       event.occurredAt.slice(0, 10),
       event.model || "unknown",
       event.feature || "unknown"
@@ -124,7 +120,7 @@ export function reconcileItemizedUsage(
     { row: UsageRecordRow; microUsd: number; tokens: number; calls: number }
   >();
   for (const row of rows) {
-    const key = aggregateKey(row.userId, row.billingUserId, row.date, row.model, row.feature);
+    const key = aggregateKey(row.userId, row.date, row.model, row.feature);
     const slot = slots.get(key);
     if (slot) {
       slot.microUsd += row.costMicroUsd || 0;
