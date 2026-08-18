@@ -19,7 +19,14 @@ jest.mock("../services/llmUsagePolicyResolverService", () => ({
   getEffectiveLlmUsagePolicy: jest.fn(),
 }));
 jest.mock("../services/usageRecordDb", () => ({
-  usageRecordDb: { queryByUserDateRange: jest.fn() },
+  usageRecordDb: {
+    queryByUserDateRange: jest.fn(),
+    // ENG-1251: the resolvers read the UNION of the partition fan-out and this
+    // attribute scan, so the scan half has to exist here or every read throws.
+    // Defaulted empty per test, which keeps these cases exercising the fan-out
+    // exactly as before while the union itself is covered in its own suite.
+    queryByBillingUserDateRange: jest.fn(),
+  },
 }));
 jest.mock("../services/agentModeService", () => ({
   agentModeService: { getSupportedModels: jest.fn() },
@@ -46,6 +53,7 @@ import { __setUsageTelemetrySinkForTests } from "../services/llmUsageTelemetry";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
+const mockBillingQuery = usageRecordDb.queryByBillingUserDateRange as jest.Mock;
 const mockUser = userDb.getUserById as jest.Mock;
 const mockOrg = orgDb.getOrgById as jest.Mock;
 const mockMembers = orgDb.getOrgMembers as jest.Mock;
@@ -127,6 +135,9 @@ describe("recommendation telemetry (ENG-1210 AC12)", () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
@@ -172,6 +183,9 @@ describe("recommendation telemetry (ENG-1210 AC12)", () => {
 describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
@@ -276,6 +290,9 @@ describe("recommendation honesty (ENG-1217 AC4/AC5/AC6)", () => {
 describe("resolveUsageDrivers", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
@@ -601,6 +618,9 @@ describe("resolveUsageDrivers", () => {
 describe("toCustomerDrivers — AC4 exposure boundary", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(opusLedger());
@@ -656,6 +676,9 @@ describe("previewUsageRunway — combined, non-persisted what-if (ENG-1217 AC2/A
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockModels.mockResolvedValue([OPUS, SONNET, HAIKU]);

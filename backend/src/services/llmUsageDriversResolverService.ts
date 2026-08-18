@@ -25,7 +25,7 @@
  */
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
-import { readPooledLedgerRows, resolvePooledLedgerUserIds } from "./llmUsageLedgerReader";
+import { readBilledLedgerRows, resolvePooledLedgerUserIds } from "./llmUsageLedgerReader";
 import { scheduleDb } from "./db";
 import { agentModeService } from "./agentModeService";
 import {
@@ -250,7 +250,10 @@ export async function previewUsageRunway(
   if (!usage.policy) return empty(usage.billingUserId);
 
   const { cycleStartDate, cycleResetDate } = resolveCycle(today);
-  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
+  // Union reader: a departed member's spend is still billed here, and omitting it
+  // both understates the drivers and inflates every "days recovered" estimate
+  // computed against them.
+  const rows = await readBilledLedgerRows(usage.billingUserId, cycleStartDate, today);
   const ledger: AttributionRow[] = rows.map((r) => ({
     date: r.date,
     model: r.model,
@@ -359,10 +362,11 @@ export async function resolveUsageDrivers(
   }
 
   const { cycleStartDate, cycleResetDate } = resolveCycle(today);
-  // Pooled read, not a single partition: rows are keyed by the ACTING user, so an
-  // org root's own partition omits every member whose spend it pays for. See
-  // `llmUsageLedgerReader`.
-  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
+  // Union read, not a single partition and not the fan-out alone: rows are keyed
+  // by the ACTING user, so an org root's own partition omits every member whose
+  // spend it pays for -- and the fan-out in turn omits members who have since
+  // LEFT. See `llmUsageLedgerReader`.
+  const rows = await readBilledLedgerRows(usage.billingUserId, cycleStartDate, today);
 
   const ledger: AttributionRow[] = rows.map((r) => ({
     date: r.date,

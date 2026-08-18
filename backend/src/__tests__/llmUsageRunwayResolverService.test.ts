@@ -22,7 +22,14 @@ jest.mock("../services/llmUsagePolicyResolverService", () => ({
   getEffectiveLlmUsagePolicy: jest.fn(),
 }));
 jest.mock("../services/usageRecordDb", () => ({
-  usageRecordDb: { queryByUserDateRange: jest.fn() },
+  usageRecordDb: {
+    queryByUserDateRange: jest.fn(),
+    // ENG-1251: the resolvers read the UNION of the partition fan-out and this
+    // attribute scan, so the scan half has to exist here or every read throws.
+    // Defaulted empty per test, which keeps these cases exercising the fan-out
+    // exactly as before while the union itself is covered in its own suite.
+    queryByBillingUserDateRange: jest.fn(),
+  },
 }));
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
@@ -37,6 +44,7 @@ import { toCustomerRunway } from "../services/llmUsageForecastService";
 
 const mockPolicy = getEffectiveLlmUsagePolicy as jest.Mock;
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
+const mockBillingQuery = usageRecordDb.queryByBillingUserDateRange as jest.Mock;
 const mockUser = userDb.getUserById as jest.Mock;
 const mockOrg = orgDb.getOrgById as jest.Mock;
 const mockMembers = orgDb.getOrgMembers as jest.Mock;
@@ -65,9 +73,16 @@ const policyFor = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const ledgerDays = (n: number, perDayUsd: number, month = "2026-08") =>
+/**
+ * `userId` is a parameter because a partition query returns rows whose `userId`
+ * IS that partition -- a member's rows can never come back claiming the root's id.
+ * Hard-coding it made every member's ledger identical to the root's, which the
+ * union reader then correctly deduped down to one copy, hiding the pooled burn
+ * this suite exists to prove. The fixture has to look like the table.
+ */
+const ledgerDays = (n: number, perDayUsd: number, month = "2026-08", userId = "billing-root") =>
   Array.from({ length: n }, (_, i) => ({
-    userId: "billing-root",
+    userId,
     sk: `${month}-${String(i + 1).padStart(2, "0")}#anthropic.claude-opus-5#agent_task`,
     date: `${month}-${String(i + 1).padStart(2, "0")}`,
     model: "anthropic.claude-opus-5",
@@ -80,6 +95,9 @@ const ledgerDays = (n: number, perDayUsd: number, month = "2026-08") =>
 describe("resolveUsageRunway", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // The scan half of the union: empty unless a case is specifically about a
+    // departed member, so these cases keep testing the fan-out as they did.
+    mockBillingQuery.mockResolvedValue([]);
     soloAccount();
     mockPolicy.mockResolvedValue(policyFor());
     mockQuery.mockResolvedValue(ledgerDays(10, 5));
@@ -108,7 +126,9 @@ describe("resolveUsageRunway", () => {
       { userId: "member-a", orgId: "org-1" },
     ]);
     // Each member burns the same amount, so a pooled read sees double the burn.
-    mockQuery.mockResolvedValue(ledgerDays(10, 5));
+    // Keyed per partition, as DynamoDB returns them -- identical rows under one
+    // userId would be two reads of ONE row, not two members' spend.
+    mockQuery.mockImplementation(async (uid: string) => ledgerDays(10, 5, "2026-08", uid));
 
     const pooled = await resolveUsageRunway("member-a", { today: "2026-08-11" });
 
@@ -124,6 +144,59 @@ describe("resolveUsageRunway", () => {
     );
     expect(pooled.runway!.estimatedDaysRemaining!).toBeLessThan(
       solo.runway!.estimatedDaysRemaining!,
+    );
+  });
+
+  it("counts a member who LEFT mid-cycle, whose partition no longer exists to fan out to", async () => {
+    // Raised by Greptile on PR #2407. The partition fan-out can only ask about
+    // people who are members NOW, so a member who leaves takes their spend out of
+    // the burn rate -- while `costUsedMicroUsd` still counts it, because that
+    // counter was incremented against the billing root at write time.
+    //
+    // The direction is what makes it serious: less burn means MORE projected
+    // runway, so the customer is reassured shortly before running out. That is
+    // precisely the surprise ENG-1200 exists to prevent.
+    //
+    // The union's scan half reaches these rows by their stamped `billingUserId`,
+    // independent of anyone's current membership.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    // The departed member is NOT in the member list any more.
+    mockMembers.mockResolvedValue([{ userId: "billing-root", orgId: "org-1" }]);
+    mockQuery.mockImplementation(async (uid: string) => ledgerDays(10, 5, "2026-08", uid));
+
+    const withoutDeparted = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    // Same cycle, but the scan now surfaces the departed member's stamped rows.
+    mockBillingQuery.mockResolvedValue(ledgerDays(10, 5, "2026-08", "departed-member"));
+    const withDeparted = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    expect(withDeparted.runway!.diagnostics.forecastBurnMicroUsdPerDay!).toBeGreaterThan(
+      withoutDeparted.runway!.diagnostics.forecastBurnMicroUsdPerDay!,
+    );
+    // The consequence that matters to a customer: a SHORTER, truthful runway.
+    expect(withDeparted.runway!.estimatedDaysRemaining!).toBeLessThan(
+      withoutDeparted.runway!.estimatedDaysRemaining!,
+    );
+  });
+
+  it("does not double-count a member who is BOTH current and stamped", async () => {
+    // The overlap case, and the reason dedupe is on the table's real primary key:
+    // a current member with the attribute stamped comes back from both halves. On
+    // a billing surface an overcount is the worse failure of the two.
+    mockUser.mockResolvedValue({ userId: "billing-root", orgId: "org-1" });
+    mockOrg.mockResolvedValue({ orgId: "org-1", ownerUserId: "billing-root" });
+    mockMembers.mockResolvedValue([{ userId: "billing-root", orgId: "org-1" }]);
+    mockQuery.mockImplementation(async (uid: string) => ledgerDays(10, 5, "2026-08", uid));
+
+    const fanOutOnly = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    // The SAME rows, returned again by the scan half.
+    mockBillingQuery.mockResolvedValue(ledgerDays(10, 5, "2026-08", "billing-root"));
+    const bothHalves = await resolveUsageRunway("billing-root", { today: "2026-08-11" });
+
+    expect(bothHalves.runway!.diagnostics.forecastBurnMicroUsdPerDay).toBe(
+      fanOutOnly.runway!.diagnostics.forecastBurnMicroUsdPerDay,
     );
   });
 

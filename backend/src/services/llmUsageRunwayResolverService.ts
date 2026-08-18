@@ -32,7 +32,7 @@
 
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { recordUsageTelemetry, USAGE_TELEMETRY_EVENTS } from "./llmUsageTelemetry";
-import { readPooledLedgerRows } from "./llmUsageLedgerReader";
+import { readBilledLedgerRows } from "./llmUsageLedgerReader";
 import {
   computeUsageRunway,
   type UsageRunway,
@@ -83,7 +83,13 @@ export async function resolveUsageRunway(
   // ACTING user, so a root's own partition is only its own calls — while
   // `costUsedMicroUsd` is already pooled. Mixing the two divides the account's
   // consumption by one person's burn and overstates the runway.
-  const rows = await readPooledLedgerRows(usage.billingUserId, cycleStartDate, today);
+  // The UNION reader (ENG-1251), not the partition fan-out alone. The fan-out can
+  // only ask about people who are members NOW, so a member who leaves mid-cycle
+  // takes their spend out of the burn rate while `costUsedMicroUsd` still counts
+  // it. That understates burn, and understating burn LENGTHENS the runway -- the
+  // customer is told they are fine and then runs out mid-cycle, which is the
+  // surprise this whole feature exists to prevent.
+  const rows = await readBilledLedgerRows(usage.billingUserId, cycleStartDate, today);
 
   const runway = computeUsageRunway({
     // Both of these are already credit-adjusted by getEffectiveLlmUsagePolicy —

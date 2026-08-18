@@ -252,8 +252,17 @@ export async function readBilledLedgerRows(
   ]);
 
   const byPrimaryKey = new Map<string, UsageRecordRow>();
+  let unidentified = 0;
   for (const row of [...pooled, ...(stamped || [])]) {
-    byPrimaryKey.set(`${row.userId} ${row.sk}`, row);
+    // A row missing either key component cannot be matched to its twin, and
+    // collapsing two such rows together would DROP spend -- the same undercount
+    // this union exists to fix, reintroduced by the fix itself. Both components
+    // are the table's primary key, so this should be unreachable; if it ever
+    // happens, keep every row rather than silently lose one. On a billing
+    // surface, a duplicate is visible and an omission is not.
+    const key =
+      row.userId && row.sk ? `${row.userId} ${row.sk}` : `__unidentified__${unidentified++}`;
+    byPrimaryKey.set(key, row);
   }
   return [...byPrimaryKey.values()];
 }
