@@ -266,14 +266,30 @@ router.put("/:planId", async (req, res) => {
         });
         const contentLoss = findStepContentLoss(existingSteps, forCompare);
         if (contentLoss.length > 0) {
+          // Two different accidents reach here, and saying "fields would be
+          // blanked" for both misdescribes one of them. `blanked` is a step that
+          // came back with a field emptied. `unpaired` is a step that did not
+          // come back recognisably at all — most often renamed while a field was
+          // edited, which is indistinguishable from a different step taking its
+          // number, so it is reported rather than guessed at. Naming which is
+          // which is what lets the caller tell "I typo'd a field" from "the plan
+          // no longer contains the step I thought I was editing".
+          const blanked = contentLoss.filter((l: any) => l.kind === 'blanked');
+          const unpaired = contentLoss.filter((l: any) => l.kind === 'unpaired');
+          const parts = [
+            blanked.length > 0
+              && `${blanked.length} step(s) would come back with fields that are currently set emptied`,
+            unpaired.length > 0
+              && `${unpaired.length} step(s) are not recognisable in what you sent (renamed, or replaced by a different step at the same stepCount)`,
+          ].filter(Boolean);
           return res.status(400).json({
-            message: `Refusing to update: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+            message: `Refusing to update: ${parts.join('; and ')}. A replace stores exactly what you send, so anything you omit or fail to carry over is erased.`,
             stepsWouldBeRemoved: 0,
             stepContentLoss: contentLoss,
             howToProceed: [
-              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing — merge renames and edits a step in one call without this check.',
               'To keep these steps as they are, re-send each one with its current fields.',
-              'To intentionally clear them, retry with confirm_step_removal=true.',
+              'To intentionally rename, replace or clear them, retry with confirm_step_removal=true.',
             ],
           });
         }

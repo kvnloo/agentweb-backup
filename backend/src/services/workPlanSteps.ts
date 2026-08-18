@@ -312,17 +312,35 @@ export function findStepContentLoss(before: any[], after: any[]) {
   const replacementCarriesContent = after.length > 0
     && after.every((step: any) => STEP_CONTENT_FIELDS.some((field) => !isEmptyStepValue(step[field])));
   const isWholesaleRewrite = !keptAnything && replacementCarriesContent;
-  const losses: { stepCount: any; title: any; fields: string[] }[] = [];
+  const claimed = new Set(pairs.filter((index) => index !== -1));
+  const losses: { stepCount: any; title: any; fields: string[]; kind: 'blanked' | 'unpaired' }[] = [];
   before.forEach((existing: any, i: number) => {
     const index = pairs[i];
     if (index === -1 && isWholesaleRewrite) return;
     const populated = STEP_CONTENT_FIELDS.filter((field) => !isEmptyStepValue(existing[field]));
-    const fields = index === -1
-      ? populated
-      : populated.filter((field) => isEmptyStepValue(after[index][field]));
-    if (fields.length > 0) {
-      losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields] });
+    if (index !== -1) {
+      const fields = populated.filter((field) => isEmptyStepValue(after[index][field]));
+      if (fields.length > 0) {
+        losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields], kind: 'blanked' });
+      }
+      return;
     }
+    // Unpaired. Something else may still be occupying this step's number — a
+    // rename that also edited a field lands here, because a renamed step and a
+    // brand-new one in its place are the same bytes and pairing refuses to guess
+    // between them. Report it either way; at equal length nothing else would.
+    //
+    // But report it TRUTHFULLY. Listing every populated field accused such a
+    // payload of dropping skillIds that are sitting in that very slot, unchanged.
+    // Only fields actually missing from the step now holding the number are lost.
+    const occupant = after.find((candidate: any, j: number) =>
+      !claimed.has(j)
+      && existing.stepCount !== undefined && existing.stepCount !== null
+      && Number(candidate.stepCount) === Number(existing.stepCount));
+    const fields = occupant
+      ? populated.filter((field) => isEmptyStepValue(occupant[field]))
+      : populated;
+    losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields], kind: 'unpaired' });
   });
   return losses;
 }
