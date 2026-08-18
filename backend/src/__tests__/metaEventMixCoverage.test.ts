@@ -14,6 +14,7 @@ import {
   evaluateEventMix,
   EVENT_MIX_ABSENCE_DAYS,
   EVENT_MIX_MIN_PRESENT_DAYS,
+  EVENT_MIX_MAX_ABSENCE_DAYS,
   type EventMixDay,
 } from '../services/metaEventMixCoverage';
 
@@ -178,5 +179,62 @@ describe('malformed input', () => {
 
   it('exposes its floor so a caller cannot mistake sparse data for a clean bill', () => {
     expect(EVENT_MIX_MIN_PRESENT_DAYS).toBeGreaterThan(0);
+  });
+});
+
+describe('a long-dead family stops being a REGRESSION', () => {
+  const longDead = (absentDays: number): EventMixDay[] => {
+    const days: EventMixDay[] = [];
+    for (let i = 1; i <= 12; i++) {
+      days.push(day(`2026-06-${String(i + 10).padStart(2, '0')}`, 200, ['lead', 'cr']));
+    }
+    for (let i = 0; i < absentDays; i++) {
+      const d = new Date(Date.UTC(2026, 6, 1) + i * 86400000).toISOString().slice(0, 10);
+      days.push(day(d, 200, ['lead']));
+    }
+    return days;
+  };
+
+  it('alerts while the absence is still recent', () => {
+    const days = longDead(5);
+    const v = evaluateEventMix(days, days[days.length - 1].date);
+    expect(v.alerting.map((f) => f.family)).toEqual(['cr']);
+    expect(v.stale).toEqual([]);
+  });
+
+  it('goes STALE past the cap — a retired funnel must not page daily forever', () => {
+    // The honest mitigation for an ambiguity this module cannot resolve: a deliberately
+    // retired event looks identical to a broken one, and no available signal separates them.
+    // What CAN be bounded is the cost of guessing wrong.
+    const days = longDead(EVENT_MIX_MAX_ABSENCE_DAYS + 6);
+    const v = evaluateEventMix(days, days[days.length - 1].date);
+    expect(v.alerting).toEqual([]);
+    expect(v.stale.map((f) => f.family)).toEqual(['cr']);
+  });
+
+  it('a stale finding keeps its detail, so it is recorded rather than forgotten', () => {
+    const days = longDead(EVENT_MIX_MAX_ABSENCE_DAYS + 6);
+    const v = evaluateEventMix(days, days[days.length - 1].date);
+    expect(v.stale[0].lastSeen).toBeTruthy();
+    expect(v.stale[0].spendDuringAbsence).toBeGreaterThan(0);
+  });
+});
+
+describe('a weekend cannot trip the streak, because non-spending days are excluded', () => {
+  it('pausing spend over a weekend forms no streak at all', () => {
+    // The holiday worry, tested rather than guarded against: an account that stops spending
+    // at the weekend contributes no spending days, so there is nothing for a streak to form
+    // from. A calendar-span guard was considered for this and is deliberately absent — it
+    // would be unreachable, since N spending days always span at least N calendar days.
+    const days: EventMixDay[] = [];
+    for (let i = 1; i <= 12; i++) {
+      days.push(day(`2026-08-${String(i).padStart(2, '0')}`, 200, ['lead', 'cr']));
+    }
+    days.push(day('2026-08-13', 0, []));   // weekend, no spend
+    days.push(day('2026-08-14', 0, []));
+    days.push(day('2026-08-15', 0, []));
+    const v = evaluateEventMix(days, '2026-08-16');
+    expect(v.alerting).toEqual([]);
+    expect(v.healthy).toContain('cr');
   });
 });

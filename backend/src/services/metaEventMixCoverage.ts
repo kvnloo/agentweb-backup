@@ -75,6 +75,42 @@ export const EVENT_MIX_PRESENCE_RATIO = 0.5;
  */
 export const EVENT_MIX_MIN_PRESENT_DAYS = 5;
 
+/**
+ * How long a family may be absent before it stops being a REGRESSION and becomes the
+ * established state.
+ *
+ * A regression is a TRANSITION. After this long the absence is no longer news, and the check
+ * has already said what it has to say — but the 24h re-alert window means it would otherwise
+ * page every single day, forever, for as long as the customer leaves it that way.
+ *
+ * This is the honest mitigation for the ambiguity §39 named and this module cannot resolve:
+ * a DELIBERATELY RETIRED event looks identical to a broken one from insights, and no signal
+ * available here distinguishes intent. What can be bounded is the cost of getting it wrong —
+ * a retired funnel now pages for a bounded window instead of indefinitely.
+ *
+ * Beyond it, findings move to `stale` — logged on every sweep so they never disappear, never
+ * paged. Same shape as Tier 1's `staleDelivery`.
+ */
+export const EVENT_MIX_MAX_ABSENCE_DAYS = 14;
+
+/*
+ * ⚠ A CALENDAR-SPAN GUARD WAS CONSIDERED AND DELIBERATELY NOT BUILT. Recorded so nobody
+ * re-derives it:
+ *
+ * The worry was a long weekend — three "absent" days that are really a holiday during which
+ * an event legitimately cannot happen. Two things kill that guard:
+ *
+ *   1. It would be UNREACHABLE. Spending days are distinct dates, so N spending days always
+ *      span at least N calendar days. A minimum-span test can never fail alongside a
+ *      three-spending-day streak.
+ *   2. The risk is mostly already handled. Non-spending days are excluded entirely, so an
+ *      account that pauses over a weekend forms no streak at all.
+ *
+ * The residue — spending THROUGH a holiday while the event legitimately cannot fire — is real
+ * but indistinguishable from an outage by any span measure, because a genuine outage looks
+ * exactly the same. It is bounded instead by EVENT_MIX_MAX_ABSENCE_DAYS below.
+ */
+
 /** One day of account activity, exactly as `fetchDailyAdAccountActivity` already returns it. */
 export interface EventMixDay {
   date: string;
@@ -100,6 +136,9 @@ export interface EventMixFinding {
 export type EventMixVerdict = {
   /** Reliably-present families that have now been absent long enough to mean something. */
   alerting: EventMixFinding[];
+  /** Absent for so long it is the established state rather than a regression — most often a
+   *  deliberately retired funnel. Logged on every sweep, never paged. */
+  stale: EventMixFinding[];
   /** Families reliably present AND still arriving — reported so a silent check is
    *  distinguishable from a check with nothing to watch. */
   healthy: string[];
@@ -120,7 +159,8 @@ export type EventMixVerdict = {
  */
 export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVerdict {
   const verdict: EventMixVerdict = {
-    alerting: [], healthy: [], tooSparse: [], insufficientHistory: false, spendingDaysConsidered: 0,
+    alerting: [], stale: [], healthy: [], tooSparse: [], insufficientHistory: false,
+    spendingDaysConsidered: 0,
   };
 
   const rows = (Array.isArray(days) ? days : [])
@@ -180,7 +220,7 @@ export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVe
 
     const absent = spendingDays.slice(spendingDays.length - trailing);
 
-    verdict.alerting.push({
+    const finding = {
       family,
       presentDays,
       spendingDays: spendingDays.length,
@@ -188,7 +228,13 @@ export function evaluateEventMix(days: EventMixDay[], asOf?: string): EventMixVe
       lastSeen: spendingDays[lastSeenIndex].date,
       // Every row here came from the spend > 0 filter, so no zero-fallback is reachable.
       spendDuringAbsence: Math.round(absent.reduce((sum, d) => sum + Number(d.spend), 0) * 100) / 100,
-    });
+    };
+
+    // Past the point where this is still news. Recorded, never paged — a retired funnel must
+    // not page a human daily forever just because we cannot tell it from a broken one.
+    const absenceCalendarDays = daysBetween(spendingDays[lastSeenIndex].date, absent[absent.length - 1].date);
+    if (absenceCalendarDays > EVENT_MIX_MAX_ABSENCE_DAYS) verdict.stale.push(finding);
+    else verdict.alerting.push(finding);
   }
 
   return verdict;

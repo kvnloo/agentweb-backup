@@ -715,6 +715,9 @@ export interface MonitorSummary {
   /** Families reliably present AND still arriving. Reported so an account with nothing to
    *  watch is distinguishable from one being watched and found healthy. */
   eventMixWatched: number;
+  /** Families absent so long they are the established state rather than a regression.
+   *  Logged every sweep, never paged — the bound on an ambiguity we cannot resolve. */
+  eventMixStale: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -749,6 +752,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     duplicateAccountsSkipped: 0,
     eventMixRegressions: 0,
     eventMixWatched: 0,
+    eventMixStale: 0,
   };
 
   const fetchActivity =
@@ -1293,6 +1297,17 @@ async function checkEventMixCoverage(
         `too sparse to have a baseline: ${verdict.tooSparse.join(', ')}`,
       );
     }
+    if (verdict.stale.length) {
+      // Long-dead families. Reported on EVERY sweep so they never quietly disappear, and
+      // never paged: past the cap this is the established state rather than a regression,
+      // and most often a deliberately retired funnel we cannot distinguish from a break.
+      summary.eventMixStale += verdict.stale.length;
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 — ${verdict.stale.length} family(ies) absent too long ` +
+        `to still be a regression, not alerting: ` +
+        verdict.stale.map((f) => `${f.family} (last seen ${f.lastSeen})`).join('; '),
+      );
+    }
 
     if (!verdict.alerting.length) return;
     summary.eventMixRegressions += verdict.alerting.length;
@@ -1337,6 +1352,10 @@ async function checkEventMixCoverage(
         'Longest Absence (spending days)': worst.consecutiveAbsentSpendingDays,
         'Spend During Absence': `$${verdict.alerting.reduce((n, f) => n + f.spendDuringAbsence, 0).toFixed(2)}`,
         'Still Watching': verdict.healthy.join(', ') || 'none',
+        // If Meta RENAMES an action type, the old family vanishes on every account at once and
+        // each looks like a regression. Putting the unknown names next to the missing one makes
+        // that obvious at a glance instead of after an investigation.
+        'Unrecognised Action Types Seen': summary.unrecognizedActionTypes.join(', ') || 'none',
         'Events Manager': 'https://business.facebook.com/events_manager2/list/dataset',
         'Ads Manager': `https://business.facebook.com/adsmanager/manage/campaigns?act=${adAccountId}`,
       },
