@@ -84,6 +84,18 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 export function redactInternalEconomics(dimensions: TelemetryDimensions): TelemetryDimensions {
   const removed: string[] = [];
 
+  // Arrays are descended too. They were not, and the omission was invisible: a
+  // dimension like `{ recommendations: [{ estimatedSavingsMicroUsd: 4_000_000 }] }`
+  // passed straight through with the internal figure intact, because the array
+  // matched neither the money-key test nor the plain-object branch. No current
+  // call site sends one, so nothing leaked -- but this function's entire job is to
+  // be the last line before the sink, and a guard with a silent hole in it is
+  // worse than no guard, because it is trusted.
+  const walkValue = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(walkValue);
+    return isPlainObject(value) ? walk(value as TelemetryDimensions) : value;
+  };
+
   const walk = (input: TelemetryDimensions): TelemetryDimensions => {
     const out: TelemetryDimensions = {};
     for (const [key, value] of Object.entries(input)) {
@@ -91,7 +103,7 @@ export function redactInternalEconomics(dimensions: TelemetryDimensions): Teleme
         removed.push(key);
         continue;
       }
-      out[key] = isPlainObject(value) ? walk(value) : value;
+      out[key] = walkValue(value) as TelemetryDimensions[string];
     }
     return out;
   };

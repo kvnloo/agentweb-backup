@@ -36,6 +36,46 @@ afterEach(() => {
 });
 
 describe("redactInternalEconomics", () => {
+  it("strips internal economics from inside ARRAYS, not just nested objects", () => {
+    // Raised in review on PR #2407. `walk` descended plain objects only, so an
+    // array of objects reached the sink untouched. AC4/AC12 forbid internal dollar
+    // figures crossing to a customer-visible surface, and this function is the
+    // last thing between the two.
+    const out = redactInternalEconomics({
+      recommendations: [
+        { toModel: "haiku", estimatedSavingsMicroUsd: 4_000_000 },
+        { toModel: "flash", estimatedSavingsMicroUsd: 2_000_000 },
+      ],
+    } as never) as Record<string, unknown>;
+
+    const recs = out.recommendations as Record<string, unknown>[];
+    expect(recs).toHaveLength(2);
+    expect(recs[0]).not.toHaveProperty("estimatedSavingsMicroUsd");
+    expect(recs[1]).not.toHaveProperty("estimatedSavingsMicroUsd");
+    // The safe fields survive — this is redaction, not deletion.
+    expect(recs[0].toModel).toBe("haiku");
+    expect(out.redactedKeys).toContain("estimatedSavingsMicroUsd");
+  });
+
+  it("descends arrays nested inside objects, and objects inside arrays", () => {
+    const out = redactInternalEconomics({
+      drivers: [{ inner: { costMicroUsd: 99 }, name: "sched-a" }],
+    } as never) as Record<string, unknown>;
+
+    const drivers = out.drivers as Record<string, unknown>[];
+    expect(drivers[0].inner).not.toHaveProperty("costMicroUsd");
+    expect(drivers[0].name).toBe("sched-a");
+  });
+
+  it("leaves an array of plain values alone", () => {
+    // `rejectionReasons` is a real call site and must survive untouched.
+    const out = redactInternalEconomics({
+      rejectionReasons: ["not_eligible", "no_savings"],
+    } as never) as Record<string, unknown>;
+
+    expect(out.rejectionReasons).toEqual(["not_eligible", "no_savings"]);
+  });
+
   it("drops micro-USD fields whatever they are called", () => {
     const out = redactInternalEconomics({
       estimatedSavingsMicroUsd: 5_000_000,
