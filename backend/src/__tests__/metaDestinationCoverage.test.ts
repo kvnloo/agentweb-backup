@@ -96,6 +96,15 @@ describe('collectCheckableUrls — dedupe and cap', () => {
     expect(collectCheckableUrls(ads).urls).toEqual([]);
   });
 
+  it('skips null and non-object entries rather than throwing mid-sweep', () => {
+    const ads = [null as any, 'nope' as any, ad({ destinationUrls: ['https://x.com/lp'] })];
+    expect(collectCheckableUrls(ads).urls).toEqual(['https://x.com/lp']);
+  });
+
+  it('tolerates destinationUrls that is not an array', () => {
+    expect(collectCheckableUrls([ad({ destinationUrls: 'https://x.com/lp' as any })]).urls).toEqual([]);
+  });
+
   it('SURFACES what the cap dropped, so a reduced check cannot pass for a complete one', () => {
     const ads = Array.from({ length: MAX_DESTINATION_URLS_CHECKED + 3 }, (_, i) =>
       ad({ adId: `ad_${i}`, destinationUrls: [`https://x.com/lp${i}`] }));
@@ -222,6 +231,51 @@ describe('malformed input', () => {
     expect(() => evaluateDestinationCoverage([], {}, [])).not.toThrow();
     expect(() => evaluateDestinationCoverage(undefined as any, undefined as any, undefined as any)).not.toThrow();
     expect(() => collectCheckableUrls(undefined as any)).not.toThrow();
+  });
+
+  it('skips null and non-object entries in the ads array', () => {
+    const v = evaluateDestinationCoverage(
+      [null as any, 'nope' as any, ad()], obs('https://example.com/lp', 'measured', [OWNED[0]]), OWNED);
+    expect(v.okCount).toBe(1);
+  });
+
+  it('skips an ad whose id is not a string, rather than emitting a finding with no subject', () => {
+    // A finding nobody can trace back to an ad is worse than no finding: it names a problem
+    // and gives no way to act on it.
+    const v = evaluateDestinationCoverage(
+      [ad({ adId: 42 as any })], obs('https://example.com/lp', 'unmeasured'), OWNED);
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('tolerates destinationUrls that is not an array', () => {
+    const v = evaluateDestinationCoverage([ad({ destinationUrls: 'https://x' as any })], {}, OWNED);
+    expect(v.notApplicable).toEqual([expect.objectContaining({ reason: 'no_destination' })]);
+  });
+
+  it('tolerates blank and non-string destination entries', () => {
+    const v = evaluateDestinationCoverage(
+      [ad({ destinationUrls: ['   ', null as any, 7 as any] })], {}, OWNED);
+    expect(v.notApplicable).toEqual([expect.objectContaining({ reason: 'no_destination' })]);
+  });
+
+  it('tolerates an observations bag that is not an object', () => {
+    const v = evaluateDestinationCoverage([ad()], null as any, OWNED);
+    expect(v.unverifiable).toHaveLength(1);
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('tolerates detectedPixelIds that is not an array', () => {
+    const v = evaluateDestinationCoverage(
+      [ad()],
+      { 'https://example.com/lp': { url: 'https://example.com/lp', status: 'measured', detectedPixelIds: 'x' as any } },
+      OWNED);
+    expect(v.alerting).toEqual([expect.objectContaining({ reason: 'no_pixel' })]);
+  });
+
+  it('ignores blank entries in the owned-pixel list', () => {
+    const v = evaluateDestinationCoverage(
+      [ad()], obs('https://example.com/lp', 'measured', [OWNED[0]]), ['', null as any, OWNED[0]]);
+    expect(v.okCount).toBe(1);
   });
 
   it('an account with NO owned pixels cannot produce a foreign-pixel alert it could never fix', () => {

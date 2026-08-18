@@ -158,8 +158,9 @@ export function collectCheckableUrls(
 ): { urls: string[]; urlsNotChecked: string[] } {
   const seen: string[] = [];
   for (const ad of Array.isArray(ads) ? ads : []) {
-    if (!isConversionOptimisedObjective(ad?.objective)) continue;
-    for (const url of Array.isArray(ad?.destinationUrls) ? ad.destinationUrls : []) {
+    if (!ad || typeof ad !== 'object') continue;
+    if (!isConversionOptimisedObjective(ad.objective)) continue;
+    for (const url of Array.isArray(ad.destinationUrls) ? ad.destinationUrls : []) {
       if (!isCheckableDestination(url)) continue;
       if (!seen.includes(url)) seen.push(url);
     }
@@ -317,9 +318,13 @@ export async function fetchDestinationInputs(
 
   const readJson = async (url: string): Promise<any> => {
     const response = await fetchImpl(url);
-    const body: any = await response.json();
-    if (!response.ok || body?.error) {
-      throw new Error(body?.error?.message || `HTTP ${response.status}`);
+    const parsed: any = await response.json();
+    // Graph answers some failures with HTTP 200 and an `error` object in the body, so the
+    // status alone is not the verdict. A body that is not an object at all is normalised
+    // here so every caller below can read `.data` without re-checking.
+    const body = parsed && typeof parsed === 'object' ? parsed : {};
+    if (!response.ok || body.error) {
+      throw new Error(body.error?.message || `HTTP ${response.status}`);
     }
     return body;
   };
@@ -342,19 +347,23 @@ export async function fetchDestinationInputs(
 
     for (let page = 0; page < MAX_AD_PAGES && url; page++) {
       const body = await readJson(url);
-      for (const row of Array.isArray(body?.data) ? body.data : []) {
-        const campaign = row?.campaign ?? {};
+      for (const row of Array.isArray(body.data) ? body.data : []) {
+        // Guarded once here rather than with `?.` on every field below: a row that is not an
+        // object has nothing to contribute, and eight optional chains would each be an
+        // untestable branch asserting the same thing.
+        if (!row || typeof row !== 'object') continue;
+        const campaign = row.campaign && typeof row.campaign === 'object' ? row.campaign : {};
         ads.push({
-          adId: String(row?.id ?? ''),
-          adName: row?.name,
-          campaignId: campaign?.id != null ? String(campaign.id) : undefined,
-          campaignName: campaign?.name,
-          objective: campaign?.objective,
-          effectiveStatus: row?.effective_status,
-          destinationUrls: MetaService.extractCreativeDestinationUrls(row?.creative),
+          adId: String(row.id ?? ''),
+          adName: row.name,
+          campaignId: campaign.id != null ? String(campaign.id) : undefined,
+          campaignName: campaign.name,
+          objective: campaign.objective,
+          effectiveStatus: row.effective_status,
+          destinationUrls: MetaService.extractCreativeDestinationUrls(row.creative),
         });
       }
-      url = typeof body?.paging?.next === 'string' ? body.paging.next : '';
+      url = typeof body.paging?.next === 'string' ? body.paging.next : '';
     }
 
     // Losing this read is NOT survivable: with no owned pixels to compare against, every
@@ -364,8 +373,8 @@ export async function fetchDestinationInputs(
       `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels` +
       `?fields=id&limit=100&access_token=${encodeURIComponent(accessToken)}`,
     );
-    for (const row of Array.isArray(pixelBody?.data) ? pixelBody.data : []) {
-      if (row?.id != null) ownedPixelIds.push(String(row.id));
+    for (const row of Array.isArray(pixelBody.data) ? pixelBody.data : []) {
+      if (row && typeof row === 'object' && row.id != null) ownedPixelIds.push(String(row.id));
     }
   } catch (error: any) {
     return { status: 'fetch_error', ...empty, error: error?.message || 'request failed' };

@@ -203,6 +203,133 @@ describe('fetchDestinationInputs — the ENG-941 seam', () => {
   });
 });
 
+describe('fetchDestinationInputs — defensive against what Meta actually returns', () => {
+  const inputsFor = async (adsBody: any, pixelsBody: any = PIXELS_PAGE) => {
+    const impl = jest.fn(async (url: string) => ({
+      ok: true, status: 200,
+      json: async () => (url.includes('/adspixels') ? pixelsBody : adsBody),
+    })) as any;
+    return fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl,
+      fetchHtml: async () => html('910841031004192'),
+    });
+  };
+
+  it('tolerates a data field that is not an array', async () => {
+    const inputs = await inputsFor({ data: null }, { data: undefined });
+    expect(inputs.status).toBe('ok');
+    expect(inputs.ads).toEqual([]);
+    expect(inputs.ownedPixelIds).toEqual([]);
+  });
+
+  it('tolerates rows with no campaign, no creative and no id', async () => {
+    const inputs = await inputsFor({ data: [{}] });
+    expect(inputs.ads).toEqual([expect.objectContaining({ adId: '', destinationUrls: [] })]);
+    expect(inputs.ads[0].campaignId).toBeUndefined();
+    expect(inputs.ads[0].objective).toBeUndefined();
+  });
+
+  it('coerces a numeric campaign id rather than dropping it', async () => {
+    const inputs = await inputsFor({
+      data: [{ id: 7, campaign: { id: 42, name: 'C', objective: 'OUTCOME_LEADS' }, creative: {} }],
+    });
+    expect(inputs.ads[0]).toMatchObject({ adId: '7', campaignId: '42' });
+  });
+
+  it('stops paging when next is present but not a string', async () => {
+    const inputs = await inputsFor({ data: [], paging: { next: { href: 'nope' } } });
+    expect(inputs.status).toBe('ok');
+  });
+
+  it('ignores pixel rows carrying no id', async () => {
+    const inputs = await inputsFor({ data: [] }, { data: [{ name: 'no id here' }, { id: 5 }] });
+    expect(inputs.ownedPixelIds).toEqual(['5']);
+  });
+
+  it('falls back to the HTTP status when Meta returns an error with no message', async () => {
+    const impl = jest.fn(async () => ({
+      ok: false, status: 503, json: async () => ({ error: {} }),
+    })) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs.status).toBe('fetch_error');
+    expect(inputs.error).toBe('HTTP 503');
+  });
+
+  it('treats a 200 carrying an error body as a failure, not as data', async () => {
+    // Graph does this: HTTP 200 with `{"error": …}` inside. Reading `ok` alone would accept it.
+    const impl = jest.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ error: { message: 'rate limited' } }),
+    })) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs.status).toBe('fetch_error');
+    expect(inputs.error).toBe('rate limited');
+  });
+
+  it('surfaces a thrown transport error rather than swallowing it', async () => {
+    const impl = jest.fn(async () => { throw new Error('socket hang up'); }) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs).toMatchObject({ status: 'fetch_error', error: 'socket hang up' });
+  });
+
+  it('reports a non-Error throw without producing "undefined"', async () => {
+    const impl = jest.fn(async () => { throw 'nope'; }) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs.error).toBe('request failed');
+  });
+
+  it('tolerates a body that is not an object at all', async () => {
+    // Seen from proxies and error pages: a 200 whose body parses to null or a bare string.
+    const inputs = await inputsFor(null, 'not json at all');
+    expect(inputs.status).toBe('ok');
+    expect(inputs.ads).toEqual([]);
+  });
+
+  it('skips null rows inside the ads array', async () => {
+    const inputs = await inputsFor({ data: [null, undefined, { id: '9', creative: {} }] });
+    expect(inputs.ads.map((a) => a.adId)).toEqual(['9']);
+  });
+
+  it('reports the HTTP status when the failure body carries no error object', async () => {
+    const impl = jest.fn(async () => ({ ok: false, status: 502, json: async () => ({}) })) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs).toMatchObject({ status: 'fetch_error', error: 'HTTP 502' });
+  });
+
+  it('reports a thrown null without rendering "undefined" into the log', async () => {
+    const impl = jest.fn(async () => { throw null; }) as any;
+    const inputs = await fetchDestinationInputs('123', 'tok', { fetchImpl: impl });
+    expect(inputs).toMatchObject({ status: 'fetch_error', error: 'request failed' });
+  });
+
+  it('honours META_API_VERSION', async () => {
+    const previous = process.env.META_API_VERSION;
+    process.env.META_API_VERSION = 'v99.0';
+    try {
+      const { impl, calls } = metaFetch([{ data: [] }]);
+      await fetchDestinationInputs('123', 'tok', { fetchImpl: impl as any });
+      expect(calls[0]).toContain('/v99.0/');
+    } finally {
+      if (previous === undefined) delete process.env.META_API_VERSION;
+      else process.env.META_API_VERSION = previous;
+    }
+  });
+
+  it('uses global fetch when no fetchImpl is injected', async () => {
+    const previous = (global as any).fetch;
+    (global as any).fetch = jest.fn(async (url: string) => ({
+      ok: true, status: 200,
+      json: async () => (url.includes('/adspixels') ? PIXELS_PAGE : { data: [] }),
+    }));
+    try {
+      const inputs = await fetchDestinationInputs('123', 'tok');
+      expect(inputs.status).toBe('ok');
+      expect((global as any).fetch).toHaveBeenCalled();
+    } finally {
+      (global as any).fetch = previous;
+    }
+  });
+});
+
 describe('fetchDestinationInputs — caps', () => {
   it('reports destinations past the cap rather than dropping them silently', async () => {
     const many = {
