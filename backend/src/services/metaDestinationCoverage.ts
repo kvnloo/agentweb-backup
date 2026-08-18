@@ -46,6 +46,7 @@
  */
 
 import { isConversionOptimisedObjective } from './metaTrackingMonitor';
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
 
 /**
  * Upper bound on destinations fetched per ad account per sweep.
@@ -345,17 +346,11 @@ export const DESTINATION_ADS_PAGE_SIZE = 50;
 export const MAX_AD_PAGES = 10;
 
 /**
- * Per-request ceiling on the Meta reads.
- *
- * These are awaited inside a loop over every account, so a single hung connection stalls the
- * daily sweep for every account after it — the sweep would simply never finish, which reads
- * in the logs as "the cron did not run" rather than as a network fault. Node's fetch applies
- * no default deadline of its own.
- *
- * The destination HTML fetches are already bounded at 10s inside `metaTrackingPreflight`;
- * this closes the same gap on the Graph side.
+ * Re-exported from the shared constant so §G's destination reads, §G Tier 1's reads and §F's
+ * insights read all carry the SAME deadline from one definition. Kept under this name because
+ * it is the one this module's tests and callers already reference.
  */
-export const DESTINATION_META_TIMEOUT_MS = 15_000;
+export const DESTINATION_META_TIMEOUT_MS = META_GRAPH_TIMEOUT_MS;
 
 /**
  * Days of attributed-conversion history used as the corroborating signal.
