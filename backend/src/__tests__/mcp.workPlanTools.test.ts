@@ -761,9 +761,12 @@ describe('Predefined Work Plan MCP Tools', () => {
       const payload = JSON.parse(result.content[0].text);
       expect(payload.error).toMatch(/would blank/i);
       expect(payload.stepsWouldBeRemoved).toBe(0);
+      // `kind` separates a step that came back with fields emptied from one that
+      // did not come back recognisably at all — both refuse, but only the first
+      // is honestly described as blanking (ENG-1221, Greptile round 2).
       expect(payload.stepContentLoss).toEqual([
-        { stepCount: 1, title: 'Step 1: Scope', fields: ['requiredFunctionCalls', 'skillIds'] },
-        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+        { stepCount: 1, title: 'Step 1: Scope', fields: ['requiredFunctionCalls', 'skillIds'], kind: 'blanked' },
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'], kind: 'blanked' },
       ]);
     });
 
@@ -783,7 +786,7 @@ describe('Predefined Work Plan MCP Tools', () => {
       const payload = JSON.parse(result.content[0].text);
       // Step 1 kept its contents under its new position; only step 2 lost any.
       expect(payload.stepContentLoss).toEqual([
-        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'], kind: 'blanked' },
       ]);
     });
 
@@ -1027,7 +1030,7 @@ describe('Predefined Work Plan MCP Tools', () => {
         // Only step 2 lost its requiredFunctionCalls. Matching on the shared
         // title would have paired both against step 1 and reported nothing.
         expect(payload.stepContentLoss).toEqual([
-          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'] },
+          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'], kind: 'blanked' },
         ]);
       });
     });

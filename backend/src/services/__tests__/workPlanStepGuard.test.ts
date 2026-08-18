@@ -165,6 +165,130 @@ describe('findStepContentLoss — pairing must survive a reorder (Greptile, ENG-
   });
 });
 
+describe('findStepContentLoss — a refusal must say which KIND of loss it saw (Greptile round 2)', () => {
+  // Greptile flagged the rename-with-edits case: keep step 1, rename step 2 and
+  // change one of its populated fields, and the endpoint refuses with 400.
+  //
+  // The refusal is correct and must stay. At equal length the shrink guard never
+  // fires (it tests `after.length < before.length`), so this function is the ONLY
+  // thing between a caller and a step being destroyed in place. And "renamed with
+  // an edit" is byte-for-byte indistinguishable from "deleted, replaced by a new
+  // step at the same number" — same stepCount, a title belonging to no other
+  // step, different content. No rule over this data can separate them, so the
+  // safe default is the right one: a false refusal costs one retry, a false pass
+  // destroyed 20.3k characters of someone's work.
+  //
+  // What was genuinely wrong is the REPORT. Both cases came back as "fields that
+  // are currently set would be blanked", which is false here — nothing is being
+  // blanked, the slot is being handed different content. Naming the two kinds
+  // apart is what lets the endpoint explain itself honestly.
+  const before = [
+    { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    { stepCount: 2, title: 'Beta', description: 'BETA', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+  ];
+
+  it('marks a rename-with-edits as unpaired, not as blanking', () => {
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta v2', description: 'BETA REWORDED', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss).toHaveLength(1);
+    expect(loss[0].title).toBe('Beta');
+    expect(loss[0].kind).toBe('unpaired');
+  });
+
+  it('still marks a genuinely emptied field as blanked', () => {
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta', description: '', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss).toHaveLength(1);
+    expect(loss[0].kind).toBe('blanked');
+    expect(loss[0].fields).toEqual(['description']);
+  });
+
+  it('keeps refusing the rename-with-edits — the safe default is the point', () => {
+    // Pinning the behaviour Greptile asked to remove, so a future edit cannot
+    // quietly turn a same-length step replacement back into a silent 200.
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta v2', description: 'BETA REWORDED', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    expect(findStepContentLoss(before, after).length).toBeGreaterThan(0);
+  });
+
+  it('reports the replaced-by-a-different-step case as unpaired too', () => {
+    // The indistinguishable twin of the case above. Same verdict, same kind —
+    // if these two ever reported differently, the function would be claiming a
+    // distinction the data cannot support.
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Gamma', description: 'GAMMA', skillIds: ['c'], requiredFunctionCalls: ['h'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss.map((l: any) => [l.title, l.kind])).toEqual([['Beta', 'unpaired']]);
+  });
+
+  it('merge mode performs the rename-and-edit without touching anything else', () => {
+    // The remedy the endpoint already recommends first. Worth pinning: if merge
+    // ever stopped handling rename+edit cleanly, the refusal above would become
+    // a dead end instead of a signpost. (The route runs the loss check only on
+    // the replace path, so merge output is never gated by it — what matters here
+    // is that the merge itself preserves the untouched fields.)
+    const merged = mergeWorkPlanSteps(before, [
+      { stepCount: 2, title: 'Beta v2', description: 'BETA REWORDED' },
+    ]);
+    const second = merged.find((s: any) => s.stepCount === 2);
+    expect(second.title).toBe('Beta v2');
+    expect(second.description).toBe('BETA REWORDED');
+    expect(second.skillIds).toEqual(['b']);
+    expect(second.requiredFunctionCalls).toEqual(['g']);
+    expect(merged.find((s: any) => s.stepCount === 1)).toEqual(before[0]);
+  });
+
+  it('does not list fields as lost when the replacement carries them unchanged', () => {
+    // The reporting bug underneath Greptile's complaint. An unpaired step used to
+    // have EVERY populated field listed as lost, so a rename that edited only the
+    // description accused the payload of dropping skillIds and
+    // requiredFunctionCalls that are sitting right there, identical, in the step
+    // occupying that stepCount. The refusal stands; the accusation must be true.
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta v2', description: 'BETA REWORDED', skillIds: ['b'], requiredFunctionCalls: ['g'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss).toHaveLength(1);
+    expect(loss[0].fields).not.toContain('skillIds');
+    expect(loss[0].fields).not.toContain('requiredFunctionCalls');
+  });
+
+  it('still lists a field the replacement genuinely drops on an unpaired step', () => {
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+      { stepCount: 2, title: 'Beta v2', description: 'BETA REWORDED', skillIds: [], requiredFunctionCalls: ['g'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss[0].kind).toBe('unpaired');
+    expect(loss[0].fields).toContain('skillIds');
+  });
+
+  it('lists everything when the step simply did not come back at all', () => {
+    // No candidate at that stepCount, so there is nothing carrying its content
+    // and the full populated set is the honest answer.
+    const after = [
+      { stepCount: 1, title: 'Alpha', description: 'ALPHA', skillIds: ['a'], requiredFunctionCalls: ['f'] },
+    ];
+    const loss = findStepContentLoss(before, after);
+    expect(loss).toHaveLength(1);
+    expect(loss[0].title).toBe('Beta');
+    expect(loss[0].fields).toEqual(
+      expect.arrayContaining(['description', 'skillIds', 'requiredFunctionCalls']),
+    );
+  });
+});
+
 describe('summarizeStepChange (ENG-1221 AC3)', () => {
   it('reports a diff when steps actually changed', () => {
     const partial = TEN.map((s) => ({ stepCount: s.stepCount, skillIds: ['skill-b'] }));

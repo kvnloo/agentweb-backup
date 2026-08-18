@@ -73,6 +73,61 @@ describe('PUT /api/admin/work-plans/:planId — destructive step guard (ENG-1221
       expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
     });
 
+    it('says fields were emptied when that is what happened', async () => {
+      const blanked = TEN.map((s, i) => (i === 2 ? { ...s, description: '' } : s));
+      const res = await request(app).put('/api/admin/work-plans/plan-1').send({ steps: blanked });
+      expect(res.status).toBe(400);
+      expect(res.body.stepContentLoss[0].kind).toBe('blanked');
+      expect(res.body.message).toContain('emptied');
+      expect(res.body.message).not.toContain('not recognisable');
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('says a step is unrecognisable rather than accusing the payload of blanking it', async () => {
+      // Greptile round 2: renaming one step while editing a field of it used to
+      // be reported as "would blank fields that are currently set", naming
+      // skillIds the payload plainly still carries. The refusal is right — a
+      // renamed step and a different step at the same number are the same bytes,
+      // and at equal length nothing else guards this — but the reason has to be
+      // the true one, or the caller goes looking for a blanking that never
+      // happened.
+      const renamed = TEN.map((s, i) =>
+        (i === 2 ? { ...s, title: 'Step 3: renamed', description: 'rewritten but present' } : s));
+      const res = await request(app).put('/api/admin/work-plans/plan-1').send({ steps: renamed });
+      expect(res.status).toBe(400);
+      expect(res.body.stepContentLoss).toHaveLength(1);
+      expect(res.body.stepContentLoss[0].kind).toBe('unpaired');
+      // The fields it still carries must not be listed as casualties.
+      expect(res.body.stepContentLoss[0].fields).not.toContain('skillIds');
+      expect(res.body.message).toContain('not recognisable');
+      expect(mockUpdateWorkPlan).not.toHaveBeenCalled();
+    });
+
+    it('points at merge as the way to rename and edit in one call', async () => {
+      const renamed = TEN.map((s, i) =>
+        (i === 2 ? { ...s, title: 'Step 3: renamed', description: 'rewritten but present' } : s));
+      const res = await request(app).put('/api/admin/work-plans/plan-1').send({ steps: renamed });
+      expect(JSON.stringify(res.body.howToProceed)).toContain('merge');
+      expect(JSON.stringify(res.body.howToProceed)).toContain('confirm_step_removal=true');
+    });
+
+    it('actually performs that rename-and-edit when asked via merge', async () => {
+      // The escape hatch the message advertises has to work, or the refusal is a
+      // dead end. Merge renames step 3 and rewrites its description while every
+      // other step, and step 3's own skillIds, survive untouched.
+      const res = await request(app).put('/api/admin/work-plans/plan-1').send({
+        steps_mode: 'merge',
+        steps: [{ stepCount: 3, title: 'Step 3: renamed', description: 'rewritten but present' }],
+      });
+      expect(res.status).toBe(200);
+      const written = mockUpdateWorkPlan.mock.calls[0][0].steps;
+      expect(written).toHaveLength(10);
+      const third = written.find((s: any) => s.stepCount === 3);
+      expect(third.title).toBe('Step 3: renamed');
+      expect(third.description).toBe('rewritten but present');
+      expect(third.skillIds).toEqual(TEN[2].skillIds);
+    });
+
     it('rejects a payload that would drop steps', async () => {
       const res = await request(app)
         .put('/api/admin/work-plans/plan-1')
