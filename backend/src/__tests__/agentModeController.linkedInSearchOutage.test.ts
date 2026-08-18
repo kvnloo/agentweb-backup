@@ -147,9 +147,10 @@ describe('didSourcingBlockStateChange (ENG-1131 follow-up: proactive transition 
     expect(didSourcingBlockStateChange(prior, null)).toBe(false);
   });
 
-  it('only looks at the IMMEDIATELY PRECEDING run, not the whole history', () => {
+  it('only looks at the IMMEDIATELY PRECEDING run, not the whole history — a settled recovery re-breaking still alerts', () => {
     // Blocked two runs ago, healthy last run, blocked again now — still a transition
-    // (healthy -> blocked), not "already alerted for this outage".
+    // (healthy -> blocked), not "already alerted for this outage". No createdAt on
+    // these fixtures, so there's no known prior-transition time to cool down against.
     const prior = [
       { status: 'success', blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON },
       { status: 'success', blockedBy: undefined },
@@ -160,5 +161,66 @@ describe('didSourcingBlockStateChange (ENG-1131 follow-up: proactive transition 
   it('tolerates a malformed last entry without throwing', () => {
     expect(didSourcingBlockStateChange([null as any], LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON)).toBe(true);
     expect(didSourcingBlockStateChange(['nonsense' as any], null)).toBe(false);
+  });
+
+  describe('anti-flap cooldown (ENG-1131 follow-up: borderline-probe flapping)', () => {
+    // Fixed reference point so tests are deterministic regardless of wall-clock time.
+    const NOW = '2026-08-18T12:00:00.000Z';
+    const minutesAgo = (m: number) => new Date(Date.parse(NOW) - m * 60_000).toISOString();
+
+    it('suppresses a re-alert when the last transition happened moments ago (rapid flap)', () => {
+      // healthy -> blocked 5 minutes ago, now flipping back to healthy — too soon,
+      // likely probe noise from a burst of manual re-tests rather than a real recovery.
+      const prior = [
+        { blockedBy: undefined, createdAt: minutesAgo(20) },
+        { blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON, createdAt: minutesAgo(5) },
+      ];
+      expect(
+        didSourcingBlockStateChange(prior, null, { now: NOW }),
+      ).toBe(false);
+    });
+
+    it('still alerts once the cooldown has elapsed since the last transition', () => {
+      // Same shape, but the blocked state has held for 2 hours — a real, settled
+      // transition, not noise. Must alert on the recovery.
+      const prior = [
+        { blockedBy: undefined, createdAt: minutesAgo(180) },
+        { blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON, createdAt: minutesAgo(120) },
+      ];
+      expect(
+        didSourcingBlockStateChange(prior, null, { now: NOW }),
+      ).toBe(true);
+    });
+
+    it('a schedule\'s FIRST-EVER transition is never suppressed by the cooldown (nothing to cool down against)', () => {
+      expect(
+        didSourcingBlockStateChange([], LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON, { now: NOW }),
+      ).toBe(true);
+    });
+
+    it('a custom cooldown window is respected', () => {
+      const prior = [
+        { blockedBy: undefined, createdAt: minutesAgo(20) },
+        { blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON, createdAt: minutesAgo(10) },
+      ];
+      // 10 minutes since the transition, 5-minute cooldown -> elapsed, alert fires.
+      expect(
+        didSourcingBlockStateChange(prior, null, { now: NOW, cooldownMs: 5 * 60_000 }),
+      ).toBe(true);
+      // Same history, 15-minute cooldown -> not yet elapsed, suppressed.
+      expect(
+        didSourcingBlockStateChange(prior, null, { now: NOW, cooldownMs: 15 * 60_000 }),
+      ).toBe(false);
+    });
+
+    it('ignores entries with missing/unparseable createdAt rather than throwing or miscounting', () => {
+      const prior = [
+        { blockedBy: undefined, createdAt: 'not-a-date' },
+        { blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON }, // no createdAt at all
+      ];
+      expect(() => didSourcingBlockStateChange(prior, null, { now: NOW })).not.toThrow();
+      // No usable transition timestamp found -> nothing to cool down against -> alerts.
+      expect(didSourcingBlockStateChange(prior, null, { now: NOW })).toBe(true);
+    });
   });
 });
