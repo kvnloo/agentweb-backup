@@ -183,15 +183,20 @@ export async function evaluateAccountGate(
  */
 export function buildAccountSkipReason(accountNames: string[]): string {
   const names = accountNames.filter(Boolean);
+  // "LinkedIn Outreach", not "LinkedIn". A customer can hold BOTH a `linkedin`
+  // connection (posting) and a `unipile` one (outreach), and they appear as separate
+  // entries in Settings. Saying just "LinkedIn" sends them to reconnect the wrong one
+  // — and this text reaches them, via run history and the scheduled-run result email.
   const subject =
     names.length === 0
-      ? 'The LinkedIn account this schedule uses'
+      ? 'The LinkedIn Outreach account this schedule uses'
       : names.length === 1
-        ? `The LinkedIn account "${names[0]}"`
-        : `The LinkedIn accounts ${names.map((n) => `"${n}"`).join(' and ')}`;
+        ? `The LinkedIn Outreach account "${names[0]}"`
+        : `The LinkedIn Outreach accounts ${names.map((n) => `"${n}"`).join(' and ')}`;
   return (
     `Skipped before running: ${subject} is disconnected from LinkedIn, so no invitations, ` +
-    `messages or withdrawals can be sent. Reconnect it in Settings → Connected Accounts and ` +
-    `this schedule resumes on its next run — nothing needs to be switched back on.`
+    `messages or withdrawals can be sent. Reconnect it under Settings → Connected Accounts ` +
+    `→ LinkedIn Outreach and this schedule resumes on its next run — nothing needs to be ` +
+    `switched back on.`
   );
 }

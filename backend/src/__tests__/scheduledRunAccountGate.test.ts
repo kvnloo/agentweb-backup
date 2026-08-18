@@ -116,7 +116,7 @@ describe('buildAccountSkipReason', () => {
 
   it('reads correctly for several accounts and for none', () => {
     expect(buildAccountSkipReason(['A', 'B'])).toContain('"A" and "B"');
-    expect(buildAccountSkipReason([])).toContain('The LinkedIn account this schedule uses');
+    expect(buildAccountSkipReason([])).toContain('The LinkedIn Outreach account this schedule uses');
   });
 });
 

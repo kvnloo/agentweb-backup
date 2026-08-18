@@ -3418,7 +3418,7 @@ async function pauseScheduleForDisconnectedAccount(
     } as any);
     console.error(
       `runScheduledChat: PAUSED schedule ${schedule.scheduleId} — ${consecutiveSkips} consecutive runs `
-      + `skipped for disconnected LinkedIn account(s) ${gate.accountIds.join(', ')}.`,
+      + `skipped for disconnected LinkedIn Outreach account(s) ${gate.accountIds.join(', ')}.`,
     );
     // Unlike the per-run skip, a pause is a state change the owner cannot infer
     // from anything they already received, so it gets its own message.
@@ -3466,7 +3466,7 @@ async function pauseScheduleForDisconnectedAccount(
           ? Math.max(0, Math.floor((Date.now() - since) / (24 * 60 * 60 * 1000)))
           : 0;
         await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
-          accountName: gate.accountNames[0] || 'your LinkedIn account',
+          accountName: gate.accountNames[0] || 'your LinkedIn Outreach account',
           disconnectedAt,  // may be undefined — the email omits the line rather than inventing one
           isReminder: true,
           // These are different units and were previously conflated: the copy read
@@ -3481,7 +3481,7 @@ async function pauseScheduleForDisconnectedAccount(
       console.error(`Failed to send pause notification for ${schedule.scheduleId}:`, notifyError);
     }
     await sendAgentModeOncallAlert({
-      subject: `Schedule paused — LinkedIn account disconnected: ${schedule.scheduleName}`,
+      subject: `Schedule paused — LinkedIn Outreach account disconnected: ${schedule.scheduleName}`,
       message:
         `Schedule ${schedule.scheduleId} was paused after ${consecutiveSkips} consecutive runs skipped `
         + `because its pinned Unipile account(s) ${gate.accountIds.join(', ')} have no live LinkedIn `
@@ -3976,7 +3976,7 @@ export async function runScheduledChat(
     if (accountGate.blocked) {
       console.log(
         `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
-        + `pinned LinkedIn account(s) ${accountGate.accountIds.join(', ')} disconnected`,
+        + `pinned LinkedIn Outreach account(s) ${accountGate.accountIds.join(', ')} disconnected`,
       );
       const skipResult = {
         scheduleId: schedule.scheduleId,
