@@ -169,16 +169,29 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'deep-research-max-preview-04-2026': withDerivedCache(2, 12), // same per-token rate as standard; Max differs in task depth / search volume, not token price
 
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
-  // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
-  // published Azure list prices (likely a long-standing bug). The shadow price
-  // book uses the official list prices instead — the comparison endpoint is
-  // expected to surface this discrepancy.
   // OpenAI publishes gpt-4o cached input at $1.25/1M (50% of the $2.50 input rate),
   // not the 10%-of-input default our convention would derive ($0.25). Override the
   // cache-read rate with the real published number; write stays on the convention.
   'gpt-4o': { ...withDerivedCache(2.5, 10), cacheReadPerM: 1.25 },
   'gpt-4.1': withDerivedCache(2, 8),
   'gpt-4': withDerivedCache(30, 60), // legacy default deployment name; official GPT-4 8k list price
+
+  // ── OpenRouter (ENG-9) ───────────────────────────────────────────────────────
+  // Static fallback/estimate only — the real per-call cost comes from OpenRouter's
+  // `usage.cost` and is forwarded as a costUsdOverride at call time (ENG-9 AC #6),
+  // so these entries exist to satisfy modelPricingCoverage.test.ts (no model may be
+  // priced at $0/free-by-omission) and to render an estimate before a call completes.
+  // Rates per openrouter.ai/models list pricing, Aug 2026.
+  'openrouter/openai/gpt-4o-mini': withDerivedCache(0.15, 0.6),
+  'openrouter/x-ai/grok-4.6': withDerivedCache(3, 15),
+  'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.55, 2.19),
+  'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.14, 0.28),
+  'openrouter/qwen/qwen3.8-max': withDerivedCache(1.6, 6.4),
+  'openrouter/mistralai/mistral-small-2603': withDerivedCache(0.2, 0.6),
+  'openrouter/moonshotai/kimi-k3': withDerivedCache(0.6, 2.5),
+  'openrouter/moonshotai/kimi-k2.7-code': withDerivedCache(0.6, 2.5),
+  'openrouter/z-ai/glm-5.2': withDerivedCache(0.6, 2.2),
+  'openrouter/z-ai/glm-4.7-flash': withDerivedCache(0.1, 0.4),
 
   // ── Embeddings (output side is always 0 — embeddings have no completion) ────
   'text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },

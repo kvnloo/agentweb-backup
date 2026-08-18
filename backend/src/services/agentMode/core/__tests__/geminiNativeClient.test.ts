@@ -343,8 +343,14 @@ describe('fromGeminiResponse', () => {
     };
     const out = fromGeminiResponse(resp);
     expect(out.choices[0].finish_reason).toBe('tool_calls');
+    // The id carries a random suffix so it stays unique across turns (ENG-1206),
+    // so pin its shape rather than a literal value.
     expect(out.choices[0].message.tool_calls).toEqual([
-      { id: 'call_web_search_0', type: 'function', function: { name: 'web_search', arguments: '{"q":"wa"}' } },
+      {
+        id: expect.stringMatching(/^call_web_search_0_[0-9a-f]{8}$/),
+        type: 'function',
+        function: { name: 'web_search', arguments: '{"q":"wa"}' },
+      },
     ]);
   });
 
@@ -853,5 +859,67 @@ describe('createGeminiNativeClient (end-to-end wiring)', () => {
     // response was translated + thought filtered
     expect(res.choices[0].message.content).toBe('clean answer');
     expect(res.usage.completion_tokens).toBe(10);
+  });
+});
+
+/**
+ * ENG-1206 — synthesised tool-call ids must be unique for the life of a session.
+ *
+ * Gemini returns no tool-call id, so the adapter mints one. It used to be
+ * `call_{name}_{indexWithinThisResponse}`, and that index resets every turn — so
+ * turn 2's first `get_leads` reused turn 1's id. `toolDispatch` stores an
+ * offloaded tool response at `tool-responses/{sessionId}/{toolCall.id}.txt`, so
+ * the collision silently overwrote the earlier page in S3 (prod session
+ * d5898ffd, where page 2 destroyed page 1 and the follow-up read 404'd).
+ */
+describe('fromGeminiResponse — tool-call id uniqueness (ENG-1206)', () => {
+  const respWith = (names: string[]) => ({
+    candidates: [{
+      finishReason: 'STOP',
+      content: { parts: names.map((name) => ({ functionCall: { name, args: {} } })) },
+    }],
+  });
+  const idsOf = (resp: any) =>
+    fromGeminiResponse(resp).choices[0].message.tool_calls.map((tc: any) => tc.id);
+
+  it('does not reuse an id across separate responses (the collision)', () => {
+    const turn1 = idsOf(respWith(['get_leads']));
+    const turn2 = idsOf(respWith(['get_leads']));
+    expect(turn1[0]).not.toEqual(turn2[0]);
+  });
+
+  it('keeps ids distinct within a single response', () => {
+    const ids = idsOf(respWith(['get_leads', 'get_leads', 'search_leads']));
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it('stays unique across many turns of the identical call', () => {
+    const seen = new Set<string>();
+    for (let i = 0; i < 50; i++) seen.add(idsOf(respWith(['get_leads']))[0]);
+    expect(seen.size).toBe(50);
+  });
+
+  it('still carries the tool name so ids stay debuggable', () => {
+    expect(idsOf(respWith(['get_leads']))[0]).toMatch(/^call_get_leads_/);
+  });
+
+  it('is safe to use as an S3 object key', () => {
+    // The id becomes a filename in `tool-responses/{sessionId}/{id}.txt`.
+    for (const id of idsOf(respWith(['get_leads', 'perform_data_analysis']))) {
+      expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+    }
+  });
+
+  it('round-trips: a tool result still maps back to its call name', () => {
+    const out = fromGeminiResponse(respWith(['web_search']));
+    const call = out.choices[0].message.tool_calls[0];
+    const req = toGeminiRequest({
+      messages: [
+        { role: 'assistant', content: '', tool_calls: [{ ...call, thought_signature: 'SIG' }] },
+        { role: 'tool', tool_call_id: call.id, content: '{"results":["a"]}' },
+      ],
+    } as OpenAIChatParams, OPTS);
+    const fnResp = req.contents.flatMap((c: any) => c.parts).find((p: any) => p.functionResponse);
+    expect(fnResp.functionResponse.name).toBe('web_search');
   });
 });

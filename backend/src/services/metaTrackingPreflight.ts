@@ -370,6 +370,31 @@ export function detectMetaPixels(html: string): string[] {
   return [...found];
 }
 
+/**
+ * Request headers for the destination fetch.
+ *
+ * A BROWSER user-agent, matching `googleAdsTrackingPreflight` deliberately rather than by
+ * accident — this file previously sent `AgentWeb-TrackingPreflight/1.0`, which is the exact
+ * mistake that module's own note was written to avoid:
+ *
+ *   "a custom bot UA is far more likely to be handed a WAF/bot-challenge page (no tracking
+ *    snippet ⇒ a false 'unmeasured' block on a legitimately-tracked landing page)"
+ *
+ * That applies with more force here, because THIS gate blocks launches on that verdict — so
+ * the bot UA was costing real false blocks — and ENG-926 §G's daily check reuses this same
+ * fetcher, where the same false reading would page a human every morning.
+ *
+ * We want the HTML a genuine visitor is served. `Accept-*` mirror a normal navigation for
+ * the same reason. Exported so the choice is pinned by a test rather than living only inside
+ * an istanbul-ignored network boundary, where a refactor could silently revert it.
+ */
+export const PREFLIGHT_FETCH_HEADERS: Readonly<Record<string, string>> = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
 /** How many destinations to fetch at once. Bounded: fast enough for a launch, polite to the site. */
 const FETCH_CONCURRENCY = 5;
 
@@ -418,7 +443,7 @@ async function defaultFetchHtml(url: string): Promise<string> {
         maxRedirects: 0,
         maxContentLength: MAX_HTML_BYTES,
         validateStatus: (s: number) => s >= 200 && s < 400,
-        headers: { 'User-Agent': 'AgentWeb-TrackingPreflight/1.0' },
+        headers: PREFLIGHT_FETCH_HEADERS,
         responseType: 'text',
       }),
     assertPublic: assertPublicHostname,
