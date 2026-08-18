@@ -3440,12 +3440,27 @@ async function pauseScheduleForDisconnectedAccount(
       }
       if (notifyEmails.length > 0) {
         const { emailService } = await import('../services/emailService');
-        const disconnectedAt = new Date().toISOString();
+        // Read the real disconnect time rather than stamping "now": the account has
+        // typically been dead for several runs by the time a pause fires, and telling
+        // the customer it just dropped is both wrong and unhelpful for diagnosis.
+        const { getUnipileHealth } = await import('../services/linkedInConnectionHealth');
+        const health = gate.accountIds[0]
+          ? await getUnipileHealth(gate.accountIds[0], userId).catch(() => null)
+          : null;
+        const disconnectedAt = health?.disconnected_at || new Date().toISOString();
+        const since = Date.parse(disconnectedAt);
+        const daysDisconnected = Number.isFinite(since)
+          ? Math.max(0, Math.floor((Date.now() - since) / (24 * 60 * 60 * 1000)))
+          : 0;
         await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
           accountName: gate.accountNames[0] || 'your LinkedIn account',
           disconnectedAt,
           isReminder: true,
-          daysDisconnected: consecutiveSkips,
+          // These are different units and were previously conflated: the copy read
+          // "N days of skipped runs" off a RUN count. A schedule firing every 3 days
+          // understated it threefold; one firing twice a day overstated it.
+          daysDisconnected,
+          skippedRunCount: consecutiveSkips,
           pausedScheduleName: schedule.scheduleName,
         });
       }
@@ -3734,69 +3749,6 @@ export async function runScheduledChat(
       }
     }
 
-    // ENG-1197: don't spend a run on an account that cannot act.
-    //
-    // This schedule fired daily against a LinkedIn account whose session LinkedIn
-    // had revoked. Each fire loaded skills, paged the CRM, ran discovery against a
-    // borrowed shared account, and sent nothing — ~$5 of model spend for a
-    // guaranteed no-op, recorded as a SUCCESS so no failure path ever fired.
-    //
-    // Never gates a test run or a resume. The ENG-1259 pre-check makes the same
-    // exclusion for the same reason: a human is waiting on a manual test and must
-    // see the flow exercised, not a silent no-op — and worse, a test skip would be
-    // written into runResults and inflate the very streak that triggers the
-    // auto-pause, so repeatedly testing a schedule could pause it. A resume is
-    // excluded because its session is already parked mid-flight; withholding it
-    // strands that session rather than saving anything.
-    const lastRunResult = Array.isArray(schedule.runResults) && schedule.runResults.length > 0
-      ? schedule.runResults[schedule.runResults.length - 1]
-      : null;
-    const isResumingParkedRun = lastRunResult?.status === 'pending_user_input';
-    const accountGate = (isTest || isResumingParkedRun)
-      ? { blocked: false, accountIds: [], accountNames: [] }
-      : await evaluateLinkedInAccountGate(schedule, userId);
-    if (accountGate.blocked) {
-      console.log(
-        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
-        + `pinned LinkedIn account(s) ${accountGate.accountIds.join(', ')} disconnected`,
-      );
-      const skipResult = {
-        scheduleId: schedule.scheduleId,
-        runId: preGeneratedRunId || require('uuid').v4(),
-        status: ACCOUNT_DISCONNECTED_STATUS,
-        passed: false,
-        actualResponse: buildAccountSkipReason(accountGate.accountNames),
-        actualFunctionCalls: [],
-        keywordMatches: [],
-        keywordMisses: schedule.keywords || [],
-        functionCallMatches: [],
-        functionCallMisses: schedule.requiredFunctionCalls || [],
-        executionTime: 0,
-        sessionId: '',
-        attempt: 0,
-        createdAt: new Date().toISOString(),
-      };
-      try {
-        await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
-      } catch (saveError) {
-        console.error(`Error saving account-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
-      }
-
-      // The skip is deliberately NOT accompanied by its own email. The owner is
-      // already told once, on the disconnect edge, by linkedInConnectionHealth —
-      // and one notification authority is the whole reason that path exists. A
-      // second one here would mail them on every fire of every affected schedule.
-      //
-      // Leaving the schedule active is what makes this self-healing: a reconnect
-      // resumes it with no human action. The pause below exists only for the case
-      // that never comes.
-      const trailingSkips = countTrailingAccountSkips(schedule.runResults);
-      if (trailingSkips + 1 >= MAX_CONSECUTIVE_ACCOUNT_SKIPS) {
-        await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
-      }
-      return skipResult;
-    }
-
     // Check token usage limits before creating the session
     const usageStatus = await checkTokenUsage(userId);
     if (!usageStatus.allowed) {
@@ -3963,6 +3915,93 @@ export async function runScheduledChat(
         attempt: 0,
         createdAt: new Date().toISOString(),
       };
+    }
+
+    // ENG-1197: don't spend a run on an account that cannot act.
+    //
+    // This schedule fired daily against a LinkedIn account whose session LinkedIn
+    // had revoked. Each fire loaded skills, paged the CRM, ran discovery against a
+    // borrowed shared account, and sent nothing — ~$5 of model spend for a
+    // guaranteed no-op, recorded as a SUCCESS so no failure path ever fired.
+    //
+    // Placed AFTER the in-flight lease deliberately. Both prod instances dispatch
+    // the same schedule, and `addRunResult` is a blind `list_append` with no runId
+    // dedupe — so a gate sitting before the lease had BOTH dispatchers writing a
+    // skip row and both computing the same streak. That doubled every skip in
+    // `runResults` and made MAX_CONSECUTIVE_ACCOUNT_SKIPS arrive in about three
+    // fires instead of five, with two identical pause emails at the end of it. The
+    // lease already answers "who owns this run"; the loser has returned above
+    // without writing anything, so gating here needs no CAS of its own. Skipping
+    // returns through the outer `finally`, which clears the lease and the
+    // heartbeat, leaving the schedule free for its next fire.
+    //
+    // Still ahead of session creation, skill loading and the CRM paging, which is
+    // where the ~$5 actually goes.
+    //
+    // Never gates a test run or a resume. The ENG-1259 pre-check makes the same
+    // exclusion for the same reason: a human is waiting on a manual test and must
+    // see the flow exercised, not a silent no-op — and worse, a test skip would be
+    // written into runResults and inflate the very streak that triggers the
+    // auto-pause, so repeatedly testing a schedule could pause it. A resume is
+    // excluded because its session is already parked mid-flight; withholding it
+    // strands that session rather than saving anything.
+    const lastRunResult = Array.isArray(schedule.runResults) && schedule.runResults.length > 0
+      ? schedule.runResults[schedule.runResults.length - 1]
+      : null;
+    // Both markers, because they identify different parked runs. A `pending_user_input`
+    // result is a run waiting on the customer; `pendingResumeSessionId` is one the
+    // ENG-657/971 reconciler marked resumable after an abandoned run, whose last
+    // recorded result is typically a `failure`. Keying on the run result alone let
+    // that second kind reach the gate and be skipped — stranding exactly the
+    // mid-flight session this exclusion exists to protect.
+    const isResumingParkedRun =
+      lastRunResult?.status === 'pending_user_input' ||
+      (typeof schedule.pendingResumeSessionId === 'string' && !!schedule.pendingResumeSessionId);
+    const accountGate = (isTest || isResumingParkedRun)
+      ? { blocked: false, accountIds: [], accountNames: [] }
+      : await evaluateLinkedInAccountGate(schedule, userId);
+    if (accountGate.blocked) {
+      console.log(
+        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
+        + `pinned LinkedIn account(s) ${accountGate.accountIds.join(', ')} disconnected`,
+      );
+      const skipResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: ACCOUNT_DISCONNECTED_STATUS,
+        passed: false,
+        actualResponse: buildAccountSkipReason(accountGate.accountNames),
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        // The gate probes Unipile over the network, so this is not free. Reporting 0
+        // would hide it, and the sibling ENG-1259 skip records real elapsed time.
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
+      } catch (saveError) {
+        console.error(`Error saving account-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+
+      // The skip is deliberately NOT accompanied by its own email. The owner is
+      // already told once, on the disconnect edge, by linkedInConnectionHealth —
+      // and one notification authority is the whole reason that path exists. A
+      // second one here would mail them on every fire of every affected schedule.
+      //
+      // Leaving the schedule active is what makes this self-healing: a reconnect
+      // resumes it with no human action. The pause below exists only for the case
+      // that never comes.
+      const trailingSkips = countTrailingAccountSkips(schedule.runResults);
+      if (trailingSkips + 1 >= MAX_CONSECUTIVE_ACCOUNT_SKIPS) {
+        await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
+      }
+      return skipResult;
     }
 
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
