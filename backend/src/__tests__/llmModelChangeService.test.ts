@@ -177,11 +177,15 @@ describe("applyModelChange", () => {
       { llmModel: SONNET },
       { llmModel: OPUS },
     );
+    // The compensating write is guarded too, on the model WE just wrote. If a
+    // condition failure means someone replaced it in between, our unaudited value
+    // is already gone and reinstating `modelBefore` would clobber their deliberate
+    // choice to undo a write that no longer exists.
     expect(mockUpdateSchedule).toHaveBeenNthCalledWith(
       2,
       "sched-a",
       { llmModel: OPUS },
-      undefined,
+      { llmModel: SONNET },
       undefined,
       undefined,
     );
@@ -232,10 +236,14 @@ describe("undoModelChange", () => {
 
   it("restores the model that was there before", async () => {
     const result = await undoModelChange("member-a", changeSk);
+    // The third argument guards the restore on the schedule still carrying the
+    // model this change installed, so an undo cannot reinstate a stale value over
+    // a newer choice. Asserted by value, not arity: a guard naming the wrong
+    // model would satisfy a positional check while permitting the overwrite.
     expect(mockUpdateSchedule).toHaveBeenCalledWith(
       "sched-a",
       { llmModel: OPUS },
-      undefined,
+      { llmModel: SONNET },
       undefined,
       undefined,
     );
@@ -284,12 +292,25 @@ describe("undoModelChange", () => {
   });
 
   it("does not restore twice when the change was already undone", async () => {
-    // The audit stamp is the lock. If it reports "already undone", the model
-    // must not be written again — the customer may have changed it since, and
-    // a second restore would silently overwrite their newer choice.
-    mockUndone.mockResolvedValue(false);
+    // A change whose record already carries `undoneAt` is settled: answer from the
+    // record and touch nothing. The customer may have changed the model since, and
+    // a second restore would silently overwrite that newer choice.
+    //
+    // This is now decided BEFORE the write rather than by the stamp refusing it,
+    // because the restore moved ahead of the stamp — see the durability suite. The
+    // stamp remains the lock for a genuine race between two concurrent undos.
+    mockList.mockResolvedValue([{ ...stored, undoneAt: "2026-08-18T09:00:00.000Z" }] as never);
     const result = await undoModelChange("member-a", changeSk);
     expect(result.undone).toBe(false);
     expect(mockUpdateSchedule).not.toHaveBeenCalled();
+    expect(mockUndone).not.toHaveBeenCalled();
+  });
+
+  it("reports a no-op when a concurrent undo wins the stamp", async () => {
+    // The race the stamp still owns: both callers restore to the same value, and
+    // the loser reports honestly rather than claiming an undo it did not record.
+    mockUndone.mockResolvedValue(false);
+    const result = await undoModelChange("member-a", changeSk);
+    expect(result.undone).toBe(false);
   });
 });

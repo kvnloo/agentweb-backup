@@ -143,10 +143,24 @@ async function resolveSwitchableModels(userId: string): Promise<{
 function restoreModelArgs(
   scheduleId: string,
   modelBefore: string | null,
-): [string, Record<string, unknown>, undefined, undefined, string[] | undefined] {
+  /**
+   * The model the schedule must STILL be on for this restore to be safe — the one
+   * the change being reverted installed. Without it a restore reinstates a stale
+   * value over whatever the customer picked since, reverting a deliberate choice
+   * while the audit trail records only an undo.
+   */
+  expectedCurrentModel?: string,
+): [
+  string,
+  Record<string, unknown>,
+  Record<string, unknown> | undefined,
+  undefined,
+  string[] | undefined,
+] {
+  const expect = expectedCurrentModel ? { llmModel: expectedCurrentModel } : undefined;
   return modelBefore === null
-    ? [scheduleId, {}, undefined, undefined, ['llmModel']]
-    : [scheduleId, { llmModel: modelBefore }, undefined, undefined, undefined];
+    ? [scheduleId, {}, expect, undefined, ['llmModel']]
+    : [scheduleId, { llmModel: modelBefore }, expect, undefined, undefined];
 }
 
 /** Load a scope the caller owns, or throw not-found. */
@@ -254,8 +268,13 @@ export async function applyModelChange(
     // Compensate. An unaudited change cannot be explained or undone through the
     // UI, so the customer is better served by the switch simply not happening.
     await scheduleDb
-      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore))
+      .updateSchedule(...restoreModelArgs(input.scopeId, modelBefore, input.toModel))
       .catch((revertError: unknown) => {
+        // A failed CONDITION is not a failed revert: it means our unaudited write
+        // was already replaced by someone else's deliberate one, which is the
+        // outcome the compensation wanted. Overwriting that with `modelBefore`
+        // would clobber a real choice to undo a write that no longer exists.
+        if (isConditionalCheckFailure(revertError)) return;
         // Both writes failed. Say so loudly — the schedule is now on a model the
         // customer chose but we have no record of, and only a human can
         // reconcile that.
@@ -322,10 +341,45 @@ export async function undoModelChange(
   // capability for the present.
   await loadOwnedSchedule(userId, change.scopeId);
 
+  // Already undone: answer from the record and touch nothing. With the restore
+  // moved first, omitting this would send an already-undone change into the
+  // conditional write, where a schedule since moved elsewhere reads as a conflict
+  // -- turning the benign "you already did this" into an error the customer has to
+  // interpret. The stamp below remains the authority against a genuine race; this
+  // is the cheap, correct answer for the settled case.
+  if (change.undoneAt) return { undone: false, restoredModel: null };
+
+  // RESTORE FIRST, STAMP SECOND. The stamp is still the lock against a double
+  // undo, but taking it first meant a failed restore left the audit asserting a
+  // revert that never happened -- and unrepairable, because the retry hits
+  // `attribute_not_exists(undoneAt)`, reports "already undone", and declines to
+  // touch the schedule. The customer is then told the switch is reverted while it
+  // is not, with no path back.
+  //
+  // Inverted, both failure directions stay safe. A failed restore stamps nothing,
+  // so the undo is still offered and still true. A restore that lands before a
+  // failed stamp leaves the schedule already correct, and the retry below detects
+  // that and finishes the stamp.
+  try {
+    await scheduleDb.updateSchedule(
+      ...restoreModelArgs(change.scopeId, change.modelBefore, change.modelAfter),
+    );
+  } catch (error) {
+    if (!isConditionalCheckFailure(error)) throw error;
+    // The schedule is not on the model this change installed. Either a previous
+    // attempt already restored it -- finish the stamp -- or the customer has moved
+    // on since, in which case reinstating `modelBefore` would revert a choice they
+    // made deliberately.
+    const current = await loadOwnedSchedule(userId, change.scopeId);
+    if ((current.llmModel || null) !== change.modelBefore) {
+      throw new ModelChangeConflictError(
+        "That schedule has changed since, so this switch can no longer be undone.",
+      );
+    }
+  }
+
   const stamped = await markModelChangeUndone(billingUserId, changeId, userId);
   if (!stamped) return { undone: false, restoredModel: null };
-
-  await scheduleDb.updateSchedule(...restoreModelArgs(change.scopeId, change.modelBefore));
 
   await recordUsageTelemetry(billingUserId, USAGE_TELEMETRY_EVENTS.changeUndone, {
     scope: change.scope,
