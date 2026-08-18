@@ -2989,20 +2989,36 @@ export class AgentModeService {
       throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
     }
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
+    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed.
+    // ENG-700: providerLabel is set in the SAME model-id branch that decides
+    // which resolver produces `client`, so the metering label below can never
+    // independently drift from the resolver that actually serves the call —
+    // it is NOT derived from whether `client` happens to be cached yet (a
+    // Bedrock/Vertex client is cached on the registry after its first call,
+    // same as an Azure client is pre-populated at construction time, so
+    // "client is already set" cannot distinguish the providers).
     let client = this.llmModels[model].client;
+    let providerLabel: string;
     if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
-    } else if (!client) {
-      if (model.startsWith('anthropic.')) {
+      providerLabel = 'gemini';
+    } else if (model.startsWith('anthropic.')) {
+      providerLabel = 'bedrock';
+      if (!client) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
-      } else if (model.startsWith('claude-')) {
+      }
+    } else if (model.startsWith('claude-')) {
+      providerLabel = 'vertex';
+      if (!client) {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
-      } else {
+      }
+    } else {
+      providerLabel = 'azure-openai';
+      if (!client) {
         throw new Error(`Client not initialized for model: ${model}`);
       }
     }
@@ -3035,10 +3051,10 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
-                : model.startsWith('anthropic.') ? 'bedrock'
-                : model.startsWith('claude-') ? 'vertex'
-                : 'azure-openai',
+              // ENG-700: the label of the client that actually served this call
+              // (set above, alongside client resolution) — not re-derived from
+              // the model id, which can diverge for a vendor/model-namespaced id.
+              provider: providerLabel,
               feature: usageContext?.feature || 'agent_task',
               // ENG-1251: the response's own id is stable across a retried/
               // re-processed response and distinct across real calls — closes
