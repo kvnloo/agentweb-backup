@@ -554,7 +554,13 @@ describe('intakeService.fileAutoIssue', () => {
     );
   });
 
-  it('replaces a conflicting route and owner when enriching a deduped canonical', async () => {
+  // ENG-1285: a recurrence of an already-filed oncall alert must not touch labels, assignee,
+  // state, or priority on the matched canonical — those are PM/human routing decisions, and the
+  // rail re-firing hourly must not silently revert them. Only the recurrence comment (and,
+  // separately, raise-only priority escalation via escalateIssue on a strictly more severe
+  // occurrence) are allowed side effects. See the AC on ENG-1285 — this replaces the old
+  // "replaces a conflicting route and owner" test, which asserted exactly the bug being fixed.
+  it('recurrence makes no label mutation on the matched canonical (ENG-1285 AC #1)', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([
       { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
     ]);
@@ -566,28 +572,44 @@ describe('intakeService.fileAutoIssue', () => {
       executionRoute: 'autofix',
     });
 
-    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-11', {
-      addLabelNames: ['Bug', 'autofix'],
-      removeLabelNames: ['Needs PM'],
-      assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
-      settleStateName: 'Todo',
-    });
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-11', expect.stringContaining('Recurred on'));
   });
 
-  it('fails deduped intake visibly when required route enrichment fails', async () => {
+  it('a first-file (no match) still gets the full Auto + Needs PM + Oncall + Bug label set (ENG-1285 AC #2)', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-12', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'brand new alert',
+      description: 'd',
+      source: 'Oncall alert',
+      executionRoute: 'human-triage',
+      extraLabels: ['Oncall'],
+    });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ labelNames: ['Auto', 'Bug', 'Needs PM', 'Oncall'] }),
+    );
+  });
+
+  it('a re-fire does not overwrite priority, assignee, state, or due date set by a human (ENG-1285 AC #3/#4 — regression)', async () => {
+    // Simulate PM triage having already routed the canonical: Needs PM removed, reassigned,
+    // priority set, moved off Todo. The recurrence path must never call raiseIssueTriage (the
+    // only function capable of touching any of those fields on this path), so none of it can
+    // be reverted no matter what the mock canonical currently looks like.
     linear.listOpenIssuesByLabel.mockResolvedValue([
       { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
     ]);
-    linear.raiseIssueTriage.mockRejectedValueOnce(new Error('Linear route update rejected'));
 
-    await expect(
-      fileAutoIssue({
-        title: 'same alert',
-        description: 'd',
-        source: 'AI eval',
-        executionRoute: 'autofix',
-      }),
-    ).rejects.toThrow('Linear route update rejected');
+    await fileAutoIssue({
+      title: 'same alert',
+      description: 'd',
+      source: 'AI eval',
+      executionRoute: 'human-triage',
+    });
+
+    expect(linear.raiseIssueTriage).not.toHaveBeenCalled();
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
