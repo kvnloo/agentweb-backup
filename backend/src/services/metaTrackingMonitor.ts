@@ -34,6 +34,9 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+
+
 const TAG = '[Tracking Monitor]';
 
 /** Meta's deduplicated conversion rollups. Each is a FAMILY: the bare name plus the
@@ -377,7 +380,7 @@ export async function fetchDailyAdAccountActivity(
 
   try {
     for (let page = 0; page < MAX_INSIGHTS_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
 
       if (!response.ok || body?.error) {
@@ -634,6 +637,18 @@ export interface MonitorDeps {
     adAccountId: string,
     accessToken: string,
   ) => Promise<import('./metaDestinationCoverage').DestinationInputs>;
+  /**
+   * Ad accounts already swept SUCCESSFULLY this run, shared across every user in the sweep.
+   *
+   * The same ad account is connected under several user records in production — 21 connection
+   * rows resolve to 15 distinct accounts, two of them held by three user records each.
+   * Without this, each duplicate is swept in full again: the Meta reads repeat, §G re-fetches
+   * the customer's landing pages, and every per-user counter double-counts (the "2 blackout
+   * but 1 card" discrepancy §40 left unexplained).
+   *
+   * Omit it and nothing dedupes, which is the previous behaviour.
+   */
+  sweptAccountIds?: Set<string>;
 }
 
 export interface MonitorSummary {
@@ -681,6 +696,10 @@ export interface MonitorSummary {
    *  so something IS reporting. Logged, never paged: our HTML read is an inference and
    *  Meta's attribution is direct evidence. Usually a client-side pixel injection. */
   destinationUnconfirmed: number;
+  /** Connections skipped because another user record already swept that ad account
+   *  successfully this run. Surfaced so the saving is visible and a dedupe that starts
+   *  skipping too much cannot hide. */
+  duplicateAccountsSkipped: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -712,6 +731,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     destinationUnverifiable: 0,
     destinationOk: 0,
     destinationUnconfirmed: 0,
+    duplicateAccountsSkipped: 0,
   };
 
   const fetchActivity =
@@ -740,6 +760,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // Calling Meta with `undefined` would return a token error and alert a human about a
     // connection that does not exist.
     if (!adAccountId || !accessToken) continue;
+
+    // Another user record already swept this exact ad account, successfully, this run. The
+    // second pass would read the same Meta data, re-fetch the same landing pages, and file
+    // findings under a different owner email for the same underlying account.
+    if (deps?.sweptAccountIds?.has(String(adAccountId))) {
+      summary.duplicateAccountsSkipped++;
+      continue;
+    }
 
     summary.accountsChecked++;
 
@@ -786,6 +814,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       console.warn(`${TAG} ${adAccountId}: insights unavailable — ${activity.error}`);
       continue;
     }
+
+    // Marked only once the read SUCCEEDED. Marking on sight would let the first connection
+    // encountered claim the account even when its token is dead — and production has exactly
+    // that shape: one ad account is connected under a user record whose token lacks
+    // `ads_read` AND under another whose token works. Claiming it on the broken connection
+    // would hide the account from the working one and take it dark, which is strictly worse
+    // than the duplication being removed.
+    deps?.sweptAccountIds?.add(String(adAccountId));
 
     (activity.excludedObjectives || []).forEach((o) => excludedObjectives.add(o));
     (activity.unknownObjectives || []).forEach((o) => unknownObjectives.add(o));
