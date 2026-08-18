@@ -1113,8 +1113,12 @@ async function checkDestinationCoverage(
     if (verdict.unverifiable.length || inputs.urlsNotChecked.length) {
       console.log(
         `${TAG} ${adAccountId}: §G could not judge ${verdict.unverifiable.length} destination(s)` +
-        `${inputs.urlsNotChecked.length ? `, ${inputs.urlsNotChecked.length} past the cap` : ''} — ` +
-        verdict.unverifiable.map((u) => `${u.url} (${u.error})`).join('; '),
+        `${inputs.urlsNotChecked.length ? `, ${inputs.urlsNotChecked.length} past the cap` : ''}` +
+        // Only append the detail list when there IS one. The two halves of the condition are
+        // independent, so a cap-only case would otherwise log a trailing "— " with nothing after it.
+        `${verdict.unverifiable.length
+          ? ` — ${verdict.unverifiable.map((u) => `${u.url} (${u.error})`).join('; ')}`
+          : ''}`,
       );
     }
 

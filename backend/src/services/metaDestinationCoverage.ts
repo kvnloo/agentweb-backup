@@ -208,9 +208,11 @@ export function evaluateDestinationCoverage(
   for (const ad of Array.isArray(ads) ? ads : []) {
     if (!ad || typeof ad.adId !== 'string') continue;
 
+    const objectiveKnown = typeof ad.objective === 'string' && ad.objective.trim() !== '';
+
     // An engagement or traffic campaign is not trying to convert, so a page with no pixel is
     // correct rather than broken. Every pixel-less real account in the probe was exactly this.
-    if (!isConversionOptimisedObjective(ad.objective)) {
+    if (objectiveKnown && !isConversionOptimisedObjective(ad.objective)) {
       verdict.notApplicable.push({ adId: ad.adId, reason: 'non_conversion_objective' });
       continue;
     }
@@ -227,6 +229,19 @@ export function evaluateDestinationCoverage(
     }
 
     for (const url of urls) {
+      // An objective we never READ is our own incomplete data, not a customer configuration.
+      // `isConversionOptimisedObjective` answers `true` for an unknown name deliberately — for
+      // §F's blackout that bias is right, because silence is the failure to avoid. Here it is
+      // exactly backwards: judging an ad whose campaign Graph did not return would let OUR gap
+      // page a human, contradicting this module's rule that only a complete read may produce a
+      // finding. An unrecognised-but-PRESENT objective is still judged; only an absent one is
+      // withheld.
+      if (!objectiveKnown) {
+        verdict.unverifiable.push({
+          adId: ad.adId, url, error: 'campaign objective could not be read',
+        });
+        continue;
+      }
       if (!isCheckableDestination(url)) {
         verdict.notApplicable.push({ adId: ad.adId, url, reason: 'not_a_website' });
         continue;
@@ -433,17 +448,37 @@ export async function fetchDestinationInputs(
         });
       }
       url = typeof body.paging?.next === 'string' ? body.paging.next : '';
+      // Mirrors `fetchDailyAdAccountActivity`, which returns a fetch error rather than judging
+      // a truncated window. A short ad list silently drops findings, and a check reporting
+      // "nothing wrong" from half an account's ads is worse than one admitting it could not look.
+      if (url && page === MAX_AD_PAGES - 1) {
+        throw new Error(
+          `ads still paging after ${MAX_AD_PAGES} pages — refusing to judge a truncated ad list`,
+        );
+      }
     }
 
     // Losing this read is NOT survivable: with no owned pixels to compare against, every
     // destination becomes unjudgeable, and reporting that as "nothing found" would look
     // exactly like a healthy account.
-    const pixelBody = await readJson(
+    // PAGED, not a single limit=100 read. A partial owned-pixel list is the worst failure
+    // available here: a destination carrying pixel 101 finds no owned match and files a
+    // `foreign_pixel` alert that OUR truncation invented.
+    let pixelUrl: string =
       `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels` +
-      `?fields=id&limit=100&access_token=${encodeURIComponent(accessToken)}`,
-    );
-    for (const row of Array.isArray(pixelBody.data) ? pixelBody.data : []) {
-      if (row && typeof row === 'object' && row.id != null) ownedPixelIds.push(String(row.id));
+      `?fields=id&limit=100&access_token=${encodeURIComponent(accessToken)}`;
+    for (let page = 0; page < MAX_AD_PAGES && pixelUrl; page++) {
+      const pixelBody = await readJson(pixelUrl);
+      for (const row of Array.isArray(pixelBody.data) ? pixelBody.data : []) {
+        if (row && typeof row === 'object' && row.id != null) ownedPixelIds.push(String(row.id));
+      }
+      pixelUrl = typeof pixelBody.paging?.next === 'string' ? pixelBody.paging.next : '';
+      if (pixelUrl && page === MAX_AD_PAGES - 1) {
+        throw new Error(
+          `owned-pixel list still paging after ${MAX_AD_PAGES} pages — refusing to judge ` +
+          'destinations against a truncated set of owned pixels',
+        );
+      }
     }
 
     // The second signal. ONE call at `level=ad`, aggregated over the window rather than per
