@@ -774,6 +774,45 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
   });
 
+  it('NEGATION AUDIT #6: an uncertainty hedge ("not sure it failed") must not be read as a denial of failure', () => {
+    // Independent CodeRabbit review finding (ENG-1276): "not sure it failed" or
+    // "not certain there was an error" express UNCERTAINTY about whether a
+    // failure happened — fundamentally different from "not by failure" (a
+    // confident DENIAL). The tempered-greedy-token had no way to tell them
+    // apart: "not" immediately followed by "sure"/"certain" still reached the
+    // failure word within the 20-char span and got wrongly neutralized, which
+    // could accept a cadence response with NO tool calls as a clean skip even
+    // though the actual outcome is unresolved — the dangerous direction (an
+    // unknown/possibly-failed run reported as a successful skip). The one
+    // adversarial case already covered ("Not entirely sure why the deployment
+    // failed today") only happened to be blocked by the 20-char span cap
+    // (coincidence of word count, not an actual understanding of uncertainty
+    // vs. denial) — a shorter phrasing like "not sure it failed" slips through
+    // the cap and needs its own guard.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. Not sure it failed or not, will check next run.',
+      'Non-publishing day, skipped. Not certain there was an error, but flagging it.',
+      'Non-publishing day, skipped. Never sure if it failed given the ambiguous response.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // Must not regress any legitimate single-negation case from audits #1-#5 —
+    // none of them have "sure"/"certain"/"confident"/"convinced"/"clear"
+    // immediately after the cue.
+    [
+      'Non-publishing day, skipped. Not by failure.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Not a single failure occurred today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
