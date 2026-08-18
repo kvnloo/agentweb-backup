@@ -246,7 +246,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     expect(mockAlert).not.toHaveBeenCalled();
   });
 
-  it('uses the user-selected eligible backup after the optimization threshold', async () => {
+  it('honors the schedule model past the former optimization threshold (ENG-1211)', async () => {
     mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
       billingUserId: 'test-user-123',
       policy: {
@@ -269,20 +269,22 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
       llmBackupSource: 'user',
     } as any, 'test-user-123', false);
 
-    expect(stampedModel()).toBe('gpt-5-chat-2');
+    // ENG-1211: the schedule's own model now runs. A user backup is no longer
+    // substituted below the hard cap — that substitution is the deleted behavior.
+    expect(stampedModel()).toBe('anthropic.claude-opus-5');
     expect(stampedPolicyDecision()).toEqual(expect.objectContaining({
       requestedModel: 'anthropic.claude-opus-5',
-      effectiveModel: 'gpt-5-chat-2',
+      effectiveModel: 'anthropic.claude-opus-5',
       backupModel: 'gpt-5-chat-2',
       backupSource: 'user',
-      modelSelection: 'corrected',
-      modelSelectionReason: 'requested_model_blocked_using_user_backup',
+      modelSelection: 'honored',
+      modelSelectionReason: 'requested_model_allowed',
       usageMode: 'optimized',
       usagePolicyVersion: 'pro-v1',
       recordedAt: expect.any(String),
     }));
     expect(mockWorker.runInWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ llmModel: 'gpt-5-chat-2' }),
+      expect.objectContaining({ llmModel: 'anthropic.claude-opus-5' }),
       expect.any(Function),
     );
   });
@@ -304,7 +306,7 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
 });
 
 describe('getModelOptions — authoritative model discovery', () => {
-  it('returns only optimized models as selectable after the optimization threshold', async () => {
+  it('keeps every entitled model selectable past the former optimization threshold (ENG-1211)', async () => {
     mockAgentModeService.getSupportedModels.mockResolvedValue([
       'anthropic.claude-opus-5', 'gpt-5-chat-2',
     ] as any);
@@ -329,12 +331,108 @@ describe('getModelOptions — authoritative model discovery', () => {
       { json, status } as any,
     );
 
+    // ENG-1211 AC1: nothing below the hard cap hides a model, so the picker
+    // offers the full entitled set even on a legacy `optimized` usage state.
+    // scheduleBackupModels still exposes the cheap catalog for the legacy backup
+    // field and the ENG-1213 recommendation surface.
     expect(json).toHaveBeenCalledWith(expect.objectContaining({
       usageMode: 'optimized',
       canGenerate: true,
-      selectableModels: ['gpt-5-chat-2'],
+      selectableModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
       allModels: ['anthropic.claude-opus-5', 'gpt-5-chat-2'],
       scheduleBackupModels: ['gpt-5-chat-2'],
     }));
+  });
+});
+
+/**
+ * ENG-1211 — schedule backup resolution stops manufacturing dead artifacts.
+ *
+ * `resolveScheduleBackup` used to invent a system backup whenever the caller
+ * supplied none, stamping the optimized default plus
+ * `llmBackupNeedsConfirmation: true`. That is what put an unconfirmed
+ * `gemini-3.1-flash-lite` onto 177 production rows. With the optimized branch
+ * deleted nothing ever reads a backup, so continuing to invent one would keep
+ * generating dead data and polluting ENG-1209's inventory with rows nobody chose.
+ *
+ * It also used to REJECT a requested backup that was not in the optimized
+ * catalog. Restricting which models a user may choose below the hard cap is
+ * precisely the class of behavior AC1 removes.
+ */
+describe('resolveScheduleBackup via updateScheduledChat (ENG-1211)', () => {
+  const existing = {
+    scheduleId: 'sched-1',
+    userId: 'test-user-123',
+    taskId: 'global',
+    type: 'scheduled_chat',
+    status: 'active',
+    frequency: 'daily',
+    scheduleName: 'Daily digest',
+    startingMessage: 'go',
+    llmModel: 'anthropic.claude-opus-5',
+    emailNotifications: ['owner@example.com'],
+  };
+
+  const runUpdate = async (llmBackupModel: string | undefined) => {
+    const json = jest.fn();
+    const status = jest.fn(() => ({ json }));
+    await agentModeController.updateScheduledChat(
+      {
+        user: { userId: 'test-user-123', isAdmin: false },
+        params: { scheduleId: 'sched-1' },
+        body: { llmBackupModel, emailNotifications: ['owner@example.com'] },
+      } as any,
+      { json, status } as any,
+    );
+    return { json, status };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue(existing);
+    (scheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (agentModeService.getSupportedModels as jest.Mock).mockResolvedValue([
+      'anthropic.claude-opus-5',
+      'gemini-3.1-flash-lite',
+    ]);
+    (agentModeService.getScheduledChatsDefaultModel as jest.Mock)?.mockResolvedValue?.('anthropic.claude-opus-5');
+    mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+      billingUserId: 'test-user-123',
+      policy: {
+        version: 'pro-v1',
+        enforcementState: 'enforce',
+        optimizationCostThresholdMicroUsd: 80_000_000,
+        hardCostThresholdMicroUsd: 150_000_000,
+        optimizedModelIds: ['gemini-3.1-flash-lite'],
+        optimizedDefaultModel: 'gemini-3.1-flash-lite',
+      },
+      costUsedMicroUsd: 0,
+      tokenUsed: 0,
+      mode: { usageMode: 'full_choice', admissionAllowed: true, reason: 'hard_cap_only' },
+    } as any);
+  });
+
+  it('does not invent a system backup when none was requested', async () => {
+    const { json } = await runUpdate('');
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({
+      llmBackupModel: '',
+      llmBackupSource: null,
+      llmBackupNeedsConfirmation: false,
+    }));
+  });
+
+  it('accepts a premium backup that the old optimized catalog would have rejected', async () => {
+    const { json, status } = await runUpdate('anthropic.claude-opus-5');
+    expect(status).not.toHaveBeenCalledWith(400);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({
+      llmBackupModel: 'anthropic.claude-opus-5',
+      llmBackupSource: 'user',
+      llmBackupNeedsConfirmation: false,
+    }));
+  });
+
+  it('still rejects a model that is not in the supported registry', async () => {
+    const { status } = await runUpdate('not-a-real-model');
+    expect(status).toHaveBeenCalledWith(400);
   });
 });

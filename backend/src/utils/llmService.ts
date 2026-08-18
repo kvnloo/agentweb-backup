@@ -32,6 +32,20 @@ export type OnUsageCallback = (usage: LLMUsageData) => void;
  */
 export interface LLMUsageContext {
   userId?: string;
+  /**
+   * Who this spend is BILLED to, when the caller already knows (ENG-1217).
+   *
+   * Distinct from `userId`, which is who made the call and owns the ledger
+   * partition. For an org member the two differ, and recording the difference is
+   * what lets a later reader attribute a cycle correctly across a billing change
+   * instead of inferring it from today's membership. Purely descriptive: the
+   * enforced cap is deducted by `incrementUserTokenUsage`, which resolves the
+   * billing root itself, so setting this cannot move anyone's quota.
+   *
+   * Omitted means "unknown", and `recordUsage` falls back to `userId` exactly as
+   * it always has.
+   */
+  billingUserId?: string;
   feature?: string;
   sessionId?: string;
 }
@@ -179,6 +193,7 @@ export class LLMService {
     try {
       meterUserUsage({
         userId: usageContext?.userId,
+        billingUserId: usageContext?.billingUserId,
         sessionId: usageContext?.sessionId,
         model: usage.model,
         provider: this.provider,

@@ -42,6 +42,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -1585,8 +1586,10 @@ export class AgentModeService {
   // Model for the internal dedup judge (report_product_issues duplicate detection).
   // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
   // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
-  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
-  // model choice becomes gateway/routing config rather than provider-specific.
+  // configurable default model. ENG-9: this already becomes gateway/routing config
+  // for free — setting this to an `openrouter/<provider>/<model>` id routes through
+  // OpenRouter the same as any other prefix (see getClientForModel), no code change
+  // needed at this call site.
   async getDedupJudgeModel(): Promise<string> {
     return (
       (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
@@ -1792,6 +1795,8 @@ export class AgentModeService {
 
   private gemini_client: OpenAI | null = null;
   private gemini_client_promise: Promise<OpenAI> | null = null;
+  private openrouter_client: OpenAI | null = null;
+  private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
@@ -1864,6 +1869,51 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  // ENG-9: OpenRouter is an OpenAI-compatible endpoint, so it uses the exact same
+  // lazy-load/cache shape as getGeminiClient — no new abstraction, just another
+  // baseURL. HTTP-Referer/X-Title identify the app for OpenRouter's own analytics
+  // (openrouter.ai/docs/app-attribution); they carry no auth meaning.
+  public async getOpenRouterClient(): Promise<OpenAI> {
+    if (this.openrouter_client) {
+      return this.openrouter_client;
+    }
+    if (this.openrouter_client_promise) {
+      return this.openrouter_client_promise;
+    }
+
+    this.openrouter_client_promise = (async () => {
+      try {
+        let openRouterApiKey = process.env.OPENROUTER_API_KEY;
+
+        if (!openRouterApiKey) {
+          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          openRouterApiKey = await getSecret(`${environment}/AgentWeb/OpenRouter`);
+        }
+
+        if (!openRouterApiKey || !openRouterApiKey.trim()) {
+          throw new Error('OpenRouter API key is empty or not found in env/secrets');
+        }
+
+        this.openrouter_client = new OpenAI({
+          apiKey: openRouterApiKey.trim(),
+          baseURL: 'https://openrouter.ai/api/v1',
+          defaultHeaders: {
+            'HTTP-Referer': 'https://app.agentweb.pro',
+            'X-Title': 'AgentWeb',
+          },
+        });
+
+        return this.openrouter_client;
+      } catch (error) {
+        console.error('Error initializing OpenRouter client:', error);
+        this.openrouter_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.openrouter_client_promise;
   }
 
   /**
@@ -2100,6 +2150,12 @@ export class AgentModeService {
     }
     if (model.startsWith('claude-')) {
       return this.getVertexClient(model);
+    }
+    // ENG-9: openrouter/<provider>/<model> — the suffix after the prefix passes
+    // straight through as OpenRouter's own model id, so no per-model registry
+    // churn is needed to reach a new upstream model.
+    if (model.startsWith('openrouter/')) {
+      return this.getOpenRouterClient();
     }
     return this.getGeminiClient();
   }
@@ -2792,6 +2848,60 @@ export class AgentModeService {
     'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
+    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
+    // the suffix after the prefix passed straight through as OpenRouter's own model
+    // string, so a new upstream model is one registry line, not new routing code.
+    //
+    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
+    // (2026-08-17), not guessed:
+    // - supportsTemperature: true iff `supported_parameters` includes "temperature"
+    //   for that model (all entries below do).
+    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
+    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
+    //   endpoints APIs expose no numeric tool-call limit for any model (checked
+    //   both), so setting a number here would be a guess, not evidence. (The
+    //   128 previously on this line was exactly that guess, copied from the Azure
+    //   convention without verification — removed.)
+    // - supportsVision: deliberately OMITTED even where `architecture.modality`
+    //   reports image/video input — this codebase's own convention for the flag
+    //   (see LLMModelConfig.supportsVision above) requires empirical verification
+    //   against the real describe_image path, which none of these have had yet.
+    //   Metadata-only vision support is not the bar this flag uses elsewhere.
+    // - adminOnly: true on every new entry below (not this starter one, which was
+    //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
+    //   matching the existing convention for other non-default/experimental models
+    //   (e.g. anthropic.claude-opus-4-6-v1 above).
+    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true },
+    // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
+    // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
+    // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
+    // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
+    // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
+    // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
+    // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
+    // score; Meta shipped Llama 5 in April 2026, making this a full generation
+    // behind), llama-3.1-8b-instruct (older sibling of the same superseded
+    // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
+    // not a coding model — and its pricing tiers up sharply past 32K-token
+    // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+    // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
+    // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
+    // lab/family redundancy, not because it's the top pick in its tier.
+    // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
+    // reused from the third pass).
+    //
+    // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
+    // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
+    // live) — this is a real, currently-unfillable gap, not an oversight.
+    'openrouter/x-ai/grok-4.6': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-pro': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-flash': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.8-max': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-small-2603': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k3': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k2.7-code': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-5.2': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-4.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
@@ -3017,6 +3127,15 @@ export class AgentModeService {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
       }
+    } else if (model.startsWith('openrouter/')) {
+      // ENG-9: lazy-loaded and cached on the registry, same as Bedrock/Vertex —
+      // must be its own branch, not the azure-openai fallback below, since an
+      // openrouter/* entry is registered with client: null (see llmModels).
+      providerLabel = 'openrouter';
+      if (!client) {
+        client = await this.getOpenRouterClient();
+        this.llmModels[model].client = client;
+      }
     } else {
       providerLabel = 'azure-openai';
       if (!client) {
@@ -3068,6 +3187,16 @@ export class AgentModeService {
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
+              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
+              // present, not opt-in) — ground truth from the vendor that actually
+              // billed us, not a static per-token guess our own price table (which
+              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
+              // otherwise have to estimate. Omitted for every other provider, so
+              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              costUsdOverride:
+                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
             });
           }
         } catch {
@@ -3403,12 +3532,33 @@ export class AgentModeService {
 
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       const { userDb: userDbForAdmin } = await import('./db');
+      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+      // tokenUsageService pulls in the db -> aws config graph, and a static import
+      // here would drag it into every suite that mocks this module.
+      //
+      // Everything is swallowed to the acting user. Several legacy suites replace
+      // this module with a partial mock that defines only `incrementUserTokenUsage`,
+      // so the export can genuinely be missing — and beyond that, a descriptive
+      // ledger attribute must never be the reason a customer's response fails.
+      // `userId` is the value the row carried before this existed, so the
+      // degraded path is the old behaviour exactly.
+      const resolveBillingSubject = async (): Promise<string> => {
+        try {
+          const { resolveBillingUserId } = await import('./tokenUsageService');
+          if (typeof resolveBillingUserId !== 'function') return userId;
+          return (await resolveBillingUserId(userId)) || userId;
+        } catch (err) {
+          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+          return userId;
+        }
+      };
       let [
         currentSession,
         userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt,
-        currentUser
+        currentUser,
+        billingUserId
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
         getAllowedSkills(userId),
@@ -3417,7 +3567,18 @@ export class AgentModeService {
         userDbForAdmin.getUserById(userId).catch((err) => {
           console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
           return null;
-        })
+        }),
+        // ENG-1217: who this response's spend is BILLED to, resolved once and
+        // stamped on every ledger row it writes. The ledger has always carried a
+        // `billingUserId` attribute and this path has never filled it, so an org
+        // member's rows claimed they paid for themselves while
+        // `incrementUserTokenUsage` was charging the org root — the two stores
+        // disagreed, and a reader had nothing but today's membership to go on.
+        //
+        // Resolved here rather than inside `recordUsage` because it costs two
+        // reads: once per response is free alongside this fetch, once per LLM
+        // call would not be.
+        resolveBillingSubject()
       ]);
 
       // Log if user not found (indicates orphaned schedule or deleted user)
@@ -4117,7 +4278,11 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-1210 AC6: stamp scheduled-vs-interactive provenance at metering
+            // time. The ledger row is keyed `date#model#feature` and aggregates
+            // sessionId away, so `feature` is the only dimension that survives to
+            // answer "what is my scheduled work costing me".
+            usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn
           });
@@ -4193,7 +4358,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // Same provenance as the primary call this retries — a backup-model
+                // retry of a scheduled run is still scheduled spend.
+                usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
               }), synthesisRetryDeadlineMs);
@@ -11238,7 +11405,11 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} lead(s)`,
+        // ENG-1207: same contract as searchLeads — a truncated page must not be
+        // phrased as a total.
+        message: cursor
+          ? `Showing the first ${matchingLeads.length} lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} lead(s)`,
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
@@ -11536,7 +11707,16 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} matching lead(s)`,
+        // ENG-1207: only an exhausted scan may be phrased as a total. When the
+        // scan stopped at the caller's limit, say so — a bare "Found 20" reads
+        // as "there are 20", which is how a weak model concluded a 98-match
+        // filter had 20 hits, wrote 17 of them and reported the job complete
+        // (prod session d5898ffd). The true total is deliberately NOT stated:
+        // the scan breaks at the limit, so it was never counted and any "of N"
+        // here would be invented.
+        message: cursorOut
+          ? `Showing the first ${matchingLeads.length} matching lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} matching lead(s)`,
         leads: matchingLeads.map((entry) => {
           // Per-field provenance sidecar — lets the agent cite source, provider,
           // URL and confidence per field for list-wide queries (e.g. "funding
