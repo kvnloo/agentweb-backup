@@ -55,6 +55,7 @@ const destinations = (over: any = {}) => ({
   ownedPixelIds: ['910841031004192'],
   observations: {},
   urlsNotChecked: [],
+  attributedConversionsByAd: {},
   ...over,
 });
 
@@ -180,6 +181,44 @@ describe('§G destinations — when it must stay silent', () => {
 
     expect(summary.destinationAlerts).toBe(0);
     expect(summary.destinationOk).toBe(1);
+  });
+});
+
+describe('§G destinations — the second signal', () => {
+  it('does NOT page when the ad IS being credited with conversions', async () => {
+    // The client-side pixel-injection case, which is the main false-positive vector: our
+    // HTML read cannot see a pixel installed by JavaScript, but Meta crediting THIS ad with
+    // conversions is direct evidence the page reports. Direct evidence outranks inference.
+    deps.fetchDestinations.mockResolvedValue(destinations({
+      observations: {
+        'https://lander.test/lp': {
+          url: 'https://lander.test/lp', status: 'unmeasured', detectedPixelIds: [],
+        },
+      },
+      attributedConversionsByAd: { ad_1: 6 },
+    }));
+
+    const summary = await monitorUserTracking(metaUser(), deps);
+
+    expect(summary.destinationAlerts).toBe(0);
+    expect(summary.destinationUnconfirmed).toBe(1);
+    expect(alerts.filter((a) => a.context['Alert Class'] === DESTINATION_ALERT_CLASS)).toEqual([]);
+  });
+
+  it('still pages when the ad is credited with ZERO conversions', async () => {
+    deps.fetchDestinations.mockResolvedValue(destinations({
+      observations: {
+        'https://lander.test/lp': {
+          url: 'https://lander.test/lp', status: 'unmeasured', detectedPixelIds: [],
+        },
+      },
+      attributedConversionsByAd: { ad_1: 0 },
+    }));
+
+    const summary = await monitorUserTracking(metaUser(), deps);
+
+    expect(summary.destinationAlerts).toBe(1);
+    expect(summary.destinationUnconfirmed).toBe(0);
   });
 });
 

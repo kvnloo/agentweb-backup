@@ -11,6 +11,7 @@ import {
   fetchDestinationInputs,
   evaluateDestinationCoverage,
   DESTINATION_ADS_PAGE_SIZE,
+  DESTINATION_META_TIMEOUT_MS,
   MAX_DESTINATION_URLS_CHECKED,
 } from '../services/metaDestinationCoverage';
 
@@ -36,13 +37,16 @@ const ADS_PAGE = {
 const PIXELS_PAGE = { data: [{ id: '910841031004192' }] };
 
 /** A fetch stub that answers the ads edge, then the pixels edge, in call order. */
-const metaFetch = (adsPages: any[], pixels: any = PIXELS_PAGE) => {
+const metaFetch = (adsPages: any[], pixels: any = PIXELS_PAGE, insights: any = { data: [] }) => {
   let adsCalls = 0;
   const calls: string[] = [];
-  const impl = jest.fn(async (url: string) => {
+  const impl = jest.fn(async (url: string, init?: any) => {
     calls.push(url);
     if (url.includes('/adspixels')) {
       return { ok: true, status: 200, json: async () => pixels } as any;
+    }
+    if (url.includes('/insights')) {
+      return { ok: true, status: 200, json: async () => insights } as any;
     }
     const page = adsPages[Math.min(adsCalls++, adsPages.length - 1)];
     return { ok: true, status: 200, json: async () => page } as any;
@@ -207,7 +211,9 @@ describe('fetchDestinationInputs — defensive against what Meta actually return
   const inputsFor = async (adsBody: any, pixelsBody: any = PIXELS_PAGE) => {
     const impl = jest.fn(async (url: string) => ({
       ok: true, status: 200,
-      json: async () => (url.includes('/adspixels') ? pixelsBody : adsBody),
+      json: async () => (
+        url.includes('/adspixels') ? pixelsBody : url.includes('/insights') ? { data: [] } : adsBody
+      ),
     })) as any;
     return fetchDestinationInputs('123', 'tok', {
       fetchImpl: impl,
@@ -327,6 +333,140 @@ describe('fetchDestinationInputs — defensive against what Meta actually return
     } finally {
       (global as any).fetch = previous;
     }
+  });
+});
+
+
+describe('the second signal — attributed conversions per ad', () => {
+  it('reads conversions at level=ad, so its scope matches the accusation', async () => {
+    // Tier 1's first P1 was account-scoped evidence behind an ad-set-scoped claim, failing in
+    // BOTH directions. The claim here names one ad, so the evidence must too.
+    const { impl, calls } = metaFetch([ADS_PAGE]);
+    await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html('910841031004192'),
+    });
+    const insightsCall = calls.find((c) => c.includes('/insights'))!;
+    expect(insightsCall).toContain('level=ad');
+    expect(decodeURIComponent(insightsCall)).toContain('"since"');
+  });
+
+  it('sums conversions per ad across pages', async () => {
+    const insights = {
+      data: [
+        { ad_id: '111', actions: [{ action_type: 'offsite_conversion.fb_pixel_lead', value: '4' }] },
+        { ad_id: '222', actions: [] },
+        { ad_id: null, actions: [{ action_type: 'lead', value: '9' }] },
+      ],
+    };
+    const { impl } = metaFetch([ADS_PAGE], PIXELS_PAGE, insights);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html('910841031004192'),
+    });
+    expect(inputs.attributedConversionsByAd).toEqual({ '111': 4, '222': 0 });
+  });
+
+  it('a converting ad on a page that reads as uninstrumented does NOT alert', async () => {
+    // The client-side-injection case. Our HTML read is an inference; Meta crediting THIS ad
+    // with conversions is direct evidence, and direct evidence wins.
+    const insights = {
+      data: [{ ad_id: '111', actions: [{ action_type: 'offsite_conversion.fb_pixel_lead', value: '3' }] }],
+    };
+    const { impl } = metaFetch([ADS_PAGE], PIXELS_PAGE, insights);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html(),
+    });
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+    expect(verdict.alerting).toEqual([]);
+    expect(verdict.unconfirmed).toEqual([
+      expect.objectContaining({ adId: '111', reason: 'no_pixel' }),
+    ]);
+  });
+
+  it('a NON-converting ad on the same page still alerts', async () => {
+    const insights = { data: [{ ad_id: '111', actions: [] }] };
+    const { impl } = metaFetch([ADS_PAGE], PIXELS_PAGE, insights);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html(),
+    });
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+    expect(verdict.alerting).toEqual([
+      expect.objectContaining({ adId: '111', reason: 'no_pixel' }),
+    ]);
+  });
+
+  it('suppresses a FOREIGN-pixel finding on the same evidence', async () => {
+    const insights = { data: [{ ad_id: '111', actions: [{ action_type: 'lead', value: '2' }] }] };
+    const { impl } = metaFetch([ADS_PAGE], PIXELS_PAGE, insights);
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html('999999999999999'),
+    });
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd);
+    expect(verdict.alerting).toEqual([]);
+    expect(verdict.unconfirmed).toHaveLength(1);
+  });
+
+  it('tolerates a non-object conversions map', async () => {
+    const verdict = evaluateDestinationCoverage(
+      [{ adId: 'a', objective: 'OUTCOME_LEADS', destinationUrls: ['https://x.test/lp'] }],
+      { 'https://x.test/lp': { url: 'https://x.test/lp', status: 'unmeasured', detectedPixelIds: [] } },
+      ['910841031004192'],
+      'nope' as any,
+    );
+    expect(verdict.alerting).toHaveLength(1);
+  });
+
+  it('pages the insights edge, and tolerates a non-array data field', async () => {
+    const firstPage = {
+      data: [{ ad_id: '111', actions: [{ action_type: 'lead', value: '2' }] }],
+      paging: { next: 'https://graph.facebook.com/v25.0/act_123/insights?after=CUR' },
+    };
+    let insightsCalls = 0;
+    const impl = jest.fn(async (url: string) => {
+      if (url.includes('/adspixels')) return { ok: true, status: 200, json: async () => PIXELS_PAGE } as any;
+      if (url.includes('/insights')) {
+        const body = insightsCalls++ === 0 ? firstPage : { data: null };
+        return { ok: true, status: 200, json: async () => body } as any;
+      }
+      return { ok: true, status: 200, json: async () => ADS_PAGE } as any;
+    }) as any;
+
+    const inputs = await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl, fetchHtml: async () => html('910841031004192'),
+    });
+
+    expect(insightsCalls).toBe(2);
+    expect(inputs.attributedConversionsByAd).toEqual({ '111': 2 });
+  });
+
+  it('NO second signal cannot suppress anything', async () => {
+    // "We could not read the conversions" must never read as "there were none", nor as
+    // "everything is fine". Absent evidence suppresses nothing.
+    const verdict = evaluateDestinationCoverage(
+      [{ adId: 'a', objective: 'OUTCOME_LEADS', destinationUrls: ['https://x.test/lp'] }],
+      { 'https://x.test/lp': { url: 'https://x.test/lp', status: 'unmeasured', detectedPixelIds: [] } },
+      ['910841031004192'],
+      {},
+    );
+    expect(verdict.alerting).toHaveLength(1);
+    expect(verdict.unconfirmed).toEqual([]);
+  });
+});
+
+describe('Meta reads are bounded', () => {
+  it('applies an abort deadline to every Graph call', async () => {
+    // These are awaited inside a loop over every account: one hung connection would stall the
+    // whole daily sweep, which shows up in the logs as "the cron did not run".
+    const { impl } = metaFetch([ADS_PAGE]);
+    await fetchDestinationInputs('123', 'tok', {
+      fetchImpl: impl as any, fetchHtml: async () => html('910841031004192'),
+    });
+    for (const call of (impl as jest.Mock).mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+    expect(DESTINATION_META_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
   });
 });
 
