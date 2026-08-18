@@ -363,6 +363,64 @@ describe('AgentModeService - install_skills onboarding tool-gate during loops (E
     expect(toolNamesPassedToLLM(callLLMSpy)).toContain('install_skills');
   });
 
+  // ENG-1310 AC3: "the loop-breaker never removes read/verification tools." The old
+  // directive told the model it may ONLY call read_brand_guidelines/read_market_strategy
+  // while a repetition loop is active — so a user repeating "DON'T GUESS, VERIFY" three
+  // times got a directive that actively forbade the GA4/HubSpot/Ads read it was demanding.
+  // Tools were never stripped at the code level (only install_skills is), so the fix is
+  // in the directive text: it must never tell the model verification tools are off-limits.
+  it('keeps verification/data-source tools available and permitted when the loop-breaker fires on a "don\'t guess" message', async () => {
+    mockDeps();
+    const VERIFICATION_TOOLS = [
+      { type: 'function', function: { name: 'install_skills' } },
+      { type: 'function', function: { name: 'read_brand_guidelines' } },
+      { type: 'function', function: { name: 'read_market_strategy' } },
+      { type: 'function', function: { name: 'get_website_analytics' } },
+      { type: 'function', function: { name: 'get_seo_metrics' } },
+    ];
+    jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(VERIFICATION_TOOLS);
+    const callLLMSpy = jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValue(makeLLMResponse());
+
+    const repeated = "DON'T GUESS. VERIFY the numbers before you answer.";
+    const sessionHistory = [
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Here is an estimate...' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Here is an estimate...' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Here is an estimate...' },
+    ];
+
+    await agentModeService.generateMarketingResponse(
+      repeated,
+      sessionHistory as any,
+      'test-user',
+      agentModeService.default_model,
+      'test-session'
+    );
+
+    const opts = callLLMSpy.mock.calls[0][2] as any;
+    const toolNames = (opts?.tools ?? []).map((t: any) => t.function?.name);
+    // The verification tool is NEVER removed from the tool list by the loop-breaker.
+    expect(toolNames).toContain('get_website_analytics');
+    expect(toolNames).toContain('get_seo_metrics');
+    // install_skills is still the one thing the loop-breaker gates.
+    expect(toolNames).not.toContain('install_skills');
+
+    const messagesArg = callLLMSpy.mock.calls[0][1] as any[];
+    const antiLoopMsg = messagesArg.find(
+      (m: any) => typeof m.content === 'string' && m.content.includes('ANTI-LOOP')
+    );
+    expect(antiLoopMsg).toBeDefined();
+    // The directive must not restrict the model to ONLY the two foundation tools —
+    // that was the exact bug: it explicitly permits ANY read-only/verification tool.
+    expect(antiLoopMsg.content).not.toMatch(/you may only call the read-only context tools/i);
+    expect(antiLoopMsg.content.toLowerCase()).toContain('any read-only or verification tool');
+    expect(antiLoopMsg.content.toLowerCase()).toContain('never restricted by this directive');
+  });
+
   it('does NOT strip install_skills for a normal (non-looping) onboarding turn', async () => {
     mockDeps();
     jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(TOOLS);

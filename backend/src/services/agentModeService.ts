@@ -3542,8 +3542,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3563,7 +3566,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );
@@ -3692,7 +3695,7 @@ export class AgentModeService {
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
 3. If that context is enough to complete the task, do so using it.
 4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
 5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
@@ -6269,6 +6272,22 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
+    // can raise it (`linkedin_outreach` search-people/search-parameters and the
+    // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
+    // this method, which erased the only machine-readable evidence that a run
+    // sourced zero prospects because LinkedIn search was DOWN for the account
+    // rather than because nobody matched. The scheduled-run recorder reads it back
+    // off the tool ledger (detectRunBlockedReason) to record the run as blocked
+    // instead of as a clean success the owner reads as "no one matched".
+    //
+    // Deliberately keyed on the flag, not the tool name, so it survives wherever
+    // the guard is raised. The marker is stamped ONLY after the broad control
+    // query has confirmed the outage, so it can never fire on an honest empty.
+    if (result && result.searchUnavailable === true) {
+      return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -23990,7 +24009,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
