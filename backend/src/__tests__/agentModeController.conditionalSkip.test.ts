@@ -760,6 +760,18 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
       'Non-publishing day, skipped. Without, admittedly, any failure occurring, the run completed cleanly.',
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // The guard's own "not" must be REQUIRED, not optional — self-caught on a
+    // fresh re-audit before shipping. An earlier version of the pattern used
+    // (?:not\s+)? (optional), so a plain, non-negated "it is true that there
+    // was no failure" ALSO matched the meta-negation shape and wrongly
+    // suppressed neutralization for a legitimate, single-negation denial —
+    // over-cautious (still vetoes when it could safely waive), the safe
+    // direction, but still a real behavior change from what audits #1-#4 in
+    // the same file establish as correct.
+    [
+      'Non-publishing day, skipped. It is true that there was no failure today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
   });
 
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
