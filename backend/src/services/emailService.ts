@@ -1073,13 +1073,23 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
        * copy promises, and the reason this cannot reuse the generic run-failed email.
        */
       pausedScheduleName?: string;
+      /**
+       * How many scheduled RUNS were skipped before the pause — a different unit from
+       * `daysDisconnected`, and the one the pause copy actually means. Conflating them
+       * mis-stated the elapsed time by whatever the schedule's cadence happened to be.
+       */
+      skippedRunCount?: number;
     }
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const safeName = this.escapeHtml(opts.accountName);
+      // Name the zone. Without it this renders in the server's zone with no label, so
+      // "Aug 17, 2026, 12:00 PM" tells the customer nothing they can act on.
+      // sendScheduledChatVariableRequestEmail already does this for the same reason.
       const when = new Date(opts.disconnectedAt).toLocaleString('en-US', {
         year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        timeZoneName: 'short',
       });
       const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
       const headline = opts.pausedScheduleName
@@ -1094,9 +1104,10 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
       const settingsUrl = `${customerFrontendUrl}/settings/accounts`;
       // A paused schedule needs BOTH actions, and saying only "reconnect" would
       // leave it stopped indefinitely.
+      const skippedRuns = opts.skippedRunCount ?? opts.daysDisconnected;
       const resumeHtml = opts.pausedScheduleName
         ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong> has been paused after
-             ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'} of skipped runs.
+             ${skippedRuns} skipped run${skippedRuns === 1 ? '' : 's'}.
              Reconnecting is not enough on its own — once the account is back, switch the schedule
              back on from your schedules page.</p>`
         : `<p style="line-height: 1.6;">
@@ -1162,7 +1173,7 @@ What has stopped:
 - Reading how many invitations are still pending
 
 ${opts.pausedScheduleName
-  ? `"${opts.pausedScheduleName}" has been paused after ${opts.daysDisconnected} day(s) of skipped runs. Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
+  ? `"${opts.pausedScheduleName}" has been paused after ${skippedRuns} skipped run(s). Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
   : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
 
 ---
