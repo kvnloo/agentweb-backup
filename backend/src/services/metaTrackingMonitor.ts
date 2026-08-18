@@ -571,6 +571,10 @@ export const TOKEN_ALERT_CLASS = 'meta-token-invalid';
  *  converts nothing", this says "this account converts, but not the thing it is paying for".
  *  Haven was healthy by the first measure throughout the outage. */
 export const OPTIMISATION_ALERT_CLASS = 'meta-optimisation-event-missing';
+/** §G destination coverage. A THIRD class, distinct from both above: those two ask whether a
+ *  conversion arrived, this asks whether the page could ever have sent one. An account can be
+ *  perfectly healthy on both other measures while one ad points at an uninstrumented lander. */
+export const DESTINATION_ALERT_CLASS = 'meta-destination-unmeasured';
 /** Mirrors OPTIMISATION_RECENCY_DAYS for the log line, without importing the module at
  *  top level — this file only pulls metaOptimisationCoverage in lazily. */
 const OPTIMISATION_RECENCY_DAYS_LABEL = 2;
@@ -626,6 +630,10 @@ export interface MonitorDeps {
     adAccountId: string,
     accessToken: string,
   ) => Promise<import('./metaOptimisationCoverage').OptimisationInputs>;
+  fetchDestinations?: (
+    adAccountId: string,
+    accessToken: string,
+  ) => Promise<import('./metaDestinationCoverage').DestinationInputs>;
 }
 
 export interface MonitorSummary {
@@ -659,6 +667,20 @@ export interface MonitorSummary {
   /** No obtainable evidence: no pixel on the promoted object, or an optimisation §F cannot
    *  count. Logged only, and never allowed to look like a clean pass. */
   optimisationUnconfirmable: number;
+  /** §G destinations — ACTIVE, conversion-optimised ads whose landing page carries no pixel,
+   *  or carries one this ad account does not own. The only destination state that alerts. */
+  destinationAlerts: number;
+  /** Destinations that could not be read (403, timeout, non-2xx) or could not be compared
+   *  (account owns no pixels). Logged only: a site that blocks our fetch is not a defect. */
+  destinationUnverifiable: number;
+  /** Ad+destination pairs confirmed carrying a pixel the account owns. Reported so a sweep
+   *  that checked NOTHING is distinguishable from one that checked everything and found it
+   *  healthy — those look identical in an alert count alone. */
+  destinationOk: number;
+  /** The page read as uninstrumented, but Meta is attributing conversions to that exact ad,
+   *  so something IS reporting. Logged, never paged: our HTML read is an inference and
+   *  Meta's attribution is direct evidence. Usually a client-side pixel injection. */
+  destinationUnconfirmed: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -686,6 +708,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     optimisationUnconfirmed: 0,
     optimisationUnconfirmable: 0,
     optimisationStaleDelivery: 0,
+    destinationAlerts: 0,
+    destinationUnverifiable: 0,
+    destinationOk: 0,
+    destinationUnconfirmed: 0,
   };
 
   const fetchActivity =
@@ -769,6 +795,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
     await checkOptimisationCoverage(
+      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+    );
+
+    // Also before the blackout early returns, and for the same reason as Tier 1: an account
+    // whose OTHER landers convert fine is `ok` by the blackout measure while one ad quietly
+    // sends paid traffic to a page that cannot report anything. Gating this behind a blackout
+    // verdict would hide exactly the case it exists to find.
+    await checkDestinationCoverage(
       adAccountId, accessToken, user, summary, alertTransport, now, deps,
     );
 
@@ -1026,5 +1060,118 @@ async function checkOptimisationCoverage(
     // §G is an ADDITION to an existing sweep. Nothing it can do is worth aborting the
     // blackout check that was already working.
     console.warn(`${TAG} ${adAccountId}: §G optimisation check failed — ${error?.message}`);
+  }
+}
+
+/**
+ * §G destination coverage — is an ACTIVE ad paying to send traffic to a page that cannot
+ * measure it, or to one wired to somebody else's pixel?
+ *
+ * ENG-941 asks this once at launch. The card says that is not enough: a pixel that breaks in
+ * week three, or a lander swapped after approval, is invisible to a launch-time gate.
+ */
+async function checkDestinationCoverage(
+  adAccountId: string,
+  accessToken: string,
+  user: any,
+  summary: MonitorSummary,
+  alertTransport: AlertTransport,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const {
+      fetchDestinationInputs, evaluateDestinationCoverage,
+    } = await import('./metaDestinationCoverage');
+
+    const fetchDestinations =
+      deps?.fetchDestinations ?? ((id: string, token: string) => fetchDestinationInputs(id, token));
+    const inputs = await fetchDestinations(adAccountId, accessToken);
+    if (inputs.status !== 'ok') {
+      // Transient by definition — the same call §F makes on every other read failure.
+      console.warn(`${TAG} ${adAccountId}: destinations unavailable for §G — ${inputs.error}`);
+      return;
+    }
+
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd,
+    );
+
+    summary.destinationOk += verdict.okCount;
+    summary.destinationUnverifiable += verdict.unverifiable.length;
+    summary.destinationUnconfirmed += verdict.unconfirmed.length;
+
+    if (verdict.unconfirmed.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.unconfirmed.length} destination(s) read as ` +
+        `uninstrumented but their ads ARE being credited with conversions — most likely a ` +
+        `client-side pixel our HTML read cannot see, not alerting: ` +
+        verdict.unconfirmed.map((f) => `"${f.adName || f.adId}" -> ${f.url}`).join('; '),
+      );
+    }
+
+    if (verdict.unverifiable.length || inputs.urlsNotChecked.length) {
+      console.log(
+        `${TAG} ${adAccountId}: §G could not judge ${verdict.unverifiable.length} destination(s)` +
+        `${inputs.urlsNotChecked.length ? `, ${inputs.urlsNotChecked.length} past the cap` : ''}` +
+        // Only append the detail list when there IS one. The two halves of the condition are
+        // independent, so a cap-only case would otherwise log a trailing "— " with nothing after it.
+        `${verdict.unverifiable.length
+          ? ` — ${verdict.unverifiable.map((u) => `${u.url} (${u.error})`).join('; ')}`
+          : ''}`,
+      );
+    }
+
+    if (!verdict.alerting.length) return;
+    summary.destinationAlerts += verdict.alerting.length;
+
+    const describe = (f: { adName?: string; adId: string; url: string; reason: string; detectedPixelIds: string[] }) =>
+      `"${f.adName || f.adId}" → ${f.url} — ` +
+      (f.reason === 'no_pixel'
+        ? 'no Meta pixel in the served page'
+        : `pixel ${f.detectedPixelIds.join(', ')}, which this ad account does not own`);
+
+    const foreign = verdict.alerting.filter((f) => f.reason === 'foreign_pixel');
+
+    await raise(
+      alertTransport,
+      // One alert per ACCOUNT per day. Several ads on one bad lander are one fault with one
+      // fix, and filing each separately is how a detector becomes a flood.
+      `${DESTINATION_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} is paying for traffic to ${verdict.alerting.length} destination(s) that cannot report conversions`,
+      [
+        `${verdict.alerting.length} ACTIVE, conversion-optimised ad(s) on ad account ${adAccountId}`,
+        'send paid traffic to a page that cannot report a conversion back to this account:',
+        '',
+        ...verdict.alerting.map((f) => `  • ${describe(f)}`),
+        '',
+        'This is the failure that cost RankAI ~$5,202 and the account: spend left, clicks',
+        'arrived, and the conversion column stayed empty for a reason nothing reported.',
+        foreign.length
+          ? 'At least one page IS instrumented — with a pixel this account does not own, so the\n' +
+            'conversions are being reported to somebody else. A "is there any tracking?" check\n' +
+            'passes this, which is why ownership is the test.'
+          : 'Every page named above served no Meta pixel at all.',
+        '',
+        'Checked by reading the page HTML this account\'s ads actually point at. A page that',
+        'installs its pixel only via client-side JavaScript can read as uninstrumented here —',
+        'confirm in a browser before changing a campaign.',
+      ].join('\n'),
+      {
+        'Alert Class': DESTINATION_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Destinations Affected': verdict.alerting.length,
+        'Reasons': [...new Set(verdict.alerting.map((f) => f.reason))].join(', '),
+        'Account Pixels': inputs.ownedPixelIds.join(', ') || 'none',
+        'Ads Manager': `https://business.facebook.com/adsmanager/manage/ads?act=${adAccountId}`,
+      },
+    );
+  } catch (error: any) {
+    // Same containment as Tier 1: this is an addition to a sweep that already works.
+    console.warn(`${TAG} ${adAccountId}: §G destination check failed — ${error?.message}`);
   }
 }
