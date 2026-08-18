@@ -612,8 +612,21 @@ export class ImageService {
           fullError: apiError
         });
         
+        // Prefer the real provider error body over Axios's own .message, which
+        // is just the generic "Request failed with status code NNN" — the
+        // actual detail (e.g. "You exceeded your current quota..." for hard
+        // quota exhaustion vs. "...exceeded call rate limit..." for transient
+        // throttling, both surfaced as the same HTTP 429) lives on
+        // response.data.error.message and was never read here. Without it,
+        // both cases produce an IDENTICAL generic message and the gateway's
+        // tool-error classifier (ENG-1220's quota_exceeded class) can never
+        // tell them apart, so a permanently-exhausted account gets exempted
+        // from the session-wide retry budget the same as a transient 429.
+        const providerDetail = apiError?.response?.data?.error?.message;
+        const errorDetail = providerDetail || apiError.message || apiError.error || 'Unknown error';
+
         // Re-throw the error with more context
-        throw new Error(`${modelToUse} API failed: ${apiError.message || apiError.error || 'Unknown error'}`);
+        throw new Error(`${modelToUse} API failed: ${errorDetail}`);
       }
     } catch (error: any) {
       console.error("Error generating image:", error);

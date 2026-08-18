@@ -31,6 +31,8 @@ const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
+const mockResolveAccountIdWithSource = jest.fn();
+const mockListUserOwnedUnipileAccountIds = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
@@ -46,6 +48,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
+    listUserOwnedUnipileAccountIds: (...args: any[]) => mockListUserOwnedUnipileAccountIds(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
@@ -131,6 +135,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // Default: the account CAN search, so a zero-result search is a real
     // no-match and the ENG-975 guard stays out of the way.
     mockProbeSearchCapability.mockResolvedValue('ok');
+    // Default: an explicitly-passed account_id is the user's own (ENG-1198
+    // usedSharedAccount determination for read actions).
+    mockListUserOwnedUnipileAccountIds.mockResolvedValue(['test-account-id']);
     // ENG-1026 Greptile P1 ("agent-tool authorization gap"): send-message's
     // CRM-linked checks (sync gate, duplicate check, identity check) now
     // require list access before reading a lead. Every test in this file
@@ -800,7 +807,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('reports the unconnected-account error, not the disconnect error, when no account exists', async () => {
-      mockResolveAccountId.mockResolvedValue(null);
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: null, usedSharedAccount: false });
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'search-people',
@@ -1113,6 +1120,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         ],
         fromCache: true,
         source: 'cache',
+        usedSharedAccount: false,
       });
     });
 
@@ -1180,7 +1188,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('falls back to site-wide account_id when none is provided', async () => {
-      mockResolveAccountId.mockResolvedValue('site-wide-account');
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'site-wide-account', usedSharedAccount: true });
       mockResolve.mockResolvedValue({ candidates: [], fromCache: false, source: 'api' });
 
       const result = await service.linkedinOutreach('user-1', {
@@ -1189,7 +1197,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         keywords: 'Acme',
       });
 
-      expect(mockResolveAccountId).toHaveBeenCalledWith('user-1');
+      expect(mockResolveAccountIdWithSource).toHaveBeenCalledWith('user-1');
       expect(mockResolve).toHaveBeenCalledWith('site-wide-account', expect.any(Object));
       expect(result.success).toBe(true);
     });

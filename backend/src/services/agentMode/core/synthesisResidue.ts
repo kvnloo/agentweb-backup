@@ -16,6 +16,9 @@
  *     ledger, so a synthesis failure can never erase the record of what ran.
  */
 
+import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from './termination';
+import { buildTurnTimeBudgetNudge } from '../../../utils/turnTimeBudget';
+
 /**
  * Residue is short by nature — it is the tail of a structure the model failed to
  * finish emitting. Anything longer is far likelier to be real (if odd) output, so
@@ -43,6 +46,95 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
  * its opening marker instead.
  */
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
+
+/**
+ * ENG-1188: a gemini-3.1-pro-preview work-plan session generated and
+ * screenshot-verified the corrected assets, then closed with the model echoing the
+ * injected synthesis nudge back verbatim — 3 repeats in 744 chars — instead of
+ * writing the delivery message. Non-empty and only 744 chars, it is far under
+ * `isDegenerateRepetition`'s 1000-char/300-word floor (built for a much larger
+ * collapse) and does not start with the history-echo marker above, so it slipped
+ * past every existing check and shipped straight to the user.
+ *
+ * Two or more verbatim copies of a nudge WE injected is never a real answer — a
+ * turn that merely quotes it once (e.g. explaining what the system told it) is
+ * left alone; only actual repetition trips this.
+ *
+ * `isUnusableSynthesis` is the loop's ONE choke point for terminating content
+ * (agentModeService.ts calls it exactly once, on whatever is about to ship), so
+ * every string the loop pushes as a "respond again" nudge belongs in this list —
+ * not just SYNTHESIS_NUDGE. CONTINUE_PROMPT (max_tokens continuation) and
+ * ANTI_LOOP_STOP_MESSAGE (repeated-identical-tool-calls warning) are injected by
+ * the exact same "push a system message, let the model respond again" mechanism,
+ * so a collapse that echoes either of THOSE back is just as real a failure and was,
+ * before this, just as unguarded.
+ */
+const INJECTED_NUDGES = [SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE];
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count++;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+/**
+ * ENG-907's wall-clock nudges (`buildTurnTimeBudgetNudge`, `turnTimeBudget.ts`) are
+ * injected by this exact same mechanism, but each embeds a live remaining-seconds
+ * count, so no two injections are byte-identical — the plain-string check above can
+ * never match one. Rather than hand-copy the wording into a second, driftable
+ * constant, generate a sample with a sentinel duration and turn IT into a pattern:
+ * escape the sample for regex use, then widen the sentinel's digits back into
+ * `\d+`. If the wording in turnTimeBudget.ts ever changes, this pattern changes
+ * with it automatically.
+ */
+const TIME_BUDGET_SENTINEL_SECONDS = 918273;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildTimeBudgetNudgePattern(kind: 'wrap_up' | 'final_synthesis'): RegExp {
+  const sample = buildTurnTimeBudgetNudge(
+    { phase: kind, elapsedMs: 0, remainingMs: TIME_BUDGET_SENTINEL_SECONDS * 1000, reserveMs: 0 },
+    kind,
+  );
+  const source = escapeRegExp(sample).replace(String(TIME_BUDGET_SENTINEL_SECONDS), '\\d+');
+  return new RegExp(source);
+}
+
+const TIME_BUDGET_NUDGE_PATTERNS = [
+  buildTimeBudgetNudgePattern('wrap_up'),
+  buildTimeBudgetNudgePattern('final_synthesis'),
+];
+
+/** Count non-overlapping matches of an anchorless pattern within `haystack`. */
+function countPatternOccurrences(haystack: string, pattern: RegExp): number {
+  const matches = haystack.match(new RegExp(pattern.source, 'g'));
+  return matches ? matches.length : 0;
+}
+
+/**
+ * True when `trimmed` is mostly one of our own injected nudges, echoed back. An
+ * exact match — the entire turn is one bare copy of a nudge — is non-empty, so it
+ * never re-triggers the retry ladder that injected it in the first place, and it
+ * ships as a real final answer unless caught here alongside the 2+-repeat case.
+ */
+function isNudgeEcho(trimmed: string): boolean {
+  if (
+    INJECTED_NUDGES.some((nudge) => trimmed === nudge || countOccurrences(trimmed, nudge) >= 2)
+  ) {
+    return true;
+  }
+  return TIME_BUDGET_NUDGE_PATTERNS.some((pattern) => {
+    const anchored = new RegExp(`^${pattern.source}$`);
+    return anchored.test(trimmed) || countPatternOccurrences(trimmed, pattern) >= 2;
+  });
+}
 
 /**
  * Degenerate-repetition thresholds. A model that collapses into a repetition loop
@@ -81,9 +173,10 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Both checked before the length cap: a history echo and a repetition collapse
-  // are long by nature.
+  // Checked before the length cap: a history echo, a nudge echo, and a repetition
+  // collapse are all either long by nature or an intentionally short exact-match.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
+  if (isNudgeEcho(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   if (!STRUCTURAL_ONLY.test(trimmed)) return false;
@@ -152,21 +245,53 @@ function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
 
+/**
+ * ENG-1188 root-cause fix recommendation #2: a ledger of tool NAMES and counts
+ * told the user work happened, but not how to get it — "save_file — 1 succeeded"
+ * is not a deliverable. `extractMinimalToolResult` (agentModeService.ts) already
+ * preserves the URL on every asset-producing tool's result — save_file ->
+ * file_url, create_html_file/create_html_from_template -> s3_url, generate_image
+ * -> imageUrl, playwright_browser_take_screenshot -> screenshotUrl, generate_video
+ * -> videoUrl, generate_voiceover -> audioUrl — so it is already sitting in the
+ * ledger this module reads; nothing here ever looked at it.
+ */
+const ASSET_URL_FIELDS = ['file_url', 's3_url', 'imageUrl', 'screenshotUrl', 'videoUrl', 'audioUrl'] as const;
+
+/** The URL on a succeeded call's result, checking every known asset field. */
+function extractAssetUrl(call: ExecutedToolCall): string | null {
+  const result = call.result as Record<string, unknown> | null | undefined;
+  if (!result || typeof result !== 'object') return null;
+  for (const field of ASSET_URL_FIELDS) {
+    const value = result[field];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
+}
+
 /** Tally the ledger into per-tool outcome counts, ignoring collapsed duplicates. */
 function tallyExecutedActions(
   toolCalls: ExecutedToolCall[],
-): Map<string, { ok: number; failed: number; deferred: number }> {
-  const counts = new Map<string, { ok: number; failed: number; deferred: number }>();
+): Map<string, { ok: number; failed: number; deferred: number; urls: string[] }> {
+  const counts = new Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>();
   for (const call of toolCalls || []) {
     const name = call && typeof call.name === 'string' ? call.name.trim() : '';
     if (!name) continue;
     // A collapsed duplicate never ran: the call it points at did, and is counted
     // separately. Including it would report the same action twice.
     if (call.duplicateOf !== undefined && call.duplicateOf !== null) continue;
-    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0 };
-    if ('error' in call || isReportedFailure(call)) entry.failed++;
-    else if (isDeferred(call)) entry.deferred++;
-    else entry.ok++;
+    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0, urls: [] };
+    if ('error' in call || isReportedFailure(call)) {
+      entry.failed++;
+    } else if (isDeferred(call)) {
+      entry.deferred++;
+    } else {
+      entry.ok++;
+      // Only a succeeded call's URL is a real, fetchable asset — a failed call can
+      // still carry a stale/partial URL field in its error payload, and reporting
+      // that would hand the user a link to something that was never produced.
+      const url = extractAssetUrl(call);
+      if (url && !entry.urls.includes(url)) entry.urls.push(url);
+    }
     counts.set(name, entry);
   }
   return counts;
@@ -183,17 +308,18 @@ function tallyExecutedActions(
 const COUNT_BASIS_NOTE =
   '(Counts are tool calls, not the number of records created or changed.)';
 
-/** Render the `- tool — n succeeded, n failed` lines for a tally. */
+/** Render the `- tool — n succeeded, n failed` lines (plus asset URLs) for a tally. */
 function renderLedgerLines(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
 ): string {
   const lines: string[] = [];
-  for (const [name, { ok, failed, deferred }] of counts) {
+  for (const [name, { ok, failed, deferred, urls }] of counts) {
     const parts: string[] = [];
     if (ok > 0) parts.push(`${ok} succeeded`);
     if (failed > 0) parts.push(`${failed} failed`);
     if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
     lines.push(`- ${name} — ${parts.join(', ')}`);
+    for (const url of urls) lines.push(`  ${url}`);
   }
   return lines.join('\n');
 }
@@ -236,7 +362,7 @@ export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): strin
 
 /** True when any tool in the tally has at least one call in `bucket`. */
 function countsInclude(
-  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  counts: Map<string, { ok: number; failed: number; deferred: number; urls: string[] }>,
   bucket: 'ok' | 'failed' | 'deferred',
 ): boolean {
   for (const entry of counts.values()) if (entry[bucket] > 0) return true;
