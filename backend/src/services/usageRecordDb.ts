@@ -82,8 +82,14 @@ export interface UsageRecordIncrement {
   calls?: number;
 }
 
-/** Provenance of a cost figure — see `UsageRecordIncrement.costSource`. */
-export type CostSource = "measured" | "allocated";
+/**
+ * Provenance of a cost figure — see `UsageRecordIncrement.costSource`.
+ * ENG-700: "unpriced" marks a row whose `costMicroUsd` is 0 because the model
+ * has no price entry (never because the model is genuinely free) — distinct
+ * from "allocated", which means 0 or more real dollars were computed from a
+ * known rate.
+ */
+export type CostSource = "measured" | "allocated" | "unpriced";
 
 export interface UsageRecordRow {
   userId: string;
@@ -248,13 +254,28 @@ function buildIncrementUsageUpdate(inc: UsageRecordIncrement): {
   const descriptive: Array<[string, unknown]> = [
     ["provider", inc.provider],
     ["unit", inc.unit],
-    ["costSource", inc.costSource],
   ];
   for (const [attr, value] of descriptive) {
     if (value == null) continue;
     names[`#${attr}`] = attr;
     values[`:${attr}`] = value;
     setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
+  }
+
+  // ENG-700 Greptile P1: costSource is NOT constant across writers to a row
+  // the way provider/unit are — a model can go from unpriced to priced mid-day,
+  // and once "allocated" (real cost known) it must win over a stale "unpriced"
+  // from an earlier write. if_not_exists would freeze the row on the first
+  // writer's verdict, so an allocated write always overwrites; an unpriced
+  // write still only fills a genuinely empty slot.
+  if (inc.costSource != null) {
+    names["#costSource"] = "costSource";
+    values[":costSource"] = inc.costSource;
+    setClauses.push(
+      inc.costSource === "allocated"
+        ? "#costSource = :costSource"
+        : "#costSource = if_not_exists(#costSource, :costSource)"
+    );
   }
 
   // Session is the one call-level fact that is NOT constant across a row. The sort

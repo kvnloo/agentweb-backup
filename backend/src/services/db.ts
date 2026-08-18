@@ -3334,6 +3334,10 @@ export const scheduleDb = {
     functionCallMinCalls?: { [functionName: string]: number };
     emailNotifications?: string[];
     dailyDigest?: boolean;
+    // ENG-1131 follow-up: owner opt-out for the proactive sourcing-block
+    // transition email specifically (does not affect the schedule-card badge,
+    // per-run emails, or run history).
+    disableSourcingBlockAlerts?: boolean;
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;

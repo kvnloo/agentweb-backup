@@ -1,2 +1,17 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# ENG-1312: a single pre-existing stray NUL byte (predates this file's ENG-1312
+# changes — see the "fix: strip a pre-existing stray NUL byte" commit) makes
+# git's own content-sniffing heuristic classify this file as binary for ANY
+# diff where either side still contains it — which `main` did/does until this
+# fix lands there too. `* text=auto` alone does not override that heuristic
+# (verified locally: `git diff origin/main HEAD` still rendered "Binary files
+# ... differ" with only that rule). The `diff` attribute does — it forces
+# git's diff machinery to treat this specific path as text regardless of
+# either blob's content, which is what actually makes this PR's diff (and,
+# very likely, GitHub's PR view and Greptile's own diff consumption) render
+# normally instead of as an opaque binary blob. Safe to remove once `main`
+# no longer contains the byte anywhere in this file's history that a PR could
+# diff against.
+backend/src/cron/agentReliabilitySnapshot.ts diff

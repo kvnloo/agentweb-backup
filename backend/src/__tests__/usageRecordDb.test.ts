@@ -167,6 +167,35 @@ describe('usageRecordDb', () => {
         'ProvisionedThroughputExceeded'
       );
     });
+
+    // ENG-700 Greptile P1: costSource must not freeze on a stale "unpriced"
+    // verdict once a real price is known for the same row.
+    it('writes costSource "unpriced" with if_not_exists (first-writer-wins for the still-unknown case)', async () => {
+      await usageRecordDb.incrementUsage({ ...baseIncrement, costSource: 'unpriced' });
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain(
+        '#costSource = if_not_exists(#costSource, :costSource)'
+      );
+      expect(params.ExpressionAttributeNames['#costSource']).toBe('costSource');
+      expect(params.ExpressionAttributeValues[':costSource']).toBe('unpriced');
+    });
+
+    it('writes costSource "allocated" unconditionally, overwriting a stale "unpriced" first write', async () => {
+      await usageRecordDb.incrementUsage({ ...baseIncrement, costSource: 'allocated' });
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('#costSource = :costSource');
+      expect(params.UpdateExpression).not.toContain(
+        '#costSource = if_not_exists(#costSource, :costSource)'
+      );
+      expect(params.ExpressionAttributeValues[':costSource']).toBe('allocated');
+    });
+
+    it('omits costSource entirely when not provided', async () => {
+      await usageRecordDb.incrementUsage(baseIncrement);
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toContain('costSource');
+      expect(params.ExpressionAttributeValues[':costSource']).toBeUndefined();
+    });
   });
 
   // ENG-1251 Greptile P1 ("Coverage suppresses unrelated aggregate usage"):
