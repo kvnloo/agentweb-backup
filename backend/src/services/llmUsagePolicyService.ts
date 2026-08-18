@@ -9,6 +9,60 @@ export interface LlmUsagePolicy {
   hardCostThresholdMicroUsd: number;
   optimizedModelIds: string[];
   optimizedDefaultModel: string;
+
+  /**
+   * Percentage of the enforced allowance at which the proactive usage alert
+   * fires (ENG-1214 AC5, ENG-1210 AC9 — tunable without a deploy).
+   *
+   * OPTIONAL, and it has to be: every policy already stored in production
+   * predates this field, and a validator that rejected those would take
+   * admission down for every tier the moment it shipped. Absent means the
+   * default in `resolveAlertThresholds`.
+   */
+  alertUsagePercentThreshold?: number;
+
+  /**
+   * Whether an early-exhaustion FORECAST alerts, independently of the level
+   * above (ENG-1217 AC12). Lets an admin roll forecast alerts out per tier, or
+   * silence them, without touching the usage threshold. Absent means enabled.
+   */
+  alertOnForecastShortfall?: boolean;
+}
+
+/** Defaults applied when a policy predates the alert fields, or omits them. */
+export const DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD = 90;
+export const DEFAULT_ALERT_ON_FORECAST_SHORTFALL = true;
+
+export interface ResolvedAlertThresholds {
+  usagePercent: number;
+  onForecastShortfall: boolean;
+}
+
+/**
+ * The thresholds a client should alert on, with defaults already applied.
+ *
+ * Resolved SERVER-side so there is exactly one place that knows the default. A
+ * client carrying its own fallback would keep alerting at the old number for
+ * anyone whose policy set a different one, and the disagreement would be
+ * invisible — the customer simply gets warned at the wrong time.
+ */
+export function resolveAlertThresholds(
+  policy: LlmUsagePolicy | null | undefined,
+): ResolvedAlertThresholds {
+  const raw = policy?.alertUsagePercentThreshold;
+  return {
+    usagePercent:
+      isAlertPercent(raw) ? (raw as number) : DEFAULT_ALERT_USAGE_PERCENT_THRESHOLD,
+    onForecastShortfall:
+      typeof policy?.alertOnForecastShortfall === "boolean"
+        ? policy.alertOnForecastShortfall
+        : DEFAULT_ALERT_ON_FORECAST_SHORTFALL,
+  };
+}
+
+/** 1..99. Not 100+: at the cap the user is blocked and the at-limit modal owns it. */
+function isAlertPercent(v: unknown): boolean {
+  return Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 99;
 }
 
 export interface LlmUsageModeDecision {
@@ -72,6 +126,17 @@ export function validateLlmUsagePolicy(policy: LlmUsagePolicy): string[] {
     errors.push("optimizedModelIds must contain at least one model");
   }
   if (!policy.optimizedDefaultModel?.trim()) errors.push("optimizedDefaultModel is required");
+  // Both alert fields are optional; only a PRESENT-but-invalid value is an error.
+  // `undefined` has to stay acceptable or every pre-existing stored policy breaks.
+  if (policy.alertUsagePercentThreshold !== undefined && !isAlertPercent(policy.alertUsagePercentThreshold)) {
+    errors.push("alertUsagePercentThreshold must be an integer between 1 and 99");
+  }
+  if (
+    policy.alertOnForecastShortfall !== undefined &&
+    typeof policy.alertOnForecastShortfall !== "boolean"
+  ) {
+    errors.push("alertOnForecastShortfall must be a boolean");
+  }
   if (
     Array.isArray(policy.optimizedModelIds) &&
     policy.optimizedDefaultModel &&
@@ -98,13 +163,13 @@ export function evaluateLlmUsageMode(input: {
   if (costUsedMicroUsd >= policy.hardCostThresholdMicroUsd) {
     return { usageMode: "paused", admissionAllowed: false, reason: "hard_threshold_reached" };
   }
-  if (policy.enforcementState === "hard_only") {
-    return { usageMode: "full_choice", admissionAllowed: true, reason: "hard_cap_only" };
-  }
-  if (costUsedMicroUsd >= policy.optimizationCostThresholdMicroUsd) {
-    return { usageMode: "optimized", admissionAllowed: true, reason: "optimization_threshold_reached" };
-  }
-  return { usageMode: "full_choice", admissionAllowed: true, reason: "below_optimization_threshold" };
+  // ENG-1211: there is exactly one enforcement boundary now — the hard cap.
+  // `enforce` and `hard_only` are therefore equivalent, and
+  // `optimizationCostThresholdMicroUsd` no longer gates anything. It is retained
+  // on the policy (and still validated) because ENG-1212's runway forecast reads
+  // it as an alert threshold and ENG-1209 AC6 keeps legacy config readable for
+  // rollback — but it can never again change, block, or rewrite a model.
+  return { usageMode: "full_choice", admissionAllowed: true, reason: "hard_cap_only" };
 }
 
 export function selectPolicyModel(input: {
@@ -131,65 +196,31 @@ export function selectPolicyModel(input: {
     };
   }
 
-  if (input.usageMode === "full_choice") {
-    if (requestedModel && supported.has(requestedModel)) {
-      return {
-        requestedModel,
-        effectiveModel: requestedModel,
-        backupModel,
-        backupSource: input.backupSource || null,
-        modelSelection: "honored",
-        reason: "requested_model_allowed",
-      };
-    }
-    if (!supported.has(input.systemDefaultModel)) {
-      throw new InvalidLlmUsagePolicyError("system default model is not supported");
-    }
-    return {
-      requestedModel,
-      effectiveModel: input.systemDefaultModel,
-      backupModel,
-      backupSource: input.backupSource || null,
-      modelSelection: requestedModel ? "corrected" : "defaulted",
-      reason: requestedModel ? "requested_model_unavailable_using_default" : "no_requested_model_using_default",
-    };
-  }
-
-  if (!input.policy) throw new InvalidLlmUsagePolicyError("optimized mode requires a policy");
-  const errors = validateLlmUsagePolicy(input.policy);
-  if (errors.length > 0) throw new InvalidLlmUsagePolicyError(errors.join("; "));
-  const optimized = new Set(
-    input.policy.optimizedModelIds.filter((model) => supported.has(model))
-  );
-  if (optimized.size === 0 || !optimized.has(input.policy.optimizedDefaultModel)) {
-    throw new InvalidLlmUsagePolicyError("optimized catalog has no valid supported default");
-  }
-  if (requestedModel && optimized.has(requestedModel)) {
+  // ENG-1211: every non-paused mode honors the user's choice. A stored or
+  // in-flight `optimized` value from before the cutover lands here too and is
+  // treated as full choice — the value stays parseable for rollback (ENG-1209
+  // AC6) but cannot coerce a model (ENG-1211 AC5). The former optimized branch,
+  // which substituted a user backup or the admin-configured optimized default,
+  // is deleted: that substitution IS the behavior this ticket removes.
+  if (requestedModel && supported.has(requestedModel)) {
     return {
       requestedModel,
       effectiveModel: requestedModel,
       backupModel,
       backupSource: input.backupSource || null,
       modelSelection: "honored",
-      reason: "requested_model_allowed_in_optimized_mode",
+      reason: "requested_model_allowed",
     };
   }
-  if (backupModel && input.backupSource === "user" && optimized.has(backupModel)) {
-    return {
-      requestedModel,
-      effectiveModel: backupModel,
-      backupModel,
-      backupSource: "user",
-      modelSelection: "corrected",
-      reason: "requested_model_blocked_using_user_backup",
-    };
+  if (!supported.has(input.systemDefaultModel)) {
+    throw new InvalidLlmUsagePolicyError("system default model is not supported");
   }
   return {
     requestedModel,
-    effectiveModel: input.policy.optimizedDefaultModel,
-    backupModel: input.policy.optimizedDefaultModel,
-    backupSource: "system",
-    modelSelection: "corrected",
-    reason: "requested_model_blocked_using_optimized_default",
+    effectiveModel: input.systemDefaultModel,
+    backupModel,
+    backupSource: input.backupSource || null,
+    modelSelection: requestedModel ? "corrected" : "defaulted",
+    reason: requestedModel ? "requested_model_unavailable_using_default" : "no_requested_model_using_default",
   };
 }

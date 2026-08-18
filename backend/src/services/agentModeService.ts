@@ -42,6 +42,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -3531,12 +3532,33 @@ export class AgentModeService {
 
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       const { userDb: userDbForAdmin } = await import('./db');
+      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+      // tokenUsageService pulls in the db -> aws config graph, and a static import
+      // here would drag it into every suite that mocks this module.
+      //
+      // Everything is swallowed to the acting user. Several legacy suites replace
+      // this module with a partial mock that defines only `incrementUserTokenUsage`,
+      // so the export can genuinely be missing — and beyond that, a descriptive
+      // ledger attribute must never be the reason a customer's response fails.
+      // `userId` is the value the row carried before this existed, so the
+      // degraded path is the old behaviour exactly.
+      const resolveBillingSubject = async (): Promise<string> => {
+        try {
+          const { resolveBillingUserId } = await import('./tokenUsageService');
+          if (typeof resolveBillingUserId !== 'function') return userId;
+          return (await resolveBillingUserId(userId)) || userId;
+        } catch (err) {
+          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+          return userId;
+        }
+      };
       let [
         currentSession,
         userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt,
-        currentUser
+        currentUser,
+        billingUserId
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
         getAllowedSkills(userId),
@@ -3545,7 +3567,18 @@ export class AgentModeService {
         userDbForAdmin.getUserById(userId).catch((err) => {
           console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
           return null;
-        })
+        }),
+        // ENG-1217: who this response's spend is BILLED to, resolved once and
+        // stamped on every ledger row it writes. The ledger has always carried a
+        // `billingUserId` attribute and this path has never filled it, so an org
+        // member's rows claimed they paid for themselves while
+        // `incrementUserTokenUsage` was charging the org root — the two stores
+        // disagreed, and a reader had nothing but today's membership to go on.
+        //
+        // Resolved here rather than inside `recordUsage` because it costs two
+        // reads: once per response is free alongside this fetch, once per LLM
+        // call would not be.
+        resolveBillingSubject()
       ]);
 
       // Log if user not found (indicates orphaned schedule or deleted user)
@@ -4245,7 +4278,11 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-1210 AC6: stamp scheduled-vs-interactive provenance at metering
+            // time. The ledger row is keyed `date#model#feature` and aggregates
+            // sessionId away, so `feature` is the only dimension that survives to
+            // answer "what is my scheduled work costing me".
+            usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn
           });
@@ -4321,7 +4358,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // Same provenance as the primary call this retries — a backup-model
+                // retry of a scheduled run is still scheduled spend.
+                usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
               }), synthesisRetryDeadlineMs);
@@ -11366,7 +11405,11 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} lead(s)`,
+        // ENG-1207: same contract as searchLeads — a truncated page must not be
+        // phrased as a total.
+        message: cursor
+          ? `Showing the first ${matchingLeads.length} lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} lead(s)`,
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
@@ -11664,7 +11707,16 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} matching lead(s)`,
+        // ENG-1207: only an exhausted scan may be phrased as a total. When the
+        // scan stopped at the caller's limit, say so — a bare "Found 20" reads
+        // as "there are 20", which is how a weak model concluded a 98-match
+        // filter had 20 hits, wrote 17 of them and reported the job complete
+        // (prod session d5898ffd). The true total is deliberately NOT stated:
+        // the scan breaks at the limit, so it was never counted and any "of N"
+        // here would be invented.
+        message: cursorOut
+          ? `Showing the first ${matchingLeads.length} matching lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} matching lead(s)`,
         leads: matchingLeads.map((entry) => {
           // Per-field provenance sidecar — lets the agent cite source, provider,
           // URL and confidence per field for list-wide queries (e.g. "funding
