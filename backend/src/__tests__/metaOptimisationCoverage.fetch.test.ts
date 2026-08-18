@@ -43,8 +43,17 @@ describe('fetchOptimisationInputs — the request shape', () => {
 
     const url = String(fetchImpl.mock.calls[0][0]);
     expect(url).toContain('act_123/adsets');
-    expect(decodeURIComponent(url)).toContain('promoted_object{custom_event_type,pixel_id}');
     expect(decodeURIComponent(url)).toContain('effective_status');
+
+    // Pinned individually rather than as one literal string, so reordering the sub-fields
+    // does not fail while DROPPING one silently passes.
+    const decoded = decodeURIComponent(url);
+    expect(decoded).toContain('custom_event_type');
+    expect(decoded).toContain('pixel_id');
+    // The load-bearing one: without it Meta returns `OTHER` with no name attached, and every
+    // custom-conversion ad set becomes unjudgeable. That blindness hid 8 of the 13 delivering
+    // conversion-optimised ad sets in production, all on the biggest-spending account.
+    expect(decoded).toContain('custom_event_str');
   });
 
   it('reads the pixel with aggregation=event', async () => {

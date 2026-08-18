@@ -598,6 +598,19 @@ export type AlertTransport = (
   context?: Record<string, any>,
 ) => Promise<void>;
 
+/**
+ * Where an alert goes, plus whether this run is allowed to have side effects.
+ *
+ * This is an OBJECT rather than a bare transport so the compiler forces every raise() call
+ * site to account for dry-run. A missed one would silently send a real oncall alert from a
+ * dry run — exactly the "fixed one of a pair" defect §48 records three times.
+ */
+export interface AlertSink {
+  transport: AlertTransport;
+  /** Capture-only. Suppression is skipped ENTIRELY — see raise(). */
+  dryRun: boolean;
+}
+
 /** Default transport: the canonical ops path — oncall email plus an auto-filed tracked
  *  issue, suppressed outside production by emailService itself. Lazily imported so this
  *  module's unit tests never pull in the email dependency graph. */
@@ -647,6 +660,16 @@ export interface MonitorDeps {
     adAccountId: string,
     accessToken: string,
   ) => Promise<AdAccountActivity>;
+  /**
+   * Capture alerts instead of sending them, and leave the suppression map untouched.
+   * Set only by the admin dry-run trigger; the cron never sets it.
+   */
+  dryRun?: boolean;
+  /**
+   * Restrict the sweep to ONE ad account. Used by the dry-run trigger so a change can be
+   * exercised against a single real account without reading the whole fleet.
+   */
+  onlyAdAccountId?: string;
   /**
    * Ad accounts already swept SUCCESSFULLY this run, shared across every user in the sweep.
    *
@@ -758,7 +781,10 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   const fetchActivity =
     deps?.fetchActivity ??
     ((id: string, token: string, days: number) => fetchDailyAdAccountActivity(id, token, days));
-  const alertTransport = deps?.alertTransport ?? defaultAlertTransport;
+  const alertSink: AlertSink = {
+    transport: deps?.alertTransport ?? defaultAlertTransport,
+    dryRun: deps?.dryRun === true,
+  };
   const now = deps?.now ?? Date.now();
 
   const accounts = (Array.isArray(user?.connected_accounts) ? user.connected_accounts : []).filter(
@@ -782,6 +808,11 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // connection that does not exist.
     if (!adAccountId || !accessToken) continue;
 
+    // Dry-run scoping. Deliberately BEFORE the duplicate check so a scoped run reports
+    // nothing about the accounts it never looked at — counting them as "skipped duplicates"
+    // would make a one-account probe read like a fleet sweep that deduped heavily.
+    if (deps?.onlyAdAccountId && String(adAccountId) !== String(deps.onlyAdAccountId)) continue;
+
     // Another user record already swept this exact ad account, successfully, this run. The
     // second pass would read the same Meta data, re-fetch the same landing pages, and file
     // findings under a different owner email for the same underlying account.
@@ -804,7 +835,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     if (activity.status === 'token_error') {
       summary.tokenErrors++;
       await raise(
-        alertTransport,
+        alertSink,
         `${TOKEN_ALERT_CLASS}:${adAccountId}`,
         now,
         `Meta ad account ${adAccountId} cannot be read — token invalid`,
@@ -852,7 +883,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
     await checkOptimisationCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
     // Also before the blackout early returns, and for the same reason as Tier 1: an account
@@ -860,14 +891,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // sends paid traffic to a page that cannot report anything. Gating this behind a blackout
     // verdict would hide exactly the case it exists to find.
     await checkDestinationCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
     // Also before the blackout early returns. Tier 2's whole point is the event that stops
     // while the account's OTHER conversions keep flowing — which reads as perfectly healthy
     // to the blackout check, exactly as the August outage did for eight days.
     await checkEventMixCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
     const verdict = evaluateAdAccountDays(activity.days);
@@ -913,7 +944,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     );
 
     await raise(
-      alertTransport,
+      alertSink,
       `${BLACKOUT_ALERT_CLASS}:${adAccountId}`,
       now,
       `Meta ad account ${adAccountId} spent with zero attributed conversions`,
@@ -969,16 +1000,24 @@ async function buildAccountAlertContext(
  *  failure is logged and swallowed: a broken mail server must not stop the sweep from
  *  checking the remaining accounts. */
 async function raise(
-  transport: AlertTransport,
+  sink: AlertSink,
   dedupeKey: string,
   now: number,
   subject: string,
   message: string,
   context: Record<string, any>,
 ): Promise<void> {
-  if (shouldSuppress(dedupeKey, now)) return;
+  // A dry run neither READS nor WRITES the suppression map, and both halves matter.
+  //
+  // Not reading: if the real sweep alerted on this account three hours ago, consulting the
+  // map would return "suppressed" and the dry run would report nothing wrong — the operator
+  // would read a clean result for an account that is actively alerting.
+  //
+  // Not writing: recording here would mark the alert as delivered, and the next REAL sweep
+  // would suppress it. A diagnostic run would have silenced the thing it was run to inspect.
+  if (!sink.dryRun && shouldSuppress(dedupeKey, now)) return;
   try {
-    await transport(subject, message, context);
+    await sink.transport(subject, message, context);
   } catch (error: any) {
     console.error(`${TAG} failed to send alert "${subject}": ${error?.message}`);
   }
@@ -1002,7 +1041,7 @@ async function checkOptimisationCoverage(
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
@@ -1083,7 +1122,7 @@ async function checkOptimisationCoverage(
       b.consecutiveAbsentSpendingDays > a.consecutiveAbsentSpendingDays ? b : a);
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day, not per ad set: several ad sets on one pixel are one
       // fault with one fix, and filing each separately is how a detector becomes a flood.
       `${OPTIMISATION_ALERT_CLASS}:${adAccountId}`,
@@ -1139,7 +1178,7 @@ async function checkDestinationCoverage(
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
@@ -1198,7 +1237,7 @@ async function checkDestinationCoverage(
     const foreign = verdict.alerting.filter((f) => f.reason === 'foreign_pixel');
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day. Several ads on one bad lander are one fault with one
       // fix, and filing each separately is how a detector becomes a flood.
       `${DESTINATION_ALERT_CLASS}:${adAccountId}`,
@@ -1257,7 +1296,7 @@ async function checkEventMixCoverage(
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
@@ -1316,7 +1355,7 @@ async function checkEventMixCoverage(
       b.spendDuringAbsence > a.spendDuringAbsence ? b : a);
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day. Several families stopping together is almost always
       // ONE cause — a removed snippet, a broken deploy — and filing each separately is how a
       // detector becomes a flood.
