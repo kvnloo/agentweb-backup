@@ -130,6 +130,17 @@ export function computeCostMicroUsd(
 }
 
 /**
+ * ENG-700: true when `model` has no entry in the price book. Used to mark a
+ * usage row's costSource as "unpriced" (0 dollars because the rate is
+ * missing) rather than "allocated" (0 or more real dollars from a known
+ * rate) — the two must stay distinguishable so an unpriced model never reads
+ * as confirmed-free spend.
+ */
+function isUnpriced(model: string): boolean {
+  return getModelPrice(model) === null;
+}
+
+/**
  * Record one LLM call into the shadow usage table.
  *
  * Fire-and-forget: call it WITHOUT await in hot paths. The returned promise
@@ -157,6 +168,15 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
             ctx.cacheWriteByTtl
           );
 
+    // ENG-700: an override or a known price is real allocated spend (possibly
+    // $0 for a genuinely free call). No override AND no price entry means the
+    // 0 in costMicroUsd is a missing rate, not a fact about the call — tag it
+    // "unpriced" so it never reads as confirmed-free spend. Token counts are
+    // written either way (see inputTokens/outputTokens below), unaffected by
+    // costSource.
+    const costSource =
+      ctx.costUsdOverride != null || !isUnpriced(ctx.model) ? "allocated" : "unpriced";
+
     await usageRecordDb.incrementUsage({
       userId,
       date,
@@ -168,9 +188,7 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       cacheWriteTokens,
       costMicroUsd,
       billingUserId,
-      // Every dollar on this path is derived from our own price table
-      // (utils/llmPricing) or an explicit override — never vendor-reported.
-      costSource: "allocated",
+      costSource,
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
       ...(ctx.provider ? { provider: ctx.provider } : {}),
       ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
