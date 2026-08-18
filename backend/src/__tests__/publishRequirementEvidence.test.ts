@@ -99,3 +99,81 @@ describe('requirementEvidenceNames (ENG-947)', () => {
     expect(requirementEvidenceNames([null, undefined, { noName: true }] as any)).toEqual([]);
   });
 });
+
+/**
+ * ENG-1276 follow-up — a schedule's requiredFunctionCalls names
+ * `post_on_connected_account`, but `twitter_manage_post`'s OWN description tells
+ * the model to use `post_thread` instead for a multi-tweet thread ("NEVER use
+ * this tool to post a single new tweet — use post_on_connected_account for
+ * that... if you only have 1 tweet, use post_on_connected_account instead"). A
+ * schedule has no way to know its agent will reach for the thread-specific tool,
+ * so a real, successful, irreversible publish never satisfied the requirement
+ * and the run was pressed to publish a DUPLICATE thread for the full 20-attempt
+ * budget (real prod session 0ef2078d, 2026-08-12: "Kevin — X Evening Post"
+ * published a 3-tweet thread via twitter_manage_post(post_thread), then got
+ * nudged 19 times with "Please try again. Make sure to
+ * post_on_connected_account" even though re-calling it would have duplicated a
+ * live post).
+ *
+ * Every OTHER twitter_manage_post action (reply/quote_tweet/like/unlike/
+ * retweet/unretweet/delete_tweet/get_tweet_metrics/list_replies/...) is not a
+ * new standalone post and must NOT alias — only post_thread creates the kind of
+ * content post_on_connected_account would have. linkedin_manage_post never gets
+ * an alias at all: none of its actions (repost/comment/list_comments/react/
+ * get_analytics) create a new top-level post the way post_on_connected_account
+ * does.
+ */
+describe('requirementEvidenceNames aliases the thread-post substitute (ENG-1276 follow-up)', () => {
+  it('credits a SUCCEEDED post_thread call toward post_on_connected_account', () => {
+    const ledger = [
+      {
+        name: 'twitter_manage_post',
+        arguments: { action: 'post_thread', tweets: ['one', 'two', 'three'] },
+        result: { success: true, data: [{ id: '1' }, { id: '2' }, { id: '3' }] },
+      },
+    ];
+    expect(requirementEvidenceNames(ledger)).toEqual(['twitter_manage_post', 'post_on_connected_account']);
+  });
+
+  it('handles a JSON-string arguments payload the same as a parsed object', () => {
+    const ledger = [
+      {
+        name: 'twitter_manage_post',
+        arguments: JSON.stringify({ action: 'post_thread', tweets: ['one', 'two'] }),
+        result: { success: true },
+      },
+    ];
+    expect(requirementEvidenceNames(ledger)).toEqual(['twitter_manage_post', 'post_on_connected_account']);
+  });
+
+  it('does NOT alias a FAILED post_thread call — nothing actually published', () => {
+    // twitter_manage_post itself keeps the historical non-publish "attempted
+    // counts" rule (unrelated to this alias, ENG-947 scopes tightening to
+    // publish-classified names only) — but the ALIAS specifically must require
+    // success, since it stands in for an irreversible publish.
+    const ledger = [
+      {
+        name: 'twitter_manage_post',
+        arguments: { action: 'post_thread', tweets: ['one', 'two'] },
+        error: 'rate limited',
+      },
+    ];
+    expect(requirementEvidenceNames(ledger)).toEqual(['twitter_manage_post']);
+  });
+
+  it('does NOT alias any non-post_thread twitter_manage_post action', () => {
+    const actions = ['reply', 'quote_tweet', 'delete_tweet', 'like', 'unlike', 'retweet', 'unretweet', 'get_tweet_metrics'];
+    for (const action of actions) {
+      const ledger = [{ name: 'twitter_manage_post', arguments: { action }, result: { success: true } }];
+      expect([action, requirementEvidenceNames(ledger)]).toEqual([action, ['twitter_manage_post']]);
+    }
+  });
+
+  it('does NOT alias linkedin_manage_post — none of its actions are a new top-level post', () => {
+    const actions = ['repost', 'comment', 'list_comments', 'react', 'get_analytics'];
+    for (const action of actions) {
+      const ledger = [{ name: 'linkedin_manage_post', arguments: { action }, result: { success: true } }];
+      expect([action, requirementEvidenceNames(ledger)]).toEqual([action, ['linkedin_manage_post']]);
+    }
+  });
+});
