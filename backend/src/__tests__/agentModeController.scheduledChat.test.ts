@@ -4368,5 +4368,40 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
+
+    // A user can edit a schedule's notification settings WHILE a run (which can take
+    // minutes) is already in flight. The transition check already re-fetches the
+    // schedule for its runResults — reusing that SAME fresh copy for recipients and
+    // the opt-out check costs nothing extra and honors the edit immediately, instead
+    // of silently applying it only starting from the NEXT run.
+    it('uses the freshly re-fetched schedule, not the stale function-entry copy, for recipients', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, emailNotifications: ['stale@example.com'] };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        emailNotifications: ['fresh@example.com'], // edited mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [recipients] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(recipients).toEqual(['fresh@example.com']);
+    });
+
+    it('honors a mid-run opt-out edit: suppresses the alert using the freshly re-fetched disableSourcingBlockAlerts', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, disableSourcingBlockAlerts: false };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        disableSourcingBlockAlerts: true, // owner just turned this on mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
   });
 });
