@@ -34,6 +34,13 @@ jest.mock("../services/agentModeService", () => ({
 // Mocked explicitly: without it these tests still passed, but only because the
 // real `getUserById` swallows its own AWS error and returns undefined, so they
 // were exercising a failed database call and calling it a solo user.
+jest.mock("../services/paymentHistoryDb", () => ({
+  // ENG-1210: attribution for untagged rows is resolved per ROW DATE from the
+  // payment-event timeline. Empty here means "no record", which the reader
+  // falls back from to current-state inference -- the behaviour these suites
+  // already assert.
+  paymentHistoryDb: { getByUserId: jest.fn(async () => []) },
+}));
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },

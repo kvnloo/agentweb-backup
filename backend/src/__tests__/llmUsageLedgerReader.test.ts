@@ -24,20 +24,33 @@
  * `resolveBillingUserId` uses — so the two cannot drift.
  */
 
+jest.mock("../services/paymentHistoryDb", () => ({
+  // ENG-1210: attribution for untagged rows is resolved per ROW DATE from the
+  // payment-event timeline. Empty here means "no record", which the reader
+  // falls back from to current-state inference -- the behaviour these suites
+  // already assert.
+  paymentHistoryDb: { getByUserId: jest.fn(async () => []) },
+}));
 jest.mock("../services/db", () => ({
   userDb: { getUserById: jest.fn() },
   orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
 }));
 jest.mock("../services/usageRecordDb", () => ({
-  usageRecordDb: { queryByUserDateRange: jest.fn() },
+  usageRecordDb: {
+    queryByUserDateRange: jest.fn(),
+    // ENG-1251 union: the scan half must exist or every billed read throws.
+    queryByBillingUserDateRange: jest.fn(async () => []),
+  },
 }));
 
 import {
   resolvePooledLedgerUserIds,
   readPooledLedgerRows,
+  readBilledLedgerRows,
 } from "../services/llmUsageLedgerReader";
 import { userDb, orgDb } from "../services/db";
 import { usageRecordDb } from "../services/usageRecordDb";
+import { paymentHistoryDb } from "../services/paymentHistoryDb";
 
 const mockUser = userDb.getUserById as jest.Mock;
 const mockOrg = orgDb.getOrgById as jest.Mock;
@@ -286,5 +299,97 @@ describe("readPooledLedgerRows — attribution within a partition", () => {
     const rows = await readPooledLedgerRows(ROOT, "2026-08-01", "2026-08-11");
     expect(rows).toHaveLength(1);
     expect(mockMembers).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * ENG-1210 — attribution is a HISTORICAL question, answered per row date.
+ *
+ * Raised by Greptile on PR #2407 (llmUsageLedgerReader.ts:154): a member who
+ * changes between inherited and personal billing mid-cycle had their CURRENT
+ * state applied to their whole partition, so earlier org-funded spend was dropped
+ * (or earlier self-funded spend charged to the org).
+ *
+ * Not hypothetical: on production, 2 of the 26 org members holding usage rows
+ * transitioned inside the current window -- subscription_created on 2026-06-22
+ * and 2026-07-22. `AW-PaymentHistory` records exactly when, and spans 2026-04-06
+ * onward, which covers every usage row (from 2026-06-14).
+ */
+describe("billing transitions are attributed per row date", () => {
+  const ROOT = "root-1";
+  const MEMBER = "member-x";
+
+  const row = (date: string) => ({
+    userId: MEMBER,
+    sk: `${date}#gpt-4o#chat`,
+    date,
+    model: "gpt-4o",
+    feature: "chat",
+    costMicroUsd: 1000,
+    callCount: 1,
+    // Self-stamped, i.e. untagged: says nothing about who actually paid.
+    billingUserId: MEMBER,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: ROOT, orgId: "org-1" });
+    (orgDb.getOrgById as jest.Mock).mockResolvedValue({ orgId: "org-1", ownerUserId: ROOT });
+    (orgDb.getOrgMembers as jest.Mock).mockResolvedValue([
+      { userId: ROOT, orgId: "org-1" },
+      // Self-paying TODAY -- which is what made the old code drop everything.
+      { userId: MEMBER, orgId: "org-1", subscription_status: "active" },
+    ]);
+    (usageRecordDb.queryByUserDateRange as jest.Mock).mockImplementation(async (uid: string) =>
+      uid === MEMBER ? [row("2026-06-20"), row("2026-06-25")] : [],
+    );
+    (usageRecordDb.queryByBillingUserDateRange as jest.Mock).mockResolvedValue([]);
+  });
+
+  it("keeps spend from BEFORE the member started paying for themselves", async () => {
+    (paymentHistoryDb.getByUserId as jest.Mock).mockResolvedValue([
+      { timestamp: "2026-06-22T17:06:39.763Z", eventType: "subscription_created" },
+    ]);
+
+    const rows = await readBilledLedgerRows(ROOT, "2026-06-01", "2026-06-30");
+    const dates = rows.map((r) => r.date).sort();
+
+    // 06-20 predates the subscription: the org paid for it and it must count.
+    // 06-25 is after: the member paid, so it must not.
+    expect(dates).toEqual(["2026-06-20"]);
+  });
+
+  it("drops spend from before a member CANCELLED, and keeps what came after", async () => {
+    // The mirror image. Before the cancellation they paid for themselves; after
+    // it they inherit. Charging the org for the earlier half would bill them for
+    // usage the member was separately invoiced for.
+    (paymentHistoryDb.getByUserId as jest.Mock).mockResolvedValue([
+      { timestamp: "2026-06-22T00:00:00.000Z", eventType: "subscription_canceled" },
+    ]);
+
+    const rows = await readBilledLedgerRows(ROOT, "2026-06-01", "2026-06-30");
+    expect(rows.map((r) => r.date)).toEqual(["2026-06-25"]);
+  });
+
+  it("falls back to today's state when there is no payment record at all", async () => {
+    // Most members have no events. Behaviour must be exactly what it was before:
+    // a self-paying member's untagged rows are not the org's.
+    (paymentHistoryDb.getByUserId as jest.Mock).mockResolvedValue([]);
+
+    const rows = await readBilledLedgerRows(ROOT, "2026-06-01", "2026-06-30");
+    expect(rows).toEqual([]);
+  });
+
+  it("does not let a payment-record lookup failure drop the member's spend", async () => {
+    // The timeline REFINES attribution; it must never be load-bearing enough that
+    // an outage silently removes a member from the org's burn.
+    (paymentHistoryDb.getByUserId as jest.Mock).mockRejectedValue(new Error("throttled"));
+    (orgDb.getOrgMembers as jest.Mock).mockResolvedValue([
+      { userId: ROOT, orgId: "org-1" },
+      { userId: MEMBER, orgId: "org-1" },
+    ]);
+
+    const rows = await readBilledLedgerRows(ROOT, "2026-06-01", "2026-06-30");
+    expect(rows.map((r) => r.date).sort()).toEqual(["2026-06-20", "2026-06-25"]);
   });
 });

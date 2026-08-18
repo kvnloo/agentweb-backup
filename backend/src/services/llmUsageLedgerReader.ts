@@ -89,6 +89,7 @@
  */
 
 import { userDb, orgDb } from "./db";
+import { paymentHistoryDb } from "./paymentHistoryDb";
 import { inheritsOrgBilling } from "./orgAuthz";
 import { usageRecordDb, type UsageRecordRow } from "./usageRecordDb";
 
@@ -114,15 +115,60 @@ export async function resolvePooledLedgerUserIds(billingUserId: string): Promise
 /**
  * The two answers, from one set of reads.
  *
- * `candidateUserIds` is every partition worth querying; `inheritingUserIds` is
+ * `candidateUserIds` is every partition worth querying; `poolsOn` answers, per
  * the subset that pools onto the subject as of NOW, consulted only for rows that
  * cannot say who paid for them. Resolved together because they come from the
  * same three records and splitting them would triple-read the org on every call.
  */
+/**
+ * Whether a member had their OWN live subscription on a given day, from the
+ * payment-event record rather than from their state today.
+ *
+ * This exists because attribution is a historical question and membership is not
+ * versioned. Judging a whole cycle by today's subscription state is wrong in both
+ * directions: a member who started paying for themselves mid-cycle has their
+ * earlier org-funded spend dropped, and one who cancelled has their earlier
+ * self-funded spend charged to the org. Measured on production, 2 of the 26 org
+ * members holding usage rows transitioned inside the current usage window
+ * (subscription_created on 2026-06-22 and 2026-07-22), so this is a live defect,
+ * not a hypothetical.
+ *
+ * `AW-PaymentHistory` is keyed `(userId, timestamp)` and spans 2026-04-06 onward,
+ * which fully covers the usage rows (from 2026-06-14). `null` means the record
+ * cannot answer -- no events at all -- and the caller falls back to current state,
+ * which is the pre-existing behaviour and no worse than it.
+ */
+function ownedSubscriptionOn(
+  events: { timestamp: string; eventType: string }[],
+  date: string,
+): boolean | null {
+  if (events.length === 0) return null;
+  const ordered = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const owns = (t: string) => t !== "subscription_canceled";
+
+  let latest: boolean | null = null;
+  for (const e of ordered) {
+    if (e.timestamp.slice(0, 10) <= date) latest = owns(e.eventType);
+    else break;
+  }
+  if (latest !== null) return latest;
+  // Nothing had happened yet by this date, so their state was whatever the FIRST
+  // event changed them FROM: a creation means they had none before it, a
+  // cancellation means they did.
+  return !owns(ordered[0].eventType);
+}
+
 async function resolveLedgerScope(
   billingUserId: string,
-): Promise<{ candidateUserIds: string[]; inheritingUserIds: Set<string> }> {
-  const solo = { candidateUserIds: [billingUserId], inheritingUserIds: new Set<string>() };
+): Promise<{
+  candidateUserIds: string[];
+  /** Did this actor's spend pool onto the subject ON this date? */
+  poolsOn: (actor: string, date: string) => boolean;
+}> {
+  const solo = {
+    candidateUserIds: [billingUserId],
+    poolsOn: () => false,
+  };
 
   const user = await userDb.getUserById(billingUserId);
   if (!user?.orgId) return solo;
@@ -138,7 +184,9 @@ async function resolveLedgerScope(
   // A Set both de-duplicates (getOrgMembers includes the owner) and keeps the
   // root present even if the member listing is empty or omits it.
   const candidates = new Set<string>([billingUserId]);
-  const inheriting = new Set<string>();
+  const inheritsToday = new Set<string>();
+  const timelines = new Map<string, { timestamp: string; eventType: string }[]>();
+
   for (const member of members || []) {
     if (!member?.userId) continue;
     candidates.add(member.userId);
@@ -149,10 +197,31 @@ async function resolveLedgerScope(
         org,
       )
     ) {
-      inheriting.add(member.userId);
+      inheritsToday.add(member.userId);
+    }
+    // Best-effort: the timeline REFINES attribution, so a lookup failure must
+    // degrade to today's state rather than drop the member's spend entirely.
+    try {
+      const events = await paymentHistoryDb.getByUserId(member.userId, 100);
+      timelines.set(
+        member.userId,
+        (events || []).map((e) => ({ timestamp: e.timestamp, eventType: e.eventType })),
+      );
+    } catch {
+      timelines.set(member.userId, []);
     }
   }
-  return { candidateUserIds: [...candidates], inheritingUserIds: inheriting };
+
+  const poolsOn = (actor: string, date: string): boolean => {
+    if (!candidates.has(actor)) return false;
+    const owned = ownedSubscriptionOn(timelines.get(actor) || [], date);
+    // The record answers for this day: they pooled iff they had no own plan then.
+    if (owned !== null) return !owned;
+    // It cannot answer, so fall back to today's state -- unchanged behaviour.
+    return inheritsToday.has(actor);
+  };
+
+  return { candidateUserIds: [...candidates], poolsOn };
 }
 
 /**
@@ -172,7 +241,7 @@ function isBilledTo(
   row: UsageRecordRow,
   actor: string,
   subject: string,
-  inheritingMembers: ReadonlySet<string>,
+  poolsOn: (actor: string, date: string) => boolean,
 ): { billed: boolean; inferred: boolean } {
   // The subject's own partition is theirs by definition -- not an inference.
   if (actor === subject) return { billed: true, inferred: false };
@@ -180,7 +249,11 @@ function isBilledTo(
   // The row states who paid. Evidence, not inference.
   if (recorded && recorded !== actor) return { billed: recorded === subject, inferred: false };
   // Nothing on the row says who paid, so this is decided by who is a member NOW.
-  return { billed: inheritingMembers.has(actor), inferred: true };
+  // Decided per ROW DATE, not by the actor's state today -- see
+  // `ownedSubscriptionOn`. Still `inferred`, because the row itself names nobody:
+  // the timeline says who was paying that day, which is a much better answer than
+  // today's state but is still not the row's own testimony.
+  return { billed: poolsOn(actor, row.date), inferred: true };
 }
 
 /**
@@ -221,13 +294,13 @@ export async function readPooledLedgerRows(
   startDate: string,
   endDate: string,
 ): Promise<UsageRecordRow[]> {
-  const { candidateUserIds, inheritingUserIds } = await resolveLedgerScope(billingUserId);
+  const { candidateUserIds, poolsOn } = await resolveLedgerScope(billingUserId);
   const perUser = await Promise.all(
     candidateUserIds.map(async (userId) => {
       const rows = await usageRecordDb.queryByUserDateRange(userId, startDate, endDate);
       const kept: UsageRecordRow[] = [];
       for (const row of rows || []) {
-        const { billed, inferred } = isBilledTo(row, userId, billingUserId, inheritingUserIds);
+        const { billed, inferred } = isBilledTo(row, userId, billingUserId, poolsOn);
         if (!billed) continue;
         // Annotated on a copy so the caller's row object is never mutated and the
         // marker cannot be mistaken for a stored attribute.
