@@ -49,8 +49,26 @@ export interface ItemizedUsageResult {
 // the OTHER member's aggregate row, since both hash to the same key. Every
 // charge event carries actingUserId and every aggregate row carries userId,
 // so both sides can always be scoped correctly.
-const aggregateKey = (actingUserId: string, date: string, model: string, feature: string) =>
-  `${actingUserId}#${date}#${model}#${feature}`;
+//
+// ENG-1210 (Greptile, PR #2407): the PAYER is in the key too, now that the payer
+// is part of the aggregate row's own sort key. A billing transition mid-day
+// produces two rows for one (actor, date, model, feature) slot, and in the
+// subject's OWN partition both are read. Keyed without the payer they would hash
+// together, so one slot's charge-event coverage would be subtracted from BOTH
+// rows -- understating the itemized total by a whole day's coverage, which is the
+// same undercount direction this area keeps failing in.
+//
+// Both sides can be scoped: every charge event carries billingUserId (it is the
+// events table's partition key) and every aggregate row carries it as an
+// attribute. Rows written before the key change carry their last-writer value,
+// which is what they were already reconciled against.
+const aggregateKey = (
+  actingUserId: string,
+  billingUserId: string,
+  date: string,
+  model: string,
+  feature: string,
+) => `${actingUserId}#${billingUserId}#${date}#${model}#${feature}`;
 
 export function reconcileItemizedUsage(
   events: LlmChargeAuditEvent[],
@@ -77,6 +95,7 @@ export function reconcileItemizedUsage(
   for (const event of events) {
     const key = aggregateKey(
       event.actingUserId,
+      event.billingUserId,
       event.occurredAt.slice(0, 10),
       event.model || "unknown",
       event.feature || "unknown"
@@ -89,7 +108,7 @@ export function reconcileItemizedUsage(
   }
 
   const aggregateItems: ItemizedUsageItem[] = rows.flatMap((row) => {
-    const key = aggregateKey(row.userId, row.date, row.model, row.feature);
+    const key = aggregateKey(row.userId, row.billingUserId, row.date, row.model, row.feature);
     const coverage = coverageByKey.get(key);
     // row.costMicroUsd is already micro-USD, same unit as the charge events summed above.
     const rowMicroUsd = row.costMicroUsd || 0;

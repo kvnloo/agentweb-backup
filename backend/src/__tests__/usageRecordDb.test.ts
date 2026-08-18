@@ -72,13 +72,40 @@ describe('usageRecordDb', () => {
       expect(params.UpdateExpression).toContain('callCount :calls');
     });
 
-    it('keys rows by (userId, date#model#feature)', async () => {
+    it('keys rows by (userId, date#model#feature#billingUserId)', async () => {
+      // The payer is part of the KEY, not just an attribute (ENG-1210, raised by
+      // Greptile on PR #2407). It used to be an unconditional SET, so a member
+      // whose billing owner changed mid-day left one row holding both payers'
+      // counters stamped with whichever call wrote last -- the whole day landing
+      // on one bill and vanishing from the other.
       await usageRecordDb.incrementUsage(baseIncrement);
       const params = mockDynamoDB.update.mock.calls[0][0];
       expect(params.Key).toEqual({
         userId: 'user-1',
-        sk: '2026-06-12#anthropic.claude-sonnet-4-6#agent-chat',
+        sk: '2026-06-12#anthropic.claude-sonnet-4-6#agent-chat#owner-1',
       });
+    });
+
+    it('gives two payers on the same day their own rows, so counters never mix', async () => {
+      // The transition. Same actor, same day, same model, same feature -- and two
+      // different payers, which must never share an aggregate.
+      await usageRecordDb.incrementUsage(baseIncrement);
+      await usageRecordDb.incrementUsage({ ...baseIncrement, billingUserId: 'owner-2' });
+
+      const first = mockDynamoDB.update.mock.calls[0][0].Key.sk;
+      const second = mockDynamoDB.update.mock.calls[1][0].Key.sk;
+      expect(first).not.toEqual(second);
+      expect(second).toBe('2026-06-12#anthropic.claude-sonnet-4-6#agent-chat#owner-2');
+    });
+
+    it('keeps the date as the leading segment, so range queries still match', async () => {
+      // Load-bearing: every reader selects on `sk BETWEEN :start AND :end~`. If the
+      // payer were prefixed rather than appended, every historical range query
+      // would silently return nothing.
+      await usageRecordDb.incrementUsage(baseIncrement);
+      const sk = mockDynamoDB.update.mock.calls[0][0].Key.sk;
+      expect(sk.startsWith('2026-06-12#')).toBe(true);
+      expect(sk < '2026-06-12~').toBe(true);
     });
 
     it('passes integer microdollar cost, summed totalTokens, callCount 1, and billingUserId', async () => {
@@ -187,9 +214,11 @@ describe('usageRecordDb', () => {
       const ledgerItem = TransactItems[0].Update;
 
       expect(ledgerItem.TableName).toBe('AW-UsageRecords');
+      // Same key shape as the standalone path, payer segment included -- the two
+      // must never drift, which is why they share one builder.
       expect(ledgerItem.Key).toEqual({
         userId: 'user-1',
-        sk: '2026-06-12#anthropic.claude-sonnet-4-6#engine:agent_task',
+        sk: '2026-06-12#anthropic.claude-sonnet-4-6#engine:agent_task#owner-1',
       });
       expect(ledgerItem.ConditionExpression).toBeUndefined();
       // ENG-1251 Greptile P1: callCount ADDs the group's true call count (3
