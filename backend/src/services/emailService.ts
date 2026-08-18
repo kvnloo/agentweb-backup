@@ -1470,6 +1470,11 @@ Schedule ID: ${scheduleId}
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      // CodeRabbit (PR #2383): escape before interpolating into the HTML body —
+      // a schedule name containing markup otherwise renders unescaped in the
+      // recipient's email client. sendScheduleSourcingBlockTransitionEmail
+      // already does this; this brings the sibling function in line with it.
+      const safeScheduleName = this.escapeHtml(scheduleName);
 
       // ENG-351: resolve {{cite:N}} markers to inline sources so recipients can trace each figure.
       // 'markdown' → the HTML body (marked()) renders clickable source links; the plain-text body
@@ -1573,13 +1578,13 @@ Schedule ID: ${scheduleId}
           <div class="container">
             <div class="header">
               <h1>${statusIcon} Scheduled Chat Results</h1>
-              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeScheduleName}</p>
             </div>
-            
+
             <div class="content">
               <div class="section" style="background-color: ${statusBg}; border-left: 4px solid ${statusColor}; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; line-height: 1.5;">
-                  Your scheduled chat <strong>"${scheduleName}"</strong> ${primaryMessage}
+                  Your scheduled chat <strong>"${safeScheduleName}"</strong> ${primaryMessage}
                   It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong>
                   and completed at <strong>${currentDate}</strong>.
                 </p>
