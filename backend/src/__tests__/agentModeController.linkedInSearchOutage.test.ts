@@ -69,6 +69,16 @@ describe('detectRunBlockedReason (ENG-1131)', () => {
     const toolCalls = [null, undefined, 'nonsense', { name: 'x' }, { name: 'y', result: null }] as any[];
     expect(detectRunBlockedReason(toolCalls)).toBeNull();
   });
+
+  // CodeRabbit (PR #2383): the check only read result.searchUnavailable, with no
+  // check on call.name — any unrelated tool whose result happened to carry that
+  // exact field would misattribute the LinkedIn outage to it. searchUnavailable
+  // is only ever raised by the two sourcing tools today, but the check itself
+  // should not depend on that staying true.
+  it('does not flag an unrelated tool whose result happens to carry a searchUnavailable field', () => {
+    const toolCalls = [{ name: 'update_html_file', result: { searchUnavailable: true } }];
+    expect(detectRunBlockedReason(toolCalls)).toBeNull();
+  });
 });
 
 describe('computeScheduleRunHealth blocked-reason passthrough (ENG-1131)', () => {
