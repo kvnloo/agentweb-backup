@@ -1493,21 +1493,44 @@ Schedule ID: ${scheduleId}
       // agentModeController.ts for why), but the card/email must not say
       // "successfully executed" when the reason it produced nothing was an
       // upstream outage, not a real empty result.
+      //
+      // ENG-1131 follow-up: a run can be BOTH blocked AND have failed to meet
+      // its OTHER requirements — a schedule whose only sourcing path is search
+      // can't satisfy requiredFunctionCalls when that path is down
+      // (allRequirementsMet in agentModeController.ts depends on
+      // allFunctionCallsMet). Failure must take icon/color precedence over the
+      // blocked state: an owner must never read a run that failed as a
+      // reassuring "outage, self-heals, nothing to worry about" notice with no
+      // mention it also failed. The outage explanation is instead ALWAYS
+      // appended as its own note when isBlockedRun, independent of pass/fail —
+      // additive context, never a replacement for the failure signal.
       const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
-      const statusColor = isBlockedRun ? '#ffc107' : (result.passed ? '#28a745' : '#dc3545');
-      const statusIcon = isBlockedRun ? '⚠️' : (result.passed ? '✅' : '❌');
-      const statusBg = isBlockedRun ? '#fff3cd' : (result.passed ? '#e8f5e8' : '#ffeaea');
-      const statusMessageHtml = isBlockedRun
+      const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+      const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+      const statusBg = !result.passed ? '#ffeaea' : (isBlockedRun ? '#fff3cd' : '#e8f5e8');
+      // Each of the 4 (passed x blocked) combinations gets its own headline —
+      // NOT derived from `passed` alone, or the original "don't say
+      // 'successfully executed' for a blocked run" fix (the whole point of
+      // this email surfacing at all) regresses right back for the passed +
+      // blocked case.
+      const primaryMessage = !result.passed && isBlockedRun
+        ? 'did not meet all criteria on this run. LinkedIn people search was also unavailable for the connected account during the run — see the note below.'
+        : !result.passed
+        ? 'executed but did not meet all criteria and results are ready.'
+        : isBlockedRun
+        ? 'ran, but LinkedIn people search was unavailable for the connected account, so no prospects could be sourced — see the note below.'
+        : 'has been successfully executed and results are ready.';
+      const outageNoteHtml = isBlockedRun
         ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
           'this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is ' +
           'account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically ' +
           'once search returns for the account.'
-        : `has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.`;
-      const statusMessageText = isBlockedRun
+        : '';
+      const outageNoteText = isBlockedRun
         ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
           'this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: ' +
           'your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.'
-        : `has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.`;
+        : '';
 
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric',
@@ -1556,14 +1579,18 @@ Schedule ID: ${scheduleId}
             <div class="content">
               <div class="section" style="background-color: ${statusBg}; border-left: 4px solid ${statusColor}; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; line-height: 1.5;">
-                  ${isBlockedRun
-                    ? `Your scheduled chat <strong>"${scheduleName}"</strong> ran, but ${statusMessageHtml}`
-                    : `Your scheduled chat <strong>"${scheduleName}"</strong> ${statusMessageHtml}`}
+                  Your scheduled chat <strong>"${scheduleName}"</strong> ${primaryMessage}
                   It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong>
                   and completed at <strong>${currentDate}</strong>.
                 </p>
               </div>
-              
+
+              ${isBlockedRun ? `
+              <div class="section" style="background-color: #fff3cd; border-left: 4px solid #ffc107; margin: 20px 0;">
+                <p style="margin: 0; font-size: 14px; line-height: 1.5;">${outageNoteHtml}</p>
+              </div>
+              ` : ''}
+
               ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
               <div class="section">
                 <h3>🔧 Function Call Details</h3>
@@ -1612,10 +1639,11 @@ Schedule ID: ${scheduleId}
       const text = `
 Scheduled Chat Results: ${scheduleName}
 
-${isBlockedRun
-  ? `Your scheduled chat "${scheduleName}" ran, but ${statusMessageText}`
-  : `Your scheduled chat "${scheduleName}" ${statusMessageText}`}
+Your scheduled chat "${scheduleName}" ${primaryMessage}
 It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
+${isBlockedRun ? `
+${outageNoteText}
+` : ''}
 
 ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
@@ -1907,12 +1935,19 @@ Sent via AgentWeb: ${customerFrontendUrl}
         // ENG-1131: a blocked-sourcing run (LinkedIn search outage) still has
         // `passed: true` — see agentModeController.ts — so it must be read off
         // `blockedBy` explicitly rather than rendered as a plain PASSED run.
+        //
+        // ENG-1131 follow-up: a run can be BOTH blocked AND failed to meet its
+        // other requirements (a schedule whose only sourcing path is search
+        // can't satisfy requiredFunctionCalls when that path is down). FAILED
+        // must take badge precedence over BLOCKED — the outage note below is
+        // always shown when isBlockedRun regardless of pass/fail, so no
+        // information is lost either way.
         const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
-        const statusIcon = isBlockedRun ? '⚠️' : (result.passed ? '✅' : '❌');
-        const statusLabel = isBlockedRun ? 'BLOCKED' : (result.passed ? 'PASSED' : 'FAILED');
-        const statusColor = isBlockedRun ? '#ffc107' : (result.passed ? '#28a745' : '#dc3545');
-        const statusTextColor = isBlockedRun ? '#664d03' : 'white';
-        const itemBg = isBlockedRun ? '#fffbea' : (result.passed ? '#f8fff8' : '#fff8f8');
+        const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
+        const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+        const statusTextColor = !result.passed ? 'white' : (isBlockedRun ? '#664d03' : 'white');
+        const itemBg = !result.passed ? '#fff8f8' : (isBlockedRun ? '#fffbea' : '#f8fff8');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
@@ -2045,7 +2080,8 @@ ${dateLabel}:
 Individual Run Results:
 ${todaysResults.map((result, index) => {
         const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
-        const statusLabel = isBlockedRun ? 'BLOCKED' : (result.passed ? 'PASSED' : 'FAILED');
+        // FAILED takes precedence over BLOCKED — see the HTML branch above for why.
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
