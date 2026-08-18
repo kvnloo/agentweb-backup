@@ -100,6 +100,37 @@ describe('emailService.sendScheduledChatResultEmail — ENG-1131 blocked-sourcin
     expect(subject).toContain('❌');
     expect(htmlContent).toContain('did not meet all criteria');
   });
+
+  // A schedule whose ONLY sourcing path is LinkedIn search can fail to meet its
+  // required function calls BECAUSE search was blocked — so blockedBy and
+  // passed:false are not mutually exclusive. The email must never let the
+  // reassuring "outage, no action needed, self-heals" framing hide the fact
+  // the run also failed to deliver.
+  it('shows the run FAILED (not a reassuring blocked-only message) when the run was both blocked AND failed to meet its criteria', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      'owner@example.com',
+      'DTC Founder Prospecting',
+      { ...baseResult, passed: false, blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON },
+      'schedule-123',
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+
+    // Failure must be visible — this is the primary, urgent signal.
+    expect(subject).toContain('❌');
+    expect(htmlContent).toContain('did not meet all criteria');
+    expect(subject).not.toContain('✅');
+    expect(htmlContent).not.toContain('successfully executed');
+
+    // The outage explanation must ALSO still be present, as context — not replacing
+    // the failure signal, but explaining it.
+    expect(htmlContent.toLowerCase()).toContain('unavailable');
+    expect(htmlContent.toLowerCase()).toContain('nobody matched your filters');
+    expect(textContent.toLowerCase()).toContain('unavailable');
+  });
 });
 
 describe('emailService.sendDailyDigestEmail — ENG-1131 blocked-sourcing state', () => {
@@ -159,6 +190,31 @@ describe('emailService.sendDailyDigestEmail — ENG-1131 blocked-sourcing state'
     const [, , , htmlContent] = spy.mock.calls[0];
     expect(htmlContent).toContain('❌ FAILED');
     expect(htmlContent.toLowerCase()).not.toContain('unavailable for the connected account');
+  });
+
+  it('shows FAILED (not BLOCKED) as the badge, plus the outage note, when a run was both blocked and failed', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    const results = [
+      {
+        passed: false,
+        blockedBy: LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON,
+        actualResponse: 'Could not source prospects and required calls were unmet.',
+        keywordMatches: [], keywordMisses: [], functionCallMatches: [], functionCallMisses: ['linkedin_outreach'],
+        executionTime: 341179, sessionId: 'session-blocked-failed', attempt: 3,
+        createdAt: new Date().toISOString(),
+      },
+    ];
+
+    await emailService.sendDailyDigestEmail('owner@example.com', 'DTC Founder Prospecting', results, 'schedule-789');
+
+    const [, , textContent, htmlContent] = spy.mock.calls[0];
+    // Failure is the primary, urgent badge — never silently swapped for BLOCKED.
+    expect(htmlContent).toContain('❌ FAILED');
+    expect(htmlContent).not.toContain('BLOCKED');
+    // The outage explanation is still present as context.
+    expect(htmlContent.toLowerCase()).toContain('unavailable for the connected account');
+    expect(textContent.toLowerCase()).toContain('unavailable');
   });
 });
 
