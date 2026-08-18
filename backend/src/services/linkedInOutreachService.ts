@@ -26,6 +26,23 @@ export class LinkedInOutreachService {
   // another. Note: the per-recipient "Should delay new invitation" rejection does
   // NOT arm this breaker — that one is specific to a single recipient.
   private invitationCooldownUntil: Map<string, number> = new Map();
+
+  /**
+   * True while this account is inside the ENG-126 account-level invitation cooldown.
+   *
+   * Exposed so callers can tell "this send will not reach LinkedIn" BEFORE paying a
+   * pacing slot for it. The breaker below short-circuits the network call entirely,
+   * so a paced caller would otherwise sleep the full gap and consume one of the
+   * account's hourly writes for zero LinkedIn traffic — for up to an hour, on every
+   * queued invite.
+   */
+  isUnderInvitationCooldown(accountId: string): boolean {
+    const until = this.invitationCooldownUntil.get(accountId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.invitationCooldownUntil.delete(accountId);
+    return false;
+  }
   private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
   // Per-account people-search capability verdict (ENG-975). See
   // probeSearchCapability below for why this exists; cached per account so a
