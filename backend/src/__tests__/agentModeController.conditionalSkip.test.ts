@@ -395,7 +395,15 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       // (SEND_TEST, ADD_ASSET, CREATE_INLINE, ...) — a bare trailing \b would
       // miss a FUTURE compound like PUBLISH_RESULTS, since \w includes the
       // underscore and there is no boundary between PUBLISH and _RESULTS.
-      const WRITE_SHAPED_VALUE = /\b(?:CREATE|UPDATE|DELETE|REMOVE|POST|PUBLISH|SEND|UPLOAD|ADD|ATTACH|REPOST|COMMENT|REACT|LIKE|UNLIKE|RETWEET|UNRETWEET|PAUSE|RESUME|ENABLE|DISABLE|WRITE|SET|MODIFY|EDIT|RETAG_UTM)\w*/i;
+      // Widened on independent review (ENG-1276 follow-up): the original list
+      // was drawn from verbs already observed in THIS registry's write tools,
+      // which is exactly the reactive-allowlist trap this whole drift guard
+      // exists to avoid for the readOnly flag itself. Added plausible future
+      // write verbs that hadn't appeared yet — CANCEL/APPROVE/REJECT/SCHEDULE/
+      // SUBSCRIBE/FOLLOW/BLOCK/ARCHIVE/ASSIGN/TAG/SHARE/GRANT/REVOKE/TRANSFER/
+      // MERGE — none of which collide with any current readOnly tool's actual
+      // enum values (verified by running this test after widening).
+      const WRITE_SHAPED_VALUE = /\b(?:CREATE|UPDATE|DELETE|REMOVE|POST|PUBLISH|SEND|UPLOAD|ADD|ATTACH|REPOST|COMMENT|REACT|LIKE|UNLIKE|RETWEET|UNRETWEET|PAUSE|RESUME|ENABLE|DISABLE|WRITE|SET|MODIFY|EDIT|RETAG_UTM|CANCEL|APPROVE|REJECT|SCHEDULE|SUBSCRIBE|FOLLOW|UNFOLLOW|BLOCK|UNBLOCK|ARCHIVE|UNARCHIVE|ASSIGN|UNASSIGN|TAG|UNTAG|SHARE|GRANT|REVOKE|TRANSFER|MERGE)\w*/i;
 
       function collectEnumValues(schema: any, out: string[] = []): string[] {
         if (!schema || typeof schema !== 'object') return out;
@@ -656,6 +664,58 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       'Non-publishing day, skipped. No real error happened on our end.',
       'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
+  it('NEGATION AUDIT #4: the comma exclusion from #3 must be scoped to "no" only, not "not"/"never"/"without" (independent review finding)', () => {
+    // An independent fresh-eyes review (not a production incident) reproduced a
+    // real gap in #3's fix: `(?!\s*,)` was applied to ALL FOUR cue words, but
+    // the interjection problem it fixes is specific to a bare "No," opening an
+    // INDEPENDENT clause ("the answer is no; separately, X happened"). "Not,"/
+    // "Never,"/"Without," followed by a comma are still fronted negations with
+    // a parenthetical aside in between — the negation continues to apply across
+    // the comma to whatever follows ("Without, admittedly, any failure
+    // occurring..." still means "there was no failure"). Scoping the exclusion
+    // to "no" alone fixes this without reopening #3's original gap (verified:
+    // "No, unfortunately, ... failed" still isn't neutralized).
+    //
+    // NOT fixed here, and deliberately so: the review also found that a LONG
+    // parenthetical after "never"/"not" ("Never, in this case, did we see a
+    // failure" — 28 characters to the failure word) still doesn't get
+    // neutralized, because it exceeds the 20-char span cap from #3. That cap is
+    // independently load-bearing for a MORE realistic and MORE dangerous case —
+    // "Not entirely sure why the deployment failed today" is a genuine failure
+    // report (the hedge is about the CAUSE, not a denial that it happened), and
+    // widening the cap to accommodate an elaborate courtroom-style parenthetical
+    // would reopen that gap in the direction that matters more (a real failure
+    // silently waived, not an unusual phrasing still causing a retry). See the
+    // cap's own test coverage below.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // Short parentheticals after not/never/without now correctly waive.
+    [
+      'Non-publishing day, skipped. Without, admittedly, any failure occurring, the run completed cleanly.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // "No," stays excluded — #3's original fix must not regress.
+    [
+      'Non-publishing day, skipped. No, unfortunately, today\'s run failed for unknown reasons.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // The length cap is a DELIBERATE trade-off, not an oversight: it still
+    // blocks a long parenthetical after not/never (the elaborate cases the
+    // review constructed), AND — the case that actually justifies keeping the
+    // cap — a genuine failure hedged with "not entirely sure why" is NOT
+    // wrongly waived.
+    [
+      'Non-publishing day, skipped. Never, in this case, did we see a failure.',
+      'Non-publishing day, skipped. Not entirely sure why the deployment failed today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
   });
 
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
