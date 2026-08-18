@@ -625,6 +625,39 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
   });
 
+  it('NEGATION AUDIT #3: an interjection "No," must not bridge a comma-joined run-on to a genuine failure (ENG-1276 follow-up)', () => {
+    // Found on a fresh adversarial re-audit of #2's own widening, NOT from a
+    // production incident: "No," introducing an independent clause is
+    // grammatically an INTERJECTION ("the answer is no"), not a negator of
+    // whatever follows it — but the unbounded tempered-greedy-token from #2 had
+    // no way to tell that apart from "No" used as a direct negator, so a
+    // comma-joined run-on with no "but"/semicolon/period in between could bridge
+    // all the way to a genuinely UNRELATED failure and wrongly neutralize it.
+    // None of the LEGITIMATE cases in #1/#2 have a comma directly after the cue,
+    // so rejecting that shape costs nothing real. Also bounds the maximum span
+    // as a second, independent backstop against an unforeseen long bridge.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. No, unfortunately, today\'s run failed for unknown reasons.',
+      'Non-publishing day, skipped. No, the deployment failed, we should investigate.',
+      'Non-publishing day, skipped. No, it did not work — the post failed.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // The fix must not regress any of the genuine "No <word> failure/error"
+    // negators from #1/#2 — none of them have a comma right after the cue.
+    [
+      'Non-publishing day, skipped. No real error happened on our end.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
