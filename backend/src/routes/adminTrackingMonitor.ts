@@ -30,6 +30,23 @@ router.post('/run', async (req: Request, res: Response) => {
   // alert storm — the same fail-safe direction §C's relay took by shipping default-off.
   const dryRun = body.dryRun === undefined ? true : body.dryRun === true;
 
+  // REJECT an invalid scope; never silently widen it.
+  //
+  // Coercing a bad value to `undefined` reads as "no scope given", so `{"adAccountId": 12345}`
+  // — a number, which is exactly how an id gets pasted from a JSON tool — quietly became a
+  // FLEET-WIDE run. With `dryRun: false` that is a full sweep with real oncall alerts from a
+  // request that asked for one account. A request that names a scope and does not get it must
+  // fail, not do something larger.
+  for (const field of ['userId', 'adAccountId'] as const) {
+    const value = body[field];
+    if (value === undefined) continue; // genuinely omitted — unscoped is the intent
+    if (typeof value !== 'string' || !value.trim()) {
+      return res.status(400).json({
+        message: `${field} must be a non-empty string when provided`,
+      });
+    }
+  }
+
   const userId = typeof body.userId === 'string' && body.userId.trim() ? body.userId.trim() : undefined;
   const adAccountId =
     typeof body.adAccountId === 'string' && body.adAccountId.trim()
