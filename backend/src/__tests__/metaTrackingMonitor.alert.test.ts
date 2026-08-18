@@ -20,6 +20,7 @@ import {
   BLACKOUT_ALERT_CLASS,
   TOKEN_ALERT_CLASS,
   ALERT_REALERT_WINDOW_MS,
+  OPTIMISATION_ALERT_CLASS,
 } from '../services/metaTrackingMonitor';
 
 const metaUser = (userId: string, accountIds: string[]) => ({
@@ -56,7 +57,16 @@ beforeEach(() => {
       alerts.push({ subject, message, context });
     },
     fetchActivity: jest.fn().mockResolvedValue({ status: 'ok', days: healthyDays() }),
-    now: Date.parse('2026-08-15T00:00:00Z'),
+    // §G's fetch is stubbed to nothing by default. Without this every test in this file
+    // would reach graph.facebook.com for real, because the production default is a live
+    // Graph call — a unit suite that depends on the network is one that fails for reasons
+    // that have nothing to do with the code under test.
+    fetchOptimisation: jest.fn().mockResolvedValue({
+      status: 'ok', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {},
+    }),
+    // Inside OPTIMISATION_RECENCY_DAYS of outageDays()'s newest row (2026-08-09), so the
+    // recency gate treats these ad sets as still delivering rather than as past waste.
+    now: Date.parse('2026-08-10T00:00:00Z'),
   };
 });
 
@@ -299,5 +309,157 @@ describe('monitorUserTracking — the objective filter must be observable', () =
     });
     const summary = await monitorUserTracking(metaUser('u1', ['acct1', 'acct2']), deps);
     expect(summary.excludedObjectives).toEqual(['OUTCOME_ENGAGEMENT']);
+  });
+});
+
+/**
+ * ENG-926 §G Tier 1, wired into the sweep.
+ *
+ * The single most important property here is the FIRST test: this must fire on an account
+ * the blackout check calls perfectly healthy. Haven converted `lead` every day of its
+ * `complete_registration` outage, so §F was correctly silent for all eight days. A §G that
+ * only ran on troubled accounts would have been silent too.
+ */
+const havenAdSets = (status = 'ACTIVE') => [
+  {
+    id: 'as_cr', name: 'Maintenance Triage – Cold Prospecting', effective_status: status,
+    promoted_object: { custom_event_type: 'COMPLETE_REGISTRATION', pixel_id: 'px_haven' },
+  },
+  {
+    id: 'as_lead', name: 'Growth', effective_status: status,
+    promoted_object: { custom_event_type: 'LEAD', pixel_id: 'px_haven' },
+  },
+];
+
+/** Haven's real shape during the outage: lead every day, complete_registration never.
+ *  Four days, not three — the newest is dropped as unsettled (ATTRIBUTION_SETTLE_DAYS),
+ *  so three SETTLED absent days are needed to reach the threshold. */
+const outageDays = () => [
+  { date: '2026-08-06', spend: 223.93, conversions: 4, unrecognized: [], families: ['lead'] },
+  { date: '2026-08-07', spend: 229.62, conversions: 9, unrecognized: [], families: ['lead'] },
+  { date: '2026-08-08', spend: 214.85, conversions: 6, unrecognized: [], families: ['lead'] },
+  { date: '2026-08-09', spend: 250.85, conversions: 8, unrecognized: [], families: ['lead'] },
+];
+
+/** The same days, attributed to the AD SET that is making the claim. Account totals cannot
+ *  stand in for this: they let a sibling vouch for a dead pixel and let a non-delivering
+ *  ad set inherit someone else's spend (both P1s on the first version). */
+const outageDaysByAdSet = (ids = ['as_cr', 'as_lead']) =>
+  Object.fromEntries(ids.map((id) => [id, outageDays().map(({ date, spend, families }) => ({
+    date, spend, families: id === 'as_lead' ? ['lead'] : families.filter((f) => f !== 'lead'),
+  }))]));
+
+describe('monitorUserTracking — §G Tier 1', () => {
+  it('ALERTS on an account the blackout check calls healthy — the Haven blind spot', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
+    deps.fetchOptimisation.mockResolvedValue({
+      status: 'ok',
+      adSets: havenAdSets(),
+      receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+
+    expect(summary.blackouts).toBe(0);        // §F is silent, correctly
+    expect(summary.healthy).toBe(1);          // and calls the account healthy
+    expect(summary.optimisationAlerts).toBe(1);
+
+    const alert = alerts.find((a) => a.context['Alert Class'] === OPTIMISATION_ALERT_CLASS);
+    expect(alert).toBeDefined();
+    expect(alert.message).toContain('COMPLETE_REGISTRATION');
+    expect(alert.message).not.toContain('LEAD');   // Lead IS arriving — do not name it
+    expect(alert.context['Longest Absence (spending days)']).toBe(3);
+    expect(alert.context['Owner Email']).toBe('u1@example.com');
+  });
+
+  it('files ONE alert per account, however many ad sets share the fault', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
+    deps.fetchOptimisation.mockResolvedValue({
+      status: 'ok',
+      adSets: [
+        ...havenAdSets(),
+        { id: 'as_cr2', name: 'Leasing', effective_status: 'ACTIVE',
+          promoted_object: { custom_event_type: 'COMPLETE_REGISTRATION', pixel_id: 'px_haven' } },
+      ],
+      receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(['as_cr', 'as_lead', 'as_cr2']),
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.optimisationAlerts).toBe(2);
+    expect(alerts.filter((a) => a.context['Alert Class'] === OPTIMISATION_ALERT_CLASS)).toHaveLength(1);
+  });
+
+  it('does not re-alert inside the dedupe window', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
+    deps.fetchOptimisation.mockResolvedValue({
+      status: 'ok', adSets: havenAdSets(), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
+    });
+
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(alerts.filter((a) => a.context['Alert Class'] === OPTIMISATION_ALERT_CLASS)).toHaveLength(1);
+
+    deps.now += ALERT_REALERT_WINDOW_MS + 1;
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(alerts.filter((a) => a.context['Alert Class'] === OPTIMISATION_ALERT_CLASS)).toHaveLength(2);
+  });
+
+  it('LOGS a paused mismatch and never alerts on it', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: outageDays() });
+    deps.fetchOptimisation.mockResolvedValue({
+      status: 'ok', adSets: havenAdSets('PAUSED'), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: outageDaysByAdSet(),
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.optimisationAlerts).toBe(0);
+    expect(summary.optimisationDormant).toBe(1);
+    expect(alerts.filter((a) => a.context['Alert Class'] === OPTIMISATION_ALERT_CLASS)).toEqual([]);
+  });
+
+  it('does not alert when the account converted that family recently — low volume', async () => {
+    deps.fetchActivity.mockResolvedValue({
+      status: 'ok',
+      days: [{ date: '2026-08-08', spend: 214.85, conversions: 6, unrecognized: [],
+               families: ['lead', 'complete_registration'] }],
+    });
+    deps.fetchOptimisation.mockResolvedValue({
+      status: 'ok', adSets: havenAdSets(), receivedEventsByPixel: { px_haven: ['PageView', 'Lead'] },
+      spendingDaysByAdSet: {
+        as_cr: [{ date: '2026-08-08', spend: 214.85, families: ['lead', 'complete_registration'] }],
+        as_lead: [{ date: '2026-08-08', spend: 214.85, families: ['lead'] }],
+      },
+    });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.optimisationAlerts).toBe(0);
+    expect(summary.optimisationUnconfirmed).toBe(1);
+  });
+
+  it('a §G fetch failure never alerts and never disturbs the blackout check', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
+    deps.fetchOptimisation.mockResolvedValue({ status: 'fetch_error', adSets: [], receivedEventsByPixel: {}, spendingDaysByAdSet: {}, error: 'rate limited' });
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.optimisationAlerts).toBe(0);
+    expect(summary.blackouts).toBe(1); // the check that was already working still worked
+  });
+
+  it('a §G throw never aborts the sweep', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'ok', days: blackoutDays() });
+    deps.fetchOptimisation.mockRejectedValue(new Error('boom'));
+
+    const summary = await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(summary.blackouts).toBe(1);
+    expect(summary.optimisationAlerts).toBe(0);
+  });
+
+  it('never runs §G for an account whose token is dead', async () => {
+    deps.fetchActivity.mockResolvedValue({ status: 'token_error', days: [], error: 'expired' });
+    await monitorUserTracking(metaUser('u1', ['acct1']), deps);
+    expect(deps.fetchOptimisation).not.toHaveBeenCalled();
   });
 });
