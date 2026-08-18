@@ -311,7 +311,26 @@ export function findStepContentLoss(before: any[], after: any[]) {
   // same-length write blanks a step with neither guard firing.
   const replacementCarriesContent = after.length > 0
     && after.every((step: any) => STEP_CONTENT_FIELDS.some((field) => !isEmptyStepValue(step[field])));
-  const isWholesaleRewrite = !keptAnything && replacementCarriesContent;
+  // "Carries content" only asks whether each step has SOME content, so a payload
+  // that renamed and renumbered everything while keeping the descriptions and
+  // dropping the skillIds still looked like a new plan, and every loss was
+  // suppressed into a silent 200.
+  //
+  // A genuinely new plan does not reuse the prose of the one it replaces. A step
+  // description repeated byte for byte is an amendment that lost its footing, not
+  // a rewrite. Only prose counts: skillIds and requiredFunctionCalls recur across
+  // unrelated plans, so reading those as evidence would refuse ordinary rewrites.
+  const REWRITE_IDENTITY_FIELDS = ['description', 'userInstructions'] as const;
+  const existingProse = new Set<string>();
+  before.forEach((step: any) => {
+    REWRITE_IDENTITY_FIELDS.forEach((field) => {
+      if (!isEmptyStepValue(step[field])) existingProse.add(`${field}:${JSON.stringify(step[field])}`);
+    });
+  });
+  const reusesExistingProse = after.some((step: any) =>
+    REWRITE_IDENTITY_FIELDS.some((field) =>
+      !isEmptyStepValue(step[field]) && existingProse.has(`${field}:${JSON.stringify(step[field])}`)));
+  const isWholesaleRewrite = !keptAnything && replacementCarriesContent && !reusesExistingProse;
   const claimed = new Set(pairs.filter((index) => index !== -1));
   const losses: { stepCount: any; title: any; fields: string[]; kind: 'blanked' | 'unpaired' }[] = [];
   before.forEach((existing: any, i: number) => {
