@@ -71,9 +71,38 @@ export interface TrackingMonitorCronSummary {
   eventMixWatched: number;
   /** Families absent too long to still count as a regression. Logged, never paged. */
   eventMixStale: number;
+  /** Present ONLY on a dry run: every alert the sweep would have sent, in order.
+   *  Absent (not empty) on a real run, so the two are never confused. */
+  capturedAlerts?: CapturedAlert[];
 }
 
-export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
+/** An alert a dry run intercepted instead of delivering. */
+export interface CapturedAlert {
+  subject: string;
+  message: string;
+  context?: Record<string, any>;
+}
+
+export interface TrackingMonitorRunOptions {
+  /**
+   * Capture alerts instead of sending them, and leave the alert-suppression map untouched.
+   *
+   * Exists because `monitorUserTracking` has exactly one caller — a 09:00 UTC timer with no
+   * run on boot — so before this, every §F/§G change was unverifiable in production until the
+   * next morning, and each fix-verify cycle cost another 24 hours.
+   */
+  dryRun?: boolean;
+  /** Restrict the sweep to one user record. */
+  userId?: string;
+  /** Restrict the sweep to one ad account. */
+  adAccountId?: string;
+}
+
+export async function runMetaTrackingMonitor(
+  options?: TrackingMonitorRunOptions,
+): Promise<TrackingMonitorCronSummary> {
+  const dryRun = options?.dryRun === true;
+  const capturedAlerts: CapturedAlert[] = [];
   const summary: TrackingMonitorCronSummary = {
     usersScanned: 0,
     accountsChecked: 0,
@@ -113,10 +142,31 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
 
   const unknownTypes = new Set<string>();
 
+  if (options?.userId) {
+    users = users.filter((u: any) => String(u?.userId) === String(options.userId));
+  }
+
   for (const user of users) {
     summary.usersScanned++;
     try {
-      const result = await monitorUserTracking(user, { sweptAccountIds });
+      const result = await monitorUserTracking(user, {
+        sweptAccountIds,
+        dryRun,
+        onlyAdAccountId: options?.adAccountId,
+        // Capture in the SAME order the sweep would have sent, so the output reads as the
+        // run's actual alert stream rather than a set.
+        ...(dryRun
+          ? {
+              alertTransport: async (
+                subject: string,
+                message: string,
+                context?: Record<string, any>,
+              ) => {
+                capturedAlerts.push({ subject, message, context });
+              },
+            }
+          : {}),
+      });
       summary.accountsChecked += result.accountsChecked;
       summary.blackouts += result.blackouts;
       summary.tokenErrors += result.tokenErrors;
@@ -149,6 +199,10 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     // what Meta says it received. Its own try/catch, because it is a different question
     // from the spend check and one failing must not suppress the other.
     try {
+      // Skipped on a dry run: this check has its own alert path that does NOT route through
+      // the injected transport, so running it here would send a real alert from a run whose
+      // entire contract is "no side effects".
+      if (dryRun) continue;
       const divergence = await checkConversionDivergenceForUser(user);
       if (divergence.status === 'not-arriving') summary.conversionDivergences++;
     } catch (error: any) {
@@ -157,9 +211,10 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
   }
 
   summary.unrecognizedActionTypes = [...unknownTypes];
+  if (dryRun) summary.capturedAlerts = capturedAlerts;
 
   console.log(
-    `${TAG} swept ${summary.usersScanned} user(s), ${summary.accountsChecked} ad account(s): ` +
+    `${TAG} ${dryRun ? '[DRY RUN] ' : ''}swept ${summary.usersScanned} user(s), ${summary.accountsChecked} ad account(s): ` +
     `${summary.healthy} healthy, ${summary.idle} idle, ${summary.blackouts} blackout, ` +
     `${summary.tokenErrors} token error, ${summary.unclassifiable} unclassifiable, ` +
     `${summary.fetchErrors} unavailable` +
@@ -199,6 +254,7 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
       : '') +
+    (dryRun ? `, ${capturedAlerts.length} alert(s) captured and NOT sent` : '') +
     (summary.unrecognizedActionTypes.length
       ? ` — unknown action types seen: ${summary.unrecognizedActionTypes.join(', ')}`
       : ''),
