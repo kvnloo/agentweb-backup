@@ -223,7 +223,11 @@ export function computeReliabilitySnapshot(input: ComputeSnapshotInput): Reliabi
         toolFailed++;
         const toolName = strDim(e.dimensions?.toolName) ?? 'unknown';
         const errorClass = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
-        const key = `${toolName} ${errorClass}`;
+        // Unambiguous encoding — a plain `${toolName} ${errorClass}` join lets
+        // ("alpha beta", "gamma") and ("alpha", "beta gamma") collide onto the
+        // same key and silently merge two unrelated failure clusters
+        // (CodeRabbit, PR #2443).
+        const key = JSON.stringify([toolName, errorClass]);
         const existing = clusterCounts.get(key);
         if (existing) existing.count++;
         else clusterCounts.set(key, { toolName, errorClass, count: 1 });
