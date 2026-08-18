@@ -70,7 +70,7 @@ jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: { notifyLinkedInConnectionAccepted: (...a: any[]) => mockNotifyLinkedInConnectionAccepted(...a) },
 }));
 
-import { runLinkedInConnectionSync } from '../cron/linkedInConnectionSyncCron';
+import { runLinkedInConnectionSync, __resetWalkPacingForTests } from '../cron/linkedInConnectionSyncCron';
 
 const onePageOfConnections = () =>
   jest.fn().mockResolvedValueOnce({
@@ -82,6 +82,8 @@ const onePageOfConnections = () =>
   });
 
 beforeEach(() => {
+  // ENG-1197: the cron paces its full walk per account in module state.
+  __resetWalkPacingForTests();
   jest.clearAllMocks();
   // Single site-wide account to sync.
   mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify([{ account_id: 'acct-1', enabled: true }]) });
