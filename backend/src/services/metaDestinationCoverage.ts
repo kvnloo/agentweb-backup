@@ -87,8 +87,16 @@ export function isCheckableDestination(rawUrl: string): boolean {
     return false;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
-  return !META_OWNED_HOSTS.has(host) && !APP_STORE_HOSTS.has(host);
+  // SUFFIX, not equality. Stripping `www.` and comparing exactly leaves every other
+  // subdomain checkable — `l.facebook.com` (Meta's own link shim), `web.facebook.com`,
+  // `m.facebook.com`, `business.facebook.com`, `l.instagram.com`. Those reach the fetcher,
+  // and a 200 with no owned pixel then produces a finding against a host that could never
+  // carry a page pixel in the first place. The trailing dot is stripped because a
+  // fully-qualified `facebook.com.` is the same host.
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const isUnder = (hosts: Set<string>) =>
+    [...hosts].some((owned) => host === owned || host.endsWith(`.${owned}`));
+  return !isUnder(META_OWNED_HOSTS) && !isUnder(APP_STORE_HOSTS);
 }
 
 export interface DestinationAd {
@@ -162,6 +170,12 @@ export function collectCheckableUrls(
   const seen: string[] = [];
   for (const ad of Array.isArray(ads) ? ads : []) {
     if (!ad || typeof ad !== 'object') continue;
+    // Mirrors `evaluateDestinationCoverage`, which routes an absent objective to
+    // `unverifiable`. Collecting those destinations spends a fetch and a slot from
+    // MAX_DESTINATION_URLS_CHECKED on a URL that can never produce a verdict — and can push a
+    // judgeable destination past the cap into `urlsNotChecked`. Both functions must apply the
+    // same eligibility rule or the cap silently prefers the un-judgeable ones.
+    if (typeof ad.objective !== 'string' || ad.objective.trim() === '') continue;
     if (!isConversionOptimisedObjective(ad.objective)) continue;
     for (const url of Array.isArray(ad.destinationUrls) ? ad.destinationUrls : []) {
       if (!isCheckableDestination(url)) continue;

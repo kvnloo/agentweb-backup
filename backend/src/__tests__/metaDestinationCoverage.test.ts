@@ -50,6 +50,30 @@ describe('isCheckableDestination — what is even a website', () => {
     expect(isCheckableDestination('http://example.com/lp')).toBe(true);
   });
 
+  it('rejects Meta-owned SUBDOMAINS, not just the bare domain', () => {
+    // Exact-match-after-stripping-www let all of these through to the fetcher, where a 200
+    // with no owned pixel would produce a finding against a host that can never carry a page
+    // pixel. `l.facebook.com` is Meta's own link shim and a plausible real destination.
+    for (const host of [
+      'l.facebook.com', 'web.facebook.com', 'm.facebook.com', 'business.facebook.com',
+      'l.instagram.com', 'api.whatsapp.com',
+    ]) {
+      expect(isCheckableDestination(`https://${host}/x`)).toBe(false);
+    }
+    // A fully-qualified name is the same host.
+    expect(isCheckableDestination('https://facebook.com./x')).toBe(false);
+  });
+
+  it('does NOT reject a lookalike domain that merely ends in the same letters', () => {
+    // Suffix matching must anchor on a dot, or `notfacebook.com` becomes unreachable.
+    expect(isCheckableDestination('https://notfacebook.com/lp')).toBe(true);
+    expect(isCheckableDestination('https://my-instagram.com/lp')).toBe(true);
+  });
+
+  it('rejects app-store subdomains by the same rule', () => {
+    expect(isCheckableDestination('https://apps.apple.com/us/app/x')).toBe(false);
+  });
+
   it('rejects Meta-owned destinations — an ad pointing at a Page has no lander to measure', () => {
     // Seen live: one ACTIVE ad's destination was www.facebook.com/profile.php?id=…
     expect(isCheckableDestination('https://www.facebook.com/profile.php?id=1145')).toBe(false);
@@ -85,6 +109,17 @@ describe('collectCheckableUrls — dedupe and cap', () => {
   it('drops non-website destinations before anything tries to fetch them', () => {
     const ads = [ad({ destinationUrls: ['https://www.facebook.com/p', 'https://x.com/lp'] })];
     expect(collectCheckableUrls(ads).urls).toEqual(['https://x.com/lp']);
+  });
+
+  it('does not spend a cap slot on an ad whose objective was never read', () => {
+    // evaluateDestinationCoverage can only ever mark these `unverifiable`, so fetching them
+    // wastes work AND can push a judgeable destination past the cap into urlsNotChecked.
+    const ads = [
+      ad({ adId: 'unknown', objective: undefined, destinationUrls: ['https://x.com/unknown'] }),
+      ad({ adId: 'blank', objective: '   ', destinationUrls: ['https://x.com/blank'] }),
+      ad({ adId: 'good', destinationUrls: ['https://x.com/good'] }),
+    ];
+    expect(collectCheckableUrls(ads).urls).toEqual(['https://x.com/good']);
   });
 
   it('ignores ads under a non-conversion objective — every pixel-less real account was one', () => {
