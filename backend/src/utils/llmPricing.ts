@@ -163,10 +163,6 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'deep-research-max-preview-04-2026': withDerivedCache(2, 12), // same per-token rate as standard; Max differs in task depth / search volume, not token price
 
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
-  // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
-  // published Azure list prices (likely a long-standing bug). The shadow price
-  // book uses the official list prices instead — the comparison endpoint is
-  // expected to surface this discrepancy.
   // OpenAI publishes gpt-4o cached input at $1.25/1M (50% of the $2.50 input rate),
   // not the 10%-of-input default our convention would derive ($0.25). Override the
   // cache-read rate with the real published number; write stays on the convention.
