@@ -22,6 +22,7 @@
 
 import {
   getAccountsByUserId,
+  getAccountsByUserIdIncludingOrgShared,
   updateAccountConfig,
   LinkedInOutreachConfig,
 } from './connectedAccountsDb';
@@ -90,27 +91,54 @@ function daysBetween(fromIso: string, now: number): number {
 }
 
 /**
- * Resolve the account row for a Unipile account id under one owner.
+ * Resolve the account row for a Unipile account id, and the user who actually owns it.
  *
  * Matches `config.unipile_account_id` as well as `account_id` because the sync cron
  * derives its id list from either, but `updateAccountConfig` keys strictly on
  * `account_id` — so the canonical `account_id` is what has to come back out.
+ *
+ * `viewerUserId` is a starting point, NOT the answer. An org-shared Unipile account
+ * is usable by a teammate who does not own it, and every write here — the config
+ * mutation, the paused-schedule resume, the owner's email — belongs to the OWNER's
+ * record. Looking only at `getAccountsByUserId(viewerUserId)` found nothing for a
+ * borrowed account, so `recordUnipileAccountHealth` silently no-opped: no flag, no
+ * oncall alert, no gate state, for exactly the shared-account path ENG-1198 shipped.
+ * The org-shared getter tags each row with its real owner (`userId`), which is what
+ * callers must use from here on.
  */
 async function findUnipileAccount(
   accountId: string,
-  ownerUserId: string,
-): Promise<{ accountId: string; accountName: string; config: LinkedInOutreachConfig } | null> {
-  const accounts = await getAccountsByUserId(ownerUserId);
-  const match = accounts.find(
-    (acc) =>
-      acc.platform === 'unipile' &&
-      (acc.account_id === accountId ||
-        (acc.config as LinkedInOutreachConfig)?.unipile_account_id === accountId),
-  );
-  if (!match) return null;
+  viewerUserId: string,
+): Promise<{
+  accountId: string;
+  accountName: string;
+  ownerUserId: string;
+  config: LinkedInOutreachConfig;
+} | null> {
+  const matches = (acc: { platform: string; account_id: string; config?: unknown }): boolean =>
+    acc.platform === 'unipile' &&
+    (acc.account_id === accountId ||
+      (acc.config as LinkedInOutreachConfig)?.unipile_account_id === accountId);
+
+  // Own accounts first: the common case, one read, and no ambiguity about ownership.
+  const owned = await getAccountsByUserId(viewerUserId);
+  let match = owned.find(matches);
+  let ownerUserId = viewerUserId;
+
+  if (!match) {
+    const shared = await getAccountsByUserIdIncludingOrgShared(viewerUserId);
+    match = shared.find(matches);
+    // The org-shared getter stamps a non-persisted `userId` marker naming the owner.
+    // Absent it we would be writing to the wrong user's record, so decline instead.
+    const resolvedOwner = (match as { userId?: string } | undefined)?.userId;
+    if (!match || !resolvedOwner) return null;
+    ownerUserId = resolvedOwner;
+  }
+
   return {
     accountId: match.account_id,
     accountName: match.account_name || 'LinkedIn account',
+    ownerUserId,
     config: (match.config || {}) as LinkedInOutreachConfig,
   };
 }
@@ -146,7 +174,10 @@ export async function recordUnipileAccountHealth(params: {
   state: SessionState;
   now?: number;
 }): Promise<HealthOutcome> {
-  const { accountId, ownerUserId, state } = params;
+  // The caller passes whoever OBSERVED the dead session, which is not necessarily
+  // whose account it is — a teammate can drive an org-shared Unipile account. The
+  // real owner is resolved from the account row below and used for every write.
+  const { accountId, ownerUserId: viewerUserId, state } = params;
   const now = params.now ?? Date.now();
 
   // An indeterminate probe (timeout, 5xx, transport) proves nothing about the
@@ -158,12 +189,12 @@ export async function recordUnipileAccountHealth(params: {
 
   // Site-wide/shared accounts belong to no customer: there is no user record to
   // write to and nobody whose inbox this belongs in.
-  if (!ownerUserId) return 'no-op';
+  if (!viewerUserId) return 'no-op';
 
   try {
-    const account = await findUnipileAccount(accountId, ownerUserId);
+    const account = await findUnipileAccount(accountId, viewerUserId);
     if (!account) return 'no-op';
-    const { config, accountName } = account;
+    const { config, accountName, ownerUserId } = account;
 
     if (state === 'connected') {
       const wasDisconnected = !!config.needs_reconnect;
@@ -311,7 +342,12 @@ export async function recordUnipileAccountHealth(params: {
       accountId,
       accountName,
       disconnectedAt,
-      isReminder: true,
+      // NOT hard-coded true. The transition branch above deliberately does not email
+      // the customer, so this branch sends the FIRST owner email as well as every
+      // later reminder — and `isReminder` picks the subject and headline. Hard-coding
+      // it made that first email read "Still disconnected after 0 days", since it
+      // fires one cron cycle after the disconnect was recorded.
+      isReminder: !firstNotifyPending,
       daysDisconnected: daysBetween(disconnectedAt, now),
       notifyOwner: true,
     });
@@ -379,10 +415,13 @@ async function notify(params: {
  * runner — keeps reading the persisted flag, which is why this has to be cleared in
  * the store rather than only in memory.
  */
-export async function clearDisconnectFlag(ownerUserId: string, accountId: string): Promise<void> {
+export async function clearDisconnectFlag(viewerUserId: string, accountId: string): Promise<void> {
   try {
-    const account = await findUnipileAccount(accountId, ownerUserId);
+    const account = await findUnipileAccount(accountId, viewerUserId);
     if (!account?.config.needs_reconnect) return;
+    // Same ownership rule as the record path: the flag lives on the owner's record,
+    // which is normally the reconnecting user but need not be for an org-shared account.
+    const { ownerUserId } = account;
     await updateAccountConfig(ownerUserId, 'unipile', account.accountId, () => ({
       updates: { last_verified_at: new Date().toISOString() },
       unset: ['needs_reconnect', 'disconnected_at', 'disconnect_notified_at'],
