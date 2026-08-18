@@ -17,6 +17,71 @@ env:
   AWS_REGION: 'us-west-2'
 
 jobs:
+  auto-draft-guard:
+    name: Auto-draft on synchronize (ENG-1283)
+    # Option B (Greptile/Actions cost): collapses a push-fix-push-fix cycle on
+    # an already-ready PR into exactly one heavy CI + one Greptile run. Only a
+    # `synchronize` of a PR that was NOT already draft hits this branch —
+    # `opened`, `reopened`, and `ready_for_review` never do, so their heavy run
+    # is untouched (criterion 2 of ENG-1283). A push to a still-draft PR also
+    # never hits this branch (draft == false is required), so it costs nothing
+    # beyond the ~15s this job itself takes on the one push per ready-flip that
+    # matters.
+    #
+    # Builds on Option A (ENG-1282, merged/observed 2026-08-17): that stopped
+    # Greptile's own re-review billing per push; this stops the heavy Actions
+    # run (tests + Greptile trigger) from starting at all on that same push.
+    if: github.event.action == 'synchronize' && github.event.pull_request.draft == false
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    # Keyed exactly like every other job in this file (ENG-1277, #2360 fix):
+    # the draft flag from THIS run's own event payload is part of the group
+    # name, so a still-draft run and a ready run on the same ref can never
+    # share a group and cancel each other. This job's own draft flag is always
+    # `false` (the `if:` above requires it), so it never collides with a
+    # concurrent draft-time run of anything else in this file.
+    concurrency:
+      group: ${{ github.workflow }}-auto-draft-guard-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    outputs:
+      converted: ${{ steps.convert.outputs.converted }}
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Convert PR back to draft
+        id: convert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='
+            mutation($id: ID!) {
+              convertPullRequestToDraft(input: { pullRequestId: $id }) {
+                pullRequest { isDraft }
+              }
+            }' -f id="${PR_NODE_ID}" > /tmp/convert-result.json
+          is_draft="$(jq -r '.data.convertPullRequestToDraft.pullRequest.isDraft' /tmp/convert-result.json)"
+          if [ "${is_draft}" != "true" ]; then
+            echo "::error::convertPullRequestToDraft did not report isDraft=true: $(cat /tmp/convert-result.json)"
+            exit 1
+          fi
+          echo "converted=true" >> "${GITHUB_OUTPUT}"
+
+      # Criterion 5: a PR sitting in this auto-converted state must be visibly
+      # distinguishable from one a human abandoned, so Watchdog's stale-PR
+      # sweep (loop-pr-ops.md, >7 days) does not misflag it. A fresh, named
+      # comment plus the fresh commit timestamp that triggered it both predate
+      # any 7-day staleness window.
+      - name: Comment explaining the auto-draft
+        if: steps.convert.outputs.converted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "Auto-drafted (ENG-1283): a new commit landed on this ready PR, so it was converted back to draft to collapse this fix into a single CI + Greptile run instead of re-billing both on every push. Mark it \`ready for review\` again when you're done pushing fixes."
+
   detect-changes:
     name: Detect changed projects
     # ENG-1277: draft-gated. This job ran unconditionally on every push
@@ -26,7 +91,18 @@ jobs:
     # downstream will use). `ready_for_review` already re-triggers a full run,
     # so no evidence is lost — merge-evidence.sh already treats an all-skipped
     # draft-time run as NO_EVIDENCE, not a pass.
-    if: github.event.pull_request.draft == false
+    #
+    # ENG-1283: also skip when THIS push is the one auto-draft-guard just
+    # converted back to draft — `always()` so this still evaluates even though
+    # auto-draft-guard is `if:`-skipped on every event this job cares about
+    # other than the one synchronize case (skipped is not success, and a
+    # custom `if:` is implicitly ANDed with success() otherwise, which would
+    # wrongly skip detect-changes on opened/reopened/ready_for_review too).
+    if: |
+      always() &&
+      github.event.pull_request.draft == false &&
+      needs.auto-draft-guard.outputs.converted != 'true'
+    needs: [auto-draft-guard]
     # ENG-1277: 1 vCPU ubuntu-slim ($0.002/min vs ubuntu-latest's $0.006). This
     # job is a ~15-25s paths-filter read via the REST API — no docker, no build.
     runs-on: ubuntu-slim
@@ -409,6 +485,12 @@ jobs:
       # deploy cannot lose a clause without a red check (ENG-991).
       - name: Run staging-deploy gate contract suite
         run: bash .github/scripts/staging-deploy-gate.test.sh
+
+      # No script under test — asserts the auto-draft-guard / detect-changes
+      # job wiring in this same file (ENG-1283), including the #2360
+      # concurrency-group pattern it reuses.
+      - name: Run auto-draft-guard contract suite
+        run: bash .github/scripts/auto-draft-guard.test.sh
 
   # ENG-836: prod deploys immutable, which forbids changing resource config and
   # instance config in one operation. PR #2237 did exactly that, EB accepted the
