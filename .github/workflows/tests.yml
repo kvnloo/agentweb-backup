@@ -383,6 +383,9 @@ jobs:
       - name: Run greptile-gate.sh regression suite
         run: bash .github/scripts/greptile-gate.test.sh
 
+      - name: Run greptile-verdict-policy.sh regression suite
+        run: bash .github/scripts/greptile-verdict-policy.test.sh
+
       - name: Run greptile-request-review.sh regression suite
         run: bash .github/scripts/greptile-request-review.test.sh
 
@@ -533,10 +536,14 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-greptile-review-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
-    # `verdict` is pass | refused | unavailable. The job still FAILS on anything
-    # but pass. Since ENG-1039 nothing downstream consumes this output (the
-    # test jobs no longer wait on this gate); it is kept for the job log and
-    # any future consumer. Nothing may ever treat a non-pass as a pass.
+    # `verdict` is pass | refused | unavailable. Since 2026-08-18
+    # (greptile-verdict-policy.sh) the job FAILS on `refused` — a genuine
+    # below-bar review — but PASSES (with a loud ::warning::) on
+    # `unavailable`, where Greptile never returned any verdict for this head
+    # at all. See that script's header for the full policy and the incident
+    # that prompted it. Since ENG-1039 nothing downstream consumes this
+    # output (the test jobs no longer wait on this gate); it is kept for the
+    # job log and any future consumer.
     outputs:
       verdict: ${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}
     steps:
@@ -628,12 +635,19 @@ jobs:
           echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
           echo "greptile-gate verdict=${verdict} (exit ${rc})"
 
-      - name: Fail the gate unless Greptile returned 5/5
-        if: (steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict) != 'pass'
+      # 2026-08-18: PR #2425 sat blocked most of a day by a real Greptile-side
+      # outage (reviews stuck on a stale head for hours, retrigger requests
+      # 400ing, unrelated PRs reviewed normally in the same window) despite
+      # the code being independently proven the whole time. `refused` (a
+      # genuine below-bar review) still hard-fails, unchanged; `unavailable`
+      # (Greptile never answered for this head at all) now passes with a
+      # loud warning instead. See greptile-verdict-policy.sh's header for the
+      # full policy — CodeRabbit needed no equivalent change; it was already
+      # advisory-only (never a required check, always reports `pass`).
+      - name: Apply the Greptile verdict policy
         run: |
-          printf '::error::Greptile gate verdict=%s (exit %s). This job fails for both `refused` and `unavailable`; the merge gate is unchanged.\n' \
-            '${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
-          exit 1
+          bash .github/scripts/greptile-verdict-policy.sh \
+            '${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}'
 
   # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
   # unchanged (ENG-991). GitHub isolates repository secrets from Dependabot on
