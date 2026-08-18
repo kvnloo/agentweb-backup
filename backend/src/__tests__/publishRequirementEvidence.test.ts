@@ -221,3 +221,68 @@ describe('requirementEvidenceNames suppresses the alias when both names are sepa
     expect(requirementEvidenceNames(succeededPostThread, required)).toEqual(['twitter_manage_post']);
   });
 });
+
+/**
+ * ENG-1276 follow-up #3 — a full audit of every "use tool X instead" redirect
+ * in the tool registry (see the drift/coverage test in
+ * agentModeController.conditionalSkip.test.ts) turned up ONE more verified,
+ * genuine analog to twitter_manage_post/post_on_connected_account:
+ *
+ *   email(action='send') <-> send_email_from_sender
+ *
+ * Both send a REAL email to a recipient — email's own description says
+ * "Prefer this over the `email` tool when the user has no connected mailbox
+ * but has a configured sender" and send_email_from_sender's says the mirror
+ * image ("Prefer this over the `email` tool when..."). Which one a run
+ * actually calls depends on whether the user has a connected mailbox or a
+ * configured CRM sender — account state the schedule owner has no way to
+ * predict when they set up requiredFunctionCalls. Verified via both
+ * execute() paths: email(action='send') resolves through
+ * resolveEmailAccount(userId, account_id, 'send') (a real write), and
+ * send_email_from_sender always sends (no action param — every call IS a
+ * send) via sendEmailFromConfiguredSender.
+ *
+ * Unlike twitter_manage_post/post_on_connected_account (one-directional —
+ * post_on_connected_account can never do a thread), this pair is genuinely
+ * BIDIRECTIONAL: whichever tool the account state routes through should
+ * credit the OTHER one too.
+ */
+describe('requirementEvidenceNames aliases the email send substitute (ENG-1276 follow-up #3)', () => {
+  it('credits a SUCCEEDED email(action=send) call toward send_email_from_sender', () => {
+    const ledger = [{ name: 'email', arguments: { action: 'send', to: 'x@y.com' }, result: { success: true } }];
+    expect(requirementEvidenceNames(ledger)).toEqual(['email', 'send_email_from_sender']);
+  });
+
+  it('credits a SUCCEEDED send_email_from_sender call toward email (the reverse direction)', () => {
+    const ledger = [{ name: 'send_email_from_sender', arguments: { to: 'x@y.com' }, result: { success: true } }];
+    expect(requirementEvidenceNames(ledger)).toEqual(['send_email_from_sender', 'email']);
+  });
+
+  it('does NOT alias any non-send email action', () => {
+    const actions = ['search', 'list', 'get'];
+    for (const action of actions) {
+      const ledger = [{ name: 'email', arguments: { action }, result: { success: true } }];
+      expect([action, requirementEvidenceNames(ledger)]).toEqual([action, ['email']]);
+    }
+  });
+
+  it('does NOT alias a FAILED call in either direction', () => {
+    expect(requirementEvidenceNames([{ name: 'email', arguments: { action: 'send' }, error: 'rate limited' }])).toEqual(['email']);
+    expect(requirementEvidenceNames([{ name: 'send_email_from_sender', arguments: {}, error: 'no sender configured' }])).toEqual([
+      'send_email_from_sender',
+    ]);
+  });
+
+  it('suppresses the alias when a schedule requires BOTH email and send_email_from_sender', () => {
+    const emailSend = [{ name: 'email', arguments: { action: 'send' }, result: { success: true } }];
+    expect(requirementEvidenceNames(emailSend, ['email', 'send_email_from_sender'])).toEqual(['email']);
+
+    const senderSend = [{ name: 'send_email_from_sender', arguments: {}, result: { success: true } }];
+    expect(requirementEvidenceNames(senderSend, ['email', 'send_email_from_sender'])).toEqual(['send_email_from_sender']);
+  });
+
+  it('still aliases when only ONE of the pair is required (the realistic case)', () => {
+    const emailSend = [{ name: 'email', arguments: { action: 'send' }, result: { success: true } }];
+    expect(requirementEvidenceNames(emailSend, ['send_email_from_sender'])).toEqual(['email', 'send_email_from_sender']);
+  });
+});
