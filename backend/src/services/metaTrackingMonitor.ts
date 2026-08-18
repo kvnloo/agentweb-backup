@@ -34,6 +34,9 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+
+
 const TAG = '[Tracking Monitor]';
 
 /** Meta's deduplicated conversion rollups. Each is a FAMILY: the bare name plus the
@@ -377,7 +380,7 @@ export async function fetchDailyAdAccountActivity(
 
   try {
     for (let page = 0; page < MAX_INSIGHTS_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
 
       if (!response.ok || body?.error) {
@@ -571,6 +574,16 @@ export const TOKEN_ALERT_CLASS = 'meta-token-invalid';
  *  converts nothing", this says "this account converts, but not the thing it is paying for".
  *  Haven was healthy by the first measure throughout the outage. */
 export const OPTIMISATION_ALERT_CLASS = 'meta-optimisation-event-missing';
+/** §G destination coverage. A THIRD class, distinct from both above: those two ask whether a
+ *  conversion arrived, this asks whether the page could ever have sent one. An account can be
+ *  perfectly healthy on both other measures while one ad points at an uninstrumented lander. */
+export const DESTINATION_ALERT_CLASS = 'meta-destination-unmeasured';
+/** §G Tier 2. A FOURTH class, and the most general: the blackout says "this account converts
+ *  nothing", Tier 1 says "not the thing it pays for", destinations say "this page could never
+ *  send anything", and this says "something that used to arrive reliably has stopped" —
+ *  including events nobody optimises for, which is the only one of the four that can catch a
+ *  silently dropped event with no spend pointed at it. */
+export const EVENT_MIX_ALERT_CLASS = 'meta-event-mix-regression';
 /** Mirrors OPTIMISATION_RECENCY_DAYS for the log line, without importing the module at
  *  top level — this file only pulls metaOptimisationCoverage in lazily. */
 const OPTIMISATION_RECENCY_DAYS_LABEL = 2;
@@ -626,6 +639,26 @@ export interface MonitorDeps {
     adAccountId: string,
     accessToken: string,
   ) => Promise<import('./metaOptimisationCoverage').OptimisationInputs>;
+  fetchDestinations?: (
+    adAccountId: string,
+    accessToken: string,
+  ) => Promise<import('./metaDestinationCoverage').DestinationInputs>;
+  fetchEventMix?: (
+    adAccountId: string,
+    accessToken: string,
+  ) => Promise<AdAccountActivity>;
+  /**
+   * Ad accounts already swept SUCCESSFULLY this run, shared across every user in the sweep.
+   *
+   * The same ad account is connected under several user records in production — 21 connection
+   * rows resolve to 15 distinct accounts, two of them held by three user records each.
+   * Without this, each duplicate is swept in full again: the Meta reads repeat, §G re-fetches
+   * the customer's landing pages, and every per-user counter double-counts (the "2 blackout
+   * but 1 card" discrepancy §40 left unexplained).
+   *
+   * Omit it and nothing dedupes, which is the previous behaviour.
+   */
+  sweptAccountIds?: Set<string>;
 }
 
 export interface MonitorSummary {
@@ -659,6 +692,32 @@ export interface MonitorSummary {
   /** No obtainable evidence: no pixel on the promoted object, or an optimisation §F cannot
    *  count. Logged only, and never allowed to look like a clean pass. */
   optimisationUnconfirmable: number;
+  /** §G destinations — ACTIVE, conversion-optimised ads whose landing page carries no pixel,
+   *  or carries one this ad account does not own. The only destination state that alerts. */
+  destinationAlerts: number;
+  /** Destinations that could not be read (403, timeout, non-2xx) or could not be compared
+   *  (account owns no pixels). Logged only: a site that blocks our fetch is not a defect. */
+  destinationUnverifiable: number;
+  /** Ad+destination pairs confirmed carrying a pixel the account owns. Reported so a sweep
+   *  that checked NOTHING is distinguishable from one that checked everything and found it
+   *  healthy — those look identical in an alert count alone. */
+  destinationOk: number;
+  /** The page read as uninstrumented, but Meta is attributing conversions to that exact ad,
+   *  so something IS reporting. Logged, never paged: our HTML read is an inference and
+   *  Meta's attribution is direct evidence. Usually a client-side pixel injection. */
+  destinationUnconfirmed: number;
+  /** Connections skipped because another user record already swept that ad account
+   *  successfully this run. Surfaced so the saving is visible and a dedupe that starts
+   *  skipping too much cannot hide. */
+  duplicateAccountsSkipped: number;
+  /** §G Tier 2 — conversion families that were reliably arriving and have now stopped. */
+  eventMixRegressions: number;
+  /** Families reliably present AND still arriving. Reported so an account with nothing to
+   *  watch is distinguishable from one being watched and found healthy. */
+  eventMixWatched: number;
+  /** Families absent so long they are the established state rather than a regression.
+   *  Logged every sweep, never paged — the bound on an ambiguity we cannot resolve. */
+  eventMixStale: number;
 }
 
 /** How many days of history each check reads. Comfortably more than the blackout
@@ -686,6 +745,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     optimisationUnconfirmed: 0,
     optimisationUnconfirmable: 0,
     optimisationStaleDelivery: 0,
+    destinationAlerts: 0,
+    destinationUnverifiable: 0,
+    destinationOk: 0,
+    destinationUnconfirmed: 0,
+    duplicateAccountsSkipped: 0,
+    eventMixRegressions: 0,
+    eventMixWatched: 0,
+    eventMixStale: 0,
   };
 
   const fetchActivity =
@@ -714,6 +781,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // Calling Meta with `undefined` would return a token error and alert a human about a
     // connection that does not exist.
     if (!adAccountId || !accessToken) continue;
+
+    // Another user record already swept this exact ad account, successfully, this run. The
+    // second pass would read the same Meta data, re-fetch the same landing pages, and file
+    // findings under a different owner email for the same underlying account.
+    if (deps?.sweptAccountIds?.has(String(adAccountId))) {
+      summary.duplicateAccountsSkipped++;
+      continue;
+    }
 
     summary.accountsChecked++;
 
@@ -761,6 +836,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       continue;
     }
 
+    // Marked only once the read SUCCEEDED. Marking on sight would let the first connection
+    // encountered claim the account even when its token is dead — and production has exactly
+    // that shape: one ad account is connected under a user record whose token lacks
+    // `ads_read` AND under another whose token works. Claiming it on the broken connection
+    // would hide the account from the working one and take it dark, which is strictly worse
+    // than the duplication being removed.
+    deps?.sweptAccountIds?.add(String(adAccountId));
+
     (activity.excludedObjectives || []).forEach((o) => excludedObjectives.add(o));
     (activity.unknownObjectives || []).forEach((o) => unknownObjectives.add(o));
 
@@ -769,6 +852,21 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
     await checkOptimisationCoverage(
+      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+    );
+
+    // Also before the blackout early returns, and for the same reason as Tier 1: an account
+    // whose OTHER landers convert fine is `ok` by the blackout measure while one ad quietly
+    // sends paid traffic to a page that cannot report anything. Gating this behind a blackout
+    // verdict would hide exactly the case it exists to find.
+    await checkDestinationCoverage(
+      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+    );
+
+    // Also before the blackout early returns. Tier 2's whole point is the event that stops
+    // while the account's OTHER conversions keep flowing — which reads as perfectly healthy
+    // to the blackout check, exactly as the August outage did for eight days.
+    await checkEventMixCoverage(
       adAccountId, accessToken, user, summary, alertTransport, now, deps,
     );
 
@@ -1026,5 +1124,247 @@ async function checkOptimisationCoverage(
     // §G is an ADDITION to an existing sweep. Nothing it can do is worth aborting the
     // blackout check that was already working.
     console.warn(`${TAG} ${adAccountId}: §G optimisation check failed — ${error?.message}`);
+  }
+}
+
+/**
+ * §G destination coverage — is an ACTIVE ad paying to send traffic to a page that cannot
+ * measure it, or to one wired to somebody else's pixel?
+ *
+ * ENG-941 asks this once at launch. The card says that is not enough: a pixel that breaks in
+ * week three, or a lander swapped after approval, is invisible to a launch-time gate.
+ */
+async function checkDestinationCoverage(
+  adAccountId: string,
+  accessToken: string,
+  user: any,
+  summary: MonitorSummary,
+  alertTransport: AlertTransport,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const {
+      fetchDestinationInputs, evaluateDestinationCoverage,
+    } = await import('./metaDestinationCoverage');
+
+    const fetchDestinations =
+      deps?.fetchDestinations ?? ((id: string, token: string) => fetchDestinationInputs(id, token));
+    const inputs = await fetchDestinations(adAccountId, accessToken);
+    if (inputs.status !== 'ok') {
+      // Transient by definition — the same call §F makes on every other read failure.
+      console.warn(`${TAG} ${adAccountId}: destinations unavailable for §G — ${inputs.error}`);
+      return;
+    }
+
+    const verdict = evaluateDestinationCoverage(
+      inputs.ads, inputs.observations, inputs.ownedPixelIds, inputs.attributedConversionsByAd,
+    );
+
+    summary.destinationOk += verdict.okCount;
+    summary.destinationUnverifiable += verdict.unverifiable.length;
+    summary.destinationUnconfirmed += verdict.unconfirmed.length;
+
+    if (verdict.unconfirmed.length) {
+      console.log(
+        `${TAG} ${adAccountId}: ${verdict.unconfirmed.length} destination(s) read as ` +
+        `uninstrumented but their ads ARE being credited with conversions — most likely a ` +
+        `client-side pixel our HTML read cannot see, not alerting: ` +
+        verdict.unconfirmed.map((f) => `"${f.adName || f.adId}" -> ${f.url}`).join('; '),
+      );
+    }
+
+    if (verdict.unverifiable.length || inputs.urlsNotChecked.length) {
+      console.log(
+        `${TAG} ${adAccountId}: §G could not judge ${verdict.unverifiable.length} destination(s)` +
+        `${inputs.urlsNotChecked.length ? `, ${inputs.urlsNotChecked.length} past the cap` : ''}` +
+        // Only append the detail list when there IS one. The two halves of the condition are
+        // independent, so a cap-only case would otherwise log a trailing "— " with nothing after it.
+        `${verdict.unverifiable.length
+          ? ` — ${verdict.unverifiable.map((u) => `${u.url} (${u.error})`).join('; ')}`
+          : ''}`,
+      );
+    }
+
+    if (!verdict.alerting.length) return;
+    summary.destinationAlerts += verdict.alerting.length;
+
+    const describe = (f: { adName?: string; adId: string; url: string; reason: string; detectedPixelIds: string[] }) =>
+      `"${f.adName || f.adId}" → ${f.url} — ` +
+      (f.reason === 'no_pixel'
+        ? 'no Meta pixel in the served page'
+        : `pixel ${f.detectedPixelIds.join(', ')}, which this ad account does not own`);
+
+    const foreign = verdict.alerting.filter((f) => f.reason === 'foreign_pixel');
+
+    await raise(
+      alertTransport,
+      // One alert per ACCOUNT per day. Several ads on one bad lander are one fault with one
+      // fix, and filing each separately is how a detector becomes a flood.
+      `${DESTINATION_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} is paying for traffic to ${verdict.alerting.length} destination(s) that cannot report conversions`,
+      [
+        `${verdict.alerting.length} ACTIVE, conversion-optimised ad(s) on ad account ${adAccountId}`,
+        'send paid traffic to a page that cannot report a conversion back to this account:',
+        '',
+        ...verdict.alerting.map((f) => `  • ${describe(f)}`),
+        '',
+        'This is the failure that cost RankAI ~$5,202 and the account: spend left, clicks',
+        'arrived, and the conversion column stayed empty for a reason nothing reported.',
+        foreign.length
+          ? 'At least one page IS instrumented — with a pixel this account does not own, so the\n' +
+            'conversions are being reported to somebody else. A "is there any tracking?" check\n' +
+            'passes this, which is why ownership is the test.'
+          : 'Every page named above served no Meta pixel at all.',
+        '',
+        'Checked by reading the page HTML this account\'s ads actually point at. A page that',
+        'installs its pixel only via client-side JavaScript can read as uninstrumented here —',
+        'confirm in a browser before changing a campaign.',
+      ].join('\n'),
+      {
+        'Alert Class': DESTINATION_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Destinations Affected': verdict.alerting.length,
+        'Reasons': [...new Set(verdict.alerting.map((f) => f.reason))].join(', '),
+        'Account Pixels': inputs.ownedPixelIds.join(', ') || 'none',
+        'Ads Manager': `https://business.facebook.com/adsmanager/manage/ads?act=${adAccountId}`,
+      },
+    );
+  } catch (error: any) {
+    // Same containment as Tier 1: this is an addition to a sweep that already works.
+    console.warn(`${TAG} ${adAccountId}: §G destination check failed — ${error?.message}`);
+  }
+}
+
+/**
+ * §G Tier 2 — has a conversion family that used to arrive reliably stopped arriving?
+ *
+ * The one check of the four that can see an event dropped with NOBODY optimising for it.
+ * Tier 1 reads `promoted_object`, so it is structurally blind to that; the blackout check
+ * reads totals, so an account whose other conversions keep flowing looks healthy throughout.
+ * That is exactly how a managed client's `CompleteRegistration` ran dark for 8+ days.
+ *
+ * Its own 30-day read, separate from the blackout's 7-day one. Widening the shared window
+ * instead would silently change what `evaluateAdAccountDays` streaks over, and that function
+ * decides whether a customer gets paged.
+ */
+async function checkEventMixCoverage(
+  adAccountId: string,
+  accessToken: string,
+  user: any,
+  summary: MonitorSummary,
+  alertTransport: AlertTransport,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const { evaluateEventMix, EVENT_MIX_WINDOW_DAYS, EVENT_MIX_ABSENCE_DAYS } =
+      await import('./metaEventMixCoverage');
+
+    const fetchEventMix =
+      deps?.fetchEventMix ??
+      ((id: string, token: string) => fetchDailyAdAccountActivity(id, token, EVENT_MIX_WINDOW_DAYS));
+    const activity = await fetchEventMix(adAccountId, accessToken);
+    if (activity.status !== 'ok') {
+      // Transient by definition — the same call every other read failure in this file makes.
+      console.warn(`${TAG} ${adAccountId}: event-mix history unavailable — ${activity.error}`);
+      return;
+    }
+
+    // The sweep's own date, so "has it stopped" is judged against today rather than against
+    // whatever the newest row Meta happened to return is.
+    const asOf = new Date(now).toISOString().slice(0, 10);
+    const verdict = evaluateEventMix(activity.days, asOf);
+
+    summary.eventMixWatched += verdict.healthy.length;
+
+    if (verdict.insufficientHistory) {
+      // Said out loud rather than passed over in silence: "no history to judge" and "judged
+      // and healthy" are different states, and only one of them is reassuring.
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 has too little spending history to judge ` +
+        `(${verdict.spendingDaysConsidered} spending day(s) in the window)`,
+      );
+      return;
+    }
+    if (verdict.tooSparse.length) {
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 not watching ${verdict.tooSparse.length} family(ies) — ` +
+        `too sparse to have a baseline: ${verdict.tooSparse.join(', ')}`,
+      );
+    }
+    if (verdict.stale.length) {
+      // Long-dead families. Reported on EVERY sweep so they never quietly disappear, and
+      // never paged: past the cap this is the established state rather than a regression,
+      // and most often a deliberately retired funnel we cannot distinguish from a break.
+      summary.eventMixStale += verdict.stale.length;
+      console.log(
+        `${TAG} ${adAccountId}: §G Tier 2 — ${verdict.stale.length} family(ies) absent too long ` +
+        `to still be a regression, not alerting: ` +
+        verdict.stale.map((f) => `${f.family} (last seen ${f.lastSeen})`).join('; '),
+      );
+    }
+
+    if (!verdict.alerting.length) return;
+    summary.eventMixRegressions += verdict.alerting.length;
+
+    const worst = verdict.alerting.reduce((a, b) =>
+      b.spendDuringAbsence > a.spendDuringAbsence ? b : a);
+
+    await raise(
+      alertTransport,
+      // One alert per ACCOUNT per day. Several families stopping together is almost always
+      // ONE cause — a removed snippet, a broken deploy — and filing each separately is how a
+      // detector becomes a flood.
+      `${EVENT_MIX_ALERT_CLASS}:${adAccountId}`,
+      now,
+      `Meta ad account ${adAccountId} has stopped receiving ${verdict.alerting.length} conversion event(s) it used to receive reliably`,
+      [
+        `${verdict.alerting.length} conversion family(ies) that arrived reliably on this account`,
+        `have now been absent for ${EVENT_MIX_ABSENCE_DAYS}+ consecutive SPENDING days:`,
+        '',
+        ...verdict.alerting.map((f) =>
+          `  • ${f.family} — present on ${f.presentDays} of ${f.spendingDays} spending day(s), ` +
+          `last seen ${f.lastSeen}, absent ${f.consecutiveAbsentSpendingDays} spending day(s) since, ` +
+          `$${f.spendDuringAbsence} spent meanwhile`),
+        '',
+        'This is the failure that ran for 8+ days on a managed client in August 2026: a',
+        'tracking wrapper was removed, one event stopped arriving, and NOTHING could see it —',
+        'the account kept converting on its other events, so the blackout check stayed green,',
+        'and no ad set optimised for the dropped one, so §G Tier 1 stayed silent too.',
+        '',
+        'Check whether the event still fires on the site at all. A deploy, a tag-manager',
+        'change, or a removed snippet are the usual causes. NOTE: this is measured from',
+        'ad-ATTRIBUTED conversions, so an event that still fires for organic visitors but has',
+        'stopped for ad traffic looks identical here.',
+      ].join('\n'),
+      {
+        'Alert Class': EVENT_MIX_ALERT_CLASS,
+        'Alert Priority': 'high',
+        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
+        'Owner Email': user?.email,
+        'Families Affected': verdict.alerting.map((f) => f.family).join(', '),
+        'Longest Absence (spending days)': worst.consecutiveAbsentSpendingDays,
+        // The UNION across families, not the sum. Each finding's own figure is account spend
+        // over ITS absent days, so adding them counts the same days once per family — three
+        // families absent on the same five days would report triple what the account spent.
+        'Spend During Absence': `$${verdict.combinedSpendDuringAbsence.toFixed(2)}`,
+        'Still Watching': verdict.healthy.join(', ') || 'none',
+        // If Meta RENAMES an action type, the old family vanishes on every account at once and
+        // each looks like a regression. Putting the unknown names next to the missing one makes
+        // that obvious at a glance instead of after an investigation.
+        'Unrecognised Action Types Seen': summary.unrecognizedActionTypes.join(', ') || 'none',
+        'Events Manager': 'https://business.facebook.com/events_manager2/list/dataset',
+        'Ads Manager': `https://business.facebook.com/adsmanager/manage/campaigns?act=${adAccountId}`,
+      },
+    );
+  } catch (error: any) {
+    // Same containment as the other three: an addition must never abort a sweep that works.
+    console.warn(`${TAG} ${adAccountId}: §G Tier 2 check failed — ${error?.message}`);
   }
 }

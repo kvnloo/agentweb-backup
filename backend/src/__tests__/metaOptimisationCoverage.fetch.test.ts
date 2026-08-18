@@ -9,6 +9,7 @@
  */
 
 import { fetchOptimisationInputs, MAX_PIXELS_CHECKED } from '../services/metaOptimisationCoverage';
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
 
 const ok = (body: any) => ({ ok: true, status: 200, json: async () => body });
 const fail = (error: any, status = 400) => ({ ok: false, status, json: async () => ({ error }) });
@@ -258,5 +259,30 @@ describe('fetchOptimisationInputs — remaining shapes seen in the wild', () => 
     const result = await fetchOptimisationInputs('123', 'tok');
     expect(result.status).toBe('ok');
     spy.mockRestore();
+  });
+});
+
+describe('ENG-1326 — every Graph read is bounded', () => {
+  it('passes an abort deadline on EVERY request, not just the first', async () => {
+    // These are awaited inside a loop over every user and every ad account, and Node's fetch
+    // applies no default deadline. One connection that accepts a request and never completes
+    // the response stalls the rest of the daily sweep — which reads in the logs as "the cron
+    // did not run" rather than as a network fault.
+    const fetchImpl = jest.fn()
+      .mockResolvedValueOnce(ok({ data: [adSet('as1', 'pix1')] }))
+      .mockResolvedValue(ok(statsBody([{ Lead: 1 }])));
+
+    await fetchOptimisationInputs('act1', 'tok', { fetchImpl: fetchImpl as any });
+
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(1);
+    for (const call of fetchImpl.mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('uses the SHARED constant, so the three monitor modules cannot drift apart', () => {
+    // ENG-683: a map duplicated across four files diverged. One definition, imported.
+    expect(META_GRAPH_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(META_GRAPH_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
   });
 });
