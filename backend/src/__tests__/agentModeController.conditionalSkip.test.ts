@@ -445,9 +445,9 @@ describe('scheduledRunSignalsConditionalSkip', () => {
   // the same review before it can ship silently.
   //
   // Disposition of every pair found as of this audit:
-  //   - twitter_manage_post -> post_on_connected_account: REAL bug (Kevin's
-  //     three schedules, 10+ Linear duplicates 2026-08-03..08-12). FIXED —
-  //     aliased (post_thread action only).
+  //   - twitter_manage_post -> post_on_connected_account: REAL bug (three
+  //     production schedules, 10+ Linear duplicates 2026-08-03..08-12). FIXED
+  //     — aliased (post_thread action only).
   //   - email -> send_email_from_sender, send_email_from_sender -> email: same
   //     shape, verified via both execute() paths (email's send action is a real
   //     write through resolveEmailAccount(..., 'send'); send_email_from_sender

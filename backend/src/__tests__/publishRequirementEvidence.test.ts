@@ -109,11 +109,10 @@ describe('requirementEvidenceNames (ENG-947)', () => {
  * schedule has no way to know its agent will reach for the thread-specific tool,
  * so a real, successful, irreversible publish never satisfied the requirement
  * and the run was pressed to publish a DUPLICATE thread for the full 20-attempt
- * budget (real prod session 0ef2078d, 2026-08-12: "Kevin — X Evening Post"
- * published a 3-tweet thread via twitter_manage_post(post_thread), then got
- * nudged 19 times with "Please try again. Make sure to
- * post_on_connected_account" even though re-calling it would have duplicated a
- * live post).
+ * budget (ENG-1276: a real production run published a 3-tweet thread via
+ * twitter_manage_post(post_thread), then got nudged 19 times with "Please try
+ * again. Make sure to post_on_connected_account" even though re-calling it
+ * would have duplicated a live post).
  *
  * Every OTHER twitter_manage_post action (reply/quote_tweet/like/unlike/
  * retweet/unretweet/delete_tweet/get_tweet_metrics/list_replies/...) is not a
@@ -196,7 +195,7 @@ describe('requirementEvidenceNames suppresses the alias when both names are sepa
     expect(requirementEvidenceNames(succeededPostThread)).toEqual(['twitter_manage_post', 'post_on_connected_account']);
   });
 
-  it('still aliases when the schedule requires ONLY post_on_connected_account (the evidenced Kevin case)', () => {
+  it('still aliases when the schedule requires ONLY post_on_connected_account (the evidenced production case)', () => {
     expect(requirementEvidenceNames(succeededPostThread, ['post_on_connected_account', 'generate_image'])).toEqual([
       'twitter_manage_post',
       'post_on_connected_account',

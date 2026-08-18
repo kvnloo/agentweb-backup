@@ -99,10 +99,10 @@ export function countsTowardRequirement(toolCall: any): boolean {
  * agent will legitimately reach for the thread-specific tool instead, so a real,
  * successful, irreversible publish never satisfied the requirement and the run
  * was pressed to publish a DUPLICATE thread for the full 20-attempt retry
- * budget (real prod session 0ef2078d, 2026-08-12: "Kevin — X Evening Post"
- * published a 3-tweet thread via twitter_manage_post(post_thread), then was
- * nudged 19 more times even though re-calling post_on_connected_account would
- * have duplicated a post already live).
+ * budget (ENG-1276: a real production run published a 3-tweet thread via
+ * twitter_manage_post(post_thread), then was nudged 19 more times even though
+ * re-calling post_on_connected_account would have duplicated a post already
+ * live).
  *
  * Scoped to exactly the one action that creates the kind of new top-level post
  * post_on_connected_account would have: post_thread. Every other
@@ -161,8 +161,9 @@ const REQUIREMENT_ALIASES: Array<{ name: string; aliasFor: string; matchesAction
  * satisfying both — so the alias is suppressed exactly when the schedule
  * requires BOTH the alias's source name AND its target name as separate
  * requirements. Requiring only one of the two (or neither) is exactly what
- * every EVIDENCED schedule does — Kevin's three schedules require only
- * post_on_connected_account, never twitter_manage_post itself — and aliasing
+ * every EVIDENCED schedule does — the three production schedules behind
+ * ENG-1276 require only post_on_connected_account, never twitter_manage_post
+ * itself — and aliasing
  * stays on: crediting a name nobody is checking is inert, not a double-credit.
  * Omitted (legacy callers, or a caller with no requirement list handy) keeps
  * always-aliasing too.
