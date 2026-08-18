@@ -1850,8 +1850,23 @@ export function scheduledRunSignalsConditionalSkip(
   // consumes up to its NEAREST failure word, a later, un-negated failure word in
   // the same sentence (no cue of its own) is untouched — "not a failure of the
   // schedule, but image generation failed" neutralizes only the first mention.
+  //
+  // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
+  // #3) of the widening above — NOT a production incident, but a real gap in
+  // the same direction as the one that already broke twice:
+  //   (1) A cue immediately followed by a comma — "No,", "Not," — is
+  //       grammatically an INTERJECTION introducing an independent clause
+  //       ("the answer is no; separately, X happened"), not a negator of
+  //       whatever follows it. Without this, "No, unfortunately, today's run
+  //       failed for unknown reasons." bridged clean across the comma (no
+  //       "but"/semicolon in the way) and wrongly neutralized a genuine,
+  //       unrelated failure. None of the legitimate cases above have a comma
+  //       directly after the cue, so excluding it costs nothing real.
+  //   (2) The span is capped at 20 characters — every legitimate case here
+  //       needs at most ~9 ("a single ") — as an independent backstop against
+  //       an unforeseen long bridge neither guard above catches.
   const NEGATED_FAILURE_MENTION =
-    /\b(?:not|no|never|without)\b(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:])*?\b(?:failed|failures?|errors?|errored)\b/gi;
+    /\b(?:not|no|never|without)\b(?!\s*,)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
   const failureScan = expandContractions(
     text
       .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
