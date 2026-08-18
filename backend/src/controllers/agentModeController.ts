@@ -1854,19 +1854,43 @@ export function scheduledRunSignalsConditionalSkip(
   // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
   // #3) of the widening above — NOT a production incident, but a real gap in
   // the same direction as the one that already broke twice:
-  //   (1) A cue immediately followed by a comma — "No,", "Not," — is
-  //       grammatically an INTERJECTION introducing an independent clause
-  //       ("the answer is no; separately, X happened"), not a negator of
-  //       whatever follows it. Without this, "No, unfortunately, today's run
-  //       failed for unknown reasons." bridged clean across the comma (no
-  //       "but"/semicolon in the way) and wrongly neutralized a genuine,
-  //       unrelated failure. None of the legitimate cases above have a comma
-  //       directly after the cue, so excluding it costs nothing real.
+  //   (1) A BARE "no" immediately followed by a comma is grammatically an
+  //       INTERJECTION introducing an independent clause ("the answer is no;
+  //       separately, X happened"), not a negator of whatever follows it.
+  //       Without this, "No, unfortunately, today's run failed for unknown
+  //       reasons." bridged clean across the comma (no "but"/semicolon in the
+  //       way) and wrongly neutralized a genuine, unrelated failure.
+  //       Deliberately scoped to "no" ONLY, not "not"/"never"/"without" — an
+  //       independent review (ENG-1276 follow-up, not a production incident)
+  //       found that those three keep negating ACROSS a comma-set-off
+  //       parenthetical ("Without, admittedly, any failure occurring..." still
+  //       means no failure happened), so excluding the comma there wrongly
+  //       reverted legitimate cases to vetoing.
   //   (2) The span is capped at 20 characters — every legitimate case here
-  //       needs at most ~9 ("a single ") — as an independent backstop against
-  //       an unforeseen long bridge neither guard above catches.
+  //       needs at most ~9 ("a single ") — as an independent backstop. This
+  //       is a DELIBERATE trade-off, not just a safety margin: the same review
+  //       found the cap also blocks a long parenthetical after "never"/"not"
+  //       ("Never, in this case, did we see a failure" — 28 characters to the
+  //       failure word), which stays un-neutralized (an unusual phrasing still
+  //       causes a retry — safe direction). Widening the cap to accommodate
+  //       that would reopen a MORE realistic and MORE dangerous gap in the
+  //       other direction: "Not entirely sure why the deployment failed
+  //       today" is a genuine failure report (the hedge is about the CAUSE,
+  //       not a denial it happened) that must NOT get silently waived.
+  //
+  // KNOWN, DELIBERATELY UNHANDLED LIMITATION (found on the same review, not a
+  // production incident): double negation. "It is not true that there was no
+  // failure today" re-asserts a real failure, but this pattern only sees the
+  // inner "no failure" and neutralizes it, so the outer negation's flip is
+  // lost. This phrasing register (nested logical negation) is a mismatch for
+  // what an LLM writes in a terse scheduled-run status line — every real
+  // production transcript behind this function's other tests is direct
+  // ("Sunday. No.", "not by failure") — so detecting it would mean tracking
+  // negation-of-negation depth, a materially bigger and riskier change than
+  // the pattern-matching this function already does, for a case with no
+  // observed real-world occurrence. Documented rather than fixed.
   const NEGATED_FAILURE_MENTION =
-    /\b(?:not|no|never|without)\b(?!\s*,)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+    /\b(?:no(?!\s*,)|not|never|without)\b(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
   const failureScan = expandContractions(
     text
       .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
