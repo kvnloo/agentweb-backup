@@ -136,9 +136,23 @@ const REQUIREMENT_ALIASES: Array<{ name: string; aliasFor: string; matchesAction
  * builds this ledger in three places (the resumed-run seed, the completion-gate
  * continuation turn, and the main turn) and they must not drift — three private
  * copies of a rule is precisely how the bug above survived.
+ *
+ * `requiredFunctionNames` (ENG-1276 follow-up) is the calling schedule's OWN
+ * requiredFunctionCalls, when the caller has it to hand. A schedule that
+ * requires BOTH post_on_connected_account AND twitter_manage_post as separate
+ * line items wants two distinct actions, not one thread-post call silently
+ * satisfying both — so the alias is suppressed exactly when the schedule
+ * requires BOTH the alias's source name AND its target name as separate
+ * requirements. Requiring only one of the two (or neither) is exactly what
+ * every EVIDENCED schedule does — Kevin's three schedules require only
+ * post_on_connected_account, never twitter_manage_post itself — and aliasing
+ * stays on: crediting a name nobody is checking is inert, not a double-credit.
+ * Omitted (legacy callers, or a caller with no requirement list handy) keeps
+ * always-aliasing too.
  */
-export function requirementEvidenceNames(toolCalls: any[]): string[] {
+export function requirementEvidenceNames(toolCalls: any[], requiredFunctionNames?: Iterable<string>): string[] {
   if (!Array.isArray(toolCalls)) return [];
+  const requiredSet = requiredFunctionNames ? new Set(requiredFunctionNames) : null;
   const names: string[] = [];
   for (const call of toolCalls) {
     if (!countsTowardRequirement(call)) continue;
@@ -148,7 +162,9 @@ export function requirementEvidenceNames(toolCalls: any[]): string[] {
     // SAME success bar a real post_on_connected_account call would need — an
     // attempted-but-failed thread must not silently satisfy the requirement.
     const alias = REQUIREMENT_ALIASES.find((a) => a.name === call.name && a.matchesAction(toolCallAction(call)));
-    if (alias && toolCallSucceeded(call)) names.push(alias.aliasFor);
+    if (!alias || !toolCallSucceeded(call)) continue;
+    if (requiredSet && requiredSet.has(alias.name) && requiredSet.has(alias.aliasFor)) continue;
+    names.push(alias.aliasFor);
   }
   return names;
 }

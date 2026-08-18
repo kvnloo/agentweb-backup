@@ -2578,7 +2578,8 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
+  const requiredFunctionNames = requiredFunctions.map((reqFunc) => reqFunc.functionName);
+  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? [], requiredFunctionNames);
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2823,7 +2824,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...requirementEvidenceNames(continuationToolCalls)
+          ...requirementEvidenceNames(continuationToolCalls, requiredFunctionNames)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2965,7 +2966,7 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
+      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls, requiredFunctionNames));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -4411,32 +4412,30 @@ export async function runScheduledChat(
     // result email, and the reassuring one is the one that is wrong.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
+    // ENG-827: filter to the requirements this run was actually HELD TO —
+    // publish-scope-filtered, not the raw schedule config — BEFORE building the
+    // requirement evidence, so a run authorized for only one of a
+    // twitter_manage_post/post_on_connected_account pair (ENG-1276 follow-up)
+    // sees the same held-to set the alias suppression checks against. Reading
+    // the unfiltered config here persisted a self-contradicting record on an
+    // unauthorized run: `post_on_connected_account {required: 1, actual: 0}`
+    // sitting next to an empty functionCallMisses and passed: true. Nothing
+    // downstream can tell that apart from a genuine silent miss, which is the
+    // false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt, the evidence ledger, and this record.
+    // ENG-827: filtered against `effectivePublishAuthorization` — the authorization
+    // the run FINISHED under, which differs from the admitted one when the owner
+    // revoked consent mid-run.
+    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    requirementEvidenceNames(result.toolCalls, heldToFunctionNames).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
-
-    // ENG-827: report the requirements this run was actually HELD TO, which is the
-    // publish-scope-filtered list the checker used above — not the raw schedule
-    // config. Reading the unfiltered config here persisted a self-contradicting
-    // record on an unauthorized run: `post_on_connected_account {required: 1,
-    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
-    // Nothing downstream can tell that apart from a genuine silent miss, which is
-    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
-    // feeds the checker, the prompt and this record.
-    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
-    // run FINISHED under, which differs from the admitted one when the owner revoked
-    // consent mid-run. Reading the raw schedule config here instead persisted a
-    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
-    // next to an empty functionCallMisses on a passing run. Nothing downstream can
-    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
-    // ENG-764 had to unpick.
-    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
-      .forEach((functionName: string) => {
-        finalFunctionCallDetails[functionName] = {
-          actual: actualFunctionCallCounts[functionName] || 0,
-          required: functionCallMinCalls[functionName] || 1
-        };
-      });
+    heldToFunctionNames.forEach((functionName: string) => {
+      finalFunctionCallDetails[functionName] = {
+        actual: actualFunctionCallCounts[functionName] || 0,
+        required: functionCallMinCalls[functionName] || 1
+      };
+    });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
