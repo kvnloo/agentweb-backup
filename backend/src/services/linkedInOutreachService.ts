@@ -1458,6 +1458,18 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
+    const { accountId } = await this.resolveAccountIdWithSource(userId);
+    return accountId;
+  }
+
+  /**
+   * Same resolution as resolveAccountId, but also reports whether the
+   * returned account came from the user's own connected accounts or the
+   * site-wide shared pool. Callers whose responses carry viewer-relative data
+   * (network_distance, dedup-against-pending-invites) need this to avoid
+   * silently presenting another account's network as the user's own (ENG-1198).
+   */
+  async resolveAccountIdWithSource(userId: string): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
     // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
     //    session is still live. A single disconnected account must not shadow a
     //    working one, nor force a needless fall-through to the shared site-wide
@@ -1472,7 +1484,7 @@ export class LinkedInOutreachService {
       const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
       for (const account of userAccounts) {
         if (await this.isAccountConnected(account.account_id)) {
-          return account.account_id;
+          return { accountId: account.account_id, usedSharedAccount: false };
         }
         this.log(`User account ${account.account_id} is disconnected — trying next own account`);
       }
@@ -1489,14 +1501,14 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (await this.isAccountConnected(account.account_id)) {
-            return account.account_id;
+            return { accountId: account.account_id, usedSharedAccount: true };
           }
           this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
 
-    return null;
+    return { accountId: null, usedSharedAccount: false };
   }
 
   /**

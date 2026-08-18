@@ -56,7 +56,7 @@ describe('fetchDailyAdAccountActivity', () => {
 
     expect(result.status).toBe('ok');
     expect(result.days).toEqual([
-      { date: '2026-06-08', spend: 199.96, conversions: 17, unrecognized: [] },
+      { date: '2026-06-08', spend: 199.96, conversions: 17, unrecognized: [], families: ['lead'] },
     ]);
   });
 
@@ -136,6 +136,7 @@ describe('fetchDailyAdAccountActivity', () => {
       spend: 10,
       conversions: 0,
       unrecognized: [],
+      families: [],
     });
   });
 });
