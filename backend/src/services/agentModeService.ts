@@ -22,6 +22,7 @@ import {
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
+import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
@@ -4662,7 +4663,7 @@ export class AgentModeService {
             console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
             (messages as any[]).push({
               role: 'user',
-              content: '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.'
+              content: ANTI_LOOP_STOP_MESSAGE,
             });
           }
         } else {
@@ -5302,7 +5303,15 @@ export class AgentModeService {
    * scratch — an expensive, non-converging loop. Surfacing the existing filenames
    * lets the model generate only what's missing and then advance the step.
    */
-  public static extractGeneratedImageFilenames(sessionHistory?: any[]): string[] {
+  /**
+   * `sinceIso` (ENG-1188): when set, only images generated at or after this
+   * timestamp count — used to scope a work-plan step's produced-asset count to
+   * that step alone rather than the whole session (see setWorkPlanStatus). A
+   * marker with no timestamp (only possible on messages from before the
+   * `metadata.timestamp` field existed) is counted regardless, so this can never
+   * make an old in-flight session's count go DOWN relative to the unscoped call.
+   */
+  public static extractGeneratedImageFilenames(sessionHistory?: any[], sinceIso?: string): string[] {
     if (!Array.isArray(sessionHistory)) return [];
     const seen = new Set<string>();
     const filenames: string[] = [];
@@ -5318,6 +5327,8 @@ export class AgentModeService {
         if (match) filename = match[1].trim();
       }
       if (!filename || seen.has(filename)) continue;
+      const timestamp = typeof msg.metadata?.timestamp === 'string' ? msg.metadata.timestamp : undefined;
+      if (sinceIso && timestamp && timestamp < sinceIso) continue;
       seen.add(filename);
       filenames.push(filename);
     }
@@ -29520,7 +29531,14 @@ ${strippedHtml}`;
     sessionId: string
   ): Promise<any> {
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
+      // ENG-1188 (Greptile): consistentRead, not the default eventually-consistent
+      // read -- a turn that writes an "Image generated" marker and then
+      // immediately calls set_work_plan_status in the same turn can otherwise race
+      // a stale replica and see too few images, rejecting genuinely-complete work
+      // as insufficientAssets. ENG-510 built this parameter for exactly this "just
+      // wrote it, must see it now" shape (agentModeController.ts already uses it
+      // for the analogous timed-out-run read).
+      const session = await chatbotDb.getChatSession(sessionId, true);
       if (!session || !session.workPlan) {
         return {
           success: false,
@@ -29528,21 +29546,38 @@ ${strippedHtml}`;
         };
       }
 
+      // ENG-1188 (Greptile follow-up): each step's PRE-BATCH resolvedAt/completedAt
+      // AND status, captured before any update in THIS call runs. workPlan.steps
+      // below starts as the SAME array session.workPlan.steps points at (the
+      // spread on the next line only copies the top-level object), so an
+      // in-place `workPlan.steps[i] = {...}` replacement further down is visible
+      // through both references — reading a "live" cutoff would see this batch's
+      // OWN just-assigned timestamps, collapsing every step resolved together in
+      // one call to the same instant and wrongly excluding assets a later step in
+      // that same batch actually produced in an earlier turn.
+      //
+      // Status is captured alongside the timestamp (CodeRabbit, PR #2430): a step
+      // that was completed/skipped and later reset to 'pending' (e.g. its assets
+      // need regenerating) keeps its old resolvedAt/completedAt untouched — only
+      // a 'completed'/'skipped' transition refreshes those fields. Blindly trusting
+      // that stale timestamp as a cutoff for a later step would wrongly widen the
+      // asset-count window with assets from the step's earlier, now-superseded
+      // attempt — see the cutoff walk below for how a reset step's PRE-BATCH
+      // status routes it to its fresh LIVE timestamp instead.
+      const originalStepStateByCount = new Map<number, { resolvedAt: string | undefined; status: string }>(
+        session.workPlan.steps.map((s: any) => [s.stepCount, { resolvedAt: s.resolvedAt || s.completedAt, status: s.status }])
+      );
+
       const workPlan = { ...session.workPlan };
       const updatedSteps: Array<{ stepCount: number; title: string; status: string }> = [];
       const notFoundSteps: number[] = [];
       const missingFunctionCalls: Array<{ stepCount: number; title: string; missing: string[] }> = [];
+      const outOfOrderSteps: Array<{ stepCount: number; title: string; pendingSteps: string[] }> = [];
 
       // Get function call counts from session (make a copy to modify)
       const calledFunctionCounts = { ...(session.calledFunctions || {}) };
       let countsModified = false;
 
-      // Count media assets actually produced this session (distinct "Image generated:"
-      // markers), used by the expectedAssetCount completion gate below. This is ground
-      // truth from the message history — independent of the calledFunctions counter,
-      // which can be inflated by non-producing generate_image returns (confirmation
-      // gate). Computed once; cheap relative to the DynamoDB round-trips already done.
-      const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages).length;
       const insufficientAssets: Array<{ stepCount: number; title: string; expected: number; produced: number }> = [];
 
       // Process each update
@@ -29555,6 +29590,29 @@ ${strippedHtml}`;
         }
 
         const step = workPlan.steps[stepIndex];
+
+        // Cross-step ordering gate (ENG-1188 root cause fault #3): the xCures
+        // incident marked "QA, Contact Sheet & Delivery" completed while "Render
+        // the Full Size Matrix" — an earlier step — was still pending, so delivery
+        // never actually gated on the rendering it claimed to deliver. Neither gate
+        // below catches this: both only look at the step being completed, never at
+        // whether the steps before it are actually done. Checked against the
+        // in-progress workPlan.steps (not a snapshot from before the loop), so
+        // several steps completed in the same batch, in order, chain correctly —
+        // and a batch that completes them out of order is caught per-step.
+        if (update.status === 'completed') {
+          const pendingEarlierSteps = workPlan.steps.filter(
+            (s: any) => s.stepCount < step.stepCount && s.status !== 'completed' && s.status !== 'skipped'
+          );
+          if (pendingEarlierSteps.length > 0) {
+            outOfOrderSteps.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              pendingSteps: pendingEarlierSteps.map((s: any) => `${s.stepCount} "${s.title}"`),
+            });
+            continue; // Skip updating this step
+          }
+        }
 
         // Validate required function calls if marking as completed
         if (update.status === 'completed' && step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) {
@@ -29590,8 +29648,8 @@ ${strippedHtml}`;
         }
 
         // Asset-count completion gate. When a step declares expectedAssetCount, it may
-        // not be marked completed until the session has actually produced that many
-        // media assets. This prevents the xCures failure mode: a "Generate 3 Images Per
+        // not be marked completed until IT has actually produced that many media
+        // assets. This prevents the xCures failure mode: a "Generate 3 Images Per
         // Hook — 18 total" step being marked done with only 3 images produced (the model
         // self-reported "Hooks 2-6 generate-pending" yet completed the step). The
         // required-function-calls gate above could not catch this — it only checked that
@@ -29599,25 +29657,84 @@ ${strippedHtml}`;
         // non-producing confirmation-gate returns. Counting real assets is the fix.
         // The user can still legitimately reduce scope via modify_work_plan (lowering or
         // clearing expectedAssetCount), so this never becomes an unrecoverable block.
+        //
+        // ENG-1188: scoped to images generated SINCE the previous step resolved, not
+        // the whole session — otherwise an earlier step's images satisfy a later
+        // step's requirement without it producing anything of its own (e.g. step 1's
+        // 18 hero images would silently cover step 2's own "3 required" declaration).
+        // No earlier step (or none with a resolvedAt yet) means no cutoff, matching
+        // the session-wide count this replaces for step 1.
+        //
+        // ENG-1188 (Greptile follow-up): the cutoff comes from each earlier step's
+        // PRE-BATCH resolvedAt (originalStepStateByCount, captured before this call
+        // started), walking back to the nearest earlier step that already had one —
+        // NOT the live in-progress workPlan.steps. A step resolved earlier in this
+        // SAME batch shares this instant as its live timestamp, which would exclude
+        // assets this step actually produced in an earlier turn; a step resolved
+        // in this same batch simply contributes no cutoff of its own, same as a
+        // step that has never resolved.
+        //
+        // ENG-1188 (CodeRabbit follow-up): a step can be reset to 'pending' after
+        // having been completed/skipped before (e.g. its assets need
+        // regenerating) — only 'completed'/'skipped' transitions stamp
+        // resolvedAt/completedAt, so a reset step KEEPS its stale timestamp from
+        // the earlier, now-superseded attempt. The ordering gate above means the
+        // only way we can reach a 'completed' update here with an earlier step's
+        // PRE-BATCH status of 'pending' is if that earlier step is ALSO being
+        // resolved within this very batch (otherwise it would still be pending
+        // live, too, and the ordering gate would have rejected this update
+        // already). In that case, trust the fresh, just-stamped LIVE timestamp
+        // for that step instead of its stale pre-batch one — that boundary is
+        // exactly "when did this step's redo actually finish," which correctly
+        // excludes both the stale pre-reset attempt's assets AND any redo-work
+        // assets produced leading up to this exact re-completion. A step with NO
+        // prior resolution at all (genuinely first-time-completed within this
+        // batch) still contributes no cutoff, same as the existing behavior.
         if (update.status === 'completed'
           && typeof step.expectedAssetCount === 'number'
-          && step.expectedAssetCount > 0
-          && producedAssetCount < step.expectedAssetCount) {
-          insufficientAssets.push({
-            stepCount: update.stepCount,
-            title: step.title,
-            expected: step.expectedAssetCount,
-            produced: producedAssetCount,
-          });
-          continue; // Skip updating this step
+          && step.expectedAssetCount > 0) {
+          const earlierStepCounts = workPlan.steps
+            .filter((s: any) => s.stepCount < step.stepCount)
+            .map((s: any) => s.stepCount as number)
+            .sort((a: number, b: number) => b - a); // nearest first
+          let sinceIso: string | undefined;
+          for (const count of earlierStepCounts) {
+            const preBatch = originalStepStateByCount.get(count);
+            if (!preBatch) continue;
+            if (preBatch.status === 'completed' || preBatch.status === 'skipped') {
+              if (preBatch.resolvedAt) { sinceIso = preBatch.resolvedAt; break; }
+              continue;
+            }
+            if (preBatch.resolvedAt) {
+              const live = workPlan.steps.find((s: any) => s.stepCount === count);
+              if (live?.resolvedAt) { sinceIso = live.resolvedAt; break; }
+            }
+          }
+          const producedAssetCount = AgentModeService.extractGeneratedImageFilenames(session.messages, sinceIso).length;
+          if (producedAssetCount < step.expectedAssetCount) {
+            insufficientAssets.push({
+              stepCount: update.stepCount,
+              title: step.title,
+              expected: step.expectedAssetCount,
+              produced: producedAssetCount,
+            });
+            continue; // Skip updating this step
+          }
         }
 
         // Update the step status
+        const resolvedNow = update.status === 'completed' || update.status === 'skipped'
+          ? new Date().toISOString()
+          : undefined;
         workPlan.steps[stepIndex] = {
           ...workPlan.steps[stepIndex],
           status: update.status,
           notes: update.notes,
-          completedAt: update.status === 'completed' ? new Date().toISOString() : workPlan.steps[stepIndex].completedAt
+          completedAt: update.status === 'completed' ? resolvedNow : workPlan.steps[stepIndex].completedAt,
+          // ENG-1188 (Greptile follow-up): set for 'skipped' too, unlike completedAt
+          // — see the field's doc comment in chatbotService.ts for why this can't
+          // just reuse completedAt.
+          resolvedAt: resolvedNow || workPlan.steps[stepIndex].resolvedAt,
         };
 
         updatedSteps.push({
@@ -29625,6 +29742,22 @@ ${strippedHtml}`;
           title: workPlan.steps[stepIndex].title,
           status: update.status
         });
+      }
+
+      // Ordering gate failure — a step was completed while an earlier step in the
+      // plan is still pending. Same all-or-nothing shape as the two gates below:
+      // the caller can just resend the batch in the correct order.
+      if (outOfOrderSteps.length > 0) {
+        const errorDetails = outOfOrderSteps.map(oos =>
+          `Step ${oos.stepCount} "${oos.title}": earlier step(s) not yet done: ${oos.pendingSteps.join(', ')}`
+        ).join('\n');
+
+        return {
+          success: false,
+          message: 'Cannot mark steps as completed. Earlier steps in the plan are not done yet.',
+          outOfOrderSteps,
+          formattedContent: `❌ Cannot complete these steps yet:\n${errorDetails}\n\nComplete (or explicitly skip) the earlier step(s) first, then mark this step as completed.`
+        };
       }
 
       // Check if there are missing function calls - this is a critical error
