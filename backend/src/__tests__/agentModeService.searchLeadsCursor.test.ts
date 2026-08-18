@@ -302,3 +302,108 @@ describe('AgentModeService.searchLeads — truncated-page messaging (ENG-1207)',
     expect(result.leads).toHaveLength(20);
   });
 });
+
+/**
+ * ENG-1207 AC2 — "same treatment for `get_leads` and any other cursor-paged agent
+ * tool with a count in its message."
+ *
+ * `getLeads` received the identical fix as `searchLeads` but shipped with no test
+ * of its own, so the AC was met by inspection rather than by evidence. That is the
+ * weaker half of the same defect: the production incident was a MODEL reading
+ * "Found 20 lead(s)" as a complete count and stopping, and `get_leads` is the tool
+ * it reaches for first. A regression in this wording is invisible to types, to
+ * the compiler, and to every other test in the suite.
+ */
+describe('AgentModeService.getLeads — truncated-page messaging (ENG-1207 AC2)', () => {
+  let service: AgentModeService;
+  const userId = 'user-1';
+  const listId = 'list-1';
+  const mockList = { listId, userId, name: 'Test List' };
+
+  const buildLeads = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      leadId: `lead-${String(count - i).padStart(4, '0')}`,
+      listId,
+      email: `user${i}@example.com`,
+      firstName: `First${i}`,
+      lastName: `Last${i}`,
+      company: `Co${i}`,
+      title: 'Engineer',
+      customFields: {},
+    }));
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+  });
+
+  it('does not phrase a truncated page as a total', async () => {
+    // The exact production failure, in the tool the model reaches for first.
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.has_more).toBe(true);
+    expect(result.message).not.toMatch(/^Found 20 lead\(s\)$/);
+  });
+
+  it('says the page is partial and names the way to continue', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.message).toMatch(/first 20/i);
+    expect(result.message).toMatch(/more/i);
+    expect(result.message).toMatch(/next_cursor/);
+  });
+
+  it('does NOT invent a total it never scanned', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.message).not.toMatch(/of \d+/i);
+  });
+
+  it('still reports an exhaustive result as a plain total', async () => {
+    // No cursor back means the listing completed, so the count IS the total and
+    // must keep reading as one — over-hedging a complete answer is its own defect.
+    const leads = buildLeads(5);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: undefined } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.has_more).toBe(false);
+    expect(result.message).toBe('Found 5 lead(s)');
+  });
+
+  it('hands back a usable cursor with the truncated page', async () => {
+    // The wording tells the model to pass next_cursor; that only helps if one is
+    // actually returned.
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(typeof result.next_cursor).toBe('string');
+    expect(result.next_cursor.length).toBeGreaterThan(0);
+    expect(result.leads).toHaveLength(20);
+  });
+});
