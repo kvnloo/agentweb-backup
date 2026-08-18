@@ -336,28 +336,49 @@ describe('buildLinkedInContextFromCache', () => {
     expect(ctx).not.toContain('Resolved LinkedIn profile URL');
   });
 
-  it('strips the fabricated /in/undefined out of a row cached before the write-side fix', () => {
-    // A cache hit replays the stored blob verbatim, so rows written while the
-    // anonymized sentinel was still being persisted would keep handing the LLM a
-    // profile URL that resolves to nobody — long after the write path stopped
-    // producing them.
-    const poisoned = {
-      ...MOCK_PERSON_RAW_DATA,
-      linkedinData: {
-        ...(MOCK_PERSON_RAW_DATA as any).linkedinData,
-        rawProfile: {
-          public_identifier: 'undefined',
-          public_profile_url: 'https://www.linkedin.com/in/undefined',
-          headline: 'CEO at Acme',
-        },
+  // A row cached before the sentinel was rejected on the WRITE path. Both halves are
+  // poisoned, and they are stored separately: the blob under `rawProfile`, and the
+  // slug under its own `publicIdentifier` attribute. `person_identity` caches for 90
+  // days, so these rows outlive the write-side fix by a full quarter.
+  const poisonedRow = {
+    ...MOCK_PERSON_RAW_DATA,
+    linkedinData: {
+      ...(MOCK_PERSON_RAW_DATA as any).linkedinData,
+      publicIdentifier: 'undefined',
+      rawProfile: {
+        public_identifier: 'undefined',
+        public_profile_url: 'https://www.linkedin.com/in/undefined',
+        headline: 'CEO at Acme',
       },
-    } as any;
+    },
+  } as any;
 
-    const ctx = buildLinkedInContextFromCache(poisoned, true);
+  it('strips the fabricated /in/undefined out of a row cached before the write-side fix', () => {
+    const ctx = buildLinkedInContextFromCache(poisonedRow, true);
 
     expect(ctx).not.toContain('/in/undefined');
     expect(ctx).not.toContain('"public_identifier"');
     // The genuine content of the row still survives.
     expect(ctx).toContain('CEO at Acme');
+  });
+
+  it('does not label the fabricated slug as the RESOLVED profile URL', () => {
+    // The separate `publicIdentifier` attribute is not read back out of `rawProfile`,
+    // so sanitizing the blob does not cover it. Emitting it here is worse than the
+    // blob leak: "Resolved LinkedIn profile URL" is the strongest claim this context
+    // makes to the model, and citation verification then accepts the URL because the
+    // slug ("undefined") does appear in the source text.
+    const ctx = buildLinkedInContextFromCache(poisonedRow, true);
+
+    expect(ctx).not.toContain('Resolved LinkedIn profile URL');
+  });
+
+  it('still resolves the URL for a row whose cached slug is real', () => {
+    // Guards the fix from over-reaching: a valid cached identifier must still produce
+    // the resolved-URL line.
+    const ctx = buildLinkedInContextFromCache(MOCK_PERSON_RAW_DATA, true);
+
+    expect(ctx).toContain('Resolved LinkedIn profile URL');
+    expect(ctx).toContain('linkedin.com/in/john-doe');
   });
 });
