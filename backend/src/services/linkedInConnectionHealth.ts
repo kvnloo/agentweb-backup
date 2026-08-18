@@ -189,7 +189,27 @@ export async function recordUnipileAccountHealth(params: {
 
   // Site-wide/shared accounts belong to no customer: there is no user record to
   // write to and nobody whose inbox this belongs in.
-  if (!viewerUserId) return 'no-op';
+  //
+  // But "nobody to email" is not "nobody to tell". These are the accounts with the
+  // WIDEST blast radius — discovery for many customers runs through them — and
+  // returning here before the alert meant one could die and emit no signal at all:
+  // no flag, no page, no gate, just a failing sync every 10 minutes forever. That is
+  // the same 38-day blind spot this module exists to close, so oncall is paged even
+  // though there is no owner record to persist against.
+  if (!viewerUserId) {
+    if (state === 'disconnected') {
+      await sendAgentModeOncallAlert({
+        subject: 'Site-wide LinkedIn account disconnected',
+        message:
+          `Unipile account ${accountId} has a dead LinkedIn session and no owner record, `
+          + `so there is no customer to ask to reconnect it. Needs an operator.`,
+        context: { accountId, ownerUserId: null },
+        dedupeKey: `linkedin-disconnected-ownerless:${accountId}`,
+        dedupeWindowMs: 12 * 60 * 60 * 1000,
+      }).catch(() => undefined);
+    }
+    return 'no-op';
+  }
 
   try {
     const account = await findUnipileAccount(accountId, viewerUserId);
@@ -336,6 +356,7 @@ export async function recordUnipileAccountHealth(params: {
     });
     if (!wonReminder) return 'no-op';
 
+
     const disconnectedAt = config.disconnected_at || new Date(now).toISOString();
     await notify({
       ownerUserId,
@@ -418,15 +439,29 @@ async function notify(params: {
 export async function clearDisconnectFlag(viewerUserId: string, accountId: string): Promise<void> {
   try {
     const account = await findUnipileAccount(accountId, viewerUserId);
-    if (!account?.config.needs_reconnect) return;
+    if (!account) return;
     // Same ownership rule as the record path: the flag lives on the owner's record,
     // which is normally the reconnecting user but need not be for an org-shared account.
     const { ownerUserId } = account;
-    await updateAccountConfig(ownerUserId, 'unipile', account.accountId, () => ({
-      updates: { last_verified_at: new Date().toISOString() },
-      unset: ['needs_reconnect', 'disconnected_at', 'disconnect_notified_at'],
-    }));
-    console.log(`${TAG} account=${accountId} disconnect flag cleared after reconnect`);
+    if (account.config.needs_reconnect) {
+      await updateAccountConfig(ownerUserId, 'unipile', account.accountId, () => ({
+        updates: { last_verified_at: new Date().toISOString() },
+        unset: ['needs_reconnect', 'disconnected_at', 'disconnect_notified_at'],
+      }));
+      console.log(`${TAG} account=${accountId} disconnect flag cleared after reconnect`);
+    }
+    // Deliberately NOT conditional on the flag still being set.
+    //
+    // The reconnect route calls `createAccount` before this, and `createAccount`
+    // REPLACES `config` wholesale — so by the time we read it the flag is already
+    // gone, and guarding on it returned here without ever resuming. An auto-paused
+    // schedule then stayed paused forever, which is the one state a reconnect could
+    // not undo on its own and the entire reason this function exists. The cron could
+    // not save it either: it computes `wasDisconnected` from the same wiped flag.
+    //
+    // Resuming unconditionally is safe because the resume itself is narrow — paused
+    // AND `pausedReason: 'linkedin_disconnected'` AND pinning this account — and
+    // idempotent, so a call for an account that was never disconnected does nothing.
     await resumeSchedulesPausedForAccount(ownerUserId, account.accountId);
   } catch (error) {
     console.error(`${TAG} Failed to clear disconnect flag for ${accountId}:`, error);

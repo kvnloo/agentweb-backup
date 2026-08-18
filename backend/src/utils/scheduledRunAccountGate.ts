@@ -83,7 +83,30 @@ export function countTrailingAccountSkips(
 export interface UnipileAccountLike {
   account_id: string;
   account_name?: string;
-  config?: { needs_reconnect?: boolean };
+  config?: { needs_reconnect?: boolean; unipile_account_id?: string };
+}
+
+/**
+ * Every id a stored row can legitimately be named by.
+ *
+ * A connected-account row carries TWO ids: our `account_id`, and Unipile's own
+ * `config.unipile_account_id`. They are usually equal, but legacy rows differ — the
+ * sync cron already resolves `config?.unipile_account_id || account_id`, and
+ * `findUnipileAccount` matches on either. This gate matched `account_id` alone, so a
+ * schedule naming the Unipile token on such a row pinned nothing, the gate returned
+ * NOT_BLOCKED, and the `needs_reconnect` flag written on that very row was never
+ * read. It fails open, so the cost is continued waste rather than an outage — but
+ * skipping that run is the gate's entire job.
+ */
+export function unipileIdsForAccount(account: UnipileAccountLike): string[] {
+  return [account.account_id, account.config?.unipile_account_id].filter(
+    (id): id is string => typeof id === 'string' && id.length > 0,
+  );
+}
+
+/** The id Unipile itself knows this account by — the one worth probing. */
+export function probeIdForAccount(account: UnipileAccountLike): string {
+  return account.config?.unipile_account_id || account.account_id;
 }
 
 export interface AccountGateDeps {
@@ -121,13 +144,17 @@ export async function evaluateAccountGate(
     const accounts = await deps.listUnipileAccounts(userId);
     if (!Array.isArray(accounts) || accounts.length === 0) return NOT_BLOCKED;
 
+    // Match on EITHER id the row can be named by, then probe the one Unipile knows.
     const pinnedIds = findPinnedUnipileAccountIds(
       startingMessage,
-      accounts.map((acc) => acc.account_id),
+      accounts.flatMap(unipileIdsForAccount),
     );
     if (pinnedIds.length === 0) return NOT_BLOCKED;
 
-    const pinned = accounts.filter((acc) => pinnedIds.includes(acc.account_id));
+    const pinned = accounts.filter((acc) =>
+      unipileIdsForAccount(acc).some((id) => pinnedIds.includes(id)),
+    );
+    if (pinned.length === 0) return NOT_BLOCKED;
     // One live pinned account is enough for the run to have something to work with.
     if (pinned.some((acc) => !acc.config?.needs_reconnect)) return NOT_BLOCKED;
 
@@ -135,13 +162,13 @@ export async function evaluateAccountGate(
     // reconnect. Confirm against Unipile before withholding — one call, only on the
     // path that would otherwise skip. 'unknown' falls through and runs.
     for (const acc of pinned) {
-      if ((await deps.probeSession(acc.account_id)) !== 'disconnected') return NOT_BLOCKED;
+      if ((await deps.probeSession(probeIdForAccount(acc))) !== 'disconnected') return NOT_BLOCKED;
     }
 
     return {
       blocked: true,
-      accountIds: pinned.map((acc) => acc.account_id),
-      accountNames: pinned.map((acc) => acc.account_name || acc.account_id),
+      accountIds: pinned.map(probeIdForAccount),
+      accountNames: pinned.map((acc) => acc.account_name || probeIdForAccount(acc)),
     };
   } catch (error) {
     console.error('[scheduledRunAccountGate] failing open:', error);

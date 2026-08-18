@@ -25,6 +25,14 @@ export function isProvenDisconnectError(error: any): boolean {
   const status = structured?.status || error?.body?.status || error?.status;
   const classification =
     structured?.classification || error?.body?.classification || error?.classification;
+  // 403 is deliberately NOT proof. `handleError` classifies 401 AND 403 as
+  // AUTH_ERROR, but a 403 is a permission/plan/endpoint restriction — the session
+  // is alive, we are just not allowed to do that thing. This predicate used to feed
+  // a 10-minute in-memory cache where a wrong verdict expired harmlessly; it now
+  // persists `needs_reconnect`, withholds scheduled runs, and emails a paying
+  // customer that their account is broken. That is not a mistake worth making on a
+  // 403.
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
   return (
     code === 'errors/disconnected_account' ||
     classification === 'AUTH_ERROR' ||
