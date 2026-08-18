@@ -85,6 +85,7 @@ import {
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
+import { emmaToolRegistry } from '../emma/registry';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import {
@@ -1793,10 +1794,25 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // anchor to the leading token — otherwise a write like `add_leads_to_list` or
 // `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
 // word. Irregular read names that don't lead with a read verb are listed exactly.
+// perform_data_analysis belongs here too (ENG-1276): it runs code on caller-supplied
+// data with no external side effects — the same as analyze_*/read_* — but its name
+// doesn't lead with a recognized verb, so without this it was misclassified as a
+// write and vetoed a legitimate skip whose FIRST step is calling it to compute
+// today's weekday (real prod session 17834849…, 2026-08-16).
 const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
-const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
+// ENG-1276 follow-up: the exact-name allowlist above is reactive — it only grows
+// once a new read-only tool's odd name has ALREADY broken a real schedule
+// (perform_data_analysis was one such case). perform_deep_research is a live,
+// still-unpatched analog: same "no external side effects" shape, same
+// non-read-verb name, just not yet observed breaking a run. Rather than wait for
+// that, the tool's OWN registration can declare `readOnly: true` (see
+// McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
+// side-effect-free, and this consults it. Checked last, after the free name
+// checks — cheaper and requires no registry state for the common case.
 function isReadOnlyToolName(name: string): boolean {
-  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+  if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
+  return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
 function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
@@ -1919,10 +1935,115 @@ export function scheduledRunSignalsConditionalSkip(
   // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  // A NEGATED failure/error mention — "not by failure", "no errors", "without any
+  // failure", "not a single failure", "never any failure" — DENIES a failure
+  // happened; it is not evidence of one. HARD_FAILURE_PATTERNS below matches
+  // these words ANYWHERE in the turn with no negation awareness, so a clean skip
+  // that merely denies a failure ("Posts published: 0 (by design, not by
+  // failure)") tripped the veto exactly like a real failure would (real prod
+  // regression, session 7f95530d, 2026-08-15 — the run made ZERO tool calls and
+  // still hit the 20-attempt nudge cap, ENG-1276 follow-up).
+  //
+  // A tempered greedy token, not a fixed adjacency pattern: the negation cue,
+  // then any run of text that does NOT cross a clause boundary, then the
+  // failure/error word. An earlier version only matched the cue landing
+  // DIRECTLY on the noun (an optional article/"by", nothing else), which caught
+  // "not by failure" but missed equally natural phrasings like "not a SINGLE
+  // failure" or "no REAL error" — the same underlying bug, just a wording the
+  // model hadn't happened to use yet (ENG-1276 follow-up #2).
+  //
+  // The clause-boundary exclusion is what keeps this fail-CLOSED as the span
+  // widens: a negation cue must never reach ACROSS a semicolon/sentence break or
+  // a contrastive conjunction ("but"/"however"/"though"/"yet"/"except") to
+  // neutralize an unrelated, genuine failure on the far side — "not a great day,
+  // BUT the post failed to publish" and "no post today; auth failed" both stop
+  // the match before reaching "failed", so it stays intact and still vetoes.
+  // Matching is also non-overlapping and left-to-right, so once a match
+  // consumes up to its NEAREST failure word, a later, un-negated failure word in
+  // the same sentence (no cue of its own) is untouched — "not a failure of the
+  // schedule, but image generation failed" neutralizes only the first mention.
+  //
+  // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
+  // #3) of the widening above — NOT a production incident, but a real gap in
+  // the same direction as the one that already broke twice:
+  //   (1) A BARE "no" immediately followed by a comma is grammatically an
+  //       INTERJECTION introducing an independent clause ("the answer is no;
+  //       separately, X happened"), not a negator of whatever follows it.
+  //       Without this, "No, unfortunately, today's run failed for unknown
+  //       reasons." bridged clean across the comma (no "but"/semicolon in the
+  //       way) and wrongly neutralized a genuine, unrelated failure.
+  //       Deliberately scoped to "no" ONLY, not "not"/"never"/"without" — an
+  //       independent review (ENG-1276 follow-up, not a production incident)
+  //       found that those three keep negating ACROSS a comma-set-off
+  //       parenthetical ("Without, admittedly, any failure occurring..." still
+  //       means no failure happened), so excluding the comma there wrongly
+  //       reverted legitimate cases to vetoing.
+  //   (2) The span is capped at 20 characters — every legitimate case here
+  //       needs at most ~9 ("a single ") — as an independent backstop. This
+  //       is a DELIBERATE trade-off, not just a safety margin: the same review
+  //       found the cap also blocks a long parenthetical after "never"/"not"
+  //       ("Never, in this case, did we see a failure" — 28 characters to the
+  //       failure word), which stays un-neutralized (an unusual phrasing still
+  //       causes a retry — safe direction). Widening the cap to accommodate
+  //       that would reopen a MORE realistic and MORE dangerous gap in the
+  //       other direction: "Not entirely sure why the deployment failed
+  //       today" is a genuine failure report (the hedge is about the CAUSE,
+  //       not a denial it happened) that must NOT get silently waived.
+  //
+  // DOUBLE NEGATION (found on the same review, not a production incident):
+  // "It is not true that there was no failure today" re-asserts a real
+  // failure, but a single-pass regex only sees the INNER "no failure" and has
+  // no concept of the OUTER negation flipping it back. Properly PARSING this
+  // would mean tracking negation-of-negation depth — a materially bigger,
+  // riskier change bolted onto an already-layered pattern, for phrasing that
+  // doesn't match any real production transcript behind this function's other
+  // tests (every one is direct: "Sunday. No.", "not by failure"). Instead this
+  // FAILS CLOSED: neutralizeNegatedFailureMentions() below skips any SENTENCE
+  // that itself negates a truth claim ("it is not true that...", "that's
+  // false...") entirely — a failure word inside such a sentence is left
+  // untouched and still vetoes via the normal HARD_FAILURE_PATTERNS check.
+  // Safe because it doesn't need to understand the sentence, only recognize
+  // the shape and decline to be clever about it — the dangerous direction
+  // (silently waiving a real failure) is closed even without real parsing.
+  //
+  // UNCERTAINTY HEDGE (independent CodeRabbit review finding, ENG-1276): "not
+  // sure it failed" / "not certain there was an error" express UNCERTAINTY
+  // about whether a failure happened — fundamentally different from "not by
+  // failure" (a confident DENIAL). Without excluding these, a cadence response
+  // with NO tool calls could get accepted as a clean skip even though the
+  // actual outcome is unresolved — the dangerous direction again. The 20-char
+  // span cap only accidentally blocked the one longer example already covered
+  // ("Not entirely sure why the deployment failed today" — coincidence of word
+  // count, not real understanding), so a shorter phrasing like "not sure it
+  // failed" needed its own explicit guard: reject the cue when immediately
+  // followed by an uncertainty word.
+  const NEGATED_FAILURE_MENTION =
+    /\b(?:no(?!\s*,)|not|never|without)\b(?!\s+(?:sure|certain|confident|convinced|clear)\b)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+  // "not" is REQUIRED before true/the case/accurate/correct — self-caught on a
+  // fresh re-audit before shipping: an earlier version made it optional
+  // ((?:not\s+)?), so a plain, non-negated "it is true that there was no
+  // failure" also matched this meta-negation shape and wrongly suppressed
+  // neutralization for a legitimate, single-negation denial. Over-cautious
+  // (still vetoes when it could safely waive) rather than dangerous, but still
+  // a real behavior change from what the earlier negation audits establish —
+  // "isn't/wasn't" already carry the negation in the contraction, so they get
+  // their own branch with no separate "not" required.
+  const META_NEGATION_OF_TRUTH =
+    /\b(?:is|was)\s+not\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:isn['’]?t|wasn['’]?t)\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:that['’]?s|that\s+is|it['’]?s|it\s+is)\s+false\b|\bfalse\s+that\b/i;
+  function neutralizeNegatedFailureMentions(input: string): string {
+    return input
+      .split(/([.;!?\n]+)/)
+      .map((segment, i) =>
+        i % 2 === 1 || META_NEGATION_OF_TRUTH.test(segment) ? segment : segment.replace(NEGATED_FAILURE_MENTION, ' ')
+      )
+      .join('');
+  }
   const failureScan = expandContractions(
-    text
-      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    neutralizeNegatedFailureMentions(
+      text
+        .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+        .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    )
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
@@ -2659,7 +2780,28 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
+  //
+  // CodeRabbit review (ENG-1276) also flagged that `requiredFunctions` — and so
+  // this derived name list, used only for the ENG-1276 alias double-credit
+  // suppression — is captured ONCE here and does not shrink if consent narrows
+  // mid-run (`livePublishAuthorization`/`effectivePublishAuthorization` below).
+  // Investigated and left as-is: the FINAL persisted record already re-derives
+  // its own held-to list fresh from `effectivePublishAuthorization` at the end
+  // of the run (see `heldToFunctionNames` in runScheduledChat) — that is the
+  // value that actually reaches the schedule owner, and it is not stale. The
+  // only consumer of THIS list is the alias suppression, and a stale (wider)
+  // list there can only make suppression MORE likely to apply, never less —
+  // i.e. it can under-credit a name nobody ends up requiring, never
+  // double-credit one. Safe direction, and currently unreachable in practice
+  // besides: no evidenced schedule requires both names of any alias pair to
+  // begin with, so this is two unevidenced conditions compounded. Making it
+  // fully live would mean re-deriving this list at each of the three
+  // requirementEvidenceNames call sites from whatever authorization is active
+  // AT THAT MOMENT — a real change to a part of this function's mid-run
+  // consent-narrowing plumbing, not a quick win, for a currently-unreachable
+  // gap in the safe direction.
+  const requiredFunctionNames = requiredFunctions.map((reqFunc) => reqFunc.functionName);
+  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? [], requiredFunctionNames);
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2904,7 +3046,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...requirementEvidenceNames(continuationToolCalls)
+          ...requirementEvidenceNames(continuationToolCalls, requiredFunctionNames)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -3046,7 +3188,7 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
+      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls, requiredFunctionNames));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -3553,6 +3695,11 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  // Pre-existing at runtime (finalFunctionCallDetails, ENG-947) but missing from
+  // this type until a test needed to assert on it directly (CodeRabbit review,
+  // ENG-1276) — declaring it changes no behavior, only lets TS see a field the
+  // object has always returned.
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
   attempt: number;
@@ -4534,32 +4681,40 @@ export async function runScheduledChat(
     // result email, and the reassuring one is the one that is wrong.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
+    // ENG-827: filter to the requirements this run was actually HELD TO —
+    // publish-scope-filtered, not the raw schedule config — BEFORE building the
+    // requirement evidence, so a run authorized for only one of a
+    // twitter_manage_post/post_on_connected_account pair (ENG-1276 follow-up)
+    // sees the same held-to set the alias suppression checks against. Reading
+    // the unfiltered config here persisted a self-contradicting record on an
+    // unauthorized run: `post_on_connected_account {required: 1, actual: 0}`
+    // sitting next to an empty functionCallMisses and passed: true. Nothing
+    // downstream can tell that apart from a genuine silent miss, which is the
+    // false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt, the evidence ledger, and this record.
+    // ENG-827: filtered against `effectivePublishAuthorization` — the authorization
+    // the run FINISHED under, which differs from the admitted one when the owner
+    // revoked consent mid-run.
+    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    // ENG-657, applied here too (CodeRabbit review, ENG-1276): a RESUMED run's
+    // verification already seeds its evidence with resumePriorToolCalls (see
+    // `priorToolCalls: resumePriorToolCalls` passed into runVerifiedChat below),
+    // so the pass/fail DECISION correctly counts the abandoned portion's calls.
+    // This persisted record was built from `result.toolCalls` alone — only the
+    // calls made in the resumed portion — so a resumed run that passed because
+    // an EARLIER call satisfied a requirement could still write
+    // `{required: 1, actual: 0}` here: a self-contradicting record next to an
+    // empty functionCallMisses, the exact false-failure shape ENG-479/ENG-764/
+    // ENG-827 already had to unpick for a different stale-snapshot cause.
+    requirementEvidenceNames([...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
-
-    // ENG-827: report the requirements this run was actually HELD TO, which is the
-    // publish-scope-filtered list the checker used above — not the raw schedule
-    // config. Reading the unfiltered config here persisted a self-contradicting
-    // record on an unauthorized run: `post_on_connected_account {required: 1,
-    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
-    // Nothing downstream can tell that apart from a genuine silent miss, which is
-    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
-    // feeds the checker, the prompt and this record.
-    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
-    // run FINISHED under, which differs from the admitted one when the owner revoked
-    // consent mid-run. Reading the raw schedule config here instead persisted a
-    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
-    // next to an empty functionCallMisses on a passing run. Nothing downstream can
-    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
-    // ENG-764 had to unpick.
-    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
-      .forEach((functionName: string) => {
-        finalFunctionCallDetails[functionName] = {
-          actual: actualFunctionCallCounts[functionName] || 0,
-          required: functionCallMinCalls[functionName] || 1
-        };
-      });
+    heldToFunctionNames.forEach((functionName: string) => {
+      finalFunctionCallDetails[functionName] = {
+        actual: actualFunctionCallCounts[functionName] || 0,
+        required: functionCallMinCalls[functionName] || 1
+      };
+    });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it

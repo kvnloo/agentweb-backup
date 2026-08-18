@@ -90,13 +90,99 @@ export function countsTowardRequirement(toolCall: any): boolean {
 }
 
 /**
+ * ENG-1276 follow-up — twitter_manage_post's OWN description tells the model to
+ * use it, not post_on_connected_account, for a multi-tweet thread: "NEVER use
+ * this tool to post a single new tweet — use post_on_connected_account for
+ * that... This tool is for: multi-tweet threads (2+ tweets)... if you only have
+ * 1 tweet, use post_on_connected_account instead." A schedule whose
+ * requiredFunctionCalls names post_on_connected_account has no way to know its
+ * agent will legitimately reach for the thread-specific tool instead, so a real,
+ * successful, irreversible publish never satisfied the requirement and the run
+ * was pressed to publish a DUPLICATE thread for the full 20-attempt retry
+ * budget (ENG-1276: a real production run published a 3-tweet thread via
+ * twitter_manage_post(post_thread), then was nudged 19 more times even though
+ * re-calling post_on_connected_account would have duplicated a post already
+ * live).
+ *
+ * Scoped to exactly the one action that creates the kind of new top-level post
+ * post_on_connected_account would have: post_thread. Every other
+ * twitter_manage_post action (reply/quote_tweet/like/unlike/retweet/unretweet/
+ * delete_tweet/analytics) touches EXISTING content or isn't a post at all, so it
+ * must not alias. linkedin_manage_post gets no alias here either — none of its
+ * actions (repost/comment/list_comments/react/get_analytics) create a new
+ * top-level post the way post_on_connected_account does; a repost/comment is
+ * not the schedule's own content going out.
+ */
+function toolCallAction(toolCall: any): string | undefined {
+  const args = toolCall?.arguments;
+  if (!args) return undefined;
+  if (typeof args === 'string') {
+    try {
+      return JSON.parse(args)?.action;
+    } catch {
+      return undefined;
+    }
+  }
+  return args.action;
+}
+
+/**
+ * ENG-1276 follow-up #3 — email(action='send') and send_email_from_sender both
+ * send a REAL email to a recipient; which one a run actually calls depends on
+ * whether the user has a connected mailbox or a configured CRM sender, account
+ * state a schedule owner has no way to predict when writing
+ * requiredFunctionCalls. Verified via both execute() paths: email's send
+ * action resolves through resolveEmailAccount(userId, account_id, 'send') (a
+ * real write, not a preview), and send_email_from_sender always sends — it
+ * has no `action` param at all, every call IS a send.
+ *
+ * Unlike twitter_manage_post/post_on_connected_account (one-directional —
+ * post_on_connected_account can never do a thread), this pair is genuinely
+ * BIDIRECTIONAL: whichever tool the account state routes through should
+ * credit the other one too, so both directions are listed.
+ */
+const REQUIREMENT_ALIASES: Array<{ name: string; aliasFor: string; matchesAction: (action: string | undefined) => boolean }> = [
+  { name: 'twitter_manage_post', aliasFor: 'post_on_connected_account', matchesAction: (a) => a === 'post_thread' },
+  { name: 'email', aliasFor: 'send_email_from_sender', matchesAction: (a) => a === 'send' },
+  { name: 'send_email_from_sender', aliasFor: 'email', matchesAction: () => true },
+];
+
+/**
  * The requirement ledger for a set of tool calls: every name that may be counted
  * against `requiredFunctionCalls`. One shared mapper because runVerifiedChat
  * builds this ledger in three places (the resumed-run seed, the completion-gate
  * continuation turn, and the main turn) and they must not drift — three private
  * copies of a rule is precisely how the bug above survived.
+ *
+ * `requiredFunctionNames` (ENG-1276 follow-up) is the calling schedule's OWN
+ * requiredFunctionCalls, when the caller has it to hand. A schedule that
+ * requires BOTH post_on_connected_account AND twitter_manage_post as separate
+ * line items wants two distinct actions, not one thread-post call silently
+ * satisfying both — so the alias is suppressed exactly when the schedule
+ * requires BOTH the alias's source name AND its target name as separate
+ * requirements. Requiring only one of the two (or neither) is exactly what
+ * every EVIDENCED schedule does — the three production schedules behind
+ * ENG-1276 require only post_on_connected_account, never twitter_manage_post
+ * itself — and aliasing
+ * stays on: crediting a name nobody is checking is inert, not a double-credit.
+ * Omitted (legacy callers, or a caller with no requirement list handy) keeps
+ * always-aliasing too.
  */
-export function requirementEvidenceNames(toolCalls: any[]): string[] {
+export function requirementEvidenceNames(toolCalls: any[], requiredFunctionNames?: Iterable<string>): string[] {
   if (!Array.isArray(toolCalls)) return [];
-  return toolCalls.filter(countsTowardRequirement).map((call: any) => call.name).filter(Boolean);
+  const requiredSet = requiredFunctionNames ? new Set(requiredFunctionNames) : null;
+  const names: string[] = [];
+  for (const call of toolCalls) {
+    if (!countsTowardRequirement(call)) continue;
+    if (!call.name) continue;
+    names.push(call.name);
+    // The alias stands in for a publish tool, so it earns its credit under the
+    // SAME success bar a real post_on_connected_account call would need — an
+    // attempted-but-failed thread must not silently satisfy the requirement.
+    const alias = REQUIREMENT_ALIASES.find((a) => a.name === call.name && a.matchesAction(toolCallAction(call)));
+    if (!alias || !toolCallSucceeded(call)) continue;
+    if (requiredSet && requiredSet.has(alias.name) && requiredSet.has(alias.aliasFor)) continue;
+    names.push(alias.aliasFor);
+  }
+  return names;
 }
