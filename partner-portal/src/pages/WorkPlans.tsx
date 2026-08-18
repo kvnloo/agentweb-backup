@@ -375,14 +375,6 @@ export default function WorkPlans() {
       setDialogOpen(false);
       fetchPlans();
     } catch (err: any) {
-      if (err.response?.status === 409) {
-        // Keep the dialog open — their edits are still in it, and closing would
-        // throw away the work while the plan on screen is the outdated one.
-        setError(
-          "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
-        );
-        return;
-      }
       const data = err.response?.data as StepLossRefusal | undefined;
       // The guard's refusal carries exactly what would be lost. Show it as
       // something the admin can decide on rather than an error they cannot act
@@ -391,6 +383,20 @@ export default function WorkPlans() {
         || (data?.stepContentLoss?.length ?? 0) > 0;
       if (err.response?.status === 400 && describesLoss) {
         setStepLoss(data ?? null);
+        return;
+      }
+      // Every other failure closes the confirmation first. A retry that comes
+      // back a stale-write conflict — or anything else — would otherwise leave
+      // the modal sitting over the error that explains it, offering a "Save
+      // anyway" that cannot work: the admin clicks it, fails the same way, and
+      // never sees why.
+      setStepLoss(null);
+      if (err.response?.status === 409) {
+        // Keep the EDITOR open — their edits are still in it, and closing would
+        // throw away the work while the plan on screen is the outdated one.
+        setError(
+          "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
+        );
         return;
       }
       setError(data?.message || "Failed to save work plan");
