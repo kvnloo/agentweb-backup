@@ -136,11 +136,15 @@ export function rewritePublishGateScope(
 export function hasUnscopedPublishGateProse(systemPrompt?: string | null): boolean {
   const prompt = systemPrompt || "";
   if (!/PUBLISH GATE/.test(prompt)) return false;
-  const unscoped =
-    /overrides every other instruction/i.test(prompt) ||
-    /overrides any other instruction here/i.test(prompt);
-  if (!unscoped) return false;
-  // Recognised text would have been rewritten already; if a rewrite still
-  // applies, the caller simply has not run it yet.
-  return rewritePublishGateScope(prompt).applied.length === 0;
+  const unscoped = (text: string) =>
+    /overrides every other instruction/i.test(text) ||
+    /overrides any other instruction here/i.test(text);
+  if (!unscoped(prompt)) return false;
+  // A prompt can carry BOTH a recognised legacy block (which the rewrite below
+  // fixes) AND a separate, hand-edited unscoped rule elsewhere in the same
+  // prompt. Checking `applied.length === 0` alone would treat any recognised
+  // match as proof the whole prompt is clean, silently masking the
+  // hand-edited half. Apply every known rewrite first, then re-check what's
+  // left — that's the only way to catch the mixed case.
+  return unscoped(rewritePublishGateScope(prompt).systemPrompt);
 }

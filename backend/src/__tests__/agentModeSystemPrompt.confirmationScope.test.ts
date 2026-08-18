@@ -1,4 +1,5 @@
 import { AGENT_MODE_SYSTEM_PROMPT } from '../docs/agentModeSystemPrompt';
+import { MIN_PROMPTS } from '../services/skillHardening/applyHardening';
 
 // ENG-1311 (fix for ENG-1307). Human-drafted behavioral contract:
 //
@@ -54,5 +55,45 @@ describe('AgentMode system prompt - confirmation scoped to money/publish/send/ir
     expect(sectionEnd).toBeGreaterThan(sectionStart);
     const section = AGENT_MODE_SYSTEM_PROMPT.slice(sectionStart, sectionEnd);
     expect(section).toContain('Explicit confirmation is required ONLY for three things');
+  });
+
+  // CodeRabbit (PR #2445): the "ONLY for three things" rule, read alone, would
+  // conflict with MIN_PROMPTS.googleCalendar ("CONFIRM before any
+  // create/update/delete" — unconditional) and MIN_PROMPTS.meetingIntelligence
+  // ("show the draft and get explicit approval" before task/calendar writes) —
+  // a reversible calendar write matches none of the three named exceptions,
+  // so the composed prompt (base + installed-skill context, see
+  // agentModeService.ts's `installedSkillContextMsg`) would hand the model two
+  // contradictory rules for the same action. Fix: state explicit precedence
+  // (a floor, not a ceiling) rather than rewording the skill-specific prompts,
+  // so calendar/meeting-intelligence behavior is unchanged.
+  describe('composed-prompt path: does not contradict stricter skill-specific confirmation rules', () => {
+    it('states the confirmation-scope rule is a floor a skill can raise, not a ceiling', () => {
+      expect(AGENT_MODE_SYSTEM_PROMPT).toContain('This is a FLOOR, not a ceiling');
+      expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+        "this rule never lowers another skill's explicit confirmation requirement"
+      );
+    });
+
+    it('leaves MIN_PROMPTS.googleCalendar\'s unconditional confirm-before-write rule in place', () => {
+      expect(MIN_PROMPTS.googleCalendar).toContain(
+        'CONFIRM before any create/update/delete'
+      );
+    });
+
+    it('leaves MIN_PROMPTS.meetingIntelligence\'s confirm-before-write rule in place', () => {
+      expect(MIN_PROMPTS.meetingIntelligence).toContain(
+        'Before any action that writes or sends'
+      );
+    });
+
+    it('composing base prompt + a stricter installed skill yields both rules, with the floor rule readable as deferring to the skill', () => {
+      // Mirrors how agentModeService.ts's installedSkillContextMsg concatenates
+      // an installed skill's systemPrompt alongside the base system prompt.
+      const composed = `${AGENT_MODE_SYSTEM_PROMPT}\n\nInstalled Skills:\ngoogleCalendar- Google Calendar: ${MIN_PROMPTS.googleCalendar}`;
+      expect(composed).toContain('Explicit confirmation is required ONLY for three things');
+      expect(composed).toContain('This is a FLOOR, not a ceiling');
+      expect(composed).toContain('CONFIRM before any create/update/delete');
+    });
   });
 });

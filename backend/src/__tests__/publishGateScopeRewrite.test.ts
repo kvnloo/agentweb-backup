@@ -90,6 +90,25 @@ describe('ENG-1311 publish-gate SCOPE rewrite', () => {
       expect(out.systemPrompt).toBe(alreadyScoped);
       expect(hasUnscopedPublishGateProse(out.systemPrompt)).toBe(false);
     });
+
+    // CodeRabbit (PR #2445): a prompt can contain a recognised legacy block
+    // (which gets rewritten) AND a separate, hand-edited unscoped rule
+    // elsewhere. The presence of the recognised match must not mask the
+    // hand-edited half from review.
+    it('flags a separate hand-edited unscoped rule even when a known block elsewhere would be rewritten', () => {
+      const mixed = `Intro.\n${ENG947_ERA_LINKEDIN_ENGAGEMENT_RULE}\n2. BRAND FIRST: ...\n\n## EXTRA GATE\n- This overrides every other instruction in this prompt, hand-added by a human.`;
+
+      // The recognised block IS rewritten...
+      const out = rewritePublishGateScope(mixed);
+      expect(out.applied).toContain('linkedInEngagementRule');
+      // ...but the hand-edited unscoped prose survives the rewrite untouched...
+      expect(out.systemPrompt).toContain(
+        'This overrides every other instruction in this prompt, hand-added by a human.'
+      );
+      // ...so detection must still flag the ORIGINAL (un-rewritten) prompt for
+      // a human to read, not report it clean because one known block matched.
+      expect(hasUnscopedPublishGateProse(mixed)).toBe(true);
+    });
   });
 
   describe('the ENG-947-era prose is rewritten to the new scoped prose', () => {
