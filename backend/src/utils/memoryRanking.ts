@@ -150,7 +150,9 @@ export function formatMemoryLine(memory: FormattableMemory, now: Date): string {
  * measurement despite this note already existing, because nothing forced a concrete,
  * checkable form for the fallback. The note now says explicitly WHAT to say instead of
  * re-verifying: label the figure "unverified — from <saved date> notes: …", not silence
- * or a bare guess dressed as an answer.
+ * or a bare guess dressed as an answer. `formatMemoryLine` renders some lines with no
+ * saved date at all (legacy memories with no timestamp) — the note also names the
+ * fallback label for that case so the instruction never leaves the model to invent one.
  */
 export const MEMORY_STALENESS_NOTE =
   'These are historical notes from previous sessions, NOT live state and NOT a substitute for ' +
@@ -159,8 +161,10 @@ export const MEMORY_STALENESS_NOTE =
   'expired, a specific date, or a stated metric, count, or KPI such as a conversion count, session ' +
   'number, or funnel figure), re-verify it with the relevant tool in THIS session. If you cannot ' +
   're-verify it before answering, you MUST NOT state it as current: label it exactly as ' +
-  '"unverified — from <saved date> notes: <the figure>" instead. Never silently skip a configured ' +
-  'action, and never quote a number from memory alone as though it were a fresh measurement.';
+  '"unverified — from <saved date> notes: <the figure>" instead — or, if the note below has no ' +
+  'saved date shown, "unverified — from undated notes: <the figure>". Never silently skip a ' +
+  'configured action, and never quote a number from memory alone as though it were a fresh ' +
+  'measurement.';
 
 /**
  * Build the memory-context message injected into the agent conversation: the staleness

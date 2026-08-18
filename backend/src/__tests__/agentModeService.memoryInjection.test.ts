@@ -125,11 +125,13 @@ describe('AgentModeService — memory injection wiring (ENG-1310 AC1)', () => {
     // authorship is exactly what let a stale figure read as a live measurement.
     expect(memoryMsg.content).not.toMatch(/facts from previous sessions/i);
     expect(memoryMsg.content).toContain('Account Memory (unverified notes from previous sessions):');
-    // The caution bookends the content — first and last thing the model reads.
+    // The caution bookends the content — first and last thing the model reads. Assert
+    // the closing occurrence is the true suffix, not merely "some later occurrence" —
+    // that weaker check would also pass if the note appeared twice back-to-back near
+    // the front, leaving the actual content unbookended.
     const firstNote = memoryMsg.content.indexOf(MEMORY_STALENESS_NOTE);
-    const lastNote = memoryMsg.content.lastIndexOf(MEMORY_STALENESS_NOTE);
     expect(firstNote).toBe(0);
-    expect(lastNote).toBeGreaterThan(firstNote);
+    expect(memoryMsg.content.endsWith(MEMORY_STALENESS_NOTE)).toBe(true);
     // Carries its saved date, so any later reference has a source to attribute (AC1).
     expect(memoryMsg.content).toContain('saved 2026-07-31');
   });
@@ -154,10 +156,11 @@ describe('AgentModeService — memory injection wiring (ENG-1310 AC1)', () => {
     // Never claims the notes are verified "shared facts" for the org either.
     expect(orgMemoryMsg.content).not.toMatch(/shared facts for/i);
     expect(orgMemoryMsg.content).toContain('Organization Memory (unverified shared notes for "Acme Co"):');
+    // Assert the closing note is the true suffix — see the account-memory test above for
+    // why "some later occurrence" is too weak to prove real bookending.
     const firstNote = orgMemoryMsg.content.indexOf(MEMORY_STALENESS_NOTE);
-    const lastNote = orgMemoryMsg.content.lastIndexOf(MEMORY_STALENESS_NOTE);
     expect(firstNote).toBe(0);
-    expect(lastNote).toBeGreaterThan(firstNote);
+    expect(orgMemoryMsg.content.endsWith(MEMORY_STALENESS_NOTE)).toBe(true);
     expect(orgMemoryMsg.content).toContain('saved 2026-07-30');
   });
 

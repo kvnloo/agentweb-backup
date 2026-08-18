@@ -157,6 +157,9 @@ describe('ENG-940: trimming preserves the S3 recovery reference', () => {
     expect(digest.content).toMatch(/not a verified source/i);
     expect(digest.content).toMatch(/do not restate any number or figure/i);
     expect(digest.content).toMatch(/read_tool_response\/search_tool_response/);
+    // The recovery instruction is useless without the key it points at still being
+    // present in the compressed placeholder — assert it, not just the pointing text.
+    expect(digest.content).toContain(s3Key);
   });
 
   it('tells the model to re-run the source tool when there is no S3 recovery key (ENG-1310 AC2)', () => {

@@ -201,6 +201,7 @@ describe('buildMemoryContextMessage', () => {
 
     const firstNoteIdx = msg.indexOf(MEMORY_STALENESS_NOTE);
     const headerIdx = msg.indexOf('Account Memory (unverified notes from previous sessions):');
+    const lastLineIdx = msg.indexOf('GA4: 416 form_starts, 91 submits');
     const lastNoteIdx = msg.lastIndexOf(MEMORY_STALENESS_NOTE);
 
     expect(firstNoteIdx).toBeGreaterThanOrEqual(0);
@@ -209,6 +210,12 @@ describe('buildMemoryContextMessage', () => {
     // ...and again AFTER it, so it is not lost at the end of a long block.
     expect(lastNoteIdx).toBeGreaterThan(headerIdx);
     expect(lastNoteIdx).not.toBe(firstNoteIdx);
+    // Specifically after the LAST rendered memory line, not merely after the header —
+    // a note sandwiched between the header and the list would satisfy the two checks
+    // above without ever bookending the actual content.
+    expect(lastNoteIdx).toBeGreaterThan(lastLineIdx);
+    // And it is the true suffix of the message — nothing trails the closing caution.
+    expect(msg.endsWith(MEMORY_STALENESS_NOTE)).toBe(true);
   });
 });
 
@@ -231,6 +238,13 @@ describe('MEMORY_STALENESS_NOTE', () => {
   it('gives a concrete "unverified — from <date> notes:" fallback label when re-verification is not possible (ENG-1310 AC1)', () => {
     expect(MEMORY_STALENESS_NOTE).toMatch(/unverified — from <saved date> notes:/i);
     expect(MEMORY_STALENESS_NOTE).toMatch(/must not state it as current/i);
+  });
+
+  // ENG-1310 AC1 follow-up: formatMemoryLine falls back to an unstamped line when no
+  // timestamp is available, so the "<saved date>" fallback label has nothing to fill in —
+  // without an explicit undated form the model would have to invent one.
+  it('gives an "unverified — from undated notes:" fallback for memory lines with no saved date', () => {
+    expect(MEMORY_STALENESS_NOTE).toMatch(/unverified — from undated notes:/i);
   });
 });
 
