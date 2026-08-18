@@ -191,6 +191,14 @@ export interface ChatSession {
       description?: string;
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
+      // ENG-1188 (Greptile): set alongside completedAt for 'completed' AND ALSO for
+      // 'skipped' -- unlike completedAt, this exists purely so setWorkPlanStatus's
+      // asset-count gate has a real "this step left pending" marker for a skipped
+      // step to scope a later step's asset count against, instead of silently
+      // falling through to counting the whole session. Internal bookkeeping only;
+      // never rendered (PlanProgress/HorizontalPlanProgress key off completedAt +
+      // status === 'completed', which reusing completedAt here would have broken).
+      resolvedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
@@ -3093,6 +3101,8 @@ export class ChatbotDB {
         userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
+        /** ENG-1188: see the matching field on the read-side workPlan type above. */
+        resolvedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
