@@ -31924,6 +31924,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
     if (sessionState === 'disconnected') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      // Persist alongside the reactive handler below, so the owner alert doesn't
+      // depend on which of the two paths happened to observe the dead session first
+      // (ENG-1197).
+      const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+      await recordUnipileAccountHealth({
+        accountId: account_id,
+        ownerUserId: userId,
+        state: 'disconnected',
+      });
       return this.linkedInDisconnectedResponse();
     }
     if (sessionState === 'unknown') {
@@ -32773,6 +32782,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // probe's 10-minute cache window), so the reactive path stays as the backstop.
         // Both return the identical response via one helper.
         linkedInOutreachService.clearStatusCache(account_id);
+        // Persist it as well (ENG-1197). This used to end here — the one place that
+        // learned a session was dead told the model and nobody else, so an unattended
+        // scheduled run discovered the outage, no-opped, and left no trace anything
+        // was wrong. Recording it is what gives the owner an alert and lets the next
+        // run skip instead of repeating the discovery. A no-op for shared accounts,
+        // which this user doesn't own.
+        const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+        await recordUnipileAccountHealth({
+          accountId: account_id,
+          ownerUserId: userId,
+          state: 'disconnected',
+        });
         return this.linkedInDisconnectedResponse();
       }
 
