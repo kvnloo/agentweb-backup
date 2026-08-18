@@ -529,6 +529,14 @@ export function fromGeminiResponse(resp: any): any {
       completion_tokens: completionTokens,
       total_tokens: usage.totalTokenCount || (promptTokens + completionTokens),
       cache_read_input_tokens: cacheReadTokens,
+      // ENG-1188/ENG-1301: always 0, not a measurement. Unlike Bedrock/Anthropic,
+      // Gemini's generateContent response carries no "cache write" counter — a
+      // cache write there is a separate caches.create() call with its own
+      // billing, and this codebase never calls it (no caching is implemented for
+      // Gemini at all yet; see ENG-1301). Do not read a session's
+      // cacheTokens.creation as evidence caching never engaged — cacheReadTokens
+      // above is the field that would show Google's automatic/implicit caching,
+      // if any, taking effect.
       cache_creation_input_tokens: 0,
     },
   };
