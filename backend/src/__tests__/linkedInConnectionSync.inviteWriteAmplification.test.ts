@@ -70,7 +70,11 @@ jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: { notifyLinkedInConnectionAccepted: jest.fn().mockResolvedValue(undefined) },
 }));
 
-import { runLinkedInConnectionSync, __resetWalkPacingForTests } from '../cron/linkedInConnectionSyncCron';
+import {
+  runLinkedInConnectionSync,
+  __resetDisconnectBackoffForTests,
+  __resetWalkPacingForTests,
+} from '../cron/linkedInConnectionSyncCron';
 
 const ACCOUNT = 'acct-1';
 
@@ -115,7 +119,9 @@ const upsertedIds = () =>
     (rows as any[]).map((r) => r.invitedUserPublicId));
 
 beforeEach(() => {
-  // ENG-1197: the cron paces its full walk per account in module state.
+  // ENG-1197: the cron paces both its dead-account re-checks and its full
+  // walk in module state.
+  __resetDisconnectBackoffForTests();
   __resetWalkPacingForTests();
   jest.clearAllMocks();
   mockGetSetting.mockResolvedValue({
