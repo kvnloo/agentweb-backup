@@ -6,20 +6,34 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
   beforeEach(() => {
     svc = Object.create(AgentModeService.prototype);
     svc.llmModels = {
-      'tiered-model': { client: null, supportsTemperature: true, tier: 'pro', description: 'For complex tasks' },
+      'tiered-model': {
+        client: null, supportsTemperature: true,
+        tier: 'pro', description: 'For complex tasks', name: 'Tiered Model', provider: 'anthropic',
+      },
       'untiered-model': { client: null, supportsTemperature: true },
-      'admin-only-model': { client: null, supportsTemperature: true, adminOnly: true, tier: 'ultra_premium', description: 'Frontier' },
+      'admin-only-model': {
+        client: null, supportsTemperature: true, adminOnly: true,
+        tier: 'ultra_premium', description: 'Frontier', name: 'Admin Only Model', provider: 'openai',
+      },
       'voice-model': { client: null, supportsTemperature: true, isLive: true, tier: 'medium', description: 'Voice' },
     };
     svc.getSupportedModels = AgentModeService.prototype.getSupportedModels.bind(svc);
     svc.getDefaultModel = jest.fn().mockResolvedValue('tiered-model');
   });
 
-  // FAIL case 1: an untiered model must not be dropped — it defaults to 'medium'.
-  it('defaults an untiered model to the medium tier with a generic description', async () => {
+  // FAIL case 1: an untiered/unnamed model must not be dropped or crash the picker —
+  // it defaults to medium/generic-description/other-provider, and its display name
+  // falls back to the raw id rather than being blank.
+  it('defaults an untiered model to medium/generic-description/other-provider, name falling back to the id', async () => {
     const result = await svc.getSupportedModelsWithMetadata(false);
     const untiered = result.find((m: any) => m.id === 'untiered-model');
-    expect(untiered).toEqual({ id: 'untiered-model', tier: 'medium', description: 'General-purpose model' });
+    expect(untiered).toEqual({
+      id: 'untiered-model',
+      name: 'untiered-model',
+      tier: 'medium',
+      description: 'General-purpose model',
+      provider: 'other',
+    });
   });
 
   // FAIL case 2: adminOnly filtering must still apply for non-admin callers.
@@ -34,13 +48,18 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
     expect(result.some((m: any) => m.id === 'voice-model')).toBe(false);
   });
 
-  // SUCCESS case: a tiered model returns its real tier + description, and adminOnly
-  // models are included for an admin caller.
-  it('returns real tier and description for a tiered model, and includes adminOnly for admins', async () => {
+  // SUCCESS case: a tiered model returns its real tier/description/name/provider (not
+  // guessed from the id), and adminOnly models are included for an admin caller with
+  // the same full metadata.
+  it('returns real tier/description/name/provider for a tiered model, and includes adminOnly for admins', async () => {
     const result = await svc.getSupportedModelsWithMetadata(true);
     const tiered = result.find((m: any) => m.id === 'tiered-model');
-    expect(tiered).toEqual({ id: 'tiered-model', tier: 'pro', description: 'For complex tasks' });
+    expect(tiered).toEqual({
+      id: 'tiered-model', name: 'Tiered Model', tier: 'pro', description: 'For complex tasks', provider: 'anthropic',
+    });
     const admin = result.find((m: any) => m.id === 'admin-only-model');
-    expect(admin).toEqual({ id: 'admin-only-model', tier: 'ultra_premium', description: 'Frontier' });
+    expect(admin).toEqual({
+      id: 'admin-only-model', name: 'Admin Only Model', tier: 'ultra_premium', description: 'Frontier', provider: 'openai',
+    });
   });
 });
