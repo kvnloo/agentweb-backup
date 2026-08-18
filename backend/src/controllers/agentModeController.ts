@@ -589,6 +589,14 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
   return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
 }
 
+// ENG-1131 follow-up: minimum real time since the schedule's last observed
+// blocked-state transition before alerting on a new one. Guards against a
+// borderline account whose search-capability probe oscillates right at its
+// pass/fail boundary (or a burst of manual re-tests) firing an alert on every
+// toggle. Short enough that a genuine new/distinct outage is still reported
+// promptly (worst case: delayed by less than this window).
+const DEFAULT_SOURCING_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
 /**
  * ENG-1131 follow-up: true when this run's blocked-state differs from the
  * IMMEDIATELY PRECEDING run's — i.e. an edge, not a level. `priorRunResults`
@@ -602,14 +610,53 @@ export function detectRunBlockedReason(toolCalls: any[] | undefined | null): str
  * owner already knows. A schedule's very first run counts as a transition
  * into the blocked state (no prior run = treated as previously healthy), but
  * not a transition if its first run is healthy.
+ *
+ * Anti-flap cooldown: an edge is only reported if the schedule's most recent
+ * PRIOR transition (found by scanning the full history, not just the last
+ * run) happened at least `cooldownMs` ago. This deliberately does NOT require
+ * N consecutive consistent prior runs — a genuinely settled "broke, fully
+ * recovered, broke again" sequence separated by real time must still alert;
+ * only rapid back-to-back toggling is dampened. No known prior-transition
+ * timestamp (old fixtures with no `createdAt`, or nothing found) never
+ * suppresses — cooldown can only apply against a timestamp we actually have.
  */
 export function didSourcingBlockStateChange(
   priorRunResults: any[] | undefined | null,
   currentBlockedBy: string | null,
+  options: { now?: string | number | Date; cooldownMs?: number } = {},
 ): boolean {
   const results = Array.isArray(priorRunResults) ? priorRunResults : [];
-  const previousBlockedBy = results.length > 0 ? results[results.length - 1]?.blockedBy : undefined;
-  return Boolean(currentBlockedBy) !== Boolean(previousBlockedBy);
+  if (results.length === 0) {
+    return Boolean(currentBlockedBy);
+  }
+  const last = results[results.length - 1];
+  const previousBlockedBy = last && typeof last === 'object' ? last.blockedBy : undefined;
+  if (Boolean(currentBlockedBy) === Boolean(previousBlockedBy)) {
+    return false;
+  }
+
+  // Scan the WHOLE history once for the most recent point where blocked-state
+  // itself changed run-over-run, to find when the state we're about to leave
+  // actually began.
+  let priorState: boolean | undefined;
+  let lastTransitionAt: number | null = null;
+  for (const run of results) {
+    const state = Boolean(run && typeof run === 'object' ? run.blockedBy : undefined);
+    if (priorState !== undefined && state !== priorState) {
+      const parsed = run && typeof run === 'object' ? Date.parse(run.createdAt) : NaN;
+      if (!Number.isNaN(parsed)) lastTransitionAt = parsed;
+    }
+    priorState = state;
+  }
+
+  if (lastTransitionAt !== null) {
+    const cooldownMs = options.cooldownMs ?? DEFAULT_SOURCING_ALERT_COOLDOWN_MS;
+    const now = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+    if (!Number.isNaN(now) && now - lastTransitionAt < cooldownMs) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
@@ -4568,6 +4615,29 @@ export async function runScheduledChat(
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
 
+    // ENG-1131 follow-up: re-fetch the schedule's run history immediately before
+    // deciding on a sourcing-block transition, instead of using `schedule` as
+    // loaded at the top of this (often multi-minute) function. Two runs of the
+    // same schedule racing concurrently — e.g. a manual Test click overlapping a
+    // cron trigger — would otherwise both read the SAME stale prior-run snapshot
+    // and both fire the alert. This doesn't eliminate the race (a true fix needs
+    // a DB-level conditional write), but narrows the window from run-duration
+    // down to a single DB round-trip. Deliberately NOT a persisted "already
+    // alerted" flag: that write can't be atomic with the email send either, and
+    // would trade a rare, harmless duplicate for the strictly worse failure mode
+    // of a silently missed alert — the same reasoning already established in
+    // this file for notifyScheduleOwnerOfFailure's zero-output path.
+    let priorRunResultsForTransitionCheck: any[] | undefined = schedule.runResults;
+    try {
+      const freshSchedule: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+      if (freshSchedule) priorRunResultsForTransitionCheck = freshSchedule.runResults;
+    } catch (refetchError) {
+      console.error(
+        `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
+      );
+      // Fall back to the (possibly stale) schedule.runResults already in scope.
+    }
+
     // Save the result to database (without actualResponse to save space)
     const resultToStore = { ...finalResult };
     delete (resultToStore as any).actualResponse;
@@ -4580,11 +4650,9 @@ export async function runScheduledChat(
 
     // ENG-1131 follow-up: alert the owner the MOMENT sourcing breaks or recovers,
     // instead of only reporting it passively via the schedule-card badge / per-run
-    // emails the next time they happen to check. `schedule.runResults` here is the
-    // history from BEFORE this run, so didSourcingBlockStateChange compares against
-    // the immediately preceding run — fires once per transition, not once per run
-    // of a multi-day outage.
-    if (didSourcingBlockStateChange(schedule.runResults, blockedBy)) {
+    // emails the next time they happen to check. Fires once per transition, not
+    // once per run of a multi-day outage.
+    if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
       await notifyScheduleOwnerOfSourcingBlockTransition(schedule, userId, {
         isNowBlocked: Boolean(blockedBy),
       });
