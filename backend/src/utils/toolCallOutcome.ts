@@ -126,8 +126,25 @@ function toolCallAction(toolCall: any): string | undefined {
   return args.action;
 }
 
+/**
+ * ENG-1276 follow-up #3 — email(action='send') and send_email_from_sender both
+ * send a REAL email to a recipient; which one a run actually calls depends on
+ * whether the user has a connected mailbox or a configured CRM sender, account
+ * state a schedule owner has no way to predict when writing
+ * requiredFunctionCalls. Verified via both execute() paths: email's send
+ * action resolves through resolveEmailAccount(userId, account_id, 'send') (a
+ * real write, not a preview), and send_email_from_sender always sends — it
+ * has no `action` param at all, every call IS a send.
+ *
+ * Unlike twitter_manage_post/post_on_connected_account (one-directional —
+ * post_on_connected_account can never do a thread), this pair is genuinely
+ * BIDIRECTIONAL: whichever tool the account state routes through should
+ * credit the other one too, so both directions are listed.
+ */
 const REQUIREMENT_ALIASES: Array<{ name: string; aliasFor: string; matchesAction: (action: string | undefined) => boolean }> = [
   { name: 'twitter_manage_post', aliasFor: 'post_on_connected_account', matchesAction: (a) => a === 'post_thread' },
+  { name: 'email', aliasFor: 'send_email_from_sender', matchesAction: (a) => a === 'send' },
+  { name: 'send_email_from_sender', aliasFor: 'email', matchesAction: () => true },
 ];
 
 /**
