@@ -111,6 +111,25 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
       expect.objectContaining({ userId: undefined, feature: 'agent_task' })
     );
   });
+
+  // ENG-700 AC #5: the vendor recorded matches the client that served the call.
+  // Regression guard: a Bedrock/Vertex client is cached on the registry after
+  // its first call, exactly like an Azure client is pre-populated at
+  // construction time — so "client is already set" must NOT be used as a
+  // proxy for "this is Azure OpenAI", or a cached Bedrock model would
+  // mislabel as azure-openai on its second call onward.
+  it('keeps the "bedrock" label on a second call, after the client is cached', async () => {
+    await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+    await svc.callLLM(MODEL, [{ role: 'user', content: 'hi again' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledTimes(2);
+    expect(mockMeterUser.mock.calls[0][0]).toMatchObject({ provider: 'bedrock' });
+    expect(mockMeterUser.mock.calls[1][0]).toMatchObject({ provider: 'bedrock' });
+  });
 });
 
 describe('makeToolUsageCallback no longer double-charges (ENG-200)', () => {
