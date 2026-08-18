@@ -70,6 +70,10 @@ beforeEach(() => {
     fetchDestinations: jest.fn().mockResolvedValue({
       status: 'ok', ads: [], ownedPixelIds: [], observations: {}, urlsNotChecked: [],
     }),
+    // §G Tier 2 makes its own 30-day Graph read. Without this every test here reaches
+    // graph.facebook.com for real — the ENG-1111 guard blocks it, so the suite still passes
+    // while silently exercising a different path from production.
+    fetchEventMix: jest.fn().mockResolvedValue({ status: 'ok', days: [] }),
     // Inside OPTIMISATION_RECENCY_DAYS of outageDays()'s newest row (2026-08-09), so the
     // recency gate treats these ad sets as still delivering rather than as past waste.
     now: Date.parse('2026-08-10T00:00:00Z'),
