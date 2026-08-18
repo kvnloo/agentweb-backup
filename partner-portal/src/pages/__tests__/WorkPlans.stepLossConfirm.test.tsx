@@ -172,6 +172,46 @@ describe("WorkPlans turns a step-loss refusal into a decision (ENG-1221)", () =>
     expect(screen.queryByText(/save anyway/i)).not.toBeInTheDocument();
   });
 
+  it("closes the confirmation when the confirmed retry hits a conflict", async () => {
+    // Greptile, round 1: the modal used to survive a failed retry, sitting over
+    // the error that explains it and offering a "Save anyway" that cannot work.
+    // The admin clicks, fails identically, and never sees why.
+    const conflict = Object.assign(new Error("Request failed with status code 409"), {
+      response: { status: 409, data: { message: "stale" } },
+    });
+    await renderPage();
+    await openEditor();
+    mockedAxios.put.mockRejectedValueOnce(removalRefusal).mockRejectedValueOnce(conflict);
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(saveAnyway()).toBeInTheDocument());
+    fireEvent.click(saveAnyway());
+
+    await waitFor(() => expect(screen.getByText(/changed while you were editing/i)).toBeInTheDocument());
+    // By role, not by text: the dialog's own body says "save anyway" too.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /save anyway/i })).not.toBeInTheDocument());
+    // The editor itself must stay open, or the edits are gone.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("closes the confirmation when the confirmed retry fails for any other reason", async () => {
+    const boom = Object.assign(new Error("Request failed with status code 500"), {
+      response: { status: 500, data: { message: "Something went wrong upstream" } },
+    });
+    await renderPage();
+    await openEditor();
+    mockedAxios.put.mockRejectedValueOnce(removalRefusal).mockRejectedValueOnce(boom);
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(saveAnyway()).toBeInTheDocument());
+    fireEvent.click(saveAnyway());
+
+    await waitFor(() => expect(screen.getByText(/Something went wrong upstream/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /save anyway/i })).not.toBeInTheDocument());
+  });
+
   it("does not report a refused save as saved", async () => {
     await renderPage();
     await openEditor();
