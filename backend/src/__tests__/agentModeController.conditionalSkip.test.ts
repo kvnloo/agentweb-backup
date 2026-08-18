@@ -306,6 +306,61 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     })).toBe(true);
   });
 
+  it('fires on the REAL 2026-08-15 prod regression: a NEGATED "failure" mention read as hard failure evidence (ENG-1276 follow-up, session 7f95530d…)', () => {
+    // The day BEFORE the perform_data_analysis regression above, the SAME schedule
+    // hit the SAME 20-attempt nudge trap through a completely different mechanism:
+    // this run made ZERO tool calls at all (the model reasoned the weekday in
+    // prose, never touching perform_data_analysis or anything else), so the
+    // write-call veto (step 3) was never in play. The skip explanation instead
+    // said "Posts published: 0 (by design, not by failure)" — HARD_FAILURE_PATTERNS
+    // (step 2a) matches the bare word "failure" ANYWHERE in the turn with no
+    // negation awareness, so this benign sentence EXPLICITLY DENYING a failure
+    // tripped the veto exactly like a real one would.
+    const SATURDAY_0815 = new Date('2026-08-15T13:26:57.527Z');
+    expect(SATURDAY_0815.getUTCDay()).toBe(6);
+    const instruction =
+      'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+      'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped." Only proceed on Monday, Wednesday, or Friday.';
+    const realSkip =
+      'LUCAS: non-publishing day, skipped.\n\n' +
+      '<p><strong>Weekday check:</strong> Today is <strong>Saturday, 15 August 2026</strong>. This schedule only publishes Monday, Wednesday, and Friday — so nothing was created and nothing was published.</p>\n\n' +
+      '<ul>\n' +
+      '<li>Posts published: <strong>0</strong> (by design, not by failure)</li>\n' +
+      '<li>Images generated: <strong>0</strong></li>\n' +
+      '<li>Tool calls made: <strong>none</strong> — no brand/market reads, no research, no publish attempts</li>\n' +
+      '</ul>';
+    expect(scheduledRunSignalsConditionalSkip(realSkip, {
+      now: SATURDAY_0815,
+      instruction,
+      toolCalls: [],
+    })).toBe(true);
+  });
+
+  it('NEGATION AUDIT: a denied failure/error is waived; a genuine one nearby still vetoes', () => {
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // A denied failure/error is the OPPOSITE of hard failure evidence.
+    [
+      'Non-publishing day, skipped. Posts published: 0 (by design, not by failure).',
+      'Non-publishing day, skipped. This was not a failure — the cadence simply excludes today.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Nothing was published, without any failure on our end.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // A genuine failure elsewhere in the SAME turn must still veto — neutralizing
+    // one denied mention must not blind the check to a real one nearby.
+    [
+      'Non-publishing day, skipped. Not a failure of the schedule, but image generation failed.',
+      'Non-publishing day, skipped. No failure here, though the LinkedIn API timed out.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
     // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
     // phrasing surface rather than the single wording that happened to break.
