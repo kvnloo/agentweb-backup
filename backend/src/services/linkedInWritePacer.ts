@@ -180,7 +180,7 @@ function overHourlyCeiling(recent: number[], at: number): WriteSlot {
   return {
     allowed: false,
     reason:
-      `This LinkedIn account has already performed ${recent.length} write actions in the last hour, ` +
+      `This LinkedIn Outreach account has already performed ${recent.length} write actions in the last hour, ` +
       `which is the safety ceiling that keeps LinkedIn from revoking the account's session. ` +
       `Remaining actions should be left for a later run.`,
     retryAfterMs: Math.max(0, (recent[0] ?? at) + HOUR_MS - at),
@@ -241,7 +241,7 @@ export async function reserveWriteSlot(
     return {
       allowed: false,
       reason:
-        `${queuedAhead} LinkedIn write actions are already queued for this account, which is more ` +
+        `${queuedAhead} LinkedIn Outreach write actions are already queued for this account, which is more ` +
         `than can be paced safely in one run. Remaining actions should be left for a later run.`,
       retryAfterMs: projectedWait,
     };

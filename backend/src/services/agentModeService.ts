@@ -32177,7 +32177,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             return {
               success: false,
               error:
-                'Cannot resend yet — this LinkedIn account is under an active account-level '
+                'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
                 + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
                 + 'Skip the remaining invites and report what was completed.',
             };
