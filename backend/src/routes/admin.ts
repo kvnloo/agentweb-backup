@@ -4876,6 +4876,24 @@ router.post("/subscription-types", async (req, res) => {
             ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
             : [],
           optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          // ENG-1214 AC5. Carried through RAW and only when present.
+          //
+          // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
+          // value: coercing here (Number(...), `=== true`) would turn every bad
+          // input into a valid-looking one and make that validation a no-op, so
+          // an admin typing 100 would silently get a threshold that never fires.
+          //
+          // Only when present, because this object is built from an explicit
+          // whitelist and REPLACES the stored policy. Materialising a default
+          // here would freeze today's 90 onto every tier, after which the
+          // default could never move; and absent must stay distinguishable from
+          // deliberately-configured-to-90.
+          ...(type.llmUsagePolicy.alertUsagePercentThreshold !== undefined
+            ? { alertUsagePercentThreshold: type.llmUsagePolicy.alertUsagePercentThreshold }
+            : {}),
+          ...(type.llmUsagePolicy.alertOnForecastShortfall !== undefined
+            ? { alertOnForecastShortfall: type.llmUsagePolicy.alertOnForecastShortfall }
+            : {}),
         };
         const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
         const supportedModels = new Set(await agentModeService.getSupportedModels(true));

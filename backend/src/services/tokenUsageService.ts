@@ -1,7 +1,10 @@
 import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
 import { inheritsOrgBilling } from "./orgAuthz";
-import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy } from "./llmUsagePolicyService";
+import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
+  resolveAlertThresholds,
+  type ResolvedAlertThresholds,
+} from "./llmUsagePolicyService";
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
@@ -29,6 +32,16 @@ export interface TokenUsageStatus {
   costEnforced: boolean;
   usageMode?: LlmUsageMode;
   usagePolicyVersion?: string | null;
+  /**
+   * Alert thresholds with defaults ALREADY applied (ENG-1214 AC5, ENG-1210 AC9).
+   *
+   * Resolved here rather than left nullable so the client never carries its own
+   * fallback. A portal holding a private default would keep warning at the old
+   * number for any tier whose policy set a different one, and the disagreement
+   * would be invisible — both sides look right in isolation while the customer
+   * is warned at the wrong moment.
+   */
+  alertThresholds: ResolvedAlertThresholds;
 }
 
 /**
@@ -247,6 +260,8 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     costEnforced: costIsGate,
     usageMode: versionedCostPolicyEnforced ? usageDecision.usageMode : (allowed ? "full_choice" : "paused"),
     usagePolicyVersion: llmUsagePolicy?.version || null,
+    // Always present, always resolved — see the note on the field.
+    alertThresholds: resolveAlertThresholds(llmUsagePolicy),
   };
 }
 
