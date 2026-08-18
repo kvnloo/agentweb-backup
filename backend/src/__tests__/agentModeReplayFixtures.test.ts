@@ -114,6 +114,21 @@ describe('agentModeReplayFixtures (ENG-1312 criterion 3)', () => {
     expect(result.reason).toMatch(/pending/i);
   });
 
+  it('checkReplayFixture fails a non-pending fixture that has neither maxChars nor maxWords set (CodeRabbit, PR #2443) — a misconfigured threshold must not silently pass', () => {
+    const fixture: JudgeReplayFixture = {
+      id: 'test-ungated',
+      label: 'test',
+      thresholdSource: 'ENG-1309 test',
+      isPlaceholder: true,
+      pending: false,
+      turns: [{ role: 'assistant', content: 'x'.repeat(999999) }],
+      assertion: {},
+    };
+    const result = checkReplayFixture(fixture);
+    expect(result.pass).toBe(false);
+    expect(result.reason).toMatch(/no threshold|misconfigur|maxChars|maxWords/i);
+  });
+
   // SUCCESS tests ------------------------------------------------------------
 
   it('checkReplayFixture passes a fixture whose reply is within its maxChars threshold', () => {

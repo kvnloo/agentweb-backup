@@ -95,6 +95,18 @@ export function checkReplayFixture(fixture: JudgeReplayFixture): ReplayFixtureRe
     };
   }
 
+  if (fixture.assertion.maxChars === undefined && fixture.assertion.maxWords === undefined) {
+    // A non-pending fixture with no numeric threshold is a misconfiguration —
+    // it would otherwise pass unconditionally forever, silently turning off
+    // the exact CI gate criterion 3 asks for (CodeRabbit, PR #2443). Register
+    // it with `pending: true` instead if there is genuinely no threshold yet.
+    return {
+      id: fixture.id,
+      pass: false,
+      reason: `${fixture.id}: misconfigured — pending is false but neither maxChars nor maxWords is set (${fixture.thresholdSource})`,
+    };
+  }
+
   const content = assistantContent(fixture);
 
   if (fixture.assertion.maxChars !== undefined && content.length > fixture.assertion.maxChars) {
