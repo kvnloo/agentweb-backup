@@ -73,27 +73,39 @@ beforeEach(() => {
 });
 
 describe('incremental mode', () => {
-  it('stops after one page when nothing on it changed', async () => {
-    // The steady state: 0 upserted, everything unchanged, three more pages behind it
-    // that used to be fetched anyway on all 144 daily cycles.
-    const known = ['a', 'b', 'c'];
+  it('stops after TWO consecutive fully-known pages', async () => {
+    // Two, not one: the early exit rests on Unipile ordering the feed newest-first,
+    // which is observed rather than contractual, and the cost of being wrong is a
+    // pending invitation missing from the cache — which reads as "never invited"
+    // and can re-invite someone. One extra page is the insurance.
+    const known = ['a', 'b', 'c', 'd'];
     mockGetAllSentInvitationsByAccount.mockResolvedValue(known.map((id) => cachedRow(id)));
     servePages([
-      known.map((id) => invitation(id)),
-      [invitation('d')],
+      [invitation('a'), invitation('b')],
+      [invitation('c'), invitation('d')],
       [invitation('e')],
     ]);
 
     await syncSentInvitationsForAccount(ACCOUNT, { mode: 'incremental' });
 
-    expect(mockListSentInvitations).toHaveBeenCalledTimes(1);
+    expect(mockListSentInvitations).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps walking when only ONE page was fully known', async () => {
+    // A single known page is exactly the out-of-order case the two-page rule guards.
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('a')]);
+    servePages([[invitation('a')], [invitation('new')], [invitation('z')]]);
+
+    await syncSentInvitationsForAccount(ACCOUNT, { mode: 'incremental' });
+
+    expect(mockListSentInvitations).toHaveBeenCalledTimes(3);
   });
 
   it('never prunes when it stopped early', async () => {
     // The pages it did not read still hold pending invitations; pruning against a
     // partial set would delete every one of them.
-    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('a')]);
-    servePages([[invitation('a')], [invitation('b')]]);
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('a'), cachedRow('b')]);
+    servePages([[invitation('a')], [invitation('b')], [invitation('c')]]);
 
     await syncSentInvitationsForAccount(ACCOUNT, { mode: 'incremental' });
 
@@ -101,13 +113,13 @@ describe('incremental mode', () => {
   });
 
   it('keeps walking past a page that contains a new invitation', async () => {
-    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('b')]);
-    servePages([[invitation('new-1')], [invitation('b')], [invitation('c')]]);
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('b'), cachedRow('c')]);
+    servePages([[invitation('new-1')], [invitation('b')], [invitation('c')], [invitation('d')]]);
 
     await syncSentInvitationsForAccount(ACCOUNT, { mode: 'incremental' });
 
-    // Page 1 had something new, page 2 was entirely known — so it stops there.
-    expect(mockListSentInvitations).toHaveBeenCalledTimes(2);
+    // Page 1 had something new; pages 2 and 3 were known — stops after the pair.
+    expect(mockListSentInvitations).toHaveBeenCalledTimes(3);
   });
 
   it('keeps walking past a page whose invitation text changed', async () => {
@@ -143,16 +155,17 @@ describe('incremental mode', () => {
   it('still upserts what it did read before stopping', async () => {
     // Page 1 mixes one new invitation with a known one, so the walk continues;
     // page 2 is entirely known, so it stops there and never reads page 3.
-    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('b'), cachedRow('known')]);
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([cachedRow('b'), cachedRow('known'), cachedRow('known2')]);
     servePages([
       [invitation('new-1'), invitation('b')],
       [invitation('known')],
+      [invitation('known2')],
       [invitation('c')],
     ]);
 
     const upserted = await syncSentInvitationsForAccount(ACCOUNT, { mode: 'incremental' });
 
-    expect(mockListSentInvitations).toHaveBeenCalledTimes(2);
+    expect(mockListSentInvitations).toHaveBeenCalledTimes(3);
     expect(upserted).toBe(1);
     expect(mockUpsertSentInvitations).toHaveBeenCalledWith([
       expect.objectContaining({ invitedUserPublicId: 'new-1' }),

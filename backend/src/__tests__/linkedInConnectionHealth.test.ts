@@ -27,12 +27,13 @@ jest.mock('../utils/agentModeAlerts', () => ({
 }));
 jest.mock('../services/db', () => ({
   userDb: { getUserById: jest.fn() },
+  scheduleDb: { getSchedulesByUserId: jest.fn().mockResolvedValue([]), updateSchedule: jest.fn() },
 }));
 
 const { getAccountsByUserId, updateAccountConfig } = require('../services/connectedAccountsDb');
 const { emailService } = require('../services/emailService');
 const { sendAgentModeOncallAlert } = require('../utils/agentModeAlerts');
-const { userDb } = require('../services/db');
+const { userDb, scheduleDb } = require('../services/db');
 
 const ACCOUNT_ID = 'tMgX8uZJTZWTG_mFY1aI2A';
 const OWNER = 'owner-user-id';
@@ -61,9 +62,10 @@ function applyMutation(freshConfig: Record<string, any>) {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+  delete process.env.LINKEDIN_DISCONNECT_NOTIFY; // default is ON
   updateAccountConfig.mockResolvedValue(undefined);
   userDb.getUserById.mockResolvedValue({ email: 'jennifer.sun@tfaconnect.com' });
+  scheduleDb.getSchedulesByUserId.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -148,14 +150,14 @@ describe('recordUnipileAccountHealth — the disconnect edge', () => {
     expect(updates).toMatchObject({
       needs_reconnect: true,
       disconnected_at: '2026-08-17T12:00:00.000Z',
-      disconnect_notified_at: '2026-08-17T12:00:00.000Z',
     });
-    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
-    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledWith(
-      ['jennifer.sun@tfaconnect.com'],
-      expect.objectContaining({ isReminder: false, accountName: 'Jennifer Sun' }),
-    );
+    // Never stamped on the transition: no owner email goes out here, and the stamp
+    // means "last time we emailed the owner".
+    expect(updates).not.toHaveProperty('disconnect_notified_at');
+    // Oncall is immediate; the customer's copy waits for confirmation so a
+    // transient 401 cannot produce an un-sendable false alarm.
     expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
   });
 
   it('sends nothing when a concurrent instance already won the transition', async () => {
@@ -212,7 +214,7 @@ describe('recordUnipileAccountHealth — the disconnect edge', () => {
 
 describe('recordUnipileAccountHealth — owner notification kill-switch', () => {
   it('records the flag but suppresses the owner email when disabled', async () => {
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false';
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false'; // explicit kill switch
     givenAccount({});
 
     const outcome = await recordUnipileAccountHealth({
@@ -232,7 +234,7 @@ describe('recordUnipileAccountHealth — owner notification kill-switch', () => 
   it('does not stamp disconnect_notified_at while suppressed', async () => {
     // Otherwise turning the flag on later would find a "recent notification" that
     // never happened, and the owner would hear nothing for a full reminder window.
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false';
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false'; // explicit kill switch
     givenAccount({});
 
     await recordUnipileAccountHealth({
@@ -433,7 +435,7 @@ describe('reminder cadence is independent of the owner-email flag', () => {
     // Gating the whole reminder branch on the flag meant that at its production
     // default a permanently-dead account produced ONE alert ever and then silence —
     // the exact 38-day blind spot this exists to close.
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false';
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false'; // explicit kill switch
     const old = new Date(NOW - 30 * 24 * 60 * 60 * 1000).toISOString();
     givenAccount({ needs_reconnect: true, disconnected_at: old, disconnect_notified_at: old });
 
@@ -447,6 +449,43 @@ describe('reminder cadence is independent of the owner-email flag', () => {
     expect(outcome).toBe('reminded');
     expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
     expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+
+  it('does NOT stamp disconnect_notified_at while the owner email is suppressed', async () => {
+    // The stamp means "last time we emailed the OWNER". Writing it when no email
+    // went out costs the customer a full reminder window: the stamp lands seconds
+    // after the disconnect, so whoever later enables the flag finds the reminder
+    // "not due" and the customer hears nothing for a week.
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false'; // explicit kill switch
+    givenAccount({ needs_reconnect: true, disconnected_at: '2026-08-13T23:44:00.000Z' });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(outcome).toBe('reminded');
+    expect(updateAccountConfig).not.toHaveBeenCalled();
+  });
+
+  it('reaches the customer on the first cycle after the flag is enabled', async () => {
+    // The end-to-end consequence: an account that went dead while suppressed must
+    // be emailed as soon as the flag flips, not a window later.
+    delete process.env.LINKEDIN_DISCONNECT_NOTIFY; // default ON
+    givenAccount({ needs_reconnect: true, disconnected_at: '2026-08-13T23:44:00.000Z' });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID,
+      ownerUserId: OWNER,
+      state: 'disconnected',
+      now: NOW,
+    });
+
+    expect(outcome).toBe('reminded');
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
+    expect(applyMutation({}).updates.disconnect_notified_at).toBe('2026-08-17T12:00:00.000Z');
   });
 });
 
@@ -470,7 +509,10 @@ describe('notification delivery failures', () => {
   });
 
   it('still emails the owner when the oncall alert fails', async () => {
-    givenAccount({});
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - 30 * 60 * 1000).toISOString(), // past confirmation
+    });
     sendAgentModeOncallAlert.mockRejectedValue(new Error('notion down'));
 
     const outcome = await recordUnipileAccountHealth({
@@ -480,7 +522,7 @@ describe('notification delivery failures', () => {
       now: NOW,
     });
 
-    expect(outcome).toBe('marked-disconnected');
+    expect(outcome).toBe('reminded');
     expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
   });
 
@@ -497,5 +539,104 @@ describe('notification delivery failures', () => {
 
     expect(outcome).toBe('marked-disconnected');
     expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('owner notification default', () => {
+  it('emails the owner when the env var is unset', async () => {
+    // Default flipped ON (2026-08-17): a disconnect is a total outage of the thing
+    // the customer pays for, and one email per disconnect EVENT is not the
+    // 2026-06-03 flood shape (one per connection, thousands at once).
+    delete process.env.LINKEDIN_DISCONNECT_NOTIFY;
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - 30 * 60 * 1000).toISOString(), // past confirmation
+    });
+
+    await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('is still killable with an explicit false', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'false';
+    givenAccount({});
+
+    await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('graceful-failure mitigations', () => {
+  const { resumeSchedulesPausedForAccount, DISCONNECT_CONFIRM_MS } =
+    require('../services/linkedInConnectionHealth');
+
+  it('does not email the customer on a single blip', async () => {
+    // A transient Unipile 401 must never tell a paying customer their account is
+    // broken — an email cannot be unsent. The flag and oncall still fire at once.
+    givenAccount({});
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(outcome).toBe('marked-disconnected');
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+
+  it('emails once the disconnect is confirmed on a later observation', async () => {
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - DISCONNECT_CONFIRM_MS - 1000).toISOString(),
+    });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(outcome).toBe('reminded');
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays silent while still inside the confirmation window', async () => {
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - 60_000).toISOString(),
+    });
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(outcome).toBe('no-op');
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).not.toHaveBeenCalled();
+  });
+
+  it('resumes only the schedules this gate paused, for this account', async () => {
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', status: 'paused', pausedReason: 'linkedin_disconnected', startingMessage: `use ${ACCOUNT_ID}` },
+      { scheduleId: 'b', status: 'paused', pausedReason: undefined, startingMessage: `use ${ACCOUNT_ID}` },      // human-paused
+      { scheduleId: 'c', status: 'paused', pausedReason: 'linkedin_disconnected', startingMessage: 'use other-acct' },
+      { scheduleId: 'd', status: 'active', pausedReason: 'linkedin_disconnected', startingMessage: `use ${ACCOUNT_ID}` },
+    ]);
+
+    const resumed = await resumeSchedulesPausedForAccount(OWNER, ACCOUNT_ID);
+
+    expect(resumed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith('a', expect.objectContaining({ status: 'active' }));
+  });
+
+  it('never breaks the reconnect callback when resuming fails', async () => {
+    scheduleDb.getSchedulesByUserId.mockRejectedValue(new Error('dynamo down'));
+
+    await expect(resumeSchedulesPausedForAccount(OWNER, ACCOUNT_ID)).resolves.toBe(0);
   });
 });
