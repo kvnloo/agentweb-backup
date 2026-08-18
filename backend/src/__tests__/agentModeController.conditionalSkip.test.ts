@@ -118,6 +118,8 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -304,6 +306,67 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       instruction,
       toolCalls: [{ name: 'perform_data_analysis' }],
     })).toBe(true);
+  });
+
+  describe('registry-declared readOnly tools (ENG-1276 follow-up)', () => {
+    const SUNDAY = new Date('2026-08-02T12:00:00Z');
+    const skipContent = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+
+    it('treats a tool the registry declares readOnly:true as read, not write', () => {
+      emmaToolRegistry.register({
+        name: 'fake_registry_readonly_tool',
+        definition: { name: 'fake_registry_readonly_tool', description: 'test', inputSchema: { type: 'object', properties: {} } },
+        execute: async () => ({}),
+        readOnly: true,
+      });
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'fake_registry_readonly_tool' }],
+      })).toBe(true);
+    });
+
+    it('still treats a registered tool with readOnly unset (or false) as a write', () => {
+      emmaToolRegistry.register({
+        name: 'fake_registry_write_tool',
+        definition: { name: 'fake_registry_write_tool', description: 'test', inputSchema: { type: 'object', properties: {} } },
+        execute: async () => ({}),
+      });
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'fake_registry_write_tool' }],
+      })).toBe(false);
+    });
+
+    it('still treats an UNREGISTERED tool name as a write (fail-safe default unchanged)', () => {
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'totally_unknown_tool_xyz' }],
+      })).toBe(false);
+    });
+
+    // Pins the PRODUCTION configuration itself — verified read-only by reading
+    // each tool's actual execute() implementation (not just its name/description,
+    // since ENG-1276 is precisely about those lying): perform_deep_research only
+    // calls Gemini Deep Research + uploads to internal S3 (no external publish);
+    // call_google_ads_reporting_api and call_linkedin_ads_insights_api only fetch
+    // analytics, with no write-capable action in their schemas at all — unlike
+    // their write-bundling siblings call_google_ads_api/call_linkedin_marketing_api,
+    // which correctly stay unflagged.
+    it('the real tool registry flags the confirmed side-effect-free analogs of perform_data_analysis', () => {
+      const readOnlyNames = ['perform_deep_research', 'call_google_ads_reporting_api', 'call_linkedin_ads_insights_api'];
+      for (const name of readOnlyNames) {
+        expect([name, emmaToolRegistry.getTool(name)?.readOnly]).toEqual([name, true]);
+        expect([name, scheduledRunSignalsConditionalSkip(skipContent, { now: SUNDAY, toolCalls: [{ name }] })]).toEqual([name, true]);
+      }
+    });
+
+    it('does NOT flag the write-bundling siblings of the read-only analytics tools', () => {
+      const writeNames = ['call_google_ads_api', 'call_linkedin_marketing_api', 'call_hubspot_api'];
+      for (const name of writeNames) {
+        expect([name, emmaToolRegistry.getTool(name)?.readOnly]).toEqual([name, undefined]);
+        expect([name, scheduledRunSignalsConditionalSkip(skipContent, { now: SUNDAY, toolCalls: [{ name }] })]).toEqual([name, false]);
+      }
+    });
   });
 
   it('fires on the REAL 2026-08-15 prod regression: a NEGATED "failure" mention read as hard failure evidence (ENG-1276 follow-up, session 7f95530d…)', () => {
