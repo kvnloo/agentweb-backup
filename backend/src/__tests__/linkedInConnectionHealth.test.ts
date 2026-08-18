@@ -17,6 +17,7 @@ import {
 
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
+  getAccountsByUserIdIncludingOrgShared: jest.fn().mockResolvedValue([]),
   updateAccountConfig: jest.fn(),
 }));
 jest.mock('../services/emailService', () => ({
@@ -30,7 +31,11 @@ jest.mock('../services/db', () => ({
   scheduleDb: { getSchedulesByUserId: jest.fn().mockResolvedValue([]), updateSchedule: jest.fn() },
 }));
 
-const { getAccountsByUserId, updateAccountConfig } = require('../services/connectedAccountsDb');
+const {
+  getAccountsByUserId,
+  getAccountsByUserIdIncludingOrgShared,
+  updateAccountConfig,
+} = require('../services/connectedAccountsDb');
 const { emailService } = require('../services/emailService');
 const { sendAgentModeOncallAlert } = require('../utils/agentModeAlerts');
 const { userDb, scheduleDb } = require('../services/db');
@@ -63,6 +68,7 @@ function applyMutation(freshConfig: Record<string, any>) {
 beforeEach(() => {
   jest.clearAllMocks();
   delete process.env.LINKEDIN_DISCONNECT_NOTIFY; // default is ON
+  getAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
   updateAccountConfig.mockResolvedValue(undefined);
   userDb.getUserById.mockResolvedValue({ email: 'jennifer.sun@tfaconnect.com' });
   scheduleDb.getSchedulesByUserId.mockResolvedValue([]);
@@ -638,5 +644,112 @@ describe('graceful-failure mitigations', () => {
     scheduleDb.getSchedulesByUserId.mockRejectedValue(new Error('dynamo down'));
 
     await expect(resumeSchedulesPausedForAccount(OWNER, ACCOUNT_ID)).resolves.toBe(0);
+  });
+});
+
+describe('what the customer actually reads (ENG-1197 review round 2)', () => {
+  const { DISCONNECT_CONFIRM_MS } = require('../services/linkedInConnectionHealth');
+
+  // The transition branch never emails the customer — it only flags and pages
+  // oncall, because a single blip must not reach a paying customer. So the FIRST
+  // customer email is sent by the reminder branch, one cron cycle later. Hard-coding
+  // isReminder there made that first email arrive as
+  // "Still disconnected after 0 days".
+  it('does not label the first owner email as a reminder', async () => {
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - DISCONNECT_CONFIRM_MS - 1000).toISOString(),
+      // disconnect_notified_at absent: the owner has never been emailed.
+    });
+
+    await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledWith(
+      ['jennifer.sun@tfaconnect.com'],
+      expect.objectContaining({ isReminder: false, daysDisconnected: 0 }),
+    );
+  });
+
+  it('does label a later email as a reminder, with the elapsed days', async () => {
+    const disconnectedAt = new Date(NOW - 8 * 24 * 60 * 60 * 1000).toISOString();
+    givenAccount({
+      needs_reconnect: true,
+      disconnected_at: disconnectedAt,
+      disconnect_notified_at: disconnectedAt, // emailed once, 8 days ago
+    });
+
+    await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: OWNER, state: 'disconnected', now: NOW,
+    });
+
+    expect(emailService.sendLinkedInAccountDisconnectedEmail).toHaveBeenCalledWith(
+      ['jennifer.sun@tfaconnect.com'],
+      expect.objectContaining({ isReminder: true, daysDisconnected: 8 }),
+    );
+  });
+});
+
+describe('an org-shared account belongs to its owner, not its user', () => {
+  const TEAMMATE = 'teammate-user-id';
+
+  // ENG-1198 shipped shared-account fallback, so a teammate can drive an account
+  // they do not own. findUnipileAccount used to look only at the caller's OWN
+  // accounts, find nothing, and return null — so a disconnect observed through a
+  // borrowed account wrote no flag, paged nobody, and left the schedule gate blind.
+  function givenSharedAccount(config: Record<string, any>) {
+    getAccountsByUserId.mockResolvedValue([]); // the teammate owns nothing
+    getAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      {
+        platform: 'unipile',
+        account_id: ACCOUNT_ID,
+        account_name: 'Jennifer Sun',
+        userId: OWNER, // the non-persisted owner marker the org-shared getter stamps
+        config: { unipile_account_id: ACCOUNT_ID, ...config },
+      },
+    ]);
+  }
+
+  it('flags the OWNER record when a teammate observes the disconnect', async () => {
+    givenSharedAccount({});
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: TEAMMATE, state: 'disconnected', now: NOW,
+    });
+
+    expect(outcome).toBe('marked-disconnected');
+    // The config write must target the owner, or it lands on the wrong user record.
+    expect(updateAccountConfig).toHaveBeenCalledWith(OWNER, 'unipile', ACCOUNT_ID, expect.any(Function));
+    expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it('emails the owner, not the teammate who happened to hit the dead session', async () => {
+    givenSharedAccount({
+      needs_reconnect: true,
+      disconnected_at: new Date(NOW - 10 * 60 * 1000).toISOString(),
+    });
+    userDb.getUserById.mockResolvedValue({ email: 'jennifer.sun@tfaconnect.com' });
+
+    await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: TEAMMATE, state: 'disconnected', now: NOW,
+    });
+
+    expect(userDb.getUserById).toHaveBeenCalledWith(OWNER);
+  });
+
+  it('declines rather than guessing when the shared row carries no owner marker', async () => {
+    getAccountsByUserId.mockResolvedValue([]);
+    getAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: ACCOUNT_ID, config: { unipile_account_id: ACCOUNT_ID } },
+    ]);
+
+    const outcome = await recordUnipileAccountHealth({
+      accountId: ACCOUNT_ID, ownerUserId: TEAMMATE, state: 'disconnected', now: NOW,
+    });
+
+    // Writing to the caller's record would corrupt an unrelated user's account.
+    expect(outcome).toBe('no-op');
+    expect(updateAccountConfig).not.toHaveBeenCalled();
   });
 });
