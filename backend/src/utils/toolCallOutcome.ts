@@ -90,6 +90,47 @@ export function countsTowardRequirement(toolCall: any): boolean {
 }
 
 /**
+ * ENG-1276 follow-up — twitter_manage_post's OWN description tells the model to
+ * use it, not post_on_connected_account, for a multi-tweet thread: "NEVER use
+ * this tool to post a single new tweet — use post_on_connected_account for
+ * that... This tool is for: multi-tweet threads (2+ tweets)... if you only have
+ * 1 tweet, use post_on_connected_account instead." A schedule whose
+ * requiredFunctionCalls names post_on_connected_account has no way to know its
+ * agent will legitimately reach for the thread-specific tool instead, so a real,
+ * successful, irreversible publish never satisfied the requirement and the run
+ * was pressed to publish a DUPLICATE thread for the full 20-attempt retry
+ * budget (real prod session 0ef2078d, 2026-08-12: "Kevin — X Evening Post"
+ * published a 3-tweet thread via twitter_manage_post(post_thread), then was
+ * nudged 19 more times even though re-calling post_on_connected_account would
+ * have duplicated a post already live).
+ *
+ * Scoped to exactly the one action that creates the kind of new top-level post
+ * post_on_connected_account would have: post_thread. Every other
+ * twitter_manage_post action (reply/quote_tweet/like/unlike/retweet/unretweet/
+ * delete_tweet/analytics) touches EXISTING content or isn't a post at all, so it
+ * must not alias. linkedin_manage_post gets no alias here either — none of its
+ * actions (repost/comment/list_comments/react/get_analytics) create a new
+ * top-level post the way post_on_connected_account does; a repost/comment is
+ * not the schedule's own content going out.
+ */
+function toolCallAction(toolCall: any): string | undefined {
+  const args = toolCall?.arguments;
+  if (!args) return undefined;
+  if (typeof args === 'string') {
+    try {
+      return JSON.parse(args)?.action;
+    } catch {
+      return undefined;
+    }
+  }
+  return args.action;
+}
+
+const REQUIREMENT_ALIASES: Array<{ name: string; aliasFor: string; matchesAction: (action: string | undefined) => boolean }> = [
+  { name: 'twitter_manage_post', aliasFor: 'post_on_connected_account', matchesAction: (a) => a === 'post_thread' },
+];
+
+/**
  * The requirement ledger for a set of tool calls: every name that may be counted
  * against `requiredFunctionCalls`. One shared mapper because runVerifiedChat
  * builds this ledger in three places (the resumed-run seed, the completion-gate
@@ -98,5 +139,16 @@ export function countsTowardRequirement(toolCall: any): boolean {
  */
 export function requirementEvidenceNames(toolCalls: any[]): string[] {
   if (!Array.isArray(toolCalls)) return [];
-  return toolCalls.filter(countsTowardRequirement).map((call: any) => call.name).filter(Boolean);
+  const names: string[] = [];
+  for (const call of toolCalls) {
+    if (!countsTowardRequirement(call)) continue;
+    if (!call.name) continue;
+    names.push(call.name);
+    // The alias stands in for a publish tool, so it earns its credit under the
+    // SAME success bar a real post_on_connected_account call would need — an
+    // attempted-but-failed thread must not silently satisfy the requirement.
+    const alias = REQUIREMENT_ALIASES.find((a) => a.name === call.name && a.matchesAction(toolCallAction(call)));
+    if (alias && toolCallSucceeded(call)) names.push(alias.aliasFor);
+  }
+  return names;
 }
