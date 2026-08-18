@@ -30,6 +30,9 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 const mockResolveAccountIdWithSource = jest.fn();
 const mockListUserOwnedUnipileAccountIds = jest.fn().mockResolvedValue([]);
 const mockSearchPeople = jest.fn();
+// Named so a test can assert the ENG-975 outage probe was NOT consulted for a page
+// that our own anonymized filter emptied.
+const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountIdWithSource: (...args: any[]) => mockResolveAccountIdWithSource(...args),
@@ -37,7 +40,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     isAccountConnected: jest.fn().mockResolvedValue(true),
     probeAccountSession: jest.fn().mockResolvedValue('connected'),
-    probeSearchCapability: jest.fn().mockResolvedValue('ok'),
+    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
     clearStatusCache: jest.fn(),
   },
 }));
@@ -131,6 +134,88 @@ describe('AgentModeService.linkedinOutreach — shared-account fallback disclosu
 
       expect(result.data.items).toHaveLength(1);
       expect(result.data.items[0].public_identifier).toBe('jsmith');
+    });
+
+    it('reports how many results the anonymized filter removed', async () => {
+      // ENG-1198 dropped them silently. The count is what lets the agent tell
+      // "some matches were out of reach" from "this is all there was".
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'jsmith' },
+          { provider_id: 'p2', public_identifier: 'undefined' },
+          { provider_id: 'p3', public_identifier: 'undefined' },
+        ],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-people',
+        keywords: 'CMO healthtech',
+      });
+
+      expect(result.data.anonymizedFiltered).toBe(2);
+    });
+
+    it('omits the count entirely when nothing was filtered', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'jsmith' }],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-people',
+        keywords: 'CMO healthtech',
+      });
+
+      expect(result.data).not.toHaveProperty('anonymizedFiltered');
+    });
+
+    it('explains an all-anonymized page instead of returning a bare empty list', async () => {
+      // The regression this closes: an entirely out-of-network page became
+      // `items: []` with no explanation — indistinguishable from an empty niche
+      // AND from the ENG-975 "account cannot search" outage. The ENG-975 canary
+      // does NOT cover it, because that only fires when the RAW page was empty.
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      mockSearchPeople.mockResolvedValue({
+        items: [
+          { provider_id: 'p1', public_identifier: 'undefined' },
+          { provider_id: 'p2', public_identifier: 'undefined' },
+          { provider_id: 'p3', public_identifier: 'undefined' },
+        ],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-people',
+        keywords: 'owner veterinary practice',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toHaveLength(0);
+      expect(result.data.anonymizedFiltered).toBe(3);
+      expect(result.message).toContain('anonymized');
+      // Must not read as an outage — that would send the agent down the ENG-975
+      // escalation path for a search that worked perfectly.
+      expect(result.message).toContain('not an outage');
+    });
+
+    it('does not run the ENG-975 outage probe when the raw page had results', async () => {
+      mockResolveAccountIdWithSource.mockResolvedValue({ accountId: 'own-acct-1', usedSharedAccount: false });
+      mockSearchPeople.mockResolvedValue({
+        items: [{ provider_id: 'p1', public_identifier: 'undefined' }],
+        cursor: null,
+      });
+
+      const result = await service.linkedinOutreach(userId, {
+        action: 'search-people',
+        keywords: 'owner veterinary practice',
+      });
+
+      // The account searched fine and returned a row; only our filter emptied it.
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
     });
 
     it('passes explicit account_id straight through without calling the fallback resolver, but still checks ownership', async () => {
