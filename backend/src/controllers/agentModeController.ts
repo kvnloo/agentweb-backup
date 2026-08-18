@@ -4634,15 +4634,31 @@ export async function runScheduledChat(
     // would trade a rare, harmless duplicate for the strictly worse failure mode
     // of a silently missed alert — the same reasoning already established in
     // this file for notifyScheduleOwnerOfFailure's zero-output path.
-    let priorRunResultsForTransitionCheck: any[] | undefined = schedule.runResults;
-    try {
-      const freshSchedule: any = await scheduleDb.getScheduleById(schedule.scheduleId);
-      if (freshSchedule) priorRunResultsForTransitionCheck = freshSchedule.runResults;
-    } catch (refetchError) {
-      console.error(
-        `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
-      );
-      // Fall back to the (possibly stale) schedule.runResults already in scope.
+    //
+    // Scoped to REAL scheduled runs only (!isTest), same as every sibling
+    // owner notification in this function (notifyScheduleOwnerOfFailure). A
+    // manual "Test this schedule" click must never send this unsolicited
+    // alert — the owner is already looking at the run they just triggered,
+    // and testing repeatedly while debugging a suspected outage would
+    // otherwise spam an email they didn't ask for. Also skips the re-fetch
+    // entirely on a test run, since it would go unused.
+    if (!isTest) {
+      let priorRunResultsForTransitionCheck: any[] | undefined = schedule.runResults;
+      try {
+        const freshSchedule: any = await scheduleDb.getScheduleById(schedule.scheduleId);
+        if (freshSchedule) priorRunResultsForTransitionCheck = freshSchedule.runResults;
+      } catch (refetchError) {
+        console.error(
+          `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
+        );
+        // Fall back to the (possibly stale) schedule.runResults already in scope.
+      }
+
+      if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
+        await notifyScheduleOwnerOfSourcingBlockTransition(schedule, userId, {
+          isNowBlocked: Boolean(blockedBy),
+        });
+      }
     }
 
     // Save the result to database (without actualResponse to save space)
@@ -4653,16 +4669,6 @@ export async function runScheduledChat(
     } catch (error) {
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
-    }
-
-    // ENG-1131 follow-up: alert the owner the MOMENT sourcing breaks or recovers,
-    // instead of only reporting it passively via the schedule-card badge / per-run
-    // emails the next time they happen to check. Fires once per transition, not
-    // once per run of a multi-day outage.
-    if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
-      await notifyScheduleOwnerOfSourcingBlockTransition(schedule, userId, {
-        isNowBlocked: Boolean(blockedBy),
-      });
     }
 
     // Self-improve: when enabled, run a reflection turn in the same session that may
