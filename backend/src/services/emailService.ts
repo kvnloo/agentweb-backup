@@ -1063,7 +1063,13 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     toEmails: string | string[],
     opts: {
       accountName: string;
-      /** Omit when the real disconnect time is unknown — better silent than invented. */
+      /**
+       * When we DETECTED the dead session — not when LinkedIn ended it, which we have
+       * no way to know. On a first-ever detection this is stamped "now", so for an
+       * account that has been dead for weeks it is the moment we noticed and nothing
+       * more. The copy says exactly that. Omit it entirely when even that is unknown;
+       * the sentence drops rather than inventing a time.
+       */
       disconnectedAt?: string;
       isReminder: boolean;
       daysDisconnected: number;
@@ -1085,22 +1091,23 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const safeName = this.escapeHtml(opts.accountName);
-      // Name the zone. Without it this renders in the server's zone with no label, so
-      // "Aug 17, 2026, 12:00 PM" tells the customer nothing they can act on.
-      // sendScheduledChatVariableRequestEmail already does this for the same reason.
+      // Rendered in UTC and labelled as such. Without an explicit `timeZone` this took
+      // the SERVER's zone — meaningless to a customer base spread across the world, and
+      // actively misleading once labelled, since the label would name our zone as
+      // though it were theirs. UTC is the one zone that is unambiguous to everyone.
       const whenParsed = opts.disconnectedAt ? new Date(opts.disconnectedAt) : null;
       const when = whenParsed && !Number.isNaN(whenParsed.getTime())
         ? whenParsed.toLocaleString('en-US', {
             year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-            timeZoneName: 'short',
+            timeZone: 'UTC', timeZoneName: 'short',
           })
         : null;
       const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
       const headline = opts.pausedScheduleName
-        ? 'A schedule was paused — LinkedIn still disconnected'
+        ? 'A schedule was paused — LinkedIn Outreach still disconnected'
         : opts.isReminder
-          ? `Still disconnected after ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'}`
-          : 'Your LinkedIn account disconnected';
+          ? `Still disconnected ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'} after we detected it`
+          : 'Your LinkedIn Outreach account disconnected';
       // /settings/:tab — the tab slug is `accounts` (labelled "Connected Accounts"
       // in the sidebar). `/settings/connected-accounts` is not a real tab, so it
       // would have sent every recipient of this alert to a dead page. Canonical
@@ -1148,9 +1155,9 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
             </div>
             <div class="content">
               <div class="error-section">
-                <h3>LinkedIn outreach is paused until you reconnect</h3>
+                <h3>LinkedIn Outreach is paused until you reconnect</h3>
                 <p style="margin: 0; line-height: 1.6;">
-                  LinkedIn ended the session for <strong>${safeName}</strong>${when ? ` on <strong>${when}</strong>` : ''}.
+                  LinkedIn has ended the session for <strong>${safeName}</strong>${when ? ` &mdash; we detected this on <strong>${when}</strong>` : ''}.
                   Reconnecting takes about a minute and only you can do it &mdash; it needs your LinkedIn login.
                 </p>
               </div>
@@ -1163,7 +1170,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
               ${resumeHtml}
             </div>
             <div class="footer">
-              <a class="button" href="${settingsUrl}">Reconnect LinkedIn</a>
+              <a class="button" href="${settingsUrl}">Reconnect LinkedIn Outreach</a>
               <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
                 If reconnecting does not work, remove the connection and add it again as a new connection.
               </p>
@@ -1175,7 +1182,7 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
 
       const text = `${headline}: ${opts.accountName}
 
-LinkedIn ended the session for "${opts.accountName}" on ${when}. Reconnecting takes about a minute and only you can do it - it needs your LinkedIn login.
+LinkedIn has ended the session for "${opts.accountName}"${when ? ` - we detected this on ${when}` : ''}. Reconnecting takes about a minute and only you can do it - it needs your LinkedIn login.
 
 What has stopped:
 - Sending connection invitations and messages
@@ -1187,14 +1194,14 @@ ${opts.pausedScheduleName
   : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
 
 ---
-Reconnect LinkedIn: ${settingsUrl}
+Reconnect LinkedIn Outreach: ${settingsUrl}
 If reconnecting does not work, remove the connection and add it again as a new connection.`;
 
       const subject = opts.pausedScheduleName
         ? `⏸️ Schedule paused: "${opts.pausedScheduleName}" needs ${opts.accountName} reconnected`
         : opts.isReminder
-          ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn outreach paused)`
-          : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn outreach paused)`;
+          ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn Outreach paused)`
+          : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn Outreach paused)`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmail(emailList, subject, text, html);
       console.log(`LinkedIn disconnect email sent to: ${emailList.join(', ')} (reminder=${opts.isReminder})`);
