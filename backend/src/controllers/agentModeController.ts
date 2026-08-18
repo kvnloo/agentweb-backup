@@ -581,10 +581,18 @@ export { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON };
  * error but still stores its minimal result), `find_leads` raises it on a
  * `success: true` response; both are read the same way here.
  */
+// The only tools the ENG-975 guard is wired into. Checked by name, not just by
+// the presence of `searchUnavailable`, so an unrelated tool whose result
+// object happens to carry a field with that exact name can never be
+// misattributed as a LinkedIn search outage (CodeRabbit, PR #2383).
+const LINKEDIN_SOURCING_TOOL_NAMES = new Set(['linkedin_outreach', 'find_leads']);
+
 export function detectRunBlockedReason(toolCalls: any[] | undefined | null): string | null {
   if (!Array.isArray(toolCalls)) return null;
   const blocked = toolCalls.some(
-    (call: any) => call && typeof call === 'object' && call.result?.searchUnavailable === true,
+    (call: any) => call && typeof call === 'object'
+      && LINKEDIN_SOURCING_TOOL_NAMES.has(call.name)
+      && call.result?.searchUnavailable === true,
   );
   return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
 }
