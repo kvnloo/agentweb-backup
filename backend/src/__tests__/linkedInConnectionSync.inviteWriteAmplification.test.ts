@@ -43,11 +43,13 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 const mockUpsertSentInvitations = jest.fn().mockResolvedValue(undefined);
 const mockPruneStaleSentInvitations = jest.fn().mockResolvedValue(0);
 const mockGetAllSentInvitationsByAccount = jest.fn().mockResolvedValue([]);
+const mockDeleteSentInvitationsByProfileUrls = jest.fn().mockResolvedValue(0);
 jest.mock('../services/unipileSentInvitationsDb', () => ({
   upsertSentInvitations: (...a: any[]) => mockUpsertSentInvitations(...a),
   pruneStaleSentInvitations: (...a: any[]) => mockPruneStaleSentInvitations(...a),
   getAllSentInvitationsByAccount: (...a: any[]) => mockGetAllSentInvitationsByAccount(...a),
   profileUrlFromPublicId: (id: string) => `https://www.linkedin.com/in/${id}/`,
+  deleteSentInvitationsByProfileUrls: (...a: any[]) => mockDeleteSentInvitationsByProfileUrls(...a),
 }));
 
 jest.mock('../services/dripSequenceDb', () => ({

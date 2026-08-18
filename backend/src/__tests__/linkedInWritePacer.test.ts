@@ -31,7 +31,8 @@ function makeClock(startAt = 1_000_000) {
     advance: (ms: number) => {
       current += ms;
     },
-    // Midpoint jitter — deterministic, and leaves the gap exactly at its nominal value.
+    // Midpoint jitter — deterministic. Jitter is UPWARD only, so this yields
+    // 1.1x the configured gap, never less than it.
     random: () => 0.5,
   };
 }
@@ -313,8 +314,12 @@ describe('the hourly ceiling under concurrency (Greptile P1)', () => {
     for (const r of refused) {
       if (!r.allowed) expect(r.reason).toContain('safety ceiling');
     }
-    // Two grants means exactly one gap elapsed, not four.
-    expect(clock.now()).toBe(1_000_000 + 5000);
+    // Two grants means ONE gap elapsed, not four: the three over-cap callers were
+    // refused while holding the turn, before sleeping. Asserted as a range rather
+    // than a literal so it pins that fact rather than the jitter's exact shape.
+    const elapsed = clock.now() - 1_000_000;
+    expect(elapsed).toBeGreaterThanOrEqual(5000);
+    expect(elapsed).toBeLessThan(2 * 5000);
   });
 
   it('still allows the full quota when calls arrive one at a time', async () => {

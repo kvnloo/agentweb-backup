@@ -37,6 +37,7 @@ jest.mock('../services/unipileSentInvitationsDb', () => ({
   pruneStaleSentInvitations: jest.fn().mockResolvedValue(0),
   getAllSentInvitationsByAccount: jest.fn().mockResolvedValue([]),
   profileUrlFromPublicId: (id: string) => `https://www.linkedin.com/in/${id}/`,
+  deleteSentInvitationsByProfileUrls: jest.fn().mockResolvedValue(0),
 }));
 
 const mockResolveListIdForAccount = jest.fn();

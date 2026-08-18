@@ -27,6 +27,7 @@ const mockSendMessage = jest.fn();
 const mockGetLinkedInProfile = jest.fn();
 const mockSendInMail = jest.fn();
 const mockSendInvitation = jest.fn();
+const mockIsUnderInvitationCooldown = jest.fn((..._args: any[]) => false);
 const mockGetMessagesWithContact = jest.fn();
 const mockResolveProviderId = jest.fn();
 const mockSearchPeople = jest.fn();
@@ -44,6 +45,8 @@ jest.mock('../services/linkedInOutreachService', () => ({
     getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
+    // ENG-126 breaker check — must be present or send-invite throws before pacing.
+    isUnderInvitationCooldown: (...args: any[]) => mockIsUnderInvitationCooldown(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
     resolveProviderId: (...args: any[]) => mockResolveProviderId(...args),
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
@@ -1877,6 +1880,30 @@ describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
       expect(first.duplicate).toBe(true);
       expect(second.duplicate).toBe(true);
       expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not spend a slot while the ENG-126 breaker is armed', async () => {
+      // The breaker short-circuits the network call INSIDE sendInvitation, so a
+      // paced caller slept a full gap and burned one of the account's hourly writes
+      // for a request that never left the process — for the whole hour the breaker
+      // is armed, on every queued invite. That inverts the breaker's own purpose.
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+      mockIsUnderInvitationCooldown.mockReturnValue(true);
+
+      const results = [
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+        await service.linkedinOutreach('user-1', inviteArgs),
+      ];
+
+      for (const result of results) {
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Cannot resend yet');
+        // Not the pacer's refusal: the ceiling of one was never touched.
+        expect(result.message).not.toBe('LinkedIn write actions are being paced');
+      }
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      mockIsUnderInvitationCooldown.mockReturnValue(false);
     });
 
     it('still spends a slot on a send that does reach Unipile', async () => {
