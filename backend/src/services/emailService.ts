@@ -8,6 +8,7 @@ import { userDb } from './db';
 import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1363,6 +1364,11 @@ Schedule ID: ${scheduleId}
       sessionId: string;
       attempt: number;
       createdAt: string;
+      // ENG-1131: set when the run "succeeded" (produced a report) but its only
+      // sourcing path was blocked — e.g. the LinkedIn people-search outage. Left
+      // separate from `passed` on purpose (see agentModeController.ts), so this
+      // email must read it explicitly instead of trusting `passed` alone.
+      blockedBy?: string;
     },
     scheduleId: string,
     summary?: string
@@ -1388,8 +1394,26 @@ Schedule ID: ${scheduleId}
         // Fall back to regular agent-mode URL if share creation fails
       }
 
-      const statusColor = result.passed ? '#28a745' : '#dc3545';
-      const statusIcon = result.passed ? '✅' : '❌';
+      // ENG-1131: a blocked-sourcing run reads neither as a plain success nor a
+      // failure — `passed` stays `true` (the run itself completed; see
+      // agentModeController.ts for why), but the card/email must not say
+      // "successfully executed" when the reason it produced nothing was an
+      // upstream outage, not a real empty result.
+      const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+      const statusColor = isBlockedRun ? '#ffc107' : (result.passed ? '#28a745' : '#dc3545');
+      const statusIcon = isBlockedRun ? '⚠️' : (result.passed ? '✅' : '❌');
+      const statusBg = isBlockedRun ? '#fff3cd' : (result.passed ? '#e8f5e8' : '#ffeaea');
+      const statusMessageHtml = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is ' +
+          'account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically ' +
+          'once search returns for the account.'
+        : `has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.`;
+      const statusMessageText = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: ' +
+          'your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.'
+        : `has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.`;
 
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric',
@@ -1436,10 +1460,12 @@ Schedule ID: ${scheduleId}
             </div>
             
             <div class="content">
-              <div class="section" style="background-color: ${result.passed ? '#e8f5e8' : '#ffeaea'}; border-left: 4px solid ${result.passed ? '#28a745' : '#dc3545'}; margin: 20px 0;">
+              <div class="section" style="background-color: ${statusBg}; border-left: 4px solid ${statusColor}; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; line-height: 1.5;">
-                  Your scheduled chat <strong>"${scheduleName}"</strong> has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready. 
-                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong> 
+                  ${isBlockedRun
+                    ? `Your scheduled chat <strong>"${scheduleName}"</strong> ran, but ${statusMessageHtml}`
+                    : `Your scheduled chat <strong>"${scheduleName}"</strong> ${statusMessageHtml}`}
+                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong>
                   and completed at <strong>${currentDate}</strong>.
                 </p>
               </div>
@@ -1492,7 +1518,9 @@ Schedule ID: ${scheduleId}
       const text = `
 Scheduled Chat Results: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.
+${isBlockedRun
+  ? `Your scheduled chat "${scheduleName}" ran, but ${statusMessageText}`
+  : `Your scheduled chat "${scheduleName}" ${statusMessageText}`}
 It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
 
 ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
@@ -1782,8 +1810,15 @@ Sent via AgentWeb: ${customerFrontendUrl}
 
       // Generate results HTML
       const resultsHtml = todaysResults.map((result, index) => {
-        const statusIcon = result.passed ? '✅' : '❌';
-        const statusColor = result.passed ? '#28a745' : '#dc3545';
+        // ENG-1131: a blocked-sourcing run (LinkedIn search outage) still has
+        // `passed: true` — see agentModeController.ts — so it must be read off
+        // `blockedBy` explicitly rather than rendered as a plain PASSED run.
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        const statusIcon = isBlockedRun ? '⚠️' : (result.passed ? '✅' : '❌');
+        const statusLabel = isBlockedRun ? 'BLOCKED' : (result.passed ? 'PASSED' : 'FAILED');
+        const statusColor = isBlockedRun ? '#ffc107' : (result.passed ? '#28a745' : '#dc3545');
+        const statusTextColor = isBlockedRun ? '#664d03' : 'white';
+        const itemBg = isBlockedRun ? '#fffbea' : (result.passed ? '#f8fff8' : '#fff8f8');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
@@ -1791,11 +1826,11 @@ Sent via AgentWeb: ${customerFrontendUrl}
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : '#';
 
         return `
-          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${result.passed ? '#f8fff8' : '#fff8f8'};">
+          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${itemBg};">
             <div class="result-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
               <div class="result-info">
-                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: white;">
-                  ${statusIcon} ${result.passed ? 'PASSED' : 'FAILED'}
+                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: ${statusTextColor};">
+                  ${statusIcon} ${statusLabel}
                 </span>
                 <span style="margin-left: 15px; color: #6c757d; font-size: 14px;">Run ${index + 1} at ${runTime}</span>
               </div>
@@ -1805,6 +1840,14 @@ Sent via AgentWeb: ${customerFrontendUrl}
               </div>
             </div>
             <div class="result-content">
+              ${isBlockedRun ? `
+                <div style="background-color: #fff3cd; border: 1px solid #ffe69c; color: #664d03; padding: 10px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; line-height: 1.4;">
+                  LinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced —
+                  this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is
+                  account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically
+                  once search returns for the account.
+                </div>
+              ` : ''}
               <div class="response-preview" style="background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; line-height: 1.4; max-height: 100px; overflow: hidden; position: relative;">
                 ${this.escapeHtml(result.actualResponse.length > 200 ? result.actualResponse.substring(0, 200) + '...' : result.actualResponse)}
               </div>
@@ -1907,13 +1950,15 @@ ${dateLabel}:
 
 Individual Run Results:
 ${todaysResults.map((result, index) => {
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        const statusLabel = isBlockedRun ? 'BLOCKED' : (result.passed ? 'PASSED' : 'FAILED');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
         });
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
         return `
-Run ${index + 1} at ${runTime} - ${result.passed ? 'PASSED' : 'FAILED'}
+Run ${index + 1} at ${runTime} - ${statusLabel}${isBlockedRun ? '\nLinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced — this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.' : ''}
 Response: ${result.actualResponse.substring(0, 100)}${result.actualResponse.length > 100 ? '...' : ''}
 View Conversation: ${sessionUrl}
 `;

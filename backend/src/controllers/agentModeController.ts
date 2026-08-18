@@ -27,6 +27,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import {
   isRunStoreEnabled,
@@ -562,13 +563,13 @@ export interface ScheduleRunHealth {
   lastRunBlockedBy: string | null;
 }
 
-/**
- * ENG-1131: recorded on a run result whose LinkedIn people-search was proven
- * unavailable for the account (the ENG-975 control-query guard fired). The run
- * itself may well have "succeeded" — produced a report, updated the CRM — while
- * sourcing zero prospects for a reason that has nothing to do with the filters.
- */
-export const LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON = 'linkedin_search_unavailable';
+// ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
+// emailService.ts can also import it without a circular dependency — this
+// controller already imports emailService. Re-exported below (as a normal
+// import + export, not `export ... from`, so detectRunBlockedReason further
+// down can still reference it as a local binding) so existing importers of
+// this constant from this file keep working.
+export { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON };
 
 /**
  * ENG-1131: read the run's tool ledger for proof that its sourcing path was down.
