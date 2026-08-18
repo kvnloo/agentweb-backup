@@ -293,8 +293,8 @@ describe("resolveUsageDrivers", () => {
       { date: "2026-08-03", model: OPUS, feature: "agent_task:interactive", costMicroUsd: 40 * USD, callCount: 4 },
     ]);
     mockSchedules.mockResolvedValue([
-      { scheduleId: "sched-a", title: "Lead list enrichment", frequency: "daily" },
-      { scheduleId: "sched-unused", title: "Something else", frequency: "weekly" },
+      { scheduleId: "sched-a", scheduleName: "Lead list enrichment", frequency: "daily" },
+      { scheduleId: "sched-unused", scheduleName: "Something else", frequency: "weekly" },
     ]);
 
     const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
@@ -339,7 +339,7 @@ describe("resolveUsageDrivers", () => {
         : [],
     );
     mockSchedules.mockImplementation(async (uid: string) =>
-      uid === "member-a" ? [{ scheduleId: "m-sched", title: "Member digest", frequency: "weekly" }] : [],
+      uid === "member-a" ? [{ scheduleId: "m-sched", scheduleName: "Member digest", frequency: "weekly" }] : [],
     );
 
     const { scheduleDrivers } = await resolveUsageDrivers("member-a", { today: "2026-08-11" });
@@ -350,7 +350,7 @@ describe("resolveUsageDrivers", () => {
     mockQuery.mockResolvedValue([
       { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:sched-a", costMicroUsd: 60 * USD, callCount: 6 },
     ]);
-    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", title: "Lead list enrichment", frequency: "daily" }]);
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", scheduleName: "Lead list enrichment", frequency: "daily" }]);
 
     const customer = toCustomerDrivers(await resolveUsageDrivers("u1", { today: "2026-08-11" }));
     expect(customer.scheduleDrivers[0]).toHaveProperty("title", "Lead list enrichment");
