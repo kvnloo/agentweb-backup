@@ -12,6 +12,14 @@
  */
 
 import { metaService } from '../services/metaService';
+import * as crypto from 'crypto';
+
+const sha256 = (v: string) => crypto.createHash('sha256').update(v).digest('hex');
+
+/** EVERY argument of every call, not just the first — a value logged as a second argument
+ *  would otherwise be invisible to these assertions. */
+const allLogOutput = () =>
+  logSpy.mock.calls.map((c) => c.map((a: any) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')).join('\n');
 
 const okResponse = () => ({
   ok: true,
@@ -35,7 +43,9 @@ afterEach(() => {
 });
 
 const capiLine = () =>
-  logSpy.mock.calls.map((c) => String(c[0])).find((l) => l.includes('user_data keys:')) ?? '';
+  logSpy.mock.calls
+    .map((c) => c.map((a: any) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+    .find((l) => l.includes('user_data keys:')) ?? '';
 
 describe('the CAPI key-set log', () => {
   it('names fbc and fbp when they are sent — the claim /stats cannot support', async () => {
@@ -69,13 +79,21 @@ describe('the CAPI key-set log', () => {
       eventName: 'Lead',
     });
 
-    const all = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    const all = allLogOutput();
+
+    // Plaintext.
     expect(all).not.toContain('DO_NOT_LOG_THIS_CLICK_ID');
     expect(all).not.toContain('DO_NOT_LOG_THIS_BROWSER_ID');
     expect(all).not.toContain('leak-check@example.test');
     expect(all).not.toContain('203.0.113.55');
     expect(all).not.toContain('Mozilla/5.0');
     expect(all).not.toContain('15550100839');
+
+    // And the HASHES — which is the form a real leak would actually take. `userData.em` and
+    // `userData.ph` hold SHA-256 digests, never the plaintext, so a regression that logged
+    // the VALUES of user_data would emit these and every assertion above would still pass.
+    expect(all).not.toContain(sha256('leak-check@example.test'));
+    expect(all).not.toContain(sha256('15550100839'));
     // The KEYS are still named, so suppressing values did not suppress the evidence.
     expect(capiLine()).toContain('client_ip_address');
     expect(capiLine()).toContain('fbc');
