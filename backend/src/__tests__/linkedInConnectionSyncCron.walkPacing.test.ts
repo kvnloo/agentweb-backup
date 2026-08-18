@@ -17,7 +17,16 @@ jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     listConnections: (...a: any[]) => mockListConnections(...a),
     listSentInvitations: (...a: any[]) => mockListSentInvitations(...a),
+    probeAccountSession: jest.fn().mockResolvedValue('connected'),
   },
+  // Named export, not a method: the cron calls it in the catch block around the
+  // sent-invitation walk. Omitting it makes that catch throw a TypeError which
+  // escapes the whole sweep — and it is only reachable once the health-recording
+  // branch is present, so a suite that passes on one branch alone fails as soon as
+  // both are on main.
+  isProvenDisconnectError: (err: any) =>
+    err?.structuredError?.classification === 'AUTH_ERROR'
+    || Number(err?.structuredError?.status) === 401,
 }));
 
 const mockUpsertConnections = jest.fn().mockResolvedValue(undefined);
