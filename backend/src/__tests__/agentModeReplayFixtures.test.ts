@@ -39,17 +39,34 @@ import {
 describe('agentModeReplayFixtures (ENG-1312 criterion 3)', () => {
   // FAIL tests -------------------------------------------------------------
 
-  it('registers a fixture for every session named in ENG-1312/ENG-1309\'s own acceptance criteria (5 total, neutral synthetic IDs — CodeRabbit, PR #2443)', () => {
-    expect(REPLAY_FIXTURES).toHaveLength(5);
+  it('registers exactly the five expected synthetic-id fixtures with the correct pending/non-pending membership (CodeRabbit, PR #2443)', () => {
+    const ids = REPLAY_FIXTURES.map((f) => f.id).sort();
+    expect(ids).toEqual(
+      [
+        'length-limit-ignored-1',
+        'pushback-not-rewarded-1',
+        'unnecessary-permission-1',
+        'yesno-terse-1',
+        'yesno-terse-2',
+      ].sort(),
+    );
     for (const f of REPLAY_FIXTURES) {
       // Neutral slugs only — never a real production session ID (all-digit/hex).
       expect(f.id).not.toMatch(/^[0-9a-f]{8}$/i);
     }
+    // Exactly 3 of the 5 have an explicit numeric threshold (ENG-1309's own
+    // acceptance criteria); the other 2 (unnecessary-permission-1,
+    // pushback-not-rewarded-1) are judge-dimension assertions, registered
+    // `pending: true` — see the module doc comment.
+    const nonPending = REPLAY_FIXTURES.filter((f) => !f.pending).map((f) => f.id).sort();
+    expect(nonPending).toEqual(['length-limit-ignored-1', 'yesno-terse-1', 'yesno-terse-2'].sort());
+    const pending = REPLAY_FIXTURES.filter((f) => f.pending).map((f) => f.id).sort();
+    expect(pending).toEqual(['pushback-not-rewarded-1', 'unnecessary-permission-1'].sort());
   });
 
   it('every fixture with a numeric threshold cites its source issue in a comment-visible field', () => {
     const thresholded = REPLAY_FIXTURES.filter((f) => !f.pending);
-    expect(thresholded.length).toBeGreaterThanOrEqual(3);
+    expect(thresholded).toHaveLength(3);
     for (const f of thresholded) {
       expect(f.thresholdSource).toMatch(/ENG-1309/);
     }
@@ -146,6 +163,43 @@ describe('agentModeReplayFixtures (ENG-1312 criterion 3)', () => {
       assertion: { maxChars: 600 },
     };
     expect(checkReplayFixture(fixture).pass).toBe(true);
+  });
+
+  it('checkReplayFixture passes a reply of exactly maxChars (boundary is <=, not <) (CodeRabbit, PR #2443)', () => {
+    const fixture: JudgeReplayFixture = {
+      id: 'test-exact-chars',
+      label: 'test',
+      thresholdSource: 'ENG-1309 test',
+      isPlaceholder: true,
+      pending: false,
+      turns: [{ role: 'assistant', content: 'x'.repeat(600) }],
+      assertion: { maxChars: 600 },
+    };
+    const result = checkReplayFixture(fixture);
+    expect(result.pass).toBe(true);
+    // One character over the same boundary must fail, proving this isn't
+    // vacuously true because the comparison is missing entirely.
+    const over = { ...fixture, turns: [{ role: 'assistant' as const, content: 'x'.repeat(601) }] };
+    expect(checkReplayFixture(over).pass).toBe(false);
+  });
+
+  it('checkReplayFixture passes a reply of exactly maxWords (boundary is <=, not <) (CodeRabbit, PR #2443)', () => {
+    const fixture: JudgeReplayFixture = {
+      id: 'test-exact-words',
+      label: 'test',
+      thresholdSource: 'ENG-1309 test',
+      isPlaceholder: true,
+      pending: false,
+      turns: [{ role: 'assistant', content: Array.from({ length: 150 }, () => 'word').join(' ') }],
+      assertion: { maxWords: 150 },
+    };
+    const result = checkReplayFixture(fixture);
+    expect(result.pass).toBe(true);
+    const over = {
+      ...fixture,
+      turns: [{ role: 'assistant' as const, content: Array.from({ length: 151 }, () => 'word').join(' ') }],
+    };
+    expect(checkReplayFixture(over).pass).toBe(false);
   });
 
   it('the registered length-limit-ignored-1 fixture uses the ENG-1309 ~6,000 char threshold', () => {
