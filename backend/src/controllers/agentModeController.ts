@@ -27,6 +27,7 @@ import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterReq
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import {
   isRunStoreEnabled,
@@ -84,6 +85,7 @@ import {
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
+import { emmaToolRegistry } from '../emma/registry';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import {
@@ -554,12 +556,122 @@ export interface ScheduleRunHealth {
   // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
   // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
   consecutiveFailures: number;
+  // ENG-1131: why the most recent run could not do its real work, when it could
+  // not. Distinct from `lastRunStatus` on purpose: a prospecting run blocked by
+  // the LinkedIn people-search outage still writes a report and still records
+  // `status: 'success'`, so the owner's card is green while sourcing is down.
+  // Null when the last run was unblocked.
+  lastRunBlockedBy: string | null;
+}
+
+// ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
+// emailService.ts can also import it without a circular dependency — this
+// controller already imports emailService. Re-exported below (as a normal
+// import + export, not `export ... from`, so detectRunBlockedReason further
+// down can still reference it as a local binding) so existing importers of
+// this constant from this file keep working.
+export { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON };
+
+/**
+ * ENG-1131: read the run's tool ledger for proof that its sourcing path was down.
+ *
+ * The ENG-975 guard stamps `searchUnavailable: true` on the tool result once a
+ * maximally broad control query has confirmed the account cannot search — so this
+ * can never fire on a search that genuinely matched nobody. `linkedin_outreach`
+ * raises it with `success: false` (the dispatcher downgrades that entry to an
+ * error but still stores its minimal result), `find_leads` raises it on a
+ * `success: true` response; both are read the same way here.
+ */
+// The only tools the ENG-975 guard is wired into. Checked by name, not just by
+// the presence of `searchUnavailable`, so an unrelated tool whose result
+// object happens to carry a field with that exact name can never be
+// misattributed as a LinkedIn search outage (CodeRabbit, PR #2383).
+const LINKEDIN_SOURCING_TOOL_NAMES = new Set(['linkedin_outreach', 'find_leads']);
+
+export function detectRunBlockedReason(toolCalls: any[] | undefined | null): string | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const blocked = toolCalls.some(
+    (call: any) => call && typeof call === 'object'
+      && LINKEDIN_SOURCING_TOOL_NAMES.has(call.name)
+      && call.result?.searchUnavailable === true,
+  );
+  return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
+}
+
+// ENG-1131 follow-up: minimum real time since the schedule's last observed
+// blocked-state transition before alerting on a new one. Guards against a
+// borderline account whose search-capability probe oscillates right at its
+// pass/fail boundary (or a burst of manual re-tests) firing an alert on every
+// toggle. Short enough that a genuine new/distinct outage is still reported
+// promptly (worst case: delayed by less than this window).
+const DEFAULT_SOURCING_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * ENG-1131 follow-up: true when this run's blocked-state differs from the
+ * IMMEDIATELY PRECEDING run's — i.e. an edge, not a level. `priorRunResults`
+ * is the schedule's history from BEFORE this run (its last element is the
+ * previous run); `currentBlockedBy` is this run's own `detectRunBlockedReason`
+ * result.
+ *
+ * Deliberately edge-triggered so a schedule can proactively alert its owner
+ * the moment sourcing breaks or recovers, without alerting again on every
+ * subsequent run of a multi-day outage — that would just be spam once the
+ * owner already knows. A schedule's very first run counts as a transition
+ * into the blocked state (no prior run = treated as previously healthy), but
+ * not a transition if its first run is healthy.
+ *
+ * Anti-flap cooldown: an edge is only reported if the schedule's most recent
+ * PRIOR transition (found by scanning the full history, not just the last
+ * run) happened at least `cooldownMs` ago. This deliberately does NOT require
+ * N consecutive consistent prior runs — a genuinely settled "broke, fully
+ * recovered, broke again" sequence separated by real time must still alert;
+ * only rapid back-to-back toggling is dampened. No known prior-transition
+ * timestamp (old fixtures with no `createdAt`, or nothing found) never
+ * suppresses — cooldown can only apply against a timestamp we actually have.
+ */
+export function didSourcingBlockStateChange(
+  priorRunResults: any[] | undefined | null,
+  currentBlockedBy: string | null,
+  options: { now?: string | number | Date; cooldownMs?: number } = {},
+): boolean {
+  const results = Array.isArray(priorRunResults) ? priorRunResults : [];
+  if (results.length === 0) {
+    return Boolean(currentBlockedBy);
+  }
+  const last = results[results.length - 1];
+  const previousBlockedBy = last && typeof last === 'object' ? last.blockedBy : undefined;
+  if (Boolean(currentBlockedBy) === Boolean(previousBlockedBy)) {
+    return false;
+  }
+
+  // Scan the WHOLE history once for the most recent point where blocked-state
+  // itself changed run-over-run, to find when the state we're about to leave
+  // actually began.
+  let priorState: boolean | undefined;
+  let lastTransitionAt: number | null = null;
+  for (const run of results) {
+    const state = Boolean(run && typeof run === 'object' ? run.blockedBy : undefined);
+    if (priorState !== undefined && state !== priorState) {
+      const parsed = run && typeof run === 'object' ? Date.parse(run.createdAt) : NaN;
+      if (!Number.isNaN(parsed)) lastTransitionAt = parsed;
+    }
+    priorState = state;
+  }
+
+  if (lastTransitionAt !== null) {
+    const cooldownMs = options.cooldownMs ?? DEFAULT_SOURCING_ALERT_COOLDOWN_MS;
+    const now = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+    if (!Number.isNaN(now) && now - lastTransitionAt < cooldownMs) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
-    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
   }
   const last = results[results.length - 1] || {};
   let consecutiveFailures = 0;
@@ -571,6 +683,7 @@ export function computeScheduleRunHealth(runResults: any[] | undefined | null): 
     lastRunStatus: last.status ?? null,
     lastRunAt: last.createdAt ?? null,
     consecutiveFailures,
+    lastRunBlockedBy: last.blockedBy ?? null,
   };
 }
 
@@ -1681,10 +1794,25 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // anchor to the leading token — otherwise a write like `add_leads_to_list` or
 // `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
 // word. Irregular read names that don't lead with a read verb are listed exactly.
+// perform_data_analysis belongs here too (ENG-1276): it runs code on caller-supplied
+// data with no external side effects — the same as analyze_*/read_* — but its name
+// doesn't lead with a recognized verb, so without this it was misclassified as a
+// write and vetoed a legitimate skip whose FIRST step is calling it to compute
+// today's weekday (real prod session 17834849…, 2026-08-16).
 const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
-const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
+// ENG-1276 follow-up: the exact-name allowlist above is reactive — it only grows
+// once a new read-only tool's odd name has ALREADY broken a real schedule
+// (perform_data_analysis was one such case). perform_deep_research is a live,
+// still-unpatched analog: same "no external side effects" shape, same
+// non-read-verb name, just not yet observed breaking a run. Rather than wait for
+// that, the tool's OWN registration can declare `readOnly: true` (see
+// McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
+// side-effect-free, and this consults it. Checked last, after the free name
+// checks — cheaper and requires no registry state for the common case.
 function isReadOnlyToolName(name: string): boolean {
-  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+  if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
+  return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
 function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
@@ -1807,10 +1935,115 @@ export function scheduledRunSignalsConditionalSkip(
   // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  // A NEGATED failure/error mention — "not by failure", "no errors", "without any
+  // failure", "not a single failure", "never any failure" — DENIES a failure
+  // happened; it is not evidence of one. HARD_FAILURE_PATTERNS below matches
+  // these words ANYWHERE in the turn with no negation awareness, so a clean skip
+  // that merely denies a failure ("Posts published: 0 (by design, not by
+  // failure)") tripped the veto exactly like a real failure would (real prod
+  // regression, session 7f95530d, 2026-08-15 — the run made ZERO tool calls and
+  // still hit the 20-attempt nudge cap, ENG-1276 follow-up).
+  //
+  // A tempered greedy token, not a fixed adjacency pattern: the negation cue,
+  // then any run of text that does NOT cross a clause boundary, then the
+  // failure/error word. An earlier version only matched the cue landing
+  // DIRECTLY on the noun (an optional article/"by", nothing else), which caught
+  // "not by failure" but missed equally natural phrasings like "not a SINGLE
+  // failure" or "no REAL error" — the same underlying bug, just a wording the
+  // model hadn't happened to use yet (ENG-1276 follow-up #2).
+  //
+  // The clause-boundary exclusion is what keeps this fail-CLOSED as the span
+  // widens: a negation cue must never reach ACROSS a semicolon/sentence break or
+  // a contrastive conjunction ("but"/"however"/"though"/"yet"/"except") to
+  // neutralize an unrelated, genuine failure on the far side — "not a great day,
+  // BUT the post failed to publish" and "no post today; auth failed" both stop
+  // the match before reaching "failed", so it stays intact and still vetoes.
+  // Matching is also non-overlapping and left-to-right, so once a match
+  // consumes up to its NEAREST failure word, a later, un-negated failure word in
+  // the same sentence (no cue of its own) is untouched — "not a failure of the
+  // schedule, but image generation failed" neutralizes only the first mention.
+  //
+  // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
+  // #3) of the widening above — NOT a production incident, but a real gap in
+  // the same direction as the one that already broke twice:
+  //   (1) A BARE "no" immediately followed by a comma is grammatically an
+  //       INTERJECTION introducing an independent clause ("the answer is no;
+  //       separately, X happened"), not a negator of whatever follows it.
+  //       Without this, "No, unfortunately, today's run failed for unknown
+  //       reasons." bridged clean across the comma (no "but"/semicolon in the
+  //       way) and wrongly neutralized a genuine, unrelated failure.
+  //       Deliberately scoped to "no" ONLY, not "not"/"never"/"without" — an
+  //       independent review (ENG-1276 follow-up, not a production incident)
+  //       found that those three keep negating ACROSS a comma-set-off
+  //       parenthetical ("Without, admittedly, any failure occurring..." still
+  //       means no failure happened), so excluding the comma there wrongly
+  //       reverted legitimate cases to vetoing.
+  //   (2) The span is capped at 20 characters — every legitimate case here
+  //       needs at most ~9 ("a single ") — as an independent backstop. This
+  //       is a DELIBERATE trade-off, not just a safety margin: the same review
+  //       found the cap also blocks a long parenthetical after "never"/"not"
+  //       ("Never, in this case, did we see a failure" — 28 characters to the
+  //       failure word), which stays un-neutralized (an unusual phrasing still
+  //       causes a retry — safe direction). Widening the cap to accommodate
+  //       that would reopen a MORE realistic and MORE dangerous gap in the
+  //       other direction: "Not entirely sure why the deployment failed
+  //       today" is a genuine failure report (the hedge is about the CAUSE,
+  //       not a denial it happened) that must NOT get silently waived.
+  //
+  // DOUBLE NEGATION (found on the same review, not a production incident):
+  // "It is not true that there was no failure today" re-asserts a real
+  // failure, but a single-pass regex only sees the INNER "no failure" and has
+  // no concept of the OUTER negation flipping it back. Properly PARSING this
+  // would mean tracking negation-of-negation depth — a materially bigger,
+  // riskier change bolted onto an already-layered pattern, for phrasing that
+  // doesn't match any real production transcript behind this function's other
+  // tests (every one is direct: "Sunday. No.", "not by failure"). Instead this
+  // FAILS CLOSED: neutralizeNegatedFailureMentions() below skips any SENTENCE
+  // that itself negates a truth claim ("it is not true that...", "that's
+  // false...") entirely — a failure word inside such a sentence is left
+  // untouched and still vetoes via the normal HARD_FAILURE_PATTERNS check.
+  // Safe because it doesn't need to understand the sentence, only recognize
+  // the shape and decline to be clever about it — the dangerous direction
+  // (silently waiving a real failure) is closed even without real parsing.
+  //
+  // UNCERTAINTY HEDGE (independent CodeRabbit review finding, ENG-1276): "not
+  // sure it failed" / "not certain there was an error" express UNCERTAINTY
+  // about whether a failure happened — fundamentally different from "not by
+  // failure" (a confident DENIAL). Without excluding these, a cadence response
+  // with NO tool calls could get accepted as a clean skip even though the
+  // actual outcome is unresolved — the dangerous direction again. The 20-char
+  // span cap only accidentally blocked the one longer example already covered
+  // ("Not entirely sure why the deployment failed today" — coincidence of word
+  // count, not real understanding), so a shorter phrasing like "not sure it
+  // failed" needed its own explicit guard: reject the cue when immediately
+  // followed by an uncertainty word.
+  const NEGATED_FAILURE_MENTION =
+    /\b(?:no(?!\s*,)|not|never|without)\b(?!\s+(?:sure|certain|confident|convinced|clear)\b)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+  // "not" is REQUIRED before true/the case/accurate/correct — self-caught on a
+  // fresh re-audit before shipping: an earlier version made it optional
+  // ((?:not\s+)?), so a plain, non-negated "it is true that there was no
+  // failure" also matched this meta-negation shape and wrongly suppressed
+  // neutralization for a legitimate, single-negation denial. Over-cautious
+  // (still vetoes when it could safely waive) rather than dangerous, but still
+  // a real behavior change from what the earlier negation audits establish —
+  // "isn't/wasn't" already carry the negation in the contraction, so they get
+  // their own branch with no separate "not" required.
+  const META_NEGATION_OF_TRUTH =
+    /\b(?:is|was)\s+not\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:isn['’]?t|wasn['’]?t)\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:that['’]?s|that\s+is|it['’]?s|it\s+is)\s+false\b|\bfalse\s+that\b/i;
+  function neutralizeNegatedFailureMentions(input: string): string {
+    return input
+      .split(/([.;!?\n]+)/)
+      .map((segment, i) =>
+        i % 2 === 1 || META_NEGATION_OF_TRUTH.test(segment) ? segment : segment.replace(NEGATED_FAILURE_MENTION, ' ')
+      )
+      .join('');
+  }
   const failureScan = expandContractions(
-    text
-      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    neutralizeNegatedFailureMentions(
+      text
+        .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+        .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    )
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
@@ -2547,7 +2780,28 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
+  //
+  // CodeRabbit review (ENG-1276) also flagged that `requiredFunctions` — and so
+  // this derived name list, used only for the ENG-1276 alias double-credit
+  // suppression — is captured ONCE here and does not shrink if consent narrows
+  // mid-run (`livePublishAuthorization`/`effectivePublishAuthorization` below).
+  // Investigated and left as-is: the FINAL persisted record already re-derives
+  // its own held-to list fresh from `effectivePublishAuthorization` at the end
+  // of the run (see `heldToFunctionNames` in runScheduledChat) — that is the
+  // value that actually reaches the schedule owner, and it is not stale. The
+  // only consumer of THIS list is the alias suppression, and a stale (wider)
+  // list there can only make suppression MORE likely to apply, never less —
+  // i.e. it can under-credit a name nobody ends up requiring, never
+  // double-credit one. Safe direction, and currently unreachable in practice
+  // besides: no evidenced schedule requires both names of any alias pair to
+  // begin with, so this is two unevidenced conditions compounded. Making it
+  // fully live would mean re-deriving this list at each of the three
+  // requirementEvidenceNames call sites from whatever authorization is active
+  // AT THAT MOMENT — a real change to a part of this function's mid-run
+  // consent-narrowing plumbing, not a quick win, for a currently-unreachable
+  // gap in the safe direction.
+  const requiredFunctionNames = requiredFunctions.map((reqFunc) => reqFunc.functionName);
+  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? [], requiredFunctionNames);
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2792,7 +3046,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...requirementEvidenceNames(continuationToolCalls)
+          ...requirementEvidenceNames(continuationToolCalls, requiredFunctionNames)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2934,7 +3188,7 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
+      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls, requiredFunctionNames));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -3364,6 +3618,48 @@ async function notifyScheduleOwnerOfFailure(
   }
 }
 
+/**
+ * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+ * schedule's LinkedIn sourcing capability changes state — call only when
+ * `didSourcingBlockStateChange` is true, so this fires once per transition,
+ * not once per run of a multi-day outage. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort
+ * by design — a notification failure must never break the run.
+ *
+ * Respects `schedule.disableSourcingBlockAlerts` — an owner opt-out for this
+ * specific alert. Does NOT affect the schedule-card badge, per-run emails, or
+ * run history, which stay on regardless (those are informational surfaces on
+ * data the owner is already looking at; this is the one that reaches into
+ * their inbox unprompted).
+ */
+async function notifyScheduleOwnerOfSourcingBlockTransition(
+  schedule: any,
+  userId: string,
+  detail: { isNowBlocked: boolean }
+): Promise<void> {
+  if (schedule.disableSourcingBlockAlerts === true) return;
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduleSourcingBlockTransitionEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; sourcing-block transition alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send sourcing-block transition alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -3399,6 +3695,11 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  // Pre-existing at runtime (finalFunctionCallDetails, ENG-947) but missing from
+  // this type until a test needed to assert on it directly (CodeRabbit review,
+  // ENG-1276) — declaring it changes no behavior, only lets TS see a field the
+  // object has always returned.
+  functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
   attempt: number;
@@ -4380,37 +4681,54 @@ export async function runScheduledChat(
     // result email, and the reassuring one is the one that is wrong.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
+    // ENG-827: filter to the requirements this run was actually HELD TO —
+    // publish-scope-filtered, not the raw schedule config — BEFORE building the
+    // requirement evidence, so a run authorized for only one of a
+    // twitter_manage_post/post_on_connected_account pair (ENG-1276 follow-up)
+    // sees the same held-to set the alias suppression checks against. Reading
+    // the unfiltered config here persisted a self-contradicting record on an
+    // unauthorized run: `post_on_connected_account {required: 1, actual: 0}`
+    // sitting next to an empty functionCallMisses and passed: true. Nothing
+    // downstream can tell that apart from a genuine silent miss, which is the
+    // false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt, the evidence ledger, and this record.
+    // ENG-827: filtered against `effectivePublishAuthorization` — the authorization
+    // the run FINISHED under, which differs from the admitted one when the owner
+    // revoked consent mid-run.
+    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    // ENG-657, applied here too (CodeRabbit review, ENG-1276): a RESUMED run's
+    // verification already seeds its evidence with resumePriorToolCalls (see
+    // `priorToolCalls: resumePriorToolCalls` passed into runVerifiedChat below),
+    // so the pass/fail DECISION correctly counts the abandoned portion's calls.
+    // This persisted record was built from `result.toolCalls` alone — only the
+    // calls made in the resumed portion — so a resumed run that passed because
+    // an EARLIER call satisfied a requirement could still write
+    // `{required: 1, actual: 0}` here: a self-contradicting record next to an
+    // empty functionCallMisses, the exact false-failure shape ENG-479/ENG-764/
+    // ENG-827 already had to unpick for a different stale-snapshot cause.
+    requirementEvidenceNames([...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
-
-    // ENG-827: report the requirements this run was actually HELD TO, which is the
-    // publish-scope-filtered list the checker used above — not the raw schedule
-    // config. Reading the unfiltered config here persisted a self-contradicting
-    // record on an unauthorized run: `post_on_connected_account {required: 1,
-    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
-    // Nothing downstream can tell that apart from a genuine silent miss, which is
-    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
-    // feeds the checker, the prompt and this record.
-    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
-    // run FINISHED under, which differs from the admitted one when the owner revoked
-    // consent mid-run. Reading the raw schedule config here instead persisted a
-    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
-    // next to an empty functionCallMisses on a passing run. Nothing downstream can
-    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
-    // ENG-764 had to unpick.
-    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
-      .forEach((functionName: string) => {
-        finalFunctionCallDetails[functionName] = {
-          actual: actualFunctionCallCounts[functionName] || 0,
-          required: functionCallMinCalls[functionName] || 1
-        };
-      });
+    heldToFunctionNames.forEach((functionName: string) => {
+      finalFunctionCallDetails[functionName] = {
+        actual: actualFunctionCallCounts[functionName] || 0,
+        required: functionCallMinCalls[functionName] || 1
+      };
+    });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
     const runDelivered = result.success && !result.deferredUnresolved;
+
+    // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
+    const blockedBy = detectRunBlockedReason(result.toolCalls);
+    if (blockedBy) {
+      console.log(
+        `AgentMode: scheduled run ${schedule.scheduleId} was blocked by ${blockedBy} — ` +
+        `sourcing was unavailable, not empty`,
+      );
+    }
 
     const finalResult = {
       scheduleId: schedule.scheduleId,
@@ -4436,6 +4754,15 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
+      // people-search still delivers a report when that endpoint is down for the
+      // account, so it lands here as a plain `success` and the owner's schedule
+      // card stays green while zero prospects were sourced — reading exactly like
+      // "nobody matched your filters". Persist WHY it was blocked so the card can
+      // say so. Kept separate from `status` deliberately: the outage is upstream
+      // and self-clearing, so flipping these runs to failures would bury the
+      // owner's real failure signal under a fleet-wide vendor incident.
+      ...(blockedBy ? { blockedBy } : {}),
       // ENG-947: the run ended early because its publish-press budget ran out with
       // the publish tool still uncalled — the content was drafted and held, not
       // published. Still a `failure` (nothing shipped, so the streak/oncall
@@ -4457,6 +4784,50 @@ export async function runScheduledChat(
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
+
+    // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
+    // sourcing-block transition, instead of using `schedule` as loaded at the
+    // top of this (often multi-minute) function. Two runs of the same schedule
+    // racing concurrently — e.g. a manual Test click overlapping a cron trigger
+    // — would otherwise both read the SAME stale prior-run snapshot and both
+    // fire the alert. This doesn't eliminate the race (a true fix needs a
+    // DB-level conditional write), but narrows the window from run-duration
+    // down to a single DB round-trip. Deliberately NOT a persisted "already
+    // alerted" flag: that write can't be atomic with the email send either, and
+    // would trade a rare, harmless duplicate for the strictly worse failure mode
+    // of a silently missed alert — the same reasoning already established in
+    // this file for notifyScheduleOwnerOfFailure's zero-output path.
+    //
+    // Scoped to REAL scheduled runs only (!isTest), same as every sibling
+    // owner notification in this function (notifyScheduleOwnerOfFailure). A
+    // manual "Test this schedule" click must never send this unsolicited
+    // alert — the owner is already looking at the run they just triggered,
+    // and testing repeatedly while debugging a suspected outage would
+    // otherwise spam an email they didn't ask for. Also skips the re-fetch
+    // entirely on a test run, since it would go unused.
+    if (!isTest) {
+      let freshSchedule: any = null;
+      try {
+        freshSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+      } catch (refetchError) {
+        console.error(
+          `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
+        );
+        // Fall back to the (possibly stale) `schedule` already in scope below.
+      }
+      const priorRunResultsForTransitionCheck: any[] | undefined =
+        freshSchedule ? freshSchedule.runResults : schedule.runResults;
+
+      if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
+        // Notify using the freshly re-fetched schedule, not the function-entry
+        // copy — we already paid for this read, so a mid-run edit to
+        // emailNotifications or disableSourcingBlockAlerts is honored at zero
+        // extra cost, rather than ignored until the schedule's next run.
+        await notifyScheduleOwnerOfSourcingBlockTransition(freshSchedule || schedule, userId, {
+          isNowBlocked: Boolean(blockedBy),
+        });
+      }
+    }
 
     // Save the result to database (without actualResponse to save space)
     const resultToStore = { ...finalResult };
@@ -8705,6 +9076,11 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
+        // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
+        // blocked/recovered" transition email specifically — does not affect the
+        // schedule-card badge, per-run emails, or run history, which stay on.
+        // Default false = alerts on, matching every existing schedule's behavior.
+        disableSourcingBlockAlerts: req.body.disableSourcingBlockAlerts === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -8847,6 +9223,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        disableSourcingBlockAlerts,
         timezone
       } = req.body;
 
@@ -8940,6 +9317,11 @@ export const agentModeController = {
         ...(requirePublishApproval !== undefined
           ? { requirePublishApproval: requirePublishApproval === true }
           : {}),
+        // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
+        // preserve the existing value when this request doesn't touch it.
+        disableSourcingBlockAlerts: disableSourcingBlockAlerts !== undefined
+          ? (disableSourcingBlockAlerts === true)
+          : ((existingSchedule as any).disableSourcingBlockAlerts || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

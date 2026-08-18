@@ -196,6 +196,64 @@ describe('usageRecorderService', () => {
       expect(Number.isInteger(inc.costMicroUsd)).toBe(true);
     });
 
+    // Boundary: costUsdOverride of exactly 0 is a real, explicit charge (e.g. a
+    // free-tier image generation) — `!= null` must not treat the falsy 0 as
+    // "no override" and fall through to unpriced classification.
+    it('tags an explicit costUsdOverride of exactly 0 as "allocated", not "unpriced"', async () => {
+      await recordUsage({
+        ...baseCtx,
+        model: 'gemini-2.5-flash-image',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsdOverride: 0,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.costSource).toBe('allocated');
+      expect(inc.costMicroUsd).toBe(0);
+    });
+
+    // Boundary: a negative override (bad upstream data) must not produce a
+    // negative ledger entry, and must still record as "allocated" since it was
+    // an explicit (if malformed) cost signal, not an absence of pricing.
+    it('clamps a negative costUsdOverride to 0 and still tags it "allocated"', async () => {
+      await recordUsage({
+        ...baseCtx,
+        model: 'gemini-2.5-flash-image',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsdOverride: -5,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.costMicroUsd).toBe(0);
+      expect(inc.costSource).toBe('allocated');
+    });
+
+    // Invalid input: an empty-string model must not throw inside price lookup —
+    // it degrades to "unknown"/"unpriced" like a missing model, per the
+    // defensive `canonicalModelId` guard.
+    it('tags an empty-string model as "unpriced" without throwing', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await expect(recordUsage({ ...baseCtx, model: '' })).resolves.toBeUndefined();
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.costSource).toBe('unpriced');
+      expect(inc.model).toBe('unknown');
+    });
+
+    // Error-path: costSource tagging happens before the db write — a downstream
+    // db failure on an unpriced-tagged row must still fail open (acceptance
+    // criterion), not throw or lose the classification work already done.
+    it('still fails open when the db adapter rejects while recording an unpriced model', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockIncrement.mockRejectedValue(new Error('DynamoDB is down'));
+
+      await expect(
+        recordUsage({ ...baseCtx, model: 'mystery-model-x' })
+      ).resolves.toBeUndefined();
+      expect(mockIncrement.mock.calls[0][0].costSource).toBe('unpriced');
+      expect(errorSpy).toHaveBeenCalled();
+    });
+
     it('sanitizes negative / fractional token counts', async () => {
       await recordUsage({ ...baseCtx, inputTokens: -5, outputTokens: 10.6 });
       const inc = mockIncrement.mock.calls[0][0];
