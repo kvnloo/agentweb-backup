@@ -58,6 +58,7 @@ describe('bedrockInferenceProfiles', () => {
           'anthropic.claude-sonnet-4-6',
           'anthropic.claude-opus-4-6-v1',
           'anthropic.claude-opus-4-8',
+          'claude-opus-4-8', // legacy settings alias
           // ENG-744 — the Claude 5 generation
           'anthropic.claude-opus-5',
           'anthropic.claude-sonnet-5',

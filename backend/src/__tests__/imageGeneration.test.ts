@@ -1749,6 +1749,66 @@ describe('ImageService', () => {
       expect(callCount).toBe(2);
       expect(result.success).toBe(true);
     });
+
+    it('preserves the real provider error detail so the classifier can tell quota exhaustion from rate limiting (ENG-1220)', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(
+        JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' }),
+      );
+
+      const mockAxios = require('axios');
+      const quotaError: any = new Error('Request failed with status code 429');
+      quotaError.status = 429;
+      quotaError.response = {
+        status: 429,
+        data: {
+          error: {
+            message: 'You exceeded your current quota, please check your plan and billing details.',
+            type: 'insufficient_quota',
+          },
+        },
+      };
+      (mockAxios.default.post as jest.Mock).mockRejectedValue(quotaError);
+
+      const result = await imageService.generateImage({
+        prompt: 'Test quota exhaustion',
+        filename: 'quota-test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-2',
+        size: '1024x1024'
+      });
+
+      expect(result.success).toBe(false);
+      // Must carry the real provider detail, not just the generic Axios wrapper
+      // text ("Request failed with status code 429") — otherwise the gateway's
+      // classifier (toolErrorClassifier.ts) can never distinguish hard quota
+      // exhaustion from transient rate-limiting, and a permanently-broken
+      // account gets exempted from the session-wide retry budget forever.
+      expect(result.error).toContain('exceeded your current quota');
+    });
+
+    it('still falls back to the generic Axios message when the provider error has no structured body', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(
+        JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' }),
+      );
+
+      const mockAxios = require('axios');
+      const networkError: any = new Error('Request failed with status code 429');
+      networkError.status = 429;
+      // No .response at all — a raw network/connection-level failure, not a
+      // parsed HTTP error response with a JSON body.
+      (mockAxios.default.post as jest.Mock).mockRejectedValue(networkError);
+
+      const result = await imageService.generateImage({
+        prompt: 'Test generic fallback',
+        filename: 'generic-test.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-2',
+        size: '1024x1024'
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Request failed with status code 429');
+    });
   });
 
   describe('normalizeImageModel (GA migration alias)', () => {

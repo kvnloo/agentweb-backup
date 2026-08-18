@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { userDb, User } from './db';
+import { invalidateCachedPixels } from './metaPixelsCache';
 
 // ============================================
 // Type Definitions
@@ -312,6 +313,20 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   // persisted here so every later delivery reuses it directly — see
   // resolveOrCreateBookingList in calendlyWebhook.ts.
   booking_lead_list_id?: string;
+  // ENG-1141: which Meta pixel/ad account CAPI attribution uses for this connection's
+  // bookings. Unlike landing pages (per-generation choice, no stored default — a human
+  // is present at creation time), a booking webhook is unattended, so this has to be
+  // settable once and reused — see resolveMetaPixelWithDefault in metaService.ts, which
+  // falls back to the caller's first connected account/first pixel when unset.
+  attributionPixelId?: string;
+  attributionAccountId?: string;
+  // ENG-1141: an explicit "don't wire Meta up at all" choice. Distinct from simply leaving
+  // the pair unset, which means "auto-resolve to my first account/pixel" — a customer who
+  // connected Calendly purely for scheduling has no way to express "no Meta attribution"
+  // otherwise, and would silently get CAPI Schedule events fired against whichever ad
+  // account happened to be first. When true, the booking is still created and CRM-forwarded
+  // exactly as before; only the CAPI leg is skipped.
+  attributionDisabled?: boolean;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
@@ -414,6 +429,12 @@ export const createAccount = async (
     connected_accounts: updatedAccounts,
   } as Partial<User>);
 
+  // ENG-1141: which pixels exist for this user just changed. Without this, connecting a
+  // Meta account and immediately opening the create dialog would read a cached "no pixels"
+  // answer — which the picker reads as "nothing to choose" — and ship a silently untracked
+  // page. See services/metaPixelsCache.ts.
+  invalidateCachedPixels(userId);
+
   return accountConfig;
 };
 
@@ -440,7 +461,19 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
  *
  * Own accounts are always returned (ownerUserId === callerUserId). Other
  * members' accounts are included only when sharedWithOrg === true.
- * Deduplication is by account_id — the caller's own account wins on conflict.
+ * Deduplication is by platform + account_id — the caller's own account wins on
+ * conflict.
+ *
+ * Platform is part of the key because account_id alone does not identify an
+ * account: one Google account connected for both Gmail and Drive carries the
+ * same address on both rows. Keying on the id alone dropped whichever of the
+ * two came second, and dropped a teammate's shared account entirely if the
+ * caller happened to hold any account at the same id on any platform. For a
+ * mailbox that is not cosmetic — losing the Gmail row makes it unresolvable
+ * again, which is ENG-943's symptom reached by another route, and one the
+ * resolver's own "prefer the email platform" guard cannot catch because the row
+ * never arrives. Own accounts were never deduped at all, so consumers already
+ * handle one address appearing on two platforms.
  */
 export const getAccountsWithOwnerIncludingOrgShared = async (
   callerUserId: string
@@ -461,15 +494,21 @@ export const getAccountsWithOwnerIncludingOrgShared = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  const seen = new Set(ownAccounts.map(a => a.account_id));
+  // platform + account_id, not account_id alone — see the note above. The
+  // separator is written as an escape and never as a literal control character:
+  // a raw NUL in the source makes git and grep treat this entire file as
+  // binary, which silently costs every diff and review of it.
+  const identity = (account: { platform: string; account_id: string }) =>
+    `${account.platform}\u0000${account.account_id}`;
+  const seen = new Set(ownAccounts.map(identity));
   const sharedAccounts: ConnectedAccountWithUser[] = [];
 
   for (const member of members) {
     if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
     for (const account of memberAccounts) {
-      if (account.sharedWithOrg && !seen.has(account.account_id)) {
-        seen.add(account.account_id);
+      if (account.sharedWithOrg && !seen.has(identity(account))) {
+        seen.add(identity(account));
         sharedAccounts.push({ ...account, userId: member.userId });
       }
     }
@@ -607,42 +646,122 @@ export const updateAccountTokens = async (
  * Update arbitrary config fields on a connected account.
  * Used to store webhook_id, webhook_url, etc. after initial creation.
  */
+/**
+ * Config keys to REMOVE outright, applied after the merge.
+ *
+ * A plain merge can only ever add or overwrite, so a field that records a
+ * past observation — `ads_scope_revoked_at`, say — has no way to be retracted
+ * once it is wrong. Setting it to `undefined` is not equivalent: the key
+ * survives the spread and its removal would then depend on marshalling
+ * behaviour rather than on anything stated here. Deleting is explicit.
+ */
+export interface UpdateAccountConfigOptions {
+  unset?: string[];
+}
+
+/**
+ * Either a fixed set of fields to merge (the common case — the value doesn't
+ * depend on what's currently stored), or a function of the freshly-read
+ * config that returns the merge for THIS attempt (for a caller whose update is
+ * *derived* from current state — narrowing a scope list, defaulting a
+ * timestamp only if unset).
+ *
+ * The function form exists because the CAS retry below re-reads on conflict
+ * but, with a fixed object, would reapply the SAME pre-computed values against
+ * the fresh read — silently correct only when the update doesn't depend on
+ * what it's overwriting. For a derived update that's a real bug: two writers
+ * racing on one account's capability fields (a sweep's revocation and a
+ * concurrent recovery) could have the loser's stale-derived write clobber the
+ * winner's fresh state on retry, reversing whichever transition arrived
+ * second. The function form re-derives every attempt, closing that gap.
+ */
+export type AccountConfigMutation =
+  | Record<string, any>
+  | ((freshConfig: Record<string, any>) => {
+      updates: Record<string, any>;
+      unset?: string[];
+    });
+
 export const updateAccountConfig = async (
   userId: string,
   platform: PlatformType,
   accountId: string,
-  configUpdates: Record<string, any>
+  configUpdates: AccountConfigMutation,
+  options?: UpdateAccountConfigOptions
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
-  if (!user) {
-    throw new Error('User not found');
-  }
+  // Compare-and-swap, mirroring updateAccountTokens. The User model forces a
+  // whole-list write, so a plain read-modify-write silently discards anything
+  // another writer changed in between — a token the refresh cron had just
+  // renewed, or a capability marker a concurrent sweep had just set. Conditioning
+  // the write on the list we actually read turns that clobber into a retry.
+  //
+  // Unlike the token path this re-applies the merge rather than failing closed:
+  // this function's contract is "merge these fields into whatever is current",
+  // so a fresh read followed by the same merge is exactly the right answer —
+  // provided the merge itself is recomputed from that fresh read when it needs
+  // to be (see AccountConfigMutation above).
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const user = await userDb.getUserByIdConsistent(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
 
-  const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accounts.findIndex(
-    acc => acc.platform === platform && acc.account_id === accountId
-  );
+    const storedAccounts = (user as User).connected_accounts;
+    const accounts = normalizeAccounts(storedAccounts);
+    const accountIndex = accounts.findIndex(
+      acc => acc.platform === platform && acc.account_id === accountId
+    );
 
-  if (accountIndex < 0) {
-    throw new Error(`No ${platform} account with id "${accountId}" connected`);
-  }
+    if (accountIndex < 0) {
+      throw new Error(`No ${platform} account with id "${accountId}" connected`);
+    }
 
-  const existingAccount = accounts[accountIndex];
-  const updatedAccount: ConnectedAccountConfig = {
-    ...existingAccount,
-    config: {
+    const existingAccount = accounts[accountIndex];
+
+    const isDerived = typeof configUpdates === 'function';
+    const { updates, unset } = isDerived
+      ? configUpdates(existingAccount.config || {})
+      : { updates: configUpdates, unset: options?.unset };
+
+    const mergedConfig: Record<string, any> = {
       ...existingAccount.config,
-      ...configUpdates,
-    },
-    updated_at: new Date().toISOString(),
-  };
+      ...updates,
+    };
+    for (const key of unset || []) {
+      delete mergedConfig[key];
+    }
 
-  const updatedAccounts = [...accounts];
-  updatedAccounts[accountIndex] = updatedAccount;
+    const updatedAccount: ConnectedAccountConfig = {
+      ...existingAccount,
+      config: mergedConfig as ConnectedAccountConfig['config'],
+      updated_at: new Date().toISOString(),
+    };
 
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
+    const updatedAccounts = [...accounts];
+    updatedAccounts[accountIndex] = updatedAccount;
+
+    try {
+      await userDb.updateUser(userId, {
+        connected_accounts: updatedAccounts,
+      } as Partial<User>, {
+        condition: {
+          expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+          names: { '#expectedConnectedAccounts': 'connected_accounts' },
+          values: { ':expectedConnectedAccounts': storedAccounts },
+        },
+      });
+      return;
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') throw error;
+      if (attempt === 2) {
+        throw Object.assign(
+          new Error(`Connected account "${accountId}" changed while updating its config; retry`),
+          { code: 'ConnectedAccountChanged' },
+        );
+      }
+      // Loop: re-read and re-apply the merge onto whatever is now current.
+    }
+  }
 };
 
 /**
@@ -668,6 +787,9 @@ export const deleteAccount = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: a disconnect must not leave that account's pixels listed in the picker.
+  invalidateCachedPixels(userId);
 };
 
 /**
@@ -697,6 +819,10 @@ export const deleteAccountById = async (
   await userDb.updateUser(userId, {
     connected_accounts: filteredAccounts,
   } as Partial<User>);
+
+  // ENG-1141: same as deleteAccount — a disconnected account's pixels must stop being
+  // offered immediately, not a TTL later.
+  invalidateCachedPixels(userId);
 };
 
 /**

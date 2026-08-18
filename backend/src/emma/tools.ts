@@ -506,6 +506,8 @@ Actions:
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
 
+SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
+
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
 - provider_id: the Unipile provider_id directly if you already have it`,
@@ -875,6 +877,23 @@ emmaToolRegistry.register({
     name: "call_meta_marketing_api",
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
+
+LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a pre-flight
+  tracking check on the campaign's destination URLs first. A destination is measurable only if its served HTML
+  carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some other account
+  will never receive these conversions, so it does not count. If any destination fails, the launch is BLOCKED
+  (result has blocked=true, reason='tracking_preflight') and the message names each destination and what was
+  checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel is
+  receiving events server-side, the page may be measured through the Conversions API, which this check cannot
+  see. Only pass params.override_tracking_check=true if the user explicitly chooses to launch anyway — never set
+  it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
+  or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
+  The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
+  unconfirmed preview call, show the user the WARNING line that comes back in the summary, and on the confirmed
+  call pass params.tracking_override_token exactly as the preview returned it, alongside params.confirm=true.
+  Adding the override only to the confirmed call, or changing any other argument after the preview, invalidates
+  it — the API returns a fresh preview instead of launching. There is no way to waive the check without the user
+  being shown that it is being waived.
 
 ⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
   CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
@@ -3420,7 +3439,7 @@ emmaToolRegistry.register({
   name: 'add_leads_to_list',
   definition: {
     name: 'add_leads_to_list',
-    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
+    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. IMPORTING A FILE: pass the WHOLE set of rows in ONE call — the backend already writes in chunks internally, and splitting a file across many calls only burns turn time and risks the import being cut off part-way. The call is safe to repeat: a row that is already in the list merges or is reported as already present, it is never duplicated (rows with no email and no LinkedIn URL dedupe on name+company). RESULT: `attempted`, a `reconciliation` breakdown (created / merged / alreadyPresent / duplicateInRequest / anonymizedSkipped / failed / unprocessed), `importedIdentifiers` naming every row now in the list, and — when the import did not complete — `resumable: true`, `unimportedRows` naming the rows that did not land, and `unimportedRowRanges` giving the positions of EVERY row that did not land within the rows you just sent (e.g. "7,19,101-220"). On a very large partial `unimportedRows` can be trimmed and says so; `unimportedRowRanges` is never truncated, so resend every row it names. If you get a partial result, immediately call this tool again with just those rows, and repeat until a result comes back with `complete: true`. Never end the turn telling the user to retry the import themselves.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3448,7 +3467,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId);
+    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+      // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
+      // soft deadline, which is neither a bound on the turn nor still meaningful once it
+      // has passed (ENG-1133).
+      turnDeadlineMs: context?.turnHardCapMs,
+    });
   }
 });
 
@@ -6356,7 +6380,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6364,20 +6388,29 @@ emmaToolRegistry.register({
     await bootstrapEmailProviders();
 
     try {
-      const { provider } = await resolveEmailAccount(userId, args.account_id);
+      // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
+      // record, and that is where the provider reads (and refreshes) its tokens.
+      // A send is resolved as a write, so it is refused on a teammate's mailbox.
+      const operation = args.action === 'send' ? 'send' : 'read';
+      const resolved = await resolveEmailAccount(userId, args.account_id, operation);
+      const { provider, ownerUserId } = resolved;
+      // Every provider call runs inside withAccessGuard: a teammate's shared
+      // mailbox is re-checked immediately before the call AND before the result
+      // is returned, so a share revoked mid-read discloses nothing.
+      const guarded = <T>(read: () => Promise<T>) => withAccessGuard(userId, resolved, operation, read);
 
       switch (args.action) {
         case 'search': {
           if (!args.query) return { error: 'search action requires a query parameter.' };
           const maxResults = Math.min(args.max_results || 10, 50);
-          const results = await provider.searchEmails(userId, args.account_id, args.query, maxResults);
+          const results = await guarded(() => provider.searchEmails(ownerUserId, args.account_id, args.query, maxResults));
           if (results.length === 0) return { message: 'No emails found matching your search.' };
           return { emails: results, count: results.length };
         }
 
         case 'list': {
           const maxResults = Math.min(args.max_results || 20, 50);
-          const results = await provider.listEmails(userId, args.account_id, args.folder || 'INBOX', maxResults);
+          const results = await guarded(() => provider.listEmails(ownerUserId, args.account_id, args.folder || 'INBOX', maxResults));
           if (results.length === 0) return { message: 'No emails found.' };
           return { emails: results, count: results.length };
         }
@@ -6385,7 +6418,7 @@ emmaToolRegistry.register({
         case 'get': {
           const ids: string[] = Array.isArray(args.message_ids) ? args.message_ids : [];
           if (ids.length === 0) return { error: 'get action requires a message_ids array with at least one ID.' };
-          const emails = await provider.getEmails(userId, args.account_id, ids);
+          const emails = await guarded(() => provider.getEmails(ownerUserId, args.account_id, ids));
           return { emails, count: emails.length };
         }
 
@@ -6393,7 +6426,7 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
-          const result = await provider.sendEmail(userId, args.account_id, {
+          const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,
             body: args.body,
@@ -6654,7 +6687,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {

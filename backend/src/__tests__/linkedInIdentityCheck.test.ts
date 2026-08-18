@@ -1,0 +1,368 @@
+/**
+ * ENG-1026 — LinkedIn identity cross-check before personalized sends.
+ *
+ * Covers the pure check (crossCheckProfileIdentity) and the shared async guard
+ * (verifyLinkedInIdentityForSend) used by both the CRM REST routes and the
+ * agent-mode linkedinOutreach tool paths.
+ *
+ * Contract:
+ *  1. Company mismatch between the live profile and the lead → refuse.
+ *  2. Successful cross-check → linkedinIdentityVerifiedAt + verified URL stamped
+ *     via crmDb.updateLead.
+ *  3. No company on the lead / no lead context → do not block, do not stamp.
+ *  4. Name mismatch alone → refuse (reuses unipileNameMatches).
+ *  5. Previously verified lead (stamp + same canonical URL) → skip the re-fetch.
+ *  Fail OPEN on infra errors (profile fetch throws) — only positive mismatch
+ *  evidence refuses.
+ */
+
+const mockGetLinkedInProfile = jest.fn();
+jest.mock('../services/linkedInOutreachService', () => ({
+  linkedInOutreachService: {
+    getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
+  },
+}));
+
+const mockUpdateLead = jest.fn().mockResolvedValue(undefined);
+jest.mock('../services/db', () => ({
+  crmDb: {
+    updateLead: (...args: any[]) => mockUpdateLead(...args),
+  },
+}));
+
+import {
+  crossCheckProfileIdentity,
+  verifyLinkedInIdentityForSend,
+} from '../services/linkedInIdentityCheck';
+
+// The concrete production failure: lead Florence Su (VP Performance Marketing,
+// Vivian Health) whose stored slug resolves to a different Florence Su (TPM at
+// Snowflake).
+const snowflakeProfile = {
+  first_name: 'Florence',
+  last_name: 'Su',
+  headline: 'Technical Program Manager at Snowflake',
+  work_experience: [{ position: 'Technical Program Manager', company: 'Snowflake', current: true }],
+};
+
+const vivianLead = {
+  firstName: 'Florence',
+  lastName: 'Su',
+  company: 'Vivian Health',
+  linkedin: 'https://www.linkedin.com/in/florencesu',
+};
+
+describe('crossCheckProfileIdentity (pure)', () => {
+  it('refuses on company mismatch (Florence Su case)', () => {
+    const res = crossCheckProfileIdentity(snowflakeProfile, vivianLead);
+    expect(res.verdict).toBe('mismatch');
+  });
+
+  it('matches when the current employer equals the lead company (suffix/case tolerant)', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health, Inc.', current: true }],
+      },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('matches on headline containment ("VP Marketing @ Vivian Health")', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'VP Marketing @ Vivian Health' },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('is unverifiable when the lead has no company', () => {
+    const res = crossCheckProfileIdentity(snowflakeProfile, {
+      firstName: 'Florence',
+      lastName: 'Su',
+    });
+    expect(res.verdict).toBe('unverifiable');
+  });
+
+  it('is unverifiable when the profile carries no company or headline signal', () => {
+    const res = crossCheckProfileIdentity({ first_name: 'Florence', last_name: 'Su' }, vivianLead);
+    expect(res.verdict).toBe('unverifiable');
+  });
+
+  it('refuses on a clear name mismatch even when company is absent on the profile', () => {
+    const res = crossCheckProfileIdentity(
+      { first_name: 'Bob', last_name: 'Jones' },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('mismatch');
+  });
+
+  // ENG-1026 Greptile P1 (round 2): unbounded substring containment lets a
+  // SHORT or common lead company name false-match a completely unrelated
+  // profile company/headline that merely happens to contain those letters
+  // in sequence, with no word boundary. This is not a contrived edge case --
+  // short company names ("AI", "Co", brand initialisms) are common.
+  it('does NOT false-match on a raw substring with no word boundary ("AI" inside "Krai Group")', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [{ company: 'Krai Group', current: true }],
+      },
+      { firstName: 'Florence', lastName: 'Su', company: 'AI' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('does NOT false-match via the reverse containment direction either ("Krai Group" as lead company vs a profile company "AI")', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [{ company: 'AI', current: true }],
+      },
+      { firstName: 'Florence', lastName: 'Su', company: 'Krai Group' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('does NOT false-match on headline containment with no word boundary ("AI" inside "Chai Tea Co")', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'Barista at Chai Tea Co' },
+      { firstName: 'Florence', lastName: 'Su', company: 'AI' },
+    );
+    expect(res.verdict).not.toBe('match');
+  });
+
+  it('still matches a genuine whole-word phrase containment ("Google" inside "Software Engineer at Google Cloud")', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'Software Engineer at Google Cloud' },
+      { firstName: 'Florence', lastName: 'Su', company: 'Google' },
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('still matches a genuine multi-word phrase containment ("Vivian Health" inside a longer headline)', () => {
+    const res = crossCheckProfileIdentity(
+      { name: 'Florence Su', headline: 'VP Marketing, Vivian Health Group' },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  // ENG-1026 Greptile P1 (round 3): full-profile work_experience entries (the
+  // ONLY shape getLinkedInProfile ever returns) signal "ongoing" via the
+  // ABSENCE of an `end` field, not a `current` boolean -- that flag only
+  // exists on a different, lighter search-result shape elsewhere in the
+  // codebase. Checking `current === true` here fell through to work[0]
+  // whenever it was unset, and work[0] can be a FORMER job -- letting a
+  // stale/former employer verify and cache as current identity evidence.
+  it('does NOT verify against a former employer when no entry carries current:true, but a LATER entry has no `end` (is genuinely ongoing)', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        // No entry has `current: true`. work[0] is a FORMER job (has `end`)
+        // that happens to match the lead's stored company -- the exact
+        // false-positive shape Greptile flagged.
+        work_experience: [
+          { company: 'Vivian Health', end: '2023-01-01' }, // FORMER — has an end date
+          { company: 'Snowflake' }, // no `end` — genuinely current
+        ],
+      },
+      vivianLead, // lead.company === 'Vivian Health'
+    );
+    // Must check against the genuinely current job (Snowflake), not the
+    // former one (Vivian Health) that happens to sit first in the array.
+    expect(res.verdict).toBe('mismatch');
+  });
+
+  it('correctly matches when the genuinely current entry (no `end`) IS the lead\'s company, even when it is not first in the array', () => {
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [
+          { company: 'Snowflake', end: '2022-01-01' }, // FORMER
+          { company: 'Vivian Health' }, // no `end` — genuinely current
+        ],
+      },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+
+  it('falls back to the first entry only when NO entry is genuinely current (every entry has an `end`)', () => {
+    // No live "current" signal at all -- this is the pre-existing, unchanged
+    // best-effort fallback (not what this finding is about), kept for
+    // regression coverage of that boundary.
+    const res = crossCheckProfileIdentity(
+      {
+        first_name: 'Florence',
+        last_name: 'Su',
+        work_experience: [
+          { company: 'Vivian Health', end: '2023-01-01' },
+          { company: 'Snowflake', end: '2020-01-01' },
+        ],
+      },
+      vivianLead,
+    );
+    expect(res.verdict).toBe('match');
+  });
+});
+
+describe('verifyLinkedInIdentityForSend (shared guard)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const baseOpts = {
+    listId: 'list-1',
+    leadId: 'lead-1',
+    profileUrl: 'https://www.linkedin.com/in/florencesu',
+    accountId: 'acct-1',
+  };
+
+  it('refuses the send with a structured error on mismatch and does not stamp', async () => {
+    mockGetLinkedInProfile.mockResolvedValue(snowflakeProfile);
+    const res = await verifyLinkedInIdentityForSend({ ...baseOpts, lead: vivianLead });
+    expect(res.allowed).toBe(false);
+    expect((res as any).refusal).toMatchObject({
+      code: 'linkedin_identity_mismatch',
+      details: expect.objectContaining({
+        leadCompany: 'Vivian Health',
+        profileName: expect.stringContaining('Florence'),
+      }),
+    });
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('stamps linkedinIdentityVerifiedAt + verified URL on a successful cross-check', async () => {
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+    const res = await verifyLinkedInIdentityForSend({ ...baseOpts, lead: vivianLead });
+    expect(res.allowed).toBe(true);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      linkedinIdentityVerifiedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      linkedinIdentityVerifiedUrl: 'https://www.linkedin.com/in/florencesu',
+    }));
+  });
+
+  it('does not block or stamp when the lead has no company and no name', async () => {
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      lead: { linkedin: 'https://www.linkedin.com/in/florencesu' },
+    });
+    expect(res.allowed).toBe(true);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('does not block when there is no lead context at all', async () => {
+    const res = await verifyLinkedInIdentityForSend({ ...baseOpts, lead: null });
+    expect(res.allowed).toBe(true);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+  });
+
+  it('fails open (allows, no stamp) when the profile fetch throws', async () => {
+    mockGetLinkedInProfile.mockRejectedValue(new Error('unipile 500'));
+    const res = await verifyLinkedInIdentityForSend({ ...baseOpts, lead: vivianLead });
+    expect(res.allowed).toBe(true);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('skips the re-fetch entirely for a previously verified lead with the same URL', async () => {
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      lead: {
+        ...vivianLead,
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: 'https://linkedin.com/in/florencesu/',
+      },
+    });
+    expect(res.allowed).toBe(true);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+  });
+
+  it('re-checks when the stamped URL differs from the current lead URL', async () => {
+    mockGetLinkedInProfile.mockResolvedValue(snowflakeProfile);
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      lead: {
+        ...vivianLead,
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: 'https://www.linkedin.com/in/some-other-slug',
+      },
+    });
+    expect(mockGetLinkedInProfile).toHaveBeenCalled();
+    expect(res.allowed).toBe(false);
+  });
+
+  // ENG-1026 Greptile P1 ("cached verification isn't bound to the actual send
+  // target"): a lead's stamp is legitimately for the lead's OWN stored URL
+  // (lead.linkedin). A separate, model-supplied `profileUrl` targeting a
+  // DIFFERENT profile must never be waved through on the strength of that
+  // stamp -- the cache key must be the URL actually being sent to, not the
+  // lead's stored URL.
+  it('does NOT reuse a stamp verified against the lead\'s own URL to authorize a send to a different target profileUrl', async () => {
+    mockGetLinkedInProfile.mockResolvedValue(snowflakeProfile); // a mismatch, if actually checked
+    const differentTargetUrl = 'https://www.linkedin.com/in/totally-different-person';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: differentTargetUrl, // NOT the lead's stored URL
+      lead: {
+        ...vivianLead, // lead.linkedin === 'https://www.linkedin.com/in/florencesu'
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: 'https://www.linkedin.com/in/florencesu', // stamp matches lead.linkedin, NOT the target
+      },
+    });
+    // Must re-verify against the actual target, not short-circuit on the stale stamp.
+    expect(mockGetLinkedInProfile).toHaveBeenCalledWith(differentTargetUrl, expect.anything());
+    expect(res.allowed).toBe(false);
+  });
+
+  it('DOES reuse the stamp when the target profileUrl matches what was actually verified (not just lead.linkedin)', async () => {
+    // The lead's stored URL is stale/different, but the target being sent to
+    // right now is exactly the URL that was previously verified -- this is
+    // the legitimate cache-hit case and must still skip the re-fetch.
+    const verifiedUrl = 'https://www.linkedin.com/in/florencesu';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: verifiedUrl,
+      lead: {
+        firstName: 'Florence',
+        lastName: 'Su',
+        company: 'Vivian Health',
+        linkedin: 'https://www.linkedin.com/in/a-stale-different-slug', // stale lead.linkedin
+        linkedinIdentityVerifiedAt: '2026-08-01T00:00:00.000Z',
+        linkedinIdentityVerifiedUrl: verifiedUrl, // matches the ACTUAL target
+      },
+    });
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(res.allowed).toBe(true);
+    expect((res as any).verified).toBe(true);
+  });
+
+  it('stamps the ACTUAL target profileUrl on a successful cross-check, not lead.linkedin', async () => {
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+    const targetUrl = 'https://www.linkedin.com/in/florencesu-alt-slug';
+    const res = await verifyLinkedInIdentityForSend({
+      ...baseOpts,
+      profileUrl: targetUrl,
+      lead: { ...vivianLead, linkedin: 'https://www.linkedin.com/in/a-completely-different-stored-slug' },
+    });
+    expect(res.allowed).toBe(true);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
+      linkedinIdentityVerifiedUrl: targetUrl,
+    }));
+  });
+});

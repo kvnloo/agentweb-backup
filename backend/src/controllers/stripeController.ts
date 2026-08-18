@@ -11,6 +11,8 @@ import {
   handleInvoicePaymentSucceeded,
   handleInvoicePaymentFailed,
   handleChargeRefunded,
+  handleChargeDisputeCreated,
+  handleChargeDisputeClosed,
   handleSubscriptionScheduleEnded,
   reconcileAllStripeUsers,
 } from '../services/stripeService';
@@ -130,6 +132,17 @@ export async function handleWebhook(req: Request, res: Response) {
         break;
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object);
+        break;
+      // Chargebacks on AgentWeb Credits purchases. Capacity is revoked when the
+      // dispute opens; `.closed` only records the outcome (a won dispute does
+      // not auto-restore capacity — see handleChargeDisputeClosed).
+      // NOTE: requires both events to be enabled on the Stripe webhook endpoint
+      // (Developers → Webhooks → edit), same as the subscription_schedule ones.
+      case 'charge.dispute.created':
+        await handleChargeDisputeCreated(event.data.object);
+        break;
+      case 'charge.dispute.closed':
+        await handleChargeDisputeClosed(event.data.object);
         break;
       // subscription_schedule lifecycle: clear any cached scheduledChange
       // on the user record when the schedule reaches a terminal state. See

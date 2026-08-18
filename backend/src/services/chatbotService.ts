@@ -9,9 +9,16 @@ import { getReleases } from "../controllers/release";
 import { fetchMintlifyDocsContent, chunkDocsContent } from "./docsKnowledgeSource";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
-import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
-import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
+// ENG-1277: type-only. `SearchServiceClient` (the value) is required lazily
+// inside searchPlatformKnowledgeBase() below — that function is the only
+// caller, and `@google-cloud/discoveryengine` pulls in ~379 transitive
+// modules that every jest worker previously paid on `require()` of this file
+// regardless of whether a test ever calls it. `EngineServiceClient` was
+// imported but never referenced anywhere in this file or its tests'
+// production paths (only in mock factories, which don't need the real
+// export to exist) — dropped rather than carried into the lazy form.
+import type { protos } from '@google-cloud/discoveryengine';
 import { taskDb, userDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
@@ -184,6 +191,14 @@ export interface ChatSession {
       description?: string;
       status: 'pending' | 'completed' | 'skipped';
       completedAt?: string;
+      // ENG-1188 (Greptile): set alongside completedAt for 'completed' AND ALSO for
+      // 'skipped' -- unlike completedAt, this exists purely so setWorkPlanStatus's
+      // asset-count gate has a real "this step left pending" marker for a skipped
+      // step to scope a later step's asset count against, instead of silently
+      // falling through to counting the whole session. Internal bookkeeping only;
+      // never rendered (PlanProgress/HorizontalPlanProgress key off completedAt +
+      // status === 'completed', which reusing completedAt here would have broken).
+      resolvedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
       skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
@@ -543,6 +558,17 @@ function keywordBasedChunkRetrieval(
  * Persisted audit of a Google Ads pre-flight tracking check (ENG-335), stored on
  * the chat/run record so a launch's measurement status is durable and auditable.
  */
+/** ENG-941 — Meta counterpart of GoogleAdsMeasurementCheckRecord below. */
+export interface MetaMeasurementCheckRecord {
+  accountId: string;
+  campaignId?: string;
+  action: string;
+  outcome: 'passed' | 'blocked' | 'overridden';
+  /** Per-destination check results (url + status + detected pixels). */
+  urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
+  checkedAt: string;
+}
+
 export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
@@ -693,6 +719,37 @@ export class ChatbotDB {
     return chatSession;
   }
 
+  /**
+   * Bound a message to the per-item persistence budget.
+   *
+   * Check serialized item size in UTF-8 BYTES — covers both string content and
+   * content-block arrays. DynamoDB's hard limit is 400KB per item; we use 350KB as a
+   * safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
+   * a CJK/emoji-heavy message is far bigger encoded than its character count.
+   *
+   * ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
+   * long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
+   * routinely 20x the answer — truncating `content` shed nothing, the item stayed
+   * over 400KB, batchWrite threw, and the report was lost from the transcript while
+   * the run still reported success. shrinkMessageForPersistence sheds the ledger
+   * first and the answer last, and guarantees the item fits.
+   *
+   * ENG-1048: this lives here, rather than inline in one writer, because EVERY path
+   * that writes a message item is subject to the same ceiling. ENG-946 guarded only
+   * the append path, so the session→table migration, the repair pass and the
+   * single-message update still wrote raw messages and still threw on an oversized one.
+   *
+   * Returns the ORIGINAL reference when the message already fits.
+   */
+  private fitMessageForPersistence(message: any, label: string): any {
+    const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
+    const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
+    if (safeMessage !== message) {
+      console.warn(`${label} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
+    }
+    return safeMessage;
+  }
+
   // Add messages to AW-ChatMessages table
   private async addMessagesToMessagesTable(sessionId: string, messages: ChatMessage[], startIndex: number): Promise<void> {
     if (messages.length === 0) {
@@ -705,22 +762,10 @@ export class ChatbotDB {
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
-          // Check serialized item size in UTF-8 BYTES — covers both string content and
-          // content-block arrays. DynamoDB hard limit is 400KB per item; we use 350KB as a
-          // safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
-          // a CJK/emoji-heavy message is far bigger encoded than its character count.
-          //
-          // ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
-          // long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
-          // routinely 20x the answer — truncating `content` shed nothing, the item stayed
-          // over 400KB, batchWrite threw, and the report was lost from the transcript while
-          // the run still reported success. shrinkMessageForPersistence sheds the ledger
-          // first and the answer last, and guarantees the item fits.
-          const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
-          const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
-          if (safeMessage !== message) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
-          }
+          const safeMessage = this.fitMessageForPersistence(
+            message,
+            `Message ${startIndex + i + index} for session ${sessionId}`,
+          );
           return {
             PutRequest: {
               Item: {
@@ -914,6 +959,36 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Append a Meta pre-flight tracking check to the session's run record (ENG-941).
+   * Same audit contract as recordGoogleAdsMeasurementCheck above: a launch decision —
+   * passed, blocked, or explicitly overridden — and its per-destination measurement
+   * status must survive, so a later "0 conversions" report can say the campaign was
+   * never measurable instead of presenting a bare zero. Best-effort by design: a
+   * persistence failure must never break the launch flow.
+   */
+  async recordMetaMeasurementCheck(
+    sessionId: string,
+    record: MetaMeasurementCheckRecord
+  ): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression:
+          'SET metaMeasurementChecks = list_append(if_not_exists(metaMeasurementChecks, :empty), :rec), updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':rec': [record],
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error recording Meta measurement check for session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -1053,7 +1128,11 @@ export class ChatbotDB {
           '#message': 'message',
         },
         ExpressionAttributeValues: {
-          ':message': updatedMessage,
+          // ENG-1048: adding feedback grows an item that may already sit at the ceiling.
+          ':message': this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} feedback for session ${sessionId}`,
+          ),
         },
         ReturnValues: 'ALL_NEW',
       };
@@ -1302,7 +1381,11 @@ export class ChatbotDB {
             Item: {
               sessionId,
               messageIndex: i + index,
-              message,
+              // ENG-1048: same 400KB ceiling as the append path.
+              message: this.fitMessageForPersistence(
+                message,
+                `Migrated message ${i + index} for session ${sessionId}`,
+              ),
             },
           },
         }));
@@ -1507,7 +1590,12 @@ export class ChatbotDB {
           Item: {
             sessionId,
             messageIndex,
-            message
+            // ENG-1048: a repaired message is subject to the same 400KB ceiling —
+            // without this the repair pass throws on exactly the messages it exists to fix.
+            message: this.fitMessageForPersistence(
+              message,
+              `Repaired message ${messageIndex} for session ${sessionId}`,
+            )
           }
         }
       }));
@@ -3004,6 +3092,8 @@ export class ChatbotDB {
         userInstructions?: string;
         status: 'pending' | 'completed' | 'skipped';
         completedAt?: string;
+        /** ENG-1188: see the matching field on the read-side workPlan type above. */
+        resolvedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
         skillIds?: string[];
@@ -3640,7 +3730,11 @@ export class ChatbotDB {
         },
         UpdateExpression: "SET message = :message",
         ExpressionAttributeValues: {
-          ":message": updatedMessage,
+          // ENG-1048: same 400KB ceiling as every other message write.
+          ":message": this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} for session ${sessionId}`,
+          ),
         },
       };
 
@@ -4077,6 +4171,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
     }
 
     // Initialize the Search Service clients
+    // ENG-1277: lazy load — see the import comment above for why.
+    const { SearchServiceClient, protos } = await import('@google-cloud/discoveryengine');
     const privateKey = await getGCSPPrivateKey();
 
     const publicClient = new SearchServiceClient({
@@ -4739,6 +4835,10 @@ export async function generateChatResponse(
             model: activeDeployment,
             provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
             feature: 'chat',
+            // ENG-1251: response.id is stable across a retried/re-processed
+            // response and distinct across real calls — closes the "retries
+            // defeat charge dedup" Greptile P1 for this iteration's charge.
+            eventId: typeof response?.id === 'string' ? response.id : undefined,
             inputTokens: u.prompt_tokens || 0,
             outputTokens: u.completion_tokens || 0,
             cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,

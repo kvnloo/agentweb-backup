@@ -68,10 +68,14 @@ describe('seed-eng618-leadgen-skills', () => {
       );
     });
 
-    it('carries the absolute PUBLISH GATE (never posts unattended)', () => {
+    it('carries the absolute PUBLISH GATE, deferring the unattended call to the run', () => {
+      // ENG-947: this used to assert "never publish" unattended. That blanket
+      // refusal outranked the run's PUBLISH AUTHORIZATION block and deadlocked
+      // authorized schedules, so the gate now defers rather than decides.
       const skill = buildXEngineSkill();
       expect(skill.systemPrompt).toContain('## PUBLISH GATE (ABSOLUTE');
-      expect(skill.systemPrompt).toContain('save as a draft and notify; never publish');
+      expect(skill.systemPrompt).not.toContain('save as a draft and notify; never publish');
+      expect(skill.systemPrompt!.replace(/\s+/g, ' ')).toContain('PUBLISH AUTHORIZATION');
     });
 
     it('every tool named in the prompt is declared in toolNames', () => {
