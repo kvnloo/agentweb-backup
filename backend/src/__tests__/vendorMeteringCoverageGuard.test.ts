@@ -40,8 +40,19 @@ interface VendorSignature {
  * (usageRecorderService.recordUsage / recordVendorUsage, from ENG-693). Any
  * OTHER "recordUsage" (e.g. Apollo/enrich.so's call-count quota trackers) does
  * not count — those are visibility, not the $ ledger.
+ *
+ * Requires BOTH an import of recordUsage/recordVendorUsage FROM
+ * usageRecorderService AND an actual call to one of them — a bare substring
+ * match on "usageRecorderService" (e.g. inside a comment, a string literal, or
+ * an unused import) must not be enough to claim a module is metered
+ * (CodeRabbit finding on this PR, ENG-701).
  */
-const METERED_MARKER = /usageRecorderService/;
+const USAGE_RECORDER_IMPORT = /import\s*\{[^}]*\b(?:recordUsage|recordVendorUsage)\b[^}]*\}\s*from\s*['"][^'"]*usageRecorderService['"]/;
+const USAGE_RECORDER_CALL = /\b(?:recordUsage|recordVendorUsage)\s*\(/;
+
+function isMetered(content: string): boolean {
+  return USAGE_RECORDER_IMPORT.test(content) && USAGE_RECORDER_CALL.test(content);
+}
 
 interface AllowlistEntry {
   /** Path relative to src/, forward-slash separated. */
@@ -158,7 +169,7 @@ function scanForVendorViolations(
   for (const [rel, content] of files) {
     for (const { vendor, re } of signatures) {
       if (!re.test(content)) continue;
-      if (METERED_MARKER.test(content)) continue; // metered — no allowlist needed
+      if (isMetered(content)) continue; // metered — no allowlist needed
 
       const entry = allowlistByPath.get(rel);
       if (!entry) {
@@ -209,7 +220,7 @@ function findStaleAllowlistEntries(
       continue;
     }
 
-    if (METERED_MARKER.test(content)) {
+    if (isMetered(content)) {
       stale.push(
         `${entry.path} (now records usage via usageRecorderService — ${entry.issue} shipped, remove from VENDOR_ALLOWLIST)`
       );
@@ -299,6 +310,43 @@ describe('vendor metering guard mechanism (fixtures)', () => {
     const stale = findStaleAllowlistEntries(new Map(), SIGS, allowlist);
     expect(stale).toHaveLength(1);
     expect(stale[0]).toMatch(/no longer exists/);
+  });
+
+  // CodeRabbit (this PR): a bare substring match on "usageRecorderService" must
+  // not be enough to claim a module is metered — a comment or an unused import
+  // proves nothing about whether usage is actually recorded.
+  it('does NOT treat a module as metered from a comment merely mentioning usageRecorderService', () => {
+    const files = new Map([
+      [
+        'services/newVendorThing.ts',
+        "fetch('https://fake-vendor.example.com/bill-me'); // TODO: wire through usageRecorderService one day",
+      ],
+    ]);
+    const violations = scanForVendorViolations(files, SIGS, []);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toMatch(/records no usage/);
+  });
+
+  it('does NOT treat a module as metered from an unused usageRecorderService import with no call', () => {
+    const files = new Map([
+      [
+        'services/newVendorThing.ts',
+        "import { recordVendorUsage } from './usageRecorderService';\nfetch('https://fake-vendor.example.com/bill-me');",
+      ],
+    ]);
+    const violations = scanForVendorViolations(files, SIGS, []);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toMatch(/records no usage/);
+  });
+
+  it('DOES treat a module as metered when both the import and an actual call are present', () => {
+    const files = new Map([
+      [
+        'services/newVendorThing.ts',
+        "import { recordUsage } from '../services/usageRecorderService';\nfetch('https://fake-vendor.example.com/bill-me');\nvoid recordUsage({ model: 'x' } as any);",
+      ],
+    ]);
+    expect(scanForVendorViolations(files, SIGS, [])).toEqual([]);
   });
 });
 
