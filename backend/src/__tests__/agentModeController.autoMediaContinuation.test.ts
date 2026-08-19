@@ -557,20 +557,28 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
    * history still shows an unresolved pause and re-fires the resume if so.
    */
   describe('getSession durability backstop', () => {
-    const makeGetSessionReq = () =>
-      ({ params: { sessionId: mockSessionId }, user: { userId: mockUserId, isAdmin: false } } as unknown as Request);
+    const recentIso = () => new Date(Date.now() - 5000).toISOString();
+    const staleIso = () => new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // 3h ago
 
-    it('re-fires the auto-continuation when the session is reopened with an unresolved deferral and nothing running', async () => {
-      const sessionWithUnresolvedDeferral = {
-        ...mockSession,
-        messages: [{
-          role: 'assistant',
-          content: '3 done',
-          timestamp: '2026-08-14T18:21:12.708Z',
-          metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T18:21:12.708Z' },
-        }],
-      };
-      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithUnresolvedDeferral as any);
+    const makeGetSessionReq = (userOverride?: Partial<{ userId: string; isAdmin: boolean }>, delegateInfo?: any) =>
+      ({
+        params: { sessionId: mockSessionId },
+        user: { userId: mockUserId, isAdmin: false, ...userOverride },
+        ...(delegateInfo ? { delegateInfo } : {}),
+      } as unknown as Request);
+
+    const sessionWithDeferralAt = (iso: string) => ({
+      ...mockSession,
+      messages: [{
+        role: 'assistant',
+        content: '3 done',
+        timestamp: iso,
+        metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: iso },
+      }],
+    });
+
+    it('re-fires the auto-continuation when the GENUINE owner reopens a recent, unresolved deferral with nothing running', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDeferralAt(recentIso()) as any);
       mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
 
       const res = makeRes();
@@ -584,14 +592,7 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
 
     it('does NOT re-fire while a generation is already active for the session (avoids racing an in-flight resume)', async () => {
       activeSessionGenerations.add(mockSessionId);
-      const sessionWithUnresolvedDeferral = {
-        ...mockSession,
-        messages: [{
-          role: 'assistant', content: '3 done', timestamp: '2026-08-14T18:21:12.708Z',
-          metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T18:21:12.708Z' },
-        }],
-      };
-      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithUnresolvedDeferral as any);
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDeferralAt(recentIso()) as any);
 
       const res = makeRes();
       await agentModeController.getSession(makeGetSessionReq(), res);
@@ -611,6 +612,82 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       await flush();
 
       expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    // ENG-1239 (rework): a passive READ (opening a page) must never spend a customer's
+    // credits on their behalf unless it's genuinely them, right now — not staff looking,
+    // not an old abandoned batch resurfacing unprompted.
+    it('does NOT re-fire when an ADMIN directly views another customer\'s session (no delegation)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDeferralAt(recentIso()) as any);
+
+      const res = makeRes();
+      await agentModeController.getSession(makeGetSessionReq({ userId: 'admin-1', isAdmin: true }), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-fire for a DELEGATED session (admin acting as the customer, but not the customer themselves)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDeferralAt(recentIso()) as any);
+
+      const res = makeRes();
+      // Per the delegation model, req.user.userId is already the TARGET customer's id —
+      // delegateInfo.isDelegated is the only signal distinguishing this from a real login.
+      await agentModeController.getSession(makeGetSessionReq({}, { isDelegated: true, adminUserId: 'admin-1' }), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-fire for a STALE deferral (abandoned batch resurfacing on a much-later, unrelated visit)', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDeferralAt(staleIso()) as any);
+
+      const res = makeRes();
+      await agentModeController.getSession(makeGetSessionReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ENG-1239 (rework): if a prior recovery attempt was ITSELF interrupted (process died
+   * after persisting the [SYSTEM] directive but before replying — see the durability
+   * backstop above), firing another attempt used to persist a SECOND, redundant directive
+   * on top of the still-dangling first one. Harmless functionally (both hidden from the
+   * customer, no duplicate images — proven live), but it lets hidden rows accumulate.
+   */
+  describe('duplicate dangling-directive suppression', () => {
+    it('does NOT persist a second directive when the tail is already a dangling auto-continuation directive', async () => {
+      const sessionWithDanglingDirective = {
+        ...mockSession,
+        messages: [
+          { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+          {
+            role: 'user',
+            content: '[SYSTEM] This is an automatic continuation...',
+            metadata: { kind: 'auto-continuation', timestamp: new Date(Date.now() - 5000).toISOString() },
+          },
+        ],
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithDanglingDirective as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      // Drives the same round-1 auto-continuation call the durability backstop fires,
+      // against a session whose tail is already the dangling directive from a prior,
+      // itself-interrupted attempt.
+      const res = makeRes();
+      await agentModeController.getSession(
+        { params: { sessionId: mockSessionId }, user: { userId: mockUserId, isAdmin: false } } as unknown as Request,
+        res,
+      );
+      await flush();
+
+      const persistedKinds = mockChatbotDb.addMessageToSession.mock.calls
+        .map((call) => (call[1] as any)?.metadata?.kind);
+      expect(persistedKinds.filter((k) => k === 'auto-continuation')).toHaveLength(0);
+      // The batch still completes — suppressing the duplicate directive doesn't block the resume.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
     });
   });
 });

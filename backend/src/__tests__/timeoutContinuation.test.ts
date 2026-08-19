@@ -432,4 +432,41 @@ describe('hasUnresolvedMediaDeferral', () => {
   it('ignores a null/malformed last entry', () => {
     expect(hasUnresolvedMediaDeferral([{ role: 'user', content: 'hi' }, null] as any)).toBe(false);
   });
+
+  // ENG-1239 (rework): getSession is a passive READ endpoint — merely reopening a session
+  // must never silently spend the customer's credits on a batch they may have long since
+  // abandoned. sinceMs bounds the backstop to a genuinely RECENT pause; an old one just sits
+  // there until the customer explicitly re-engages (types "continue"), same as pre-fix.
+  // Optional and defaults to no bound, so every test above (and any other caller) is
+  // unaffected — only getSession opts into staleness bounding.
+  it('returns false for an otherwise-matching pause older than sinceMs (stale — do not auto-resume on a passive reopen)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T17:00:00Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs, sinceMs)).toBe(false);
+  });
+
+  it('returns true for a matching pause at/after sinceMs', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T18:05:00Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs, sinceMs)).toBe(true);
+  });
+
+  it('treats a dangling auto-continuation directive with no timestamp at all as stale once sinceMs is set (fail closed)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [
+      { role: 'user', content: '[SYSTEM] automatic continuation...', metadata: { kind: 'auto-continuation' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs, sinceMs)).toBe(false);
+  });
+
+  it('defaults to no staleness bound when sinceMs is omitted (backward compatible)', () => {
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2020-01-01T00:00:00Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
+  });
 });
