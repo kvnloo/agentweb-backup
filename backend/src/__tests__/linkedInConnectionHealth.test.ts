@@ -442,6 +442,28 @@ describe('clearDisconnectFlag', () => {
 
     await expect(clearDisconnectFlag(OWNER, ACCOUNT_ID)).resolves.toBeUndefined();
   });
+
+  it('repoints a stale account_id inside a schedule prompt on reconnect (ENG-1366)', async () => {
+    // ACCOUNT_ID is the account reconnecting; OLD_ID is a previous, now-dead
+    // account still lingering on the user record with a schedule that
+    // hardcodes it — the exact shape found on Jennifer Sun's real schedule.
+    const OLD_ID = 'tMgX8uZJTZWTG_mFY1aI2A_stale';
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'Jennifer Sun', config: { unipile_account_id: ACCOUNT_ID } },
+      { platform: 'unipile', account_id: OLD_ID, account_name: 'Jennifer Sun (old)', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'sched-1', status: 'active', startingMessage: `Use LinkedIn account_id ${OLD_ID} for all actions.` },
+    ]);
+
+    await clearDisconnectFlag(OWNER, ACCOUNT_ID);
+
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'sched-1',
+      expect.objectContaining({ startingMessage: `Use LinkedIn account_id ${ACCOUNT_ID} for all actions.` }),
+      expect.anything(),
+    );
+  });
 });
 
 describe('getUnipileHealth', () => {
@@ -676,6 +698,211 @@ describe('graceful-failure mitigations', () => {
     scheduleDb.getSchedulesByUserId.mockRejectedValue(new Error('dynamo down'));
 
     await expect(resumeSchedulesPausedForAccount(OWNER, ACCOUNT_ID)).resolves.toBe(0);
+  });
+});
+
+describe('repointStaleAccountReferences (ENG-1366)', () => {
+  const { repointStaleAccountReferences } = require('../services/linkedInConnectionHealth');
+  const NEW_ACCOUNT_ID = 'ofGscnIrR5qZYZ00ovNsTQ';
+
+  it('repoints every occurrence of a stale account id in a schedule prompt, leaving the rest of the text untouched', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'Jennifer Sun', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'Jennifer Sun (old)', config: { needs_reconnect: true } },
+    ]);
+    const originalMessage = `Use ${ACCOUNT_ID} first, then ${ACCOUNT_ID} again, then ${ACCOUNT_ID} once more. Target list X.`;
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage },
+    ]);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledTimes(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'a',
+      expect.objectContaining({
+        startingMessage: `Use ${NEW_ACCOUNT_ID} first, then ${NEW_ACCOUNT_ID} again, then ${NEW_ACCOUNT_ID} once more. Target list X.`,
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('repoints across multiple stale ids on the same user in one pass', async () => {
+    const OLD_ID_2 = 'anotherOldId1234567X';
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+      { platform: 'unipile', account_id: OLD_ID_2, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `first use ${ACCOUNT_ID}, later use ${OLD_ID_2}` },
+    ]);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'a',
+      expect.objectContaining({ startingMessage: `first use ${NEW_ACCOUNT_ID}, later use ${NEW_ACCOUNT_ID}` }),
+      expect.anything(),
+    );
+  });
+
+  it('snapshots the pre-repoint text into promptRevisions, so an unwanted rewrite is always recoverable (ENG-1366 review)', async () => {
+    // A blind substring replace has no understanding of context — if a prompt
+    // ever narrated an old account rather than directing live use of it, the
+    // rewrite could read strangely. Rather than try to detect that (fragile,
+    // and risks silently under-fixing genuine stale references), preserve
+    // exactly what a human's own edit already preserves: the prior text, so
+    // any surprising rewrite is visible and reversible, not silently lost.
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const originalMessage = `Use ${ACCOUNT_ID} for all actions.`;
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage, promptRevisions: [{ startingMessage: 'even older text', updatedAt: '2026-01-01T00:00:00.000Z' }] },
+    ]);
+
+    await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    expect(updates.promptRevisions).toHaveLength(2);
+    expect(updates.promptRevisions[0]).toEqual({ startingMessage: 'even older text', updatedAt: '2026-01-01T00:00:00.000Z' });
+    expect(updates.promptRevisions[1]).toMatchObject({ startingMessage: originalMessage });
+  });
+
+  it('caps promptRevisions at the same limit the customer-facing edit uses, dropping the oldest first', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const existingRevisions = Array.from({ length: 10 }, (_, i) => ({
+      startingMessage: `revision ${i}`,
+      updatedAt: `2026-01-0${(i % 9) + 1}T00:00:00.000Z`,
+    }));
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}`, promptRevisions: existingRevisions },
+    ]);
+
+    await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    const [, updates] = scheduleDb.updateSchedule.mock.calls[0];
+    expect(updates.promptRevisions).toHaveLength(10);
+    expect(updates.promptRevisions[0].startingMessage).toBe('revision 1');
+    expect(updates.promptRevisions[9]).toMatchObject({ startingMessage: `use ${ACCOUNT_ID}` });
+  });
+
+  it('passes an optimistic-concurrency expectation so a write cannot clobber a concurrent edit', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    const originalMessage = `use ${ACCOUNT_ID}`;
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: originalMessage },
+    ]);
+
+    await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'a',
+      expect.anything(),
+      { startingMessage: originalMessage },
+    );
+  });
+
+  it('treats a lost race on one schedule as a skip, not a failure, and still processes the rest', async () => {
+    // Two near-simultaneous reconnects (or a human editing at the same moment)
+    // can both read the same stale text before either writes. The loser's
+    // conditional write is rejected by DynamoDB rather than silently
+    // overwriting — that must not abort repointing this user's OTHER,
+    // unrelated schedules.
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}` },
+      { scheduleId: 'b', startingMessage: `also use ${ACCOUNT_ID}` },
+    ]);
+    const conditionalCheckError = Object.assign(new Error('conditional check failed'), {
+      code: 'ConditionalCheckFailedException',
+    });
+    scheduleDb.updateSchedule
+      .mockRejectedValueOnce(conditionalCheckError)
+      .mockResolvedValueOnce(undefined);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(1);
+    expect(scheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+  });
+
+  it('still fails open (resolves to 0) on a genuine, non-conditional write error', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}` },
+    ]);
+    scheduleDb.updateSchedule.mockRejectedValue(new Error('dynamo down'));
+
+    await expect(repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID)).resolves.toBe(0);
+  });
+
+  it('is a no-op and writes nothing when no schedule references any stale id', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: 'use a totally unrelated account' },
+    ]);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(0);
+    expect(scheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op and never queries schedules when the user has no stale accounts at all', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([
+      { scheduleId: 'a', startingMessage: `use ${ACCOUNT_ID}` },
+    ]);
+
+    const repointed = await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(repointed).toBe(0);
+    expect(scheduleDb.getSchedulesByUserId).not.toHaveBeenCalled();
+    expect(scheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  it('scopes the schedule lookup to the reconnecting user only', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockResolvedValue([]);
+
+    await repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID);
+
+    expect(scheduleDb.getSchedulesByUserId).toHaveBeenCalledWith(OWNER);
+  });
+
+  it('swallows a store failure and resolves to 0 rather than throwing', async () => {
+    getAccountsByUserId.mockResolvedValue([
+      { platform: 'unipile', account_id: NEW_ACCOUNT_ID, account_name: 'x', config: {} },
+      { platform: 'unipile', account_id: ACCOUNT_ID, account_name: 'x', config: { needs_reconnect: true } },
+    ]);
+    scheduleDb.getSchedulesByUserId.mockRejectedValue(new Error('dynamo down'));
+
+    await expect(repointStaleAccountReferences(OWNER, NEW_ACCOUNT_ID)).resolves.toBe(0);
   });
 });
 
