@@ -294,29 +294,45 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
 
-      # ENG-1371, two corrections to this ignore list:
+      # ENG-1371: `/__tests__/twins/` restored to this list. A CLI
+      # `--testPathIgnorePatterns` REPLACES the array in jest.config.js rather
+      # than extending it, so passing this flag silently dropped the config's
+      # twins exclusion and loaded both twin suites into this job. They
+      # self-skip without `.env.twins.json`, so it was benign — but they are
+      # opt-in by design (src/__tests__/twins/README.md) and should not sit in a
+      # required suite by accident. Coverage-neutral: a skipped suite executes
+      # nothing and therefore contributes nothing.
       #
-      # `agentMode` (was `/__tests__/agentMode`). Job A selects with
-      # `--testPathPattern="agentMode"`, which matches the substring anywhere in
-      # the path. The old ignore here required the literal `/__tests__/agentMode`,
-      # so it only excluded files named `agentMode*` sitting DIRECTLY under a
-      # `__tests__/` dir — 263 of them. The other 23 (everything under
+      # `/__tests__/agentMode` is deliberately LEFT ALONE, and the mismatch it
+      # creates is deliberately accepted. Job A selects with
+      # `--testPathPattern="agentMode"`, which matches that substring anywhere
+      # in the path; this ignore requires the literal `/__tests__/agentMode`, so
+      # it only excludes the 263 files named `agentMode*` sitting DIRECTLY under
+      # a `__tests__/` dir. The other 23 — everything under
       # `services/agentMode/**/__tests__/`, plus names like
-      # `loops.agentModeWiring.test.ts`) matched job A's pattern AND survived
-      # job B's ignore, so they ran twice on every backend PR. The two lists are
-      # now exact complements.
+      # `loops.agentModeWiring.test.ts` — run in BOTH backend jobs, on every
+      # backend PR.
       #
-      # `/__tests__/twins/` restored. A CLI `--testPathIgnorePatterns` REPLACES
-      # the array in jest.config.js rather than extending it, so passing this
-      # flag silently dropped the config's twins exclusion and loaded both twin
-      # suites into this job. They self-skip without `.env.twins.json`, so it was
-      # benign — but they are opt-in by design (see src/__tests__/twins/README.md)
-      # and should not be in a required suite by accident.
+      # Making the two lists exact complements was tried here and reverted,
+      # because it is not the cost cleanup it looks like. Coverage is collected
+      # ONLY from `src/utils/**` (jest.config.js `collectCoverageFrom`) and ONLY
+      # by this job — job A produces none. Two files in that 23 are
+      # `src/__tests__/utils/agentModeAlerts.test.ts` and
+      # `.../agentModeErrors.test.ts`, whose targets `src/utils/agentModeAlerts.ts`
+      # and `src/utils/agentModeErrors.ts` are inside the coverage scope; every
+      # other test touching those two modules is also `agentMode`-named. So
+      # excluding the 23 sends both modules to zero coverage and the gate below
+      # fails — measured on PR #2491: branches 95.2% -> 93.99%, statements
+      # 98.35% -> 97.55%.
+      #
+      # Deduplicating the split therefore cannot be done without first deciding
+      # what coverage measures. Tracked with that decision on ENG-1376; do not
+      # "fix" this line in isolation.
       - name: Run tests with coverage (non-agentMode files)
         working-directory: backend
         run: >
           npm run test:coverage --
-          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/twins/" "agentMode"
+          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/twins/" "/__tests__/agentMode"
           --coverageThreshold='{}'
           --coverageReporters=text --coverageReporters=json-summary
 
