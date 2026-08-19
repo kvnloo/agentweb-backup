@@ -462,9 +462,71 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
     // Resuming unconditionally is safe because the resume itself is narrow — paused
     // AND `pausedReason: 'linkedin_disconnected'` AND pinning this account — and
     // idempotent, so a call for an account that was never disconnected does nothing.
+    //
+    // Repoint first (ENG-1366): a reconnect mints a brand-new account_id — the old
+    // one is never reused — so any schedule that hardcoded the old id would still
+    // fail to match `account.accountId` below unless its text is corrected first.
+    await repointStaleAccountReferences(ownerUserId, account.accountId);
     await resumeSchedulesPausedForAccount(ownerUserId, account.accountId);
   } catch (error) {
     console.error(`${TAG} Failed to clear disconnect flag for ${accountId}:`, error);
+  }
+}
+
+/**
+ * Rewrite any other schedule of this user's that hardcodes a now-stale Unipile
+ * account_id, so it points at the account that just reconnected (ENG-1366).
+ *
+ * `createAccount` matches on `platform === 'unipile' && account_id === input.account_id`
+ * to decide update-vs-append (`connectedAccountsDb.ts`) — a genuinely new id from a
+ * reconnect always misses that match, so the new row is appended and the old,
+ * now-dead row is left in place. Nothing else in the backend ever rewrites a
+ * schedule's `startingMessage` (confirmed by searching every call site), so a
+ * schedule that hardcoded the old id stays orphaned forever otherwise: the
+ * account-gate blocks the run before the model is invoked, and even
+ * `resumeSchedulesPausedForAccount` can't find it, because both match on literal
+ * substrings of `startingMessage` and the text still names an id nobody uses
+ * anymore.
+ *
+ * Scoped to `ownerUserId`'s own schedules only, never cross-user. Literal
+ * substring replace, same technique as a manual fix, so surrounding prompt text
+ * is preserved exactly and every occurrence (a prompt can repeat the id several
+ * times) is caught in one pass. Fails open like its sibling above — a repoint
+ * failure must never break the reconnect response, since the account itself is
+ * already saved by the time this runs.
+ */
+export async function repointStaleAccountReferences(
+  ownerUserId: string,
+  newAccountId: string,
+): Promise<number> {
+  try {
+    const accounts = (await getAccountsByUserId(ownerUserId)) as any[];
+    const staleIds = accounts
+      .filter((a) => a.platform === 'unipile' && a.account_id !== newAccountId && a.config?.needs_reconnect)
+      .map((a) => a.account_id as string);
+    if (staleIds.length === 0) return 0;
+
+    const { scheduleDb } = await import('./db');
+    const schedules = (await scheduleDb.getSchedulesByUserId(ownerUserId)) || [];
+    let repointed = 0;
+    for (const s of schedules as any[]) {
+      const original = String(s?.startingMessage || '');
+      let updated = original;
+      for (const oldId of staleIds) {
+        if (updated.includes(oldId)) updated = updated.split(oldId).join(newAccountId);
+      }
+      if (updated === original) continue;
+      await scheduleDb.updateSchedule(s.scheduleId, {
+        startingMessage: updated,
+        updatedAt: new Date().toISOString(),
+      } as any);
+      repointed += 1;
+      console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);
+    }
+    return repointed;
+  } catch (error) {
+    console.error(`${TAG} Failed to repoint stale account references to ${newAccountId}:`, error);
+    return 0;
   }
 }
 
