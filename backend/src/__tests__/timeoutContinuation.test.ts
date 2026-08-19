@@ -5,6 +5,7 @@ import {
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
   hasPersistedMediaBudgetDeferral,
+  hasUnresolvedMediaDeferral,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -346,5 +347,65 @@ describe('hasPersistedMediaBudgetDeferral', () => {
   it('skips null/undefined entries and markers with no timestamp at all', () => {
     const msgs = [null, undefined, { role: 'tool', metadata: { mediaBudgetDeferred: true } }];
     expect(hasPersistedMediaBudgetDeferral(msgs as any, turnStart)).toBe(false);
+  });
+});
+
+describe('hasUnresolvedMediaDeferral', () => {
+  // ENG-1239: a durability backstop for the in-process auto-continuation chain — if the
+  // backend process dies mid-batch (e.g. a deploy), the chain is lost with no record it
+  // was ever attempted. This lets the NEXT touch of the session (e.g. the customer
+  // reopening it) detect "the last thing that happened here was an unresolved media
+  // pause" and re-trigger a resume, without a new persistence layer — just reading
+  // whether the tail of session history still shows a pause nothing has resolved yet.
+  it('returns false for non-array or empty input', () => {
+    expect(hasUnresolvedMediaDeferral(undefined)).toBe(false);
+    expect(hasUnresolvedMediaDeferral(null)).toBe(false);
+    expect(hasUnresolvedMediaDeferral([])).toBe(false);
+  });
+
+  it('returns true when the last message is the whole-turn-timeout partial-delivery notice for a media batch', () => {
+    const msgs = [
+      { role: 'user', content: 'make 4 images' },
+      { role: 'assistant', content: '3 done so far', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
+  });
+
+  it('returns true when the last message is the model\'s own reply carrying a deferred generate_image toolCall', () => {
+    const msgs = [
+      {
+        role: 'assistant',
+        content: '3 of 4 done, reply continue',
+        metadata: { toolCalls: [{ result: { deferred: true, reason: 'media_generation_time_budget' } }] },
+      },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
+  });
+
+  it('returns false when the last message is a normal completed reply (nothing pending)', () => {
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+      { role: 'assistant', content: 'All 4 creatives are ready.', metadata: { toolCalls: [{ result: { success: true } }] } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
+  });
+
+  it('returns false once superseded by the round-cap exhaustion notice (auto-retry must not loop forever)', () => {
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+      { role: 'assistant', content: "couldn't finish automatically", metadata: { kind: 'auto-continuation-exhausted' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
+  });
+
+  it('returns false for a non-media whole-turn-timeout notice (generic salvaged-work pause)', () => {
+    const msgs = [
+      { role: 'assistant', content: 'partial research results', metadata: { kind: 'generation-timeout-continuation' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
+  });
+
+  it('ignores a null/malformed last entry', () => {
+    expect(hasUnresolvedMediaDeferral([{ role: 'user', content: 'hi' }, null] as any)).toBe(false);
   });
 });

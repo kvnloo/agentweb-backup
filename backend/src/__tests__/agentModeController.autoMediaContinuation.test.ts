@@ -13,9 +13,16 @@
  * with no further auto-continuation once the batch is complete.
  */
 import { Request, Response } from 'express';
-import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
+import {
+  agentModeController,
+  activeSessionGenerations,
+  autoContinuationSessions,
+  preemptAutoContinuationAndWait,
+} from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { requestCancel } from '../utils/sseProgress';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 jest.mock('../services/durableLandingService', () => ({
   findInFlightJobForSession: jest.fn().mockResolvedValue(null),
@@ -106,6 +113,8 @@ jest.mock('../server', () => ({
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockRequestCancel = requestCancel as jest.Mock;
+const mockSendOncallAlert = sendAgentModeOncallAlert as jest.Mock;
 
 describe('AgentModeController - automatic media-batch continuation (ENG-1239)', () => {
   const mockUserId = 'user-media-batch';
@@ -183,7 +192,9 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
   beforeEach(() => {
     jest.clearAllMocks();
     activeSessionGenerations.clear();
+    autoContinuationSessions.clear();
     delete process.env.AGENT_RUN_STORE;
+    mockSendOncallAlert.mockResolvedValue(undefined);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
@@ -450,6 +461,156 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
       const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
       expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
       expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+    });
+  });
+
+  /**
+   * ENG-1239 (rework): a genuine customer message that collided with a background
+   * auto-continuation used to get a flat 409 SESSION_BUSY — for a request the customer
+   * had every right to make, blocked by work they never asked for or knew was running.
+   * preemptAutoContinuationAndWait cancels the continuation and gives it a bounded
+   * window to actually release before falling back to the old 409. Tested directly
+   * (rather than driving the full /generate handler through real multi-second timing)
+   * so the test stays fast and isolates the preemption logic itself.
+   */
+  describe('preemptAutoContinuationAndWait', () => {
+    it('is a no-op (returns false, no cancel calls) when the lock is held by a REAL request, not an auto-continuation', async () => {
+      activeSessionGenerations.add(mockSessionId); // some other real request holds it
+      // deliberately NOT added to autoContinuationSessions
+
+      const preempted = await preemptAutoContinuationAndWait(mockSessionId);
+
+      expect(preempted).toBe(false);
+      expect(mockRequestCancel).not.toHaveBeenCalled();
+      expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+    });
+
+    it('cancels the auto-continuation and re-claims the lock once it releases within the window', async () => {
+      activeSessionGenerations.add(mockSessionId);
+      autoContinuationSessions.add(mockSessionId);
+
+      const preemptPromise = preemptAutoContinuationAndWait(mockSessionId);
+      // Simulate the cancelled continuation's own .finally() releasing the lock shortly
+      // after cancellation is requested (cooperative — not instant).
+      setTimeout(() => {
+        autoContinuationSessions.delete(mockSessionId);
+        activeSessionGenerations.delete(mockSessionId);
+      }, 10);
+
+      const preempted = await preemptPromise;
+
+      expect(preempted).toBe(true);
+      expect(mockRequestCancel).toHaveBeenCalledWith(mockSessionId);
+      expect(mockWorkerService.cancelSession).toHaveBeenCalledWith(mockSessionId);
+      // The lock is now held for the caller (the real request), not left free.
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(true);
+    });
+  });
+
+  /**
+   * ENG-1239 (rework): after the round cap, the customer's last visible signal used to be
+   * indistinguishable from an ordinary single deferral — nothing told them automatic
+   * retries had been exhausted, and nobody but a console.error would know a provider was
+   * this degraded. This closes both gaps.
+   */
+  it('leaves an explicit closing message and pages on-call once the round cap is exhausted', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockWorkerService.runInWorker.mockResolvedValue(
+      workerResponse(
+        '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+        [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+      ),
+    );
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush(200);
+
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      mockSessionId,
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.stringMatching(/wasn't able to finish this batch automatically/i),
+        metadata: expect.objectContaining({ kind: 'auto-continuation-exhausted' }),
+      }),
+    );
+    expect(mockIoEmit).toHaveBeenCalledWith(
+      'session-message-appended',
+      expect.objectContaining({
+        message: expect.objectContaining({ content: expect.stringMatching(/wasn't able to finish/i) }),
+      }),
+    );
+    expect(mockSendOncallAlert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        subject: expect.stringMatching(/retry cap/i),
+        context: expect.objectContaining({ sessionId: mockSessionId }),
+      }),
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  /**
+   * ENG-1239 (rework): the auto-continuation chain is purely in-process — a deploy or
+   * crash between rounds loses it with no record it was ever attempted. getSession is a
+   * durability backstop: any later touch of the session re-checks whether the tail of
+   * history still shows an unresolved pause and re-fires the resume if so.
+   */
+  describe('getSession durability backstop', () => {
+    const makeGetSessionReq = () =>
+      ({ params: { sessionId: mockSessionId }, user: { userId: mockUserId, isAdmin: false } } as unknown as Request);
+
+    it('re-fires the auto-continuation when the session is reopened with an unresolved deferral and nothing running', async () => {
+      const sessionWithUnresolvedDeferral = {
+        ...mockSession,
+        messages: [{
+          role: 'assistant',
+          content: '3 done',
+          timestamp: '2026-08-14T18:21:12.708Z',
+          metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T18:21:12.708Z' },
+        }],
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithUnresolvedDeferral as any);
+      mockWorkerService.runInWorker.mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      const res = makeRes();
+      await agentModeController.getSession(makeGetSessionReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      const callArgs = mockWorkerService.runInWorker.mock.calls[0][0] as any;
+      expect(callArgs.messageContent).toMatch(/automatic continuation/i);
+    });
+
+    it('does NOT re-fire while a generation is already active for the session (avoids racing an in-flight resume)', async () => {
+      activeSessionGenerations.add(mockSessionId);
+      const sessionWithUnresolvedDeferral = {
+        ...mockSession,
+        messages: [{
+          role: 'assistant', content: '3 done', timestamp: '2026-08-14T18:21:12.708Z',
+          metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true, timestamp: '2026-08-14T18:21:12.708Z' },
+        }],
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue(sessionWithUnresolvedDeferral as any);
+
+      const res = makeRes();
+      await agentModeController.getSession(makeGetSessionReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-fire for an ordinary session with no unresolved deferral', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'assistant', content: 'All done, no batch pending.' }],
+      } as any);
+
+      const res = makeRes();
+      await agentModeController.getSession(makeGetSessionReq(), res);
+      await flush();
+
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
     });
   });
 });
