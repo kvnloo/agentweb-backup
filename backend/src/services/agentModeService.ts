@@ -840,6 +840,27 @@ interface LLMModelConfig {
    * entirely (that's what adminOnly is for).
    */
   legacy?: boolean;
+  /**
+   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
+   * entirely when there is insufficient benchmark evidence for this model —
+   * never estimated or invented. Does NOT get lowered merely because a
+   * model is `legacy`; legacy affects picker visibility grouping only, not
+   * how good the model actually is.
+   */
+  qualityScore?: number;
+  /** Methodology/source note for qualityScore — benchmark name, source
+   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
+   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
+  qualityScoreSource?: string;
+  /**
+   * Relative cost score, 0-100, higher = more expensive, normalized against
+   * a fixed reference workload using real input/output/cached/reasoning-
+   * token pricing. Omitted when pricing isn't available — never estimated.
+   */
+  costScore?: number;
+  /** Pricing snapshot date + reference-workload note for the cost tooltip
+   *  (e.g. "Pricing snapshot 2026-08-19; normalized to 1M in / 1M out"). */
+  costScoreSource?: string;
 }
 
 /** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
@@ -858,6 +879,12 @@ export interface SupportedModelInfo {
   provider: ModelProvider;
   /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
   legacy?: true;
+  /** 0-100, higher = stronger. Omitted when there's no benchmark evidence — never a guess. */
+  qualityScore?: number;
+  qualityScoreSource?: string;
+  /** 0-100, higher = more expensive. Omitted when pricing isn't available. */
+  costScore?: number;
+  costScoreSource?: string;
 }
 
 // Type for LLM call options
@@ -3011,6 +3038,10 @@ export class AgentModeService {
           description: config?.description ?? 'General-purpose model',
           provider: config?.provider ?? 'other',
           ...(config?.legacy ? { legacy: true as const } : {}),
+          ...(typeof config?.qualityScore === 'number' ? { qualityScore: config.qualityScore } : {}),
+          ...(config?.qualityScoreSource ? { qualityScoreSource: config.qualityScoreSource } : {}),
+          ...(typeof config?.costScore === 'number' ? { costScore: config.costScore } : {}),
+          ...(config?.costScoreSource ? { costScoreSource: config.costScoreSource } : {}),
         };
       });
   }

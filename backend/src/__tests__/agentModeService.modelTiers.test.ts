@@ -20,6 +20,12 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
         client: null, supportsTemperature: true, legacy: true,
         tier: 'medium', description: 'Previous-generation', name: 'Legacy Model', provider: 'anthropic',
       },
+      'scored-model': {
+        client: null, supportsTemperature: true,
+        tier: 'pro', description: 'Scored', name: 'Scored Model', provider: 'anthropic',
+        qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
+        costScore: 95, costScoreSource: 'Pricing snapshot 2026-08-19',
+      },
     };
     svc.getSupportedModels = AgentModeService.prototype.getSupportedModels.bind(svc);
     svc.getDefaultModel = jest.fn().mockResolvedValue('tiered-model');
@@ -82,5 +88,28 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
     // asserted on the existing 'tiered-model' fixture above.
     const current = result.find((m: any) => m.id === 'tiered-model');
     expect(current).not.toHaveProperty('legacy');
+  });
+
+  // FAIL case 5: a model with real quality/cost scores must surface them
+  // (and their source notes) to the picker — never rounded/reinterpreted
+  // here, that's the frontend meter's job.
+  it('surfaces qualityScore/costScore and their source notes when present', async () => {
+    const result = await svc.getSupportedModelsWithMetadata(false);
+    const scored = result.find((m: any) => m.id === 'scored-model');
+    expect(scored).toEqual({
+      id: 'scored-model', name: 'Scored Model', tier: 'pro', description: 'Scored', provider: 'anthropic',
+      qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
+      costScore: 95, costScoreSource: 'Pricing snapshot 2026-08-19',
+    });
+  });
+
+  // A model with no scores omits the keys entirely (never a guessed 0 or null).
+  it('omits qualityScore/costScore entirely — never a guessed value — when a model has neither', async () => {
+    const result = await svc.getSupportedModelsWithMetadata(false);
+    const tiered = result.find((m: any) => m.id === 'tiered-model');
+    expect(tiered).not.toHaveProperty('qualityScore');
+    expect(tiered).not.toHaveProperty('qualityScoreSource');
+    expect(tiered).not.toHaveProperty('costScore');
+    expect(tiered).not.toHaveProperty('costScoreSource');
   });
 });
