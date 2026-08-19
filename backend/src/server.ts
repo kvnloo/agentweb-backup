@@ -840,6 +840,28 @@ createTestAccount().then(async () => {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
       }
 
+      // Skill Review Queue Digest (ENG-932) — runs daily.
+      // "Submit for Review" fires no notification at all (ENG-149 correctly
+      // killed the old per-submission oncall page as noise, but that left the
+      // queue with no reader). This alerts once a skill has sat in
+      // pending_review past the stale window, deduped to at most one message
+      // per day regardless of queue size — submitting a single skill still
+      // pages nobody.
+      try {
+        const { runSkillReviewQueueDigest } = await import('./cron/skillReviewQueueDigestCron');
+        const SKILL_REVIEW_DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+          .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error:', e));
+        }, SKILL_REVIEW_DIGEST_INTERVAL_MS);
+        console.log('[skillReviewQueueDigestCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
+      }
+
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
       // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
       // mailbox send (Graph produces no Resend webhooks), so this polls each connected

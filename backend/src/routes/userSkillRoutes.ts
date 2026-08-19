@@ -133,8 +133,12 @@ router.delete("/:skillId", async (req, res) => {
 
     if (!skill) return res.status(404).json({ message: "Skill not found" });
 
-    // Skills are member-owned: the skill owner may delete; the org owner may
-    // also delete a same-org member's skill as an admin override.
+    // Skills are member-owned: the skill owner may delete regardless of
+    // visibility (ENG-932 — a skill accidentally submitted for review must
+    // not become undeletable by its own owner). The org owner may also
+    // delete a same-org member's skill as an admin override, but only while
+    // it's still private — deleting someone else's public/pending-review
+    // skill on their behalf is a separate, unrequested capability.
     if (skill.ownerId !== userId) {
       const callerUser = await userDb.getUserById(userId);
       let allowed = false;
@@ -146,10 +150,10 @@ router.delete("/:skillId", async (req, res) => {
         }
       }
       if (!allowed) return res.status(403).json({ message: "Not authorized" });
-    }
 
-    if (skill.visibility !== 'private') {
-      return res.status(403).json({ message: "Cannot delete skills that are public or pending review" });
+      if (skill.visibility !== 'private') {
+        return res.status(403).json({ message: "Cannot delete skills that are public or pending review" });
+      }
     }
 
     await skillService.deleteSkill(skillId);
@@ -175,6 +179,25 @@ router.post("/:skillId/submit-for-review", async (req, res) => {
     if (error.message === 'Only private skills can be submitted for review') return res.status(400).json({ message: error.message });
     console.error("Error submitting skill for review:", error);
     res.status(500).json({ message: "Failed to submit skill for review" });
+  }
+});
+
+// Withdraw a skill from the platform review queue back to private (ENG-932:
+// "Submit for Review" previously had no owner-side way back).
+router.post("/:skillId/withdraw-review", async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { skillId } = req.params;
+
+    const skill = await skillService.withdrawFromReview(skillId, userId);
+
+    res.json(skill);
+  } catch (error: any) {
+    if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
+    if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
+    if (error.message === 'Skill is not pending review') return res.status(400).json({ message: error.message });
+    console.error("Error withdrawing skill from review:", error);
+    res.status(500).json({ message: "Failed to withdraw skill from review" });
   }
 });
 

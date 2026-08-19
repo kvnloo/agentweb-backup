@@ -468,6 +468,23 @@ export class SkillService {
     return skill;
   }
 
+  /**
+   * ENG-932: the owner-side undo for an accidental submitForReview(). Unlike
+   * rejectSkill(), this never writes reviewFeedback — nothing was rejected,
+   * the owner just wants their skill back, so no "review feedback" banner.
+   */
+  async withdrawFromReview(skillId: string, ownerId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.ownerId !== ownerId) throw new Error('Not authorized');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    skill.visibility = 'private';
+    skill.reviewFeedback = undefined;
+    await this.updateSkill(skill);
+    return skill;
+  }
+
   async deleteSkill(skillId: string): Promise<void> {
     const params = {
       TableName: this.tableName,

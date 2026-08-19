@@ -340,6 +340,75 @@ describe('SkillService', () => {
     });
   });
 
+  describe('withdrawFromReview (ENG-932)', () => {
+    const pendingSkill = {
+      skillId: 'skill-1',
+      name: 'Test Skill',
+      description: 'Description',
+      toolNames: ['tool1'],
+      isPublished: false,
+      ownerId: 'owner-1',
+      visibility: 'pending_review',
+      createdAt: mockTimestamp,
+      updatedAt: mockTimestamp,
+    };
+
+    it('moves a pending_review skill back to private, owned by the requester', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill }) // getSkill
+        .mockResolvedValueOnce({}); // updateSkill put
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(result.visibility).toBe('private');
+      expect(result.reviewFeedback).toBeUndefined();
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        Item: expect.objectContaining({ visibility: 'private' }),
+      }));
+    });
+
+    it('leaves the skill content unchanged aside from visibility', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      const putCall = mockPut.mock.calls[0][0];
+      expect(putCall.Item.name).toBe(pendingSkill.name);
+      expect(putCall.Item.description).toBe(pendingSkill.description);
+      expect(putCall.Item.skillId).toBe(pendingSkill.skillId);
+    });
+
+    it('throws "Skill not found" for a missing skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: undefined });
+      await expect(skillService.withdrawFromReview('nope', 'owner-1'))
+        .rejects.toThrow('Skill not found');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Not authorized" when the requester does not own the skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pendingSkill });
+      await expect(skillService.withdrawFromReview('skill-1', 'someone-else'))
+        .rejects.toThrow('Not authorized');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Skill is not pending review" for a private skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: { ...pendingSkill, visibility: 'private' } });
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill is not pending review');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Skill is not pending review" for an already-public skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: { ...pendingSkill, visibility: 'public' } });
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill is not pending review');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+  });
+
   describe('syncSkill', () => {
     const mockSkill = {
       skillId: 'skill-1',
