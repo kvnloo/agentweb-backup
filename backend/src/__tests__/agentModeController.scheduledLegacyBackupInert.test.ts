@@ -206,10 +206,36 @@ const okResponse = {
   responseMessages: [],
 };
 
-/** What the worker was actually asked to run. */
-const dispatched = () => (mockWorker.runInWorker as jest.Mock).mock.calls[0][0] as {
-  llmModel?: string;
-  transientFallbackModel?: string | null;
+type Dispatch = { llmModel?: string; transientFallbackModel?: string | null };
+
+/** EVERY worker dispatch this run produced, not just the first.
+ *
+ * `calls[0]` alone was not enough (CodeRabbit, #2485). A scheduled run can drive
+ * more than one turn, so a later dispatch could arm the backup and every
+ * assertion here would still pass. The transient fallback is consumed INSIDE the
+ * worker rather than re-dispatched, so the invariant is per-call and has to hold
+ * on all of them. */
+const allDispatches = (): Dispatch[] =>
+  (mockWorker.runInWorker as jest.Mock).mock.calls.map((c) => c[0] as Dispatch);
+
+/** The first dispatch, for the model assertions that are about THIS turn. */
+const dispatched = (): Dispatch => {
+  const calls = allDispatches();
+  expect(calls.length).toBeGreaterThan(0);
+  return calls[0];
+};
+
+/** The inertness invariant, asserted across every dispatch a run produced. */
+const expectNoDispatchArmedTheBackup = () => {
+  const calls = allDispatches();
+  expect(calls.length).toBeGreaterThan(0);
+  for (const [i, call] of calls.entries()) {
+    expect({ call: i, fallback: call.transientFallbackModel }).toEqual({
+      call: i,
+      fallback: undefined,
+    });
+    expect(call.llmModel).not.toBe(SYSTEM_BACKUP);
+  }
 };
 
 beforeEach(() => {
@@ -249,7 +275,7 @@ describe('ENG-1209 AC4 — a scheduled run cannot be coerced by a legacy backup'
     // global backup", so the retry path consults a setting rather than this
     // schedule's row. Any string here would be the schedule's own backup
     // becoming effective without the confirmation AC4 requires.
-    expect(call.transientFallbackModel).toBeUndefined();
+    expectNoDispatchArmedTheBackup();
   }, 30000);
 
   it('never dispatches the unconfirmed backup as the model itself', async () => {
@@ -257,7 +283,7 @@ describe('ENG-1209 AC4 — a scheduled run cannot be coerced by a legacy backup'
 
     const call = dispatched();
     expect(call.llmModel).not.toBe(SYSTEM_BACKUP);
-    expect(call.transientFallbackModel).not.toBe(SYSTEM_BACKUP);
+    expectNoDispatchArmedTheBackup();
   }, 30000);
 
   it('an INHERITING schedule falls to the platform default, not the cheap backup', async () => {
@@ -267,7 +293,7 @@ describe('ENG-1209 AC4 — a scheduled run cannot be coerced by a legacy backup'
 
     const call = dispatched();
     expect(call.llmModel).toBe(PLATFORM_DEFAULT);
-    expect(call.transientFallbackModel).toBeUndefined();
+    expectNoDispatchArmedTheBackup();
   }, 30000);
 
   it('treats a USER-confirmed backup the same way — data, never a dispatch', async () => {
@@ -287,7 +313,7 @@ describe('ENG-1209 AC4 — a scheduled run cannot be coerced by a legacy backup'
 
     const call = dispatched();
     expect(call.llmModel).toBe(EXPLICIT_MODEL);
-    expect(call.transientFallbackModel).toBeUndefined();
+    expectNoDispatchArmedTheBackup();
   }, 30000);
 
   it('a schedule with NO backup at all dispatches identically', async () => {
@@ -312,6 +338,82 @@ describe('ENG-1209 AC4 — a scheduled run cannot be coerced by a legacy backup'
 
     const call = dispatched();
     expect(call.llmModel).toBe(EXPLICIT_MODEL);
-    expect(call.transientFallbackModel).toBeUndefined();
+    expectNoDispatchArmedTheBackup();
+  }, 30000);
+
+});
+
+/**
+ * CLAUDE.md Rule 2 requires invalid-input, boundary and error-path cases, and here
+ * they are not a formality — the five above all describe a HAPPY dispatch, and a
+ * backup exists precisely for when things go wrong. "Can never become effective"
+ * is a claim about the failure modes, so proving it only on the success path
+ * leaves the interesting half unproven (CodeRabbit, #2485).
+ */
+describe('ENG-1209 AC4 — the failure modes, which is when a backup would be used', () => {
+  it('ERROR PATH: the worker throwing does not re-dispatch on the stored backup', async () => {
+    // The case the whole file is about. A transient provider failure is exactly
+    // the moment a fallback is for; if the schedule's own backup were ever going
+    // to become effective, it would be here.
+    mockWorker.runInWorker.mockRejectedValue(new Error('transient provider failure'));
+
+    await runScheduledChat(
+      scheduleWithSystemBackup({ llmModel: EXPLICIT_MODEL }) as any,
+      userId, false, 'run-err',
+    ).catch(() => undefined); // the run may absorb or surface it; neither may arm the backup
+
+    // Whatever the run did about the failure, no dispatch it made carried the
+    // schedule's backup — asserted across ALL calls, so a retry cannot hide here.
+    expectNoDispatchArmedTheBackup();
+  }, 30000);
+
+  it('BOUNDARY: an unsupported primary falls back through the registry, still not to the backup', async () => {
+    // ENG-46: an unknown model id is mapped forward before dispatch. That mapping
+    // is a different mechanism from the transient fallback, and the boundary worth
+    // pinning is that a primary needing rescue does NOT reach for this schedule's
+    // cheap backup to do it.
+    (mockAgentModeService.resolveGenerationModel as jest.Mock).mockImplementation(
+      (model: string) => ({
+        model: model === 'retired-model-v0' ? PLATFORM_DEFAULT : model,
+        fellBack: model === 'retired-model-v0',
+        requestedModel: model,
+      }),
+    );
+
+    await runScheduledChat(
+      scheduleWithSystemBackup({ llmModel: 'retired-model-v0' }) as any,
+      userId, false, 'run-bound',
+    );
+
+    expectNoDispatchArmedTheBackup();
+    expect(dispatched().llmModel).not.toBe(SYSTEM_BACKUP);
+  }, 30000);
+
+  it('INVALID INPUT: a malformed stored backup is ignored, not dispatched or crashed on', async () => {
+    // These rows were machine-written and never validated since. A blank-ish or
+    // unknown id must stay inert in the same way a well-formed one does — the row
+    // is data, so its CONTENT cannot change whether it is consulted.
+    for (const junk of ['   ', 'not-a-real-model', '']) {
+      jest.clearAllMocks();
+      mockWorker.runInWorker.mockResolvedValue(okResponse as any);
+      mockAgentModeService.getDefaultModel.mockResolvedValue(PLATFORM_DEFAULT);
+      (mockAgentModeService as any).getScheduledChatsDefaultModel.mockResolvedValue(PLATFORM_DEFAULT);
+      mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
+      mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+      mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
+      (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
+        { role: 'assistant', content: 'Done.' },
+      ]);
+      mockUserDb.getUserById.mockResolvedValue({ userId, email: 'o@example.com' } as any);
+
+      await runScheduledChat(
+        scheduleWithSystemBackup({ llmModel: EXPLICIT_MODEL, llmBackupModel: junk }) as any,
+        userId, false, `run-junk-${junk.trim() || 'empty'}`,
+      );
+
+      expectNoDispatchArmedTheBackup();
+      expect(dispatched().llmModel).toBe(EXPLICIT_MODEL);
+    }
   }, 30000);
 });
