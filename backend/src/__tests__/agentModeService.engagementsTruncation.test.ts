@@ -172,6 +172,70 @@ describe('ENG-1207 — get_lead_engagements must not report a page as a total', 
     expect(result.message).not.toContain('999');
   });
 
+  it('states the exact message, with the lead name normalised', async () => {
+    // Pinning the whole string rather than fragments (CodeRabbit, #2490). The
+    // message is the tool's entire contract with the model — a stray double space
+    // or a dangling preposition is a real defect in a sentence a model parses, and
+    // fragment assertions let both through.
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({ total: 143 });
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(143),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.message).toBe(
+      'Showing the first 20 of 143 engagement(s) for Ada Lovelace — raise limit to see more.',
+    );
+  });
+
+  it('BOUNDARY: a lead with NO name does not leave a dangling "for"', async () => {
+    // `${firstName || ''} ${lastName || ''}` collapses to an empty label, which
+    // reads as "... engagement(s) for  — raise limit". Trimming the whole message
+    // does not help: the gap is in the middle.
+    (mockCrmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId, listId });
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({ total: 143 });
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(143),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.message).not.toMatch(/\s{2,}/);
+    expect(result.message).not.toMatch(/for\s*—/);
+    expect(result.message).toContain('20');
+    expect(result.message).toContain('143');
+  });
+
+  it('BOUNDARY: a lead with only a LAST name reads naturally', async () => {
+    (mockCrmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId, listId, lastName: 'Lovelace' });
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({ total: 3 });
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(3),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.message).toBe('Found 3 engagement(s) for Lovelace');
+  });
+
+  it('ERROR PATH: a REJECTED count query must not take the whole tool down', async () => {
+    // Distinct from the malformed-shape case above, and sharper: the count is
+    // fetched in the same `Promise.all` as the engagements, so a rejection there
+    // rejects both — even though the message no longer uses the count at all. The
+    // data the caller asked for is sitting right there in the other promise.
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockRejectedValue(new Error('count query failed'));
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(143),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.success).toBe(true);
+    expect(result.engagements).toHaveLength(20);
+    expect(result.message).toContain('143');
+  });
+
   it('honours an explicit limit and reports against it', async () => {
     (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
       total: 143, last7Days: 4, totalAllMessages: 143,

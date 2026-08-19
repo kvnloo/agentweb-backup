@@ -12835,10 +12835,16 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      const [engagementCount, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId),
+      // ENG-1207: the count is fetched alongside the engagements, so a rejection
+      // there rejected BOTH -- taking down a tool whose actual payload was sitting
+      // in the other promise. It is a summary field, not the answer, and since the
+      // message no longer derives its total from it (see below), nothing the caller
+      // asked for depends on it. Degrade the summary, not the tool.
+      const [engagementCountResult, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch(() => null),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
@@ -12861,10 +12867,15 @@ export class AgentModeService {
       // Counting the array we truncated keeps the two numbers describing the same
       // thing by construction, and removes the failure mode entirely.
       const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      // A lead with neither name collapses the label to '', leaving
+      // "... engagement(s) for  — raise limit": a double space and a dangling
+      // preposition in a sentence a model parses. Trimming the whole message does
+      // not help, because the gap is in the middle. Drop the clause instead.
+      const forLead = leadLabel ? ` for ${leadLabel}` : '';
       const truncated = engagements.length > limitedEngagements.length;
       const engagementMessage = truncated
-        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s) for ${leadLabel} — raise limit to see more.`.trim()
-        : `Found ${limitedEngagements.length} engagement(s) for ${leadLabel}`.trim();
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s)${forLead} — raise limit to see more.`
+        : `Found ${limitedEngagements.length} engagement(s)${forLead}`;
 
       return {
         success: true,
