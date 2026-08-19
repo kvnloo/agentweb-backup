@@ -162,14 +162,20 @@ async function applyScheduleEditWithConsentNarrowing(
   // history is never deleted for an edit that then fails, and bound to the history the
   // count was measured against so it cannot take a second prefix off a list another
   // writer already shortened.
-  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any },
+  // ENG-1365: attributes to REMOVE as part of THIS write. Restoring inheritance is a
+  // removal, not a value, and it has to ride the same write as the edit that asked
+  // for it -- a second call could leave the rename applied with the model still
+  // pinned, or the reverse, with nothing to say which landed.
+  removeAttributes?: string[]
 ): Promise<void> {
+  const removals = removeAttributes && removeAttributes.length ? removeAttributes : undefined;
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
   const write = async (payload: any, expectation?: Record<string, any>) => {
     if (shedRunResults && shedRunResults.count > 0) {
       try {
-        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults, removals);
       } catch (writeError: any) {
         // The shed count belongs to the history it was measured against; it cannot be
         // replayed against a different one. Hand back a conflict instead of retrying.
@@ -185,8 +191,8 @@ async function applyScheduleEditWithConsentNarrowing(
       }
       return;
     }
-    if (expectation) {
-      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+    if (expectation || removals) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation, undefined, removals);
       return;
     }
     await scheduleDb.updateSchedule(scheduleId, payload);
@@ -9647,7 +9653,21 @@ export const agentModeController = {
           : ((existingSchedule as any).disableSourcingBlockAlerts || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
-        llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        // ENG-1365: partial-update safe, for the reason the requirePublishApproval
+        // comment above already gives. The previous form was
+        // `llmModel !== undefined ? llmModel : (existingSchedule.llmModel || '')`,
+        // whose fallback wrote `''` whenever the request stayed silent AND the
+        // stored attribute was absent -- so a rename, a cadence change, any edit at
+        // all, converted "inherits the platform default" into "stores an empty
+        // string". It only moved one way, and the empty string is the state that
+        // made every model switch 409 permanently (ENG-1363).
+        //
+        // Silent request -> omit the key entirely; the partial SET leaves whatever
+        // is stored exactly as it is, including an existing `''`, which is a data
+        // question and not a rename's business.
+        // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
+        // the attribute, not a blank value in it.
+        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -9807,7 +9827,10 @@ export const agentModeController = {
               expectedLength: observedRunResults.length,
               expectedLast: observedRunResults[observedRunResults.length - 1],
             }
-          : undefined
+          : undefined,
+        // ENG-1365: only when the request EXPLICITLY clears the model. A silent
+        // request removes nothing, because it was never asked to.
+        llmModel === '' ? ['llmModel'] : undefined
       );
 
       res.json({
