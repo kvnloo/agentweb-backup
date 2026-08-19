@@ -82,12 +82,20 @@ describe('collectSitesToCheck', () => {
   it('caps, and REPORTS what it did not check rather than truncating silently', () => {
     const many = Array.from({ length: MAX_SITES_CHECKED + 7 }, (_, i) =>
       page({ id: `p${i}`, siteId: `site${String(i).padStart(3, '0')}`, deployedUrl: `https://s${i}.test/` }));
-    // Rotation is applied first, so build a population that is entirely due today.
+    // Rotation runs first, so generate ids until MORE than the cap are due — otherwise this
+    // test can pass without ever exercising truncation, which is what it is named for.
     const when = new Date(Date.UTC(2026, 7, 19));
-    const due = many.filter((p) => shouldCheckSiteToday(String(p.siteId), when));
+    const dueIds: string[] = [];
+    for (let i = 0; dueIds.length < MAX_SITES_CHECKED + 5 && i < 100_000; i++) {
+      const id = `site-${i}`;
+      if (shouldCheckSiteToday(id, when)) dueIds.push(id);
+    }
+    expect(dueIds.length).toBe(MAX_SITES_CHECKED + 5);   // the scenario is genuinely reached
+
+    const due = dueIds.map((id) => page({ id, siteId: id, deployedUrl: `https://${id}.test/` }));
     const { sites, sitesNotChecked } = collectSitesToCheck(due, when);
-    expect(sites.length).toBeLessThanOrEqual(MAX_SITES_CHECKED);
-    expect(sites.length + sitesNotChecked).toBe(due.length);
+    expect(sites).toHaveLength(MAX_SITES_CHECKED);        // exact, not <=
+    expect(sitesNotChecked).toBe(5);                      // exact
   });
 
   it('is deterministic, so a cap truncates the same set each run', () => {
@@ -265,19 +273,24 @@ describe('fetchLandingPageInputs — the read path, exercised through injected d
     const due = dueDateFor('site-x');
     jest.useFakeTimers().setSystemTime(due);
     try {
-      const r = await fetchLandingPageInputs('u1', ['999'], {
+      // A REAL pixel id: the detector requires 6+ digits (`fbq\(['"]init['"],['"]\d{6,}`).
+      // The earlier fixture used '999' and detected nothing, which the old
+      // `Array.isArray(...)` assertion happily passed — a fixture that never exercised the
+      // mapping it was named for.
+      const r = await fetchLandingPageInputs('u1', ['910841031004192'], {
         listPages: async () => ([{
           id: 'site-x', siteId: 'site-x', status: 'deployed',
           deployedUrl: 'https://x.test/', isRootPage: true,
         }] as any),
-        fetchHtml: async () => '<script>fbq("init","999")</script>',
+        fetchHtml: async () => '<script>fbq("init","910841031004192")</script>',
       });
       expect(r.status).toBe('ok');
-      if (r.sites.length) {
-        const obs = r.observations['https://x.test/'];
-        expect(obs).toBeDefined();
-        expect(Array.isArray(obs.detectedPixelIds)).toBe(true);
-      }
+      // The site must actually be due, or this proves nothing.
+      expect(r.sites).toHaveLength(1);
+      const obs = r.observations['https://x.test/'];
+      expect(obs).toBeDefined();
+      // The POINT of the mapping: PIXEL:999 -> '999'. An empty array used to pass here.
+      expect(obs.detectedPixelIds).toContain('910841031004192');
     } finally {
       jest.useRealTimers();
     }

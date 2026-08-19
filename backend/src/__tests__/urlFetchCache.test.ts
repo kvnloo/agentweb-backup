@@ -119,3 +119,35 @@ describe('bounded memory', () => {
     expect(underlying).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('eviction never drops an in-flight request', () => {
+  it('keeps unresolved promises even past the cap, so no URL is fetched twice', async () => {
+    // Evicting a pending entry would make a later caller miss, start a SECOND underlying
+    // fetch, and double-hit the customer's page — the exact thing this cache prevents.
+    const resolvers: Array<(v: string) => void> = [];
+    const underlying = jest.fn().mockImplementation(
+      () => new Promise<string>((r) => { resolvers.push(r); }),
+    );
+    const cache = createUrlFetchCache(underlying);
+
+    const first = cache.fetchHtml('https://oldest.test/');
+    const rest = [];
+    for (let i = 0; i < MAX_CACHE_ENTRIES + 10; i++) rest.push(cache.fetchHtml(`https://s-${i}.test/`));
+
+    const callsBefore = underlying.mock.calls.length;
+    const again = cache.fetchHtml('https://oldest.test/');           // must be a HIT
+    expect(underlying.mock.calls.length).toBe(callsBefore);
+
+    resolvers.forEach((r) => r('<html></html>'));
+    await Promise.all([first, again, ...rest]);
+    expect(await again).toBe('<html></html>');
+  });
+
+  it('still evicts once entries have settled', async () => {
+    const cache = createUrlFetchCache(jest.fn().mockResolvedValue('<html></html>'));
+    for (let i = 0; i < MAX_CACHE_ENTRIES + 20; i++) await cache.fetchHtml(`https://d-${i}.test/`);
+    const st = cache.stats();
+    expect(st.distinct).toBeLessThanOrEqual(MAX_CACHE_ENTRIES);
+    expect(st.evicted).toBeGreaterThan(0);
+  });
+});

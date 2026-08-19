@@ -80,6 +80,8 @@ export function createUrlFetchCache(underlying: (url: string) => Promise<string>
   // Stores the PROMISE, not the settled value, so two checks racing the same URL in the same
   // tick share one request rather than both missing an empty cache and firing.
   const inflight = new Map<string, Promise<Entry>>();
+  // Which keys have SETTLED. Only these may be evicted — see the eviction loop.
+  const settled = new Set<string>();
   let fetches = 0;
   let hits = 0;
   let evicted = 0;
@@ -92,17 +94,25 @@ export function createUrlFetchCache(underlying: (url: string) => Promise<string>
     } else {
       fetches++;
       pending = underlying(url).then(
-        (html): Entry => ({ ok: true, html }),
-        (error): Entry => ({ ok: false, error }),
+        (html): Entry => { settled.add(key); return { ok: true, html }; },
+        (error): Entry => { settled.add(key); return { ok: false, error }; },
       );
       inflight.set(key, pending);
-      // Insertion-ordered, so the first key is the oldest. Evicting it costs at most a repeat
-      // fetch later; NOT evicting costs the whole fleet's HTML resident for the entire sweep.
-      while (inflight.size > MAX_CACHE_ENTRIES) {
-        const oldest = inflight.keys().next().value;
-        if (oldest === undefined) break;
-        inflight.delete(oldest);
-        evicted++;
+      // Evict the oldest SETTLED entries only.
+      //
+      // ⚠ Evicting an UNRESOLVED promise would break the whole point of this map: a later
+      // caller for that URL would miss, start a SECOND `underlying` fetch, and double-hit the
+      // customer's page — the exact duplicate request this cache exists to prevent. An
+      // in-flight entry costs a promise, not the HTML; only settled entries hold the bytes
+      // that made a memory bound necessary.
+      if (inflight.size > MAX_CACHE_ENTRIES) {
+        for (const k of inflight.keys()) {
+          if (inflight.size <= MAX_CACHE_ENTRIES) break;
+          if (!settled.has(k)) continue; // still running — never evict
+          inflight.delete(k);
+          settled.delete(k);
+          evicted++;
+        }
       }
     }
     const entry = await pending;
