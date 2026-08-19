@@ -54,6 +54,10 @@ export interface TrackingMonitorCronSummary {
   landingPageUnverifiable: number;
   /** Sites confirmed carrying a pixel this account owns. Printed even at zero. */
   landingPageOk: number;
+  /** Sites not due in today's weekly rotation slot. Not a failure. */
+  landingPageDeferred: number;
+  /** HTML read as bare while the record claims an owned pixel. Logged, never paged. */
+  landingPageUnconfirmed: number;
   /** §G destinations — ACTIVE ads pointing at a page with no pixel, or a pixel the paying
    *  account does not own. */
   destinationAlerts: number;
@@ -128,6 +132,8 @@ export async function runMetaTrackingMonitor(
     landingPageAlerts: 0,
     landingPageUnverifiable: 0,
     landingPageOk: 0,
+    landingPageDeferred: 0,
+    landingPageUnconfirmed: 0,
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
@@ -149,6 +155,9 @@ export async function runMetaTrackingMonitor(
   const { createUrlFetchCache } = await import('../services/urlFetchCache');
   const { defaultFetchHtml } = await import('../services/metaTrackingPreflight');
   const urlCache = createUrlFetchCache(defaultFetchHtml);
+
+  // Collected across every user and raised ONCE at the end. See raiseLandingPageRollup.
+  const landingPageFindings: Awaited<ReturnType<typeof monitorUserTracking>>['landingPageFindings'] = [];
 
   let users: any[];
   try {
@@ -202,6 +211,11 @@ export async function runMetaTrackingMonitor(
       summary.landingPageAlerts += result.landingPageAlerts ?? 0;
       summary.landingPageUnverifiable += result.landingPageUnverifiable ?? 0;
       summary.landingPageOk += result.landingPageOk ?? 0;
+      summary.landingPageDeferred += result.landingPageDeferred ?? 0;
+      summary.landingPageUnconfirmed += result.landingPageUnconfirmed ?? 0;
+      if (result.landingPageFindings?.length) {
+        landingPageFindings.push(...result.landingPageFindings);
+      }
       summary.destinationAlerts += result.destinationAlerts ?? 0;
       summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
       summary.destinationOk += result.destinationOk ?? 0;
@@ -230,6 +244,25 @@ export async function runMetaTrackingMonitor(
     } catch (error: any) {
       console.error(`${TAG} divergence check failed for user ${user?.userId}: ${error?.message}`);
     }
+  }
+
+  // §G's landing-page findings are fleet-shaped and low priority, so they become ONE alert
+  // rather than one per customer — the volume is 1 whether two customers are affected or
+  // twenty. Its own try/catch: a rollup failure must not lose the sweep's summary.
+  try {
+    const { raiseLandingPageRollup } = await import('../services/metaTrackingMonitor');
+    await raiseLandingPageRollup(landingPageFindings, {
+      dryRun,
+      ...(dryRun
+        ? {
+            transport: async (subject: string, message: string, context?: Record<string, any>) => {
+              capturedAlerts.push({ subject, message, context });
+            },
+          }
+        : {}),
+    });
+  } catch (error: any) {
+    console.error(`${TAG} landing-page rollup failed: ${error?.message}`);
   }
 
   summary.unrecognizedActionTypes = [...unknownTypes];
@@ -272,6 +305,12 @@ export async function runMetaTrackingMonitor(
     // Printed even at zero, for the same reason destinationOk is: zero alerts reads the same
     // whether every site was healthy or none was ever fetched.
     `, ${summary.landingPageOk} generated site(s) verified` +
+    (summary.landingPageDeferred > 0
+      ? `, ${summary.landingPageDeferred} not due in today's rotation`
+      : '') +
+    (summary.landingPageUnconfirmed > 0
+      ? `, ${summary.landingPageUnconfirmed} reading as bare but recorded as installed`
+      : '') +
     (summary.landingPageUnverifiable > 0
       ? `, ${summary.landingPageUnverifiable} unreadable`
       : '') +

@@ -24,6 +24,39 @@ import { preflightMetaTrackingGate } from './metaTrackingPreflight';
  *  rather than silently truncating (§44's third defect). */
 export const MAX_SITES_CHECKED = 20;
 
+/** Days over which the site population is rotated. See {@link shouldCheckSiteToday}. */
+export const SITE_ROTATION_DAYS = 7;
+
+/**
+ * Should this site be fetched TODAY?
+ *
+ * What this check detects — a deployed page carrying no usable pixel — is a CONFIGURATION
+ * state, not a live signal. It changes when someone regenerates or hand-edits a site, on the
+ * order of weeks; re-fetching every customer's pages every single day to re-confirm a fact
+ * that almost never moves is the definition of waste, and it is waste aimed at someone else's
+ * servers rather than ours.
+ *
+ * So each site is checked roughly once a week instead of daily: ~7x fewer outbound requests,
+ * spread evenly rather than arriving as one daily burst. Storage-free by construction — the
+ * shard falls out of the site id and the date, so nothing has to be remembered between runs,
+ * which keeps §G clear of the data-plane gate exactly as every other §G check is.
+ *
+ * ⚠ THE TRADE, STATED: worst-case detection latency goes from 1 day to 7. That is acceptable
+ * here and would NOT be for the other §G checks — this is the only one whose findings have no
+ * ad spend behind them. A page nothing points at is losing nothing while it waits. The moment
+ * an ad DOES point at it, #2448 picks it up the next morning at full daily cadence.
+ */
+export function shouldCheckSiteToday(siteId: string, asOf: Date = new Date()): boolean {
+  const id = String(siteId ?? '');
+  if (!id) return false;
+  // Cheap deterministic hash — this only has to spread ids evenly, not resist anything.
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  // Days since epoch, so the shard advances once per UTC day regardless of run time.
+  const day = Math.floor(asOf.getTime() / 86_400_000);
+  return h % SITE_ROTATION_DAYS === day % SITE_ROTATION_DAYS;
+}
+
 export interface LandingPageRecord {
   id: string;
   userId?: string;
@@ -59,6 +92,17 @@ export type LandingPageFinding = {
 export type LandingPageVerdict = {
   /** Deployed sites we built whose served HTML carries no usable pixel. */
   alerting: LandingPageFinding[];
+  /**
+   * The HTML read as uninstrumented, but the page's own record says we installed an owned
+   * pixel on it. Logged, NEVER paged.
+   *
+   * Our read is an INFERENCE: we fetch without executing JavaScript, so a site injecting its
+   * pixel client-side (a tag manager, a consent gate, a framework that hydrates it) reads as
+   * bare when it is fine. When the record and the fetch disagree, the record is evidence we
+   * once installed it deliberately, and it outranks a single unexecuted read — the same
+   * "second signal outranks our HTML inference" rule #2448 established.
+   */
+  unconfirmed: LandingPageFinding[];
   /** Fetch failed, or the account owns no pixels to compare against. Logged, never paged. */
   unverifiable: { siteId: string; url: string; reason: string }[];
   /** Confirmed carrying a pixel this account owns. */
@@ -73,9 +117,13 @@ export type LandingPageVerdict = {
  * Preference order within a site: the root record (`isRootPage`, or `siteId === id`), then the
  * oldest — the root is where the shared layout and therefore the pixel lives.
  */
-export function collectSitesToCheck(pages: LandingPageRecord[] | null | undefined): {
+export function collectSitesToCheck(
+  pages: LandingPageRecord[] | null | undefined,
+  asOf: Date = new Date(),
+): {
   sites: SiteToCheck[];
   sitesNotChecked: number;
+  sitesDeferred: number;
 } {
   const rows = (Array.isArray(pages) ? pages : []).filter(Boolean);
   const bySite = new Map<string, LandingPageRecord[]>();
@@ -113,9 +161,14 @@ export function collectSitesToCheck(pages: LandingPageRecord[] | null | undefine
 
   // Deterministic order so a cap truncates the same set each run rather than a shifting one.
   all.sort((a, b) => a.siteId.localeCompare(b.siteId));
+
+  // Rotation applied AFTER collection so the deferred count is honest about the whole
+  // population rather than only what today's shard happened to contain.
+  const due = all.filter((s) => shouldCheckSiteToday(s.siteId, asOf));
   return {
-    sites: all.slice(0, MAX_SITES_CHECKED),
-    sitesNotChecked: Math.max(0, all.length - MAX_SITES_CHECKED),
+    sites: due.slice(0, MAX_SITES_CHECKED),
+    sitesNotChecked: Math.max(0, due.length - MAX_SITES_CHECKED),
+    sitesDeferred: all.length - due.length,
   };
 }
 
@@ -136,7 +189,7 @@ export function evaluateLandingPageCoverage(
   sitesNotChecked = 0,
 ): LandingPageVerdict {
   const verdict: LandingPageVerdict = {
-    alerting: [], unverifiable: [], okCount: 0, sitesNotChecked,
+    alerting: [], unconfirmed: [], unverifiable: [], okCount: 0, sitesNotChecked,
   };
   const owned = new Set((ownedPixelIds ?? []).filter(Boolean).map(String));
   const obs = observations && typeof observations === 'object' ? observations : {};
@@ -156,6 +209,14 @@ export function evaluateLandingPageCoverage(
 
     const detected = (o.detectedPixelIds ?? []).filter(Boolean).map(String);
     if (detected.length === 0) {
+      // The record claims we installed a pixel this account owns, and the fetch disagrees.
+      // Two explanations, and only one of them is a defect: the page injects it client-side
+      // (our unexecuted read cannot see it), or it was genuinely removed. Downgraded rather
+      // than paged, because a confidently wrong alert costs more than an honest gap.
+      if (site.recordedPixelId && owned.has(String(site.recordedPixelId))) {
+        verdict.unconfirmed.push({ ...site, reason: 'no_pixel', detectedPixelIds: [] });
+        continue;
+      }
       verdict.alerting.push({ ...site, reason: 'no_pixel', detectedPixelIds: [] });
       continue;
     }
@@ -180,6 +241,9 @@ export type LandingPageInputs = {
   status: 'ok' | 'fetch_error';
   sites: SiteToCheck[];
   sitesNotChecked: number;
+  /** Sites whose weekly rotation slot is not today. Not a failure — reported so the
+   *  difference between "checked and healthy" and "not due" is never invisible. */
+  sitesDeferred: number;
   observations: Record<string, { status?: string; detectedPixelIds?: string[] }>;
   error?: string;
 };
@@ -195,7 +259,7 @@ export async function fetchLandingPageInputs(
   ownedPixelIds: string[],
   deps?: LandingPageFetchDeps,
 ): Promise<LandingPageInputs> {
-  const empty = { sites: [], sitesNotChecked: 0, observations: {} };
+  const empty = { sites: [], sitesNotChecked: 0, sitesDeferred: 0, observations: {} };
   let pages: LandingPageRecord[] = [];
 
   try {
@@ -210,8 +274,8 @@ export async function fetchLandingPageInputs(
     return { status: 'fetch_error', ...empty, error: error?.message || 'landing page read failed' };
   }
 
-  const { sites, sitesNotChecked } = collectSitesToCheck(pages);
-  if (sites.length === 0) return { status: 'ok', ...empty };
+  const { sites, sitesNotChecked, sitesDeferred } = collectSitesToCheck(pages);
+  if (sites.length === 0) return { status: 'ok', ...empty, sitesDeferred };
 
   try {
     const gate = await preflightMetaTrackingGate(
@@ -231,11 +295,11 @@ export async function fetchLandingPageInputs(
           .map((m: string) => m.replace(/^PIXEL:/, '')),
       };
     }
-    return { status: 'ok', sites, sitesNotChecked, observations };
+    return { status: 'ok', sites, sitesNotChecked, sitesDeferred, observations };
   } catch (error: any) {
     // The page list already succeeded, so it is kept: every site becomes unverifiable, which
     // is logged and pages nobody. Discarding it too would throw away good work.
     console.warn(`[Tracking Monitor] §G landing-page fetch failed: ${error?.message ?? error}`);
-    return { status: 'ok', sites, sitesNotChecked, observations: {} };
+    return { status: 'ok', sites, sitesNotChecked, sitesDeferred, observations: {} };
   }
 }
