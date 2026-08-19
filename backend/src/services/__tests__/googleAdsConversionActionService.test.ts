@@ -178,29 +178,44 @@ describe('optional fields are sent only when supplied', () => {
 describe('every field sent is a field checked (Greptile, ENG-1322)', () => {
   const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
 
+  // These fixtures quote the lookback window on purpose. It is an INT64, and the
+  // REST transport hands INT64 back as a JSON string — the same reason createBudget
+  // sends `amountMicros: String(...)` and listBudgets types its read-back as string.
+  // Mocking it as a bare number tested a response shape production never returns.
+
   it('reports drift on a lookback window Google did not honour', async () => {
     // The field was being SENT but not CHECKED, so a create that silently widened
     // the attribution window came back with an empty drift report. A wrong window
     // misattributes conversions for weeks and nothing errors.
-    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 30 })]);
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: '30' })]);
     const out = await googleAdsService.createConversionAction('u', CUSTOMER, {
       ...valid, clickThroughLookbackWindowDays: 90,
     });
     expect(out.drift).toEqual([
-      { field: 'clickThroughLookbackWindowDays', requested: 90, stored: 30 },
+      { field: 'clickThroughLookbackWindowDays', requested: 90, stored: '30' },
     ]);
   });
 
   it('reports no drift when the window was stored as asked', async () => {
-    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 90 })]);
+    // The regression Greptile caught: stored exactly as requested, but "90" !== 90
+    // raised drift on a write that was perfectly honoured.
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: '90' })]);
     const out = await googleAdsService.createConversionAction('u', CUSTOMER, {
       ...valid, clickThroughLookbackWindowDays: 90,
     });
     expect(out.drift).toEqual([]);
   });
 
+  it('reports no drift on an UPDATE whose window read back as a string', async () => {
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: '60' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, {
+      clickThroughLookbackWindowDays: 60,
+    });
+    expect(out.drift).toEqual([]);
+  });
+
   it('does not check a window the caller never set', async () => {
-    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 30 })]);
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: '30' })]);
     const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
     expect(out.drift).toEqual([]);
   });

@@ -181,3 +181,74 @@ describe('diffConversionAction (ENG-1322 AC4 — read back, do not trust the cre
     expect(drift).toEqual([{ field: 'status', requested: 'PAUSED', stored: undefined }]);
   });
 });
+
+describe('diffConversionAction — Google Ads INT64 fields arrive as JSON strings', () => {
+  // Not a spec reading: this service already knows it. `createBudget` sends
+  // `amountMicros: String(...)`, `listBudgets` declares the read-back as string,
+  // and listCampaigns/listBiddingStrategies both wrap the INT64 `id` in String().
+  // `clickThroughLookbackWindowDays` is INT64 too, so a 90 we sent reads back "90".
+  // Comparing those by identity reported drift on a write that was stored exactly
+  // as asked — a false alarm on the one signal that exists to be trusted.
+
+  it('does not report drift when an INT64 reads back as its string form', () => {
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 90 },
+      { clickThroughLookbackWindowDays: '90' },
+    )).toEqual([]);
+  });
+
+  it('still reports drift when the stored number genuinely differs', () => {
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 90 },
+      { clickThroughLookbackWindowDays: '30' },
+    )).toEqual([{ field: 'clickThroughLookbackWindowDays', requested: 90, stored: '30' }]);
+  });
+
+  it('treats an empty string as drift, not as zero', () => {
+    // Number('') is 0. A coercion loose enough to call that a match would report
+    // "stored exactly as asked" for a field Google never stored at all.
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 0 },
+      { clickThroughLookbackWindowDays: '' },
+    )).toEqual([{ field: 'clickThroughLookbackWindowDays', requested: 0, stored: '' }]);
+  });
+
+  it('treats a non-numeric string as drift', () => {
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 90 },
+      { clickThroughLookbackWindowDays: 'NINETY' },
+    )).toEqual([{ field: 'clickThroughLookbackWindowDays', requested: 90, stored: 'NINETY' }]);
+  });
+
+  it('treats a missing INT64 as drift rather than coercing absence to a match', () => {
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 90 },
+      {},
+    )).toEqual([{ field: 'clickThroughLookbackWindowDays', requested: 90, stored: undefined }]);
+  });
+
+  it('does not loosen booleans — primaryForGoal is a real JSON boolean', () => {
+    // Only INT64 is string-encoded. A boolean arriving as the string "true" means
+    // something upstream is wrong, and that is worth reporting rather than hiding.
+    expect(diffConversionAction(
+      { primaryForGoal: true },
+      { primaryForGoal: 'true' },
+    )).toEqual([{ field: 'primaryForGoal', requested: true, stored: 'true' }]);
+  });
+
+  it('does not treat a boolean stored value as a numeric match', () => {
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 1 },
+      { clickThroughLookbackWindowDays: true },
+    )).toEqual([{ field: 'clickThroughLookbackWindowDays', requested: 1, stored: true }]);
+  });
+
+  it('still matches when Google returns the INT64 as an actual number', () => {
+    // The API is not guaranteed to be consistent across transports, and the
+    // gRPC/library path hands back a number. Both shapes must read as stored.
+    expect(diffConversionAction(
+      { clickThroughLookbackWindowDays: 90 },
+      { clickThroughLookbackWindowDays: 90 },
+    )).toEqual([]);
+  });
+});
