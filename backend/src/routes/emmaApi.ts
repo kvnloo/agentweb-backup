@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
+import { publishRevalidationForForwardedRun } from '../utils/scheduledPublishConsentGuard';
 
 const router = Router();
 
@@ -173,11 +174,11 @@ router.post('/attach-knowledge-base-files', async (req: Request, res: Response) 
 router.post('/generate-image', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image } = req.body;
+    const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image, category } = req.body;
     const result = await svc.generateImage(
       prompt, filename, size || '1024x1024', quality || 'medium',
       input_images || [], userId(req), session_id || '',
-      image_model, logo_image
+      image_model, logo_image, undefined, category
     );
     res.json(result);
   } catch (err: any) {
@@ -226,33 +227,42 @@ router.post('/remove-c2pa', async (req: Request, res: Response) => {
 
 router.post('/email', async (req: Request, res: Response) => {
   try {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard } = await import('../services/emailProviderService');
     await bootstrapEmailProviders();
-    const { provider } = await resolveEmailAccount(userId(req), req.body.account_id);
+    // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
+    // record, and that is where the provider reads (and refreshes) its tokens.
+    // A send is resolved as a write, so it is refused on a teammate's mailbox.
+    const operation = req.body.action === 'send' ? 'send' : 'read';
+    const resolved = await resolveEmailAccount(userId(req), req.body.account_id, operation);
+    const { provider, ownerUserId } = resolved;
+    // Every provider call runs inside withAccessGuard: a teammate's shared
+    // mailbox is re-checked immediately before the call AND before the result is
+    // returned, so a share revoked mid-read discloses nothing.
+    const guarded = <T,>(read: () => Promise<T>) => withAccessGuard(userId(req), resolved, operation, read);
 
     const { action } = req.body;
     let result;
     switch (action) {
       case 'search': {
         const maxResults = Math.min(req.body.max_results || 10, 50);
-        const emails = await provider.searchEmails(userId(req), req.body.account_id, req.body.query, maxResults);
+        const emails = await guarded(() => provider.searchEmails(ownerUserId, req.body.account_id, req.body.query, maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'list': {
         const maxResults = Math.min(req.body.max_results || 20, 50);
-        const emails = await provider.listEmails(userId(req), req.body.account_id, req.body.folder || 'INBOX', maxResults);
+        const emails = await guarded(() => provider.listEmails(ownerUserId, req.body.account_id, req.body.folder || 'INBOX', maxResults));
         result = { emails, count: emails.length };
         break;
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
-        const emails = await provider.getEmails(userId(req), req.body.account_id, ids);
+        const emails = await guarded(() => provider.getEmails(ownerUserId, req.body.account_id, ids));
         result = { emails, count: emails.length };
         break;
       }
       case 'send': {
-        const sendResult = await provider.sendEmail(userId(req), req.body.account_id, {
+        const sendResult = await provider.sendEmail(ownerUserId, req.body.account_id, {
           to: req.body.to,
           subject: req.body.subject,
           body: req.body.body,
@@ -295,10 +305,32 @@ router.post('/linkedin-outreach', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * ENG-827: rebuild the scheduled run's publish re-check on the far side of a self-call.
+ *
+ * The hook is a closure, so it cannot cross an HTTP boundary — only the session id it
+ * is keyed on can. `attachPublishRevalidation` remakes the identical hook here, which
+ * means the adapters re-read live consent immediately before the write no matter which
+ * side of the boundary the tool call started on.
+ */
+function buildScheduledPublishContext(req: Request): any {
+  return publishRevalidationForForwardedRun(req, 'post_on_connected_account');
+}
+
 router.post('/post-on-account', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.postOnConnectedAccount(userId(req), req.body.account_id, req.body.content, req.body.media_urls || []);
+    // ENG-827 (Greptile, security): the caller checked consent before making this
+    // self-call, but the irreversible work — media upload, Instagram's container,
+    // YouTube's transfer — happens here, minutes later. Rebuild the run's re-check
+    // hook from the session it forwarded so the adapters bind the write to consent
+    // as it stands at the write. No session header means an ordinary interactive
+    // call, which is not gated and gets no hook.
+    const toolContext = buildScheduledPublishContext(req);
+    const result = await svc.postOnConnectedAccount(
+      userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
+      undefined, toolContext
+    );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

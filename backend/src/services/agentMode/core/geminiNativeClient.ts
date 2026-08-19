@@ -12,8 +12,12 @@
  *
  * This module is deliberately dependency-light and its translation is pure/exported
  * so the request<->response mapping (the risky part of a provider-transport change)
- * can be characterization-tested without the SDK or the network.
+ * can be characterization-tested without the SDK or the network. The single
+ * exception is the synthesised tool-call id, which must be unique per session and
+ * therefore draws randomness — see `mintToolCallId` (ENG-1206).
  */
+
+import { randomBytes } from 'crypto';
 
 /** Minimal shape of the OpenAI chat-completions params the agent loop passes in. */
 export interface OpenAIChatParams {
@@ -285,19 +289,33 @@ export function toGeminiRequest(
   opts: GeminiRequestOptions,
 ): { model: string; contents: any[]; config: any } {
   // Gemini matches function results to calls by NAME, not id, so pre-map every
-  // assistant tool_call id -> {name, signed}. `signed` = the call carries a Gemini
-  // thoughtSignature: gemini-3.5-flash (a thinking model) REQUIRES that signature to
-  // be echoed back on the functionCall part, or the next turn 400s
-  // ("Function call is missing a thought_signature"). Unsigned calls — from the
-  // compat path or a pre-fix session — are degraded to text so no unsigned
-  // functionCall part is ever sent (and their results are degraded to text too, to
-  // keep functionResponse paired with a functionCall).
-  const toolCallInfo = new Map<string, { name: string; signed: boolean }>();
+  // assistant tool_call id -> {name, structural}. A thinking model REQUIRES the
+  // thoughtSignature it issued to be echoed back, or the next turn 400s
+  // ("Function call is missing a thought_signature"), so a turn we cannot send
+  // structurally is degraded to text instead (its results too, to keep every
+  // functionResponse paired with a functionCall).
+  //
+  // ENG-1054: signature presence is a property of the TURN, not of the call.
+  // Gemini signs only the FIRST functionCall part of a multi-call turn and returns
+  // its siblings unsigned — so treating `signed` per-call degraded 77 of 105 calls
+  // in the production session, dumping ~111 KB of tool JSON into the conversation
+  // as prose. That is what taught the model to reply with transcribed tool output
+  // (a 20,081-char echo) and, once a payload was cut mid-JSON, with the bare `}]`
+  // that ended the run.
+  //
+  // Verified live against gemini-3.1-pro-preview rather than assumed:
+  //   - an unsigned functionCall with NO signed sibling  -> 400 (the case above)
+  //   - unsigned functionCalls ALONGSIDE a signed sibling in the same turn
+  //     -> ACCEPTED (it is exactly the shape Gemini itself returned)
+  // So a turn keeps its structural form when ANY of its calls is signed, and only
+  // a wholly-unsigned turn (legacy/compat history) still degrades to text.
+  const toolCallInfo = new Map<string, { name: string; structural: boolean }>();
   for (const msg of params.messages) {
     if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      const turnIsSigned = msg.tool_calls.some((tc: any) => !!tc?.thought_signature);
       for (const tc of msg.tool_calls) {
         if (tc?.id && tc?.function?.name) {
-          toolCallInfo.set(tc.id, { name: tc.function.name, signed: !!tc.thought_signature });
+          toolCallInfo.set(tc.id, { name: tc.function.name, structural: turnIsSigned });
         }
       }
     }
@@ -327,15 +345,21 @@ export function toGeminiRequest(
     } else if (msg.role === 'assistant') {
       const parts = contentToParts(msg.content);
       if (Array.isArray(msg.tool_calls)) {
+        const turnIsSigned = msg.tool_calls.some((tc: any) => !!tc?.thought_signature);
         for (const tc of msg.tool_calls) {
           let args: any = {};
           try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
-          if (tc.thought_signature) {
-            // Echo the thoughtSignature back — required for a thinking-model tool turn.
-            parts.push({ functionCall: { name: tc.function?.name, args }, thoughtSignature: tc.thought_signature });
+          if (turnIsSigned) {
+            // Echo the turn back in the shape Gemini produced it: the signature on
+            // whichever part carried one, siblings structural but unsigned. Attaching
+            // a sibling's signature would be a forgery, and omitting the part loses
+            // the call — both are worse than reproducing what we were given.
+            const part: any = { functionCall: { name: tc.function?.name, args } };
+            if (tc.thought_signature) part.thoughtSignature = tc.thought_signature;
+            parts.push(part);
           } else {
-            // No signature (legacy/compat history) → degrade to text; an unsigned
-            // functionCall part would 400 the whole request.
+            // Nothing in this turn is signed (legacy/compat history) → degrade to
+            // text; a lone unsigned functionCall part would 400 the whole request.
             parts.push({ text: `[Previously called ${tc.function?.name}(${tc.function?.arguments || '{}'})]` });
           }
         }
@@ -344,7 +368,7 @@ export function toGeminiRequest(
     } else if (msg.role === 'tool') {
       const info = toolCallInfo.get(msg.tool_call_id);
       const name = info?.name || msg.name || 'tool';
-      if (info && !info.signed) {
+      if (info && !info.structural) {
         // Its call was degraded to text above, so pair the result as text too
         // (a functionResponse with no matching functionCall part would 400).
         const resultText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
@@ -400,6 +424,32 @@ export function toGeminiRequest(
  * response the agent loop reads (`choices[0].message`, `finish_reason`,
  * `stop_reason`, `usage`). Pure.
  */
+/**
+ * Gemini returns no id on a functionCall, so the adapter mints one. It has to be
+ * unique for the life of the SESSION, not merely within one response.
+ *
+ * `toolDispatch` offloads a large tool response to
+ * `tool-responses/{sessionId}/{toolCall.id}.txt`, so two turns that each open
+ * with the same tool would write the same key and the later page would silently
+ * destroy the earlier one. That is ENG-1206, observed in prod session
+ * d5898ffd: `get_leads` page 2 overwrote page 1 at `call_get_leads_0.txt`, the
+ * follow-up read came back `not_found`, and the agent answered from a set it
+ * could no longer assemble.
+ *
+ * A per-response index alone is what caused the bug. A content hash would be no
+ * better — the exact failure was the SAME tool called with the SAME arguments on
+ * consecutive turns. Hence a random suffix, which also stops a model guessing a
+ * neighbouring key (it invented `call_read_tool_response_1.txt` in that session)
+ * instead of using the key it was handed.
+ *
+ * The name is kept for debuggability and sanitised because the id becomes an S3
+ * object name.
+ */
+function mintToolCallId(name: unknown, indexInResponse: number): string {
+  const safeName = String(name || 'fn').replace(/[^A-Za-z0-9_-]/g, '_');
+  return `call_${safeName}_${indexInResponse}_${randomBytes(4).toString('hex')}`;
+}
+
 export function fromGeminiResponse(resp: any): any {
   const candidate = resp?.candidates?.[0];
   const parts: any[] = candidate?.content?.parts || [];
@@ -413,7 +463,7 @@ export function fromGeminiResponse(resp: any): any {
     if (part.thought === true) continue;
     if (part.functionCall) {
       const toolCall: any = {
-        id: `call_${part.functionCall.name || 'fn'}_${toolCalls.length}`,
+        id: mintToolCallId(part.functionCall.name, toolCalls.length),
         type: 'function',
         function: {
           name: part.functionCall.name,
@@ -509,6 +559,14 @@ export function fromGeminiResponse(resp: any): any {
       completion_tokens: completionTokens,
       total_tokens: usage.totalTokenCount || (promptTokens + completionTokens),
       cache_read_input_tokens: cacheReadTokens,
+      // ENG-1188/ENG-1301: always 0, not a measurement. Unlike Bedrock/Anthropic,
+      // Gemini's generateContent response carries no "cache write" counter — a
+      // cache write there is a separate caches.create() call with its own
+      // billing, and this codebase never calls it (no caching is implemented for
+      // Gemini at all yet; see ENG-1301). Do not read a session's
+      // cacheTokens.creation as evidence caching never engaged — cacheReadTokens
+      // above is the field that would show Google's automatic/implicit caching,
+      // if any, taking effect.
       cache_creation_input_tokens: 0,
     },
   };

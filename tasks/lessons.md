@@ -181,3 +181,52 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
 - Why it happened
 - How to prevent it
 - Example or reference
+
+## Reading an adjacent function is not reading the function (ENG-941, 2026-08-14)
+
+- **What went wrong:** claimed "ad sets default to PAUSED" and built the launch gate's predicate on it. `createAdSet` sets status only when provided, so an omitted status falls through to Meta's default of ACTIVE — an ad set created with no status started delivering completely ungated. Same day, claimed "Emma has exactly 4 landing-page tools" and used it to conclude a capability didn't exist.
+- **Why it happened:** the PAUSED default was read from `createCampaign`, one function away. The tool list was read from a gating array in `agentModeService`, not the registry in `emma/tools.ts`. Both sources were adjacent, plausible, and wrong. Both claims were stated with confidence.
+- **How to prevent it:** before asserting a default, a capability, or a list, open the exact function or registry that produces it. "I checked" means naming the file and line you checked, not the neighbourhood. If a claim is load-bearing for a design decision, quote the line.
+- **Reference:** `metaService.createAdSet` vs `createCampaign`; `emma/tools.ts` registry vs `agentModeService.ts:6565`.
+
+## A safety gate must be tested for being reached, not just for being right (ENG-941, 2026-08-14)
+
+- **What went wrong:** the pure check and the enforcement logic were both well covered, and neither would have failed if the gate were never called at all.
+- **Why it happened:** unit tests exercise a function directly. A gate that is wired in wrongly — or after an earlier early-return — is indistinguishable from a correct one at that level. The first wiring test immediately revealed the ENG-400 confirmation gate returns before the tracking gate is reached.
+- **How to prevent it:** for anything that blocks, add a test that drives the real entry point and asserts the downstream write did NOT happen. Assert the absence of the side effect, not just the returned verdict.
+- **Reference:** `metaLaunchGateWiring.test.ts`.
+
+## Run the whole suite, and don't trust a CI score you didn't attribute to a commit (ENG-941, 2026-08-14)
+
+- **What went wrong:** ran only the suites that looked related, and pushed. The full run found 1 failure in 22,920 — the gate correctly failing closed in a suite that mocks neither credentials nor the Graph API. Separately, a failing "Require Greptile Review" was read as a verdict on fixed code when it was re-reading a review posted before the fixes.
+- **Why it happened:** a new dependency reaches suites that never mentioned it. And the required check re-reads the last posted review, so its state can lag the head by an entire round.
+- **How to prevent it:** run `npm test` in full before pushing anything that adds a dependency to a shared path. To judge a review, count the review comments and check which head they were posted against — do not read the score string alone.
+- **Reference:** `agentModeService.audienceCampaignWorkflows.test.ts`; PR #2406.
+
+## A mocked API cannot tell you the API's own rules (ENG-926 §C, 2026-08-15)
+
+- **What went wrong:** to stop guessing a currency, the CRM→Meta relay was changed to send a closed-won `Purchase` with no `value`/`currency` when the lead didn't state one. Every unit test passed. The first live send was rejected by Meta: `Missing Currency for Purchase Event`. The "safer" change had converted a slightly-wrong number into a **lost conversion** — strictly worse, and exactly the failure the card exists to prevent.
+- **Why it happened:** every test mocks `fetch`, so they assert the shape *we* decided to send. A mock will happily accept a payload the real API rejects; it validates our intent, never the contract. Meta requires `value` and `currency` on `Purchase` — a rule that exists only on Meta's side and is therefore invisible to any local test.
+- **How to prevent it:** when a change alters what goes **on the wire** to a third party, prove it against that third party before believing it. A single live send, or a direct probe of the endpoint, settles it in seconds. Probe the negative case too: `action_source: bogus_value` was rejected, which is what made "`system_generated` is accepted" meaningful rather than the API just ignoring the field.
+- **The design lesson underneath:** "omit rather than guess" is usually right, but only where the field is optional. Check whether the API treats it as required before choosing omission — otherwise you trade a wrong value for no event at all. The fix was to change the event: `Purchase` when the value can be stated, a custom `CRMWonDeal` when it cannot.
+- **Second-order consequence worth noting:** once one conversion could emit two different event names, fire-once had to key on the conversion *kind*, not the emitted name — or a deal sent as `CRMWonDeal` would be sent again as `Purchase` the moment someone filled in the currency. A fix that changes an identifier usually moves the deduplication boundary with it.
+- **Reference:** PR #2412; `metaConversionRelay.ts` (`resolveEventName`, `buildConversionValue`); Graph v25 probes, error subcode 2804010.
+
+## An ad blocker makes a working tag look like a dead one (ENG-839 AC2, 2026-08-17)
+
+- **What went wrong:** verifying Haven's browser pixel through the Claude-in-Chrome profile, a synthetic lead produced `Lead: 1` on the pixel with `event_source: {SERVER: 2}` and no `BROWSER` at all — not even a PageView for my own visit. I wrote that up as "the browser leg did not reach Meta", one step from reporting a P1 against a managed client with live spend.
+- **Why it happened:** the profile has an ad blocker. It answers `connect.facebook.net/en_US/fbevents.js` with an **empty body** rather than failing the request, so `performance.getEntriesByType('resource')` still shows the script as loaded. `window.fbq` exists (it is the inline stub), `fbq.queue` holds `['init', <pixel>]` and `['track','PageView']` forever, `fbq.callMethod` is never defined, and **zero** `facebook.com/tr` requests go out. Every symptom points at the site; none of them are the site's fault.
+- **The tell I skipped:** `transferSize: 0, decodedBodySize: 0`. A real `fbevents.js` is ~410KB. I read "request made, no events sent" as a site fault without ever checking whether the response had any bytes in it.
+- **How to prevent it:** verify tags in **Playwright**, never Claude-in-Chrome — Playwright runs a clean browser with no extensions. Same machine, same IP, minutes apart: Chrome profile got 0 bytes, Playwright got 409,632 bytes, initialised the library, drained the queue and sent both `PageView` and `Lead`. Before concluding any tag is broken, assert `decodedBodySize > 0` **and** `typeof fbq.callMethod === 'function'` **and** `fbq.queue.length === 0`. A non-empty queue means the library never took over.
+- **The general form:** a blocked resource and a broken integration are indistinguishable from the *effects* alone. Both give you "the code is there and nothing happened." Distinguish them at the source — did the dependency actually arrive, with bytes — before attributing the failure to the code under test. Same shape as the mocked-API lesson above: local observation was measuring our own environment, not the thing we meant to test.
+- **Reference:** Haven pixel `646256265203090`; clean-run browser Lead `eid=9ac5ffc6-70b4-473a-85b9-6e82953185b8`.
+
+## Fixing one field's normalisation is a signal to check its neighbours (ENG-926 §B, 2026-08-17)
+
+- **What went wrong:** `fn` and `ln` were hashed for Meta CAPI with `trim().toLowerCase()` only, so every name carrying punctuation or an internal space hashed to something Meta would never produce. `O'Brien` and `van der Berg` never matched, on every event sent, for **24 days** — from the commit that introduced CAPI (`bbb5fc32b`, 2026-07-23) until `ba64aaea5`.
+- **Why it survived so long:** the failure has no symptom. No error, no rejected event, nothing wrong-looking in our own data — only a lower match rate than we believed we had. A hash mismatch is indistinguishable from a person Meta simply does not know.
+- **The part worth generalising:** the original commit also had `ph` wrong (no leading-zero strip). Someone later fixed `ph` — carefully, with a good comment about UK dialling prefixes — and **did not look two lines below at `fn`/`ln`, which had the same class of defect**. These four lines were written together, in one block, from one wrong assumption. Fixing one of them is the strongest available signal that the others deserve a read.
+- **How to prevent it:** when correcting how a value is normalised, encoded or hashed before leaving the process, check every sibling field in the same block *in the same change*. They almost always share an author, a moment, and a misconception.
+- **How to get the rules right, rather than guess:** do not implement a third party's normalisation from its prose docs. Meta's own `fbevents.js` was loaded in a clean browser against a dummy pixel id; the request it emits carries both the hash and an `ncud[...]` mask of the normalised value (letters `*`, digits `#`). Reading those masks answered what the documentation does not — that ALL whitespace is stripped (not just the ends), and that accents are PRESERVED rather than folded to ASCII. Folding accents is the obvious-looking implementation and would have broken every non-English name that matches today.
+- **Then pin it:** eight of Meta's own hashes are now test expectations, so a future divergence fails with the exact field and value. For a defect whose only symptom is a number being quietly lower than it should be, a golden-vector test is the only thing that makes drift visible at all.
+- **Reference:** `metaUserDataNormalisation.ts`, `metaUserDataNormalisation.test.ts`, PR #2439.

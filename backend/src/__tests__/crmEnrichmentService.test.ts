@@ -653,6 +653,49 @@ describe('CrmEnrichmentService', () => {
       expect(allUserMsgs).toContain('LinkedIn');
     });
 
+    it('should not synthesize a fake /in/undefined URL when get-profile returns an anonymized profile (ENG-1198)', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({
+        leadId: 'lead1',
+        linkedin: 'https://www.linkedin.com/in/existing-url',
+        firstName: 'Jane',
+        lastName: 'Doe',
+        company: 'Acme',
+      })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+      mockGetAccountsByUserId.mockResolvedValue([{ account_id: 'acc1', platform: 'unipile' }] as any);
+
+      // Mirrors what agentModeService's get-profile now returns for an out-of-network
+      // profile viewed via a shared account: public_identifier is Unipile's literal
+      // 'undefined' sentinel, flagged anonymized:true, and public_profile_url dropped.
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({
+        success: true,
+        data: { public_identifier: 'undefined', anonymized: true, headline: 'CTO', usedSharedAccount: true, sharedAccountId: 'shared-1' },
+      });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ linkedin_url: 'https://www.linkedin.com/in/existing-url' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find the personal LinkedIn profile URL for {{firstName}} {{lastName}} at {{company}}',
+        outputFields: ['linkedin_url'],
+        sources: ['linkedin'],
+        sourcesPerField: { linkedin_url: ['linkedin'] },
+        linkedinSearchTemplate: '{{firstName}} {{lastName}} {{company}}',
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+
+      const allUserMsgs = mockGeminiCreate.mock.calls
+        .map(call => (call[0].messages.find((m: any) => m.role === 'user')?.content) || '')
+        .join('\n---\n');
+      expect(allUserMsgs).not.toContain('in/undefined');
+    });
+
     it('should re-process already-enriched leads when forceOverwrite=true', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [
@@ -1765,6 +1808,87 @@ describe('CrmEnrichmentService template fallback chain', () => {
     });
 
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
+  });
+});
+
+describe('CrmEnrichmentService cross-provider timeout fallback', () => {
+  const input = {
+    leadContext: { company: 'Acme Corp' },
+    webContext: 'Acme Corp source context',
+    linkedinContext: '',
+    spec: {
+      userId: 'user-fallback',
+      instruction: 'Find company size',
+      outputFields: ['company_size'],
+    },
+    lead: { leadId: 'lead-fallback' },
+    enrichConfig: {
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  afterEach(() => {
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  it('uses the fallback model client after a primary timeout', async () => {
+    const primaryCreate = jest.fn().mockRejectedValue(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }));
+    const fallbackCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    const fallbackClient = { chat: { completions: { create: fallbackCreate } } };
+    mockAgentModeService.getClientForModel
+      .mockResolvedValueOnce(primaryClient as any)
+      .mockResolvedValueOnce(fallbackClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(primaryCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
+  });
+
+  it('does not resolve the fallback client when the primary succeeds', async () => {
+    const primaryCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(1);
+    expect(primaryCreate.mock.calls[0][0].model).toBe('gpt-5-chat-2');
+  });
+
+  it('keeps non-timeout provider errors on the primary path', async () => {
+    const providerError = new Error('provider rejected request');
+    const primaryCreate = jest.fn().mockRejectedValue(providerError);
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    await expect((new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    )).rejects.toThrow('provider rejected request');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(2);
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(1, 'gpt-5-chat-2');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(2, 'gpt-5-chat-2');
   });
 });
 

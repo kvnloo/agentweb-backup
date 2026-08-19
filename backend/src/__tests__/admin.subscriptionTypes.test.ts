@@ -27,6 +27,9 @@ jest.mock('../services/subscriptionService', () => ({
   getAllAvailablePages: jest.fn(() => ['/', '/agent-mode', '/settings', '/guide', '/tasks']),
   getAllAvailableSkills: jest.fn(async () => ['skill-1', 'skill-2', '__other_skills__']),
   getAllAvailableConnectedAccounts: jest.fn(() => ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram']),
+  getAllAvailableSubscriptionFeatures: jest.fn(() => [
+    { id: 'scheduled_chats', label: 'Scheduled chats', description: 'Create and run scheduled chats.' },
+  ]),
   getPublicAllowedSkills: jest.fn(async () => []),
   // Keep getAllAvailableFunctionCalls for backward compat if referenced elsewhere
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
@@ -46,6 +49,11 @@ jest.mock('../services/skillService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     getUnassociatedToolNames: jest.fn(() => ['other_tool_1', 'other_tool_2']),
+    getSupportedModels: jest.fn(async () => [
+      'gemini-3.1-flash-lite',
+      'anthropic.claude-haiku-4-5-20251001-v1:0',
+      'anthropic.claude-opus-5',
+    ]),
   },
 }));
 
@@ -139,6 +147,15 @@ describe('Admin subscription types routes', () => {
     );
     // Should not have allowedFunctionCalls in the response (replaced by allowedSkills)
     expect(legacy.allowedSkills).toContain('skill-1');
+    expect(legacy.allowedFeatures).toEqual(['scheduled_chats']);
+  });
+
+  it('GET /api/admin/subscription-features returns reusable feature metadata', async () => {
+    const res = await request(app)
+      .get('/api/admin/subscription-features')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+    expect(res.body.features).toEqual([expect.objectContaining({ id: 'scheduled_chats' })]);
   });
 
   it('POST /api/admin/subscription-types should save expanded skills instead of "*"', async () => {
@@ -194,6 +211,20 @@ describe('Admin subscription types routes', () => {
       '__other_skills__',
     ]);
     expect(pro.allowedSkills).not.toContain('*');
+    expect(pro.allowedFeatures).toEqual(['scheduled_chats']);
+  });
+
+  it('POST /api/admin/subscription-types persists an explicit feature denial', async () => {
+    mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+    await request(app)
+      .post('/api/admin/subscription-types')
+      .set('Authorization', 'Bearer test-token')
+      .send({ subscriptionTypes: [{
+        name: 'Community', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], allowedFeatures: [],
+      }] })
+      .expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].allowedFeatures).toEqual([]);
   });
 
   // ENG-200: the per-user cost cap lives on the tier as monthlyCostAllowance. The
@@ -250,6 +281,185 @@ describe('Admin subscription types routes', () => {
     const free = savedTypes.find((t: any) => t.name === 'Free');
     expect(starter.monthlyCostAllowance).toBe(250);
     expect(free.monthlyCostAllowance).toBeUndefined();
+  });
+
+  it('GET /api/admin/subscription-types round-trips the versioned LLM usage policy', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }]),
+    } as any);
+
+    const res = await request(app).get('/api/admin/subscription-types').expect(200);
+
+    expect(res.body[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  it('POST /api/admin/subscription-types validates and persists a cost-only policy', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy).toEqual(llmUsagePolicy);
+  });
+
+  // ENG-1214 AC5: the alert thresholds are only "admin-configurable" if the
+  // admin save path can actually carry them. It builds the stored policy from an
+  // explicit field whitelist, so a field missing from that list is not merely
+  // un-settable -- it is silently DROPPED from any policy that already had it,
+  // reverting the tier to the defaults without telling anyone.
+  it('persists the alert thresholds when an admin sets them', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-alert-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+      alertUsagePercentThreshold: 75,
+      alertOnForecastShortfall: false,
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.alertUsagePercentThreshold).toBe(75);
+    expect(saved[0].llmUsagePolicy.alertOnForecastShortfall).toBe(false);
+  });
+
+  it('leaves the alert fields absent when the admin omits them', async () => {
+    // Absent must stay absent rather than being materialised as the default:
+    // a stored 90 cannot later be told apart from "never configured", which is
+    // what lets the default move without rewriting every tier.
+    const llmUsagePolicy = {
+      version: 'starter-noalert-v1', enforcementState: 'enforce',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy).not.toHaveProperty('alertUsagePercentThreshold');
+    expect(saved[0].llmUsagePolicy).not.toHaveProperty('alertOnForecastShortfall');
+  });
+
+  it('rejects an out-of-range alert threshold instead of coercing it', async () => {
+    // Passing the value through RAW is what lets validation see it. Coercing at
+    // the boundary (Number(...), === true) would make the validator a no-op and
+    // silently store a threshold that never fires.
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'starter-bad-v1', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+          alertUsagePercentThreshold: 100,
+        },
+      }],
+    }).expect(400);
+  });
+
+  it('rejects a non-boolean forecast-alert flag instead of coercing it', async () => {
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'starter-bad-v2', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 30_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+          alertOnForecastShortfall: 'yes',
+        },
+      }],
+    }).expect(400);
+  });
+
+  it('persists the hard-cap-only rollout state independently of model optimization', async () => {
+    const llmUsagePolicy = {
+      version: 'starter-hard-v1', enforcementState: 'hard_only',
+      optimizationCostThresholdMicroUsd: 30_000_000,
+      hardCostThresholdMicroUsd: 60_000_000,
+      optimizedModelIds: ['gemini-3.1-flash-lite'],
+      optimizedDefaultModel: 'gemini-3.1-flash-lite',
+    };
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsagePolicy }],
+    }).expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsagePolicy.enforcementState).toBe('hard_only');
+  });
+
+  it('rejects a policy whose hard cost threshold is not above its optimization threshold', async () => {
+    const res = await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsagePolicy: {
+          version: 'bad-v1', enforcementState: 'enforce',
+          optimizationCostThresholdMicroUsd: 60_000_000,
+          hardCostThresholdMicroUsd: 60_000_000,
+          optimizedModelIds: ['gemini-3.1-flash-lite'],
+          optimizedDefaultModel: 'gemini-3.1-flash-lite',
+        },
+      }],
+    }).expect(400);
+
+    expect(res.body.message).toContain('hardCostThresholdMicroUsd must be greater');
+    expect(mockedSettingsService.setSetting).not.toHaveBeenCalled();
+  });
+
+  it('round-trips admin-priced additional usage packages', async () => {
+    const llmUsageTopUp = {
+      enabled: true,
+      minimumMarkupBps: 25_000,
+      packages: [{
+        id: 'aw-10', label: '10 AgentWeb Credits', priceCents: 2_500,
+        usageCreditMicroUsd: 10_000_000, active: true,
+      }],
+    };
+    await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{ name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], llmUsageTopUp }],
+    }).expect(200);
+    const saved = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+    expect(saved[0].llmUsageTopUp).toEqual(llmUsageTopUp);
+  });
+
+  it('rejects an additional usage package below the configured markup floor', async () => {
+    const res = await request(app).post('/api/admin/subscription-types').send({
+      subscriptionTypes: [{
+        name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'],
+        llmUsageTopUp: {
+          enabled: true,
+          minimumMarkupBps: 25_000,
+          packages: [{ id: 'bad', label: 'Bad', priceCents: 2_499, usageCreditMicroUsd: 10_000_000, active: true }],
+        },
+      }],
+    }).expect(400);
+    expect(res.body.message).toContain('below minimumMarkupBps');
   });
 
   describe('POST /api/admin/subscription-types/:typeName/skills', () => {

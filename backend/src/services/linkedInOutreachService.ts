@@ -5,6 +5,41 @@ import { userDb } from './db';
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
 // Twitter/X support is suspended — see dev.md for details.
 
+/**
+ * Does this error prove the LinkedIn session is gone, as opposed to merely failing?
+ *
+ * The distinction is the whole point. A timeout, a 5xx or a transport blip says
+ * nothing about session validity, and treating one as a disconnection suppresses a
+ * healthy account behind a false reconnect prompt (ENG-281). Only Unipile's explicit
+ * disconnect code, a 401, or an AUTH_ERROR classification are proof.
+ *
+ * Exported so every caller that persists or blocks on this verdict — the session
+ * probe, the sync cron's health recorder — shares one definition. Two copies of a
+ * safety predicate is one copy too many.
+ */
+export function isProvenDisconnectError(error: any): boolean {
+  // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
+  // `structuredError`. Read both so classification can't depend on which layer threw.
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification =
+    structured?.classification || error?.body?.classification || error?.classification;
+  // 403 is deliberately NOT proof. `handleError` classifies 401 AND 403 as
+  // AUTH_ERROR, but a 403 is a permission/plan/endpoint restriction — the session
+  // is alive, we are just not allowed to do that thing. This predicate used to feed
+  // a 10-minute in-memory cache where a wrong verdict expired harmlessly; it now
+  // persists `needs_reconnect`, withholds scheduled runs, and emails a paying
+  // customer that their account is broken. That is not a mistake worth making on a
+  // 403.
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return (
+    code === 'errors/disconnected_account' ||
+    classification === 'AUTH_ERROR' ||
+    Number(status) === 401
+  );
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -26,7 +61,29 @@ export class LinkedInOutreachService {
   // another. Note: the per-recipient "Should delay new invitation" rejection does
   // NOT arm this breaker — that one is specific to a single recipient.
   private invitationCooldownUntil: Map<string, number> = new Map();
+
+  /**
+   * True while this account is inside the ENG-126 account-level invitation cooldown.
+   *
+   * Exposed so callers can tell "this send will not reach LinkedIn" BEFORE paying a
+   * pacing slot for it. The breaker below short-circuits the network call entirely,
+   * so a paced caller would otherwise sleep the full gap and consume one of the
+   * account's hourly writes for zero LinkedIn traffic — for up to an hour, on every
+   * queued invite.
+   */
+  isUnderInvitationCooldown(accountId: string): boolean {
+    const until = this.invitationCooldownUntil.get(accountId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.invitationCooldownUntil.delete(accountId);
+    return false;
+  }
   private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
+  // Per-account people-search capability verdict (ENG-975). See
+  // probeSearchCapability below for why this exists; cached per account so a
+  // paging loop or a run that tries several queries pays at most one probe.
+  private searchCapabilityCache: Map<string, { state: 'ok' | 'degraded'; timestamp: number }> = new Map();
+  private static readonly SEARCH_CAPABILITY_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -369,21 +426,12 @@ export class LinkedInOutreachService {
         state = 'connected';
       }
     } catch (error: any) {
-      // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
-      // `structuredError`. Read both so the classification cannot depend on which
-      // layer threw.
+      // Only a proven-dead signal may say "disconnected"; everything else is
+      // indeterminate and the caller decides. See isProvenDisconnectError.
+      state = isProvenDisconnectError(error) ? 'disconnected' : 'unknown';
       const structured = error?.structuredError;
       const code = structured?.code || error?.body?.code || error?.code || '';
       const status = structured?.status || error?.body?.status || error?.status;
-      const classification = structured?.classification || error?.body?.classification || error?.classification;
-      // Only these mean "the LinkedIn session is gone". A timeout or transport
-      // failure proves nothing about the session, so it must not be reported as
-      // a disconnection to a caller that would block on it.
-      const definitivelyDisconnected =
-        code === 'errors/disconnected_account' ||
-        classification === 'AUTH_ERROR' ||
-        Number(status) === 401;
-      state = definitivelyDisconnected ? 'disconnected' : 'unknown';
       this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''}) → ${state}`);
     }
     this.connectedStatusCache.set(accountId, { state, timestamp: Date.now() });
@@ -394,6 +442,82 @@ export class LinkedInOutreachService {
     // Unchanged semantics for every pre-existing caller: anything that is not a
     // proven-live session is `false`, including an indeterminate probe.
     return (await this.probeAccountSession(accountId)) === 'connected';
+  }
+
+  /**
+   * A maximally broad control query. Any LinkedIn account whose people search
+   * works at all matches this; a zero on it is about the ACCOUNT, not the query.
+   */
+  static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
+
+  /**
+   * People-search capability canary (ENG-975).
+   *
+   * An account can lose its people-search capability while leaving profile
+   * reads and invitation lists fully functional. Confirmed cause for the
+   * reported outage: an open Unipile incident (2026-08) — LinkedIn is rolling
+   * out changes to Classic Search account by account, so a given account either
+   * searches normally or returns zero for everything. A commercial-use limit,
+   * search restriction or soft block produces the same shape. Whatever the
+   * cause, Unipile relays it as HTTP 200 with
+   * `items: []` and `paging.total_count: 0`, which is byte for byte what a
+   * genuine no-match looks like. So a zero-result search alone cannot tell
+   * "nobody matches" from "this account can no longer search", and callers that
+   * assume the former report a false empty (0 invites sent, 0 leads imported)
+   * on what is actually an outage.
+   *
+   * This re-runs one broad control query on the same account to break the tie:
+   *   'ok'        — the control matched people, so the caller's zero is real.
+   *   'degraded'  — the control ALSO returned zero: search is broken for this
+   *                 account. Callers should fail loudly.
+   *   'unknown'   — the probe itself failed. Same philosophy as the ENG-281
+   *                 session probe: an indeterminate probe proves nothing, so it
+   *                 is never cached and must never block the caller.
+   *
+   * Deliberately NOT called from `searchPeople`. CRM enrichment runs narrow
+   * person-name searches that legitimately return zero all day; probing there
+   * would double those calls against LinkedIn's rate limits. The guard belongs
+   * to the agent-facing callers, where a false empty is what reaches the user.
+   */
+  async probeSearchCapability(accountId: string): Promise<'ok' | 'degraded' | 'unknown'> {
+    const cached = this.searchCapabilityCache.get(accountId);
+    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.SEARCH_CAPABILITY_TTL_MS) {
+      return cached.state;
+    }
+    let state: 'ok' | 'degraded';
+    try {
+      const client = await this.getClient();
+      const result = await LinkedInOutreachService.withTimeout(
+        client.request.send({
+          method: 'POST',
+          path: ['linkedin', 'search'],
+          parameters: { account_id: accountId },
+          headers: { 'Content-Type': 'application/json' },
+          body: {
+            api: 'classic',
+            category: 'people',
+            keywords: LinkedInOutreachService.SEARCH_CAPABILITY_CANARY_KEYWORDS,
+          },
+        }) as Promise<any>,
+        LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS,
+        `LinkedIn search capability probe for ${accountId}`,
+      ) as any;
+      state = Array.isArray(result?.items) && result.items.length > 0 ? 'ok' : 'degraded';
+    } catch (error: any) {
+      // Not cached: a probe that could not run says nothing about the account.
+      this.warn(`Search capability probe could not run — treating as indeterminate`, {
+        accountId,
+        reason: error?.message,
+      });
+      return 'unknown';
+    }
+    this.searchCapabilityCache.set(accountId, { state, timestamp: Date.now() });
+    this.log(`Search capability probe`, { accountId, state });
+    return state;
+  }
+
+  clearSearchCapabilityCache(accountId: string): void {
+    this.searchCapabilityCache.delete(accountId);
   }
 
   /**
@@ -1377,6 +1501,18 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
+    const { accountId } = await this.resolveAccountIdWithSource(userId);
+    return accountId;
+  }
+
+  /**
+   * Same resolution as resolveAccountId, but also reports whether the
+   * returned account came from the user's own connected accounts or the
+   * site-wide shared pool. Callers whose responses carry viewer-relative data
+   * (network_distance, dedup-against-pending-invites) need this to avoid
+   * silently presenting another account's network as the user's own (ENG-1198).
+   */
+  async resolveAccountIdWithSource(userId: string): Promise<{ accountId: string | null; usedSharedAccount: boolean }> {
     // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
     //    session is still live. A single disconnected account must not shadow a
     //    working one, nor force a needless fall-through to the shared site-wide
@@ -1391,7 +1527,7 @@ export class LinkedInOutreachService {
       const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
       for (const account of userAccounts) {
         if (await this.isAccountConnected(account.account_id)) {
-          return account.account_id;
+          return { accountId: account.account_id, usedSharedAccount: false };
         }
         this.log(`User account ${account.account_id} is disconnected — trying next own account`);
       }
@@ -1408,14 +1544,14 @@ export class LinkedInOutreachService {
         const shuffled = enabled.sort(() => Math.random() - 0.5);
         for (const account of shuffled) {
           if (await this.isAccountConnected(account.account_id)) {
-            return account.account_id;
+            return { accountId: account.account_id, usedSharedAccount: true };
           }
           this.log(`Site-wide account ${account.account_id} (${account.account_name}) is disconnected — skipping`);
         }
       }
     } catch { /* ignore parse errors or settings fetch failures */ }
 
-    return null;
+    return { accountId: null, usedSharedAccount: false };
   }
 
   /**

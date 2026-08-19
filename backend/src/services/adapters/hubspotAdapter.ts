@@ -1105,6 +1105,9 @@ export class HubspotAdapter implements CrmAdapter {
                 result.newCount += batchResult.newCount;
                 result.updatedCount += batchResult.mergedCount;
                 result.errorCount += batchResult.errorCount;
+                // ENG-1002: carry refused placeholder rows so the sync totals
+                // still account for every record handed to the CRM.
+                result.anonymizedSkipped = (result.anonymizedSkipped || 0) + (batchResult.anonymizedSkipped || 0);
                 if (batchResult.errors?.length > 0) {
                     result.errors.push(...batchResult.errors);
                 }

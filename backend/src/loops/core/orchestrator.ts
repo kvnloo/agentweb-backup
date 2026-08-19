@@ -97,6 +97,7 @@ export async function runLoop(
     const cap = manifest.thresholds.maxActiveArmsPerKey * Math.max(1, manifest.mutationSurface.length);
     const proposals = allProposals.slice(0, cap);
     result.proposals = proposals;
+    result.proposalsTruncated = allProposals.length - proposals.length;
     ports.logger.log('debug', '[loops] policy fired rules', {
       loopId: manifest.loopId,
       proposals: proposals.length,

@@ -239,6 +239,84 @@ const createTaskExecutionsTable = async () => {
   }
 };
 
+// Create Async Job Queue table — generic crash-safety net for any webhook receiver's
+// fire-and-forget processing (ENG-524). One table for every integration, discriminated
+// by `source`, rather than a table per integration: a new source just registers a
+// processor function, no schema change. See backend/src/services/asyncJobQueue.ts.
+const createAsyncJobQueueTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AsyncJobQueue`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'StatusCreatedAtIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Calendly Orphaned Webhooks table — last-resort durable record of a
+// Calendly webhook_id that couldn't be either deleted remotely OR durably
+// enqueued for cleanup retry (both AW-AsyncJobQueue writes exhausted). Greptile
+// P1 on #2291 (round 15/16): the async job queue is itself the thing failing to
+// accept writes in exactly this scenario, so a fallback that ALSO writes to that
+// same table has no value — this is a genuinely separate table so the fallback
+// actually has a chance of succeeding when the queue table specifically (not
+// DynamoDB broadly) is the problem. Keyed by `<userId>_<calendlyUserUri>` so a
+// later /connect for that exact identity can look itself up directly (no listing,
+// preserving the same tenant-safety guarantee as the local-account-record check —
+// see calendlyAuth.ts's provisionCalendlyWebhook). See
+// services/calendlyWebhookCleanupQueue.ts.
+const createCalendlyOrphanedWebhooksTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-CalendlyOrphanedWebhooks`,
+    AttributeDefinitions: [
+      { AttributeName: 'id', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'id', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Waitlist table
 const createWaitlistTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1787,6 +1865,97 @@ const createUsageRecordsTable = async () => {
   }
 };
 
+// Append-only, per-charge LLM audit evidence. eventId is the uniqueness/dedup
+// key (caller-controlled, not reliably date-prefixed); the GSI below on
+// occurredAt is what makes a billing subject's charges queryable by month.
+const createLlmChargeEventsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-LlmChargeEvents`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'eventId', AttributeType: 'S' },
+      { AttributeName: 'occurredAt', AttributeType: 'S' },
+    ],
+    KeySchema: [{ AttributeName: 'billingUserId', KeyType: 'HASH' }, { AttributeName: 'eventId', KeyType: 'RANGE' }],
+    // eventId is caller-controlled and not reliably date-prefixed (provider
+    // response IDs, engine task-derived keys) -- monthly queries go through
+    // occurredAt, which is always a real timestamp. See llmChargeAuditDb.ts.
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BillingUserOccurredAtIndex',
+        KeySchema: [
+          { AttributeName: 'billingUserId', KeyType: 'HASH' },
+          { AttributeName: 'occurredAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+};
+
+// ENG-1217 AC9: append-only audit for customer-confirmed model switches, so a
+// change can be explained and undone. Sort key is `{changedAt}#{changeId}` —
+// timestamp FIRST, so a date-range query works on the base table and this needs
+// no GSI. That is the deliberate difference from AW-LlmChargeEvents above, whose
+// caller-controlled `eventId` did not sort by time and had to have an index
+// added after monthly queries were found silently missing events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds — 365d). Enable DynamoDB native
+// TTL on the `ttl` attribute manually, same as UsageRecords/LoopEvents.
+// Append-only audit of customer-confirmed model changes (ENG-1217 AC9).
+// Sort key is `${changedAt}#${changeId}` so the base table is range-queryable by
+// day without a GSI -- llmChargeAuditDb keyed on a caller-controlled id and had
+// to add one after date-range queries silently missed events (ENG-1251).
+// TTL: rows carry a `ttl` attr (epoch seconds, 365d). Enable DynamoDB native TTL
+// on the `ttl` attribute MANUALLY -- CreateTable does not configure it, and
+// nothing at runtime will report that it is missing. Same manual step as the
+// UsageRecords/LoopEvents/AgentRuns tables.
+export const createModelChangeAuditTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ModelChangeAudit`,
+    AttributeDefinitions: [
+      { AttributeName: 'billingUserId', AttributeType: 'S' },
+      { AttributeName: 'sk', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'billingUserId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+  try { await dynamodb.createTable(params).promise(); console.log(`Created ${params.TableName} table`); }
+  catch (error: any) { if (error.code !== 'ResourceInUseException') throw error; }
+
+  // `recordModelChange` writes a 365-day `ttl`, but CreateTable does not enable
+  // expiry -- so without this the attribute is decorative and audit rows are kept
+  // forever. Attempted here rather than left to a runbook line because nothing at
+  // runtime reports it missing: the failure mode is silent, indefinite retention
+  // of customer billing decisions.
+  //
+  // Run unconditionally, including on the already-exists path, since a table
+  // created before this shipped has TTL off.
+  //
+  // Never fatal. `dynamodb:UpdateTimeToLive` is not always granted to the role
+  // running setup, and refusing to finish table creation over a retention setting
+  // would be the wrong trade -- so it says plainly what is left to do instead.
+  try {
+    await dynamodb.updateTimeToLive({
+      TableName: params.TableName,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: 'ttl' },
+    }).promise();
+    console.log(`Enabled TTL on ${params.TableName} (attribute: ttl)`);
+  } catch (error: any) {
+    if (error.code === 'ValidationException' && /already enabled/i.test(error.message || '')) return;
+    console.warn(
+      `[create-tables] Could not enable TTL on ${params.TableName}: ${error.code || error.message}. ` +
+      `Audit rows are retained indefinitely until someone runs: aws dynamodb update-time-to-live ` +
+      `--table-name ${params.TableName} --time-to-live-specification "Enabled=true,AttributeName=ttl"`,
+    );
+  }
+};
+
 // Create Agent Runs table (run-survival core — durable run records +
 // idempotency submit-locks; see services/agentMode/runStore.ts). Single pk
 // hash key with two item kinds: run#<runId>, idem#<key>.
@@ -2291,6 +2460,8 @@ const main = async () => {
     await createUsersTable();
     await createTasksTable();
     await createTaskExecutionsTable();
+    await createAsyncJobQueueTable();
+    await createCalendlyOrphanedWebhooksTable();
     await createWaitlistTable();
     await createSubscribersTable();
     await createTaskSchedulesTable();
@@ -2322,6 +2493,8 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createMcpSessionsTable();
     await createUsageRecordsTable();
+    await createLlmChargeEventsTable();
+    await createModelChangeAuditTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
     await createOrgMemoryTable();

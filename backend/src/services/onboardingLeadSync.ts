@@ -44,8 +44,8 @@ export interface MirrorOnboardingInput {
    * full log is written to the Lead so the Lead record is a complete mirror.
    */
   allEvents: OnboardingEvent[];
-  /** Derived onboarding stage on the User record. */
-  onboardingStage: OnboardingStage;
+  /** Derived onboarding stage on the User record, omitted for lateral events. */
+  onboardingStage: OnboardingStage | null;
 }
 
 export interface MirrorOnboardingDeps {
@@ -129,8 +129,10 @@ export async function mirrorOnboardingEventToLead(
 
     const analytics = {
       [ONBOARDING_LEAD_FIELD]: input.allEvents,
-      [ONBOARDING_STAGE_FIELD]: input.onboardingStage,
       [ONBOARDING_DEVIATION_COUNT_FIELD]: countDeviations(input.allEvents),
+      ...(input.onboardingStage !== null && {
+        [ONBOARDING_STAGE_FIELD]: input.onboardingStage,
+      }),
     };
 
     if (existing && (existing as any).leadId) {

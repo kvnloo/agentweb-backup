@@ -96,6 +96,19 @@ if [ "$sub" = "api" ]; then
       # Cases that mean to exercise the new rule set files.txt explicitly.
       emit_file files.txt files_exit 'partner-portal/src/App.tsx'
       ;;
+    *compare/*)
+      # ENG-1003: what the base branch gained since this PR diverged. Emitted
+      # as raw JSON, not a projected list, because the gate reads two things
+      # from it — the file list AND `ahead_by` — and a single `--jq` could only
+      # project one of them.
+      #
+      # The default is an EMPTY file list, which the gate reads as "the base
+      # moved but changed nothing this PR touches". Cases that mean to exercise
+      # the overlap rule set compare.json explicitly. This default is only ever
+      # consulted when mergeStateStatus is BEHIND, and every fixture written
+      # before ENG-1003 is CLEAN, so it cannot alter their verdicts.
+      emit_file compare.json compare_exit '{"ahead_by":0,"files":[]}'
+      ;;
     *)
       emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
       ;;
@@ -119,13 +132,28 @@ new_fixture_dir() {
   mktemp -d "${WORKDIR}/fixture.XXXXXX"
 }
 
-# pr_view <dir> <mergeable> [isDraft] [state] [headSha]
+# pr_view <dir> <mergeable> [isDraft] [state] [headSha] [mergeStateStatus] [baseRefName]
+#
+# The two trailing parameters are ENG-1003's and default to today's behaviour
+# (CLEAN against main), so every fixture written before it keeps its verdict.
 pr_view() {
   local dir="$1" mergeable="$2" draft="${3:-false}" state="${4:-OPEN}" sha="${5:-${HEAD}}"
+  local merge_state="${6:-CLEAN}" base_ref="${7:-main}"
   cat >"${dir}/pr_view.json" <<EOF
 {"number":2231,"state":"${state}","isDraft":${draft},"mergeable":"${mergeable}",
- "mergeStateStatus":"CLEAN","headRefOid":"${sha}"}
+ "mergeStateStatus":"${merge_state}","headRefOid":"${sha}","baseRefName":"${base_ref}"}
 EOF
+}
+
+# base_compare <dir> <ahead_by> <newline-separated paths the base gained>
+# The `repos/{repo}/compare/{head}...{base}` body: `.files` is the diff from the
+# merge base to the base branch head, i.e. exactly what landed on main while
+# this PR was open (ENG-1003).
+base_compare() {
+  local dir="$1" ahead="$2" files="$3" json
+  json="$(printf '%s\n' "${files}" | jq -R '{filename: .}' | jq -s \
+    --argjson ahead "${ahead}" '{ahead_by: $ahead, files: [.[] | select(.filename != "")]}')"
+  printf '%s\n' "${json}" >"${dir}/compare.json"
 }
 
 # checkruns <dir> <json array of {name,status,conclusion}>
@@ -201,7 +229,9 @@ check() {
       "${desc}" "${expected_exit}" "${LAST_EXIT}" "${LAST_OUTPUT}"
     return
   fi
-  if [ -n "${expected_substr}" ] && ! printf '%s' "${LAST_OUTPUT}" | grep -qF "${expected_substr}"; then
+  # ENG-1277: here-string, not a pipe — avoids a SIGPIPE-under-pipefail race
+  # if grep exits early on a match (see trunk-deploy-state.test.sh's fix).
+  if [ -n "${expected_substr}" ] && ! grep -qF "${expected_substr}" <<<"${LAST_OUTPUT}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf 'FAIL  %s\n      expected output to contain: %s\n      output: %s\n' \
       "${desc}" "${expected_substr}" "${LAST_OUTPUT}"
@@ -929,6 +959,28 @@ for non_backend in \
   check "a PR touching only ${non_backend} passes with the suite skipped" 0 'PASS'
 done
 
+# Renames and the backend classifier (Greptile P1 on ENG-1003). The workflow's
+# path filter classifies on the POST-rename path, so the gate must too:
+#
+# 1. A file renamed OUT of the backend does not schedule the backend jobs.
+#    Gating on its old name would demand evidence the workflow never produced —
+#    a NO_EVIDENCE the author cannot fix by re-running anything.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'docs/service-notes.md\tbackend/src/serviceNotes.ts')"
+run_gate "${d}"
+check 'a rename OUT of backend/ passes with the suite skipped (classified on current path)' 0 'PASS'
+
+# 2. A file renamed INTO the backend is a backend change under its current
+#    name, and the requirement still bites when the suite did not run.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'backend/src/serviceNotes.ts\tdocs/service-notes.md')"
+run_gate "${d}"
+check 'a rename INTO backend/ still requires the backend suite' 3 'changes backend paths'
+
 # Renaming a job must fail closed rather than delete the requirement. With the
 # override pointing at a name nothing reports, the gate blocks.
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -959,15 +1011,154 @@ run_gate "${d}"
 check 'an empty changed-files list is ERROR, never a pass' 4 'ERROR'
 
 # ---------------------------------------------------------------------------
+# ENG-1003: the evidence must describe the merge that would actually happen
+# ---------------------------------------------------------------------------
+#
+# Everything above establishes that a real run executed at this head and nothing
+# failed. That is a statement about the PR's own code. It is NOT a statement
+# about the merge, because `refs/pull/N/merge` — what the suite actually checks
+# out on a `pull_request` event — was built against whatever `main` was when the
+# run started. Commits that land on `main` afterwards are outside the evidence.
+#
+# Today nothing in this gate notices that. The freshness property is enforced
+# only by GitHub's `strict` branch-protection flag, which pays for it by forcing
+# a full ~34-runner-minute revalidation of EVERY open PR after EVERY merge —
+# 25 of agentweb's 35 open PRs were BEHIND with 0 CLEAN when ENG-1003 was filed.
+#
+# So the property moves here, where it can be checked precisely and for free:
+# a base that moved only matters if it moved a file this PR also touches.
+# Overlap is the thing that can invalidate a green suite; everything else is
+# GitHub being conservative because it cannot read a diff.
+#
+# This is strictly a TIGHTENING. Before this block the gate passed a PR whose
+# tested merge base was hundreds of commits stale without comment.
+
+GREEN_HEAD='321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+GREEN_WF='[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100}
+]'
+
+# A PR that is green at its head, touching one non-backend file, in the given
+# mergeStateStatus. Section 7 is not exercised (the file is not a backend path),
+# so every verdict below is attributable to the staleness rule alone.
+green_pr() {
+  local dir="$1" merge_state="$2"
+  pr_view "${dir}" 'MERGEABLE' false OPEN "${GREEN_HEAD}" "${merge_state}" 'main'
+  checkruns "${dir}" "${COMPLETED_GREEN_RUN}"
+  workflowruns "${dir}" "${GREEN_WF}"
+  changed_files "${dir}" 'partner-portal/src/App.tsx'
+}
+
+# 1. The case the rule exists for: main moved a file this PR also edits, so the
+#    green suite was run against a merge result that no longer exists.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'partner-portal/src/App.tsx
+backend/src/services/db.ts'
+run_gate "${d}"
+check 'ENG-1003: a stale base that moved a file this PR touches is NO_EVIDENCE' 3 'partner-portal/src/App.tsx'
+
+# 2. The saving. The base moved, but nowhere near this PR's diff, so the tested
+#    merge result is still the one that would land. This is the verdict that
+#    makes turning `strict` off safe rather than reckless.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md
+customer-portal/src/Other.tsx'
+run_gate "${d}"
+check 'ENG-1003: a stale base with no overlapping file still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md'
+run_gate "${d}"
+check 'ENG-1003: the non-overlapping pass says the base moved and why it is safe' 0 'base has moved 12 commit'
+
+# 3. Fail closed when the comparison itself cannot be read. A gate that cannot
+#    see the base must not certify freshness.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '7\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable base comparison is ERROR, never a pass' 4 'ERROR'
+
+# 4. GitHub's compare endpoint caps `files` at 300. A truncated list cannot
+#    prove the ABSENCE of an overlap, and this PR's files are deliberately
+#    absent from it — so without the cap check this fixture would false-PASS.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 400 "$(seq 1 300 | sed 's|^|unrelated/f|; s|$|.ts|')"
+run_gate "${d}"
+check 'ENG-1003: a truncated base file list cannot prove no overlap, so NO_EVIDENCE' 3 'truncat'
+
+# 5. The freshness check keys on `ahead_by`, never on the displayed merge
+#    state: mergeStateStatus reports one dominant state, so a PR that is behind
+#    AND awaiting a required review reads BLOCKED, not BEHIND. A gate that
+#    trusted the label would false-PASS exactly this fixture.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BLOCKED'
+base_compare "${d}" 12 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a behind base hidden under BLOCKED still fails freshness' 3 'partner-portal/src/App.tsx'
+
+# 5b. A genuinely current PR (compare says the base has not moved) passes, and
+#     an unreadable comparison is now an ERROR for every PR, not only BEHIND
+#     ones — the comparison is the evidence, so its absence fails closed.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+base_compare "${d}" 0 ''
+run_gate "${d}"
+check 'ENG-1003: a current base (ahead_by 0) still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+printf '9\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable comparison fails closed even when the state reads CLEAN' 4 'ERROR'
+
+# 6. Renames participate under both paths: the base renamed the file this PR
+#    edits, so the overlap only exists via `previous_filename`. Filename-only
+#    projection would false-PASS this.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '%s\n' '{"ahead_by":3,"files":[{"filename":"partner-portal/src/AppRenamed.tsx","previous_filename":"partner-portal/src/App.tsx"}]}' >"${d}/compare.json"
+run_gate "${d}"
+check 'ENG-1003: a base rename of a file this PR edits is caught via previous_filename' 3 'partner-portal/src/App.tsx'
+
+# 6b. The PR side of the same coin: this PR renamed the file, the base edited
+#     it under the old name. The overlap only exists via the PR's
+#     previous_filename, which the current-path-only backend classifier must
+#     not have stripped from the overlap list.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+changed_files "${d}" "$(printf 'partner-portal/src/AppRenamed.tsx\tpartner-portal/src/App.tsx')"
+base_compare "${d}" 3 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a PR rename of a file the base edits is caught via the PR previous_filename' 3 'partner-portal/src/App.tsx'
+
+# ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY
 # ---------------------------------------------------------------------------
 #
 # The gate's ability to tell a draft skip from a path-filter skip rests entirely
-# on `Require Greptile Review` being conditioned on draft state and nothing else.
-# Add a path filter to that job and every assertion above still passes while the
-# real gate quietly stops working, because a path-skipped discriminator is
-# indistinguishable from a draft-skipped one. Assert the workflow here so the
-# invariant breaks loudly, in CI, in the PR that breaks it.
+# on `Require Greptile Review` being conditioned on draft state and nothing else
+# that can vary independently of draft state. Add a path filter to that job and
+# every assertion above still passes while the real gate quietly stops working,
+# because a path-skipped discriminator is indistinguishable from a
+# draft-skipped one. Assert the workflow here so the invariant breaks loudly,
+# in CI, in the PR that breaks it.
+#
+# ENG-1277 added `always() &&` in front of the draft check when it reordered
+# this job to run after backend-tests-a/b (needs: [detect-changes,
+# backend-tests-a, backend-tests-b]). Without `always()`, GitHub implicitly
+# ANDs an `if:` with `success()` whenever the expression names no status-check
+# function, so a path-filtered skip of backend-tests-a/b on a non-backend PR
+# would silently skip this job too — reintroducing exactly the ambiguity this
+# invariant exists to prevent. `always()` is a status-check function, not a
+# condition on paths or draft state, so it does not weaken the invariant: the
+# expression still reduces to "skip iff draft" for every PR, backend or not.
+# The expected string below is therefore `always() && <draft check>`, not the
+# draft check alone.
 
 WORKFLOW="$(cd "${SCRIPT_DIR}/../.." && pwd)/.github/workflows/tests.yml"
 DISCRIMINATOR_IF="$(awk '
@@ -977,71 +1168,67 @@ DISCRIMINATOR_IF="$(awk '
 ' "${WORKFLOW}")"
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if [ "${DISCRIMINATOR_IF}" = "github.event.pull_request.draft == false" ]; then
-  printf "ok    invariant: the 'Require Greptile Review' job is gated on draft state alone\n"
+if [ "${DISCRIMINATOR_IF}" = "always() && github.event.pull_request.draft == false" ]; then
+  printf "ok    invariant: the 'Require Greptile Review' job is gated on draft state alone (plus always())\n"
 else
   TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf "FAIL  invariant: 'Require Greptile Review' must be gated on draft state ALONE for the\n"
-  printf "      draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
+  printf "FAIL  invariant: 'Require Greptile Review' must be gated on 'always() && draft == false'\n"
+  printf "      for the draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
   printf "      If this job legitimately gained a path filter, merge-evidence.sh needs a new\n"
   printf "      discriminator — it can no longer tell a draft run from a path-skipped one.\n"
 fi
 
 # ---------------------------------------------------------------------------
-# Invariant guard — the two halves of ENG-915 must stay in step
+# Invariant guard — test execution stays DECOUPLED from the Greptile gate
 # ---------------------------------------------------------------------------
 #
-# The requirement above is only sound while the workflow really does gate the
-# backend suite on the Greptile result, and only reaches the right jobs while
-# the names match. Both are edits somebody makes in tests.yml, in a PR that
-# never opens this file, so assert them from here.
+# ENG-1039 reversed ENG-915's ordering: the Greptile check failed 61% of the
+# time over 2026-08-01..10 and every failure skipped the backend suite (303
+# skipped executions), destroying the run's test evidence and forcing a full
+# ~31-min re-run. Test evidence must be produced independently of whether the
+# reviewer check answered. The merge gate is unchanged — `greptile-review`
+# remains required and fail-closed — but re-serializing the test jobs behind
+# it is a regression. Assert the workflow here so the coupling cannot creep
+# back in a PR that never opens this file.
 
 GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
 
 for job_key in backend-tests-a backend-tests-b; do
-  # The condition is a `>-` block scalar, so collect every line of it rather
-  # than the `if:` line alone — reading only the first line would find the
-  # folding indicator and silently assert nothing.
-  JOB_IF="$(awk -v job="  ${job_key}:" '
+  # Collect the job's whole header (needs + the `>-` if block scalar) so a
+  # dependency reintroduced in either field is caught.
+  # Comment lines are dropped: they legitimately narrate the ENG-1039 history
+  # and would otherwise trip the substring check below.
+  JOB_HEADER="$(awk -v job="  ${job_key}:" '
     $0 == job            { in_job = 1; next }
     in_job && /^  [a-z]/ { exit }
-    in_job && /^    if:/ { sub(/^    if: */, ""); collecting = 1; print; next }
-    collecting && /^      / { print; next }
-    collecting           { exit }
+    in_job && /^    steps:/ { exit }
+    in_job && /^ *#/     { next }
+    in_job               { print }
   ' "${WORKFLOW}" | tr '\n' ' ')"
 
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.result == 'success'"; then
-    printf "ok    invariant: %s is gated on the Greptile result (ENG-915)\n" "${job_key}"
-  else
+  # ENG-1277: here-string, not a pipe — see the check() fix above for why.
+  if grep -q "greptile" <<<"${JOB_HEADER}"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    printf "FAIL  invariant: %s must require needs.greptile-review.result == 'success'.\n" "${job_key}"
-    printf "      Found: '%s'\n" "${JOB_IF}"
-    printf "      Without it the suite runs on every ready-flip again (ENG-915 AC1), and the\n"
-    printf "      backend-suite requirement in merge-evidence.sh is enforcing an ordering that\n"
-    printf "      no longer exists.\n"
+    printf "FAIL  invariant: %s references greptile-review in needs/if.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_HEADER}"
+    printf "      ENG-1039 decoupled test execution from the reviewer check: a 61%%-flaky\n"
+    printf "      Greptile poll was deciding whether test evidence exists. Do not\n"
+    printf "      re-serialize the suite behind it.\n"
+  else
+    printf "ok    invariant: %s runs independently of the Greptile gate (ENG-1039)\n" "${job_key}"
   fi
 
-  # The outage bypass must stay narrowed to `unavailable`. Widening it to any
-  # non-success result — or to `always()` without a result check — would let a
-  # REFUSED 3/5 run the suite, which is AC1 deleted.
+  # The suite must still be draft-gated and path-gated — decoupling from the
+  # reviewer check must not turn into running on every draft push.
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.outputs.verdict == 'unavailable'"; then
-    if printf '%s' "${JOB_IF}" | grep -qE "verdict != 'pass'|result != 'success'|result != 'failure'"; then
-      TESTS_FAILED=$((TESTS_FAILED + 1))
-      printf "FAIL  invariant: %s bypasses the gate on a NEGATED condition.\n" "${job_key}"
-      printf "      Found: '%s'\n" "${JOB_IF}"
-      printf "      The bypass must name 'unavailable' positively; a negation lets a refused\n"
-      printf "      3/5 through and deletes ENG-915 AC1.\n"
-    else
-      printf "ok    invariant: %s bypasses only on the 'unavailable' verdict\n" "${job_key}"
-    fi
+  if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
+     && grep -qF "needs.detect-changes.outputs.backend == 'true'" <<<"${JOB_HEADER}"; then
+    printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    printf "FAIL  invariant: %s has lost the Greptile-outage bypass.\n" "${job_key}"
-    printf "      Found: '%s'\n" "${JOB_IF}"
-    printf "      Without it a Greptile outage costs every PR its test feedback, not just\n"
-    printf "      its merge.\n"
+    printf "FAIL  invariant: %s must keep the draft gate and backend path filter.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_HEADER}"
   fi
 done
 

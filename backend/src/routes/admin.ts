@@ -23,7 +23,8 @@ import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
-import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
+import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
@@ -36,6 +37,7 @@ import { validateEmail } from "../utils/validation";
 import { resolveConfigTarget } from "../services/analyticsConfigResolver";
 import { readAnalyticsConfig, writeAnalyticsConfig } from "../services/analyticsConfigStore";
 import { validateAnalyticsConfig } from "../services/analyticsConfigValidator";
+import { sweepUndeliverableDomains } from "../services/emailDeliverabilityService";
 
 const router = express.Router();
 
@@ -148,6 +150,10 @@ const ADMIN_USER_LIST_FIELDS = [
   "lastActiveAt",
   "displayName",
   "supportNote",
+  // ENG-720: undeliverable-email flag so support/CS sees replies won't land
+  "emailUndeliverable",
+  "emailUndeliverableReason",
+  "emailUndeliverableAt",
   "role",
   "roles",
   "taskCount",
@@ -184,6 +190,7 @@ const ADMIN_USER_LIST_FIELDS = [
   "tokenUsage",
   "tokenUsageHistory",
   "tokenAllowanceBonus",
+  "llmUsageCredits",
   "extraCostUsage",
   "extraCostUsageHistory",
   "googleDriveFolders",
@@ -228,20 +235,87 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
     }
-    const org = await orgDb.getOrgById(orgId);
-    if (!org) {
-      return res.status(404).json({ message: "Organization not found" });
+    // Guarded read-modify-write with retry: an overlapping share-settings
+    // writer fails the conditional write and we re-apply the toggle on top of
+    // the fresh document instead of clobbering its changes.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; ; attempt++) {
+      const org = await orgDb.getOrgById(orgId);
+      if (!org) {
+        return res.status(404).json({ message: "Organization not found" });
+      }
+      const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
+      const shareSettings = {
+        ...(org.shareSettings ?? {}),
+        analytics: { enabled, editors: existing.editors ?? [] },
+      };
+      try {
+        await orgDb.updateShareSettings(orgId, shareSettings as any, org.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
+          throw writeError;
+        }
+      }
     }
-    const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
-    const shareSettings = {
-      ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors ?? [] },
-    };
-    await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
   } catch (error: any) {
     console.error("Error updating org analytics-sharing:", error.message);
     return res.status(500).json({ message: "Failed to update analytics sharing" });
+  }
+});
+
+// ─── Org billing owner (admin-controlled) ────────────────────────────────
+// PATCH /api/admin/orgs/:orgId/billing-owner  { userId }
+//
+// The escape hatch for the refusal in routes/org.ts: a paying billing owner
+// cannot be removed, because their card cannot follow the badge. When a
+// customer is genuinely stuck — the payer has left the company, say — this
+// moves the pointer deliberately, by a human who knows the plan will now
+// resolve to the new owner's subscription.
+//
+// It does NOT move money. Whatever the new owner is paying becomes what the
+// org gets, which is why the response says so explicitly rather than leaving
+// the operator to infer it.
+router.patch("/orgs/:orgId/billing-owner", async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { userId } = req.body ?? {};
+    if (!userId || typeof userId !== "string") {
+      return res.status(400).json({ message: "Body field 'userId' is required" });
+    }
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+    if (org.ownerUserId === userId) {
+      return res.json({ orgId, ownerUserId: userId, unchanged: true });
+    }
+
+    const target = await userDb.getUserById(userId);
+    if (!target || target.orgId !== orgId) {
+      return res.status(400).json({ message: "That user is not a member of this organization" });
+    }
+    // Owner-only, so the pointer can never rest on someone without the
+    // authority to manage what it pays for.
+    if (target.orgRole !== "owner") {
+      return res.status(400).json({ message: "The billing owner must be an owner of the organization" });
+    }
+
+    const previous = org.ownerUserId;
+    await orgDb.updateOrg(orgId, { ownerUserId: userId });
+    console.log(`[admin] billing owner for ${orgId}: ${previous} -> ${userId} (by ${(req as any).user?.userId})`);
+
+    return res.json({
+      orgId,
+      ownerUserId: userId,
+      previousOwnerUserId: previous,
+      // Said out loud: this moved the pointer, not the payment method.
+      note: "Billing pointer moved. The org's plan now resolves to the new owner's own subscription; the previous owner's Stripe subscription is untouched and still bills them.",
+      newOwnerSubscription: target.subscriptionType ?? "Free",
+      newOwnerSubscriptionStatus: target.subscription_status ?? "none",
+    });
+  } catch (error: any) {
+    console.error("Error updating org billing owner:", error.message);
+    return res.status(500).json({ message: "Failed to update billing owner" });
   }
 });
 
@@ -626,7 +700,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
       ? await crmDb.batchCreateLeads(parsed.listId, leads)
-      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
     if (results.errorCount === 0) {
@@ -644,6 +718,16 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       );
     }
 
+    // ENG-1002: this route reports `attemptedCount` outright, so a row refused
+    // as a LinkedIn placeholder leaves attempted > success + errors with
+    // nothing to explain the difference. Report it in both the payload and the
+    // message, as the other import paths do.
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
+    const skippedNote =
+      syncAnonymizedSkipped > 0
+        ? ` ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped.`
+        : "";
+
     return res.json({
       success: true,
       source,
@@ -656,15 +740,29 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
       message:
-        results.errorCount === 0
+        (results.errorCount === 0
           ? `Synced ${results.successCount} record(s) from ${source}.`
-          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`) +
+        skippedNote,
     });
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
     return res.status(500).json({ message: error.message || "Error running CRM sync" });
+  }
+});
+
+// ENG-720 AC4: report-only MX sweep — active accounts whose email domain
+// fails MX resolution. Repairing/contacting those users is a human decision.
+router.get("/email-deliverability/mx-sweep", async (_req, res) => {
+  try {
+    const report = await sweepUndeliverableDomains();
+    res.json(report);
+  } catch (error) {
+    console.error("Error running MX sweep:", error);
+    res.status(500).json({ error: "Failed to run MX sweep" });
   }
 });
 
@@ -1195,15 +1293,24 @@ router.put("/users/:userId/email-sender", async (req, res) => {
 router.get("/slack/channel-info", async (req, res) => {
   try {
     const { channelId } = req.query;
-    if (!channelId || typeof channelId !== "string") {
+    if (typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const configuredChannelId = channelId.trim();
+    if (!configuredChannelId) {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const info = await getSlackChannelInfo(channelId.trim());
+    const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
-      return res.status(404).json({ message: "Channel not found or bot not a member" });
+      return res.json({
+        channelId: configuredChannelId,
+        displayName: configuredChannelId,
+        resolved: false,
+        message: "Channel not found or bot not a member",
+      });
     }
-    res.json(info);
+    res.json({ ...info, channelId: configuredChannelId, resolved: true });
   } catch (error: any) {
     console.error("Error fetching Slack channel info:", error);
     res.status(500).json({ message: "Error fetching channel info", details: error.message });
@@ -3132,11 +3239,11 @@ router.get("/chat-sessions", async (req, res) => {
       }
     }
 
-    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
-      limit,
-      lastEvaluatedKey,
-      timeRange
-    );
+    const {
+      sessions,
+      lastEvaluatedKey: nextKey,
+      gapQueryTruncated,
+    } = await chatbotDb.getRecentSessionsPage(limit, lastEvaluatedKey, timeRange);
 
     // Load messages from the messages table for each session
     const sessionsWithMessages = await Promise.all(
@@ -3152,6 +3259,32 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    // ENG-1332: coverage metadata travels with the response so a caller (e.g.
+    // the Daily Satisfaction Score Report) can state its own denominator
+    // honestly instead of inferring one from sessions.length.
+    let scoringCoverage:
+      | {
+          requestedRangeCount: number;
+          totalFetched: number;
+          alreadyScored: number;
+          newlyScored: number;
+          // ENG-1332 (Greptile): named `unscored`, not `skippedForBudget` — an
+          // in-range session lands here whenever it has no persisted score
+          // after this run, whether that's because the scoring budget ran out
+          // (see `timedOut`), the scorer threw, it intentionally returned no
+          // score, or it lost the conditional-write race to an admin override.
+          // The old name implied budget was always the cause; it usually
+          // isn't distinguishable from here, so the name no longer claims it.
+          unscored: number;
+          timedOut: boolean;
+          // True when the gap query (see getRecentSessionsPage) hit its page
+          // cap before exhausting [endTime, now] — some late-touched in-range
+          // sessions may exist beyond where it stopped, so requestedRangeCount
+          // may understate the true population for this window.
+          requestedRangeMayBeIncomplete: boolean;
+        }
+      | undefined;
+
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3163,6 +3296,26 @@ router.get("/chat-sessions", async (req, res) => {
       } catch (error) {
         console.error("Error loading scoring judges for sync mode:", error);
       }
+
+      // ENG-1332 (Greptile): alreadyScored/newlyScored must be counted over the
+      // same population as requestedRangeCount, or a time-range sync that also
+      // fetched historical sessions (touched, not created, in the window) can
+      // report a scored total that exceeds its own denominator. Scope both to
+      // sessions actually created in the requested range.
+      const inRangeSessions = timeRange
+        ? sessionsWithMessages.filter(
+            (session: any) =>
+              session.createdAt &&
+              session.createdAt >= timeRange.startTime &&
+              session.createdAt <= timeRange.endTime
+          )
+        : sessionsWithMessages;
+      const requestedRangeCount = inRangeSessions.length;
+      const alreadyScoredIds = new Set(
+        inRangeSessions
+          .filter((session: any) => session.satisfactionScore?.evaluatedAt)
+          .map((session: any) => session.sessionId)
+      );
 
       // ENG-291: score with bounded concurrency under a wall-clock budget and
       // apply the results in-memory. This returns before the tool timeout even on
@@ -3179,6 +3332,33 @@ router.get("/chat-sessions", async (req, res) => {
           `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
         );
       }
+
+      const newlyScored = inRangeSessions.filter(
+        (session: any) =>
+          session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
+      ).length;
+
+      // ENG-1332 (Greptile): backfill.skipped counts across the FULL fetched
+      // set (in-range + historical), the same population mismatch as
+      // alreadyScored/newlyScored above. What the report actually needs — "how
+      // many requested-window sessions remain unscored" — is fully derivable
+      // from the counts already scoped to inRangeSessions: every in-range
+      // session is accounted for by exactly one of alreadyScored (had a score
+      // already), newlyScored (scored this run), or neither — so the
+      // remainder is the honest, correctly-scoped count. It is NOT purely a
+      // budget count (see the `unscored` field comment above), which is why
+      // it's paired with `timedOut` rather than named after budget alone.
+      const unscored = requestedRangeCount - alreadyScoredIds.size - newlyScored;
+
+      scoringCoverage = {
+        requestedRangeCount,
+        totalFetched: sessionsWithMessages.length,
+        alreadyScored: alreadyScoredIds.size,
+        newlyScored,
+        unscored,
+        timedOut: backfill.timedOut,
+        requestedRangeMayBeIncomplete: gapQueryTruncated === true,
+      };
     }
 
     const nextCursor = nextKey
@@ -3192,7 +3372,11 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringCoverage ? { scoringCoverage } : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
@@ -4607,6 +4791,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4615,6 +4800,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
+        allowedFeatures: allAvailableFeatures,
       }];
     }
 
@@ -4647,6 +4833,11 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
 
@@ -4656,10 +4847,13 @@ router.get("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
         ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
+        ...(type.llmUsagePolicy ? { llmUsagePolicy: type.llmUsagePolicy } : {}),
+        ...(type.llmUsageTopUp ? { llmUsageTopUp: type.llmUsageTopUp } : {}),
       };
     }));
 
@@ -4684,6 +4878,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4695,6 +4890,9 @@ router.post("/subscription-types", async (req, res) => {
       }
       if (!Array.isArray(type.allowedSkills)) {
         throw new Error("Each subscription type must have allowedSkills array");
+      }
+      if (type.allowedFeatures !== undefined && !Array.isArray(type.allowedFeatures)) {
+        throw new Error("allowedFeatures must be an array when provided");
       }
 
       // Remove "/marketing" prefix from allowedPages if present
@@ -4724,6 +4922,11 @@ router.post("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4736,6 +4939,72 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyCostAllowance)
         : null;
 
+      let normalizedLlmUsagePolicy: any = undefined;
+      if (type.llmUsagePolicy != null) {
+        const { validateLlmUsagePolicy } = await import('../services/llmUsagePolicyService');
+        const { getModelPrice } = await import('../utils/llmPricing');
+        const { agentModeService } = await import('../services/agentModeService');
+        normalizedLlmUsagePolicy = {
+          version: String(type.llmUsagePolicy.version || '').trim(),
+          enforcementState: type.llmUsagePolicy.enforcementState,
+          optimizationCostThresholdMicroUsd: Number(type.llmUsagePolicy.optimizationCostThresholdMicroUsd),
+          hardCostThresholdMicroUsd: Number(type.llmUsagePolicy.hardCostThresholdMicroUsd),
+          optimizedModelIds: Array.isArray(type.llmUsagePolicy.optimizedModelIds)
+            ? [...new Set(type.llmUsagePolicy.optimizedModelIds.map((model: unknown) => String(model).trim()).filter(Boolean))]
+            : [],
+          optimizedDefaultModel: String(type.llmUsagePolicy.optimizedDefaultModel || '').trim(),
+          // ENG-1214 AC5. Carried through RAW and only when present.
+          //
+          // Raw, because `validateLlmUsagePolicy` rejects a present-but-invalid
+          // value: coercing here (Number(...), `=== true`) would turn every bad
+          // input into a valid-looking one and make that validation a no-op, so
+          // an admin typing 100 would silently get a threshold that never fires.
+          //
+          // Only when present, because this object is built from an explicit
+          // whitelist and REPLACES the stored policy. Materialising a default
+          // here would freeze today's 90 onto every tier, after which the
+          // default could never move; and absent must stay distinguishable from
+          // deliberately-configured-to-90.
+          ...(type.llmUsagePolicy.alertUsagePercentThreshold !== undefined
+            ? { alertUsagePercentThreshold: type.llmUsagePolicy.alertUsagePercentThreshold }
+            : {}),
+          ...(type.llmUsagePolicy.alertOnForecastShortfall !== undefined
+            ? { alertOnForecastShortfall: type.llmUsagePolicy.alertOnForecastShortfall }
+            : {}),
+        };
+        const policyErrors = validateLlmUsagePolicy(normalizedLlmUsagePolicy);
+        const supportedModels = new Set(await agentModeService.getSupportedModels(true));
+        for (const model of normalizedLlmUsagePolicy.optimizedModelIds) {
+          if (!supportedModels.has(model)) policyErrors.push(`optimized model '${model}' is not supported`);
+          if (!getModelPrice(model)) policyErrors.push(`optimized model '${model}' has no price entry`);
+        }
+        if (policyErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage policy: ${policyErrors.join('; ')}`);
+        }
+      }
+
+      let normalizedLlmUsageTopUp: any = undefined;
+      if (type.llmUsageTopUp != null) {
+        const { validateLlmUsageTopUpConfig } = await import('../services/llmUsageTopUpService');
+        normalizedLlmUsageTopUp = {
+          enabled: type.llmUsageTopUp.enabled === true,
+          minimumMarkupBps: Number(type.llmUsageTopUp.minimumMarkupBps),
+          packages: Array.isArray(type.llmUsageTopUp.packages)
+            ? type.llmUsageTopUp.packages.map((item: any) => ({
+                id: String(item.id || '').trim(),
+                label: String(item.label || '').trim(),
+                priceCents: Number(item.priceCents),
+                usageCreditMicroUsd: Number(item.usageCreditMicroUsd),
+                active: item.active === true,
+              }))
+            : [],
+        };
+        const topUpErrors = validateLlmUsageTopUpConfig(normalizedLlmUsageTopUp);
+        if (topUpErrors.length > 0) {
+          throw new Error(`${type.name} LLM usage top-up: ${topUpErrors.join('; ')}`);
+        }
+      }
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -4747,8 +5016,11 @@ router.post("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
+        ...(normalizedLlmUsagePolicy ? { llmUsagePolicy: normalizedLlmUsagePolicy } : {}),
+        ...(normalizedLlmUsageTopUp ? { llmUsageTopUp: normalizedLlmUsageTopUp } : {}),
       };
     }));
 
@@ -4765,6 +5037,11 @@ router.post("/subscription-types", async (req, res) => {
     console.error("Error saving subscription types:", error);
     res.status(400).json({ message: error.message || "Error saving subscription types" });
   }
+});
+
+router.get("/subscription-features", async (_req, res) => {
+  const subscriptionService = await import('../services/subscriptionService');
+  res.json({ features: subscriptionService.getAllAvailableSubscriptionFeatures() });
 });
 
 // Add or remove a single skill from a subscription type
@@ -4974,6 +5251,69 @@ router.post("/users/:userId/token-bonus", async (req, res) => {
   } catch (error) {
     console.error("Error granting token bonus:", error);
     res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Grant an auditable, idempotent one-time provider-cost credit for this month.
+// This is the cost-based replacement for ad-hoc token bonuses once a tier has a
+// versioned LLM usage policy. Org members resolve to their billing owner so the
+// grant and the enforced counter cannot diverge.
+router.post("/users/:userId/llm-usage-credit", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { amountUsd, reason, idempotencyKey } = req.body || {};
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res.status(400).json({ message: "amountUsd must be a positive number" });
+    }
+    // Admin grants are audited in cents on payment-history — sub-cent grants
+    // cannot be represented faithfully there, so reject them here with a 400
+    // instead of letting the service layer throw and surface as a generic 500.
+    // Check whole-cent-ness BEFORE rounding: a naive `Math.round(x * 1e6) % 1e4`
+    // silently lifts $0.0099999 to 1c and grants it. Comparing the pre-round
+    // value against its rounded-cents equivalent (with a floating-point
+    // epsilon) catches over-precise input up to representation limits.
+    const centsExact = amountUsd * 100;
+    const centsRounded = Math.round(centsExact);
+    // Tight epsilon (1e-9) — legitimate 2-decimal IEEE-754 representations
+    // (`0.10 * 100 = 10.000000000000002`) sit at ~2e-15 and pass; over-precise
+    // inputs like `0.009999999` (1e-7 diff) fail. 1e-6 was too loose and let
+    // 7-9-nines sub-cent inputs silently lift to 1c.
+    if (Math.abs(centsExact - centsRounded) > 1e-9) {
+      return res.status(400).json({
+        message: "amountUsd must be in whole cents (2 decimal places max)",
+      });
+    }
+    const amountMicroUsd = centsRounded * 10_000;
+    if (typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ message: "reason is required" });
+    }
+    if (typeof idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{8,100}$/.test(idempotencyKey)) {
+      return res.status(400).json({ message: "idempotencyKey must be 8-100 URL-safe characters" });
+    }
+    const targetUser = await userDb.getUserById(userId);
+    if (!targetUser) return res.status(404).json({ message: "User not found" });
+
+    const billingUserId = await resolveBillingUserId(userId);
+    const admin = (req as any).user;
+    const result = await grantMonthlyLlmUsageCredit({
+      billingUserId,
+      grantId: `admin:${billingUserId}:${idempotencyKey}`,
+      source: "admin",
+      amountMicroUsd,
+      reason,
+      grantedBy: admin?.email || admin?.userId || "admin",
+    });
+    return res.json({
+      granted: result.granted,
+      billingUserId,
+      amountUsd: amountMicroUsd / 1_000_000,
+      month: result.ledger.month,
+      totalAdminGrantedUsd: (result.ledger.totalAdminGrantedMicroUsd || 0) / 1_000_000,
+      grants: result.ledger.grants,
+    });
+  } catch (error) {
+    console.error("Error granting LLM usage credit:", error);
+    return res.status(500).json({ message: "Error granting LLM usage credit" });
   }
 });
 
@@ -5219,7 +5559,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
       adminOverride: true as const,
     };
 
-    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore);
+    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore, { allowOverride: true });
 
     res.json({ satisfactionScore });
   } catch (error: any) {

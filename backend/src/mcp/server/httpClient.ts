@@ -6,6 +6,7 @@
 import jwt from 'jsonwebtoken';
 import { getJwtSecret } from '../../config/jwt';
 import { Agent, setGlobalDispatcher } from 'undici';
+import { SCHEDULED_SESSION_HEADER } from '../../utils/scheduledPublishConsentGuard';
 
 // Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
 // is too short for MCP tools that call slow endpoints (e.g. generate_landing_page
@@ -27,7 +28,7 @@ interface UserRecord {
 interface McpFetchOptions {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string;
-  context: { userId?: string; agentUserId?: string; isDelegatedAccess?: boolean };
+  context: { userId?: string; agentUserId?: string; isDelegatedAccess?: boolean; sessionId?: string };
   body?: Record<string, unknown>;
   queryParams?: Record<string, string>;
   /** Override the default 5-minute timeout (in ms). Use for long-running calls like v0 generation. */
@@ -115,6 +116,13 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     // for lifecycle telemetry — see services/landerLifecycleEvents.ts.
     'X-AgentWeb-Channel': 'agent',
   };
+
+  // ENG-827: carries the scheduled run's identity to the route so it can re-check
+  // publish consent against live state at its own last moment. Absent for ordinary
+  // interactive calls, which are not gated.
+  if (context.sessionId) {
+    headers[SCHEDULED_SESSION_HEADER] = String(context.sessionId);
+  }
 
   const controller = new AbortController();
   const effectiveTimeout = options.timeoutMs ?? 5 * 60 * 1000; // default 5 minutes

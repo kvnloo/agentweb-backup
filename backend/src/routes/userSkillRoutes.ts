@@ -1,10 +1,12 @@
 import express from "express";
-import { skillService, Skill } from "../services/skillService";
+import { skillService } from "../services/skillService";
 import { userDb, orgDb } from "../services/db";
+import { can } from "../services/orgAuthz";
 import {
   canEditItem,
-  isFeatureEffectivelyEnabled,
 } from "../services/orgShareService";
+import { resolveUserSkillAccess } from "../services/userSkillAccessService";
+import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 
 const router = express.Router();
 
@@ -12,29 +14,10 @@ const router = express.Router();
 router.get("/", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const user = await userDb.getUserById(userId);
-    const orgId = user?.orgId;
-    const org = orgId ? await orgDb.getOrgById(orgId) : null;
-    const skillsEnabled = isFeatureEffectivelyEnabled(
-      { userId, orgId, orgRole: user?.orgRole as "owner" | "member" | undefined },
-      org,
-      "skills",
-    );
+    const { sharedOrgId } = await resolveUserSkillAccess(userId);
 
-    const [ownSkills, publicSkills, systemSkills, orgSkills] = await Promise.all([
-      skillService.getSkillsByOwner(userId),
-      skillService.getSkillsByVisibility('public'),
-      skillService.getSkillsByVisibility('system'),
-      (orgId && skillsEnabled) ? skillService.getSkillsByOrg(orgId, userId) : Promise.resolve([] as Skill[]),
-    ]);
-
-    const seen = new Set<string>();
-    const all = [...ownSkills, ...orgSkills, ...publicSkills, ...systemSkills].filter(s => {
-      if (seen.has(s.skillId)) return false;
-      seen.add(s.skillId);
-      return true;
-    });
-    res.json({ items: all, truncated: false });
+    const items = await skillService.getSkillsAvailableToUser(userId, sharedOrgId);
+    res.json({ items, truncated: false });
   } catch (error) {
     console.error("Error fetching user skills:", error);
     res.status(500).json({ message: "Failed to fetch skills" });
@@ -57,10 +40,14 @@ router.get("/mine", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { name, description, toolNames, systemPrompt } = req.body;
+    const { name, description, toolNames, systemPrompt, welcomeMessage } = req.body;
 
     if (!name || !description) {
       return res.status(400).json({ message: "Name and description are required" });
+    }
+    const welcomeMessageError = validateWelcomeMessage(welcomeMessage);
+    if (welcomeMessageError) {
+      return res.status(400).json({ message: welcomeMessageError });
     }
 
     const user = await userDb.getUserById(userId);
@@ -69,13 +56,9 @@ router.post("/", async (req, res) => {
     // Skills are member-owned: any user may create their own. Org-wide
     // visibility is governed separately by the shareSettings `enabled` toggle.
 
-    const skill = await skillService.createSkill(
-      name,
-      description,
-      toolNames || [],
-      systemPrompt,
-      false // not published
-    );
+    const skill = welcomeMessage !== undefined
+      ? await skillService.createSkill(name, description, toolNames || [], systemPrompt, false, welcomeMessage)
+      : await skillService.createSkill(name, description, toolNames || [], systemPrompt, false);
 
     // Set ownership, visibility, and org membership
     skill.ownerId = userId;
@@ -120,13 +103,18 @@ router.put("/:skillId", async (req, res) => {
       return res.status(403).json({ message: "Cannot edit skills that are public or pending review" });
     }
 
-    const { name, description, toolNames, systemPrompt } = req.body;
+    const { name, description, toolNames, systemPrompt, welcomeMessage } = req.body;
+    const welcomeMessageError = validateWelcomeMessage(welcomeMessage);
+    if (welcomeMessageError) {
+      return res.status(400).json({ message: welcomeMessageError });
+    }
     const updated = {
       ...skill,
       ...(name !== undefined && { name }),
       ...(description !== undefined && { description }),
       ...(toolNames !== undefined && { toolNames }),
       ...(systemPrompt !== undefined && { systemPrompt }),
+      ...(welcomeMessage !== undefined && { welcomeMessage }),
     };
     await skillService.updateSkill(updated);
     res.json(updated);
@@ -150,9 +138,12 @@ router.delete("/:skillId", async (req, res) => {
     if (skill.ownerId !== userId) {
       const callerUser = await userDb.getUserById(userId);
       let allowed = false;
-      if (callerUser?.orgRole === "owner" && callerUser?.orgId && skill.ownerId) {
-        const owner = await userDb.getUserById(skill.ownerId);
-        if (owner?.orgId === callerUser.orgId) allowed = true;
+      if (callerUser?.orgId && skill.ownerId) {
+        const callerOrg = await orgDb.getOrgById(callerUser.orgId);
+        if (can({ userId, orgId: callerUser.orgId, orgRole: callerUser.orgRole }, callerOrg, "org:content:manage")) {
+          const owner = await userDb.getUserById(skill.ownerId);
+          if (owner?.orgId === callerUser.orgId) allowed = true;
+        }
       }
       if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }

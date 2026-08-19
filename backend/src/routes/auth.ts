@@ -11,6 +11,7 @@ import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
+import { resolveOrgProfileField } from '../services/orgProfileResolver';
 
 const router = express.Router();
 
@@ -98,7 +99,7 @@ router.get('/me', authenticateToken, async (req, res) => {
     // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
-        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getHiddenPages } = await import('../services/subscriptionService');
+        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getAllowedFeatures, getHiddenPages } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
         // Resolution (including the org-owner fallback and the own-active-
@@ -113,6 +114,7 @@ router.get('/me', authenticateToken, async (req, res) => {
 
         // Get allowed pages (expands "*" to actual list)
         response.allowedPages = await getAllowedPages(userId);
+        response.allowedFeatures = await getAllowedFeatures(userId);
 
         // Get hidden pages
         response.hiddenPages = await getHiddenPages(userId);
@@ -141,7 +143,10 @@ router.get('/me', authenticateToken, async (req, res) => {
         // is genuinely paying independently (same discriminator as getUserSubscriptionType).
         const hasOwnActiveSubscriptionForOverlay =
           user.subscription_status === 'active' || user.subscription_status === 'trialing';
-        if (!hasOwnActiveSubscriptionForOverlay && user.orgRole === 'member' && org?.ownerUserId && org.ownerUserId !== userId) {
+        // Keyed on the billing root rather than on `orgRole === 'member'`: an admin
+        // (or a second owner) is not "member", so the old test skipped the overlay
+        // and showed them their own empty billing record instead of the org's.
+        if (!hasOwnActiveSubscriptionForOverlay && org?.ownerUserId && org.ownerUserId !== userId) {
           const ownerUser = await userDb.getUserById(org.ownerUserId);
           if (ownerUser) {
             response.subscription_status = ownerUser.subscription_status;
@@ -158,6 +163,7 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.subscriptionType = 'Free';
         response.allowedPages = await getAllowedPages(userId);
         response.allowedSkills = [];
+        response.allowedFeatures = [];
       }
     }
 
@@ -168,7 +174,21 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.orgId = org.orgId;
       response.orgName = org.name;
       response.orgRole = user.orgRole;
-      response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      // Org-level brand, falling back to the owner's record when the org was
+      // created without copying the profile over, so this reports the same
+      // brand the Brand Guidelines page serves (ENG-927). Read by MCP's
+      // `emma_get_account_status` as `is_onboarded`.
+      // Guarded like every other org-derived enrichment in this handler: the
+      // fallback can issue an owner-record read, and `/me` is the endpoint the
+      // whole app boots off — a transient failure must degrade this one flag,
+      // not the entire response.
+      try {
+        const orgBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
+        response.hasBrandGuidelines = !!(orgBrand?.brandData?.brandName);
+      } catch (e: any) {
+        console.error('Error resolving org brand for /me:', e?.message);
+        response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      }
       // Merge org-level and user-level Drive folders so legacy user-record folders
       // (added before the org feature) continue to appear in the UI without migration.
       const orgFolders: Array<{ folderId: string; name: string }> =

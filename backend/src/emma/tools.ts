@@ -492,7 +492,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -505,6 +505,10 @@ Actions:
 - accept-invitation: (exact action string: "accept-invitation") Accept a received connection request. Requires invitation_id and shared_secret — both obtained from list-received-invitations.
 - update-conversation-history: Fetch the full message history with a LinkedIn contact from Unipile and persist it to the lead's CRM engagement activities. Also updates the lead's sync timestamp so send-message is unblocked for the next 24 hours. Requires list_id and lead_id in addition to profile_url or provider_id.
 - search-parameters: Resolve a free-text query (company name, location, industry, school, service) to LinkedIn entity IDs via Unipile's parameter search. Required: type (one of COMPANY, LOCATION, INDUSTRY, SCHOOL, SERVICE) and keywords. Optional limit. Returns ranked candidates with id/title/subtitle plus fromCache and source metadata. Use the returned id with the matching *_id field on search-people for precise structured filtering.
+
+SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
+
+ANONYMIZED RESULTS: LinkedIn hides out-of-network people behind a placeholder profile. Those are dropped from search-people results, and the count is reported as anonymizedFiltered. If items is empty but anonymizedFiltered is greater than zero, the search WORKED and the niche is NOT empty — everyone matching was simply out of reach of the account used. Do not report that as "no results found" and do not escalate it as a broken search; broaden the query or use an account whose network reaches these people. On get-profile the row cannot be dropped, so it comes back with anonymized:true and no profile URL.
 
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
@@ -736,7 +740,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterManagePost(context.userId, args);
+    return await agentModeService.twitterManagePost(context.userId, args, context);
   }
 });
 
@@ -876,6 +880,23 @@ emmaToolRegistry.register({
     description:
       `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
 
+LAUNCH GATE: setting a CAMPAIGN, AD_SET or AD to status=ACTIVE starts paid delivery, so it runs a pre-flight
+  tracking check on the campaign's destination URLs first. A destination is measurable only if its served HTML
+  carries a Meta pixel AND that pixel is one this ad account can use — a pixel belonging to some other account
+  will never receive these conversions, so it does not count. If any destination fails, the launch is BLOCKED
+  (result has blocked=true, reason='tracking_preflight') and the message names each destination and what was
+  checked. Relay that to the user and help them fix tracking. If the message notes the account's pixel is
+  receiving events server-side, the page may be measured through the Conversions API, which this check cannot
+  see. Only pass params.override_tracking_check=true if the user explicitly chooses to launch anyway — never set
+  it on your own initiative, and never to work around a block you cannot explain. A failure to VERIFY (Meta API
+  or fetch error) also blocks: unverified is treated as unmeasured, never as measured.
+  The override only takes effect once the user has SEEN it: put params.override_tracking_check=true on the
+  unconfirmed preview call, show the user the WARNING line that comes back in the summary, and on the confirmed
+  call pass params.tracking_override_token exactly as the preview returned it, alongside params.confirm=true.
+  Adding the override only to the confirmed call, or changing any other argument after the preview, invalidates
+  it — the API returns a fresh preview instead of launching. There is no way to waive the check without the user
+  being shown that it is being waived.
+
 ⚠️ MANDATORY TARGET CONFIRMATION (publish/change/delete actions):
   CAMPAIGN/AD_SET/AD with CREATE, UPDATE, DELETE, or COPY_AD are write actions that publish, change, or
   destroy live entities. For these, the API runs a two-phase confirmation:
@@ -921,8 +942,15 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
-  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / bid_strategy. Pass campaign_id to read a single campaign.
+  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / spend_cap / bid_strategy. Pass campaign_id to read a single campaign. budget_remaining is only populated by Meta when the campaign itself carries the budget (CBO); for ad-set-budgeted campaigns it is absent — read the ad sets' budgets instead, do not infer 0.
   Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
+
+SPEND CAP (campaign hard money stop):
+  params.spend_cap sets the campaign's lifetime hard stop, in CENTS (e.g. 300000 = $3,000). Writable on CAMPAIGN CREATE and CAMPAIGN UPDATE.
+  Every spend_cap write is verified server-side by re-reading the campaign, and the result says which happened:
+    spend_cap_verified:true  → the cap is really on the campaign (the value is echoed back as spend_cap). ONLY then may you tell the user a cap is in place.
+    spend_cap_verified:false with error SPEND_CAP_UNCONFIRMED → the cap could not be confirmed. This does NOT mean it failed: Meta sometimes reports a campaign without the field for a few seconds after a write that did land. Never claim the cap is set, and never announce it as missing either — re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap"). If it is still absent, apply it with CAMPAIGN UPDATE (on CREATE the campaign already exists — use the returned campaign id, do NOT create it again). The message says what was actually read.
+  Never report a spend cap as set based on the write response alone.
 
 DATASET USAGE:
   LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
@@ -950,11 +978,14 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
+                        Optional: status, spend_cap (cents), advantage_campaign_budget + budget_amount (dollars).
+                        Any OTHER param is REJECTED before the campaign is created, naming the field — nothing is ever accepted and silently dropped. Campaign-level budget goes through advantage_campaign_budget + budget_amount (never a bare daily_budget/lifetime_budget); scheduling (start_time/stop_time) comes from the AD SETS, because Meta accepts those on a campaign create and then ignores them; ad-set fields (bid_strategy, targeting, optimization_goal, billing_event) belong on AD_SET CREATE.
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
                         NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
+                        After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
@@ -1093,6 +1124,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
+            spend_cap: { type: "integer", minimum: 1, description: "CAMPAIGN CREATE/UPDATE: lifetime hard-stop spend cap for the campaign, as a positive WHOLE number of CENTS (e.g. 300000 = $3,000) — never dollars, never fractional. The write is verified by an independent read-back — see SPEND CAP in the tool description; only claim the cap is set when spend_cap_verified is true. Read it back any time via CAMPAIGN LIST with params.fields including spend_cap." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
 
             // --- Ad Set ---
@@ -1814,7 +1846,12 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
         creatives: args.creatives,
       }
     );
-  }
+  },
+  // ENG-1276 follow-up: only fetches analytics (getAdAnalytics) — no
+  // write-capable action in this tool's schema at all, unlike its sibling
+  // call_linkedin_marketing_api (CREATE/UPDATE/UPLOAD/SEND), which stays
+  // unflagged on purpose.
+  readOnly: true
 });
 
 emmaToolRegistry.register({
@@ -1948,16 +1985,28 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
-    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
+    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set. The response is size-bounded: full competitor descriptions come one page at a time, further competitors are listed by name with a bracketed offset where space allows, and on a very large roster some stored competitors are NOT named at all (the response says how many). totalCompetitors is always the true stored count. NEVER conclude a competitor is absent because it does not appear in the response — before adding any competitor, verify with competitorNames, which answers stored/not-stored regardless of what this page shows. Use competitorOffset (or the returned nextCompetitorOffset) to read further descriptions.',
     inputSchema: {
       type: 'object',
       properties: {
+        competitorOffset: {
+          type: 'number',
+          description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; further ones are listed by name where space allows. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
+        },
+        competitorNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. Names to check against the stored competitor list. The response answers stored/not-stored for each (with its offset when stored), regardless of whether that competitor appears in this page. ALWAYS use this before adding competitors to a large market strategy — it is the reliable way to avoid re-adding one that already exists. Up to 50 names per call.'
+        }
       },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId);
+    return await agentModeService.readMarketStrategy(context?.userId, {
+      competitorOffset: args?.competitorOffset,
+      competitorNames: args?.competitorNames,
+    });
   }
 });
 
@@ -2103,7 +2152,11 @@ emmaToolRegistry.register({
       args.focus_areas,
       context?.userId
     );
-  }
+  },
+  // ENG-1276 follow-up: performDeepResearchTool only calls Gemini Deep Research
+  // and uploads the result to internal S3 — no external publish, no CRM write,
+  // no third-party account action. Same shape as perform_data_analysis.
+  readOnly: true
 });
 
 // --- Tools from contentTools.ts ---
@@ -2530,7 +2583,13 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.status,
       args.author,
-      args.categories
+      args.categories,
+      // ENG-827: this registry — not the MCP one — is what a live Emma session
+      // dispatches through, so dropping the hook here left the CMS write unguarded on
+      // the path that actually runs. publishBlogArticle fetches the article HTML over
+      // the network before it writes, so the dispatcher's admission check precedes the
+      // slow part rather than the irreversible one; this is re-run at the CMS write.
+      context?.assertPublishStillAuthorized
     );
   }
 });
@@ -3391,7 +3450,7 @@ emmaToolRegistry.register({
   name: 'add_leads_to_list',
   definition: {
     name: 'add_leads_to_list',
-    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
+    description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. IMPORTING A FILE: pass the WHOLE set of rows in ONE call — the backend already writes in chunks internally, and splitting a file across many calls only burns turn time and risks the import being cut off part-way. The call is safe to repeat: a row that is already in the list merges or is reported as already present, it is never duplicated (rows with no email and no LinkedIn URL dedupe on name+company). RESULT: `attempted`, a `reconciliation` breakdown (created / merged / alreadyPresent / duplicateInRequest / anonymizedSkipped / failed / unprocessed), `importedIdentifiers` naming every row now in the list, and — when the import did not complete — `resumable: true`, `unimportedRows` naming the rows that did not land, and `unimportedRowRanges` giving the positions of EVERY row that did not land within the rows you just sent (e.g. "7,19,101-220"). On a very large partial `unimportedRows` can be trimmed and says so; `unimportedRowRanges` is never truncated, so resend every row it names. If you get a partial result, immediately call this tool again with just those rows, and repeat until a result comes back with `complete: true`. Never end the turn telling the user to retry the import themselves.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3419,7 +3478,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId);
+    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId, {
+      // The turn's real cap, not `runBudgetDeadlineMs` — that one carries the media-gen
+      // soft deadline, which is neither a bound on the turn nor still meaningful once it
+      // has passed (ENG-1133).
+      turnDeadlineMs: context?.turnHardCapMs,
+    });
   }
 });
 
@@ -4325,7 +4389,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
+    // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
+    // runs immediately before the post becomes real — see postOnConnectedAccount.
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
   }
 });
 
@@ -4377,7 +4443,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.linkedinManagePost(context?.userId, args);
+    return await agentModeService.linkedinManagePost(context?.userId, args, context);
   }
 });
 
@@ -4829,9 +4895,14 @@ emmaToolRegistry.register({
         confirm: {
           type: 'boolean',
           description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
+        },
+        category: {
+          type: 'string',
+          enum: ['ad', 'organic_post'],
+          description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
         }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4851,7 +4922,8 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.imageModel,
       args.logo_image,
-      args.confirm
+      args.confirm,
+      args.category
     );
   }
 });
@@ -6319,7 +6391,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
+    const { bootstrapEmailProviders, resolveEmailAccount, withAccessGuard, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6327,20 +6399,29 @@ emmaToolRegistry.register({
     await bootstrapEmailProviders();
 
     try {
-      const { provider } = await resolveEmailAccount(userId, args.account_id);
+      // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
+      // record, and that is where the provider reads (and refreshes) its tokens.
+      // A send is resolved as a write, so it is refused on a teammate's mailbox.
+      const operation = args.action === 'send' ? 'send' : 'read';
+      const resolved = await resolveEmailAccount(userId, args.account_id, operation);
+      const { provider, ownerUserId } = resolved;
+      // Every provider call runs inside withAccessGuard: a teammate's shared
+      // mailbox is re-checked immediately before the call AND before the result
+      // is returned, so a share revoked mid-read discloses nothing.
+      const guarded = <T>(read: () => Promise<T>) => withAccessGuard(userId, resolved, operation, read);
 
       switch (args.action) {
         case 'search': {
           if (!args.query) return { error: 'search action requires a query parameter.' };
           const maxResults = Math.min(args.max_results || 10, 50);
-          const results = await provider.searchEmails(userId, args.account_id, args.query, maxResults);
+          const results = await guarded(() => provider.searchEmails(ownerUserId, args.account_id, args.query, maxResults));
           if (results.length === 0) return { message: 'No emails found matching your search.' };
           return { emails: results, count: results.length };
         }
 
         case 'list': {
           const maxResults = Math.min(args.max_results || 20, 50);
-          const results = await provider.listEmails(userId, args.account_id, args.folder || 'INBOX', maxResults);
+          const results = await guarded(() => provider.listEmails(ownerUserId, args.account_id, args.folder || 'INBOX', maxResults));
           if (results.length === 0) return { message: 'No emails found.' };
           return { emails: results, count: results.length };
         }
@@ -6348,7 +6429,7 @@ emmaToolRegistry.register({
         case 'get': {
           const ids: string[] = Array.isArray(args.message_ids) ? args.message_ids : [];
           if (ids.length === 0) return { error: 'get action requires a message_ids array with at least one ID.' };
-          const emails = await provider.getEmails(userId, args.account_id, ids);
+          const emails = await guarded(() => provider.getEmails(ownerUserId, args.account_id, ids));
           return { emails, count: emails.length };
         }
 
@@ -6356,7 +6437,7 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
-          const result = await provider.sendEmail(userId, args.account_id, {
+          const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,
             body: args.body,
@@ -6547,8 +6628,8 @@ emmaToolRegistry.register({
     if (!org) {
       return { success: false, message: 'Organization not found.' };
     }
-    if (org.ownerUserId !== userId) {
-      return { success: false, message: 'Only the org owner can delete org memories.' };
+    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
+      return { success: false, message: 'Only org owners and admins can delete org memories.' };
     }
 
     await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
@@ -6617,7 +6698,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement (topPagesByEngagement), the same pages independently queried and sorted by session volume (topPagesBySessions), and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. For any "top/highest/most pages by sessions/volume" question, read it off topPagesBySessions — it is already sorted by sessions; do not re-sort topPagesByEngagement yourself, and do not answer a volume-ranking question from a field sorted by a different metric. If topPagesBySessions is missing and topPagesBySessionsError is present instead, that ranking could not be fetched this request — say so plainly; do not report zero pages, and do not substitute topPagesByEngagement ordering as if it answered the volume question. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6929,6 +7010,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
 // Ensure apiTools has registered its tools before we try to bridge them.
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
+import { can } from "../services/orgAuthz";
 
 // Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
 // for mcpToolRegistry to be available).
@@ -7063,6 +7145,9 @@ const adminToolNames = [
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'resolve_landing_page_by_url',
+  'share_landing_page_with_org',
+  'get_landing_page_effective_view',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -7770,8 +7855,13 @@ async function resolveLeadForAction(
   if (!listId || !leadId) return { error: 'list_id and lead_id are required' };
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { error: `Lead list ${listId} not found` };
-  if ((list as any).userId && (list as any).userId !== userId) {
-    return { error: 'Not authorized for this lead list' };
+  // ENG-1049: was a strict `list.userId !== userId` owner-only check, which
+  // over-blocked the org owner and listed crm.editors from acting on lists
+  // they don't personally own — inconsistent with every other CRM write
+  // surface. Delegate to the shared destructive guard instead.
+  const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
+  if (!(await canDestructiveCrmList(userId, list as any))) {
+    return { error: CRM_EDITOR_REQUIRED_MESSAGE };
   }
   const lead = await crmDb.getLeadById(listId, leadId);
   if (!lead) return { error: `Lead ${leadId} not found in list ${listId}` };
@@ -8408,7 +8498,8 @@ Response keys:
 - imported / skipped / errors / total — per-call counts (do not sum across calls)
 - list_total_after_import — actual post-import list size (trust this for cumulative counts)
 - cursor — pagination cursor for the next page of the same query (null when no more results)
-- importedLeads — array of the first 5 imported lead summaries (firstName, lastName, linkedin, title, company), useful for rendering a quick preview without a follow-up read
+- anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
+- importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
       type: 'object',
@@ -8510,6 +8601,11 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days)
+              counting_type is REQUIRED and never inferred: ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). Choosing wrong inflates reported conversions and silently misdirects smart bidding — nothing errors, so ASK the user rather than guessing.
+              CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
+              CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
+              NO REMOVE. Removing a conversion action severs historical attribution and cannot be undone. To stop one recording, UPDATE it with status=PAUSED.
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
@@ -8550,7 +8646,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -8562,6 +8658,11 @@ ACTION MATRIX:
         bidding_strategy_target: { type: 'number' },
         cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE (default 100000000 ≈100 currency units) or TARGET_SPEND/Maximize Clicks campaigns. Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
+        category: { type: 'string', description: 'CONVERSION_ACTION CREATE/UPDATE: what the conversion represents, e.g. SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD, BOOK_APPOINTMENT, CONTACT. Never inferred — it decides how Google reports and optimises the action.' },
+        counting_type: { type: 'string', enum: ['ONE_PER_CLICK', 'MANY_PER_CLICK'], description: 'CONVERSION_ACTION CREATE (required) / UPDATE. ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). NEVER guess — choosing wrong inflates reported conversions and silently misdirects smart bidding. Ask the user.' },
+        primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
+        click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
+        conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE. From CONVERSION_ACTION LIST or CREATE.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY and AD_GROUP LIST.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
         radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },
@@ -8646,6 +8747,11 @@ GAQL EXAMPLES:
   execute: async (args: any, context: any) => {
     return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
   },
+  // ENG-1276 follow-up: only fetches metrics/GAQL results (getQuickMetrics,
+  // queryReporting) — no write-capable action in this tool's schema at all,
+  // unlike its sibling call_google_ads_api (CREATE/UPDATE/REMOVE), which stays
+  // unflagged on purpose.
+  readOnly: true,
 });
 
 // ─── HubSpot ──────────────────────────────────────────────────────────────────

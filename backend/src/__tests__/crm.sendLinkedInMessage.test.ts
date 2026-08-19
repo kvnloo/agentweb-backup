@@ -32,16 +32,20 @@ jest.mock('../controllers/templates', () => ({
 const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
 const mockGetUserById = jest.fn();
+const mockUpdateLead = jest.fn().mockResolvedValue(undefined);
+const mockGetOrgById = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
+    updateLead: (...args: any[]) => mockUpdateLead(...args),
     getLeadsByListId: jest.fn().mockResolvedValue({ leads: [] }),
   },
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
   userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
+  orgDb: { getOrgById: (...args: any[]) => mockGetOrgById(...args) },
 }));
 
 const mockAddLinkedInMessageEvent = jest.fn();
@@ -53,10 +57,12 @@ jest.mock('../services/emailEventsDb', () => ({
 
 const mockResolveAccountId = jest.fn();
 const mockSendMessage = jest.fn();
+const mockGetLinkedInProfile = jest.fn();
 
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendMessage: (...args: any[]) => mockSendMessage(...args),
   },
 }));
@@ -180,8 +186,10 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     expect(res.status).toHaveBeenCalledWith(404);
   });
 
-  it('allows an org member (same orgId, different userId) to send — not 404', async () => {
-    // List owned by a teammate; requester is in the same org.
+  it('returns 404 when org member is not the list owner and not a CRM editor (ENG-686)', async () => {
+    // ENG-686: send-linkedin-message is a destructive write. A plain org member
+    // (same org, not the owner, not in crm.editors) is denied. This endpoint
+    // deliberately returns 404 (not 403) to avoid leaking list existence.
     mockGetLeadListById.mockResolvedValue({ listId: 'list-123', userId: 'owner-id' });
     mockGetUserById.mockImplementation((id: string) =>
       Promise.resolve(
@@ -190,6 +198,11 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
           : { userId: 'owner-id', orgId: 'org-1' },
       ),
     );
+    mockGetOrgById.mockResolvedValue({
+      orgId: 'org-1',
+      ownerUserId: 'owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] } },
+    });
     const req: any = {
       user: { userId: 'test-user-id' },
       params: { listId: 'list-123', leadId: 'lead-456' },
@@ -197,9 +210,8 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     };
     const res = makeRes();
     await handler!(req, res);
-    // Must NOT be rejected as "Lead list not found"; the send proceeds.
-    expect(res.status).not.toHaveBeenCalledWith(404);
-    expect(mockSendMessage).toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(mockSendMessage).not.toHaveBeenCalled();
   });
 
   it('returns 404 when lead not found', async () => {
@@ -300,5 +312,101 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     // We verify the contract by ensuring the route passes a non-empty eventId that can serve as fallback.
     expect(callArg.eventId).toBeTruthy();
     expect(callArg.eventId).not.toBe('');
+  });
+});
+
+// ─── ENG-1026: identity cross-check before send ──────────────────────────────
+
+describe('send-linkedin-message identity cross-check (ENG-1026)', () => {
+  const handler = findHandler(
+    router,
+    '/lists/:listId/leads/:leadId/send-linkedin-message',
+    'post',
+  );
+
+  const makeReq = () => ({
+    user: { userId: 'test-user-id' },
+    params: { listId: 'list-123', leadId: 'lead-456' },
+    body: { message: 'Hello!' },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLeadListById.mockResolvedValue(OWNED_LIST);
+    mockResolveAccountId.mockResolvedValue('unipile-acct-1');
+    mockSendMessage.mockResolvedValue({ id: 'chat-abc' });
+    mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
+  });
+
+  it('refuses with 409 linkedin_identity_mismatch when the profile company mismatches', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+      firstName: 'Florence',
+      lastName: 'Su',
+      company: 'Vivian Health',
+    });
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      headline: 'Technical Program Manager at Snowflake',
+      work_experience: [{ position: 'TPM', company: 'Snowflake', current: true }],
+    });
+
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      code: 'linkedin_identity_mismatch',
+      details: expect.objectContaining({ leadCompany: 'Vivian Health' }),
+    }));
+  });
+
+  it('sends and stamps the verified-identity fields on a successful cross-check', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+      firstName: 'Florence',
+      lastName: 'Su',
+      company: 'Vivian Health',
+    });
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
+      linkedinIdentityVerifiedAt: expect.any(String),
+      linkedinIdentityVerifiedUrl: expect.stringContaining('/in/florencesu'),
+    }));
+  });
+
+  it('does not block or fetch when the lead has no company/name data', async () => {
+    mockGetLeadById.mockResolvedValue(LEAD_WITH_LINKEDIN);
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+  });
+
+  it('fails open when the profile fetch throws', async () => {
+    mockGetLeadById.mockResolvedValue({
+      leadId: 'lead-456',
+      linkedin: 'https://www.linkedin.com/in/florencesu',
+      company: 'Vivian Health',
+    });
+    mockGetLinkedInProfile.mockRejectedValue(new Error('unipile down'));
+    const res = makeRes();
+    await handler!(makeReq() as any, res as any);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).not.toHaveBeenCalled();
   });
 });

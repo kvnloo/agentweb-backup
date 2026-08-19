@@ -15,6 +15,7 @@ jest.mock('aws-sdk', () => {
     scan: jest.fn(),
     get: jest.fn(),
     put: jest.fn(),
+    transactWrite: jest.fn(),
   };
   return {
     DynamoDB: {
@@ -35,6 +36,7 @@ describe('usageRecordDb', () => {
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
     mockDynamoDB.query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
     mockDynamoDB.scan.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+    mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
   });
 
   describe('incrementUsage', () => {
@@ -67,16 +69,43 @@ describe('usageRecordDb', () => {
       expect(params.UpdateExpression).toContain('cacheWriteTokens :cw');
       expect(params.UpdateExpression).toContain('totalTokens :tt');
       expect(params.UpdateExpression).toContain('costMicroUsd :cost');
-      expect(params.UpdateExpression).toContain('callCount :one');
+      expect(params.UpdateExpression).toContain('callCount :calls');
     });
 
-    it('keys rows by (userId, date#model#feature)', async () => {
+    it('keys rows by (userId, date#model#feature#billingUserId)', async () => {
+      // The payer is part of the KEY, not just an attribute (ENG-1210, raised by
+      // Greptile on PR #2407). It used to be an unconditional SET, so a member
+      // whose billing owner changed mid-day left one row holding both payers'
+      // counters stamped with whichever call wrote last -- the whole day landing
+      // on one bill and vanishing from the other.
       await usageRecordDb.incrementUsage(baseIncrement);
       const params = mockDynamoDB.update.mock.calls[0][0];
       expect(params.Key).toEqual({
         userId: 'user-1',
-        sk: '2026-06-12#anthropic.claude-sonnet-4-6#agent-chat',
+        sk: '2026-06-12#anthropic.claude-sonnet-4-6#agent-chat#owner-1',
       });
+    });
+
+    it('gives two payers on the same day their own rows, so counters never mix', async () => {
+      // The transition. Same actor, same day, same model, same feature -- and two
+      // different payers, which must never share an aggregate.
+      await usageRecordDb.incrementUsage(baseIncrement);
+      await usageRecordDb.incrementUsage({ ...baseIncrement, billingUserId: 'owner-2' });
+
+      const first = mockDynamoDB.update.mock.calls[0][0].Key.sk;
+      const second = mockDynamoDB.update.mock.calls[1][0].Key.sk;
+      expect(first).not.toEqual(second);
+      expect(second).toBe('2026-06-12#anthropic.claude-sonnet-4-6#agent-chat#owner-2');
+    });
+
+    it('keeps the date as the leading segment, so range queries still match', async () => {
+      // Load-bearing: every reader selects on `sk BETWEEN :start AND :end~`. If the
+      // payer were prefixed rather than appended, every historical range query
+      // would silently return nothing.
+      await usageRecordDb.incrementUsage(baseIncrement);
+      const sk = mockDynamoDB.update.mock.calls[0][0].Key.sk;
+      expect(sk.startsWith('2026-06-12#')).toBe(true);
+      expect(sk < '2026-06-12~').toBe(true);
     });
 
     it('passes integer microdollar cost, summed totalTokens, callCount 1, and billingUserId', async () => {
@@ -90,7 +119,10 @@ describe('usageRecordDb', () => {
       expect(v[':tt']).toBe(1260); // 1000 + 200 + 50 + 10
       expect(v[':cost']).toBe(6128); // rounded to integer microdollars
       expect(Number.isInteger(v[':cost'])).toBe(true);
-      expect(v[':one']).toBe(1);
+      // ENG-1251 Greptile P1: callCount ADDs the increment's own `calls`
+      // field (defaults to 1) rather than a hardcoded 1 -- lets the atomic
+      // charge-coupled path below add a whole group's call count in one shot.
+      expect(v[':calls']).toBe(1);
       expect(v[':billing']).toBe('owner-1');
     });
 
@@ -134,6 +166,168 @@ describe('usageRecordDb', () => {
       await expect(usageRecordDb.incrementUsage(baseIncrement)).rejects.toThrow(
         'ProvisionedThroughputExceeded'
       );
+    });
+
+    // ENG-700 Greptile P1: costSource must not freeze on a stale "unpriced"
+    // verdict once a real price is known for the same row.
+    it('writes costSource "unpriced" with if_not_exists (first-writer-wins for the still-unknown case)', async () => {
+      await usageRecordDb.incrementUsage({ ...baseIncrement, costSource: 'unpriced' });
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain(
+        '#costSource = if_not_exists(#costSource, :costSource)'
+      );
+      expect(params.ExpressionAttributeNames['#costSource']).toBe('costSource');
+      expect(params.ExpressionAttributeValues[':costSource']).toBe('unpriced');
+    });
+
+    it('writes costSource "allocated" unconditionally, overwriting a stale "unpriced" first write', async () => {
+      await usageRecordDb.incrementUsage({ ...baseIncrement, costSource: 'allocated' });
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('#costSource = :costSource');
+      expect(params.UpdateExpression).not.toContain(
+        '#costSource = if_not_exists(#costSource, :costSource)'
+      );
+      expect(params.ExpressionAttributeValues[':costSource']).toBe('allocated');
+    });
+
+    it('omits costSource entirely when not provided', async () => {
+      await usageRecordDb.incrementUsage(baseIncrement);
+      const params = mockDynamoDB.update.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toContain('costSource');
+      expect(params.ExpressionAttributeValues[':costSource']).toBeUndefined();
+    });
+  });
+
+  // ENG-1251 Greptile P1 ("Coverage suppresses unrelated aggregate usage"):
+  // couples the ledger increment with its paired charge event in one
+  // DynamoDB transaction so the two can never land independently.
+  describe('incrementUsageWithChargeEvent', () => {
+    const baseIncrement = {
+      userId: 'user-1',
+      date: '2026-06-12',
+      model: 'anthropic.claude-sonnet-4-6',
+      feature: 'engine:agent_task',
+      inputTokens: 1000,
+      outputTokens: 200,
+      cacheReadTokens: 50,
+      cacheWriteTokens: 10,
+      costMicroUsd: 6128,
+      billingUserId: 'owner-1',
+      calls: 3,
+    };
+    const baseChargeEvent = {
+      billingUserId: 'owner-1',
+      eventId: 'engine:user-1:anthropic.claude-sonnet-4-6:engine:agent_task:abc123',
+      occurredAt: '2026-06-12T10:00:00.000Z',
+      actingUserId: 'user-1',
+      tokens: 1260,
+      costMicroUsd: 6128,
+      model: 'anthropic.claude-sonnet-4-6',
+      feature: 'engine:agent_task',
+      calls: 3,
+    };
+
+    it('writes both items in ONE transactWrite call and returns "applied" on success', async () => {
+      const outcome = await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+
+      expect(outcome).toBe('applied');
+      expect(mockDynamoDB.transactWrite).toHaveBeenCalledTimes(1);
+      expect(mockDynamoDB.update).not.toHaveBeenCalled();
+      const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
+      expect(TransactItems).toHaveLength(2);
+    });
+
+    it('the ledger item is an unconditional Update against AW-UsageRecords, keyed and summed exactly like a plain incrementUsage call', async () => {
+      await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+      const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
+      const ledgerItem = TransactItems[0].Update;
+
+      expect(ledgerItem.TableName).toBe('AW-UsageRecords');
+      // Same key shape as the standalone path, payer segment included -- the two
+      // must never drift, which is why they share one builder.
+      expect(ledgerItem.Key).toEqual({
+        userId: 'user-1',
+        sk: '2026-06-12#anthropic.claude-sonnet-4-6#engine:agent_task#owner-1',
+      });
+      expect(ledgerItem.ConditionExpression).toBeUndefined();
+      // ENG-1251 Greptile P1: callCount ADDs the group's true call count (3
+      // records summed into this one increment), not a hardcoded 1.
+      expect(ledgerItem.ExpressionAttributeValues[':calls']).toBe(3);
+      expect(ledgerItem.ExpressionAttributeValues[':in']).toBe(1000);
+      expect(ledgerItem.ExpressionAttributeValues[':cost']).toBe(6128);
+    });
+
+    it('the charge-event item is a conditional Put against AW-LlmChargeEvents with a TTL and the same not-exists guard as recordLlmChargeEvent', async () => {
+      await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+      const [{ TransactItems }] = mockDynamoDB.transactWrite.mock.calls[0];
+      const chargeItem = TransactItems[1].Put;
+
+      expect(chargeItem.TableName).toBe('AW-LlmChargeEvents');
+      expect(chargeItem.ConditionExpression).toBe(
+        'attribute_not_exists(billingUserId) AND attribute_not_exists(eventId)'
+      );
+      expect(chargeItem.Item).toMatchObject(baseChargeEvent);
+      expect(chargeItem.Item.ttl).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    });
+
+    it('returns "duplicate" when the charge-event item (index 1) fails its condition -- and does NOT retry or rewrite anything', async () => {
+      const error: any = new Error('TransactionCanceled');
+      error.code = 'TransactionCanceledException';
+      error.CancellationReasons = [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }];
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      const outcome = await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+      expect(outcome).toBe('duplicate');
+    });
+
+    it('rethrows rather than returning "duplicate" when the LEDGER item (index 0) reports a condition failure -- structurally shouldn\'t happen since the ledger item is unconditional, but must never be misread as a confirmed charge duplicate', async () => {
+      const error: any = new Error('TransactionCanceled');
+      error.code = 'TransactionCanceledException';
+      error.CancellationReasons = [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }];
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      await expect(
+        usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent)
+      ).rejects.toThrow('TransactionCanceled');
+    });
+
+    it('returns "conflict" on a bare TransactionConflictException (concurrent writer, not a condition failure)', async () => {
+      const error: any = new Error('TransactionConflict');
+      error.code = 'TransactionConflictException';
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      const outcome = await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+      expect(outcome).toBe('conflict');
+    });
+
+    it('returns "conflict" when every cancellation reason is TransactionConflict/None (pure contention, no real condition failure)', async () => {
+      const error: any = new Error('TransactionCanceled');
+      error.code = 'TransactionCanceledException';
+      error.CancellationReasons = [{ Code: 'TransactionConflict' }, { Code: 'None' }];
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      const outcome = await usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent);
+      expect(outcome).toBe('conflict');
+    });
+
+    it('rethrows an unrecognized error shape rather than silently classifying it', async () => {
+      const error = new Error('ProvisionedThroughputExceeded');
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      await expect(
+        usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent)
+      ).rejects.toThrow('ProvisionedThroughputExceeded');
+    });
+
+    it('rethrows a TransactionCanceledException with no recognizable cancellation reasons', async () => {
+      const error: any = new Error('TransactionCanceled');
+      error.code = 'TransactionCanceledException';
+      error.CancellationReasons = [{ Code: 'ValidationError' }, { Code: 'None' }];
+      mockDynamoDB.transactWrite.mockReturnValue({ promise: jest.fn().mockRejectedValue(error) });
+
+      await expect(
+        usageRecordDb.incrementUsageWithChargeEvent(baseIncrement, baseChargeEvent)
+      ).rejects.toThrow('TransactionCanceled');
     });
   });
 

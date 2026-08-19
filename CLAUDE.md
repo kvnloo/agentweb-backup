@@ -11,8 +11,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - AI agents own qualifying engineering work through merge. Merge only from a
   branch current with `main`, after the full relevant local suite, regression
   coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, latest-head Greptile 5/5 with no unresolved actionable P1/P2,
-  attribution, rollback evidence, and acceptance-contract completeness all pass.
+  check, a passing Greptile verdict, attribution, rollback evidence, and
+  acceptance-contract completeness all pass.
+- Greptile verdict policy (changed 2026-08-18, Harsha's explicit direction —
+  see `.github/scripts/greptile-verdict-policy.sh`): a genuine below-bar
+  review (`refused`) still hard-fails the merge gate, unchanged. Greptile
+  never answering for this head at all (`unavailable` — e.g. the org-wide
+  usage cap) now passes the `Require Greptile Review` job, with a loud
+  warning annotation, rather than blocking forever. This is not "Greptile is
+  retired" — a genuine bad review is still a hard stop; only its total
+  unavailability stopped being fatal.
 - Establish "every relevant GitHub check" with
   `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
   (exit 0), never with `gh pr checks` alone. `gh pr checks` answers "did anything
@@ -478,7 +486,7 @@ Uses browser-use library with Playwright:
 **Production:**
 - Backend: AWS Elastic Beanstalk (Node.js platform), environment `Agentweb-backend-env-prod-3` → `https://api.agentweb.pro`
 - Partner Portal: AWS Elastic Beanstalk → `https://agentweb.pro`
-- Agent Engine: Google Cloud VM (manually deployed)
+- Agent Engine: Google Cloud VM, systemd-managed (dedicated `agentengine` OS user, auto-restart on crash + boot). See `agent-engine/deploy/RUNBOOK.md` for provisioning, secrets, deploy, and rollback.
 
 **Staging:**
 - Backend: AWS Elastic Beanstalk, environment `Agentweb-backend-env-1` → `https://api-stage.agentweb.pro`
@@ -561,14 +569,16 @@ zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 ```
 
 **Agent Engine:**
+
+Runs under systemd on `agentweb-agentengine-instance-prod2`, as the `agentengine`
+OS user. Full deploy/restart/rollback steps: `agent-engine/deploy/RUNBOOK.md`.
+Quick reference:
 ```bash
-# SSH to Google Cloud VM
-cd ~/agentweb
-git pull
-conda activate agent-engine
-pip install -r requirements.txt
-playwright install
-# Restart task_monitor.py
+sudo -u agentengine -i
+cd /opt/agent-engine/agentweb
+git pull origin main   # see RUNBOOK.md for the deploy-token auth step
+exit   # agentengine has no sudo (ENG-914) — restart with your own
+sudo systemctl restart agent-engine
 ```
 
 ## Environment Configuration
@@ -595,6 +605,16 @@ Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
 - `dev/AgentWeb/LinkedIn/Personal` - LinkedIn personal profile credentials
 - `dev/AgentWeb/LinkedIn/Company` - LinkedIn company page credentials
+
+### Agent Engine `.env`
+
+Agent-engine's own secrets (API keys, AWS credentials for DynamoDB/S3/Bedrock,
+SMTP, etc.) are **not** in AWS Secrets Manager above — they're in **GCP Secret
+Manager** (project `agent-engine-460619`, IDs `agentengine-<env>-<name>`),
+since the VM has no AWS-facing identity federation. See
+`agent-engine/deploy/RUNBOOK.md`'s Secrets section for the full list and why.
+Local dev still uses `agent-engine/.env` (see `.env.example`) exactly as
+before — env vars always take precedence over Secret Manager.
 
 ### Frontend `.env` (Build Time)
 

@@ -9,6 +9,58 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-18',
+    changes: [
+      'Fixed: A Scheduled Run No Longer Reports Success After Doing Nothing',
+      '- When LinkedIn ends the session on a connected LinkedIn Outreach account, nothing can be sent from it until you reconnect — but a scheduled run would still start, work through your list, send nothing, and record itself as a success',
+      '- Those runs cost you model usage for a guaranteed no-op, and because they looked successful, nothing flagged them: one account went weeks before anyone noticed',
+      '- A run whose LinkedIn Outreach account has no live session is now skipped in about a second, before any of that work begins, and is recorded as skipped rather than successful so it is visible in your run history',
+      'New: You Are Told When Your LinkedIn Outreach Account Disconnects',
+      '- You now get an email naming the account, what has stopped, and a direct link to reconnect it',
+      '- It is deliberately not sent the instant we see a problem: a brief hiccup would otherwise tell you your account is broken when it is not, so we confirm the session is still down on a later check first',
+      '- If it stays disconnected, you get a reminder rather than silence',
+      'New: A Schedule Stopped by a Disconnected Account Restarts Itself When You Reconnect',
+      '- Repeated skips now pause the schedule instead of leaving it claiming to be active, and you are told which schedule stopped',
+      '- Reconnecting the account switches it back on for you — there is nothing to remember to re-enable',
+      'Fixed: Lead Enrichment No Longer Records a LinkedIn Link That Belongs to Nobody',
+      '- LinkedIn hides the identity of profiles outside your network, and those results were being turned into a profile link that leads nowhere',
+      '- That link could be saved onto a lead and shown as if it were real, and several such leads could collapse into one another because they all pointed at the same non-existent profile',
+      '- Those results are now recognised for what they are and left out',
+      'Improved: Outreach Actions Are Paced So LinkedIn Is Less Likely to End Your Session',
+      '- Withdrawing or sending in a fast burst appears automated, and twice preceded LinkedIn ending an account\'s session within seconds — which then blocked that customer for days',
+      '- Invitations, messages and withdrawals are now spaced out per account instead of being sent all at once',
+      '- We also stopped re-reading your full pending-invitation list every few minutes, which was a large and constant load on your account for no benefit',
+    ],
+  },
+  {
+    date: '2026-08-12',
+    changes: [
+      'Fixed: Saving a Long Scheduled-Chat Prompt No Longer Fails With an Unexplained Error',
+      '- A scheduled chat keeps a copy of its previous prompt every time you edit it, so a schedule with a very long prompt could quietly fill up all the space we are allowed to store for it — after which every save was refused with a generic error and no reason',
+      '- Schedules with self-improvement switched on were hit hardest: the run could work out exactly how to improve its own prompt and then had no way to save it, so the same faults repeated week after week',
+      '- Saving now makes room automatically by dropping the oldest saved prompt versions (and, only if that is still not enough, the oldest run history), so your edit goes through',
+      '- If a prompt really is too long to store at all, you now get a clear message saying so and how long it is, instead of a generic failure',
+      '- A schedule that reaches that limit would also have stopped recording its run history within a day or two; that history now makes room for itself instead of quietly stopping',
+      'Fixed: A Very Long Answer Can No Longer Go Missing From a Chat Transcript',
+      '- An unusually large message — typically the final report of a long run, which carries the whole run\'s tool activity — could be too big to store, and was dropped from the transcript while the run still reported success',
+      '- The safeguard that trims those messages down now runs on every path that saves one, including the repair pass that exists to recover them, so the answer is kept even when the working detail behind it has to be shortened',
+    ],
+  },
+  {
+    date: '2026-08-09',
+    changes: [
+      'Changed: Organizations Can Now Have More Than One Owner',
+      '- An organization used to support exactly one owner, so handing over or sharing responsibility meant routing everything through a single person',
+      '- There are now three roles — owner, admin and member — and an organization can have multiple owners and multiple admins',
+      '- Owners can do everything inside the organization except billing: manage people and roles, edit all organization settings and shared content, and delete the organization. Changing the plan or the card stays with the one member whose subscription pays for the organization (see below)',
+      '- Billing is the one thing that is not shared. One member’s own subscription pays for the organization, and only that person can change the plan or the card — another owner subscribing changes their own subscription, not the organization’s. A paying owner cannot be removed or leave while their subscription is paying for the organization. They must end their own subscription before leaving or being removed; for continuity, set up a successor owner/subscriber path with support before the billing root departs',
+      '- Admins can invite and remove members, change organization settings, manage shared content, and promote members to admin. Only an owner can grant or revoke the owner role, remove an owner, or delete the organization',
+      '- Members use every platform feature for their own work and see whatever the organization has shared. Brand Guidelines, Market Strategy, the knowledge base, templates and landing pages are read-only for them unless an owner or admin adds them as an editor for that area',
+      '- An organization must always keep at least one owner: the last owner cannot be removed, demoted, or leave until someone else is promoted to owner. To hand an organization over, promote the new owner first, then leave — there is no separate transfer step',
+      '- This supersedes the 2026-05-12 note stating that only one owner is supported and that co-owner roles do not exist',
+    ],
+  },
+  {
     date: '2026-08-05',
     changes: [
       'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',

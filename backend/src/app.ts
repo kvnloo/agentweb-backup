@@ -44,6 +44,7 @@ import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import gmailAuthRoutes from "./routes/gmailAuth";
 import outlookAuthRoutes from "./routes/outlookAuth";
+import calendlyAuthRoutes from "./routes/calendlyAuth";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
 import twitterAuthRoutes from "./routes/twitterAuth";
 import metaAuthRoutes from "./routes/metaAuth";
@@ -56,6 +57,12 @@ import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import calendlyWebhookRoutes from "./routes/calendlyWebhook";
+// ENG-926 §C: registers the CRM -> Meta conversion relay's queue processor at boot. The
+// poller leaves a job claimed-but-unprocessed when no processor is registered for its
+// source, so this cannot be deferred to the first status transition of a process's life —
+// jobs queued before that (including any left pending by a restart) would strand.
+import { registerConversionRelayProcessor } from "./services/metaConversionRelay";
 import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
@@ -66,6 +73,9 @@ import skillRoutes from "./routes/skillRoutes";
 import userSkillRoutes from "./routes/userSkillRoutes";
 import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
 import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
+import adminLandingPagesRoutes from "./routes/adminLandingPages";
+import adminOrgDiagnosticsRoutes from "./routes/adminOrgDiagnostics";
+import adminTrackingMonitorRoutes from "./routes/adminTrackingMonitor";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
@@ -255,6 +265,7 @@ app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
+app.use("/api/webhooks/calendly", express.raw({ type: "application/json" })); // raw body needed for HMAC signature verification
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 // Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
@@ -314,6 +325,8 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
+app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
+registerConversionRelayProcessor();
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
@@ -336,6 +349,7 @@ app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/linkedin-ads", linkedInAdsAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/outlook", outlookAuthRoutes);
+app.use("/api/oauth/calendly", calendlyAuthRoutes);
 app.use("/api/oauth/google-drive", googleDriveAuthRoutes);
 app.use("/api/oauth/twitter", twitterAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
@@ -363,6 +377,9 @@ app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/user-skills", authenticateToken, userSkillRoutes);
 app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
 app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes);
+app.use("/api/admin/landing-pages", authenticateToken, isAdmin, adminLandingPagesRoutes);
+app.use("/api/admin/org-diagnostics", authenticateToken, isAdmin, adminOrgDiagnosticsRoutes);
+app.use("/api/admin/tracking-monitor", authenticateToken, isAdmin, adminTrackingMonitorRoutes);
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);

@@ -11,6 +11,7 @@ import {
   evaluateBurnIn,
   BURN_IN_DEFAULT_MIN_RUN_COUNT,
   BURN_IN_DEFAULT_TOLERANCE,
+  BURN_IN_POST_RELEASE_WINDOW_LIMIT,
   type BurnInAssessment,
 } from '../cron/burnInEvaluation';
 import type { ReliabilitySnapshot } from '../cron/agentReliabilitySnapshot';
@@ -38,12 +39,413 @@ function snap(
     medianIterations: 4,
     p90Iterations: 9,
     topClusters: [],
+    // ENG-1312: satisfaction-dimension fields — irrelevant to burn-in, zeroed.
+    concisionAvg: 0,
+    instructionComplianceAvg: 0,
+    unnecessaryPermissionRequestRate: 0,
+    satisfactionDimensionSampleCount: 0,
     computedAt: `${date}T17:45:00.000Z`,
     ...over,
   };
 }
 
 const RELEASE_AT = new Date('2026-07-20T12:00:00.000Z');
+
+function pairedSnap(
+  date: string,
+  over24h: Partial<ReliabilitySnapshot> = {},
+): ReliabilitySnapshot[] {
+  return [
+    snap(date, over24h),
+    snap(date, {
+      ...over24h,
+      windowLabel: '7d',
+      windowStart: `${date}T00:00:00.000Z`,
+      windowEnd: `${date}T23:59:59.999Z`,
+    }),
+  ];
+}
+
+const REPLAY_RELEASE_AT = new Date('2026-07-30T12:00:00.000Z');
+const REPLAY_DATES = [
+  '2026-07-28',
+  '2026-07-29',
+  '2026-07-30',
+  '2026-07-31',
+  '2026-08-01',
+  '2026-08-02',
+  '2026-08-03',
+  '2026-08-04',
+  '2026-08-05',
+  '2026-08-06',
+];
+
+function replaySnapshots(
+  overrides: Record<string, Partial<ReliabilitySnapshot>> = {},
+): ReliabilitySnapshot[] {
+  return REPLAY_DATES.flatMap((date) => pairedSnap(date, overrides[date]));
+}
+
+describe('evaluateBurnIn — attributed replay policy (ENG-938)', () => {
+  it('fixture guard: every replay date carries separate 24h and 7d rows', () => {
+    const snapshots = replaySnapshots();
+
+    for (const date of REPLAY_DATES) {
+      expect(
+        snapshots.filter((snapshot) => snapshot.date === date).map((snapshot) => snapshot.windowLabel),
+      ).toEqual(['24h', '7d']);
+    }
+  });
+
+  it('replays ENG-759 clean when the latest spike belongs to unrelated ENG-836', () => {
+    const snapshots = replaySnapshots({
+      '2026-08-06': { failedRunRate: 0.8 },
+    });
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+      incidentAttributions: [
+        { date: '2026-08-06', issueId: 'ENG-836', reason: 'unrelated production incident' },
+      ],
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+    expect(assessment.excludedIncidents).toEqual([
+      { date: '2026-08-06', issueId: 'ENG-836', reason: 'unrelated production incident' },
+    ]);
+  });
+
+  it('replays ENG-745 clean against the same unrelated incident', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({
+        '2026-08-06': { degradedRunRate: 0.75 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-745',
+      incidentAttributions: [{ date: '2026-08-06', issueId: 'ENG-836' }],
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+  });
+
+  it('fails a genuine release regression even when a later window recovers', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({
+        '2026-08-03': { failedRunRate: 0.9 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('regressed');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.postRelease?.date).toBe('2026-08-03');
+  });
+
+  it('fails closed when a replay date lacks either authoritative window row', () => {
+    const snapshots = replaySnapshots().filter(
+      (snapshot) => !(snapshot.date === '2026-08-02' && snapshot.windowLabel === '7d'),
+    );
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+    });
+
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toMatch(/24h.*7d|7d.*24h/i);
+  });
+
+  // The pairing rule protects the verdict from blended window lines. Applied to
+  // the whole horizon it instead bricks the gate on a row the verdict never
+  // reads — and it cannot self-heal, because snapshot catch-up runs 14 days
+  // back while the endpoint reads 30.
+  it('still evaluates when a pre-release date the verdict never reads lacks its 7d row', () => {
+    const snapshots = replaySnapshots().filter(
+      (snapshot) => !(snapshot.date === '2026-07-28' && snapshot.windowLabel === '7d'),
+    );
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+    });
+
+    // 2026-07-29 is the baseline; 2026-07-28 is behind it and unread.
+    expect(assessment.baseline?.date).toBe('2026-07-29');
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+  });
+
+  it('fails closed when the BASELINE date lacks its 7d row', () => {
+    const snapshots = replaySnapshots().filter(
+      (snapshot) => !(snapshot.date === '2026-07-29' && snapshot.windowLabel === '7d'),
+    );
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+    });
+
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toMatch(/24h.*7d|7d.*24h/i);
+  });
+
+  it('excludes an unrelated incident whatever the case of the attributed issue id', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({ '2026-08-06': { failedRunRate: 0.8 } }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'eng-759',
+      incidentAttributions: [{ date: '2026-08-06', issueId: 'eng-836' }],
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+  });
+
+  // The inverse, and the dangerous one: a release must never exclude its OWN
+  // incident window because the two ids differ only in case.
+  it('does NOT let a release exclude its own incident on a case mismatch', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({ '2026-08-06': { failedRunRate: 0.8 } }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'eng-836',
+      incidentAttributions: [{ date: '2026-08-06', issueId: 'ENG-836' }],
+    });
+
+    expect(assessment.verdict).toBe('regressed');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.excludedIncidents).toEqual([]);
+  });
+});
+
+describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938)', () => {
+  const EXTENDED_REPLAY_DATES = [...REPLAY_DATES, '2026-08-07', '2026-08-08', '2026-08-09'];
+
+  function extendedSnapshots(
+    overrides: Record<string, Partial<ReliabilitySnapshot>> = {},
+  ): ReliabilitySnapshot[] {
+    return EXTENDED_REPLAY_DATES.flatMap((date) => pairedSnap(date, overrides[date]));
+  }
+
+  it('exposes the limit as a named constant rather than the caller history horizon', () => {
+    expect(BURN_IN_POST_RELEASE_WINDOW_LIMIT).toBe(7);
+  });
+
+  it('fails a regression inside the fixed burn-in window count', () => {
+    // 2026-08-06 is the 7th qualifying post-release window (07-31 … 08-06).
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({ '2026-08-06': { failedRunRate: 0.9 } }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('regressed');
+    expect(assessment.postRelease?.date).toBe('2026-08-06');
+  });
+
+  it('a low-volume day inside the window makes the period unevaluable, not clean', () => {
+    // The fixed period is the first 7 post-release windows: 07-31 … 08-06.
+    // 08-01 is below minRunCount, so nobody can say whether the release was
+    // healthy that day. Crediting the clean prefix (07-31) would report `clean`
+    // on a burn-in period containing a day that was never read, so the verdict
+    // fails closed. 08-07 — outside the period entirely — is still never
+    // reached, so an out-of-period regression cannot fail the release either.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+        '2026-08-07': { failedRunRate: 0.9 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toContain('2026-08-01');
+  });
+
+  it('does not credit a clean day that sits behind an unevaluable one', () => {
+    // 08-06 is clean, but 08-01 inside the same period is unreadable. A later
+    // clean day does not paper over an earlier unevaluable one.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+  });
+
+  it('is insufficient when the FIRST window of the period is unevaluable', () => {
+    // 07-31 is the first post-release window and carries too few runs. With no
+    // readable evidence at the start of the period there is nothing to credit,
+    // and reaching forward to 08-02 would report clean on a burn-in whose
+    // opening day was never evaluated.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-07-31': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.verdict).not.toBe('clean');
+  });
+
+  it('anchors the period to the release even when the first day has no row', () => {
+    // 07-31 — the first post-release window — was never written. Anchoring on
+    // the earliest row that happens to exist would start the period at 08-01 and
+    // walk its end out to 08-07, so a regression on the 8th day would block
+    // closure for a burn-in meant to cover 07-31 … 08-06. The anchor is the
+    // release instant, so the period keeps both ends regardless of which rows
+    // survived.
+    const snapshots = extendedSnapshots({ '2026-08-07': { failedRunRate: 0.9 } }).filter(
+      (s) => s.date !== '2026-07-31',
+    );
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    // The period keeps both ends, so the 08-07 regression is out of period and
+    // never read. The missing opening day is itself unread evidence, so the
+    // verdict fails closed rather than crediting the days that survived.
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+  });
+
+  it('a date with NO snapshot row at all does not slide a later day into the period', () => {
+    // Stronger than the low-volume case: 08-01 produced no row whatsoever (the
+    // snapshot cron skipped that day). Counting rows instead of measuring time
+    // would let 08-07 — the 8th window — occupy the freed slot, so a regression
+    // eight days out would block closure for a 7-day burn-in. The period is
+    // bounded by the clock, so an absent day is simply absent.
+    const snapshots = extendedSnapshots({ '2026-08-07': { failedRunRate: 0.9 } }).filter(
+      (s) => s.date !== '2026-08-01',
+    );
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    // 08-07 stays out of period (the clock, not row count, bounds it), and the
+    // missing 08-01 row leaves the period with an unread day, so the verdict is
+    // insufficient rather than a clean read of the rows that happen to exist.
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toContain('2026-08-02');
+  });
+
+  it('is insufficient when no window inside the fixed period carries enough runs', () => {
+    // Every window in 07-31 … 08-06 is below minRunCount. Reaching past the
+    // period for qualifying rows would report `clean` on evidence the burn-in
+    // window never contained; the verdict must fail closed instead.
+    const thin = { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 };
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-07-31': thin, '2026-08-01': thin, '2026-08-02': thin, '2026-08-03': thin,
+        '2026-08-04': thin, '2026-08-05': thin, '2026-08-06': thin,
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.verdict).not.toBe('clean');
+  });
+
+  it('does not fail a release on a regression past the burn-in period', () => {
+    // 2026-08-08 is the 9th post-release window — ten days after the release,
+    // and no longer this release's burn-in evidence.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({ '2026-08-08': { failedRunRate: 0.9 } }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+    expect(assessment.postRelease?.date).toBe('2026-08-06');
+  });
+});
+
+/**
+ * The ENG-938 incident days pass on TOLERANCE, not on attribution: 08-01's real
+ * 24h failedRunRate of 0.02062 against the 0.00107 baseline is a delta of
+ * 0.01955 — 0.00045 under the 0.02 tolerance, which at ~175 runs/day is less
+ * than ONE additional failed run (0.00571 per run). So the exclusion branch is
+ * never even reached on the real series, and a slightly worse incident day
+ * would fail these releases unless the incident is attributed. These tests pin
+ * both halves so the margin is visible rather than lucky.
+ */
+describe('evaluateBurnIn — ENG-938 incident-day margin is thin', () => {
+  const INCIDENT_RELEASE_AT = new Date('2026-07-31T00:00:00.000Z');
+  const BASELINE_RATE = 0.00107;
+
+  function incidentSeries(incidentRate: number): ReliabilitySnapshot[] {
+    return ['2026-07-30', '2026-07-31', '2026-08-01', '2026-08-02'].flatMap((date) =>
+      pairedSnap(date, {
+        runCount: 175,
+        degradedRunRate: 0,
+        failedRunRate: date === '2026-08-01' ? incidentRate : BASELINE_RATE,
+      }),
+    );
+  }
+
+  it('passes on tolerance alone at the real 08-01 rate — nothing is excluded', () => {
+    const a = evaluateBurnIn({
+      snapshots: incidentSeries(0.02062),
+      releaseAt: INCIDENT_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+      incidentAttributions: [{ date: '2026-08-01', issueId: 'ENG-836' }],
+    });
+
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    // The incident day never tripped the tolerance, so exclusion never fired.
+    expect(a.excludedIncidents).toEqual([]);
+    expect(0.02062 - BASELINE_RATE).toBeLessThan(BURN_IN_DEFAULT_TOLERANCE);
+  });
+
+  it('one more failed run on that day regresses it without attribution…', () => {
+    const a = evaluateBurnIn({
+      snapshots: incidentSeries(0.02062 + 1 / 175),
+      releaseAt: INCIDENT_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+    });
+
+    expect(a.verdict).toBe('regressed');
+    expect(a.passesClosureCheck4).toBe(false);
+  });
+
+  it('…and the incident attribution is what rescues it', () => {
+    const a = evaluateBurnIn({
+      snapshots: incidentSeries(0.02062 + 1 / 175),
+      releaseAt: INCIDENT_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+      incidentAttributions: [{ date: '2026-08-01', issueId: 'ENG-836' }],
+    });
+
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    expect(a.excludedIncidents).toEqual([{ date: '2026-08-01', issueId: 'ENG-836' }]);
+  });
+});
 
 describe('evaluateBurnIn — empty is never a pass (ENG-746 AC3)', () => {
   it('returns insufficient_data, not clean, when there are no snapshots at all', () => {
@@ -353,5 +755,134 @@ describe('evaluateBurnIn — invariants (AC5: no weakening of fail-closed)', () 
     // The only post-release row is a 7d row, so for the 24h line there is none.
     expect(a.verdict).toBe('insufficient_data');
     expect(a.passesClosureCheck4).toBe(false);
+  });
+});
+
+/**
+ * The producer's real boundaries, not the tidy midnight grid the fixtures above
+ * use. `agentReliabilitySnapshotCron` closes a COMPLETED day at `T23:59:59.999Z`
+ * and the CURRENT day at `now`, so the in-progress row starts at an arbitrary
+ * time of day. Every burn-in still running contains exactly that row.
+ */
+describe('evaluateBurnIn — production window alignment (ENG-938)', () => {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const NOW = new Date('2026-08-04T17:45:00.000Z');
+  const RELEASE = new Date('2026-07-30T12:00:00.000Z');
+
+  /** Completed day: window closes at end-of-day, so it starts a day earlier. */
+  function completed(date: string, over: Partial<ReliabilitySnapshot> = {}): ReliabilitySnapshot[] {
+    const end = `${date}T23:59:59.999Z`;
+    const start = new Date(Date.parse(end) - MS_PER_DAY).toISOString();
+    return ['24h', '7d'].map((windowLabel) =>
+      snap(date, { windowStart: start, windowEnd: end, windowLabel, ...over }),
+    );
+  }
+
+  /** Current day: window closes at `now` — off the completed-day grid. */
+  function inProgress(date: string, over: Partial<ReliabilitySnapshot> = {}): ReliabilitySnapshot[] {
+    const end = NOW.toISOString();
+    const start = new Date(NOW.getTime() - MS_PER_DAY).toISOString();
+    return ['24h', '7d'].map((windowLabel) =>
+      snap(date, { windowStart: start, windowEnd: end, windowLabel, ...over }),
+    );
+  }
+
+  const snapshots = [
+    ...completed('2026-07-28'),
+    ...completed('2026-07-29'),
+    ...completed('2026-07-31'),
+    ...completed('2026-08-01'),
+    ...completed('2026-08-02'),
+    ...completed('2026-08-03'),
+    ...inProgress('2026-08-04'),
+  ];
+
+  it('reads the in-progress current-day window as present, not as a gap', () => {
+    const a = evaluateBurnIn({
+      snapshots,
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    expect(a.postRelease?.date).toBe('2026-08-04');
+  });
+
+  it('still fails closed on a day that produced no row at all', () => {
+    const a = evaluateBurnIn({
+      snapshots: snapshots.filter((s) => s.date !== '2026-08-02'),
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+    expect(a.reason).toMatch(/missing the snapshot window/i);
+  });
+
+  it('collapses a current-day row and the completed row that closes the same day', () => {
+    // The store can briefly hold both: today's row written at `now`, and the
+    // completed row for the same day closing at T23:59:59.999Z. Two rows on one
+    // closing day must not shift the period and read as a missing window.
+    const a = evaluateBurnIn({
+      snapshots: [...snapshots, ...completed('2026-08-04')],
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    expect(a.postRelease?.date).toBe('2026-08-04');
+  });
+
+  it('still refuses to scan a regression outside the seven-window period', () => {
+    const a = evaluateBurnIn({
+      snapshots: [
+        ...snapshots,
+        ...completed('2026-08-08', { failedRunRate: 0.9 }),
+      ],
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+  });
+
+  // Exact-boundary case: a release instant that lands exactly on the producer's
+  // closing grid, so a window starts at precisely `releaseAt`. That window
+  // contains no pre-release runs, so it IS the first window of the burn-in
+  // period and the `>=` walkback is meant to reach it.
+  const GRID_RELEASE = new Date('2026-07-29T23:59:59.999Z');
+
+  it('anchors the period on a window that starts exactly at the release instant', () => {
+    const a = evaluateBurnIn({
+      snapshots: [...snapshots, ...completed('2026-07-30')],
+      releaseAt: GRID_RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+  });
+
+  it('fails closed when the window starting exactly at the release instant produced no row', () => {
+    // `snapshots` has no 07-30 row, so the earliest surviving window starts at
+    // exactly releaseAt + 24h. The slot before it is fully post-release and was
+    // never written — genuinely unread evidence, not an off-by-one. Crediting
+    // the remaining days here would return `clean` for a period one day short.
+    const a = evaluateBurnIn({
+      snapshots,
+      releaseAt: GRID_RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+    expect(a.reason).toMatch(/missing the snapshot window/i);
   });
 });

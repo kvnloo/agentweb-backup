@@ -419,9 +419,24 @@ function findTrippedSessionTimeout(
  * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
  * expensive-media budget tools, and now also for any timeout-class failure
  * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
- * a per-run one, since the model retries it across separate user turns/runs. */
+ * a per-run one, since the model retries it across separate user turns/runs.
+ *
+ * ENG-1220: a rate_limit-class failure on a media tool (gpt-image-2 429s) is
+ * transient — the gateway's own retryability guidance tells the model to wait
+ * and retry it. Counting it toward the tiny (2) session-wide media budget the
+ * same as a permanent failure (safety-filter rejection, invalid args) locked
+ * generate_image for the rest of the session even though the rate limit clears.
+ * Exclude rate_limit specifically so a real retry spiral (any other class)
+ * still trips the budget, but a temporary 429 does not. Hard-quota exhaustion
+ * (OpenAI/Azure `insufficient_quota`, "exceeded your current quota") is also
+ * 429-shaped but permanent, not transient — classifyToolErrorClass buckets it
+ * as 'quota_exceeded', a distinct class from 'rate_limit', so it is NOT
+ * exempted here and still counts toward the session-wide media budget. */
 function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
-  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
+  if (mediaFailureBudget(toolName) != null) {
+    return classifyToolErrorClass(error) !== 'rate_limit';
+  }
+  return classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
@@ -1201,16 +1216,20 @@ function validateJsonSchemaConstraints(name: string, value: unknown, schema: any
   // Both sides must move together: measuring UTF-16 code units here would reject
   // 1,001 emoji that the declared `maxLength: 2000` plainly accepts, which is a
   // contract stricter than its schema — the exact defect ENG-821 exists to fix.
-  if (
-    typeof value === 'string' &&
-    typeof schema?.maxLength === 'number' &&
-    Array.from(value).length > schema.maxLength
-  ) {
-    issues.push({
-      code: 'invalid_args',
-      path: `$.${name}`,
-      message: `Argument "${name}" must be at most ${schema.maxLength} character(s).`,
-    });
+  if (typeof value === 'string' && typeof schema?.maxLength === 'number') {
+    // ENG-1048: state the received length and the overflow, not just the limit.
+    // Knowing only the ceiling makes the correction guess-and-check — a reported
+    // run walked save_memory content down 2926 → 2306 → 2128 → 1817 against a
+    // 2000 limit, one model turn per guess, and those rejections also crowd real
+    // tool results out of the context window (ENG-940).
+    const received = Array.from(value).length;
+    if (received > schema.maxLength) {
+      issues.push({
+        code: 'invalid_args',
+        path: `$.${name}`,
+        message: `Argument "${name}" must be at most ${schema.maxLength} character(s) — received ${received}; remove at least ${received - schema.maxLength}.`,
+      });
+    }
   }
 
   if (Array.isArray(value)) {

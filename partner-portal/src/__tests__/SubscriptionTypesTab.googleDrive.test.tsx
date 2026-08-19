@@ -94,6 +94,7 @@ describe('AVAILABLE_CONNECTED_ACCOUNTS — twitter entry', () => {
 describe('SubscriptionTypesTab — Google Drive in rendered UI', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedAxiosGet.mockResolvedValue({ data: [] });
   });
 
   it('shows "Google Drive" checkbox label in the connected accounts section when editing', async () => {
@@ -114,7 +115,8 @@ describe('SubscriptionTypesTab — Google Drive in rendered UI', () => {
     mockedAxiosGet
       .mockResolvedValueOnce({ data: mockSubTypes })
       .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValueOnce({ data: { pages: [] } });
+    .mockResolvedValueOnce({ data: { pages: [] } })
+    .mockResolvedValueOnce({ data: { features: [] } });
 
     render(<SubscriptionTypesTab />);
 
