@@ -412,6 +412,23 @@ export function countTrailingAbsentSpendingDays(
   return streak;
 }
 
+/**
+ * Has this ad set stopped delivering long enough that there is no spend left to stop?
+ *
+ * Extracted so the streak branch and day-1 share one definition — they answer the same
+ * question and drifted apart once already.
+ */
+export function isStaleDelivery(
+  ownDays: OptimisationSpendingDay[] | null | undefined,
+  asOf?: string,
+): boolean {
+  if (!asOf) return false;
+  const last = newestSpendingDay(ownDays);
+  if (!last) return false;
+  const staleBy = daysBetween(last, asOf);
+  return staleBy !== null && staleBy > OPTIMISATION_RECENCY_DAYS;
+}
+
 /** A mismatch the spending history CONFIRMS: the money-losing case, and the only one that alerts. */
 export interface ConfirmedOptimisationMismatch extends OptimisationMismatch {
   insightsFamily: string;
@@ -581,9 +598,7 @@ export function evaluateAccountOptimisationCoverage(
       const confirmed = { ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent };
       // ACTIVE describes configuration, not spend. Only an ad set that was still delivering
       // recently can be described as paying for anything right now.
-      const lastSpend = asOf ? newestSpendingDay(ownDays) : undefined;
-      const staleBy = asOf && lastSpend ? daysBetween(lastSpend, asOf) : null;
-      if (staleBy !== null && staleBy > OPTIMISATION_RECENCY_DAYS) {
+      if (isStaleDelivery(ownDays, asOf)) {
         verdict.staleDelivery.push(confirmed);
       } else {
         verdict.alerting.push(confirmed);
@@ -602,7 +617,13 @@ export function evaluateAccountOptimisationCoverage(
       !familyEverPresent(accountSpendingDays, family) &&
       // The pixel is demonstrably ALIVE. Without traffic of its own, its silence about this
       // event is "could not ask", never "did not arrive".
-      pixelReceivedEvent(received, 'PageView')
+      pixelReceivedEvent(received, 'PageView') &&
+      // ...and it is delivering NOW. Spending once three weeks ago and stopping is not money
+      // at risk, and paging about it says an ad set is paying for something when it is
+      // paying for nothing — the same "ACTIVE is configuration, not spend" error this module
+      // already paid for once. The streak branch guards this with newestSpendingDay(); the
+      // first version of day-1 did not, and CodeRabbit caught the gap.
+      !isStaleDelivery(ownDays, asOf)
     ) {
       verdict.alerting.push({
         ...hit,

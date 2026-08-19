@@ -895,3 +895,41 @@ describe('day-1 detection for an ad set with no history of its own', () => {
     expect((v.alerting[0] as any).day1).toBeUndefined();
   });
 });
+
+describe('day-1 detection respects delivery recency', () => {
+  it('does NOT alert when the only own spending day is stale — no spend left to stop', () => {
+    // CodeRabbit, PR #2499. The first version checked that the ad set had spent, never that
+    // it was spending NOW, so an ad set that spent once weeks ago would page someone about
+    // money nobody is spending. The streak branch has always guarded this.
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_new', name: 'Long stopped', effective_status: 'ACTIVE',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'COMPLETE_REGISTRATION' },
+      }],
+      { px_1: ['PageView', 'Lead'] },
+      { as_new: [{ date: '2026-07-20', spend: 40, families: [] as string[] }] },
+      '2026-08-15',
+      Array.from({ length: 10 }, (_, i) => ({
+        date: `2026-08-${String(i + 1).padStart(2, '0')}`, spend: 100, families: ['lead'],
+      })),
+    );
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('DOES alert when the first spending day is recent', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_new', name: 'Just resumed', effective_status: 'ACTIVE',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'COMPLETE_REGISTRATION' },
+      }],
+      { px_1: ['PageView', 'Lead'] },
+      { as_new: [{ date: '2026-08-15', spend: 40, families: [] as string[] }] },
+      '2026-08-15',
+      Array.from({ length: 10 }, (_, i) => ({
+        date: `2026-08-${String(i + 1).padStart(2, '0')}`, spend: 100, families: ['lead'],
+      })),
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0]).toMatchObject({ day1: true });
+  });
+});
