@@ -208,13 +208,21 @@ export function hasPersistedMediaBudgetDeferral(
  * condition from session history alone — no new persistence — and re-fire the resume.
  *
  * Deliberately looks ONLY at the LAST message (cheap enough to call from a
- * frequently-polled endpoint) and requires it to be one of the two shapes an unresolved
+ * frequently-polled endpoint) and requires it to be one of THREE shapes an unresolved
  * media pause actually leaves behind:
  *  - the whole-turn-timeout partial-delivery notice, tagged `mediaBudgetDeferred: true`
  *    (added alongside `kind: 'generation-timeout-continuation'` specifically for this —
  *    the generic non-media salvage variant shares the same `kind` but is NOT tagged, so
  *    it correctly returns false here)
  *  - the model's own successful reply whose toolCalls ledger still shows a deferred call
+ *  - OUR OWN synthetic auto-continuation directive (role: 'user', kind:
+ *    'auto-continuation') dangling with no reply — a process death can kill the
+ *    continuation's own turn AFTER it persists that directive but BEFORE it replies,
+ *    which neither of the two assistant-authored shapes above matches (verified live:
+ *    killing the backend right after the directive saved left getSession blind to it
+ *    until this branch was added). Scoped to the `auto-continuation` kind specifically —
+ *    a REAL customer message dangling with no reply is a different, unrelated problem
+ *    and must never be mistaken for a media pause.
  * Anything else — including the round-cap exhaustion notice (`kind:
  * 'auto-continuation-exhausted'`) superseding an earlier pause — returns false, so this
  * can never retry forever once the bounded round cap has already given up once.
@@ -224,7 +232,9 @@ export function hasUnresolvedMediaDeferral(
 ): boolean {
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const last = messages[messages.length - 1];
-  if (!last || last.role !== 'assistant') return false;
+  if (!last) return false;
+  if (last.role === 'user') return last.metadata?.kind === 'auto-continuation';
+  if (last.role !== 'assistant') return false;
   if (last.metadata?.mediaBudgetDeferred === true) return true;
   return hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls);
 }

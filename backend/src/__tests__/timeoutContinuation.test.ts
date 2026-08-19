@@ -405,6 +405,30 @@ describe('hasUnresolvedMediaDeferral', () => {
     expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
   });
 
+  // ENG-1239 (live-tested, ENG-1239 rework verification): a process death (e.g. a deploy)
+  // can kill the auto-continuation's OWN turn AFTER it persists the synthetic
+  // `[SYSTEM]` directive (role: 'user', kind: 'auto-continuation') but BEFORE it produces
+  // any reply — leaving that directive itself as the dangling last message. The two
+  // assistant-authored shapes above don't match a 'user'-role tail, so this needs its own
+  // check: verified live on the preview (session ef03e629), where killing the backend
+  // right after the continuation's directive was saved left getSession unable to detect
+  // anything was unresolved until this case was added.
+  it('returns true when the last message is OUR OWN dangling auto-continuation directive with no reply yet', () => {
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+      { role: 'user', content: '[SYSTEM] This is an automatic continuation...', metadata: { kind: 'auto-continuation', timestamp: '2026-08-14T18:21:20Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
+  });
+
+  it('does NOT treat a REAL dangling customer message (no auto-continuation kind) as an unresolved media deferral', () => {
+    const msgs = [
+      { role: 'assistant', content: '3 done', metadata: { kind: 'generation-timeout-continuation', mediaBudgetDeferred: true } },
+      { role: 'user', content: 'actually, can you also add a fifth image?', metadata: { timestamp: '2026-08-14T18:21:20Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
+  });
+
   it('ignores a null/malformed last entry', () => {
     expect(hasUnresolvedMediaDeferral([{ role: 'user', content: 'hi' }, null] as any)).toBe(false);
   });
