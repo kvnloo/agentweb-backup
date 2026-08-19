@@ -139,3 +139,60 @@ it('SKIPS the landing-page check when no account could be read at all', async ()
   await monitorUserTracking(userWith(['acct-1']), baseDeps() as any);
   expect(fetchLandingPageInputs).not.toHaveBeenCalled();
 });
+
+describe('landing-page findings roll up into ONE fleet alert — risk 3, fixed', () => {
+  // Filing one ticket per affected customer would drop N tickets into oncall on the first
+  // run and teach people to skim the channel — §F's own history, and the reason PAUSED
+  // optimisation mismatches were made log-only. Rolled up, the volume is 1 regardless.
+  it('does not page per user — findings are carried up on the summary instead', async () => {
+    evaluateLandingPageCoverage.mockReturnValue({
+      alerting: [{ siteId: 's1', pageId: 'p1', pageName: 'Lander', url: 'https://s.test/', reason: 'no_pixel', detectedPixelIds: [] }],
+      unconfirmed: [], unverifiable: [], okCount: 0, sitesNotChecked: 0,
+    });
+    fetchLandingPageInputs.mockResolvedValue({
+      status: 'ok', sites: [{ siteId: 's1', pageId: 'p1', url: 'https://s.test/' }],
+      sitesNotChecked: 0, sitesDeferred: 0, observations: {},
+    });
+
+    const deps: any = baseDeps();
+    const summary = await monitorUserTracking(userWith(['acct-1']), deps);
+
+    // The per-user transport was NOT used for a landing-page alert.
+    const subjects = deps.alertTransport.mock.calls.map((c: any[]) => String(c[0]));
+    expect(subjects.some((s: string) => s.includes('landing page'))).toBe(false);
+    // It is carried, not lost.
+    expect(summary.landingPageFindings).toHaveLength(1);
+    expect(summary.landingPageFindings[0].sites[0].url).toBe('https://s.test/');
+  });
+
+  it('raiseLandingPageRollup sends exactly ONE alert for many customers', async () => {
+    const { raiseLandingPageRollup } = require('../services/metaTrackingMonitor');
+    const transport = jest.fn().mockResolvedValue(undefined);
+
+    await raiseLandingPageRollup(
+      [
+        { userId: 'u1', email: 'a@x.test', sites: [{ name: 'A', url: 'https://a/', reason: 'no_pixel', detectedPixelIds: [] }] },
+        { userId: 'u2', email: 'b@x.test', sites: [{ name: 'B', url: 'https://b/', reason: 'foreign_pixel', detectedPixelIds: ['9'] }] },
+        { userId: 'u3', email: 'c@x.test', sites: [{ name: 'C', url: 'https://c/', reason: 'no_pixel', detectedPixelIds: [] }] },
+      ],
+      { transport, now: Date.parse('2026-08-19T09:00:00Z') },
+    );
+
+    expect(transport).toHaveBeenCalledTimes(1);
+    const [subject, message, context] = transport.mock.calls[0];
+    expect(subject).toContain('3 customer(s)');
+    expect(message).toContain('a@x.test');
+    expect(message).toContain('b@x.test');
+    expect(message).toContain('c@x.test');
+    expect(context['Alert Priority']).toBe('low');
+    expect(context['Customers Affected']).toBe(3);
+  });
+
+  it('sends nothing at all when there are no findings', async () => {
+    const { raiseLandingPageRollup } = require('../services/metaTrackingMonitor');
+    const transport = jest.fn();
+    await raiseLandingPageRollup([], { transport });
+    await raiseLandingPageRollup(undefined as any, { transport });
+    expect(transport).not.toHaveBeenCalled();
+  });
+});
