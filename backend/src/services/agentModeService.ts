@@ -22765,11 +22765,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
         docId: doc.id,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error creating ClickUp doc:', error);
+
+      // ENG-1354: ClickUp's own API error body ({ err, ECODE }) is the only thing
+      // that can distinguish an OAuth-scope problem from a workspace-side
+      // permission restriction from a malformed request — Axios's generic
+      // "Request failed with status code N" collapses all three into the same
+      // unreadable message. Mirrors the error.response?.data extraction already
+      // used in publishBlogArticle.
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const clickUpError = error?.response?.data;
+      if (clickUpError?.err) {
+        errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
+      }
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
       };
     }
   }
