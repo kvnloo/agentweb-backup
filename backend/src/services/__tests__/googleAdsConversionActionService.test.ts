@@ -133,6 +133,79 @@ describe('createConversionAction — surfaces drift (ENG-1322 AC4)', () => {
   });
 });
 
+describe('optional fields are sent only when supplied', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('sends primary_for_goal and the lookback window on create when given', async () => {
+    await googleAdsService.createConversionAction('u', CUSTOMER, {
+      ...valid, primaryForGoal: true, clickThroughLookbackWindowDays: 90,
+    });
+    const created = mutateSpy.mock.calls[0][3][0].create;
+    expect(created.primaryForGoal).toBe(true);
+    expect(created.clickThroughLookbackWindowDays).toBe(90);
+  });
+
+  it('omits them entirely when not given, rather than sending defaults', async () => {
+    await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    const created = mutateSpy.mock.calls[0][3][0].create;
+    expect('primaryForGoal' in created).toBe(false);
+    expect('clickThroughLookbackWindowDays' in created).toBe(false);
+  });
+
+  it('updates every supported field, building the mask from what was supplied', async () => {
+    searchSpy.mockResolvedValue([storedRow({
+      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK', primaryForGoal: false, status: 'PAUSED',
+    })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, {
+      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK',
+      primaryForGoal: false, clickThroughLookbackWindowDays: 30, status: 'PAUSED',
+    });
+    const op = mutateSpy.mock.calls[0][3][0];
+    expect(op.updateMask.split(',').sort()).toEqual(
+      ['category', 'click_through_lookback_window_days', 'counting_type', 'name', 'primary_for_goal', 'status'],
+    );
+    expect(op.update.countingType).toBe('MANY_PER_CLICK');
+    expect(op.update.clickThroughLookbackWindowDays).toBe(30);
+    expect(op.update.primaryForGoal).toBe(false);
+  });
+
+  it('normalises a lowercase counting_type rather than rejecting it', async () => {
+    await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, countingType: 'one_per_click' });
+    expect(mutateSpy.mock.calls[0][3][0].create.countingType).toBe('ONE_PER_CLICK');
+  });
+});
+
+describe('every field sent is a field checked (Greptile, ENG-1322)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('reports drift on a lookback window Google did not honour', async () => {
+    // The field was being SENT but not CHECKED, so a create that silently widened
+    // the attribution window came back with an empty drift report. A wrong window
+    // misattributes conversions for weeks and nothing errors.
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 30 })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, {
+      ...valid, clickThroughLookbackWindowDays: 90,
+    });
+    expect(out.drift).toEqual([
+      { field: 'clickThroughLookbackWindowDays', requested: 90, stored: 30 },
+    ]);
+  });
+
+  it('reports no drift when the window was stored as asked', async () => {
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 90 })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, {
+      ...valid, clickThroughLookbackWindowDays: 90,
+    });
+    expect(out.drift).toEqual([]);
+  });
+
+  it('does not check a window the caller never set', async () => {
+    searchSpy.mockResolvedValue([storedRow({ clickThroughLookbackWindowDays: 30 })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.drift).toEqual([]);
+  });
+});
+
 describe('listConversionActions', () => {
   it('returns an empty list for an account with none, rather than throwing', async () => {
     searchSpy.mockResolvedValue([]);

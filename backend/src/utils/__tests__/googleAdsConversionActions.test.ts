@@ -86,6 +86,26 @@ describe('parseTagSnippets (ENG-1322 AC2 — the create must hand back the tag)'
     expect(out?.conversionLabel).toBe('qAnwCOLmx-McEI65_eJD');
   });
 
+  it('skips a snippet that carries no event snippet at all', () => {
+    // Google returns variants; some have only a global site tag. Skipping them is
+    // how the WEBPAGE/HTML one still gets found.
+    const out = parseTagSnippets([
+      { type: 'WEBPAGE', globalSiteTag: '<script src="...id=AW-18192751758"></script>' },
+      snippet('AW-18192751758/qAnwCOLmx-McEI65_eJD'),
+    ]);
+    expect(out?.conversionLabel).toBe('qAnwCOLmx-McEI65_eJD');
+  });
+
+  it('tolerates a null entry in the snippets array', () => {
+    // Defensive: the array comes straight off a Google payload we do not control.
+    const out = parseTagSnippets([null as any, snippet('AW-18192751758/qAnwCOLmx-McEI65_eJD')]);
+    expect(out?.conversionLabel).toBe('qAnwCOLmx-McEI65_eJD');
+  });
+
+  it('returns null when every snippet lacks an event snippet', () => {
+    expect(parseTagSnippets([{ type: 'WEBPAGE', globalSiteTag: '<script></script>' }])).toBeNull();
+  });
+
   it('refuses to return a half-parsed pair', () => {
     // 'AW-123/' has an id and no label. Half a send_to installs tracking that never
     // matches a conversion action — worse than reporting nothing.
@@ -121,6 +141,16 @@ describe('diffConversionAction (ENG-1322 AC4 — read back, do not trust the cre
     expect(drift).toEqual([{ field: 'status', requested: 'PAUSED', stored: 'ENABLED' }]);
   });
 
+  it('treats a null stored record as total drift rather than crashing', () => {
+    // A read-back can legitimately return nothing; every requested field is then
+    // unverified, which is drift — not a pass.
+    const drift = diffConversionAction({ name: 'Submit lead form', status: 'PAUSED' }, null as any);
+    expect(drift).toEqual([
+      { field: 'name', requested: 'Submit lead form', stored: undefined },
+      { field: 'status', requested: 'PAUSED', stored: undefined },
+    ]);
+  });
+
   it('reports every drifted field, not just the first', () => {
     const drift = diffConversionAction(requested, {
       name: 'Something else', category: 'DOWNLOAD', countingType: 'MANY_PER_CLICK', status: 'PAUSED',
@@ -133,6 +163,15 @@ describe('diffConversionAction (ENG-1322 AC4 — read back, do not trust the cre
     // about, and reporting those as drift would make the signal useless.
     const drift = diffConversionAction({ name: 'Submit lead form' }, {
       name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK', status: 'ENABLED',
+    });
+    expect(drift).toEqual([]);
+  });
+
+  it('ignores a requested field explicitly set to undefined', () => {
+    // Callers build the requested map from optional params; an omitted option
+    // arrives as undefined and must not be reported as drift against a stored value.
+    const drift = diffConversionAction({ name: 'Submit lead form', status: undefined }, {
+      name: 'Submit lead form', status: 'ENABLED',
     });
     expect(drift).toEqual([]);
   });
