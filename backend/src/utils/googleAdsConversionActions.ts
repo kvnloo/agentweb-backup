@@ -139,6 +139,42 @@ export function describeGoogleAdsError(err: any): string {
   return parts.join(' — ') || String(err.message || 'Google Ads API request failed.');
 }
 
+/**
+ * The only status a conversion action can be CREATED with.
+ *
+ * Second finding from the ENG-1329 end-to-end, and a different failure from PAUSED.
+ * HIDDEN is a genuine ConversionActionStatus, so the enum check passed it — and Google
+ * then refused the create with a field error on `operations[0].create.status`:
+ *
+ *   fieldError: BLOCKED_VALUE — "The field's value is on a deny-list for this field."
+ *
+ * The value is deny-listed for that field AT CREATE TIME. You cannot create an action
+ * already hidden, or already removed. You create it enabled and change it afterwards.
+ *
+ * Worth keeping the two apart: PAUSED fails proto validation (it is not in the enum),
+ * HIDDEN fails a business rule (it is in the enum but not creatable). Same field, two
+ * different error shapes, and only a real account tells them apart.
+ */
+export const CREATABLE_CONVERSION_ACTION_STATUSES = ['ENABLED'] as const;
+
+/**
+ * Validate a status for CREATE specifically. UPDATE stays unrestricted — HIDDEN is
+ * exactly what UPDATE is for, and is the supported alternative to removal.
+ */
+export function assertCreatableConversionActionStatus(value: unknown): 'ENABLED' {
+  // Runs the full enum check first, so PAUSED still gets its own campaign-status
+  // explanation rather than being lumped in with "not creatable".
+  const status = assertConversionActionStatus(value);
+  if (status !== 'ENABLED') {
+    throw new Error(
+      `A conversion action cannot be created with status ${status} — Google deny-lists that `
+      + 'value on create (BLOCKED_VALUE). Create it with status ENABLED, then UPDATE it to '
+      + `${status} once it exists.`,
+    );
+  }
+  return status;
+}
+
 export interface ConversionTagPair {
   /** The `AW-…` half — the Google tag id that goes in the page's base snippet. */
   conversionId: string;
