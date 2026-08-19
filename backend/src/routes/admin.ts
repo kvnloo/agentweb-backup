@@ -3239,11 +3239,11 @@ router.get("/chat-sessions", async (req, res) => {
       }
     }
 
-    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
-      limit,
-      lastEvaluatedKey,
-      timeRange
-    );
+    const {
+      sessions,
+      lastEvaluatedKey: nextKey,
+      gapQueryTruncated,
+    } = await chatbotDb.getRecentSessionsPage(limit, lastEvaluatedKey, timeRange);
 
     // Load messages from the messages table for each session
     const sessionsWithMessages = await Promise.all(
@@ -3268,8 +3268,20 @@ router.get("/chat-sessions", async (req, res) => {
           totalFetched: number;
           alreadyScored: number;
           newlyScored: number;
-          skippedForBudget: number;
+          // ENG-1332 (Greptile): named `unscored`, not `skippedForBudget` — an
+          // in-range session lands here whenever it has no persisted score
+          // after this run, whether that's because the scoring budget ran out
+          // (see `timedOut`), the scorer threw, it intentionally returned no
+          // score, or it lost the conditional-write race to an admin override.
+          // The old name implied budget was always the cause; it usually
+          // isn't distinguishable from here, so the name no longer claims it.
+          unscored: number;
           timedOut: boolean;
+          // True when the gap query (see getRecentSessionsPage) hit its page
+          // cap before exhausting [endTime, now] — some late-touched in-range
+          // sessions may exist beyond where it stopped, so requestedRangeCount
+          // may understate the true population for this window.
+          requestedRangeMayBeIncomplete: boolean;
         }
       | undefined;
 
@@ -3332,18 +3344,20 @@ router.get("/chat-sessions", async (req, res) => {
       // many requested-window sessions remain unscored" — is fully derivable
       // from the counts already scoped to inRangeSessions: every in-range
       // session is accounted for by exactly one of alreadyScored (had a score
-      // already), newlyScored (scored this run), or neither (still unscored,
-      // whether skipped for budget or a scoring error) — so the remainder is
-      // the honest, correctly-scoped count.
-      const skippedForBudget = requestedRangeCount - alreadyScoredIds.size - newlyScored;
+      // already), newlyScored (scored this run), or neither — so the
+      // remainder is the honest, correctly-scoped count. It is NOT purely a
+      // budget count (see the `unscored` field comment above), which is why
+      // it's paired with `timedOut` rather than named after budget alone.
+      const unscored = requestedRangeCount - alreadyScoredIds.size - newlyScored;
 
       scoringCoverage = {
         requestedRangeCount,
         totalFetched: sessionsWithMessages.length,
         alreadyScored: alreadyScoredIds.size,
         newlyScored,
-        skippedForBudget,
+        unscored,
         timedOut: backfill.timedOut,
+        requestedRangeMayBeIncomplete: gapQueryTruncated === true,
       };
     }
 
