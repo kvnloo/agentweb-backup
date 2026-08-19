@@ -77,6 +77,15 @@ export async function addPageViaCodingAgent(
     siteId: site.siteId ?? site.id,
     ...(opts.originatingSessionId ? { originatingSessionId: opts.originatingSessionId } : {}),
     ...(opts.leadListId ? { leadListId: opts.leadListId } : {}),
+    // A conversion is site-wide by construction (shared root layout), so this page
+    // inherits the site's pair rather than resolving its own — the same rule addSubPage
+    // follows. Carried onto the record so RULE 7.5 and the offline import (ENG-1325) can
+    // read it off ANY page of the site (ENG-1328).
+    ...(site.googleAdsConversionId ? { googleAdsConversionId: site.googleAdsConversionId } : {}),
+    ...(site.googleAdsConversionLabel ? { googleAdsConversionLabel: site.googleAdsConversionLabel } : {}),
+    ...(site.googleAdsCustomerId ? { googleAdsCustomerId: site.googleAdsCustomerId } : {}),
+    ...(site.googleAdsTrackingInstalled !== undefined
+      ? { googleAdsTrackingInstalled: site.googleAdsTrackingInstalled } : {}),
     createdAt: now,
     updatedAt: now,
   };
@@ -89,7 +98,12 @@ export async function addPageViaCodingAgent(
   // (check_deployment), and we promote to main ONLY on a green build — so the live
   // site is never broken by a bad generation.
   const draftBranch = LANDING_PAGE_PREVIEW_BRANCH;
-  const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId);
+  // Both halves or neither: an id without its label fires a conversion that matches no
+  // conversion action — reported as fired, attributing nothing.
+  const googleAds = site.googleAdsConversionId && site.googleAdsConversionLabel
+    ? { conversionId: site.googleAdsConversionId, conversionLabel: site.googleAdsConversionLabel }
+    : undefined;
+  const task = buildSubPageTask(slug, name, prompt, brandContext, opts.leadListId, googleAds);
 
   try {
     const result = await runCodingAgent(task, {
@@ -191,7 +205,8 @@ export function buildSubPageTask(
   name: string,
   prompt: string,
   brand: BrandContext,
-  leadListId?: string
+  leadListId?: string,
+  googleAds?: { conversionId: string; conversionLabel: string }
 ): string {
   const brandLines = summarizeBrand(brand);
   const formLine = leadListId
@@ -211,6 +226,21 @@ export function buildSubPageTask(
     ``,
     brandLines,
     formLine,
+    // Until now this path relied entirely on "mirror the home page's form" to carry the
+    // tracking call across. That works when it works, but it is inference: the agent can
+    // reasonably build a clean form and drop the call, and nothing would notice until a
+    // campaign reported zero conversions. Naming the requirement — and the exact pair —
+    // removes the guesswork (ENG-1328).
+    ...(googleAds ? [
+      `- This site has Google Ads conversion tracking. On a SUCCESSFUL form submission the page MUST call `
+      + `fireLeadTracking({ email, eventId, googleAds: { conversionId: "${googleAds.conversionId}", `
+      + `conversionLabel: "${googleAds.conversionLabel}" } }) — imported from "@/lib/agentweb-track", exactly as the `
+      + `home page's form does. Generate eventId ONCE per submit with crypto.randomUUID() and send the same value `
+      + `as an "eventId" field in the /api/capture body.`,
+      `- Do NOT hand-author a gtag() call and do NOT call gtag('config', ...) — the base tag is already installed `
+      + `in the shared root layout, and fireLeadTracking fires the conversion correctly, in the right order, `
+      + `before any redirect. Dropping this call means the page captures leads that report no conversion.`,
+    ] : []),
     `- Write real, specific copy from the brief — no lorem ipsum, no [PLACEHOLDER] text.`,
     `- Self-contained and consistent with the existing components; prefer reusing the site's components over writing new ones.`,
     ``,

@@ -2325,25 +2325,42 @@ async function saveGoogleAdsForPage(
     }
   }
 
-  await updateLandingPageGoogleAds(page.id, page.userId, conversionId, conversionLabel, customerId);
-
-  // Every sibling shares the layout we just committed, so every sibling just became
-  // tracked (or untracked). Best-effort per page — a sync failure must never undo the
-  // GitHub commit that already succeeded.
+  /*
+   * Write the config to EVERY page of the site, not just the one named in the request.
+   *
+   * A conversion is site-wide by construction — the base tag lives in the shared root
+   * layout we just committed — so one commit changed the answer for every page. Writing
+   * only to `page` breaks in both directions: a manual install targeting a SUB-page would
+   * leave the ROOT blank, and addSubPage reads the pair off the root, so every later
+   * sub-page would inherit nothing and capture leads that fire no conversion. Writing to
+   * all of them also keeps each record self-describing, which is what lets RULE 7.5 and
+   * the offline import (ENG-1325) read the config off ANY page without walking to a root.
+   *
+   * Best-effort per page — a sync failure must never undo the GitHub commit that already
+   * succeeded. The root is written first and NOT swallowed: it is the record addSubPage
+   * inherits from, so losing it silently is the one failure that propagates.
+   */
   const siteId = page.siteId ?? page.id;
+  await updateLandingPageGoogleAds(siteId, page.userId, conversionId, conversionLabel, customerId);
+
   try {
     const siblings = await listLandingPages(page.userId);
     await Promise.all(
       siblings
         .filter((p) => (p.siteId ?? p.id) === siteId)
-        .map((p) =>
-          updateLandingPageGoogleAdsInstalled(p.id, !!conversionId).catch((err: any) => {
-            console.error(`[LP GENERATION] Failed to sync googleAdsTrackingInstalled for page ${p.id}: ${err.message}`);
-          }),
-        ),
+        .map(async (p) => {
+          try {
+            if (p.id !== siteId) {
+              await updateLandingPageGoogleAds(p.id, p.userId, conversionId, conversionLabel, customerId);
+            }
+            await updateLandingPageGoogleAdsInstalled(p.id, !!conversionId);
+          } catch (err: any) {
+            console.error(`[LP GENERATION] Failed to sync Google Ads config for page ${p.id}: ${err.message}`);
+          }
+        }),
     );
   } catch (err: any) {
-    console.error(`[LP GENERATION] Failed to list sibling pages for googleAdsTrackingInstalled sync: ${err.message}`);
+    console.error(`[LP GENERATION] Failed to list sibling pages for Google Ads sync: ${err.message}`);
   }
 
   const vercelProjectId = await resolveVercelProjectId(page);
