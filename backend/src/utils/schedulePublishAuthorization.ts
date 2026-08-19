@@ -1,5 +1,6 @@
 import { isPublishName } from './hardeningGaps';
 import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedulePublishApproval';
+import { EQUIVALENT_PUBLISH_ROUTES, normalizeAction } from './requiredCallSatisfaction';
 
 /**
  * ENG-827 — resolving the unattended publish gate.
@@ -300,4 +301,43 @@ export function narrowPublishAuthorization(
     authorized: admitted.authorized && latest.authorized && tools.length > 0,
     tools: admitted.authorized && latest.authorized ? tools : []
   };
+}
+
+/**
+ * Whether `toolName` (optionally scoped to `args.action`) is covered by a grant for
+ * `tools` — either because it IS one of the granted tools, or because ENG-1045
+ * already treats it as ACHIEVING one of them (the identical equivalence table the
+ * completion checker uses to decide `functionCallMatches`).
+ *
+ * WITHOUT THIS, THE ENG-1045 FIX WAS UNREACHABLE IN PRACTICE. `tools` here is
+ * derived from the schedule's literal `requiredFunctionCalls` (see
+ * `getRequiredPublishTools`), so a schedule requiring only `post_on_connected_account`
+ * granted consent for exactly that name — never for `twitter_manage_post`, even
+ * though a thread/reply/quote-tweet through it satisfies the SAME requirement.
+ * `refuseUnauthorizedScheduledPublish` refused the call outright before the
+ * completion checker's equivalence route ever had a chance to credit it (live-verified
+ * on preview 2026-08-17): the model was told "this schedule is only pre-authorized to
+ * publish using post_on_connected_account" and silently collapsed a requested
+ * 2-tweet thread into one tweet rather than posting the thread it was asked for.
+ *
+ * DELIBERATELY ACTION-SCOPED, not a blanket tool grant. `twitter_manage_post` also
+ * has a `retweet` action that is NOT in `post_on_connected_account`'s equivalence
+ * list — resharing someone else's content is a different act the owner never
+ * approved, so granting the whole tool name would authorize more than the owner's
+ * literal consent covers. Matching `EQUIVALENT_PUBLISH_ROUTES` exactly, action for
+ * action, is what keeps this an outcome-equivalent substitution instead of a scope
+ * widening.
+ */
+export function isPublishCallWithinAuthorizedScope(
+  toolName: string,
+  args: any,
+  tools: string[]
+): boolean {
+  if (tools.includes(toolName)) return true;
+  const action = normalizeAction(args?.action);
+  return tools.some((required) => {
+    const routes = EQUIVALENT_PUBLISH_ROUTES[required];
+    if (!routes) return false;
+    return routes.some((route) => route.tool === toolName && (!route.actions || route.actions.includes(action)));
+  });
 }
