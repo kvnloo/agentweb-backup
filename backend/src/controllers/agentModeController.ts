@@ -871,6 +871,13 @@ function attachInProcessCompletion(
 // for a larger batch that defers more than once.
 const AUTO_MEDIA_CONTINUATION_MAX_ROUNDS = 4;
 
+// ENG-1239 (rework): how old an unresolved media-batch pause may be before getSession's
+// durability backstop stops treating it as resumable on a passive reopen. Matches the
+// idempotency dedupe window (seedMediaCallKeysFromHistory) for consistency — both exist to
+// bound how far back "this is still the same in-progress batch" is a safe assumption to
+// make. Env-overridable so tests aren't forced into real-time waits.
+const BACKSTOP_STALENESS_MS = parseInt(process.env.AUTO_MEDIA_CONTINUATION_STALENESS_MS || String(60 * 60 * 1000), 10);
+
 // ENG-1239: the turn that hit the per-turn media budget already told the user (via the
 // model's own reply) that some assets are still missing and invited "continue" — this
 // message is that continuation, fired by the SERVER instead of waiting for the customer to
@@ -6428,14 +6435,33 @@ export async function generateSessionResponse(
     }
   }
 
-  // Add user message to session in database
-  console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
-    hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
-    attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
-    attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
-  });
-  await chatbotDb.addMessageToSession(sessionId, userMessageObj);
-  console.log('AgentMode generateSessionResponse: User message saved successfully');
+  // ENG-1239 (rework): if a PRIOR auto-continuation attempt already left its directive
+  // dangling at the tail (persisted, then orphaned by a process death before any reply —
+  // see hasUnresolvedMediaDeferral), a fresh scheduleAutoMediaContinuation call would
+  // otherwise persist a SECOND, near-identical directive on top of it — harmless
+  // functionally (both are hidden from the customer, no duplicate images result, proven
+  // live), but it lets hidden rows accumulate in history every time a recovery is itself
+  // interrupted. Scoped to the exact 'auto-continuation' kind so no other caller
+  // (scheduled runs, ishare, a real customer message, every other kind) is ever affected.
+  const reusingDanglingDirective =
+    userMessageKind === 'auto-continuation'
+    && (() => {
+      const priorLast = session.messages?.[session.messages.length - 1];
+      return priorLast?.role === 'user' && (priorLast.metadata as any)?.kind === 'auto-continuation';
+    })();
+
+  if (!reusingDanglingDirective) {
+    // Add user message to session in database
+    console.log('AgentMode generateSessionResponse: Saving user message with attachments:', {
+      hasAttachments: !!(userMessageObj.metadata?.attachments && userMessageObj.metadata.attachments.length > 0),
+      attachmentCount: userMessageObj.metadata?.attachments?.length || 0,
+      attachments: userMessageObj.metadata?.attachments?.map((a: any) => ({ url: a.url, filename: a.filename }))
+    });
+    await chatbotDb.addMessageToSession(sessionId, userMessageObj);
+    console.log('AgentMode generateSessionResponse: User message saved successfully');
+  } else {
+    console.log('AgentMode generateSessionResponse: reusing an already-dangling auto-continuation directive — skipped a redundant duplicate');
+  }
 
   // Get updated session with the new user message
   const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -6905,7 +6931,26 @@ export const agentModeController = {
       // being actively generated (a real request or an already-running continuation holds
       // that lock) so this never races a resume already in flight — best-effort, must
       // never block or fail this response.
-      if (!activeSessionGenerations.has(session.sessionId) && hasUnresolvedMediaDeferral(session.messages)) {
+      //
+      // Two additional consent guards, both added after review:
+      // - genuineOwnerView: getSession is called by the owner AND by admins (direct or
+      //   delegated) investigating a customer's session. A read-only "let me check on
+      //   this" by support staff must never have the side effect of spending a
+      //   customer's credits on their behalf — only the account owner's own, real,
+      //   non-delegated session can trigger the resume. An admin can still resume it by
+      //   sending an explicit message (the customer's express consent via someone acting
+      //   on their instruction), just not merely by looking.
+      // - staleness bound (BACKSTOP_STALENESS_MS): getSession is a passive READ. Without
+      //   a bound, reopening a batch abandoned days ago would silently re-trigger billed
+      //   generation the customer never asked for on this visit. An old, unresolved
+      //   pause just sits there until they explicitly type "continue" — exactly like
+      //   pre-fix behavior.
+      const genuineOwnerView = user?.userId === session.userId && !(req as any).delegateInfo?.isDelegated;
+      if (
+        genuineOwnerView
+        && !activeSessionGenerations.has(session.sessionId)
+        && hasUnresolvedMediaDeferral(session.messages, Date.now() - BACKSTOP_STALENESS_MS)
+      ) {
         setImmediate(() => scheduleAutoMediaContinuation(
           session.sessionId,
           session.userId,

@@ -226,17 +226,32 @@ export function hasPersistedMediaBudgetDeferral(
  * Anything else — including the round-cap exhaustion notice (`kind:
  * 'auto-continuation-exhausted'`) superseding an earlier pause — returns false, so this
  * can never retry forever once the bounded round cap has already given up once.
+ *
+ * ENG-1239 (rework): `sinceMs` bounds how OLD a matching pause may be before this stops
+ * treating it as resumable — getSession is a passive READ endpoint, so without this, a
+ * customer merely reopening a session they abandoned days ago would silently trigger a
+ * fresh billed generation attempt they never asked for. Optional (defaults to no bound)
+ * so every existing caller keeps its exact prior behavior — including tolerating a
+ * message with no timestamp at all — and only a caller that explicitly wants staleness
+ * bounding (getSession) opts in. Once opted in, a matching message with NO usable
+ * timestamp fails closed (treated as stale) rather than being trusted indefinitely.
  */
 export function hasUnresolvedMediaDeferral(
   messages: TimeoutContinuationMessage[] | undefined | null,
+  sinceMs: number = 0,
 ): boolean {
   if (!Array.isArray(messages) || messages.length === 0) return false;
   const last = messages[messages.length - 1];
   if (!last) return false;
-  if (last.role === 'user') return last.metadata?.kind === 'auto-continuation';
-  if (last.role !== 'assistant') return false;
-  if (last.metadata?.mediaBudgetDeferred === true) return true;
-  return hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls);
+  const isUnresolvedShape = last.role === 'user'
+    ? last.metadata?.kind === 'auto-continuation'
+    : last.role === 'assistant'
+      && (last.metadata?.mediaBudgetDeferred === true || hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls));
+  if (!isUnresolvedShape) return false;
+  if (sinceMs <= 0) return true;
+  const rawTs = last.timestamp || last.metadata?.timestamp;
+  const ts = rawTs ? Date.parse(rawTs) : NaN;
+  return Number.isFinite(ts) && ts >= sinceMs;
 }
 
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */
