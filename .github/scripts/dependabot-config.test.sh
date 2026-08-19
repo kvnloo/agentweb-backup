@@ -42,60 +42,98 @@ if [ ! -f "${CONFIG}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Extract just the `package-ecosystem: github-actions` update block, not the
+# whole file.
+#
+# CAUGHT BY CODE RABBIT (PR #2497): the grouping and preserved-setting checks
+# originally grepped the full file. With one update block that is equivalent,
+# but it silently stops being a contract about the github-actions block
+# specifically the moment a second `updates:` entry exists (e.g. an `npm`
+# block) -- a later edit could drop `open-pull-requests-limit: 3` from
+# github-actions while adding it to the new block, and every assertion below
+# would still pass, having matched the WRONG block. Bounding capture to the
+# github-actions entry, ending at the next `  - package-ecosystem:` line (or
+# EOF), makes each assertion actually about the block ENG-1042 changed.
+# ---------------------------------------------------------------------------
+
+BLOCK="${SCRIPT_DIR}/../.dependabot-config.test.block.tmp"
+trap 'rm -f "${BLOCK}"' EXIT
+
+awk '
+  /^  - package-ecosystem:/ {
+    capturing = ($0 == "  - package-ecosystem: github-actions") ? 1 : 0
+  }
+  capturing { print }
+' "${CONFIG}" >"${BLOCK}"
+
+if [ ! -s "${BLOCK}" ]; then
+  printf 'FATAL: no package-ecosystem: github-actions update block found in %s\n' "${CONFIG}" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Helpers
 #
-# grep -Pzo over the whole file (NUL-delimited, so it's one "line") lets a
+# grep -Pzo over the whole target (NUL-delimited, so it's one "line") lets a
 # pattern match across newlines with the (?s) flag where needed, while plain
 # ^/$-anchored patterns still match per physical line as usual.
 # ---------------------------------------------------------------------------
 
 assert_match() {
-  local desc="$1" pattern="$2"
+  local desc="$1" pattern="$2" target="${3:-${CONFIG}}"
   TESTS_RUN=$((TESTS_RUN + 1))
-  if grep -Pzo "${pattern}" "${CONFIG}" >/dev/null 2>&1; then
+  if grep -Pzo "${pattern}" "${target}" >/dev/null 2>&1; then
     printf 'PASS: %s\n' "${desc}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    printf 'FAIL: %s\n  expected pattern not found in %s: %s\n' "${desc}" "${CONFIG}" "${pattern}"
+    printf 'FAIL: %s\n  expected pattern not found in %s: %s\n' "${desc}" "${target}" "${pattern}"
   fi
 }
 
 # ---------------------------------------------------------------------------
-# New behavior: grouping (ENG-1042 AC1 + AC3)
+# New behavior: grouping (ENG-1042 AC1 + AC3), scoped to the github-actions
+# update block.
 # ---------------------------------------------------------------------------
 
 assert_match 'a groups stanza exists under the github-actions update block' \
-  '(?m)^    groups:$'
+  '(?m)^    groups:$' "${BLOCK}"
 
 assert_match 'the group is named github-actions' \
-  '(?m)^      github-actions:$'
+  '(?m)^      github-actions:$' "${BLOCK}"
 
 assert_match 'the group matches every action via a wildcard pattern' \
-  '(?ms)^      github-actions:\n        patterns:\n          - "\*"$'
+  '(?ms)^      github-actions:\n        patterns:\n          - "\*"$' "${BLOCK}"
 
+# The rationale comment sits in the file's shared header (above `updates:`,
+# alongside the ENG-895 rationale it extends), not inside any one update
+# block, so this stays a whole-file check deliberately -- there is nowhere
+# inside the block itself for a header comment to live.
 assert_match 'a comment near the grouping states the CI-cost rationale, so it is not "cleaned up" as redundant' \
   '(?i)groups?.{0,200}(CI cost|runner-minutes?|batch)|((CI cost|runner-minutes?|batch).{0,200}groups?)'
 
 # ---------------------------------------------------------------------------
 # Preserved behavior: cadence, limit, SHA-pinning policy (ENG-1042 AC4,
-# ENG-895) -- these already pass on origin/main and must keep passing after
-# grouping lands, proving the change is additive, not a rewrite.
+# ENG-895), scoped to the github-actions update block -- these already pass
+# on origin/main and must keep passing after grouping lands, proving the
+# change is additive, not a rewrite.
 # ---------------------------------------------------------------------------
 
 assert_match 'the weekly Monday cadence is unchanged' \
-  '(?m)^      interval: weekly$'
+  '(?m)^      interval: weekly$' "${BLOCK}"
 assert_match 'the weekly Monday cadence is unchanged (day)' \
-  '(?m)^      day: monday$'
+  '(?m)^      day: monday$' "${BLOCK}"
 
 assert_match 'the open-pull-requests-limit of 3 is unchanged' \
-  '(?m)^    open-pull-requests-limit: 3$'
+  '(?m)^    open-pull-requests-limit: 3$' "${BLOCK}"
 
 assert_match 'the ci commit-message prefix is unchanged' \
-  '(?m)^      prefix: ci$'
+  '(?m)^      prefix: ci$' "${BLOCK}"
 
 assert_match 'the Auto label is unchanged' \
-  '(?m)^      - Auto$'
+  '(?m)^      - Auto$' "${BLOCK}"
 
+# The ENG-895 reference is in the shared file header, same reasoning as the
+# CI-cost comment above -- deliberately whole-file, not block-scoped.
 assert_match 'the ENG-895 SHA-pinning rationale header is preserved, not replaced' \
   'ENG-895'
 
