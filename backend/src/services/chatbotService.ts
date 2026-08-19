@@ -3714,6 +3714,14 @@ export class ChatbotDB {
         // final slice below never returns more than `limit` in-range sessions
         // anyway, so scanning further pages can't change the response, only add
         // cost.
+        //
+        // The `inRangeCount < limit` stop condition alone isn't enough: a
+        // sparse stale range (few or no sessions actually created in it) can
+        // never reach `limit` no matter how many pages are scanned, so it would
+        // still walk every page through "now" one at a time. A hard page cap
+        // bounds that case too — past this many pages, further scanning trades
+        // an unbounded amount of latency for a small chance of catching one
+        // more late-touched session, so this stops and logs instead.
         const nowIso = new Date().toISOString();
         if (timeRange.endTime < nowIso) {
           const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
@@ -3727,7 +3735,9 @@ export class ChatbotDB {
           };
           const lateKeyCondition =
             "adminListPartition = :adminListPartition AND updatedAt BETWEEN :end AND :now";
+          const MAX_GAP_QUERY_PAGES = 20;
           let lateKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+          let pageCount = 0;
           do {
             const lateParams: AWS.DynamoDB.DocumentClient.QueryInput = {
               TableName: this.tableName,
@@ -3741,6 +3751,7 @@ export class ChatbotDB {
             }
 
             const lateResult = await dynamodb.query(lateParams).promise();
+            pageCount++;
             for (const session of (lateResult.Items as ChatSession[]) || []) {
               if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
               const createdAt = session.createdAt;
@@ -3750,7 +3761,13 @@ export class ChatbotDB {
               }
             }
             lateKey = lateResult.LastEvaluatedKey;
-          } while (lateKey && inRangeCount < limit);
+          } while (lateKey && inRangeCount < limit && pageCount < MAX_GAP_QUERY_PAGES);
+
+          if (lateKey && pageCount >= MAX_GAP_QUERY_PAGES) {
+            console.warn(
+              `[chatbotService] getRecentSessionsPage: gap query hit its ${MAX_GAP_QUERY_PAGES}-page cap scanning [${timeRange.endTime}, ${nowIso}] for a sparse range — some late-touched in-range sessions past this point may be missing from this page`
+            );
+          }
         }
 
         // ENG-1332: the query above orders by updatedAt, not createdAt — a

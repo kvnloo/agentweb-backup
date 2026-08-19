@@ -482,6 +482,38 @@ describe('DynamoDB pagination in chatbotService', () => {
       expect(queryPromiseMock).toHaveBeenCalledTimes(2);
     });
 
+    // ENG-1332 (Greptile): a SPARSE stale range — few or no sessions actually
+    // created in it — never reaches `limit` no matter how many gap-query pages
+    // are scanned, so the inRangeCount<limit condition alone never stops the
+    // loop. A hard page cap must bound it independently.
+    it('stops paging the gap query at its page cap when a sparse range never fills the limit', async () => {
+      queryPromiseMock.mockResolvedValueOnce({ Items: [] }); // primary [start, end] query: nothing
+
+      const PAGE_CAP = 20;
+      for (let i = 0; i < PAGE_CAP; i++) {
+        queryPromiseMock.mockResolvedValueOnce({
+          // Out-of-range noise on every page: never satisfies inRangeCount.
+          Items: [
+            {
+              sessionId: `noise-${i}`,
+              adminListPartition: 'all',
+              createdAt: '2026-08-19T00:00:00.000Z', // after the requested window
+              updatedAt: '2026-08-18T15:00:00.000Z',
+            },
+          ],
+          LastEvaluatedKey: { sessionId: `noise-${i}` }, // always more pages available
+        });
+      }
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      // 1 primary page + PAGE_CAP gap pages, then stops even though the last
+      // gap page still reported a LastEvaluatedKey.
+      expect(queryPromiseMock).toHaveBeenCalledTimes(1 + PAGE_CAP);
+      expect(result.sessions).toEqual([]);
+    });
+
   });
 
   describe('getMessageCountFromMessagesTable', () => {
