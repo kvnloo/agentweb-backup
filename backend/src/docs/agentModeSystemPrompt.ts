@@ -5,6 +5,8 @@
 // To update the prompt: edit this file and open a PR.
 // DO NOT update AW-Settings manually — this file takes precedence.
 
+import { EQUIVALENT_PUBLISH_ROUTES } from '../utils/requiredCallSatisfaction';
+
 // Reusable team context block — inject wherever Emma needs to know who is on the AgentWeb team.
 // Used in: Slack session system prompts. Can be extended to email, onboarding, etc.
 export const ABOUT_AGENTWEB_TEAM = `AGENTWEB TEAM — answer questions about these people directly, without asking for more context:
@@ -741,6 +743,24 @@ export function getUnattendedExecutionDirective(
   authorizedPublishTools?: string[]
 ): string {
   if (sessionType !== 'scheduled') return '';
+  // ENG-1045: an authorized literal tool (e.g. post_on_connected_account) also
+  // covers whatever ACHIEVES the same outcome via EQUIVALENT_PUBLISH_ROUTES (e.g. a
+  // thread/reply/quote-tweet through twitter_manage_post) — the identical table the
+  // completion checker uses to credit functionCallMatches, and that
+  // scheduledPublishConsentGuard now also grants execution consent for. Without
+  // telling the model about it HERE, it never attempts the equivalent tool at all —
+  // the equivalence route is technically permitted but practically unreachable
+  // (live-verified on preview 2026-08-17: the model narrated "this schedule is only
+  // pre-authorized to publish using post_on_connected_account" and silently
+  // collapsed a requested 2-tweet thread into one tweet instead of posting the
+  // thread through the now-authorized twitter_manage_post).
+  const equivalentRouteNotes = Array.from(new Set(
+    (authorizedPublishTools || [])
+      .flatMap((tool) => EQUIVALENT_PUBLISH_ROUTES[tool] || [])
+      .map((route) => (route.actions && route.actions.length > 0
+        ? `${route.tool} (${route.actions.join('/')} only)`
+        : route.tool))
+  ));
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
   // ONLY for admin schedule owners — a non-admin scheduled run cannot call
@@ -791,8 +811,9 @@ SURFACE GAPS AS ACTIONABLE ITEMS:
 
 PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
 - The owner explicitly authorized unattended publishing for this schedule and approved ${authorizedPublishTools.join(' and ')} for it. That standing consent IS the human approval — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
-- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
-- The authorization covers ONLY ${authorizedPublishTools.join(' and ')}. Any OTHER publishing tool is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.${equivalentRouteNotes.length > 0 ? `
+- If the content needs a form the authorized tool cannot express by itself (e.g. post_on_connected_account cannot post a multi-tweet THREAD, a reply, or a quote-tweet), use ${equivalentRouteNotes.join(' or ')} instead — that is STILL covered by this same authorization for exactly that content. Publish it as asked; do NOT silently shrink or merge the requested content (e.g. collapsing a thread into one post) just to force it through the literal authorized tool name.` : ''}
+- The authorization covers ${authorizedPublishTools.join(' and ')}${equivalentRouteNotes.length > 0 ? `, and — ONLY for that same mandated content, never for anything else those tools can do — ${equivalentRouteNotes.join(' and ')}` : ''}. Any OTHER publishing tool or action is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
 - Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
   : `
 
