@@ -3334,6 +3334,10 @@ export const scheduleDb = {
     functionCallMinCalls?: { [functionName: string]: number };
     emailNotifications?: string[];
     dailyDigest?: boolean;
+    // ENG-1131 follow-up: owner opt-out for the proactive sourcing-block
+    // transition email specifically (does not affect the schedule-card badge,
+    // per-run emails, or run history).
+    disableSourcingBlockAlerts?: boolean;
     updatedAt?: string;
     sessionId?: string | null;
     type?: string;
@@ -3497,18 +3501,48 @@ export const scheduleDb = {
      * leaves the length unchanged, and length alone would wave the stale count
      * through. Capped at MAX_ATOMIC_RUN_RESULT_REMOVALS by the caller.
      */
-    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
+    shedRunResults?: { count: number; expectedLength: number; expectedLast?: any },
+    /**
+     * Attributes to REMOVE outright, restoring "never set" rather than writing a
+     * blank. Explicit rather than inferred from an undefined value: an absent
+     * attribute is a meaningful state -- a schedule with no `llmModel` INHERITS
+     * the platform default and follows it as it moves, where any stored value
+     * would not -- and deleting configuration is too consequential to happen
+     * because an optional field came through undefined.
+     */
+    removeAttributes?: string[]
   ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeNames: { [key: string]: string } = {};
       const expressionAttributeValues: { [key: string]: any } = {};
 
+      // An `undefined` value is NEVER emitted as a SET. `Object.entries` still
+      // yields the key, so doing so produced `SET #k = :k` while the
+      // DocumentClient marshaller DROPPED `:k` -- an expression referencing a
+      // value that never reached DynamoDB, which fails the entire write with a
+      // ValidationException. Skipping makes a stray undefined a no-op rather than
+      // a crash. Deliberate removal goes through `removeAttributes` instead, so
+      // it can never be triggered by an accidentally-undefined field.
       Object.entries(updates).forEach(([key, value]) => {
+        if (value === undefined) return;
         updateExpressions.push(`#${key} = :${key}`);
         expressionAttributeNames[`#${key}`] = key;
         expressionAttributeValues[`:${key}`] = value;
       });
+
+      const attributeRemovals: string[] = [];
+      for (const key of removeAttributes || []) {
+        // One key cannot be both SET and REMOVEd in a single expression, and the
+        // explicit removal wins because the caller named it outright.
+        const setIndex = updateExpressions.indexOf(`#${key} = :${key}`);
+        if (setIndex >= 0) {
+          updateExpressions.splice(setIndex, 1);
+          delete expressionAttributeValues[`:${key}`];
+        }
+        expressionAttributeNames[`#${key}`] = key;
+        attributeRemovals.push(`#${key}`);
+      }
 
       // ENG-827: an optional "only if this is still true" clause. A caller that
       // DERIVES what it writes from what it read cannot write unconditionally — a
@@ -3532,13 +3566,18 @@ export const scheduleDb = {
       // is what makes this safe against a run finishing mid-edit: appends land at the
       // tail, so index 0 still names the oldest entry. `runResults` is never also SET
       // here — overlapping document paths in one expression are rejected.
-      let removeExpression = '';
+      // Both kinds of removal share ONE clause: DynamoDB allows a single REMOVE
+      // per expression, so these are collected rather than assigned, or whichever
+      // ran second would silently discard the other.
+      const removeTargets: string[] = [...attributeRemovals];
       if (shedRunResults && shedRunResults.count > 0) {
         expressionAttributeNames['#runResults'] = 'runResults';
-        removeExpression = ` REMOVE ${Array.from(
-          { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
-          (_, index) => `#runResults[${index}]`
-        ).join(", ")}`;
+        removeTargets.push(
+          ...Array.from(
+            { length: Math.min(shedRunResults.count, MAX_ATOMIC_RUN_RESULT_REMOVALS) },
+            (_, index) => `#runResults[${index}]`
+          )
+        );
         conditionExpressions.push('size(#runResults) = :expectedRunResultsLength');
         expressionAttributeValues[':expectedRunResultsLength'] = shedRunResults.expectedLength;
         if (shedRunResults.expectedLast !== undefined && shedRunResults.expectedLength > 0) {
@@ -3549,16 +3588,31 @@ export const scheduleDb = {
         }
       }
 
+      // A removal-only update has nothing to SET, and a bare `SET ` is a syntax
+      // error -- so each clause is emitted only when it has targets.
+      const clauses: string[] = [];
+      if (updateExpressions.length > 0) clauses.push(`SET ${updateExpressions.join(", ")}`);
+      if (removeTargets.length > 0) clauses.push(`REMOVE ${removeTargets.join(", ")}`);
+      if (clauses.length === 0) {
+        // Nothing to do. Returning beats sending an empty expression, which
+        // DynamoDB rejects, and beats pretending a write happened.
+        return undefined;
+      }
+
       const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
         },
-        UpdateExpression: `SET ${updateExpressions.join(", ")}${removeExpression}`,
+        UpdateExpression: clauses.join(" "),
         ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      // An empty value map is itself a validation error, so it is only attached
+      // when the expression actually references values.
+      if (Object.keys(expressionAttributeValues).length > 0) {
+        params.ExpressionAttributeValues = expressionAttributeValues;
+      }
       if (conditionExpressions.length > 0) {
         params.ConditionExpression = conditionExpressions.join(" AND ");
       }

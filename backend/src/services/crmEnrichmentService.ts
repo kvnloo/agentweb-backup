@@ -1,4 +1,5 @@
 import { crmDb } from './db';
+import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileFields } from '../utils/linkedInAnonymizedProfile';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
@@ -883,16 +884,20 @@ export class CrmEnrichmentService {
       }
 
       if (profileData) {
-        rawProfile = profileData as Record<string, unknown>;
+        // The whole profile object is serialized into the LLM's context below and
+        // stored for the cache-replay path, so rejecting the sentinel only where a
+        // URL gets built leaves the fabricated `/in/undefined` reachable anyway —
+        // the model can read it straight out of the blob, and citation verification
+        // then accepts it because the slug really is in the source context.
+        const sanitizedProfile = withoutFabricatedProfileFields(profileData as Record<string, unknown>);
+        rawProfile = sanitizedProfile;
         // ENG-1198: Unipile anonymizes out-of-network profiles with
         // public_identifier literally the string 'undefined' — that string is
         // truthy, so leaving it here would make the URL construction below (and
         // the cache-rebuild path in buildLinkedInContextFromCache) synthesize a
         // fake https://www.linkedin.com/in/undefined and hand it to the
         // enrichment LLM as a "Resolved LinkedIn profile URL".
-        publicIdentifier = (profileData?.public_identifier && profileData.public_identifier !== 'undefined')
-          ? profileData.public_identifier
-          : null;
+        publicIdentifier = usablePublicIdentifier(profileData?.public_identifier);
         profileId = profileData?.provider_id ?? null;
 
         if (confidence === 'low') {
@@ -902,18 +907,34 @@ export class CrmEnrichmentService {
           // enrichLead) are independent and survive.
           linkedinContext = '';
         } else {
-          const rawUrl = profileData?.public_profile_url || profileData?.url || profileData?.profile_url || null;
-          const cleanUrl = rawUrl ? rawUrl.split('?')[0] : null;
+          // Read from the SANITIZED copy: on the raw object a fabricated
+          // `public_profile_url` short-circuits this `||` chain and masks a legitimate
+          // `url`/`profile_url` that would otherwise have been used.
+          const rawUrl = sanitizedProfile?.public_profile_url || sanitizedProfile?.url || sanitizedProfile?.profile_url || null;
+          // Rejecting the identifier above is only half of it: Unipile builds
+          // `public_profile_url` from that same bad identifier and sends it too, so
+          // this fallback re-created the very /in/undefined URL the identifier check
+          // had just refused, and handed it to the enrichment LLM as a resolved
+          // profile (ENG-1198 follow-up).
+          const cleanUrl = usableProfileUrl(rawUrl);
           const profileUrl = publicIdentifier
             ? `https://www.linkedin.com/in/${publicIdentifier}`
             : cleanUrl;
-          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
+          linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(sanitizedProfile, null, 2)}`;
           if (profileUrl && isEnrichingLinkedin) {
             linkedinContext += `\n\nResolved LinkedIn profile URL: ${profileUrl}`;
           }
         }
       } else if (isEnrichingLinkedin && isValidLinkedInUrl && confidence !== 'low') {
-        linkedinContext = `\n\nResolved LinkedIn profile URL: ${linkedinUrl}`;
+        // `isValidLinkedInUrl` is only a `/in/` substring test, so the lead's own
+        // stored URL can BE the fabricated one — earlier enrichment runs wrote
+        // `/in/undefined` back onto `lead.linkedin`, which makes this self-perpetuating.
+        // Citation verification cannot catch it either: it accepts a URL whose slug
+        // appears in the source context, and the slug here is the word "undefined".
+        const storedUrl = usableProfileUrl(linkedinUrl);
+        if (storedUrl) {
+          linkedinContext = `\n\nResolved LinkedIn profile URL: ${storedUrl}`;
+        }
       }
     } catch (err: any) {
       console.error(`[CrmEnrichment][LinkedIn] lookup failed for lead ${lead?.leadId}: ${err.message}`);

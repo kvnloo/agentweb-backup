@@ -803,6 +803,20 @@ describe('createAdGroup', () => {
     expect(ag.resourceName).toBe('customers/123/adGroups/789');
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.operations[0].create.type).toBe('SEARCH_STANDARD');
+    expect(body.operations[0].create.status).toBe('ENABLED');
+  });
+
+  it('passes a requested PAUSED status through to Google Ads', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroups/789' }] },
+    });
+    await service.createAdGroup('user-123', '1234567890', {
+      name: 'Paused Ad Group',
+      campaignResourceName: 'customers/123/campaigns/1',
+      type: 'SEARCH_STANDARD',
+      status: 'PAUSED',
+    });
+    expect(mockAxiosPost.mock.calls[0][1].operations[0].create.status).toBe('PAUSED');
   });
 });
 
@@ -1033,6 +1047,22 @@ describe('createAd (Responsive Search Ad)', () => {
     const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
     expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
+  });
+
+  it('passes a requested PAUSED status through to Google Ads', async () => {
+    mockNoInheritedSuffix();
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
+    });
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/123/adGroups/789',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['Headline 1'],
+      descriptions: ['Description 1'],
+      finalUrl: 'https://example.com',
+      status: 'PAUSED',
+    });
+    expect(mutateBody().operations[0].create.status).toBe('PAUSED');
   });
 });
 

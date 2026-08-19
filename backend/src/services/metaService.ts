@@ -1,3 +1,7 @@
+import {
+  normaliseUserDataField,
+  NormalisableUserDataField,
+} from './metaUserDataNormalisation';
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import axios from 'axios';
 import * as crypto from 'crypto';
@@ -2742,17 +2746,31 @@ export class MetaService {
     try {
       const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
+      // Normalisation rules live in metaUserDataNormalisation.ts, where they are pinned by
+      // hash against Meta's own fbevents.js output. They are NOT interchangeable per field:
+      // `em` keeps `.`/`+`/`@`, `ph` keeps digits only, `fn`/`ln` drop everything that is
+      // not alphanumeric. See that module's header for how each rule was established.
+      //
+      // Empty means "no usable value" and the field is omitted entirely — hashing an empty
+      // string produces a real, constant hash that Meta would accept as if it identified a
+      // person, shared by every customer who left the field blank.
+      const hashedOrOmit = (field: NormalisableUserDataField, raw?: string): string[] | undefined => {
+        const normalised = normaliseUserDataField(field, raw);
+        return normalised ? [sha256(normalised)] : undefined;
+      };
+
       const userData: Record<string, any> = {};
-      if (event.email) userData.em = [sha256(event.email.trim().toLowerCase())];
-      // Meta's documented CAPI normalization for `ph`: digits only, then strip any leading
-      // zero(s) (a common national-dialing-prefix artifact, e.g. a UK number entered as
-      // "07911123456" should normalize the same as "7911123456" before country-code
-      // prefixing). This does not add a missing country code — no user locale is available
-      // here — so a phone entered without one will still under-match; that's a data-quality
-      // gap, not something this normalization step can fix on its own.
-      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, '').replace(/^0+/, ''))];
-      if (event.firstName) userData.fn = [sha256(event.firstName.trim().toLowerCase())];
-      if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
+      const em = hashedOrOmit('em', event.email);
+      if (em) userData.em = em;
+      const ph = hashedOrOmit('ph', event.phone);
+      if (ph) userData.ph = ph;
+      // Previously trimmed and lowercased only, so every name carrying punctuation or an
+      // internal space hashed differently from Meta's version of the same name — "van der
+      // Berg" and "O'Brien" never matched, silently, on every event we have ever sent.
+      const fn = hashedOrOmit('fn', event.firstName);
+      if (fn) userData.fn = fn;
+      const ln = hashedOrOmit('ln', event.lastName);
+      if (ln) userData.ln = ln;
       if (event.clientIp) userData.client_ip_address = event.clientIp;
       if (event.userAgent) userData.client_user_agent = event.userAgent;
       if (event.fbp) userData.fbp = event.fbp;
@@ -2804,6 +2822,24 @@ export class MetaService {
         console.error(`[MetaService] sendCapiLeadEvent failed for pixel ${pixelId}: ${message}`);
         return { success: false, error: message, usage };
       }
+
+      // The ONLY record of what identity actually left this process, and the reason it exists
+      // is specific: Meta's `/stats?aggregation=match_keys` does NOT report `fbc` or `fbp`.
+      // Verified 2026-08-18 across three production pixels carrying real paid traffic and ~15
+      // distinct event types — zero occurrences of either, including on a lander proven to set
+      // both cookies. So an absent `fbc` there is NOT evidence it was never sent, and ENG-926's
+      // AC2 was once judged failed on exactly that inference (§50, corrected in §55).
+      //
+      // Until someone has Business Manager access, this line is the only send-side proof
+      // available — §42 recorded the gap as "nothing logs it".
+      //
+      // KEY NAMES ONLY, never values: every entry here is PII (`em`/`ph`/`fn`/`ln` hashes,
+      // `client_ip_address`, `client_user_agent`) or a click identifier (`fbc`/`fbp`).
+      console.log(
+        `[MetaService] CAPI ${event.eventName || 'Lead'} accepted — pixel ${pixelId} ` +
+        `event_id=${event.eventId} user_data keys: ` +
+        `${Object.keys(userData).sort().join(',') || '(none)'}`,
+      );
 
       return { success: true, fbtraceId: data.fbtrace_id, usage };
     } catch (error: any) {
