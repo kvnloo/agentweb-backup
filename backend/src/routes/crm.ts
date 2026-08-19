@@ -6935,4 +6935,44 @@ router.get('/attribution/click-id-coverage', async (req: Request, res: Response)
   }
 });
 
+// ---------------------------------------------------------------------------
+// GET /api/crm/attribution/capi-key-coverage
+//
+// ENG-926 §F — of the conversions we actually SENT to Meta, what fraction carried each
+// identity key, per day and per event type.
+//
+// ⚠ This is NOT Meta's Event Match Quality, and must not be presented as it. Meta sells no
+// EMQ API: `event_match_quality` is not a valid `/stats` aggregation, and the only EMQ
+// surface that exists (`GET /{dataset}?fields=event_stats`) returns `"{}"` on live pixels.
+// This measures the half we own — what left our process. What Meta then MATCHED is invisible
+// to us, and `/stats?aggregation=match_keys` reports arrival rather than match, and never
+// reports `fbc`/`fbp` at all.
+// ---------------------------------------------------------------------------
+router.get('/attribution/capi-key-coverage', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const rawDays = req.query.days;
+    // Matched strictly rather than parsed leniently, for the same reason as click-ID
+    // coverage: `parseInt('7.5.1')` is 7, so a lenient parse silently answers a question
+    // the caller did not ask.
+    const isWellFormed = rawDays === undefined || /^\d+$/.test(String(rawDays));
+    const days = rawDays === undefined ? 30 : Number(rawDays);
+    if (!isWellFormed || !Number.isFinite(days) || days < 1 || days > 365) {
+      return res.status(400).json({ message: 'days must be an integer between 1 and 365' });
+    }
+
+    const { computeCapiKeyCoverageForUser } = await import('../services/metaCapiKeyCoverage');
+    const coverage = await computeCapiKeyCoverageForUser(userId, days);
+    return res.json(coverage);
+  } catch (error: any) {
+    console.error('[CRM] CAPI key coverage failed:', error?.message);
+    return res.status(500).json({ message: 'Failed to compute CAPI key coverage' });
+  }
+});
+
 export default router;
