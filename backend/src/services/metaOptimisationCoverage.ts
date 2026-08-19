@@ -211,6 +211,47 @@ function daysBetween(from: string, to: string): number | null {
 }
 
 /** The most recent day the ad set actually spent, or undefined if it never did. */
+/**
+ * §G day-1 detection — how much account history must exist before ABSENCE means anything.
+ *
+ * Resuming a known-broken ad set costs ~4 days of spend before the ordinary streak reaches
+ * OPTIMISATION_ABSENCE_DAYS, because the streak needs spending days the ad set has not had
+ * yet. This floor closes that gap without storing anything.
+ *
+ * The reasoning INVERTS this module's own first P1. Account-wide PRESENCE is worthless as
+ * evidence — a busy sibling pixel's conversions land in the account's family list and vouch
+ * for a dead pixel. Account-wide ABSENCE cannot be masked that way: if a family produced
+ * ZERO conversions across the entire account while it was spending, then no pixel produced
+ * it, and a brand-new ad set optimising for it is bidding at something that does not arrive.
+ *
+ * The floor exists because "the account never produced it" is only meaningful once the
+ * account has had a real chance to. Without it, every genuinely new account would alert on
+ * its first days for not having converted YET — the noise failure §F paid for twice.
+ */
+export const DAY1_MIN_ACCOUNT_SPENDING_DAYS = 7;
+
+/** Spending days in a window. Zero-spend days are not opportunity, so they do not count. */
+export function countSpendingDays(days: OptimisationSpendingDay[] | null | undefined): number {
+  return (Array.isArray(days) ? days : []).filter((d) => Number(d?.spend) > 0).length;
+}
+
+/**
+ * Did this family EVER arrive across the window, on any day, at any spend?
+ *
+ * Deliberately not restricted to spending days: a conversion on a zero-spend day still
+ * proves the event can arrive, and this function's only job is to find an exculpating fact.
+ */
+export function familyEverPresent(
+  days: OptimisationSpendingDay[] | null | undefined,
+  family: string,
+): boolean {
+  return (Array.isArray(days) ? days : []).some((d) =>
+    (Array.isArray(d?.families) ? d.families : []).some(
+      (f) => typeof f === 'string' && f.trim().toLowerCase() === family,
+    ),
+  );
+}
+
 export function newestSpendingDay(
   days: OptimisationSpendingDay[] | null | undefined,
 ): string | undefined {
@@ -375,6 +416,9 @@ export function countTrailingAbsentSpendingDays(
 export interface ConfirmedOptimisationMismatch extends OptimisationMismatch {
   insightsFamily: string;
   consecutiveAbsentSpendingDays: number;
+  /** Raised by day-1 detection rather than by a completed absence streak. Set so an alert
+   *  can say WHY it fired on so little of the ad set's own history. */
+  day1?: true;
 }
 
 export type AccountOptimisationVerdict = {
@@ -443,6 +487,9 @@ export function evaluateAccountOptimisationCoverage(
   receivedEventsByPixel: Record<string, Iterable<string>> | null | undefined,
   spendingDaysByAdSet: Record<string, OptimisationSpendingDay[]> | null | undefined,
   asOf?: string,
+  /** The ACCOUNT's own per-day history, used only by day-1 detection. Omitted by existing
+   *  callers, which keeps their behaviour byte-identical. */
+  accountSpendingDays?: OptimisationSpendingDay[] | null,
 ): AccountOptimisationVerdict {
   const verdict: AccountOptimisationVerdict = {
     alerting: [], unconfirmed: [], unconfirmable: [], dormant: [], staleDelivery: [],
@@ -541,6 +588,28 @@ export function evaluateAccountOptimisationCoverage(
       } else {
         verdict.alerting.push(confirmed);
       }
+    } else if (
+      // ── day-1 detection ───────────────────────────────────────────────────────────
+      // Every condition is a way for the claim to be WRONG, so all must fail to hold.
+      delivering &&
+      // The ad set delivered at all — ACTIVE is configuration, not spend.
+      countSpendingDays(ownDays) >= 1 &&
+      // ...but has too little history of its own for the ordinary streak to have run.
+      absent < OPTIMISATION_ABSENCE_DAYS &&
+      // The account had a real chance to produce this family, and never did. PRESENCE would
+      // be exculpatory here; only total absence supports the claim.
+      countSpendingDays(accountSpendingDays) >= DAY1_MIN_ACCOUNT_SPENDING_DAYS &&
+      !familyEverPresent(accountSpendingDays, family) &&
+      // The pixel is demonstrably ALIVE. Without traffic of its own, its silence about this
+      // event is "could not ask", never "did not arrive".
+      pixelReceivedEvent(received, 'PageView')
+    ) {
+      verdict.alerting.push({
+        ...hit,
+        insightsFamily: family,
+        consecutiveAbsentSpendingDays: absent,
+        day1: true,
+      });
     } else {
       // Either this ad set converted the family recently — so the pixel's 24h silence is far
       // more likely to be a low-volume window than a fault — or it did not deliver at all.
