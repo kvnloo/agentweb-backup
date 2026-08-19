@@ -7,6 +7,7 @@ import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
   describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
@@ -454,7 +455,7 @@ export class GoogleAdsService {
       // and treating it as "omitted" would silently create an ENABLED action off a request
       // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
       // and inconsistent with updateConversionAction, which validates every defined status.
-      status: params.status === undefined ? 'ENABLED' : assertConversionActionStatus(params.status),
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
@@ -505,6 +506,17 @@ export class GoogleAdsService {
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
     if (params.status !== undefined) {
       const status = assertConversionActionStatus(params.status);
+      // REMOVE is refused as an operation (ENG-1329: it severs historical attribution and
+      // cannot be undone). status=REMOVED does exactly the same thing by another route, so
+      // allowing it here would refuse the front door and leave the window open.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'Setting status=REMOVED retires the conversion action permanently and severs its '
+          + 'historical attribution — the same irreversible outcome as REMOVE, which this tool '
+          + 'deliberately does not support. Use status=HIDDEN to stop it counting toward goals '
+          + 'while keeping its history.',
+        );
+      }
       update.status = status; updateMask.push('status'); requested.status = status;
     }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }

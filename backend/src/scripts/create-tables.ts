@@ -2525,6 +2525,7 @@ const main = async () => {
     await createCodingAgentRunsTable();
     await createV0UsageTable();
     await createAgentRunsTable();
+    await createMetaCapiKeyCoverageTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
@@ -3161,3 +3162,40 @@ const createV0UsageTable = async () => {
 if (require.main === module) {
   main();
 }
+
+// Create Meta CAPI key-coverage table (ENG-926 §F — send-side identity-key coverage)
+//
+// One item per pixel, per UTC day, per event name. Counters are incremented with `ADD`, so
+// no item ever needs initialising and a newly-added identity key needs no migration — an
+// absent attribute correctly reads as zero for the period we were not sending it.
+//
+// No GSI, deliberately: every read is "one pixel over a date range", which the primary key
+// already serves. A per-customer view resolves that customer's pixels first, which keeps
+// `userId` off the CAPI send path entirely.
+const createMetaCapiKeyCoverageTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MetaCapiKeyCoverage`,
+    AttributeDefinitions: [
+      { AttributeName: 'pixelId', AttributeType: 'S' },
+      // `<YYYY-MM-DD>#<eventName>` — date leads so a windowed Query is a plain range over
+      // the sort key rather than a filter across the whole partition.
+      { AttributeName: 'sk', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'pixelId', KeyType: 'HASH' },
+      { AttributeName: 'sk', KeyType: 'RANGE' },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};

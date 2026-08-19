@@ -121,9 +121,14 @@ describe('createConversionAction — surfaces drift (ENG-1322 AC4)', () => {
   });
 
   it('catches the ENG-1293 shape — a status stored as something else', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
-    const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'HIDDEN' });
-    expect(out.drift).toEqual([{ field: 'status', requested: 'HIDDEN', stored: 'ENABLED' }]);
+    // Requested ENABLED because that is the only status CREATE accepts (Google deny-lists
+    // the others on that field), so the drift this can catch at create time is Google
+    // storing something OTHER than what a valid request asked for — which is exactly the
+    // ENG-1293 shape: createAdGroup/createAd returned success and stored a different
+    // status than requested.
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'ENABLED' });
+    expect(out.drift).toEqual([{ field: 'status', requested: 'ENABLED', stored: 'HIDDEN' }]);
   });
 
   it('catches a counting_type Google did not honour', async () => {
@@ -320,5 +325,53 @@ describe('an empty status is invalid input, not an omitted field (CodeRabbit, #2
     searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
     await googleAdsService.createConversionAction('u', CUSTOMER, valid);
     expect(mutateSpy.mock.calls[0][3][0].create.status).toBe('ENABLED');
+  });
+});
+
+describe('CREATE refuses a non-ENABLED status before calling Google (ENG-1329 e2e)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('refuses HIDDEN on create without issuing a mutate', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'HIDDEN' }))
+      .rejects.toThrow(/deny-lists that value on create/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses REMOVED on create without issuing a mutate', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'REMOVED' }))
+      .rejects.toThrow();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('still allows ENABLED explicitly', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'ENABLED' });
+    expect(mutateSpy.mock.calls[0][3][0].create.status).toBe('ENABLED');
+  });
+
+  it('UPDATE to HIDDEN is still allowed — that is the supported hide path', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+    expect(out.drift).toEqual([]);
+  });
+});
+
+describe('UPDATE cannot retire an action by the back door (ENG-1329 e2e)', () => {
+  it('refuses status=REMOVED, which is REMOVE by another name', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/same irreversible outcome as REMOVE/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('points at HIDDEN as the retire path', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/status=HIDDEN/);
+  });
+
+  it('still allows HIDDEN — the whole point of the two-step', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+    expect(out.drift).toEqual([]);
+    expect(mutateSpy.mock.calls[0][3][0].update.status).toBe('HIDDEN');
   });
 });

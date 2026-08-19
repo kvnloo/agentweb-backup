@@ -16795,12 +16795,48 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
           const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+
+          // Meta's `event_stats` is the only EMQ surface that exists, and on live busy
+          // pixels it comes back EMPTY — probed on two pixels, two tokens, two Business
+          // Managers. Returning that verbatim answered `{}` to every customer who asked
+          // Emma for match quality, while the docs advertise "EMQ scores per event type".
+          //
+          // The Meta call is deliberately KEPT: if Meta ever starts serving this, the real
+          // number wins and nothing below runs. Only when it is empty do we answer with the
+          // half we can actually measure — what WE sent (ENG-926 §F).
+          const { isEmptyEventStats, computeCapiKeyCoverage } = await import('./metaCapiKeyCoverage');
+
+          if (!isEmptyEventStats(stats.event_stats)) {
+            return {
+              success: true,
+              message: `Event match quality for dataset ${stats.name || datasetId}`,
+              dataset_id: stats.id,
+              dataset_name: stats.name,
+              event_stats: stats.event_stats
+            };
+          }
+
+          const { queryCapiKeyCoverageRows } = await import('./metaCapiKeyCoverageDb');
+          const sendSide = await computeCapiKeyCoverage([String(datasetId)], 30, {
+            queryRows: (pixelId, oldestDate) => queryCapiKeyCoverageRows(pixelId, oldestDate),
+          });
+
           return {
             success: true,
-            message: `Event match quality for dataset ${stats.name || datasetId}`,
-            dataset_id: stats.id,
+            // Worded so it can never be relayed as Meta's own score. The distinction is the
+            // whole point: this says what identity we ATTACHED, not what Meta MATCHED.
+            message:
+              `Meta reports no Event Match Quality for dataset ${stats.name || datasetId} — ` +
+              `its event_stats field is empty, which is what it returns for live pixels. ` +
+              `Reporting our own send-side identity coverage instead: of the conversions we ` +
+              `sent to this dataset in the last 30 days, the share that carried each identity ` +
+              `parameter. This is NOT Meta's match-quality score and should not be described ` +
+              `as one — Meta does not expose that number through any API.`,
+            dataset_id: stats.id || datasetId,
             dataset_name: stats.name,
-            event_stats: stats.event_stats
+            event_stats: stats.event_stats,
+            meta_event_match_quality_available: false,
+            send_side_identity_coverage: sendSide
           };
         }
         default:
@@ -34506,7 +34542,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             success: false,
             error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
               + 'historical attribution in the account and cannot be undone. To stop an action from '
-              + 'recording, use CONVERSION_ACTION UPDATE with status=PAUSED instead.',
+              + 'recording, use CONVERSION_ACTION UPDATE with status=HIDDEN instead (NOT PAUSED — a '
+              + 'conversion action has no PAUSED status; that is a campaign status).',
           };
         }
       }

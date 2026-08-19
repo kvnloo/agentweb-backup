@@ -23,6 +23,14 @@ jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
 }));
 
+// ENG-926 §F — the empty-`event_stats` fallback reads our own coverage store. Mocked so this
+// suite never reaches DynamoDB; the store's own behaviour is covered in
+// metaCapiKeyCoverage.test.ts.
+jest.mock('../services/metaCapiKeyCoverageDb', () => ({
+  queryCapiKeyCoverageRows: jest.fn().mockResolvedValue([])
+}));
+import { queryCapiKeyCoverageRows } from '../services/metaCapiKeyCoverageDb';
+
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
@@ -164,6 +172,86 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
       expect((result as any).dataset_id).toBe('ds_100');
       expect((result as any).event_stats).toEqual(mockStats.event_stats);
       expect(metaService.getDatasetEventStats).toHaveBeenCalledWith('ds_100', 'mock-access-token');
+      // Meta answered, so the send-side fallback must NOT engage — the real number wins.
+      expect((result as any).send_side_identity_coverage).toBeUndefined();
+      expect(queryCapiKeyCoverageRows).not.toHaveBeenCalled();
+    });
+
+    // ─── ENG-926 §F — the empty-event_stats fallback ────────────────────────────────
+    //
+    // `event_stats` is the only EMQ surface Meta exposes and on live busy pixels it returns
+    // EMPTY (probed on two pixels, two tokens, two Business Managers). Before this, the tool
+    // returned that verbatim — answering `{}` to every customer who asked Emma for match
+    // quality, while the tool description advertised "EMQ scores per event type".
+    //
+    // ⚠ The pre-existing test above mocks event_stats NON-empty, so it exercises the
+    // untouched path and proves nothing about this one. Hence these.
+
+    // Each fixture is built by a FACTORY rather than by spreading a value, so the
+    // "absent field" case can genuinely omit the key. `{ event_stats: undefined }` creates
+    // an own property holding undefined, which is a different object shape from a missing
+    // key — the test would have passed while modelling something it did not claim to.
+    it.each([
+      ['the JSON string Meta actually returns', () => ({ id: 'ds_100', name: 'My Dataset', event_stats: '{}' })],
+      ['an empty object', () => ({ id: 'ds_100', name: 'My Dataset', event_stats: {} })],
+      ['an absent field', () => ({ id: 'ds_100', name: 'My Dataset' })],
+    ])('falls back to send-side coverage when event_stats is %s', async (_label, buildStats) => {
+      const stats = buildStats();
+      if (_label === 'an absent field') {
+        // Pin the fixture itself: if a future edit reintroduces the key, this case silently
+        // stops testing absence and starts retesting the undefined-value case above.
+        expect(Object.prototype.hasOwnProperty.call(stats, 'event_stats')).toBe(false);
+      }
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue(stats);
+
+      const result = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined,
+        { dataset_id: 'ds_100' }
+      );
+
+      expect(result.success).toBe(true);
+      expect((result as any).meta_event_match_quality_available).toBe(false);
+      expect((result as any).send_side_identity_coverage).toBeDefined();
+      // Scoped to the dataset asked about — a pixel is its own dataset in Graph v25.
+      expect(queryCapiKeyCoverageRows).toHaveBeenCalledWith('ds_100', expect.any(String));
+    });
+
+    it('says plainly that the number is NOT Meta\'s score, so Emma cannot relay it as one', async () => {
+      // The whole risk of answering with a substitute is that it gets repeated back to a
+      // customer as Meta's own match quality. The wording is the mitigation, so it is pinned.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue({
+        id: 'ds_100', name: 'My Dataset', event_stats: '{}'
+      });
+
+      const result = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined,
+        { dataset_id: 'ds_100' }
+      );
+
+      expect(result.message).toContain('NOT');
+      expect(result.message).toMatch(/send-side/i);
+      expect(result.message).toMatch(/does not expose that number/i);
+    });
+
+    it('does NOT substitute when event_stats is merely unparseable — that is a read failure, not an empty result', async () => {
+      // Failing the other way would present a parse failure as a measurement.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue({
+        id: 'ds_100', name: 'My Dataset', event_stats: 'not json'
+      });
+
+      const result = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined,
+        { dataset_id: 'ds_100' }
+      );
+
+      expect((result as any).send_side_identity_coverage).toBeUndefined();
+      expect(queryCapiKeyCoverageRows).not.toHaveBeenCalled();
     });
 
     it('AC3: accepts a dataset_id taken straight from the fixed LIST output', async () => {

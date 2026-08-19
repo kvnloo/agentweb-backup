@@ -1,3 +1,80 @@
+## ENG-1371: deleting a retired gate is easy; the things quietly leaning on it are not (2026-08-19)
+
+Greptile was dropped as a vendor. Its app had already stopped posting — the `Greptile Review`
+check-run is absent on every PR opened after 2026-08-19 ~10:00Z — but all of its code was still on
+`main`, so every run still paid for a 600s poll that could no longer succeed. This removed the
+`greptile-review` job, seven scripts and `greptile.json`. Findings, because almost none of the work
+was the deletion:
+
+- **The gate's failure mode had already inverted, and the error message lied.** `greptile-gate.sh`
+  returns `unavailable` (exit 75, which passes under ENG-1277's policy) only when no verdict exists
+  for **any** commit on the PR. If a stale pre-cutoff review existed, `greptile_alive` was set and
+  the timeout was classified `refused` (exit 1) instead, printing *"Greptile reviewed this head and
+  it did not clear the bar — a real finding, still blocking."* Greptile had not reviewed that head
+  at all. In one captured run the stale review it was ignoring was **5/5**. The `greptile_alive`
+  guard was correct when written and was silently invalidated by ENG-1282 setting
+  `triggerOnUpdates: false` — after that, every PR with one review and one later push hit the false
+  branch. **Two changes that are each individually correct can compose into a lie.**
+- **5 of the 6 open PRs failing `merge-evidence.sh` were failing on this and nothing else**
+  (#2485, #2481, #2399, #2376, #2417). The queue was blocked by a vendor we no longer used.
+- **`merge-evidence.sh` was leaning on the deleted job in a way nothing would have caught.** It used
+  `Require Greptile Review` as its draft discriminator, matched by exact name and **fail-closed on
+  absence** — so a plain `git rm` of the job would have turned every PR into NO_EVIDENCE, disabling
+  the merge gate CLAUDE.md mandates. The replacement was verified before the switch rather than
+  after: both discriminators were run against all 18 open PRs and returned **identical verdicts on
+  18/18**. `MERGE_EVIDENCE_DRAFT_JOB` already existed as an override, so that A/B needed no code
+  change at all — a seam built for renames paid for itself two months later.
+- **`detect-changes` is a strictly better discriminator than the job it replaced.** `greptile-review`
+  needed `always() &&` in front of its draft check because it declared
+  `needs: [detect-changes, backend-tests-a, backend-tests-b]`, and GitHub implicitly ANDs an `if:`
+  with `success()` when the expression names no status-check function — so a path-filtered skip
+  upstream could propagate into the discriminator. `detect-changes` is the root of the graph with no
+  `needs:` at all, so the bare draft check is exactly right. The invariant now asserts **both** the
+  `if:` and the absence of `needs:`.
+- **An invariant that greps for a vendor name goes vacuous the moment the vendor leaves.**
+  `merge-evidence.test.sh` asserted that backend-tests-a/b did not reference `greptile` in their
+  `needs`/`if`. With the job deleted that check could never fail again while appearing to pass —
+  the exact shape of a control that has quietly stopped working. It now asserts the positive
+  property instead: those jobs declare `needs: [detect-changes]` and nothing else, so a reviewer,
+  lint gate or approval job added in front of the suite fails in the PR that adds it.
+- **Renaming fixtures across a suite is not a `sed`.** The regression fixtures modelled two distinct
+  jobs — the discriminator and an ordinary second job that happened to be `Detect changed projects`.
+  A blanket rename collapsed both into one name and produced fixtures with the same job appearing
+  twice with contradictory conclusions; 7 tests went red for reasons unrelated to the change. The
+  ordinary job had to be moved out of the way first, then the discriminator promoted into the freed
+  name. The suite caught all of it, which is the point of it existing.
+- **dev.md already knew.** The ENG-754 entry recorded, on 2026-07-29, that *"`Require Greptile
+  Review` was not actually a required status check — branch protection on `main` required only
+  `Detect changed projects`."* That stayed true for three weeks while `tests.yml` asserted the
+  opposite in three separate comments and ENG-1320 based a vendor decision on it. **A fact recorded
+  once in a log does not propagate to the comments that contradict it.** Branch protection is now
+  being fixed under ENG-1373; the comments here were corrected with this change.
+- **Ride-alongs taken because the files were already open:** `dependabot-integrity-check.test.sh`
+  (20 assertions guarding the one genuinely security-relevant required check) existed but no job
+  ran it; the CLI `--testPathIgnorePatterns` *replaces* rather than extends `jest.config.js`,
+  silently re-including the opt-in twins suites; five jobs had no `timeout-minutes`, inheriting
+  GitHub's 360-minute default; and `eb-config-conflict`'s existing 5-minute ceiling turned out to
+  sit BELOW its own `fetch-depth: 0` checkout cost — it was killed at 4m59s on this very PR, having
+  survived only because the job is path-gated and had run 6 times in 197 runs without drawing the
+  tail. Auditing "jobs with no timeout" and not "jobs whose timeout is wrong" missed it.
+- **The one ride-along that had to be reverted, and why it is the most useful finding here.** Job
+  B's ignore list used `/__tests__/agentMode` while job A selects on `agentMode`, so 23 files ran
+  in BOTH backend jobs on every PR. Making the two lists exact complements looks like free money.
+  It is not: coverage is collected ONLY from `src/utils/**` and ONLY by job B, so **which tests run
+  in job B is what the coverage number measures**. Two of those 23 are
+  `src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`, whose targets sit
+  inside the coverage scope — and every other test touching those two modules is also
+  `agentMode`-named, so excluding the 23 sent both modules to zero. CI went red: branches
+  95.2% -> 93.99%, statements 98.35% -> 97.55%. Reverted, with the measurement recorded in
+  `tests.yml` so the next person does not rediscover it. **A test-selection change in a repo with a
+  coverage gate is a coverage change, whatever it looks like.** Deduplicating the split needs the
+  `collectCoverageFrom` scope decided first — ENG-1376.
+- **Both of my own errors were caught by CI, not by review or by me.** The coverage drop and the
+  timeout kill were each invisible to local suites (391 assertions, all green) because neither is
+  expressible as a script test — one needs the real Jest run, the other needs a real runner and a
+  real clone. The 5-minute timeout in particular had been latent for months. Local suites prove the
+  logic; only the real run prices it.
+
 ## ENG-1309: fixing a "prompt bloat causes verbosity" regression without adding to the pile (2026-08-18)
 
 Fix for ENG-1306 (two customers, four sessions, quantified 2x completion-token growth since the
