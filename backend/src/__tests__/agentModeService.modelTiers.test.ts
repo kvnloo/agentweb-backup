@@ -1,5 +1,23 @@
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, tierFromCostScore } from '../services/agentModeService';
 import * as llmPricing from '../utils/llmPricing';
+
+// Pins the exact band boundaries (revised 2026-08-19, three times in one
+// session — this is why a direct unit test exists now instead of only
+// being covered incidentally through registry-level tests).
+describe('tierFromCostScore', () => {
+  it('matches the documented thresholds: 71/64/51/31/0', () => {
+    expect(tierFromCostScore(100)).toBe('ultra_premium');
+    expect(tierFromCostScore(71)).toBe('ultra_premium');
+    expect(tierFromCostScore(70)).toBe('pro');
+    expect(tierFromCostScore(64)).toBe('pro');
+    expect(tierFromCostScore(63)).toBe('medium');
+    expect(tierFromCostScore(51)).toBe('medium');
+    expect(tierFromCostScore(50)).toBe('cheap');
+    expect(tierFromCostScore(31)).toBe('cheap');
+    expect(tierFromCostScore(30)).toBe('ultra_cheap');
+    expect(tierFromCostScore(0)).toBe('ultra_cheap');
+  });
+});
 
 // costScore is computed live from MODEL_PRICING (via getModelPrice), not
 // read off the config — see agentModeService.getSupportedModelsWithMetadata.

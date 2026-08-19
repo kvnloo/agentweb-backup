@@ -466,10 +466,16 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(sonnet5.legacy).toBeUndefined();
       });
 
-      it('does NOT flag Gemini 3.1 Pro as legacy just because Gemini 3.5 Flash exists — no `family` tag, so never auto-dominated', async () => {
+      // Gemini 3.1 Pro Preview and Gemini 3.5 Flash land in the same cost
+      // band with Flash scoring higher quality at a lower cost — if they
+      // shared a `family`, Flash would dominate Pro Preview by the same
+      // rule that flags GPT-5.4 Nano above. They don't share one (no
+      // Gemini model carries a `family` tag at all), so Flash correctly
+      // never marks Flash-Lite/Flash legacy either way.
+      it('does NOT flag Gemini 3.5 Flash as legacy — no `family` tag on any Gemini model, so never auto-dominated', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        const pro = models.find((m) => m.id === 'gemini-3.1-pro-preview')!;
-        expect(pro.legacy).toBeUndefined();
+        const flash = models.find((m) => m.id === 'gemini-3.5-flash')!;
+        expect(flash.legacy).toBeUndefined();
       });
 
       it('still marks the pre-existing manually-legacy models legacy regardless of dominance', async () => {
@@ -477,6 +483,55 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         for (const id of ['gpt-5-chat-2', 'gpt-5.2-chat', 'gpt-5.4', 'anthropic.claude-opus-4-6-v1', 'anthropic.claude-opus-4-8']) {
           expect(models.find((m) => m.id === id)!.legacy).toBe(true);
         }
+      });
+
+      // Harsha: "the preview gemini models should be moved to legacy asap."
+      // Static legacy: true — "preview" status isn't a cost/quality-dominance
+      // fact, so this couldn't be (and isn't) derived automatically.
+      it('marks both Gemini preview models legacy', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        for (const id of ['gemini-3-flash-preview', 'gemini-3.1-pro-preview']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBe(true);
+        }
+      });
+
+      it('does NOT mark the non-preview Gemini models legacy', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.5-flash']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBeUndefined();
+        }
+      });
+
+      // Harsha caught this live: GPT-5.6 Terra showed as legacy and that
+      // looked wrong. Root cause — GPT-5.6 Sol ("Frontier coding and
+      // agentic work") was wrongly placed in the same `family` as Terra
+      // ("Balanced general-purpose model"). Sol's OpenRouter price is
+      // currently on a promotional discount that happens to land it in the
+      // same cost band as Terra, so dominance concluded Terra was
+      // redundant — an artifact of a volatile promo price coinciding with
+      // a genuinely different product positioning, not a real supersession.
+      // Fix: Sol carries no `family` at all (same treatment as Kimi K3,
+      // which is likewise excluded from a family with its coding-specialized
+      // sibling Kimi K2.7-Code) — it can neither dominate nor be dominated.
+      it('does NOT flag GPT-5.6 Terra as legacy because of GPT-5.6 Sol — different positioning, not a generation', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const terra = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-terra')!;
+        expect(terra.legacy).toBeUndefined();
+      });
+
+      it('GPT-5.6 Sol itself is never auto-flagged legacy (carries no family)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const sol = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-sol')!;
+        expect(sol.legacy).toBeUndefined();
+      });
+
+      it('GPT-5.5 is still correctly legacy — GPT-5.6 Terra alone (same "balanced" family) is cheaper AND better', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const gpt55 = models.find((m) => m.id === 'gpt-5.5')!;
+        const terra = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-terra')!;
+        expect(terra.qualityScore).toBeGreaterThanOrEqual(gpt55.qualityScore!);
+        expect(terra.costScore!).toBeLessThanOrEqual(gpt55.costScore!);
+        expect(gpt55.legacy).toBe(true);
       });
     });
 
