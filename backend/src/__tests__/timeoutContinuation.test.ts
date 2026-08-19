@@ -433,6 +433,29 @@ describe('hasUnresolvedMediaDeferral', () => {
     expect(hasUnresolvedMediaDeferral([{ role: 'user', content: 'hi' }, null] as any)).toBe(false);
   });
 
+  // CodeRabbit (PR #2479): incremental checkpointing (persistIncrementally) can persist
+  // the raw tool-role deferral marker toolDispatch writes (metadata.mediaBudgetDeferred:
+  // true) BEFORE the model's own follow-up narration is ever composed — a process death in
+  // exactly that window leaves that tool-role message as the tail, a THIRD unresolved shape
+  // neither the user- nor assistant-authored checks above matched. Safe to key off the flag
+  // alone now: toolDispatch only ever sets it for a genuine media-budget pause (a
+  // handler-supplied deferral, e.g. ENG-822's anonymous-account-scoped refusal, is
+  // deliberately left untagged — see toolDispatch.ts and its own regression test).
+  it('returns true when the last message is the raw tool-role deferral marker (a checkpoint mid-turn)', () => {
+    const msgs = [
+      { role: 'user', content: 'make 4 images' },
+      { role: 'tool', content: 'paused...', metadata: { mediaBudgetDeferred: true, timestamp: '2026-08-19T18:00:00Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(true);
+  });
+
+  it('does NOT treat a tool-role message without the mediaBudgetDeferred flag as unresolved', () => {
+    const msgs = [
+      { role: 'tool', content: 'Sign in to use this feature.', metadata: { timestamp: '2026-08-19T18:00:00Z' } },
+    ];
+    expect(hasUnresolvedMediaDeferral(msgs)).toBe(false);
+  });
+
   // ENG-1239 (rework): getSession is a passive READ endpoint — merely reopening a session
   // must never silently spend the customer's credits on a batch they may have long since
   // abandoned. sinceMs bounds the backstop to a genuinely RECENT pause; an old one just sits

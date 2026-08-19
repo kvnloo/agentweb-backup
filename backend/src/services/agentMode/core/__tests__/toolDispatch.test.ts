@@ -592,6 +592,34 @@ describe('executePreparedTools', () => {
       expect(forwarded[0]).toMatchObject({ status: 'deferred', toolCall: expect.objectContaining({ id: 'a' }) });
     });
 
+    // CodeRabbit (PR #2479): the persisted tool-role message's `mediaBudgetDeferred: true`
+    // was set unconditionally for EVERY deferral, including a handler-supplied one (ENG-822's
+    // anonymous-account-scoped refusal) that carries its own unrelated reason. Durability
+    // checks (hasPersistedMediaBudgetDeferral, hasUnresolvedMediaDeferral) key off exactly
+    // this flag to decide "should I auto-resume this" — so an ENG-822 refusal (a deliberate,
+    // permanent policy block, never meant to be retried) would have been indistinguishable
+    // from a genuine time-budget pause and incorrectly auto-retried.
+    it('does NOT tag the persisted marker mediaBudgetDeferred for a handler-supplied (non-time-budget) deferral', async () => {
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => ({
+          status: 'success',
+          result: { deferred: true, reason: 'anonymous_account_scoped', message: 'Sign in to use this feature.' },
+          durationMs: 1,
+          policyDecision: i.policyDecision,
+        }),
+      });
+      const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"x"}')], ports, {});
+      await executePreparedTools(input);
+
+      expect(input.toolCallsLedger[0].result).toEqual({
+        deferred: true,
+        reason: 'anonymous_account_scoped',
+        message: 'Sign in to use this feature.',
+      });
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', content: 'Sign in to use this feature.' });
+      expect(input.messages[0].metadata?.mediaBudgetDeferred).not.toBe(true);
+    });
+
     it('a deferred call that did not run does not count as a produced asset', async () => {
       // Over budget with an asset already produced: a soft {success:false} would never
       // be reached because we defer BEFORE executing. Proves deferral short-circuits.
@@ -1257,6 +1285,15 @@ describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
     const sinceMs = Date.parse('2026-08-14T18:00:00Z');
     const msgs = [successMsg('generate_image', '{"prompt":"sun"}', '2026-08-01T00:00:00Z')];
     expect(seedMediaCallKeysFromHistory(msgs, sinceMs).size).toBe(0);
+  });
+
+  // CodeRabbit (PR #2479): the boundary comparison is `ts >= sinceMs` (inclusive) — pin
+  // the exact-equal case explicitly, not just a call safely after the bound.
+  it('seeds a call whose timestamp is exactly sinceMs (inclusive boundary)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', new Date(sinceMs).toISOString())];
+    const seeded = seedMediaCallKeysFromHistory(msgs, sinceMs);
+    expect(seeded.get(`generate_image:${stableStringify({ prompt: 'sun' })}`)).toBe('x');
   });
 
   it('does NOT seed a deferred call (nothing was actually produced)', () => {

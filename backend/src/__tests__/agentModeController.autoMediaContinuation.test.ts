@@ -634,6 +634,58 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
   });
 
   /**
+   * CodeRabbit (PR #2479): the exhaustion branch's live-delivery step
+   * (`io.to(...).emit(...)`) ran outside any try/catch, and every floating invocation of
+   * scheduleAutoMediaContinuation (every setImmediate kickoff, plus the recursive
+   * round+1 call) had no `.catch`. The function's own contract (see the comment above
+   * checkTokenUsage) says it must never reject — but an emit failure here would reject
+   * it anyway, and under Node's default `--unhandled-rejections=throw` an unhandled
+   * rejection on a fire-and-forget call crashes the whole backend process, not just this
+   * one session's turn. This proves a live-delivery failure during exhaustion is caught
+   * and logged instead of becoming an unhandled rejection.
+   */
+  it('does not crash the process when live-delivery fails while persisting the exhaustion closing note', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    // Empty content on every round so the REGULAR (non-exhaustion) live-push branch
+    // never calls io.to() at all — stillDeferred is driven by toolCalls, independent
+    // of content, so recursion still runs all the way to the exhaustion round. This
+    // isolates the mocked throw to the exhaustion branch's OWN io.to() call specifically.
+    mockWorkerService.runInWorker.mockResolvedValue(
+      workerResponse('', [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()]),
+    );
+    mockIoTo.mockImplementationOnce(() => {
+      throw new Error('socket server not initialized');
+    });
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush(200);
+    // Give a genuinely unhandled rejection (if this regressed) a macrotask to surface —
+    // flush() only drains microtasks/setImmediate, not the process-level event.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    process.off('unhandledRejection', onUnhandledRejection);
+
+    expect(unhandledRejections).toEqual([]);
+    // The closing note was still persisted — the failure is in DELIVERING it live, not
+    // in producing it.
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      mockSessionId,
+      expect.objectContaining({ metadata: expect.objectContaining({ kind: 'auto-continuation-exhausted' }) }),
+    );
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('failed to emit'),
+      expect.any(Error),
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  /**
    * ENG-1239 (rework): the auto-continuation chain is purely in-process — a deploy or
    * crash between rounds loses it with no record it was ever attempted. getSession is a
    * durability backstop: any later touch of the session re-checks whether the tail of
