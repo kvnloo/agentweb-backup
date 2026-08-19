@@ -2835,11 +2835,40 @@ export class MetaService {
       //
       // KEY NAMES ONLY, never values: every entry here is PII (`em`/`ph`/`fn`/`ln` hashes,
       // `client_ip_address`, `client_user_agent`) or a click identifier (`fbc`/`fbp`).
+      const sentKeys = Object.keys(userData).sort();
+
       console.log(
         `[MetaService] CAPI ${event.eventName || 'Lead'} accepted — pixel ${pixelId} ` +
         `event_id=${event.eventId} user_data keys: ` +
-        `${Object.keys(userData).sort().join(',') || '(none)'}`,
+        `${sentKeys.join(',') || '(none)'}`,
       );
+
+      // ENG-926 §F — persist what that log line says, so send-side identity coverage is a
+      // TREND rather than a grep. The card asks to track Event Match Quality over time and
+      // Meta sells no such API, so the half we own is: of the conversions we actually sent,
+      // what fraction carried each key. `fn`/`ln` were hashed wrong for 24 days and nothing
+      // could see it, because the only symptom is a number quietly lower than it should be.
+      //
+      // ⚠ Awaited, and wrapped so it can NEVER throw. Meta has already ACCEPTED this
+      // conversion by the time we get here — it cannot be recalled — so a storage fault must
+      // not turn a delivered conversion into a reported failure, nor provoke a relay retry of
+      // an event Meta already counted. Awaited rather than fire-and-forget because a floating
+      // promise outliving the Jest environment is exactly the ENG-1286 shape, and a DynamoDB
+      // update is ~10ms against a CAPI round trip of hundreds.
+      try {
+        const [{ recordCapiKeySend }, { addCapiKeyCounters }] = await Promise.all([
+          import('./metaCapiKeyCoverage'),
+          import('./metaCapiKeyCoverageDb'),
+        ]);
+        await recordCapiKeySend(
+          { pixelId, eventName: event.eventName, keys: sentKeys, nowMs: Date.now() },
+          { addCounters: addCapiKeyCounters },
+        );
+      } catch (coverageError: any) {
+        console.warn(
+          `[MetaService] CAPI key coverage not recorded for pixel ${pixelId}: ${coverageError?.message}`,
+        );
+      }
 
       return { success: true, fbtraceId: data.fbtrace_id, usage };
     } catch (error: any) {
