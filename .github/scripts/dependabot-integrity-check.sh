@@ -42,8 +42,9 @@
 # ecosystem Dependabot update bumping pinned action SHAs. So blocking
 # `.github/` outright (the first version's behavior) was actually already
 # correct and safe for THAT PR type: it just declines the bypass for it
-# (that PR still gets a full, real Greptile review — a foregone cost saving,
-# not a broken or unsafe outcome), which is the right conservative default
+# (that PR just merges through the normal test gates instead of the bypass —
+# a foregone cost saving, not a broken or unsafe outcome), which is the right
+# conservative default
 # for a file class that is also, legitimately, CI-security-relevant.
 #
 # The fix that actually closes the identity-binding gap: flip from a
@@ -109,7 +110,7 @@ set -euo pipefail
 # update DOES touch .github/workflows/*.yml (verified live against
 # agentweb#2276), but that same path is also the most CI-security-relevant
 # one in the repo — the conservative, safe choice is to decline the bypass
-# for that PR class (it still gets a full, real Greptile review) rather than
+# for that PR class (it merges through the normal test gates) rather than
 # try to distinguish "Dependabot bumped a pinned SHA" from "a line was
 # tampered with" via a content-level diff check, which is a harder, separate
 # problem this does not attempt to solve.
@@ -158,7 +159,7 @@ main() {
   fi
 
   # Same partial-pagination hazard as every other paginated `gh api` call in
-  # this repo's Greptile tooling (see greptile-request-review.sh's header):
+  # this repo's CI tooling:
   # `--paginate` can print early pages to stdout and still exit non-zero on a
   # later page. Non-empty output is not proof of a complete list — only exit
   # 0 is. Never treat a truncated file list as "here is everything changed".

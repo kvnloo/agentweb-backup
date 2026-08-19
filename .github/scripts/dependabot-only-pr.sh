@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
 #
+# ENG-1371 — NO CALLER AS OF 2026-08-19. READ THIS BEFORE EXTENDING IT.
+#
+# Its only caller was the `greptile-review` job's "Check whether this
+# Dependabot PR contains only Dependabot commits" step, which decided whether
+# a Dependabot PR could bypass the review gate. Greptile is retired and that
+# job is deleted, so there is no review left to bypass: Dependabot PRs now run
+# the same suites as everything else, which is simpler and strictly safer.
+#
+# Kept rather than deleted, deliberately, for one reason: the REQUIRED
+# `Dependabot Integrity Check` (dependabot-integrity-check.sh, ENG-1287)
+# documents itself throughout as the trusted-base backstop for THIS script.
+# Removing this file without reworking that rationale would leave a required
+# security check whose stated purpose points at nothing. That rework is a
+# separate change against a required check, not a footnote to a vendor
+# removal.
+#
+# ci-scripts-tests still runs its regression suite, so it cannot rot silently
+# while it waits for that decision.
+#
 # True iff EVERY commit in a PR was authored by dependabot[bot] — the actual
 # check the Greptile-review Dependabot bypass needs (ENG-1282).
 #

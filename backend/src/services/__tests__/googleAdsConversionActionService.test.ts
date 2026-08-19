@@ -355,3 +355,23 @@ describe('CREATE refuses a non-ENABLED status before calling Google (ENG-1329 e2
     expect(out.drift).toEqual([]);
   });
 });
+
+describe('UPDATE cannot retire an action by the back door (ENG-1329 e2e)', () => {
+  it('refuses status=REMOVED, which is REMOVE by another name', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/same irreversible outcome as REMOVE/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('points at HIDDEN as the retire path', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/status=HIDDEN/);
+  });
+
+  it('still allows HIDDEN — the whole point of the two-step', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+    expect(out.drift).toEqual([]);
+    expect(mutateSpy.mock.calls[0][3][0].update.status).toBe('HIDDEN');
+  });
+});
