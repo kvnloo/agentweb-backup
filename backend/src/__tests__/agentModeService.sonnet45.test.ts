@@ -213,6 +213,75 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * listing: this model still appears in Google's ListModels while 404ing on
      * the actual call, so a discovery-endpoint check proves nothing.
      */
+    /*
+     * 2026-08-19 picker cleanup — the founder flagged the picker as cluttered
+     * with redundant same-family versions (Opus 4.6/4.8 alongside Opus 5,
+     * Sonnet 4.5/4.6 alongside Sonnet 5, four near-identical GPT-5.x rows)
+     * and separately asked where OpenAI's GPT-5.6 family (Sol/Terra/Luna,
+     * launched 2026-07-09) was. This block covers both: the superseded
+     * versions get `legacy: true` (picker-grouping only — see
+     * LLMModelConfig.legacy; resolveGenerationModel/resolveFallbackModel are
+     * untouched, so no existing session or schedule pinned to one of these
+     * ids changes behavior), and the new GPT-5.6 tiers are added via
+     * OpenRouter, adminOnly per the existing unverified-in-our-stack
+     * convention for new OpenRouter entries.
+     */
+    describe('2026-08-19 — legacy flag + GPT-5.6 (Sol/Terra/Luna) addition', () => {
+      const LEGACY_IDS = [
+        'gpt-5-chat-2',
+        'gpt-5.2-chat',
+        'gpt-5.4',
+        'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'anthropic.claude-sonnet-4-6',
+        'anthropic.claude-opus-4-6-v1',
+        'anthropic.claude-opus-4-8',
+      ];
+      const CURRENT_IDS = ['gpt-5.5', 'anthropic.claude-opus-5', 'anthropic.claude-sonnet-5'];
+
+      it.each(LEGACY_IDS)('marks %s as legacy', (id) => {
+        expect((agentModeService as any).llmModels[id].legacy).toBe(true);
+      });
+
+      it.each(CURRENT_IDS)('does NOT mark the current frontier pick %s as legacy', (id) => {
+        expect((agentModeService as any).llmModels[id].legacy).toBeUndefined();
+      });
+
+      it.each(LEGACY_IDS)('still offers the legacy model %s to whichever caller could already see it (no access change)', async (id) => {
+        const wasAdminOnly = (agentModeService as any).llmModels[id].adminOnly === true;
+        const models = await agentModeService.getSupportedModels(wasAdminOnly);
+        expect(models).toContain(id);
+      });
+
+      const GPT_5_6 = [
+        'openrouter/openai/gpt-5.6-sol',
+        'openrouter/openai/gpt-5.6-terra',
+        'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(GPT_5_6)('offers %s to admins', async (id) => {
+        const models = await agentModeService.getSupportedModels(true);
+        expect(models).toContain(id);
+      });
+
+      it.each(GPT_5_6)('does NOT offer %s to non-admins (adminOnly, matching other new OpenRouter entries)', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).not.toContain(id);
+      });
+
+      it('tiers GPT-5.6 Sol as pro, Terra as medium, Luna as ultra_cheap', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['openrouter/openai/gpt-5.6-sol'].tier).toBe('pro');
+        expect(llmModels['openrouter/openai/gpt-5.6-terra'].tier).toBe('medium');
+        expect(llmModels['openrouter/openai/gpt-5.6-luna'].tier).toBe('ultra_cheap');
+      });
+
+      it.each(GPT_5_6)('gives %s a clean display name and the openai provider', (id) => {
+        const config = (agentModeService as any).llmModels[id];
+        expect(config.provider).toBe('openai');
+        expect(config.name).toMatch(/^GPT-5\.6 (Sol|Terra|Luna)$/);
+      });
+    });
+
     describe('ENG-744 — withdrawn model removal', () => {
       it('no longer offers the shut-down gemini-3-pro-preview to anyone', async () => {
         for (const isAdmin of [true, false]) {

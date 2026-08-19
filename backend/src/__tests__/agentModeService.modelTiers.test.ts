@@ -16,6 +16,10 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
         tier: 'ultra_premium', description: 'Frontier', name: 'Admin Only Model', provider: 'openai',
       },
       'voice-model': { client: null, supportsTemperature: true, isLive: true, tier: 'medium', description: 'Voice' },
+      'legacy-model': {
+        client: null, supportsTemperature: true, legacy: true,
+        tier: 'medium', description: 'Previous-generation', name: 'Legacy Model', provider: 'anthropic',
+      },
     };
     svc.getSupportedModels = AgentModeService.prototype.getSupportedModels.bind(svc);
     svc.getDefaultModel = jest.fn().mockResolvedValue('tiered-model');
@@ -61,5 +65,22 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
     expect(admin).toEqual({
       id: 'admin-only-model', name: 'Admin Only Model', tier: 'ultra_premium', description: 'Frontier', provider: 'openai',
     });
+  });
+
+  // FAIL case 4: a superseded-version model must carry `legacy: true` so the
+  // frontend can tuck it behind "Show more" instead of listing it inline —
+  // it still appears in the full result (never dropped/adminOnly-hidden by
+  // this flag alone), just annotated.
+  it('marks a legacy model with legacy: true, and never marks a current model with it', async () => {
+    const result = await svc.getSupportedModelsWithMetadata(false);
+    const legacy = result.find((m: any) => m.id === 'legacy-model');
+    expect(legacy).toEqual({
+      id: 'legacy-model', name: 'Legacy Model', tier: 'medium', description: 'Previous-generation',
+      provider: 'anthropic', legacy: true,
+    });
+    // Non-legacy models omit the key entirely rather than set it false —
+    // asserted on the existing 'tiered-model' fixture above.
+    const current = result.find((m: any) => m.id === 'tiered-model');
+    expect(current).not.toHaveProperty('legacy');
   });
 });

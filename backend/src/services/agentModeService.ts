@@ -832,6 +832,14 @@ interface LLMModelConfig {
   name?: string;
   /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
   provider?: ModelProvider;
+  /**
+   * True for a superseded version of a model family still kept selectable for
+   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
+   * this flag only affects picker visibility grouping, never generation). The picker
+   * UI tucks these behind a "Show more" row instead of hiding them from new selection
+   * entirely (that's what adminOnly is for).
+   */
+  legacy?: boolean;
 }
 
 /** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
@@ -848,6 +856,8 @@ export interface SupportedModelInfo {
   tier: ModelTier;
   description: string;
   provider: ModelProvider;
+  /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
+  legacy?: true;
 }
 
 // Type for LLM call options
@@ -2854,9 +2864,17 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    // 2026-08-19: gpt-5-chat-2 / 5.2-chat / 5.4 are superseded by 5.5 (each a
+    // straight version bump, never retired) — flagged `legacy` so the picker
+    // tucks them behind "Show more" instead of listing four near-identical
+    // GPT-5.x rows. Not deleted: gpt-5-chat-2/5.2-chat still have paused
+    // TaskSchedules referencing them; gpt-5.4 has none but is kept for the
+    // same reason as the others — no LEGACY_MODEL_ALIASES entry exists yet
+    // for any version bump in this registry, so deletion isn't safe without
+    // one first (see agentweb-customer-portal picker-cleanup investigation).
+    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true },
+    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true },
+    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true },
     'gpt-5.4-nano': { name: 'GPT-5.4 Nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
@@ -2927,13 +2945,31 @@ export class AgentModeService {
     'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true },
     'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
+    // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
+    // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
+    // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
+    // existing convention for unverified-in-our-stack OpenRouter entries.
+    // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
+    // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
+    // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
+    // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
+    // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    // 2026-08-19: all four below are `legacy` (picker-grouping only, see
+    // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
+    // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
+    // have active schedules touching them the same day this was written), so
+    // NOT deleted and NOT adminOnly — customers can still select them via
+    // "Show more", they're just no longer the default row per tier.
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
@@ -2974,6 +3010,7 @@ export class AgentModeService {
           tier: config?.tier ?? 'medium',
           description: config?.description ?? 'General-purpose model',
           provider: config?.provider ?? 'other',
+          ...(config?.legacy ? { legacy: true as const } : {}),
         };
       });
   }
