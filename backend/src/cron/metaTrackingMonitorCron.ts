@@ -46,6 +46,14 @@ export interface TrackingMonitorCronSummary {
   optimisationDormant: number;
   /** Full absence streak but delivery already stopped — past waste, reported not paged. */
   optimisationStaleDelivery: number;
+  /** §G generated landing pages — deployed sites WE built that carry no pixel this account
+   *  owns. Unlike destinationAlerts these need NO ad pointing at them, which is the point:
+   *  the page nothing points at today is the one someone launches against next week. */
+  landingPageAlerts: number;
+  /** Sites unreadable, or an account with no owned pixels to compare against. Logged only. */
+  landingPageUnverifiable: number;
+  /** Sites confirmed carrying a pixel this account owns. Printed even at zero. */
+  landingPageOk: number;
   /** §G destinations — ACTIVE ads pointing at a page with no pixel, or a pixel the paying
    *  account does not own. */
   destinationAlerts: number;
@@ -117,6 +125,9 @@ export async function runMetaTrackingMonitor(
     optimisationAlerts: 0,
     optimisationDormant: 0,
     optimisationStaleDelivery: 0,
+    landingPageAlerts: 0,
+    landingPageUnverifiable: 0,
+    landingPageOk: 0,
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
@@ -131,6 +142,13 @@ export async function runMetaTrackingMonitor(
   // account with one set of Meta data and one fix, so it is read once — and findings are
   // filed once, rather than once per user record that happens to hold the connection.
   const sweptAccountIds = new Set<string>();
+
+  // ONE cache for the whole sweep. Wraps the gate's own SSRF-guarded fetcher rather than
+  // replacing it, so a page read by the destination check is not fetched again by the
+  // landing-page check — and a site shared across accounts is read once, not once per account.
+  const { createUrlFetchCache } = await import('../services/urlFetchCache');
+  const { defaultFetchHtml } = await import('../services/metaTrackingPreflight');
+  const urlCache = createUrlFetchCache(defaultFetchHtml);
 
   let users: any[];
   try {
@@ -151,6 +169,7 @@ export async function runMetaTrackingMonitor(
     try {
       const result = await monitorUserTracking(user, {
         sweptAccountIds,
+        urlCache,
         dryRun,
         onlyAdAccountId: options?.adAccountId,
         // Capture in the SAME order the sweep would have sent, so the output reads as the
@@ -180,6 +199,9 @@ export async function runMetaTrackingMonitor(
       summary.optimisationAlerts += result.optimisationAlerts ?? 0;
       summary.optimisationDormant += result.optimisationDormant ?? 0;
       summary.optimisationStaleDelivery += result.optimisationStaleDelivery ?? 0;
+      summary.landingPageAlerts += result.landingPageAlerts ?? 0;
+      summary.landingPageUnverifiable += result.landingPageUnverifiable ?? 0;
+      summary.landingPageOk += result.landingPageOk ?? 0;
       summary.destinationAlerts += result.destinationAlerts ?? 0;
       summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
       summary.destinationOk += result.destinationOk ?? 0;
@@ -244,6 +266,15 @@ export async function runMetaTrackingMonitor(
       : '') +
     // Printed even at zero: an account with nothing to watch and an account watched and found
     // healthy both report zero regressions, and only this number separates them.
+    (summary.landingPageAlerts > 0
+      ? `, ${summary.landingPageAlerts} generated landing page(s) that cannot report a conversion`
+      : '') +
+    // Printed even at zero, for the same reason destinationOk is: zero alerts reads the same
+    // whether every site was healthy or none was ever fetched.
+    `, ${summary.landingPageOk} generated site(s) verified` +
+    (summary.landingPageUnverifiable > 0
+      ? `, ${summary.landingPageUnverifiable} unreadable`
+      : '') +
     `, ${summary.eventMixWatched} conversion famil(ies) watched` +
     (summary.eventMixStale > 0
       ? `, ${summary.eventMixStale} long-dead conversion famil(ies) (not alerting)`
@@ -254,6 +285,7 @@ export async function runMetaTrackingMonitor(
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
       : '') +
+    `, ${urlCache.stats().fetches} page fetch(es) (${urlCache.stats().hits} served from cache)` +
     (dryRun ? `, ${capturedAlerts.length} alert(s) captured and NOT sent` : '') +
     (summary.unrecognizedActionTypes.length
       ? ` — unknown action types seen: ${summary.unrecognizedActionTypes.join(', ')}`
