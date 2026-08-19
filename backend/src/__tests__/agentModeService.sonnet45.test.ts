@@ -268,7 +268,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(models).not.toContain(id);
       });
 
-      it('tiers GPT-5.6 Sol as pro, Terra as medium, Luna as ultra_cheap', () => {
+      // 2026-08-19: tier is now derived live from costScore (see
+      // "cost-band tier derivation" below), not read off this static field —
+      // these three still carry the pre-derivation literal so a model with
+      // no MODEL_PRICING entry has a sane fallback, but it is no longer what
+      // the picker actually shows. The real, cost-derived tiers are
+      // ultra_premium, pro, and ultra_cheap respectively (see the
+      // derivation test).
+      it('carries a static tier as a no-price fallback, distinct from its real cost-derived tier', () => {
         const llmModels = (agentModeService as any).llmModels;
         expect(llmModels['openrouter/openai/gpt-5.6-sol'].tier).toBe('pro');
         expect(llmModels['openrouter/openai/gpt-5.6-terra'].tier).toBe('medium');
@@ -283,20 +290,24 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
 
     /*
-     * 2026-08-19 — real quality/cost scores for the picker's meters. Sourced
-     * live from Artificial Analysis (Intelligence Index) + real per-token
-     * pricing, computed via a documented formula (see costScoreSource on
-     * each entry) — never estimated. `gpt-5-chat-2` genuinely does not exist
-     * under that name on AA, OpenRouter, or OpenAI's docs (confirmed via
-     * multiple direct URL probes during research), so it correctly carries
-     * neither field rather than a guess.
+     * 2026-08-19 — real quality/cost scores for the picker's meters.
+     * qualityScore is sourced live from Artificial Analysis (Intelligence
+     * Index), a hand-typed literal per model — never estimated. costScore is
+     * NOT hand-typed: it's computed live from MODEL_PRICING via
+     * costScoreFromPrice (see llmPricing.test.ts for the formula's own
+     * tests), so it can never independently drift from what we actually
+     * bill — 11 of 29 hand-typed costScores had already gone stale relative
+     * to MODEL_PRICING before this was caught and fixed. Read through
+     * getSupportedModelsWithMetadata(), the real path the picker uses, not
+     * off the private config object (costScore/costScoreSource no longer
+     * live there at all).
      */
     describe('2026-08-19 — quality/cost meter scores', () => {
       const SCORED_IDS = [
         'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
         'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
         'anthropic.claude-haiku-4-5-20251001-v1:0',
-        'gpt-5.5', 'gpt-5.4', 'gpt-5.2-chat', 'gpt-5.4-nano',
+        'gpt-5.5', 'gpt-5.4', 'gpt-5.2-chat', 'gpt-5.4-nano', 'gpt-5-chat-2',
         'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.1-flash-lite',
         'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
         'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
@@ -306,39 +317,53 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
       ];
 
-      it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', (id) => {
-        const config = (agentModeService as any).llmModels[id];
-        expect(config.qualityScore).toBeGreaterThanOrEqual(0);
-        expect(config.qualityScore).toBeLessThanOrEqual(100);
-        expect(Number.isInteger(config.qualityScore)).toBe(true);
-        expect(config.qualityScoreSource).toEqual(expect.any(String));
-        expect(config.costScore).toBeGreaterThanOrEqual(0);
-        expect(config.costScore).toBeLessThanOrEqual(100);
-        expect(Number.isInteger(config.costScore)).toBe(true);
-        expect(config.costScoreSource).toEqual(expect.any(String));
+      it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', async (id) => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const info = models.find((m) => m.id === id);
+        expect(info).toBeDefined();
+        expect(info!.qualityScore).toBeGreaterThanOrEqual(0);
+        expect(info!.qualityScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(info!.qualityScore)).toBe(true);
+        expect(info!.qualityScoreSource).toEqual(expect.any(String));
+        expect(info!.costScore).toBeGreaterThanOrEqual(0);
+        expect(info!.costScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(info!.costScore)).toBe(true);
+        expect(info!.costScoreSource).toEqual(expect.any(String));
       });
 
-      // Regression pins on a few real, hand-verified values (AA Intelligence
-      // Index v4.1.1, live-fetched 2026-08-19) — catches an accidental
-      // reshuffle without re-deriving the whole table in the assertion.
-      it('pins Claude Opus 5 at the real AA-sourced quality/cost values', () => {
-        const config = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
-        expect(config.qualityScore).toBe(63);
-        expect(config.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
+      // Regression pins on a few real, hand-verified values — catches an
+      // accidental reshuffle without re-deriving the whole table in the
+      // assertion. qualityScore is AA Intelligence Index v4.1.1
+      // (live-fetched 2026-08-19); costScore is computed from MODEL_PRICING.
+      it('pins Claude Opus 5 at the real AA-sourced quality / MODEL_PRICING-derived cost values', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const info = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        expect(info.qualityScore).toBe(63);
+        expect(info.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
+        expect(info.tier).toBe('pro'); // 70 falls in the 51-70 "pro" cost band
       });
 
-      it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real AA-sourced values', () => {
-        const config = (agentModeService as any).llmModels['openrouter/openai/gpt-4o-mini'];
-        expect(config.qualityScore).toBe(7);
-        expect(config.costScore).toBe(22);
+      it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real values', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const info = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
+        expect(info.qualityScore).toBe(7);
+        expect(info.costScore).toBe(22);
+        expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
       });
 
-      it('does NOT assign a quality or cost score to gpt-5-chat-2 — confirmed missing on AA/OpenRouter/OpenAI, never guessed', () => {
-        const config = (agentModeService as any).llmModels['gpt-5-chat-2'];
-        expect(config.qualityScore).toBeUndefined();
-        expect(config.qualityScoreSource).toBeUndefined();
-        expect(config.costScore).toBeUndefined();
-        expect(config.costScoreSource).toBeUndefined();
+      // gpt-5-chat-2 genuinely does not exist under that exact name on AA,
+      // OpenRouter, or OpenAI's model-listing docs — but a live probe (real
+      // completion call against the deployment) confirmed it routes to
+      // OpenAI's gpt-5-chat-latest, so it correctly carries an
+      // inference-based (not invented) quality score, and a costScore
+      // computed from that same model's real, officially-documented pricing.
+      it('gives gpt-5-chat-2 an inferred quality score and a real MODEL_PRICING-derived cost score, not a guess', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const info = models.find((m) => m.id === 'gpt-5-chat-2')!;
+        expect(info.qualityScore).toBe(15);
+        expect(info.qualityScoreSource).toMatch(/inferred match/i);
+        expect(info.costScore).toBe(56); // $1.25 in / $10.00 out blended 75:25 -> $3.4375/1M
+        expect(info.tier).toBe('pro'); // 56 falls in the 51-70 "pro" cost band, not its static 'medium' fallback
       });
 
       it('does not lower a legacy model\'s quality score merely for being legacy', () => {
@@ -353,6 +378,61 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(opus46.qualityScore).toBe(45);
         expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
         expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
+      });
+    });
+
+    /*
+     * 2026-08-19 — same-family dominance auto-legacy. Harsha: "anything that
+     * is band for band worse in the same model family should be put into
+     * legacy — GPT-5.6 Luna is strictly better than GPT-5.4 Nano." A model
+     * gets legacy: true when a same-`family`, originally-non-legacy sibling
+     * is at least as cheap (cost band) AND at least as good (quality score),
+     * strictly so in one dimension — see deriveDominanceLegacyIds and each
+     * model's `family` tag in the registry.
+     *
+     * `family` is deliberately narrower than `provider`: an earlier
+     * provider-wide version of this check falsely flagged Claude Sonnet 5
+     * as dominated by Claude Opus 5, and Gemini 3.1 Pro as dominated by
+     * Gemini 3.5 Flash — different product tiers serving different jobs,
+     * not generations of the same model. The tests below pin both the real
+     * positive case and that specific false-positive class as a regression
+     * guard.
+     */
+    describe('2026-08-19 — same-family dominance auto-legacy', () => {
+      it('flags GPT-5.4 Nano as legacy — GPT-5.6 Luna is the same cost band with strictly higher quality', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const nano = models.find((m) => m.id === 'gpt-5.4-nano')!;
+        const luna = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-luna')!;
+        expect(nano.tier).toBe(luna.tier); // same cost band
+        expect(luna.qualityScore).toBeGreaterThan(nano.qualityScore!);
+        expect(nano.legacy).toBe(true);
+      });
+
+      it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const mini = models.find((m) => m.id === 'openrouter/openai/gpt-4o-mini')!;
+        expect(mini.legacy).toBe(true);
+      });
+
+      it('does NOT flag Claude Sonnet 5 as legacy just because Claude Opus 5 exists — different product tier, not a generation', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const sonnet5 = models.find((m) => m.id === 'anthropic.claude-sonnet-5')!;
+        const opus5 = models.find((m) => m.id === 'anthropic.claude-opus-5')!;
+        expect(opus5.qualityScore).toBeGreaterThan(sonnet5.qualityScore!);
+        expect(sonnet5.legacy).toBeUndefined();
+      });
+
+      it('does NOT flag Gemini 3.1 Pro as legacy just because Gemini 3.5 Flash exists — no `family` tag, so never auto-dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(false);
+        const pro = models.find((m) => m.id === 'gemini-3.1-pro-preview')!;
+        expect(pro.legacy).toBeUndefined();
+      });
+
+      it('still marks the pre-existing manually-legacy models legacy regardless of dominance', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        for (const id of ['gpt-5-chat-2', 'gpt-5.2-chat', 'gpt-5.4', 'anthropic.claude-opus-4-6-v1', 'anthropic.claude-opus-4-8']) {
+          expect(models.find((m) => m.id === id)!.legacy).toBe(true);
+        }
       });
     });
 

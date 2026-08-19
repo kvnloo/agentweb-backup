@@ -1,9 +1,27 @@
 import { AgentModeService } from '../services/agentModeService';
+import * as llmPricing from '../utils/llmPricing';
+
+// costScore is computed live from MODEL_PRICING (via getModelPrice), not
+// read off the config — see agentModeService.getSupportedModelsWithMetadata.
+// None of this file's fixture ids are real MODEL_PRICING entries, so
+// getModelPrice is mocked per-id here; costScoreFromPrice itself stays the
+// real implementation (requireActual) so the expected value is computed by
+// the genuine formula, not a hand-picked magic number.
+jest.mock('../utils/llmPricing', () => ({
+  ...jest.requireActual('../utils/llmPricing'),
+  getModelPrice: jest.fn(),
+}));
+
+const SCORED_MODEL_PRICE = { inPerM: 60, outPerM: 90 };
 
 describe('AgentModeService.getSupportedModelsWithMetadata', () => {
   let svc: any;
 
   beforeEach(() => {
+    (llmPricing.getModelPrice as jest.Mock).mockImplementation((id: string) =>
+      id === 'scored-model' ? SCORED_MODEL_PRICE : null,
+    );
+
     svc = Object.create(AgentModeService.prototype);
     svc.llmModels = {
       'tiered-model': {
@@ -24,7 +42,6 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
         client: null, supportsTemperature: true,
         tier: 'pro', description: 'Scored', name: 'Scored Model', provider: 'anthropic',
         qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
-        costScore: 95, costScoreSource: 'Pricing snapshot 2026-08-19',
       },
     };
     svc.getSupportedModels = AgentModeService.prototype.getSupportedModels.bind(svc);
@@ -96,10 +113,15 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
   it('surfaces qualityScore/costScore and their source notes when present', async () => {
     const result = await svc.getSupportedModelsWithMetadata(false);
     const scored = result.find((m: any) => m.id === 'scored-model');
+    const expectedCostScore = llmPricing.costScoreFromPrice(SCORED_MODEL_PRICE);
     expect(scored).toEqual({
-      id: 'scored-model', name: 'Scored Model', tier: 'pro', description: 'Scored', provider: 'anthropic',
+      // tier is 'ultra_premium', not the fixture's static 'pro' — once a
+      // price is available, tier is derived from the real costScore, and
+      // this fixture's price computes to 95 (>=71 -> ultra_premium).
+      id: 'scored-model', name: 'Scored Model', tier: 'ultra_premium', description: 'Scored', provider: 'anthropic',
       qualityScore: 96, qualityScoreSource: 'AA Intelligence Index, 2026-08-19',
-      costScore: 95, costScoreSource: 'Pricing snapshot 2026-08-19',
+      costScore: expectedCostScore,
+      costScoreSource: expect.any(String),
     });
   });
 

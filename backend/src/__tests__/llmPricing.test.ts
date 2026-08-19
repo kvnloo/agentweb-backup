@@ -16,6 +16,7 @@ import {
   getModelPrice,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
+  costScoreFromPrice,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
 import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
@@ -345,6 +346,39 @@ describe('llmPricing', () => {
 
     it('falls back to $3.20/clip for an unknown video model', () => {
       expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
+    });
+  });
+
+  // 2026-08-19: the picker's cost meter used to store costScore as a separate
+  // hand-typed number per model. 11 of 29 had already drifted from what this
+  // exact formula produces against real MODEL_PRICING by the time that was
+  // caught. costScoreFromPrice replaces the hand-typed number so the two can
+  // never disagree again — these tests pin the formula itself.
+  describe('costScoreFromPrice', () => {
+    it('computes the 75/25 blended-rate log score for a known real price', () => {
+      // Claude Opus 5: $5/$25 -> blended $10.00/1M
+      expect(costScoreFromPrice({ inPerM: 5, outPerM: 25 })).toBe(70);
+      // GPT-4o Mini (OpenRouter): $0.15/$0.6 -> blended $0.2625/1M
+      expect(costScoreFromPrice({ inPerM: 0.15, outPerM: 0.6 })).toBe(22);
+    });
+
+    it('clamps to 0 for a blended rate at or below the $0.05/1M floor', () => {
+      expect(costScoreFromPrice({ inPerM: 0.01, outPerM: 0.01 })).toBe(0);
+      expect(costScoreFromPrice({ inPerM: 0, outPerM: 0 })).toBe(0);
+    });
+
+    it('clamps to 100 for a blended rate at or above the $100/1M ceiling', () => {
+      expect(costScoreFromPrice({ inPerM: 100, outPerM: 100 })).toBe(100);
+      expect(costScoreFromPrice({ inPerM: 500, outPerM: 500 })).toBe(100);
+    });
+
+    it('always returns an integer 0-100', () => {
+      for (const price of Object.values(MODEL_PRICING)) {
+        const score = costScoreFromPrice(price);
+        expect(Number.isInteger(score)).toBe(true);
+        expect(score).toBeGreaterThanOrEqual(0);
+        expect(score).toBeLessThanOrEqual(100);
+      }
     });
   });
 });

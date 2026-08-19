@@ -140,7 +140,11 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'anthropic.claude-haiku-4-5-20251001-v1:0': HAIKU_4_5_PRICE,
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
-  'gpt-5-chat-2': withDerivedCache(2.5, 10), // ported from estimateCost
+  // Was $2.50/$10 ("ported from estimateCost") — stale. This deployment alias
+  // routes to OpenAI's gpt-5-chat-latest ("GPT-5 Chat"); live-verified against
+  // OpenAI's own pricing docs (developers.openai.com/api/docs/models/gpt-5-chat-latest,
+  // 2026-08-19): $1.25 in / $10.00 out per 1M (cached input $0.125).
+  'gpt-5-chat-2': withDerivedCache(1.25, 10),
   'gpt-5.2-chat': withDerivedCache(1.75, 14), // developers.openai.com/api/docs/models/gpt-5.2
   'gpt-5.4': withDerivedCache(2.5, 15), // developers.openai.com/api/docs/pricing
   'gpt-5.4-nano': withDerivedCache(0.2, 1.25), // per public listings (pricepertoken/gptbreeze, Jun 2026)
@@ -331,4 +335,28 @@ export function getModelPrice(model: string): ModelPrice | null {
 /** Test hook: reset the warn dedup set. */
 export function __resetUnknownModelWarnsForTests(): void {
   warnedUnknownModels.clear();
+}
+
+/**
+ * 0-100 relative cost score for the model picker's cost meter, higher = more
+ * expensive. Blend = 75% input + 25% output (approximates a typical agent-mode
+ * workload's token mix), placed on a log scale anchored to a fixed $0.05-$100
+ * per-1M-blended-token range so real-world pricing spreads meaningfully across
+ * the scale instead of bunching near 0.
+ *
+ * Deliberately computed from MODEL_PRICING (via getModelPrice) rather than
+ * stored as a separate hand-typed number per model — two independent numbers
+ * claiming to represent "the same model's real cost" WILL drift (11 of 29
+ * hand-typed scores had already gone stale relative to MODEL_PRICING by
+ * 2026-08-19, caught by exactly this kind of cross-check). Deriving it live
+ * means the picker's cost meter can never disagree with what we actually bill.
+ */
+export function costScoreFromPrice(price: ModelPrice): number {
+  const blended = 0.75 * price.inPerM + 0.25 * price.outPerM;
+  const FLOOR_USD_PER_M = 0.05;
+  const CEILING_USD_PER_M = 100;
+  const frac =
+    (Math.log10(blended) - Math.log10(FLOOR_USD_PER_M)) /
+    (Math.log10(CEILING_USD_PER_M) - Math.log10(FLOOR_USD_PER_M));
+  return Math.round(100 * Math.max(0, Math.min(1, frac)));
 }

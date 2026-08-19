@@ -77,6 +77,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
+  costScoreFromPrice,
   cacheWriteCost,
   CacheWriteByTtl,
   imageGenerationCostUsd,
@@ -824,7 +825,12 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
-  /** Usage/cost tier for the model picker UI, ordered most- to least-expensive. Unset defaults to 'medium'. */
+  /**
+   * Usage/cost tier for the model picker UI. Only used as a fallback when
+   * getModelPrice() has no entry for this model — otherwise the picker's
+   * tier grouping is derived live from the computed cost score (see
+   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
+   */
   tier?: ModelTier;
   /** Short, user-facing one-line description shown next to the model name in the picker. */
   description?: string;
@@ -838,8 +844,26 @@ interface LLMModelConfig {
    * this flag only affects picker visibility grouping, never generation). The picker
    * UI tucks these behind a "Show more" row instead of hiding them from new selection
    * entirely (that's what adminOnly is for).
+   *
+   * Hand-set here for models superseded for reasons other than pure
+   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
+   * ALSO computes legacy live for any model that a same-`family` model
+   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
+   * computation combine with OR, never override each other.
    */
   legacy?: boolean;
+  /**
+   * Groups models that are genuinely the same product line across
+   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
+   * Claude Opus release) for automatic same-family dominance detection.
+   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
+   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
+   * product tiers serving different jobs, not generations of the same
+   * model, so they must never share a family or a stronger sibling tier
+   * would wrongly hide a still-useful different-tier model. Omitted
+   * (no family) means this model is never auto-dominated.
+   */
+  family?: string;
   /**
    * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
    * entirely when there is insufficient benchmark evidence for this model —
@@ -852,19 +876,85 @@ interface LLMModelConfig {
    *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
    *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
   qualityScoreSource?: string;
-  /**
-   * Relative cost score, 0-100, higher = more expensive, normalized against
-   * a fixed reference workload using real input/output/cached/reasoning-
-   * token pricing. Omitted when pricing isn't available — never estimated.
-   */
-  costScore?: number;
-  /** Pricing snapshot date + reference-workload note for the cost tooltip
-   *  (e.g. "Pricing snapshot 2026-08-19; normalized to 1M in / 1M out"). */
-  costScoreSource?: string;
+  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
+  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
+  // so it is computed live rather than duplicated as a second hand-typed
+  // number that can drift from what we actually bill.
 }
 
 /** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
 export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/**
+ * Cost-score band boundaries backing the picker's tier buckets (Harsha's
+ * exact thresholds, 2026-08-19) — inclusive lower bound, ordered highest
+ * band first. costScore is 0-100 and higher = more expensive (see
+ * costScoreFromPrice), so a model's tier is simply whichever band its own
+ * cost score falls in.
+ */
+export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
+  { tier: 'ultra_premium', minCostScore: 71 },
+  { tier: 'pro', minCostScore: 51 },
+  { tier: 'medium', minCostScore: 41 },
+  { tier: 'cheap', minCostScore: 31 },
+  { tier: 'ultra_cheap', minCostScore: 0 },
+];
+
+/** Derives a model's picker tier bucket from its cost score. */
+export function tierFromCostScore(costScore: number): ModelTier {
+  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
+  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
+  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
+/** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
+const TIER_RANK: Record<ModelTier, number> = {
+  ultra_cheap: 0,
+  cheap: 1,
+  medium: 2,
+  pro: 3,
+  ultra_premium: 4,
+};
+
+export interface DominanceCandidate {
+  id: string;
+  /** LLMModelConfig.family — omitted candidates are never auto-dominated. */
+  family?: string;
+  tier: ModelTier;
+  qualityScore?: number;
+  /** The model's OWN static legacy flag (not the final computed one) — only
+   *  a candidate that was not already legacy can dominate another. */
+  legacy: boolean;
+}
+
+/**
+ * Ids that should be treated as legacy because a same-`family`, originally
+ * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
+ * at least as good (same-or-higher quality score), strictly so in at least
+ * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
+ * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
+ * is dominated. Comparison is scoped to `family`, never "same provider" —
+ * Claude Opus and Claude Sonnet are different product tiers, not
+ * generations of one model, so a stronger Opus must never hide Sonnet.
+ */
+export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<string> {
+  const dominated = new Set<string>();
+  for (const a of candidates) {
+    if (!a.family || typeof a.qualityScore !== 'number') continue;
+    const beatenBySibling = candidates.some((b) => {
+      if (b.id === a.id || b.family !== a.family || b.legacy || typeof b.qualityScore !== 'number') {
+        return false;
+      }
+      const cheaperOrEqual = TIER_RANK[b.tier] <= TIER_RANK[a.tier];
+      const betterOrEqualQuality = b.qualityScore >= a.qualityScore!;
+      const strictlyBetter = TIER_RANK[b.tier] < TIER_RANK[a.tier] || b.qualityScore > a.qualityScore!;
+      return cheaperOrEqual && betterOrEqualQuality && strictlyBetter;
+    });
+    if (beatenBySibling) dominated.add(a.id);
+  }
+  return dominated;
+}
 
 /** Underlying lab a model is from, for picking the right provider icon in the picker. */
 export type ModelProvider =
@@ -2899,11 +2989,24 @@ export class AgentModeService {
     // same reason as the others — no LEGACY_MODEL_ALIASES entry exists yet
     // for any version bump in this registry, so deletion isn't safe without
     // one first (see agentweb-customer-portal picker-cleanup investigation).
-    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true },
-    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 27, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 60, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 62, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 29, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 71, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    // 2026-08-19: this deployment alias returned no match on AA/OpenRouter/
+    // OpenAI docs under this exact name — but a live probe (real completion
+    // call against the actual deployment) confirmed it's genuinely working
+    // and returns model: "gpt-chat-latest", which strongly matches OpenAI's
+    // own "GPT-5 Chat" (gpt-5-chat-latest) by name, release-era, and
+    // description ("GPT-5 snapshot previously used in ChatGPT") — not a
+    // byte-exact id confirmation, so flagged as inferred rather than
+    // certain (quality score below). Cost score is computed live from this
+    // model's MODEL_PRICING entry (llmPricing.ts), which uses OpenAI's own
+    // official pricing docs — higher confidence than AA, whose page for this
+    // same model shows a stale/broken $0.00. Kept in the registry, not
+    // removed — it's real, working infrastructure with real historical
+    // customer usage.
+    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true, qualityScore: 15, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "GPT-5 (ChatGPT)" page — inferred match (name/release-era/description), not a confirmed exact id, snapshot 2026-08-19' },
+    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 27, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2912,10 +3015,10 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 41, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 59, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 32, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 55, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2941,7 +3044,7 @@ export class AgentModeService {
     //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
     //   matching the existing convention for other non-default/experimental models
     //   (e.g. anthropic.claude-opus-4-6-v1 above).
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 22, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -2963,15 +3066,15 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 54, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 48, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 34, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 54, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 22, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 63, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 46, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 49, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 15, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
     // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
     // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
@@ -2981,9 +3084,9 @@ export class AgentModeService {
     // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
     // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
     // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 71, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 59, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 29, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', family: 'gpt5-chat', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: true, adminOnly: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
@@ -2991,21 +3094,21 @@ export class AgentModeService {
     // have active schedules touching them the same day this was written), so
     // NOT deleted and NOT adminOnly — customers can still select them via
     // "Show more", they're just no longer the default row per tier.
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 63, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 63, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 70, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 70, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 70, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 58, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19', costScore: 49, costScoreSource: 'AgentWeb blended rate (75% input / 25% output, real per-token pricing), snapshot 2026-08-19' },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -3024,26 +3127,58 @@ export class AgentModeService {
    * selectable through the HTTP generate picker (see callLLM's isLive guard).
    * Untiered entries default to 'medium' with a generic description rather than being
    * dropped, so a newly-added model is never silently invisible in the picker.
+   *
+   * costScore is computed live from MODEL_PRICING (via getModelPrice +
+   * costScoreFromPrice) rather than read off the config — see the
+   * LLMModelConfig comment for why. tier is then derived from that same
+   * costScore via tierFromCostScore, so the picker's section headers always
+   * agree with the cost meter it's grouping by. Only when a model has no
+   * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
+   * to the config's static field, and costScore/costScoreSource are omitted.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
-    return ids
-      .filter(id => !this.llmModels[id]?.isLive)
-      .map(id => {
-        const config = this.llmModels[id];
-        return {
-          id,
-          name: config?.name ?? id,
-          tier: config?.tier ?? 'medium',
-          description: config?.description ?? 'General-purpose model',
-          provider: config?.provider ?? 'other',
-          ...(config?.legacy ? { legacy: true as const } : {}),
-          ...(typeof config?.qualityScore === 'number' ? { qualityScore: config.qualityScore } : {}),
-          ...(config?.qualityScoreSource ? { qualityScoreSource: config.qualityScoreSource } : {}),
-          ...(typeof config?.costScore === 'number' ? { costScore: config.costScore } : {}),
-          ...(config?.costScoreSource ? { costScoreSource: config.costScoreSource } : {}),
-        };
-      });
+    const visibleIds = ids.filter(id => !this.llmModels[id]?.isLive);
+
+    const enriched = visibleIds.map(id => {
+      const config = this.llmModels[id];
+      const price = getModelPrice(id);
+      const costScore = price ? costScoreFromPrice(price) : undefined;
+      return {
+        id,
+        name: config?.name ?? id,
+        tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        description: config?.description ?? 'General-purpose model',
+        provider: config?.provider ?? 'other',
+        family: config?.family,
+        staticLegacy: config?.legacy === true,
+        qualityScore: config?.qualityScore,
+        qualityScoreSource: config?.qualityScoreSource,
+        costScore,
+      };
+    });
+
+    const dominatedIds = deriveDominanceLegacyIds(
+      enriched.map(e => ({ id: e.id, family: e.family, tier: e.tier, qualityScore: e.qualityScore, legacy: e.staticLegacy })),
+    );
+
+    return enriched.map(e => ({
+      id: e.id,
+      name: e.name,
+      tier: e.tier,
+      description: e.description,
+      provider: e.provider,
+      ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
+      ...(typeof e.qualityScore === 'number' ? { qualityScore: e.qualityScore } : {}),
+      ...(e.qualityScoreSource ? { qualityScoreSource: e.qualityScoreSource } : {}),
+      ...(typeof e.costScore === 'number'
+        ? {
+            costScore: e.costScore,
+            costScoreSource:
+              'AgentWeb blended rate (75% input / 25% output), computed live from the real per-token billing price table (llmPricing.ts MODEL_PRICING) — never a separately hand-typed number',
+          }
+        : {}),
+    }));
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
