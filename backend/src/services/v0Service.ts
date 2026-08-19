@@ -7,7 +7,7 @@ import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig }
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
-import { injectGoogleAdsIntoLayoutFiles } from "../utils/googleAdsInjection";
+import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
@@ -1761,6 +1761,13 @@ async function addPageToExistingRepo(
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
   if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
+  // A Google Ads conversion is site-wide by construction — the base tag lives in the shared
+  // layout — so a sub-page inherits the site's config rather than resolving its own. Carried
+  // onto the record so RULE 7.5 and the offline import (ENG-1325) can read it from ANY page
+  // of the site without walking back to the root (ENG-1328).
+  if (existingPage.googleAdsConversionId) record.googleAdsConversionId = existingPage.googleAdsConversionId;
+  if (existingPage.googleAdsConversionLabel) record.googleAdsConversionLabel = existingPage.googleAdsConversionLabel;
+  if (existingPage.googleAdsCustomerId) record.googleAdsCustomerId = existingPage.googleAdsCustomerId;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -2147,6 +2154,99 @@ async function addPageToExistingRepo(
         }
       } catch (layoutErr: any) {
         console.warn(`[V0 SERVICE] Base pixel install failed for ${repoFullName} (continuing): ${layoutErr?.message}`);
+      }
+    }
+
+    /*
+     * ENG-1328 AC2 — the same gap as the pixel install above, for Google Ads, and the one
+     * that actually bit us. remapFilesForSubPage drops app/layout.tsx from a sub-page's file
+     * set, so nothing else in this path installs a base tag. During ENG-1182 a generated
+     * sub-page received a perfectly correct conversion call and fired NOTHING, because
+     * `window.gtag` was never defined. Unblocking one test lander took a hand-written PR
+     * from a fork.
+     *
+     * The guard is broader than the pixel's deliberately. Meta only installs while APPLYING
+     * an override, because a site that already had a pixel got the snippet at generation
+     * time. A Google Ads id, by contrast, is routinely set AFTER generation — by the manual
+     * endpoint, or when a conversion action is created (ENG-1322) — and every sub-page then
+     * inherits a layout that carries nothing. So: install whenever the site has an id and
+     * the layout does not already verify. injectGoogleAdsIntoLayout is idempotent, and
+     * verify gates the write, so a repeat is a no-op rather than a duplicate.
+     *
+     * Best-effort, with one exception, exactly as above: a layout we cannot read must not
+     * fail the page build, but DRIFT is refused outright (AC5). Note that "best-effort" is
+     * weaker consolation here than for Meta — a failed pixel install still leaves the CAPI
+     * leg working, whereas Google Ads has no server-side leg until ENG-1325, so a skip here
+     * means no measurement at all. It is recorded on the record rather than shrugged off.
+     */
+    let googleAdsInstallAbandoned = false;
+    // Set true by whichever branch leaves the layout genuinely carrying the tag — either we
+    // just injected it, or it was already there. Inferring this from filesToCommit instead
+    // would report "unmeasured" for the already-present case, which is the common one.
+    let googleAdsTagPresent = false;
+    const subPageGoogleAdsId = existingPage.googleAdsConversionId;
+    if (subPageGoogleAdsId) {
+      try {
+        const currentLayout = await readRepoFile(repoFullName, "app/layout.tsx", ghHeaders);
+        if (!currentLayout) {
+          console.warn(`[V0 SERVICE] No app/layout.tsx in ${repoFullName} — skipping base Google Ads tag install`);
+        } else if (verifyGoogleAdsInjection(currentLayout, subPageGoogleAdsId)) {
+          googleAdsTagPresent = true;
+          console.log(`[V0 SERVICE] Base Google Ads tag ${subPageGoogleAdsId} already present in ${repoFullName}'s layout`);
+        } else if (repairs.some((r) => r.path === "app/layout.tsx")
+          || filesToCommit.some((f) => f.path === "app/layout.tsx")) {
+          // Another writer already owns this path in this commit — two entries for one path
+          // would be ambiguous. The pixel install above can also claim it.
+          console.warn(`[V0 SERVICE] Skipping base Google Ads tag install: app/layout.tsx is already being written this commit`);
+        } else if (/\{\/\* Google Ads Tag \*\/\}/.test(currentLayout)) {
+          /*
+           * The repo already carries a DIFFERENT AW- id than the one we are about to install.
+           * injectGoogleAdsIntoLayout always strips the existing block before inserting, so
+           * proceeding would silently repoint a LIVE site's conversions at another account.
+           * Refuse and say so: a missing install is visible and recoverable, a swapped
+           * conversion id corrupts someone's attribution quietly (ENG-910's lesson).
+           */
+          googleAdsInstallAbandoned = true;
+          console.error(
+            `[V0 SERVICE] Base Google Ads tag install ABORTED for ${repoFullName}: layout.tsx already has a ` +
+            `different Google Ads block. Not replacing it — the site record and the repo disagree, which needs ` +
+            `a human. Requested conversion id: ${subPageGoogleAdsId}.`,
+          );
+        } else {
+          const updatedLayout = injectGoogleAdsIntoLayout(currentLayout, subPageGoogleAdsId);
+          if (verifyGoogleAdsInjection(updatedLayout, subPageGoogleAdsId)) {
+            googleAdsTagPresent = true;
+            filesToCommit.push({ path: "app/layout.tsx", content: Buffer.from(updatedLayout) });
+            console.log(`[V0 SERVICE] Installing base Google Ads tag ${subPageGoogleAdsId} into ${repoFullName}'s layout`);
+          } else {
+            console.warn(
+              `[V0 SERVICE] Base Google Ads tag install skipped for ${repoFullName}: layout.tsx has no <head>/<body> anchor`,
+            );
+          }
+        }
+      } catch (layoutErr: any) {
+        console.warn(`[V0 SERVICE] Base Google Ads tag install failed for ${repoFullName} (continuing): ${layoutErr?.message}`);
+      }
+
+      /*
+       * Persist what actually happened, rather than inferring it later from the code.
+       * `false` here is the ENG-1182 condition verbatim: the site has a conversion id, so a
+       * conversion call will fire, but no base tag reached the layout — `window.gtag` will be
+       * undefined and the call goes nowhere. There is no server-side leg to fall back on until
+       * ENG-1325, so this flag is the ONLY signal that a page shipped unmeasured, and RULE 7.5
+       * needs it to refuse the launch.
+       */
+      const googleAdsTagLive = googleAdsTagPresent && !googleAdsInstallAbandoned;
+      record.googleAdsTrackingInstalled = googleAdsTagLive;
+      try {
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET googleAdsTrackingInstalled = :g, updatedAt = :u",
+          ExpressionAttributeValues: { ":g": googleAdsTagLive, ":u": new Date().toISOString() },
+        }).promise();
+      } catch (persistErr: any) {
+        console.warn(`[V0 SERVICE] Could not persist googleAdsTrackingInstalled for /${slug}: ${persistErr?.message}`);
       }
     }
 
