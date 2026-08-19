@@ -323,4 +323,133 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
 
     consoleErrorSpy.mockRestore();
   });
+
+  /**
+   * ENG-1239 (rework): the tests above all simulate a turn that returns SUCCESSFULLY
+   * with a deferred tool call in its `toolCalls` ledger — the "soft" case. Pulling the
+   * real production session (822c1ed4, 2026-08-14) message-by-message showed the actual
+   * reported incident took a DIFFERENT path: the model's own wrap-up reply itself ran
+   * past the whole-turn hard cap (GENERATION_TIMEOUT_MS), so `withGenerationTimeout`
+   * rejected with `isGenerationTimeout` and the request never got a `response` object at
+   * all — the customer-facing message came from the separate ENG-510 partial-delivery
+   * catch branch instead (`kind: 'generation-timeout-continuation'`), which never called
+   * scheduleAutoMediaContinuation. These tests cover that branch directly.
+   */
+  describe('whole-turn hard-timeout variant (the actual reported incident shape)', () => {
+    const timeoutError = () => {
+      const err: any = new Error(`Generation timed out after 600000ms for session ${mockSessionId}.`);
+      err.isGenerationTimeout = true;
+      return err;
+    };
+
+    const imageMarker = (n: number, iso: string) => ({
+      role: 'tool',
+      metadata: { kind: 'image-generated', imageUrl: `https://s3/creative-${n}.png`, imageFilename: `creative-${n}.png`, timestamp: iso },
+    });
+
+    const deferredMarker = (iso: string) => ({
+      role: 'tool',
+      metadata: { mediaBudgetDeferred: true, timestamp: iso },
+    });
+
+    it('auto-resumes after a whole-turn hard timeout when 3 images landed and a media-budget deferral was persisted', async () => {
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...mockSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (mockSession as any),
+      );
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError()) // the customer's own turn hits the hard cap
+        .mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)])); // the auto-continuation
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+
+      // The customer's own request still gets the ENG-510 partial-delivery response
+      // immediately — it does not block on the background continuation.
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ partialMediaDelivery: true }),
+      );
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+
+      await flush();
+
+      // The batch auto-completed via exactly one background continuation round, fired
+      // by the SERVER (not the customer retyping "continue"), and delivered live.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
+      expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
+      expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+      expect(mockIoEmit).toHaveBeenCalledWith(
+        'session-message-appended',
+        expect.objectContaining({ message: expect.objectContaining({ content: 'All 4 creatives are ready.' }) }),
+      );
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+    });
+
+    it('does NOT auto-continue on a whole-turn hard timeout when nothing was actually deferred', async () => {
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      // 3 images landed before the cap fired, but no mediaBudgetDeferred marker — e.g.
+      // an unrelated slow step (not a 4th deferred image) is what blew the turn budget.
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...mockSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso)] } as any)
+          : (mockSession as any),
+      );
+      mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutError());
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ partialMediaDelivery: true }));
+
+      await flush();
+
+      // No unwanted extra continuation call — nothing was actually left deferred.
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockIoEmit).not.toHaveBeenCalled();
+    });
+
+    it('also auto-resumes on the interactive-share route after a whole-turn hard timeout', async () => {
+      const shareId = 'ishare-media-batch';
+      const conversableToken = 'tok-media-batch';
+      const futureIso = new Date(Date.now() + 5000).toISOString();
+      const shareSession = {
+        ...mockSession,
+        sessionId: shareId,
+        interactiveShareMetadata: {
+          isActive: true,
+          token: conversableToken,
+          sharedAt: new Date().toISOString(),
+          expiresAt: '2099-01-01T00:00:00Z',
+        },
+      };
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string, consistentRead?: boolean) =>
+        consistentRead
+          ? ({ ...shareSession, messages: [imageMarker(1, futureIso), imageMarker(2, futureIso), imageMarker(3, futureIso), deferredMarker(futureIso)] } as any)
+          : (shareSession as any),
+      );
+      mockWorkerService.runInWorker
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValueOnce(workerResponse('All 4 creatives are ready.', [imageToolCall(4)]));
+
+      const shareReq = {
+        params: { shareId },
+        query: { conversable: conversableToken },
+        body: { userMessage: 'Generate four 4:5 ad creatives', attachments: [] },
+        ip: '127.0.0.1',
+        headers: {},
+      } as unknown as Request;
+      const res = makeRes();
+      await agentModeController.generateSharedResponse(shareReq, res);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ partialMediaDelivery: true }));
+
+      await flush();
+
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      const secondCallArgs = mockWorkerService.runInWorker.mock.calls[1][0] as any;
+      expect(secondCallArgs.messageContent).toMatch(/automatic continuation/i);
+      expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+    });
+  });
 });

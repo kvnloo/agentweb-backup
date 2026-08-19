@@ -4,6 +4,7 @@ import {
   collectTurnWorkSince,
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
+  hasPersistedMediaBudgetDeferral,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -299,5 +300,51 @@ describe('hasDeferredMediaBudgetToolCall', () => {
   it('ignores malformed entries', () => {
     const toolCalls = [null, undefined, {}, { result: null }, { result: {} }] as any;
     expect(hasDeferredMediaBudgetToolCall(toolCalls)).toBe(false);
+  });
+});
+
+describe('hasPersistedMediaBudgetDeferral', () => {
+  // ENG-1239: hasDeferredMediaBudgetToolCall only sees a settled turn's OWN toolCalls
+  // ledger — it can't tell the whole-turn-timeout catch branch (agentModeController.ts)
+  // whether the turn it just abandoned was mid-media-batch, because that branch never
+  // gets a `response` object (the generation promise rejected). This reads the same
+  // signal off the PERSISTED session history instead — the tool-role message toolDispatch
+  // writes the instant it defers a media call (metadata.mediaBudgetDeferred: true,
+  // matches the real production session 822c1ed4 at 2026-08-14T18:20:51.907Z) — so the
+  // catch branch can tell a genuine media-batch pause apart from an unrelated timeout.
+  const turnStart = Date.parse('2026-08-14T18:00:00Z');
+  const deferredMarker = (iso: string) => ({
+    role: 'tool',
+    metadata: { mediaBudgetDeferred: true, timestamp: iso },
+  });
+
+  it('returns false for non-array input', () => {
+    expect(hasPersistedMediaBudgetDeferral(undefined, turnStart)).toBe(false);
+    expect(hasPersistedMediaBudgetDeferral(null, turnStart)).toBe(false);
+  });
+
+  it('returns false when nothing was deferred this turn', () => {
+    const msgs = [
+      { role: 'tool', metadata: { kind: 'image-generated', imageUrl: 'https://s3/v1.png', timestamp: '2026-08-14T18:20:51.906Z' } },
+      { role: 'assistant', content: 'done', timestamp: '2026-08-14T18:20:52.000Z' },
+    ];
+    expect(hasPersistedMediaBudgetDeferral(msgs, turnStart)).toBe(false);
+  });
+
+  it('returns true for a deferral marker persisted at/after the turn started (the real incident shape)', () => {
+    const msgs = [
+      { role: 'tool', metadata: { kind: 'image-generated', imageUrl: 'https://s3/v1.png', timestamp: '2026-08-14T18:20:51.906Z' } },
+      deferredMarker('2026-08-14T18:20:51.907Z'),
+    ];
+    expect(hasPersistedMediaBudgetDeferral(msgs, turnStart)).toBe(true);
+  });
+
+  it('ignores a deferral marker persisted before THIS turn started (an earlier turn already resolved it)', () => {
+    expect(hasPersistedMediaBudgetDeferral([deferredMarker('2026-08-14T17:00:00Z')], turnStart)).toBe(false);
+  });
+
+  it('skips null/undefined entries and markers with no timestamp at all', () => {
+    const msgs = [null, undefined, { role: 'tool', metadata: { mediaBudgetDeferred: true } }];
+    expect(hasPersistedMediaBudgetDeferral(msgs as any, turnStart)).toBe(false);
   });
 });
