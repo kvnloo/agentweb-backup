@@ -260,7 +260,8 @@ describe("PUT /api/admin/chat-sessions/:sessionId/score", () => {
         score: 5,
         reason: "Actually great",
         adminOverride: true,
-      })
+      }),
+      { allowOverride: true }
     );
   });
 });
