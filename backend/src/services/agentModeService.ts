@@ -12843,9 +12843,32 @@ export class AgentModeService {
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
 
+      // ENG-1207: never report a truncated page as a total. `searchLeads` and
+      // `getLeads` were corrected in #2407; this tool kept saying "Found 20
+      // engagement(s)" for a lead with 143, and a model reads that as "there are
+      // 20" and stops -- the same misread that wrote 17 of 107 records and called
+      // the job done.
+      //
+      // The total is `engagements.length`, NOT `engagementCount.total`, and the
+      // distinction matters. `engagements` is the exact population being sliced,
+      // and it is complete: both of its sources paginate fully (the email-events
+      // query loops on LastEvaluatedKey and returns everything; the rest is a lead
+      // attribute). `engagementCount` is a SEPARATE query that may count a
+      // different population, which would make "20 of 143" inconsistent with the
+      // 20 rows actually returned beside it -- and it can fail independently,
+      // leaving a total that has to be omitted or invented.
+      //
+      // Counting the array we truncated keeps the two numbers describing the same
+      // thing by construction, and removes the failure mode entirely.
+      const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      const truncated = engagements.length > limitedEngagements.length;
+      const engagementMessage = truncated
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s) for ${leadLabel} — raise limit to see more.`.trim()
+        : `Found ${limitedEngagements.length} engagement(s) for ${leadLabel}`.trim();
+
       return {
         success: true,
-        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        message: engagementMessage,
         engagementSummary: {
           total: engagementCount.total,
           last7Days: engagementCount.last7Days,
