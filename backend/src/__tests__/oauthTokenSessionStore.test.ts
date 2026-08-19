@@ -10,14 +10,24 @@ jest.mock('../services/settingsService', () => ({
     getSetting: jest.fn(),
     setSetting: jest.fn(),
     deleteSetting: jest.fn(),
+    setSettingIfValueMatches: jest.fn(),
+    deleteSettingIfValueMatches: jest.fn(),
   },
 }));
 
 const ttlArgOf = (call: any[]) => call[4];
 
+const conditionalCheckFailed = () => {
+  const err: any = new Error('The conditional request failed');
+  err.code = 'ConditionalCheckFailedException';
+  return err;
+};
+
 const mockGet = settingsService.getSetting as jest.Mock;
 const mockSet = settingsService.setSetting as jest.Mock;
 const mockDelete = settingsService.deleteSetting as jest.Mock;
+const mockSetIfMatches = settingsService.setSettingIfValueMatches as jest.Mock;
+const mockDeleteIfMatches = settingsService.deleteSettingIfValueMatches as jest.Mock;
 
 const tokens = { access_token: 'a', refresh_token: 'r', expires_in: 3600, granted_scopes: ['Mail.Send'] };
 const profile = { email: 'habeb@baldwin.com', name: 'Habeb' };
@@ -36,6 +46,18 @@ beforeEach(() => {
     table.set(name, value);
   });
   mockDelete.mockImplementation(async (name: string) => {
+    table.delete(name);
+  });
+  // Real DynamoDB semantics for the conditional (compare-and-swap) primitives: the write
+  // only applies if the row's current raw value still equals what the caller read. Anything
+  // else — including two callers racing the same row — surfaces as a
+  // ConditionalCheckFailedException, exactly like the real dynamodb.put/delete would.
+  mockSetIfMatches.mockImplementation(async (name: string, value: string, expectedValue: string) => {
+    if (table.get(name) !== expectedValue) throw conditionalCheckFailed();
+    table.set(name, value);
+  });
+  mockDeleteIfMatches.mockImplementation(async (name: string, expectedValue: string) => {
+    if (table.get(name) !== expectedValue) throw conditionalCheckFailed();
     table.delete(name);
   });
 });
@@ -132,13 +154,67 @@ describe('oauthTokenSessionStore — DynamoDB TTL attribute', () => {
     expect(ttl).toBe(expectedTtl);
   });
 
-  it('does not call setSetting with a ttl when the row is emptied (deleteSetting path)', async () => {
+  it('does not call setSetting with a ttl when the row is emptied (atomic delete path)', async () => {
     const id = await storeTokenSession('u1', 'outlook', tokens, profile);
     mockSet.mockClear();
     await retrieveTokenSession(id, 'u1', 'outlook');
 
-    expect(mockDelete).toHaveBeenCalledWith('oauth_token_session_outlook_u1');
+    expect(mockDeleteIfMatches).toHaveBeenCalledWith('oauth_token_session_outlook_u1', expect.any(String));
     expect(mockSet).not.toHaveBeenCalled();
+    expect(mockSetIfMatches).not.toHaveBeenCalled();
+  });
+});
+
+// ENG-965: retrieveTokenSession's removal must be atomic with the read it's based on — a
+// failed persist must never mint tokens for a session it did not provably consume, and a
+// stale read racing a concurrent write must fail closed rather than trust its own match.
+describe('oauthTokenSessionStore — atomic one-time-use consumption (ENG-965)', () => {
+  it('never returns token material when the persisted removal fails outright', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    mockDeleteIfMatches.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+    await expect(retrieveTokenSession(id, 'u1', 'outlook')).rejects.toThrow();
+  });
+
+  it('leaves the row exactly as read when the removal fails — not silently forged as consumed', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    const before = table.get('oauth_token_session_outlook_u1');
+    mockDeleteIfMatches.mockRejectedValueOnce(new Error('boom'));
+
+    await expect(retrieveTokenSession(id, 'u1', 'outlook')).rejects.toThrow();
+    expect(table.get('oauth_token_session_outlook_u1')).toBe(before);
+  });
+
+  it('fails closed (no tokens, no throw) on a conditional-check race instead of trusting a stale read', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    mockDeleteIfMatches.mockRejectedValueOnce(conditionalCheckFailed());
+
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
+  });
+
+  it('conditions the removal on the exact row it read, proving atomicity rather than read-then-write', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    const raw = table.get('oauth_token_session_outlook_u1');
+
+    await retrieveTokenSession(id, 'u1', 'outlook');
+
+    expect(mockDeleteIfMatches).toHaveBeenCalledWith('oauth_token_session_outlook_u1', raw);
+  });
+
+  it('a genuinely failed removal really did leave the session replayable — proving the fix is the atomic condition, not a hidden second consume', async () => {
+    // If a transient store failure occurs, the underlying row is untouched by definition
+    // (no other write happened). This documents that the ONLY thing the fix changes is
+    // whether the caller can find that out and decline to hand back tokens — it does not
+    // (and cannot) retroactively erase a session a failed write never touched.
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    mockDeleteIfMatches.mockRejectedValueOnce(new Error('boom'));
+    await expect(retrieveTokenSession(id, 'u1', 'outlook')).rejects.toThrow();
+
+    // A subsequent successful attempt (e.g. the client retries the SAME session id) still
+    // consumes it correctly — this is the bounded, honest replay window the comment must
+    // describe, not an unbounded one.
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).not.toBeNull();
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
   });
 });
 

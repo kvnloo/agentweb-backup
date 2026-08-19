@@ -36,6 +36,11 @@ jest.mock('../middleware/auth', () => ({
 // request boundary.
 jest.mock('../services/settingsService', () => {
   const store = new Map<string, string>();
+  const conditionalCheckFailed = () => {
+    const err: any = new Error('The conditional request failed');
+    err.code = 'ConditionalCheckFailedException';
+    return err;
+  };
   return {
     settingsService: {
       setSetting: jest.fn(async (name: string, value: string) => { store.set(name, value); }),
@@ -44,6 +49,17 @@ jest.mock('../services/settingsService', () => {
         return settingValue ? { settingName: name, settingValue } : null;
       }),
       deleteSetting: jest.fn(async (name: string) => { store.delete(name); }),
+      // Conditional (compare-and-swap) primitives the store's one-time-use consume path
+      // uses (ENG-965) — real DynamoDB semantics: the write only applies if the row's
+      // current raw value still equals what the caller read.
+      setSettingIfValueMatches: jest.fn(async (name: string, value: string, expectedValue: string) => {
+        if (store.get(name) !== expectedValue) throw conditionalCheckFailed();
+        store.set(name, value);
+      }),
+      deleteSettingIfValueMatches: jest.fn(async (name: string, expectedValue: string) => {
+        if (store.get(name) !== expectedValue) throw conditionalCheckFailed();
+        store.delete(name);
+      }),
     },
   };
 });
