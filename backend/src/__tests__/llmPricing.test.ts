@@ -101,7 +101,6 @@ describe('llmPricing', () => {
     });
 
     it('has corrected GPT rates', () => {
-      expectRate('gpt-5.2-chat', 1.75, 14);
       expectRate('gpt-5.4', 2.5, 15);
     });
 
@@ -262,13 +261,11 @@ describe('llmPricing', () => {
       expect(dated!.outPerM).toBe(base!.outPerM);
     });
 
-    it('resolves the gpt-chat-latest rolling alias to gpt-5-chat-2 pricing', () => {
-      const alias = getModelPrice('gpt-chat-latest');
-      const canonical = getModelPrice('gpt-5-chat-2');
-      expect(alias).not.toBeNull();
-      expect(canonical).not.toBeNull();
-      expect(alias!.inPerM).toBe(canonical!.inPerM);
-      expect(alias!.outPerM).toBe(canonical!.outPerM);
+    // The gpt-chat-latest rolling alias (for the since-removed gpt-5-chat-2
+    // deployment) was removed 2026-08-19 along with that deployment — MODEL_ID_ALIASES
+    // is empty for now; this asserts it stays a well-behaved miss, not a crash.
+    it('an unmapped rolling-alias-shaped id falls through to unknown-model handling, not a crash', () => {
+      expect(() => getModelPrice('gpt-chat-latest')).not.toThrow();
     });
 
     it('handles a missing/empty model id without throwing (recordUsage passes undefined)', () => {

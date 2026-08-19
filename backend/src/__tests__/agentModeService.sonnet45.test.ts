@@ -231,8 +231,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      */
     describe('2026-08-19 — legacy flag + GPT-5.6 (Sol/Terra/Luna) addition', () => {
       const LEGACY_IDS = [
-        'gpt-5-chat-2',
-        'gpt-5.2-chat',
         'gpt-5.4',
         'anthropic.claude-sonnet-4-5-20250929-v1:0',
         'anthropic.claude-sonnet-4-6',
@@ -351,7 +349,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
         'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
         'anthropic.claude-haiku-4-5-20251001-v1:0',
-        'gpt-5.5', 'gpt-5.4', 'gpt-5.2-chat', 'gpt-5.4-nano', 'gpt-5-chat-2',
+        'gpt-5.5', 'gpt-5.4', 'gpt-5.4-nano',
         'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.1-flash-lite',
         'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
         'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
@@ -393,21 +391,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(info.qualityScore).toBe(7);
         expect(info.costScore).toBe(22);
         expect(info.tier).toBe('ultra_cheap'); // 22 falls in the <=30 "ultra_cheap" cost band
-      });
-
-      // gpt-5-chat-2 genuinely does not exist under that exact name on AA,
-      // OpenRouter, or OpenAI's model-listing docs — but a live probe (real
-      // completion call against the deployment) confirmed it routes to
-      // OpenAI's gpt-5-chat-latest, so it correctly carries an
-      // inference-based (not invented) quality score, and a costScore
-      // computed from that same model's real, officially-documented pricing.
-      it('gives gpt-5-chat-2 an inferred quality score and a real MODEL_PRICING-derived cost score, not a guess', async () => {
-        const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        const info = models.find((m) => m.id === 'gpt-5-chat-2')!;
-        expect(info.qualityScore).toBe(15);
-        expect(info.qualityScoreSource).toMatch(/inferred match/i);
-        expect(info.costScore).toBe(56); // $1.25 in / $10.00 out blended 75:25 -> $3.4375/1M
-        expect(info.tier).toBe('medium'); // 56 falls in the 51-63 "medium" cost band, not its static 'medium' fallback (same value, different reason)
       });
 
       it('does not lower a legacy model\'s quality score merely for being legacy', () => {
@@ -488,7 +471,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       it('still marks the pre-existing manually-legacy models legacy regardless of dominance', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
-        for (const id of ['gpt-5-chat-2', 'gpt-5.2-chat', 'gpt-5.4', 'anthropic.claude-opus-4-6-v1', 'anthropic.claude-opus-4-8']) {
+        for (const id of ['gpt-5.4', 'anthropic.claude-opus-4-6-v1', 'anthropic.claude-opus-4-8']) {
           expect(models.find((m) => m.id === id)!.legacy).toBe(true);
         }
       });
@@ -635,8 +618,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should have maxTools: 128 for all Azure OpenAI gpt-5.x models', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5-chat-2'].maxTools).toBe(128);
-      expect(llmModels['gpt-5.2-chat'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4'].maxTools).toBe(128);
       expect(llmModels['gpt-5.4-nano'].maxTools).toBe(128);
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);

@@ -1037,12 +1037,18 @@ const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'b
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
 // Legacy model ids persisted by sessions/schedules created before a model was
-// renamed. Maps the old id to its current registry key so old sessions keep
-// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
-// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
-// in commit c86c8ec1.
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
 const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -1927,8 +1933,18 @@ export class AgentModeService {
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
       const configured = setting?.settingValue?.trim();
-      if (configured && this.llmModels[configured] && configured !== primaryModel) {
-        return configured;
+      if (configured) {
+        // Same legacy-alias resolution as resolveConfiguredModel/normalizeModelId
+        // uses (ENG-806) — a stored backup id that's since been retired (e.g. a
+        // superseded gpt-5.x version) must still resolve to its current
+        // replacement, not silently return null and disable failover. Normalize
+        // primaryModel too so a retired id used as BOTH primary and configured
+        // backup still collapses to "same model, skip" instead of appearing to
+        // be a distinct backup once only one side is resolved forward.
+        const normalized = this.normalizeModelId(configured);
+        if (this.llmModels[normalized] && normalized !== this.normalizeModelId(primaryModel)) {
+          return normalized;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Error getting backup model setting:', error);
@@ -2984,29 +3000,17 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    // 2026-08-19: gpt-5-chat-2 / 5.2-chat / 5.4 are superseded by 5.5 (each a
-    // straight version bump, never retired) — flagged `legacy` so the picker
-    // tucks them behind "Show more" instead of listing four near-identical
-    // GPT-5.x rows. Not deleted: gpt-5-chat-2/5.2-chat still have paused
-    // TaskSchedules referencing them; gpt-5.4 has none but is kept for the
-    // same reason as the others — no LEGACY_MODEL_ALIASES entry exists yet
-    // for any version bump in this registry, so deletion isn't safe without
-    // one first (see agentweb-customer-portal picker-cleanup investigation).
-    // 2026-08-19: this deployment alias returned no match on AA/OpenRouter/
-    // OpenAI docs under this exact name — but a live probe (real completion
-    // call against the actual deployment) confirmed it's genuinely working
-    // and returns model: "gpt-chat-latest", which strongly matches OpenAI's
-    // own "GPT-5 Chat" (gpt-5-chat-latest) by name, release-era, and
-    // description ("GPT-5 snapshot previously used in ChatGPT") — not a
-    // byte-exact id confirmation, so flagged as inferred rather than
-    // certain (quality score below). Cost score is computed live from this
-    // model's MODEL_PRICING entry (llmPricing.ts), which uses OpenAI's own
-    // official pricing docs — higher confidence than AA, whose page for this
-    // same model shows a stale/broken $0.00. Kept in the registry, not
-    // removed — it's real, working infrastructure with real historical
-    // customer usage.
-    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true, qualityScore: 15, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "GPT-5 (ChatGPT)" page — inferred match (name/release-era/description), not a confirmed exact id, snapshot 2026-08-19' },
-    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 27, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
+    // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
+    // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
+    // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+    // no working deployment possible on any resource). Both were already
+    // legacy:true and the two lowest-quality entries in the gpt5-chat family.
+    // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
+    // to gpt-5.5 (see below) — a paused schedule/session still holding the old
+    // id resolves forward instead of throwing "Invalid model". Do not delete a
+    // registry entry without an alias first; that was exactly the caution the
+    // prior version of this comment existed to enforce.
     'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },

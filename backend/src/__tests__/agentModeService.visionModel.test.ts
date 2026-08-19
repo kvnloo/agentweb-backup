@@ -78,7 +78,7 @@ describe('AgentModeService - vision model (describe_image)', () => {
 
     it('includes verified multimodal models (GPT, Gemini, Claude Bedrock/Vertex)', async () => {
       const opts = await service.getVisionModelOptions(true);
-      expect(opts).toContain('gpt-5-chat-2');
+      expect(opts).toContain('gpt-5.5');
       expect(opts).toContain('gpt-5.4-nano');
       expect(opts).toContain('gemini-3-flash-preview');
       expect(opts).toContain('anthropic.claude-sonnet-4-6');

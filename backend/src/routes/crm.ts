@@ -3728,7 +3728,11 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       // Process each chunk in parallel
       const chunkProcessors = chunks.map(async (chunk, chunkIndex) => {
         // Create separate LLM service instance for each parallel task
-        const llmService = createLLMService('gpt-5.2-chat', 1);
+        // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+        // no working version deployable) — this call has been failing silently
+        // since then. Swapped to gpt-5.4, the current non-deprecated model in
+        // the same "balanced general-purpose" line.
+        const llmService = createLLMService('gpt-5.4', 1);
 
         const batchSize = 10;
         let chunkProcessedCount = 0;

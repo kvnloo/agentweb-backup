@@ -140,12 +140,10 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'anthropic.claude-haiku-4-5-20251001-v1:0': HAIKU_4_5_PRICE,
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
-  // Was $2.50/$10 ("ported from estimateCost") — stale. This deployment alias
-  // routes to OpenAI's gpt-5-chat-latest ("GPT-5 Chat"); live-verified against
-  // OpenAI's own pricing docs (developers.openai.com/api/docs/models/gpt-5-chat-latest,
-  // 2026-08-19): $1.25 in / $10.00 out per 1M (cached input $0.125).
-  'gpt-5-chat-2': withDerivedCache(1.25, 10),
-  'gpt-5.2-chat': withDerivedCache(1.75, 14), // developers.openai.com/api/docs/models/gpt-5.2
+  // gpt-5-chat-2 and gpt-5.2-chat pricing entries REMOVED 2026-08-19 along with
+  // their agentModeService registry rows (see the comment there) — both ids now
+  // resolve through LEGACY_MODEL_ALIASES to gpt-5.5 before any pricing lookup,
+  // so these entries were unreachable dead weight.
   'gpt-5.4': withDerivedCache(2.5, 15), // developers.openai.com/api/docs/pricing
   'gpt-5.4-nano': withDerivedCache(0.2, 1.25), // per public listings (pricepertoken/gptbreeze, Jun 2026)
   'gpt-5.5': withDerivedCache(5, 30), // $5/$30 in/out + $0.50/1M cached — developers.openai.com/api/docs/pricing (Apr 23 2026 GPT-5-line price doubling); cache-read derives to $0.50, matching the published rate
@@ -279,12 +277,12 @@ const warnedUnknownModels = new Set<string>();
 /**
  * Rolling-alias model ids that providers return in `response.model` but that are
  * NOT literal registry keys. Azure/OpenAI report a rolling alias for some
- * deployments (e.g. the gpt-5-chat-2 deployment reports "gpt-chat-latest"), so
- * without this map that usage meters at $0. Map alias → canonical registry key.
+ * deployments, so without this map that usage meters at $0. Map alias → canonical
+ * registry key. Empty as of 2026-08-19 — its one entry ('gpt-chat-latest' for the
+ * since-removed gpt-5-chat-2 deployment) was removed along with that deployment;
+ * left as live infrastructure for the next deployment that needs it.
  */
-const MODEL_ID_ALIASES: Record<string, string> = {
-  'gpt-chat-latest': 'gpt-5-chat-2',
-};
+const MODEL_ID_ALIASES: Record<string, string> = {};
 
 /** Trailing dated-snapshot suffix, e.g. "-2025-04-14" on "gpt-4.1-2025-04-14". */
 const DATE_SNAPSHOT_SUFFIX = /-\d{4}-\d{2}-\d{2}$/;
