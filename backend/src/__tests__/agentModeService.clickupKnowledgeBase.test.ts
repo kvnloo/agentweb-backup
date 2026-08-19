@@ -517,6 +517,49 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(result.message).toContain('parent-doc-99');
     });
 
+    // ENG-1354: a 403 from ClickUp's own API was surfacing only Axios's generic
+    // "Request failed with status code 403" — discarding ClickUp's actual
+    // { err, ECODE } response body, which is the only thing that can distinguish
+    // "our OAuth token lost write scope" from "the workspace admin restricted our
+    // app" from "malformed request". This is the same workspace (xCures,
+    // 9009113464) as two prior ClickUp incidents (ENG-10, ENG-89) that were each
+    // re-investigated from a blank slate because the real error was never captured.
+    it('should surface ClickUp\'s own error body (err + ECODE) on a 403 creating a root doc', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      const clickUpError: any = new Error('Request failed with status code 403');
+      clickUpError.response = { status: 403, data: { err: 'Team not authorized', ECODE: 'OAUTH_027' } };
+      mockCreateDoc.mockRejectedValue(clickUpError);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Team not authorized');
+      expect(result.message).toContain('OAUTH_027');
+    });
+
+    it('should surface ClickUp\'s own error body on a 403 creating a nested page', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      const clickUpError: any = new Error('Request failed with status code 403');
+      clickUpError.response = { status: 403, data: { err: 'Doc creation restricted for this app', ECODE: 'DOC_015' } };
+      mockCreatePageInDoc.mockRejectedValue(clickUpError);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'Page Doc', 'content', 'user-123', 'parent-doc-99');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Doc creation restricted for this app');
+      expect(result.message).toContain('DOC_015');
+    });
+
+    it('should fall back to the generic Axios message when ClickUp returns no response body', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockCreateDoc.mockRejectedValue(new Error('Network Error'));
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Network Error');
+    });
+
   });
 
   // ============================================

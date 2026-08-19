@@ -26,6 +26,9 @@ export const ATTR_GEN_AI_REQUEST_MODEL = 'gen_ai.request.model';
 export const ATTR_GEN_AI_USAGE_INPUT_TOKENS = 'gen_ai.usage.input_tokens';
 export const ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = 'gen_ai.usage.output_tokens';
 export const ATTR_GEN_AI_RESPONSE_FINISH_REASONS = 'gen_ai.response.finish_reasons';
+/** Model that actually served the run — differs from the request model when a
+ * legacy id was mapped forward or a transient error moved the run to a backup. */
+export const ATTR_GEN_AI_RESPONSE_MODEL = 'gen_ai.response.model';
 export const ATTR_GEN_AI_TOOL_NAME = 'gen_ai.tool.name';
 export const ATTR_GEN_AI_CONVERSATION_ID = 'gen_ai.conversation.id';
 /** Full prompt/completion content — only set when content capture is env-enabled. */

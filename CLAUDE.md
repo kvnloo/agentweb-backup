@@ -11,8 +11,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - AI agents own qualifying engineering work through merge. Merge only from a
   branch current with `main`, after the full relevant local suite, regression
   coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, latest-head Greptile 5/5 with no unresolved actionable P1/P2,
-  attribution, rollback evidence, and acceptance-contract completeness all pass.
+  check, a passing Greptile verdict, attribution, rollback evidence, and
+  acceptance-contract completeness all pass.
+- Greptile verdict policy (changed 2026-08-18, Harsha's explicit direction —
+  see `.github/scripts/greptile-verdict-policy.sh`): a genuine below-bar
+  review (`refused`) still hard-fails the merge gate, unchanged. Greptile
+  never answering for this head at all (`unavailable` — e.g. the org-wide
+  usage cap) now passes the `Require Greptile Review` job, with a loud
+  warning annotation, rather than blocking forever. This is not "Greptile is
+  retired" — a genuine bad review is still a hard stop; only its total
+  unavailability stopped being fatal.
 - Establish "every relevant GitHub check" with
   `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
   (exit 0), never with `gh pr checks` alone. `gh pr checks` answers "did anything

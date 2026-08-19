@@ -118,6 +118,7 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
+import { callSatisfiesRequirement, countCallsSatisfyingRequirement } from '../utils/requiredCallSatisfaction';
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools';
 
@@ -1109,6 +1110,52 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     // Schedule timezone Asia/Tokyo → Monday (a publish day) → rejected.
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF, timezone: 'Asia/Tokyo' })).toBe(false);
   });
+
+  it('recognizes PLURAL weekday names in the cadence, not just singular (live-verification follow-up, ENG-1276)', () => {
+    // A production live-verification run for ENG-1276 used "This schedule only
+    // publishes on Wednesdays" — the WEEKDAY_TOKEN regex only matched singular day
+    // names, so the cadence clause parsed to zero days, publishDays stayed empty,
+    // and the run fell through to the (unrelated) negated-conditional skip clause,
+    // which named Wednesday for the WRONG reason and rejected the skip on Tuesday.
+    // Net effect: the run hit the full 20-attempt retry press this ticket exists to
+    // prevent, on live phrasing an owner would naturally write.
+    const sunday = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
+    const monday = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+    const tuesday = new Date('2026-08-04T12:00:00Z'); // getUTCDay() === 2
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
+    // Weekday-agnostic content (names no day itself) so it stays valid across every
+    // `now` used below without tripping the separate model-asserted-weekday cross-
+    // check in step (4), which is orthogonal to what this test targets.
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+
+    // Positive cadence, multi-day, written with plural day names.
+    const publishOnlyPluralMWF = 'This schedule only publishes on Mondays, Wednesdays, and Fridays.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: publishOnlyPluralMWF })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: publishOnlyPluralMWF })).toBe(false);
+
+    // Skip-day list written with plural day names.
+    const skipListPlural = 'If today is a Saturday or a Sunday, publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: skipListPlural })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: skipListPlural })).toBe(false);
+
+    // The exact live-verification shape: a single plural publish day, plus a
+    // negated-conditional skip clause that ALSO names that same weekday (for the
+    // opposite reason). The positive publish-day cadence must win.
+    const singlePluralPublishDay =
+      'This test schedule only publishes on Wednesdays. If today is NOT Wednesday: create and publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: tuesday, instruction: singlePluralPublishDay })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: singlePluralPublishDay })).toBe(false);
+  });
+
+  it('recognizes a plural weekday RANGE ("Mondays through Fridays") in the cadence', () => {
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3, inside the range
+    const saturday = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6, outside the range
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+    for (const instr of ['Publish only on Mondays through Fridays.', 'Publish only on Mondays to Fridays.']) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: instr })).toBe(false);
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: instr })).toBe(true);
+    }
+  });
 });
 
 describe('reconstructPriorToolCalls (ENG-844)', () => {
@@ -1135,6 +1182,137 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
   it('drops nameless calls and tolerates non-array input', () => {
     expect(reconstructPriorToolCalls(undefined as any)).toEqual([]);
     expect(reconstructPriorToolCalls([{ metadata: { toolCalls: [{}, { name: 'get_leads' }] } }])).toEqual([{ name: 'get_leads' }]);
+  });
+
+  // ENG-1045: the publish-outcome check reads arguments.action, so the reconstruction
+  // must carry the arguments through — otherwise a resumed run that already published
+  // a thread falls back into the "post_on_connected_account (1 more time needed)" loop.
+  it('carries the action argument from the executed ledger', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } },
+    ]);
+  });
+
+  it('parses the JSON-string arguments of a request-list fallback', () => {
+    const messages = [{ tool_calls: [{ function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
+    ]);
+  });
+
+  it('omits unparseable arguments but keeps the entry and its error', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: '{not json', error: 'boom' }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'twitter_manage_post', error: 'boom' }]);
+  });
+
+  it('lets a resumed post_thread entry satisfy a post_on_connected_account requirement', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: { success: true } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(true);
+
+    // A resumed thread that FAILED still leaves the publish owed.
+    const [failed] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', failed)).toBe(false);
+  });
+
+  // ENG-1045: the real persisted shape — the executed ledger is CUMULATIVE and lands
+  // on the message that CLOSES the turn, while each intermediate assistant message
+  // keeps its own request-only tool_calls. Verified against prod session 555bb0a4,
+  // where 26 real calls reconstructed as 52 entries. Because these entries seed the
+  // required-call counts, the doubling let ONE real publish satisfy a minCount of 2.
+  it('counts a call once when the request list and the closing turn ledger both carry it', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'you_search_web', arguments: '{"q":"x"}' } }] },
+      { tool_calls: [{ id: 'call_2', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      {
+        metadata: {
+          toolCalls: [
+            { id: 'call_1', name: 'you_search_web', arguments: { q: 'x' }, result: {} },
+            { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          ],
+        },
+      },
+    ];
+
+    const entries = reconstructPriorToolCalls(messages);
+    expect(entries).toHaveLength(2);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', entries)).toBe(1);
+  });
+
+  it('upgrades a request-list entry to the ledger entry so a later-recorded failure still vetoes', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      { metadata: { toolCalls: [{ id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' }] } },
+    ];
+
+    // One entry, and it is the one carrying the error — so the publish stays owed.
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' },
+    ]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', reconstructPriorToolCalls(messages))).toBe(0);
+  });
+
+  it('never collapses distinct calls, and keeps un-identified entries separate', () => {
+    // Two genuine publishes with distinct ids must both count.
+    const distinct = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', distinct)).toBe(2);
+
+    // No id means unknown identity, which is not evidence of sameness — keep both.
+    const noIds = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(noIds).toHaveLength(2);
+  });
+
+  // ENG-947/ENG-1045: a preflight rejection commonly comes back as
+  // `result.success: false` with NO top-level `error` at all (e.g. publish_blog_article's
+  // result extraction only sets `error` when the tool itself supplied one). callSatisfiesRequirement's
+  // exact-name-match branch now calls toolCallSucceeded for every publish requirement, which reads
+  // `result.success`, so dropping `result` on reconstruction would silently credit an abandoned
+  // portion's failed publish as a success on resume.
+  it('carries the result through so a resumed publish that failed WITHOUT a top-level error still vetoes', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: false, message: 'Multiple twitter accounts connected' } }] },
+    }]);
+    expect(entry).toEqual({
+      name: 'post_on_connected_account',
+      result: { success: false, message: 'Multiple twitter accounts connected' },
+    });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
+
+    // Control: the same shape but result.success: true — must be credited.
+    const [succeeded] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: true, tweetId: '1' } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', succeeded)).toBe(true);
+  });
+
+  it('carries duplicateOf through so a resumed suppressed same-turn duplicate is not credited', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', duplicateOf: 'call_1' }] },
+    }]);
+    expect(entry).toEqual({ name: 'post_on_connected_account', duplicateOf: 'call_1' });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
   });
 });
 

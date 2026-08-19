@@ -7,6 +7,7 @@ import { usageRecordDb, UsageRecordRow, isVendorEntry } from "./usageRecordDb";
 import { userDb, orgDb, User } from "./db";
 import type { OrgRole } from "./orgAuthz";
 import { getAccountById } from "./connectedAccountsDb";
+import { normaliseFeature } from "./llmUsageAttributionService";
 import { TWITTER_PROVIDER, isPostReadOperation } from "../utils/twitterPricing";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -404,12 +405,22 @@ export async function getCostAggregation(
   );
 
   // Secondary cut: spend by feature (session type dimension already on the rows).
+  //
+  // Grouped on the segment before the first `:`, not the raw string. A `feature`
+  // carries qualifiers — `x-account:<id>` always has, and ENG-1210's metering tag
+  // adds `:interactive` / `:scheduled:<scheduleId>` — so bucketing raw would
+  // shatter this cut into one row per schedule (~90 in production) and stop any
+  // of them aggregating with the untagged rows already in the table. The leading
+  // segment is what this dimension has always meant; `normaliseFeature` is the
+  // same helper the customer-facing attribution groups by, so the admin view and
+  // the customer view cannot drift apart.
   const featureBuckets = new Map<string, CostByFeatureRow>();
   for (const item of items) {
-    let bucket = featureBuckets.get(item.feature);
+    const feature = normaliseFeature(item.feature);
+    let bucket = featureBuckets.get(feature);
     if (!bucket) {
-      bucket = { feature: item.feature, costMicroUsd: 0, costUsd: 0, totalTokens: 0, callCount: 0 };
-      featureBuckets.set(item.feature, bucket);
+      bucket = { feature, costMicroUsd: 0, costUsd: 0, totalTokens: 0, callCount: 0 };
+      featureBuckets.set(feature, bucket);
     }
     bucket.costMicroUsd += item.costMicroUsd || 0;
     bucket.totalTokens += item.totalTokens || 0;
