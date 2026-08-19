@@ -336,6 +336,89 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
   });
 
   /**
+   * ENG-1239 (rework, found via live testing on the preview): a continuation preempted by
+   * a genuine customer message (see preemptAutoContinuationAndWait) sends a cooperative
+   * cancel signal, but an already-dispatched provider call can't be aborted — the image
+   * finishes and is correctly saved regardless. The loop then stops (cancelled: true)
+   * BEFORE composing a closing reply, so `content` comes back empty even though a new
+   * asset landed — leaving a bare, unexplained image-generated marker in history with no
+   * "batch complete" narration (confirmed live: session a3e1dda2, 2026-08-19). This must
+   * still close the loop out explicitly instead of silently dropping the wrap-up.
+   */
+  it('leaves an explicit closing note when a preempted (cancelled) continuation still lands a new image', async () => {
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      )
+      // Turn 2 (the continuation): cancelled mid-flight by a preempting request, but the
+      // already-in-flight 4th image finished anyway — no composed content, cancelled: true.
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [imageToolCall(4)],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+        cancelled: true,
+        persistedResponseCount: 0,
+      });
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush();
+
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      mockSessionId,
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.stringMatching(/finished|complete/i),
+      }),
+    );
+    expect(mockIoTo).toHaveBeenCalledWith(`user:${mockUserId}`);
+    expect(mockIoEmit).toHaveBeenCalledWith(
+      'session-message-appended',
+      expect.objectContaining({
+        message: expect.objectContaining({ content: expect.stringMatching(/finished|complete/i) }),
+      }),
+    );
+    // Cancelled + no longer deferred (the toolCalls ledger shows a success, not another
+    // defer) — must not be mistaken for "still deferred" and recursed into another round.
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT leave a closing note when a cancelled continuation produced nothing new (avoid a confusing empty message)', async () => {
+    mockWorkerService.runInWorker
+      .mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      )
+      // Cancelled before the 4th image call even started — nothing new to report.
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+        cancelled: true,
+        persistedResponseCount: 0,
+      });
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush();
+
+    expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalledWith(
+      mockSessionId,
+      expect.objectContaining({ content: expect.stringMatching(/asset.*finished/i) }),
+    );
+    expect(mockIoEmit).not.toHaveBeenCalled();
+  });
+
+  /**
    * ENG-1239 (rework): the tests above all simulate a turn that returns SUCCESSFULLY
    * with a deferred tool call in its `toolCalls` ledger — the "soft" case. Pulling the
    * real production session (822c1ed4, 2026-08-14) message-by-message showed the actual
