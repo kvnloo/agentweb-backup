@@ -7,6 +7,7 @@ import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
   describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
@@ -454,7 +455,7 @@ export class GoogleAdsService {
       // and treating it as "omitted" would silently create an ENABLED action off a request
       // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
       // and inconsistent with updateConversionAction, which validates every defined status.
-      status: params.status === undefined ? 'ENABLED' : assertConversionActionStatus(params.status),
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {

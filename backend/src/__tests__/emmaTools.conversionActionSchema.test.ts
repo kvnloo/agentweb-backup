@@ -101,3 +101,20 @@ describe('the tool matrix warns off PAUSED (ENG-1329 e2e)', () => {
     expect(text).toMatch(/UPDATE it with status=HIDDEN/);
   });
 });
+
+describe('the matrix states the create/update status split (ENG-1329 e2e)', () => {
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const text = `${tool.definition?.description ?? ''}`;
+
+  it('says CREATE must be ENABLED', () => {
+    expect(text).toMatch(/On CREATE the status must be ENABLED/);
+  });
+
+  it('names the deny-list so the model does not read it as our restriction', () => {
+    expect(text).toMatch(/deny-lists HIDDEN and REMOVED on create/);
+  });
+
+  it('gives the two-step rather than only refusing', () => {
+    expect(text).toMatch(/Create it, then UPDATE it to HIDDEN/);
+  });
+});
