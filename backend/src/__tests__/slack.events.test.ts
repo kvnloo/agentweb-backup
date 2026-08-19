@@ -466,6 +466,42 @@ describe('Slack Events API', () => {
       );
     });
 
+    it('ENG-1292: does not resolve the identity fallback to a tombstoned (deleted) account', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      userDb.getAllUsers.mockResolvedValue([]);
+      getSlackUserEmail.mockResolvedValue('departed@agentweb.pro');
+      // A defensive test double: even if getUserByEmail's own deleted_* filter
+      // were ever bypassed, the call site must not trust a tombstoned account.
+      userDb.getUserByEmail.mockResolvedValue({
+        userId: 'deleted_1699999999999_user-departed',
+        email: 'departed@agentweb.pro',
+      });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_DEPARTED',
+            text: '<@UEMMA123> test',
+            channel: 'C_TOMBSTONE',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'C_TOMBSTONE',
+          text: expect.stringContaining('link this channel'),
+        })
+      );
+    });
+
     it('ENG-1292 (AC 3): no cross-tenant leak — a Slack user with no matching AgentWeb account still gets the failure path', async () => {
       settingsService.getSetting.mockResolvedValue(null);
       userDb.getAllUsers.mockResolvedValue([]);

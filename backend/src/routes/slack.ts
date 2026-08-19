@@ -801,7 +801,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               requesterEmail = await getSlackUserEmail(slackUserId);
               if (requesterEmail) {
                 const identityUser = await userDb.getUserByEmail(requesterEmail);
-                if (identityUser) {
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
                   user = identityUser;
                   console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
                 }
