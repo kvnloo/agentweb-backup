@@ -3,6 +3,7 @@ import {
   buildTimeoutContinuationMessage,
   collectTurnWorkSince,
   buildTimeoutPartialWorkMessage,
+  hasDeferredMediaBudgetToolCall,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -261,5 +262,42 @@ describe('ENG-907 — salvaging a timed-out turn that did real work', () => {
       expect(msg).not.toContain('`g`');
       expect(msg).toContain('and 3 more');
     });
+  });
+});
+
+describe('hasDeferredMediaBudgetToolCall', () => {
+  it('returns false for non-array input', () => {
+    expect(hasDeferredMediaBudgetToolCall(undefined)).toBe(false);
+    expect(hasDeferredMediaBudgetToolCall(null)).toBe(false);
+  });
+
+  it('returns false when no tool call was deferred', () => {
+    const toolCalls = [
+      { result: { success: true, imageUrl: 'https://s3/v1.png' } },
+      { result: { success: true, imageUrl: 'https://s3/v2.png' } },
+    ];
+    expect(hasDeferredMediaBudgetToolCall(toolCalls)).toBe(false);
+  });
+
+  it('returns true when a generate_image call was deferred for the media time budget', () => {
+    const toolCalls = [
+      { result: { success: true, imageUrl: 'https://s3/v1.png' } },
+      { result: { success: true, imageUrl: 'https://s3/v2.png' } },
+      { result: { success: true, imageUrl: 'https://s3/v3.png' } },
+      { result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ];
+    expect(hasDeferredMediaBudgetToolCall(toolCalls)).toBe(true);
+  });
+
+  it('does NOT treat an ENG-822 handler-supplied deferral (different reason) as a media-budget deferral', () => {
+    const toolCalls = [
+      { result: { deferred: true, reason: 'anonymous_account_scoped' } },
+    ];
+    expect(hasDeferredMediaBudgetToolCall(toolCalls)).toBe(false);
+  });
+
+  it('ignores malformed entries', () => {
+    const toolCalls = [null, undefined, {}, { result: null }, { result: {} }] as any;
+    expect(hasDeferredMediaBudgetToolCall(toolCalls)).toBe(false);
   });
 });
