@@ -118,9 +118,35 @@ export function diffConversionAction(
   for (const [field, want] of Object.entries(requested)) {
     if (want === undefined) continue;
     const got = stored?.[field];
-    if (JSON.stringify(got) !== JSON.stringify(want)) {
+    if (!storedMatchesRequested(want, got)) {
       drift.push({ field, requested: want, stored: got });
     }
   }
   return drift;
+}
+
+/** A JSON number, exactly — no blank, no whitespace, no `0x`, no `Infinity`. */
+const NUMERIC_STRING = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
+
+/**
+ * Decide whether what Google stored is what we asked for.
+ *
+ * Identity is right for every field here but one. Google Ads serialises INT64 as a
+ * JSON string — this service already relies on that elsewhere: `createBudget` sends
+ * `amountMicros: String(...)`, `listBudgets` types the read-back as string, and
+ * both listCampaigns and listBiddingStrategies wrap the INT64 `id` in String().
+ * `clickThroughLookbackWindowDays` is INT64, so a requested 90 reads back as "90"
+ * and a strict compare called a perfectly-stored write drift. A false alarm on the
+ * drift check is worse than no check: it teaches the operator to ignore it.
+ *
+ * So the loosening is deliberately narrow — a requested NUMBER against a stored
+ * canonical numeric STRING, and nothing else. Everything JS would otherwise call
+ * equal stays drift: '' is not 0, true is not 1, and an absent field is still
+ * absent rather than silently equal.
+ */
+function storedMatchesRequested(want: unknown, got: unknown): boolean {
+  if (typeof want === 'number' && typeof got === 'string' && NUMERIC_STRING.test(got)) {
+    return Number(got) === want;
+  }
+  return JSON.stringify(got) === JSON.stringify(want);
 }
