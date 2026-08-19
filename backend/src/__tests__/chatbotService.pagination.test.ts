@@ -284,6 +284,99 @@ describe('DynamoDB pagination in chatbotService', () => {
       expect(result.sessions[0].sessionId).toBe('spanning-midnight');
     });
 
+    // ENG-1332: the DynamoDB query above orders by updatedAt, not createdAt. A
+    // historical session that was merely touched (not created) during the
+    // window can have a more recent updatedAt than a session genuinely
+    // created in the window, so a naive updatedAt-DESC pass-through inverts
+    // priority — the historical session gets scored first and the real
+    // current-window session gets starved out.
+    it('prioritizes sessions created within the requested window over historical sessions merely touched within it', async () => {
+      const historicalTouched = {
+        sessionId: 'historical-touched',
+        adminListPartition: 'all',
+        createdAt: '2026-02-21T10:30:00.000Z',
+        updatedAt: '2026-08-18T13:59:00.000Z',
+        title: 'Old session touched recently',
+      };
+      const currentWindowSession = {
+        sessionId: 'current-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-17T15:00:00.000Z',
+        updatedAt: '2026-08-17T15:05:00.000Z',
+        title: 'Created in the requested window',
+      };
+
+      // DynamoDB returns updatedAt-DESC order: the historical one sorts first.
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [historicalTouched, currentWindowSession],
+      });
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual([
+        'current-window',
+        'historical-touched',
+      ]);
+    });
+
+    it('sorts multiple in-window sessions by createdAt descending', async () => {
+      const older = {
+        sessionId: 'older-in-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-17T15:00:00.000Z',
+        updatedAt: '2026-08-17T15:05:00.000Z',
+      };
+      const newer = {
+        sessionId: 'newer-in-window',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T08:00:00.000Z',
+        updatedAt: '2026-08-18T08:01:00.000Z',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [older, newer],
+      });
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual([
+        'newer-in-window',
+        'older-in-window',
+      ]);
+    });
+
+    it('keeps in-window sessions ahead of historical ones when limit truncates the result', async () => {
+      const historical1 = {
+        sessionId: 'h1',
+        adminListPartition: 'all',
+        createdAt: '2026-02-01T00:00:00.000Z',
+        updatedAt: '2026-08-18T13:59:00.000Z',
+      };
+      const historical2 = {
+        sessionId: 'h2',
+        adminListPartition: 'all',
+        createdAt: '2026-03-01T00:00:00.000Z',
+        updatedAt: '2026-08-18T13:58:00.000Z',
+      };
+      const current = {
+        sessionId: 'c1',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T08:00:00.000Z',
+        updatedAt: '2026-08-18T08:05:00.000Z',
+      };
+
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [historical1, historical2, current],
+      });
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(2, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['c1', 'h1']);
+    });
+
   });
 
   describe('getMessageCountFromMessagesTable', () => {

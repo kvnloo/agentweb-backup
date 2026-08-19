@@ -3670,8 +3670,28 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // ENG-1332: the query above orders by updatedAt, not createdAt — a
+        // historical session touched (but not created) during this window sorts
+        // by that touch, and can outrank a session genuinely created in the
+        // window if the touch is more recent. Re-prioritize before truncating:
+        // sessions actually created within the requested range come first
+        // (newest first), so the `limit` slice and any budget-bound consumer
+        // (e.g. the sync scoring backfill) exhaust in-range coverage before
+        // spending anything on out-of-range history.
+        const inRange: ChatSession[] = [];
+        const outOfRange: ChatSession[] = [];
+        for (const session of accumulated) {
+          const createdAt = session.createdAt;
+          if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+            inRange.push(session);
+          } else {
+            outOfRange.push(session);
+          }
+        }
+        inRange.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
         return {
-          sessions: accumulated.slice(0, limit),
+          sessions: [...inRange, ...outOfRange].slice(0, limit),
           lastEvaluatedKey: undefined,
         };
       } catch (error) {
