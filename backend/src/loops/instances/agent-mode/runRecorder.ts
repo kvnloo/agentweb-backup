@@ -87,6 +87,34 @@ export function computeRunVerdict(input: RunVerdictInput): {
   return reasons.length > 0 ? { verdict: 'degraded', reasons } : { verdict: 'ok', reasons: [] };
 }
 
+/**
+ * What a terminal run event (completed/failed) reports about the run.
+ *
+ * `llmModel`/`modelAtStart` are the ENG-1210 AC14 evidence dimensions: AC14 wants
+ * unchanged-behaviour evidence for below-hard-cap calls, and since the runway
+ * feature exists to move customers between models, that evidence is per-model run
+ * outcomes accumulated over time. They are recorded on the verdict rather than
+ * joined from `agent_run_started` for two reasons: that event carries the
+ * REQUESTED model, taken before `resolveGenerationModel` maps legacy ids forward
+ * and before any allow-list fallback (ENG-46); and a run that switches to a backup
+ * model mid-flight ends under a different model than it began.
+ *
+ * Neither field feeds `computeRunVerdict`. The model is a dimension on the grade,
+ * never an input to it — otherwise per-model outcome rates would be measuring
+ * their own definition.
+ */
+export interface RunTerminalInfo {
+  toolCalls?: number;
+  failedToolCalls?: number;
+  maxSameToolFailures?: number;
+  sessionId?: string;
+  claimMismatch?: boolean;
+  /** The model in effect when the run ended — the one that actually produced this outcome. */
+  llmModel?: string;
+  /** The model the run began under, when a mid-run substitution moved it. */
+  modelAtStart?: string;
+}
+
 export class AgentRunRecorder {
   /**
    * Monotonic write chain (ENG-102). Every emit is appended SYNCHRONOUSLY onto
@@ -257,26 +285,27 @@ export class AgentRunRecorder {
 
   async runCompleted(
     runId: string,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean } = {},
+    info: RunTerminalInfo = {},
   ): Promise<void> {
     // Enqueue BOTH the terminal record and its verdict SYNCHRONOUSLY (no await
     // between) so they are both on the write chain before this method yields —
     // otherwise a flush() captured right after a fire-and-forget runCompleted
     // could miss the not-yet-enqueued verdict (ENG-102). Order is still
     // completed → verdict because emit() enqueues in call order.
-    const completed = this.emit(runId, EVT_RUN_COMPLETED, cleanDims(info));
+    const completed = this.emit(runId, EVT_RUN_COMPLETED, terminalDims(info));
     const verdict = this.emitVerdict(runId, false, info);
     await Promise.all([completed, verdict]);
   }
 
   async runFailed(
     runId: string,
-    info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+    info: RunTerminalInfo & { error: unknown },
   ): Promise<void> {
     const failed = this.emit(runId, EVT_RUN_FAILED, {
       ...(info.toolCalls != null ? { toolCalls: info.toolCalls } : {}),
       ...(info.failedToolCalls != null ? { failedToolCalls: info.failedToolCalls } : {}),
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      ...modelDimensions(info),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
     });
@@ -306,8 +335,10 @@ export class AgentRunRecorder {
   private async emitVerdict(
     runId: string,
     failed: boolean,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
+    info: RunTerminalInfo,
   ): Promise<void> {
+    // Note what is NOT passed: no model. The grade is a pure function of failure
+    // counts, so per-model outcome rates read off these rows stay falsifiable.
     const { verdict, reasons } = computeRunVerdict({
       failed,
       toolCalls: info.toolCalls ?? 0,
@@ -322,6 +353,7 @@ export class AgentRunRecorder {
       failedToolCalls: info.failedToolCalls ?? 0,
       ...(info.maxSameToolFailures != null ? { maxSameToolFailures: info.maxSameToolFailures } : {}),
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      ...modelDimensions(info),
     });
   }
 
@@ -365,7 +397,41 @@ export class AgentRunRecorder {
   }
 }
 
-function cleanDims(obj: Record<string, unknown>): EventDimensions {
+/**
+ * The AC14 model dimensions for one verdict row.
+ *
+ * Keyed off the END-of-run model: that is the one that produced the outcome being
+ * graded. A substitution is recorded as its own flag rather than by simply
+ * overwriting, because a run that fell back to a backup model is not evidence
+ * about that backup — the fallback path is disproportionately degraded, so
+ * folding those runs in silently would bias per-model rates against exactly the
+ * cheaper models the runway feature recommends. Flagged, they can be excluded.
+ *
+ * Nothing is emitted without an end model: `modelAtStart` alone would read as
+ * "the model this run ran under", which in that case is unknown.
+ */
+function modelDimensions(info: RunTerminalInfo): Record<string, string | boolean> {
+  if (!info.llmModel) return {};
+  const substituted = Boolean(info.modelAtStart && info.modelAtStart !== info.llmModel);
+  return {
+    llmModel: info.llmModel,
+    ...(substituted ? { modelAtStart: info.modelAtStart as string, modelSubstituted: true } : {}),
+  };
+}
+
+/**
+ * Dimensions for a terminal run event. The model fields go through
+ * `modelDimensions` rather than the raw spread so `modelAtStart` means the same
+ * thing on the terminal event as on the verdict — present only when the run
+ * actually changed model. Two events disagreeing on what one attribute name means
+ * is how an analysis quietly draws the wrong conclusion.
+ */
+function terminalDims(info: RunTerminalInfo): EventDimensions {
+  const { llmModel, modelAtStart, ...rest } = info;
+  return { ...cleanDims(rest), ...modelDimensions({ llmModel, modelAtStart }) };
+}
+
+function cleanDims(obj: object): EventDimensions {
   const out: Record<string, string | number | boolean | null> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v === undefined) continue;
