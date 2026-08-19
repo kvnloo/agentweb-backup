@@ -454,7 +454,24 @@ jobs:
     if: needs.detect-changes.outputs.ebconfig == 'true'
     # ENG-1277: ubuntu-slim — a git diff + bash classifier, no docker.
     runs-on: ubuntu-slim
-    timeout-minutes: 5
+    # ENG-1371: raised 5 -> 12. The classifier itself is seconds, but this job
+    # needs `fetch-depth: 0` (see the checkout below — a DELETED config is
+    # classified by what it declared in the base revision, which requires
+    # history), and full-history checkout on this repo is measured at 14s at
+    # best but 159s, 188s and 247s on sampled runs — see the ENG-729 note on
+    # detect-changes' checkout. The 5-minute ceiling was set below this job's
+    # own worst case.
+    #
+    # It survived because the job is path-gated and had only executed 6 times
+    # in 197 runs, so it had never drawn the tail. It drew it on PR #2491:
+    # `Checkout PR head` ran 4m59s, the job was killed, the classifier step
+    # never executed, and GitHub reported the result as `cancelled` — which
+    # merge-evidence.sh correctly refuses to read as a pass.
+    #
+    # 12 rather than 15: ubuntu-slim's job cap is 15 minutes, and a ceiling AT
+    # the cap gives the runner no room to report a diagnosable timeout of its
+    # own before being killed from outside.
+    timeout-minutes: 12
     concurrency:
       group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
