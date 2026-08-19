@@ -94,6 +94,18 @@ export async function sendAgentModeOncallAlert(
     baseContext['iShare Link'] = ishareLink || 'N/A';
   }
 
-  await emailService.sendOncallAlert(subject, message, baseContext);
+  try {
+    await emailService.sendOncallAlert(subject, message, baseContext);
+  } catch (error) {
+    // The dedupe window was reserved before this send was attempted (so a
+    // flood of near-simultaneous callers only tries once). If the send
+    // itself failed, nothing was actually delivered — release the
+    // reservation so the next call in the window can retry, instead of
+    // silently suppressing every alert on this key until the window expires.
+    if (dedupeKey) {
+      lastAlertAtByKey.delete(dedupeKey);
+    }
+    throw error;
+  }
   return true;
 }

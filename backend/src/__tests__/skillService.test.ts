@@ -273,6 +273,26 @@ describe('SkillService', () => {
       expect(mockCreateSet).toHaveBeenCalledWith(['tool1', 'tool2']);
     });
 
+    it('returns the updatedAt actually persisted, without mutating the passed-in object', async () => {
+      const skillToUpdate = {
+        skillId: 'skill-1',
+        name: 'Test',
+        description: 'Desc',
+        toolNames: [],
+        isPublished: false,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z', // stale — the write computes a fresh one
+      };
+
+      const result = await skillService.updateSkill(skillToUpdate);
+
+      expect(result).toBe(mockTimestamp);
+      expect(mockPut.mock.calls[0][0].Item.updatedAt).toBe(mockTimestamp);
+      // The caller's own object is untouched — callers that need to stay in
+      // sync must apply the returned value themselves (see withdrawFromReview).
+      expect(skillToUpdate.updatedAt).toBe('2026-01-01T00:00:00.000Z');
+    });
+
     /**
      * ENG-947: a bulk migration cannot make a read-then-write safe by re-reading —
      * the row can still change between the read and the put. `expectedUpdatedAt`
@@ -368,6 +388,20 @@ describe('SkillService', () => {
       }));
       // The persisted item must clear reviewFeedback too, not just the returned object.
       expect(mockPut.mock.calls[0][0].Item.reviewFeedback).toBeUndefined();
+    });
+
+    it('returns the skill with the updatedAt the write actually persisted, not the stale read value', async () => {
+      const staleFixture = { ...pendingSkill, updatedAt: '2020-01-01T00:00:00.000Z' };
+      mockPromise
+        .mockResolvedValueOnce({ Item: staleFixture })
+        .mockResolvedValueOnce({});
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      // updateSkill's internal Date.prototype.toISOString mock returns mockTimestamp —
+      // the returned skill must reflect that, not the 2020 value from the read.
+      expect(result.updatedAt).toBe(mockTimestamp);
+      expect(result.updatedAt).not.toBe('2020-01-01T00:00:00.000Z');
     });
 
     it('resets a stale isPublished flag so a withdrawn skill can never read as public', async () => {

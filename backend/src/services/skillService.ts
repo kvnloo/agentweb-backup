@@ -251,12 +251,19 @@ export class SkillService {
    * ConditionalCheckFailedException, which callers are expected to treat as "skip
    * this row", not as a failure of the run.
    */
-  async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<void> {
+  /**
+   * Returns the `updatedAt` actually persisted. The caller's `skill` object is
+   * never mutated by this method — a caller that needs its own reference to
+   * stay in sync with what's now in the DB (e.g. to chain a further
+   * conditional write) must apply the returned value itself.
+   */
+  async updateSkill(skill: Skill, expectedUpdatedAt?: string): Promise<string> {
     const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
     if (welcomeMessageError) throw new Error(welcomeMessageError);
+    const updatedAt = new Date().toISOString();
     const skillItem: any = {
       ...skill,
-      updatedAt: new Date().toISOString()
+      updatedAt,
     };
 
     if (skill.toolNames && skill.toolNames.length > 0) {
@@ -277,6 +284,7 @@ export class SkillService {
 
     try {
       await dynamodb.put(params).promise();
+      return updatedAt;
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
       throw error;
@@ -487,7 +495,7 @@ export class SkillService {
       // Guard against a concurrent admin approve/reject landing between the
       // read above and this write — an unconditional put would silently
       // clobber whichever one lost the race.
-      await this.updateSkill(skill, expectedUpdatedAt);
+      skill.updatedAt = await this.updateSkill(skill, expectedUpdatedAt);
     } catch (error: any) {
       if (error?.code === 'ConditionalCheckFailedException') {
         throw new Error('Skill was changed by someone else — refresh and try again');

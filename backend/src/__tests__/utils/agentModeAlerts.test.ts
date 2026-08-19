@@ -256,6 +256,59 @@ describe('agentModeAlerts utils', () => {
       expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
     });
 
+    // ENG-932 CodeRabbit finding: the dedupe window was reserved before the
+    // send was attempted, so a failed delivery still permanently suppressed
+    // every later alert on that key for the rest of the window — nothing was
+    // actually delivered, but the system believed it had already alerted.
+    it('clears the dedupe reservation when delivery fails, so the next call retries', async () => {
+      const ts = 1_700_000_000_000;
+      mockedEmailService.sendOncallAlert.mockRejectedValueOnce(new Error('SMTP down'));
+
+      await expect(sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'first attempt',
+        dedupeKey: 'retry-after-failure',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      })).rejects.toThrow('SMTP down');
+
+      mockedEmailService.sendOncallAlert.mockResolvedValueOnce(undefined);
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'retry, still inside the same window',
+        dedupeKey: 'retry-after-failure',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000, // still well inside the 60s window
+      });
+
+      expect(delivered).toBe(true);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it('still throws on a failed send (does not swallow the error)', async () => {
+      mockedEmailService.sendOncallAlert.mockRejectedValueOnce(new Error('SMTP down'));
+      await expect(sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'no dedupe key',
+      })).rejects.toThrow('SMTP down');
+    });
+
+    it('a successful send still dedupes normally (failure-clear does not leak into the happy path)', async () => {
+      const ts = 1_700_000_000_000;
+      mockedEmailService.sendOncallAlert.mockResolvedValue(undefined);
+
+      const first = await sendAgentModeOncallAlert({
+        subject: 'Test', message: 'first', dedupeKey: 'happy-path', dedupeWindowMs: 60_000, now: ts,
+      });
+      const second = await sendAgentModeOncallAlert({
+        subject: 'Test', message: 'second, same window', dedupeKey: 'happy-path', dedupeWindowMs: 60_000, now: ts + 1_000,
+      });
+
+      expect(first).toBe(true);
+      expect(second).toBe(false);
+      expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(1);
+    });
+
     it('preserves existing behavior: no dedupeKey => every call fires (backwards compatible)', async () => {
       for (let i = 0; i < 3; i++) {
         await sendAgentModeOncallAlert({
