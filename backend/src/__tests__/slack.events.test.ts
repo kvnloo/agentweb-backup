@@ -358,9 +358,12 @@ describe('Slack Events API', () => {
       );
     });
 
-    it('should send error message when user not found for channel', async () => {
+    it('ENG-1292: names the concrete remedy (not "contact support") when neither the channel nor the requester\'s Slack identity resolves', async () => {
       settingsService.getSetting.mockResolvedValue(null);
       userDb.getAllUsers.mockResolvedValue([]);
+      // Default factory mock resolves an email with no matching AgentWeb account
+      getSlackUserEmail.mockResolvedValue('operator@agentweb.pro');
+      userDb.getUserByEmail.mockResolvedValue(undefined);
 
       const response = await request(app)
         .post('/api/slack/events')
@@ -380,13 +383,169 @@ describe('Slack Events API', () => {
       // Wait for async event processing
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      // Verify error message sent to Slack
+      // AC 2: attempted the identity fallback before giving up
+      expect(getSlackUserEmail).toHaveBeenCalledWith('U99999');
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('operator@agentweb.pro');
+
+      // AC 2: names the concrete remedy — never the old generic "contact support"
       expect(mockPostMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           channel: 'C99999',
-          text: expect.stringContaining('couldn\'t find a user account linked'),
+          text: expect.stringContaining('link this channel'),
         })
       );
+      const [[failureCall]] = mockPostMessage.mock.calls;
+      expect(failureCall.text).not.toMatch(/contact support/i);
+      expect(failureCall.text).toContain('operator@agentweb.pro');
+
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('ENG-1292 (AC 1): resolves to the mentioning Slack user\'s own AgentWeb account when the channel has no binding', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      userDb.getAllUsers.mockResolvedValue([]);
+      getSlackUserEmail.mockResolvedValue('fangfang@agentweb.pro');
+      userDb.getUserByEmail.mockResolvedValue({
+        userId: 'user-fangfang',
+        email: 'fangfang@agentweb.pro',
+      });
+
+      chatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-fangfang',
+        userId: 'user-fangfang',
+        messages: [],
+        llmModel: 'gpt-4o',
+      });
+      chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'session-fangfang' });
+      generateSessionResponse.mockResolvedValue({ content: 'Here you go!', toolCalls: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_FANGFANG',
+            text: '<@UEMMA123> summarize this file',
+            channel: 'C_GO_TO_MARKET',
+            ts: '1786962214.047529',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(getSlackUserEmail).toHaveBeenCalledWith('U_FANGFANG');
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('fangfang@agentweb.pro');
+
+      // Request proceeds normally as that user — no "couldn't find" failure
+      expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
+        'user-fangfang',
+        undefined,
+        'agent',
+        'slack-bot',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'regular',
+        undefined
+      );
+      const failureCall = mockPostMessage.mock.calls.find(
+        ([arg]) => typeof arg.text === 'string' && /couldn't find|link this channel/i.test(arg.text)
+      );
+      expect(failureCall).toBeUndefined();
+
+      // Never cached as a channel binding — a shared channel must not silently
+      // bind to whoever happened to mention Emma first (ENG-1292)
+      expect(settingsService.setSetting).not.toHaveBeenCalledWith(
+        'slack_channel_mapping_C_GO_TO_MARKET',
+        expect.anything(),
+        expect.anything(),
+        expect.anything()
+      );
+    });
+
+    it('ENG-1292 (AC 3): no cross-tenant leak — a Slack user with no matching AgentWeb account still gets the failure path', async () => {
+      settingsService.getSetting.mockResolvedValue(null);
+      userDb.getAllUsers.mockResolvedValue([]);
+      getSlackUserEmail.mockResolvedValue('stranger@external-company.com');
+      userDb.getUserByEmail.mockResolvedValue(undefined);
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_STRANGER',
+            text: '<@UEMMA123> test',
+            channel: 'C_UNBOUND',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(userDb.getUserByEmail).toHaveBeenCalledWith('stranger@external-company.com');
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockPostMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'C_UNBOUND',
+          text: expect.stringContaining('link this channel'),
+        })
+      );
+    });
+
+    it('ENG-1292 (AC 4): an existing channel binding still takes precedence — never attempts the identity fallback', async () => {
+      settingsService.getSetting.mockResolvedValue({ settingValue: 'user-bound' });
+      userDb.getUserById.mockResolvedValue({
+        userId: 'user-bound',
+        email: 'bound@agentweb.pro',
+        slackChannel: 'C_BOUND',
+      });
+
+      chatbotDb.createChatSession.mockResolvedValue({
+        sessionId: 'session-bound',
+        userId: 'user-bound',
+        messages: [],
+        llmModel: 'gpt-4o',
+      });
+      chatbotDb.updateSessionSlackThread.mockResolvedValue({ sessionId: 'session-bound' });
+      generateSessionResponse.mockResolvedValue({ content: 'ok', toolCalls: [] });
+
+      const response = await request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'app_mention',
+            user: 'U_SOMEONE_ELSE',
+            text: '<@UEMMA123> test',
+            channel: 'C_BOUND',
+            ts: '1234567890.123456',
+          },
+        });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(chatbotDb.createChatSession).toHaveBeenCalledWith(
+        'user-bound',
+        undefined,
+        'agent',
+        'slack-bot',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'regular',
+        undefined
+      );
+      // Bound channel resolves entirely from the mapping — the identity
+      // fallback path (getUserByEmail) must never run
+      expect(userDb.getUserByEmail).not.toHaveBeenCalled();
     });
 
     it('links the current Slack channel to the requested user account', async () => {
