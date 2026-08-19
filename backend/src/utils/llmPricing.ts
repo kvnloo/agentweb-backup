@@ -193,9 +193,16 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // an active "% off" promo badge, the live promotional rate is recorded
   // (it's what actually gets billed today) with a note — a promo can lapse,
   // so these are the ones most likely to need re-verifying again later.
-  'openrouter/openai/gpt-5.6-sol': withDerivedCache(2.5, 15.0), // live "50% off" promo vs $5/$30 list (openrouter.ai)
-  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.0, 12.0),
-  'openrouter/openai/gpt-5.6-luna': withDerivedCache(0.2, 1.2),
+  // BYOK-routed to our own Azure resource (agentweb-openrouter-byok, westus3, confirmed
+  // live 2026-08-19 with gpt-5.6-sol/terra/luna deployed & Running). OpenRouter's own
+  // marketplace promo pricing does NOT apply to BYOK traffic — we're billed Azure's real
+  // GlobalStandard list rate. Prices below = Azure's official "Global", short-context
+  // GPT-5.6 Series rate (azure.microsoft.com/pricing/details/cognitive-services/azure-openai),
+  // verified live 2026-08-19. (Cached/write rates already match our 10%/125% derived-cache
+  // convention exactly against Azure's own published cache rates for all three.)
+  'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
+  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.5, 15.0),
+  'openrouter/openai/gpt-5.6-luna': withDerivedCache(1.0, 6.0),
   'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live

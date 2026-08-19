@@ -443,13 +443,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * guard.
      */
     describe('2026-08-19 — same-family dominance auto-legacy', () => {
-      it('flags GPT-5.4 Nano as legacy — GPT-5.6 Luna is the same cost band with strictly higher quality', async () => {
+      // Originally this asserted Luna dominates Nano (same cost band, higher
+      // quality) — that used OpenRouter's own marketplace price for Luna.
+      // Luna is BYOK-routed to our Azure resource (agentweb-openrouter-byok,
+      // confirmed live), so we're actually billed Azure's list rate
+      // ($1.00/$6.00), not OpenRouter's. At that real price Luna's cost band
+      // moves up from 'ultra_cheap' to 'cheap' — no longer the same band as
+      // Nano, so dominance correctly no longer fires. Higher quality alone
+      // doesn't dominate; it has to be same-or-cheaper too.
+      it('does NOT flag GPT-5.4 Nano as legacy — GPT-5.6 Luna is pricier at Azure BYOK rates, not the same cost band', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(true);
         const nano = models.find((m) => m.id === 'gpt-5.4-nano')!;
         const luna = models.find((m) => m.id === 'openrouter/openai/gpt-5.6-luna')!;
-        expect(nano.tier).toBe(luna.tier); // same cost band
+        expect(nano.tier).not.toBe(luna.tier);
         expect(luna.qualityScore).toBeGreaterThan(nano.qualityScore!);
-        expect(nano.legacy).toBe(true);
+        expect(nano.legacy).toBeUndefined();
       });
 
       it('flags the far-weaker, same-band GPT-4o Mini as legacy too (dominated by GPT-5.4 Nano)', async () => {
