@@ -181,21 +181,30 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // priced at $0/free-by-omission) and to render an estimate before a call completes.
   // Rates per openrouter.ai/models list pricing, Aug 2026.
   'openrouter/openai/gpt-4o-mini': withDerivedCache(0.15, 0.6),
-  // GPT-5.6 family (Sol/Terra/Luna) — real pricing from artificialanalysis.ai,
-  // live-fetched 2026-08-19 (same research pass that sourced the picker's
-  // qualityScore/costScore for these models in agentModeService.ts).
-  'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
+  // 2026-08-19: every entry below this line was re-verified live against
+  // each model's own openrouter.ai page (top-of-page "In / Out Price" stat,
+  // cross-checked against the page's FAQ sentence) after a routine
+  // cross-check caught real drift — 10 of 12 didn't match this file, ranging
+  // from minor (~1.1-1.3x) to kimi-k3's 4.8x miss (this file had it at
+  // $0.60/$2.50; live is $2.60/$13.00 — the model is a frontier-tier price,
+  // not a budget one). These are OpenRouter's STANDARD (non-BYOK) prices —
+  // BYOK would only be cheaper if we held our own key for that specific
+  // provider, which we don't for any of these. Where OpenRouter's page shows
+  // an active "% off" promo badge, the live promotional rate is recorded
+  // (it's what actually gets billed today) with a note — a promo can lapse,
+  // so these are the ones most likely to need re-verifying again later.
+  'openrouter/openai/gpt-5.6-sol': withDerivedCache(2.5, 15.0), // live "50% off" promo vs $5/$30 list (openrouter.ai)
   'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.0, 12.0),
   'openrouter/openai/gpt-5.6-luna': withDerivedCache(0.2, 1.2),
-  'openrouter/x-ai/grok-4.6': withDerivedCache(3, 15),
-  'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.55, 2.19),
-  'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.14, 0.28),
-  'openrouter/qwen/qwen3.8-max': withDerivedCache(1.6, 6.4),
-  'openrouter/mistralai/mistral-small-2603': withDerivedCache(0.2, 0.6),
-  'openrouter/moonshotai/kimi-k3': withDerivedCache(0.6, 2.5),
-  'openrouter/moonshotai/kimi-k2.7-code': withDerivedCache(0.6, 2.5),
-  'openrouter/z-ai/glm-5.2': withDerivedCache(0.6, 2.2),
-  'openrouter/z-ai/glm-4.7-flash': withDerivedCache(0.1, 0.4),
+  'openrouter/x-ai/grok-4.6': withDerivedCache(2.0, 6.0), // was $3/$15 — stale, ~2x over live
+  'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.657, 1.315), // live "62% off" promo; lowest-confidence entry in this batch — the promo makes list price hard to reconstruct cleanly, re-verify if this model becomes cost-sensitive
+  'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.068, 0.168), // was ~2x over live
+  'openrouter/qwen/qwen3.8-max': withDerivedCache(2.0, 6.0),
+  'openrouter/mistralai/mistral-small-2603': withDerivedCache(0.15, 0.6),
+  'openrouter/moonshotai/kimi-k3': withDerivedCache(2.6, 13.0), // was $0.60/$2.50 — 4.8x under live; this is a frontier-tier model, not budget
+  'openrouter/moonshotai/kimi-k2.7-code': withDerivedCache(0.67, 3.4),
+  'openrouter/z-ai/glm-5.2': withDerivedCache(0.42, 1.32), // live "70% off" promo vs list
+  'openrouter/z-ai/glm-4.7-flash': withDerivedCache(0.06, 0.4),
 
   // ── Embeddings (output side is always 0 — embeddings have no completion) ────
   'text-embedding-3-large': { inPerM: 0.13, outPerM: 0 },
