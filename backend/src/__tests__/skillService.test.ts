@@ -346,9 +346,10 @@ describe('SkillService', () => {
       name: 'Test Skill',
       description: 'Description',
       toolNames: ['tool1'],
-      isPublished: false,
+      isPublished: true, // stale flag from a hypothetical prior approve — must be cleared on withdraw
       ownerId: 'owner-1',
       visibility: 'pending_review',
+      reviewFeedback: 'Add validation details.',
       createdAt: mockTimestamp,
       updatedAt: mockTimestamp,
     };
@@ -365,9 +366,55 @@ describe('SkillService', () => {
       expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
         Item: expect.objectContaining({ visibility: 'private' }),
       }));
+      // The persisted item must clear reviewFeedback too, not just the returned object.
+      expect(mockPut.mock.calls[0][0].Item.reviewFeedback).toBeUndefined();
     });
 
-    it('leaves the skill content unchanged aside from visibility', async () => {
+    it('resets a stale isPublished flag so a withdrawn skill can never read as public', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(result.isPublished).toBe(false);
+      expect(mockPut.mock.calls[0][0].Item.isPublished).toBe(false);
+    });
+
+    it('writes the update conditionally on the read updatedAt (concurrent-modification guard)', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ExpressionAttributeValues: { ':expectedUpdatedAt': pendingSkill.updatedAt },
+      }));
+    });
+
+    it('throws a conflict error when the skill changed between read and write', async () => {
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockRejectedValueOnce(conditionalError);
+
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill was changed by someone else — refresh and try again');
+    });
+
+    it('rejects and returns nothing when the persistence write fails for an unrelated reason', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('DynamoDB unavailable');
+    });
+
+    it('leaves the skill content unchanged aside from visibility/isPublished/reviewFeedback', async () => {
       mockPromise
         .mockResolvedValueOnce({ Item: pendingSkill })
         .mockResolvedValueOnce({});

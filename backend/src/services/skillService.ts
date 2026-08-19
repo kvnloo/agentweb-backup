@@ -479,9 +479,21 @@ export class SkillService {
     if (skill.ownerId !== ownerId) throw new Error('Not authorized');
     if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
 
+    const expectedUpdatedAt = skill.updatedAt;
     skill.visibility = 'private';
+    skill.isPublished = false;
     skill.reviewFeedback = undefined;
-    await this.updateSkill(skill);
+    try {
+      // Guard against a concurrent admin approve/reject landing between the
+      // read above and this write — an unconditional put would silently
+      // clobber whichever one lost the race.
+      await this.updateSkill(skill, expectedUpdatedAt);
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') {
+        throw new Error('Skill was changed by someone else — refresh and try again');
+      }
+      throw error;
+    }
     return skill;
   }
 

@@ -10,7 +10,7 @@ jest.mock("../../services/skillService", () => ({
 }));
 
 jest.mock("../../utils/agentModeAlerts", () => ({
-  sendAgentModeOncallAlert: jest.fn(async () => undefined),
+  sendAgentModeOncallAlert: jest.fn(async () => true),
 }));
 
 const { skillService } = require("../../services/skillService");
@@ -78,6 +78,15 @@ describe("runSkillReviewQueueDigest", () => {
 
     expect(summary.stale).toBe(1);
     expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports alertSent=false when the underlying send was suppressed by dedupe", async () => {
+    sendAgentModeOncallAlert.mockResolvedValueOnce(false);
+    skillService.getSkillsByVisibility.mockResolvedValue([skillAt(PENDING_REVIEW_STALE_HOURS + 1)]);
+
+    const summary = await runSkillReviewQueueDigest(NOW);
+
+    expect(summary).toEqual({ queueSize: 1, stale: 1, alertSent: false });
   });
 
   it("does not throw and returns an empty summary if the scan fails", async () => {

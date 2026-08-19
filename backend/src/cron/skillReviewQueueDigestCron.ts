@@ -62,7 +62,7 @@ export async function runSkillReviewQueueDigest(now: number = Date.now()): Promi
     .join('\n');
 
   try {
-    await sendAgentModeOncallAlert({
+    summary.alertSent = await sendAgentModeOncallAlert({
       subject: `${stale.length} skill${stale.length === 1 ? '' : 's'} stuck in review > ${PENDING_REVIEW_STALE_HOURS}h`,
       message:
         `The platform skill-review queue has ${stale.length} skill(s) waiting longer than ` +
@@ -73,7 +73,6 @@ export async function runSkillReviewQueueDigest(now: number = Date.now()): Promi
       context: { queueSize: summary.queueSize, stale: summary.stale },
       now,
     });
-    summary.alertSent = true;
   } catch (error) {
     console.error(`${TAG} Failed to send digest alert:`, error);
   }

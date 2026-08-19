@@ -265,5 +265,29 @@ describe('agentModeAlerts utils', () => {
       }
       expect(mockedEmailService.sendOncallAlert).toHaveBeenCalledTimes(3);
     });
+
+    // ENG-932: a caller reporting "did I actually send a digest" needs to
+    // distinguish delivered from suppressed — a caller that only checked
+    // "did this reject" previously reported every deduped call as sent.
+    it('returns true when the alert is delivered and false when suppressed by dedupe', async () => {
+      const ts = 1_700_000_000_000;
+      const delivered = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'first',
+        dedupeKey: 'return-value-test',
+        dedupeWindowMs: 60_000,
+        now: ts,
+      });
+      const suppressed = await sendAgentModeOncallAlert({
+        subject: 'Test',
+        message: 'suppressed',
+        dedupeKey: 'return-value-test',
+        dedupeWindowMs: 60_000,
+        now: ts + 1_000,
+      });
+
+      expect(delivered).toBe(true);
+      expect(suppressed).toBe(false);
+    });
   });
 });

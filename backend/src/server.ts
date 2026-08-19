@@ -850,8 +850,10 @@ createTestAccount().then(async () => {
       try {
         const { runSkillReviewQueueDigest } = await import('./cron/skillReviewQueueDigestCron');
         const SKILL_REVIEW_DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
-        cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
-          .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        if (isCronEnabled()) {
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        }
         setInterval(() => {
           if (!isCronEnabled()) return;
           cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())

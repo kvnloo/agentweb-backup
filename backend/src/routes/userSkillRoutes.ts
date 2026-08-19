@@ -196,6 +196,7 @@ router.post("/:skillId/withdraw-review", async (req, res) => {
     if (error.message === 'Skill not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
     if (error.message === 'Skill is not pending review') return res.status(400).json({ message: error.message });
+    if (error.message === 'Skill was changed by someone else — refresh and try again') return res.status(409).json({ message: error.message });
     console.error("Error withdrawing skill from review:", error);
     res.status(500).json({ message: "Failed to withdraw skill from review" });
   }

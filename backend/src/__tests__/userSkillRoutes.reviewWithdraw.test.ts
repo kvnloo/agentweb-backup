@@ -81,6 +81,18 @@ describe("POST /:skillId/withdraw-review", () => {
     const res = await request(buildApp(OWNER_ID)).post("/api/user-skills/skill-1/withdraw-review");
     expect(res.status).toBe(400);
   });
+
+  it("409s when the skill was changed concurrently (conditional-write conflict)", async () => {
+    skillService.withdrawFromReview.mockRejectedValue(new Error("Skill was changed by someone else — refresh and try again"));
+    const res = await request(buildApp(OWNER_ID)).post("/api/user-skills/skill-1/withdraw-review");
+    expect(res.status).toBe(409);
+  });
+
+  it("500s on an unrecognized service error", async () => {
+    skillService.withdrawFromReview.mockRejectedValue(new Error("Something else entirely"));
+    const res = await request(buildApp(OWNER_ID)).post("/api/user-skills/skill-1/withdraw-review");
+    expect(res.status).toBe(500);
+  });
 });
 
 describe("DELETE /:skillId — owner can delete regardless of visibility (ENG-932)", () => {
