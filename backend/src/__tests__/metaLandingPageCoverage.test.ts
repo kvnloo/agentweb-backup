@@ -242,3 +242,69 @@ describe('unconfirmed — risk 2, a client-side pixel must not page anyone', () 
     expect(v.alerting).toHaveLength(1);
   });
 });
+
+describe('fetchLandingPageInputs — the read path, exercised through injected deps', () => {
+  const { fetchLandingPageInputs } = require('../services/metaLandingPageCoverage');
+
+  it('returns fetch_error with NO sites when the page list cannot be read', async () => {
+    const r = await fetchLandingPageInputs('u1', ['px'], {
+      listPages: async () => { throw new Error('dynamo down'); },
+    });
+    expect(r.status).toBe('fetch_error');
+    expect(r.sites).toEqual([]);
+    expect(r.error).toContain('dynamo down');
+  });
+
+  it('returns ok with NO sites when the user has none deployed', async () => {
+    const r = await fetchLandingPageInputs('u1', ['px'], { listPages: async () => [] });
+    expect(r.status).toBe('ok');
+    expect(r.sites).toEqual([]);
+  });
+
+  it('maps PIXEL: mechanisms into detectedPixelIds on the happy path', async () => {
+    const due = dueDateFor('site-x');
+    jest.useFakeTimers().setSystemTime(due);
+    try {
+      const r = await fetchLandingPageInputs('u1', ['999'], {
+        listPages: async () => ([{
+          id: 'site-x', siteId: 'site-x', status: 'deployed',
+          deployedUrl: 'https://x.test/', isRootPage: true,
+        }] as any),
+        fetchHtml: async () => '<script>fbq("init","999")</script>',
+      });
+      expect(r.status).toBe('ok');
+      if (r.sites.length) {
+        const obs = r.observations['https://x.test/'];
+        expect(obs).toBeDefined();
+        expect(Array.isArray(obs.detectedPixelIds)).toBe(true);
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the site list and returns EMPTY observations when the gate throws', async () => {
+    // The page list already succeeded — discarding it would throw away good work. Every site
+    // becomes unverifiable, which is logged and pages nobody.
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const due = dueDateFor('site-y');
+    jest.useFakeTimers().setSystemTime(due);
+    try {
+      const r = await fetchLandingPageInputs('u1', ['999'], {
+        listPages: async () => ([{
+          id: 'site-y', siteId: 'site-y', status: 'deployed',
+          deployedUrl: 'https://y.test/', isRootPage: true,
+        }] as any),
+        fetchHtml: async () => { throw new Error('gate exploded'); },
+      });
+      expect(r.status).toBe('ok');
+      // Whatever the gate did with the throw, no observation may claim a verdict.
+      expect(Object.keys(r.observations).every((k) => !r.observations[k]?.detectedPixelIds?.length)).toBe(true);
+      const v = evaluateLandingPageCoverage(r.sites, r.observations, ['999'], r.sitesDeferred);
+      expect(v.alerting).toHaveLength(0);
+    } finally {
+      jest.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+});

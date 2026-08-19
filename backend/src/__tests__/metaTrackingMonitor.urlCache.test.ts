@@ -72,8 +72,11 @@ beforeEach(() => {
     status: 'ok', ads: [], ownedPixelIds: ['px-a'], observations: {},
     urlsNotChecked: [], attributedConversionsByAd: {},
   });
+  // sitesDeferred included so the mock matches the real LandingPageInputs contract — the
+  // monitor reads `inputs.sitesDeferred ?? 0`, and an absent field makes any future
+  // landingPageDeferred assertion silently meaningless.
   fetchLandingPageInputs.mockResolvedValue({
-    status: 'ok', sites: [], sitesNotChecked: 0, observations: {},
+    status: 'ok', sites: [], sitesNotChecked: 0, sitesDeferred: 0, observations: {},
   });
 });
 

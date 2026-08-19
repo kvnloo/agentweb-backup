@@ -5,7 +5,7 @@
  * property of the mechanism rather than a comparison someone has to keep correct.
  */
 
-import { createUrlFetchCache, normaliseUrlForCache } from '../services/urlFetchCache';
+import { createUrlFetchCache, normaliseUrlForCache, MAX_CACHE_ENTRIES } from '../services/urlFetchCache';
 
 describe('normaliseUrlForCache', () => {
   it('folds only what the URL spec says is insensitive', () => {
@@ -47,7 +47,10 @@ describe('createUrlFetchCache', () => {
     expect(b).toBe(a);
     expect(c).toBe(a);
     expect(underlying).toHaveBeenCalledTimes(1);
-    expect(cache.stats()).toEqual({ fetches: 1, hits: 2, distinct: 1 });
+    expect(cache.stats()).toEqual({ fetches: 1, hits: 2, distinct: 1, evicted: 0 });
+    // The RAW url reaches the fetcher, not the normalised key — a change there would
+    // alter what the SSRF-guarded fetcher actually requests.
+    expect(underlying).toHaveBeenCalledWith('https://example.com/lander');
   });
 
   it('shares ONE in-flight request between concurrent callers', async () => {
@@ -91,5 +94,28 @@ describe('createUrlFetchCache', () => {
     await cache.fetchHtml('https://b.test/');
     expect(underlying).toHaveBeenCalledTimes(2);
     expect(cache.stats().distinct).toBe(2);
+  });
+});
+
+
+describe('bounded memory', () => {
+  it('evicts the oldest entries rather than holding the fleet\'s HTML for the whole sweep', async () => {
+    // A page is capped at 5MB and a sweep reads every destination AND every generated site,
+    // in a process that also serves the API. Unbounded, that is the whole fleet resident.
+    const cache = createUrlFetchCache(jest.fn().mockResolvedValue('<html></html>'));
+    for (let i = 0; i < MAX_CACHE_ENTRIES + 25; i++) {
+      await cache.fetchHtml(`https://site-${i}.test/`);
+    }
+    const st = cache.stats();
+    expect(st.distinct).toBeLessThanOrEqual(MAX_CACHE_ENTRIES);
+    expect(st.evicted).toBe(25);
+  });
+
+  it('still serves a hit for a recently-seen URL', async () => {
+    const underlying = jest.fn().mockResolvedValue('<html></html>');
+    const cache = createUrlFetchCache(underlying);
+    await cache.fetchHtml('https://a.test/');
+    await cache.fetchHtml('https://a.test/');
+    expect(underlying).toHaveBeenCalledTimes(1);
   });
 });

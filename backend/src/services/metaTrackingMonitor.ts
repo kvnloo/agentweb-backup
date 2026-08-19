@@ -674,6 +674,19 @@ export interface MonitorDeps {
    * behaviour before this existed. The cache WRAPS that same fetcher; it never replaces it.
    */
   urlCache?: import('./urlFetchCache').UrlFetchCache;
+  /**
+   * Owned pixel ids per ad account, remembered across the sweep.
+   *
+   * The account-read dedupe (#2456) skips an account another user record already swept — which
+   * is right for the Meta reads, and WRONG for the landing-page check, because landing pages
+   * belong to the USER, not the account. Without this, a customer whose only ad account is
+   * shared with another user record has `anyAccountReadable === false` and their sites are
+   * never checked at all. Production has six such records (§45).
+   *
+   * Storing the list lets the second user reuse the first's read: no repeat Graph calls, and
+   * the user-level check still runs.
+   */
+  ownedPixelsByAccount?: Map<string, string[]>;
   fetchLandingPages?: (
     userId: string,
     ownedPixelIds: string[],
@@ -889,6 +902,14 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // findings under a different owner email for the same underlying account.
     if (deps?.sweptAccountIds?.has(String(adAccountId))) {
       summary.duplicateAccountsSkipped++;
+      // The ACCOUNT is already covered, but this USER's landing pages are not — those belong
+      // to the user, not the account. Reuse the earlier read's owned-pixel list so the
+      // user-level check below still runs, without repeating a single Graph call.
+      const remembered = deps?.ownedPixelsByAccount?.get(String(adAccountId));
+      if (remembered) {
+        anyAccountReadable = true;
+        ownedPixelIdsAcrossAccounts.push(...remembered);
+      }
       continue;
     }
 
@@ -970,6 +991,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     if (ownedPixelIds) {
       anyAccountReadable = true;
       ownedPixelIdsAcrossAccounts.push(...ownedPixelIds);
+      deps?.ownedPixelsByAccount?.set(String(adAccountId), ownedPixelIds);
     }
 
     // Also before the blackout early returns. Tier 2's whole point is the event that stops

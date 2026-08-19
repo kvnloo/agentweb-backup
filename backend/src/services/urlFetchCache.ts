@@ -50,10 +50,22 @@ export function normaliseUrlForCache(raw: string): string {
   }
 }
 
+/**
+ * Entries retained before the oldest are evicted.
+ *
+ * The gate caps a single page at 5MB, and a sweep reads both every ACTIVE ad destination and
+ * every generated site — so an unbounded cache would hold the whole fleet's HTML for the
+ * duration of the run, in a process that also serves the API. 200 entries bounds the worst
+ * case at ~1GB and the realistic case far below, while still comfortably covering the overlap
+ * this cache exists for: the destination and landing-page checks for one user run adjacently,
+ * so the hit lands long before eviction.
+ */
+export const MAX_CACHE_ENTRIES = 200;
+
 export interface UrlFetchCache {
   /** Same shape as `MetaPreflightDeps.fetchHtml`: resolves to HTML, throws on failure. */
   fetchHtml: (url: string) => Promise<string>;
-  stats: () => { fetches: number; hits: number; distinct: number };
+  stats: () => { fetches: number; hits: number; distinct: number; evicted: number };
 }
 
 type Entry = { ok: true; html: string } | { ok: false; error: unknown };
@@ -70,6 +82,7 @@ export function createUrlFetchCache(underlying: (url: string) => Promise<string>
   const inflight = new Map<string, Promise<Entry>>();
   let fetches = 0;
   let hits = 0;
+  let evicted = 0;
 
   const fetchHtml = async (url: string): Promise<string> => {
     const key = normaliseUrlForCache(url);
@@ -83,6 +96,14 @@ export function createUrlFetchCache(underlying: (url: string) => Promise<string>
         (error): Entry => ({ ok: false, error }),
       );
       inflight.set(key, pending);
+      // Insertion-ordered, so the first key is the oldest. Evicting it costs at most a repeat
+      // fetch later; NOT evicting costs the whole fleet's HTML resident for the entire sweep.
+      while (inflight.size > MAX_CACHE_ENTRIES) {
+        const oldest = inflight.keys().next().value;
+        if (oldest === undefined) break;
+        inflight.delete(oldest);
+        evicted++;
+      }
     }
     const entry = await pending;
     // Re-thrown rather than returned as a value, so a cached failure is indistinguishable
@@ -91,5 +112,5 @@ export function createUrlFetchCache(underlying: (url: string) => Promise<string>
     return entry.html;
   };
 
-  return { fetchHtml, stats: () => ({ fetches, hits, distinct: inflight.size }) };
+  return { fetchHtml, stats: () => ({ fetches, hits, distinct: inflight.size, evicted }) };
 }

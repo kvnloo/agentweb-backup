@@ -156,6 +156,10 @@ export async function runMetaTrackingMonitor(
   const { defaultFetchHtml } = await import('../services/metaTrackingPreflight');
   const urlCache = createUrlFetchCache(defaultFetchHtml);
 
+  // Per-sweep, alongside sweptAccountIds: lets a user whose ad account was already swept by
+  // another user record still get their own landing pages checked, without a repeat read.
+  const ownedPixelsByAccount = new Map<string, string[]>();
+
   // Collected across every user and raised ONCE at the end. See raiseLandingPageRollup.
   const landingPageFindings: Awaited<ReturnType<typeof monitorUserTracking>>['landingPageFindings'] = [];
 
@@ -179,6 +183,7 @@ export async function runMetaTrackingMonitor(
       const result = await monitorUserTracking(user, {
         sweptAccountIds,
         urlCache,
+        ownedPixelsByAccount,
         dryRun,
         onlyAdAccountId: options?.adAccountId,
         // Capture in the SAME order the sweep would have sent, so the output reads as the
@@ -265,6 +270,7 @@ export async function runMetaTrackingMonitor(
     console.error(`${TAG} landing-page rollup failed: ${error?.message}`);
   }
 
+  const cacheStats = urlCache.stats();
   summary.unrecognizedActionTypes = [...unknownTypes];
   if (dryRun) summary.capturedAlerts = capturedAlerts;
 
@@ -324,7 +330,7 @@ export async function runMetaTrackingMonitor(
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
       : '') +
-    `, ${urlCache.stats().fetches} page fetch(es) (${urlCache.stats().hits} served from cache)` +
+    `, ${cacheStats.fetches} page fetch(es) (${cacheStats.hits} served from cache)` +
     (dryRun ? `, ${capturedAlerts.length} alert(s) captured and NOT sent` : '') +
     (summary.unrecognizedActionTypes.length
       ? ` — unknown action types seen: ${summary.unrecognizedActionTypes.join(', ')}`

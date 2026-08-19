@@ -17,7 +17,7 @@
  * fine). Checking per page would be wrong AND would multiply outbound fetches by pages-per-site.
  */
 
-import { preflightMetaTrackingGate } from './metaTrackingPreflight';
+import { preflightMetaTrackingGate, MetaUrlTrackingResult } from './metaTrackingPreflight';
 
 /** Sites checked per account per sweep. Mirrors MAX_DESTINATION_URLS_CHECKED's reasoning:
  *  a bound that keeps one pathological account from dominating the run, reported when hit
@@ -287,12 +287,12 @@ export async function fetchLandingPageInputs(
       deps?.fetchHtml ? { fetchHtml: deps.fetchHtml } : {},
     );
     const observations: LandingPageInputs['observations'] = {};
-    for (const r of (gate?.results ?? [])) {
-      observations[(r as any).url] = {
-        status: (r as any).status,
-        detectedPixelIds: ((r as any).mechanisms ?? [])
-          .filter((m: string) => typeof m === 'string' && m.startsWith('PIXEL:'))
-          .map((m: string) => m.replace(/^PIXEL:/, '')),
+    for (const r of (gate?.results ?? []) as MetaUrlTrackingResult[]) {
+      observations[r.url] = {
+        status: r.status,
+        detectedPixelIds: (r.mechanisms ?? [])
+          .filter((m) => typeof m === 'string' && m.startsWith('PIXEL:'))
+          .map((m) => m.replace(/^PIXEL:/, '')),
       };
     }
     return { status: 'ok', sites, sitesNotChecked, sitesDeferred, observations };
