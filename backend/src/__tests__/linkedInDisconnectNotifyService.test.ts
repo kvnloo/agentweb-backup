@@ -50,6 +50,50 @@ describe('notifyAccountOwnerOfDisconnect', () => {
     delete process.env.LINKEDIN_DISCONNECT_NOTIFY;
   });
 
+  it('AC3: a persisted cooldown state that fails to read fails closed — no owner email is sent', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+    getSetting.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    await notifyAccountOwnerOfDisconnect('acct-3b', 'user-1');
+
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(setSetting).not.toHaveBeenCalled();
+  });
+
+  it('AC3: a parseable but malformed persisted state (sentToOwner:true with a missing/invalid timestamp) fails closed rather than trusting it', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+    getSetting.mockResolvedValue({
+      settingValue: JSON.stringify({ sentToOwner: true, lastOwnerNotifiedAt: 'not-a-date' }),
+    });
+
+    await notifyAccountOwnerOfDisconnect('acct-3c', 'user-1');
+
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(setSetting).not.toHaveBeenCalled();
+  });
+
+  it('AC4: an account with no resolvable owner email fails loud via the internal oncall alert, naming the account', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+    getUserById.mockResolvedValue(undefined);
+
+    await notifyAccountOwnerOfDisconnect('acct-5', 'user-1');
+
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(sendOncallAlert).toHaveBeenCalledTimes(1);
+    const [subject, message] = sendOncallAlert.mock.calls[0];
+    expect(subject + message).toMatch(/acct-5/);
+  });
+
+  it('AC4: an account with no ownerUserId at all fails loud rather than silently dropping', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+
+    await notifyAccountOwnerOfDisconnect('acct-6', undefined);
+
+    expect(getUserById).not.toHaveBeenCalled();
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(sendOncallAlert).toHaveBeenCalledTimes(1);
+  });
+
   it('AC1: sends the owner an email with a re-auth link when the flag is enabled, resolved from ownerUserId', async () => {
     process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
 
@@ -87,16 +131,6 @@ describe('notifyAccountOwnerOfDisconnect', () => {
     expect(sendEmail).not.toHaveBeenCalled();
   });
 
-  it('AC3: a persisted cooldown state that fails to read fails closed — no owner email is sent', async () => {
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
-    getSetting.mockRejectedValue(new Error('DynamoDB unavailable'));
-
-    await notifyAccountOwnerOfDisconnect('acct-3b', 'user-1');
-
-    expect(sendEmail).not.toHaveBeenCalled();
-    expect(setSetting).not.toHaveBeenCalled();
-  });
-
   it('AC3: the internal/oncall path is unaffected by the owner cooldown — a missing owner email still alerts every call', async () => {
     process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
     getUserById.mockResolvedValue(undefined);
@@ -109,28 +143,6 @@ describe('notifyAccountOwnerOfDisconnect', () => {
     await notifyAccountOwnerOfDisconnect('acct-4', 'user-1');
 
     expect(sendOncallAlert).toHaveBeenCalledTimes(2);
-  });
-
-  it('AC4: an account with no resolvable owner email fails loud via the internal oncall alert, naming the account', async () => {
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
-    getUserById.mockResolvedValue(undefined);
-
-    await notifyAccountOwnerOfDisconnect('acct-5', 'user-1');
-
-    expect(sendEmail).not.toHaveBeenCalled();
-    expect(sendOncallAlert).toHaveBeenCalledTimes(1);
-    const [subject, message] = sendOncallAlert.mock.calls[0];
-    expect(subject + message).toMatch(/acct-5/);
-  });
-
-  it('AC4: an account with no ownerUserId at all fails loud rather than silently dropping', async () => {
-    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
-
-    await notifyAccountOwnerOfDisconnect('acct-6', undefined);
-
-    expect(getUserById).not.toHaveBeenCalled();
-    expect(sendEmail).not.toHaveBeenCalled();
-    expect(sendOncallAlert).toHaveBeenCalledTimes(1);
   });
 
   it('does not send twice for the same account+state when called concurrently before the cooldown record lands (best-effort within one call)', async () => {

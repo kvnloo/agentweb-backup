@@ -36,13 +36,30 @@ const isNotifyEnabled = (): boolean => process.env.LINKEDIN_DISCONNECT_NOTIFY ==
 
 const STATE_READ_ERROR = Symbol('linkedin-disconnect-notify-state-read-error');
 
+function isValidDisconnectNotifyState(value: unknown): value is DisconnectNotifyState {
+  if (!value || typeof value !== 'object') return false;
+  const state = value as Record<string, unknown>;
+  if (typeof state.sentToOwner !== 'boolean') return false;
+  if (state.sentToOwner) {
+    if (typeof state.lastOwnerNotifiedAt !== 'string') return false;
+    if (Number.isNaN(new Date(state.lastOwnerNotifiedAt).getTime())) return false;
+  }
+  return true;
+}
+
 async function readState(
   accountId: string,
 ): Promise<DisconnectNotifyState | null | typeof STATE_READ_ERROR> {
   try {
     const setting = await settingsService.getSetting(stateKey(accountId));
     if (!setting?.settingValue) return null;
-    return JSON.parse(setting.settingValue) as DisconnectNotifyState;
+    const parsed = JSON.parse(setting.settingValue);
+    // Reject parseable-but-malformed state (e.g. sentToOwner:true with a
+    // missing/invalid lastOwnerNotifiedAt) rather than trusting it — a bad
+    // cooldown timestamp would otherwise silently disable the "at most one
+    // owner email per window" guarantee (AC3).
+    if (!isValidDisconnectNotifyState(parsed)) return STATE_READ_ERROR;
+    return parsed;
   } catch {
     return STATE_READ_ERROR;
   }
