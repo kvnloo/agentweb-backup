@@ -2508,4 +2508,59 @@ describe('resolveIdentity — placeholder/test email addresses (ENG-968)', () =>
     expect(deps.apolloBrokerChain).not.toHaveBeenCalled();
     expect(deps.findEmailViaPatterns).not.toHaveBeenCalled();
   });
+
+  it('FAIL CASE: a personal (non-placeholder) lead.emailDomain must not be sent to Apollo as a company domain', async () => {
+    // gmail.com is not a placeholder, but it is not anyone's employer either —
+    // the same standard already applied to rawEmailDomain (hasBusinessEmailDomain)
+    // must apply to the stale lead.emailDomain field too.
+    const apolloPeopleMatch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({ apolloPeopleMatch });
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          emailDomain: 'gmail.com',
+          firstName: 'Jane',
+          lastName: 'Doe',
+          company: 'Acme',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    for (const call of apolloPeopleMatch.mock.calls) {
+      expect(call[0].domain).not.toBe('gmail.com');
+    }
+  });
+
+  it('FAIL CASE: Tier 0.5 must not accept a website that resolves to a placeholder domain', async () => {
+    // Company-name-only lead: Tier 0.5 fires with no email to validate the
+    // returned website against, so a hallucinated example.com website must be
+    // rejected outright — not stored as `website`, not derived into `emailDomain`.
+    const apolloPeopleMatch = jest.fn().mockResolvedValue(null);
+    const deps = makeDeps({
+      resolveCompanyDomainViaWebSearch: jest
+        .fn()
+        .mockResolvedValue({ website: 'https://example.com', company: 'Acme' }),
+      apolloPeopleMatch,
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, firstName: 'Jane', lastName: 'Doe', company: 'Acme' },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.website).toBeUndefined();
+      expect(result.resolved.emailDomain).toBeUndefined();
+    }
+    for (const call of apolloPeopleMatch.mock.calls) {
+      expect(call[0].domain).not.toBe('example.com');
+    }
+  });
 });
