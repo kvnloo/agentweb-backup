@@ -154,10 +154,16 @@ jobs:
           filters: |
             backend_src:
               - 'backend/**'
-              # All 13 test directories are `__tests__`, nested throughout the
+              # All 13 SOURCE test directories are `__tests__`, nested throughout the
               # tree (backend/src/__tests__, backend/src/services/__tests__,
               # backend/src/services/agentMode/core/__tests__, …) — excluding
-              # only backend/src/__tests__ would miss most of them. The
+              # only backend/src/__tests__ would miss most of them.
+              #
+              # A `find backend -type d -name __tests__` returns 24, not 13.
+              # The extra 11 are stale copies under `backend/dist/`, which is
+              # gitignored build output with 0 tracked files — they can never
+              # appear in a PR diff, so they are irrelevant to this filter.
+              # Count `backend/src` only when checking this number. The
               # *.test.ts globs match nothing today (there are zero colocated
               # test files); they keep the rule true if that convention changes.
               - '!backend/**/__tests__/**'

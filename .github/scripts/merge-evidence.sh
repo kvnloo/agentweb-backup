@@ -103,8 +103,8 @@
 # `success` at this head. Anything else — skipped, absent, cancelled — is
 # NO_EVIDENCE. The diff is read from `pulls/{n}/files`, which is the same
 # input `dorny/paths-filter` decides on, and the path list below mirrors the
-# `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: the
-# a gate may reorder work, it must not reduce merge evidence.
+# `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: a
+# gate may reorder work, but it must not reduce merge evidence.
 #
 # Why a CLI and not a CI job
 # --------------------------
@@ -726,9 +726,13 @@ fi
 # Scope, stated honestly: this proves FILE-LEVEL independence, not semantic
 # independence. Two PRs can break each other while editing different files. That
 # is a real gap — but it is a gap `strict` does not close either, because
-# `strict` only forces the branch to be current, and the two REQUIRED contexts
-# here (`Detect changed projects`) does not run the test
-# suite at all. So this is strictly more evidence than the repo has today, not
+# `strict` only forces the branch to be current, and the sole REQUIRED context
+# here (`Detect changed projects`) does not run the test suite at all — it is a
+# ~25s paths-filter job at the HEAD of the graph, so it reports green long
+# before the suites it gates even finish. (Until ENG-1371 the required set also
+# named `Require Greptile Review`, which at least sat behind backend-tests-a/b;
+# that job is gone, so the required set now proves strictly less than it did.
+# ENG-1373 is the fix.) So this is strictly more evidence than the repo has today, not
 # less. Turning `strict` off is a separate, human decision (ENG-1003); this block
 # is what makes that decision safe to take rather than a silent loss of a gate.
 

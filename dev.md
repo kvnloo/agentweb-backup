@@ -51,11 +51,29 @@ was the deletion:
   being fixed under ENG-1373; the comments here were corrected with this change.
 - **Ride-alongs taken because the files were already open:** `dependabot-integrity-check.test.sh`
   (20 assertions guarding the one genuinely security-relevant required check) existed but no job
-  ran it; job B's `--testPathIgnorePatterns` used `/__tests__/agentMode` where job A selects on
-  `agentMode`, so 23 test files ran in **both** backend jobs on every PR; the same CLI flag
-  *replaces* rather than extends `jest.config.js`, silently re-including the opt-in twins suites;
-  and five jobs had no `timeout-minutes`, inheriting GitHub's 360-minute default. The A/B split is
-  now an exact partition — 286 + 1193 files, zero overlap.
+  ran it; the CLI `--testPathIgnorePatterns` *replaces* rather than extends `jest.config.js`,
+  silently re-including the opt-in twins suites; five jobs had no `timeout-minutes`, inheriting
+  GitHub's 360-minute default; and `eb-config-conflict`'s existing 5-minute ceiling turned out to
+  sit BELOW its own `fetch-depth: 0` checkout cost — it was killed at 4m59s on this very PR, having
+  survived only because the job is path-gated and had run 6 times in 197 runs without drawing the
+  tail. Auditing "jobs with no timeout" and not "jobs whose timeout is wrong" missed it.
+- **The one ride-along that had to be reverted, and why it is the most useful finding here.** Job
+  B's ignore list used `/__tests__/agentMode` while job A selects on `agentMode`, so 23 files ran
+  in BOTH backend jobs on every PR. Making the two lists exact complements looks like free money.
+  It is not: coverage is collected ONLY from `src/utils/**` and ONLY by job B, so **which tests run
+  in job B is what the coverage number measures**. Two of those 23 are
+  `src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`, whose targets sit
+  inside the coverage scope — and every other test touching those two modules is also
+  `agentMode`-named, so excluding the 23 sent both modules to zero. CI went red: branches
+  95.2% -> 93.99%, statements 98.35% -> 97.55%. Reverted, with the measurement recorded in
+  `tests.yml` so the next person does not rediscover it. **A test-selection change in a repo with a
+  coverage gate is a coverage change, whatever it looks like.** Deduplicating the split needs the
+  `collectCoverageFrom` scope decided first — ENG-1376.
+- **Both of my own errors were caught by CI, not by review or by me.** The coverage drop and the
+  timeout kill were each invisible to local suites (391 assertions, all green) because neither is
+  expressible as a script test — one needs the real Jest run, the other needs a real runner and a
+  real clone. The 5-minute timeout in particular had been latent for months. Local suites prove the
+  logic; only the real run prices it.
 
 ## ENG-1309: fixing a "prompt bloat causes verbosity" regression without adding to the pile (2026-08-18)
 

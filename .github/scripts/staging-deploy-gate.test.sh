@@ -307,13 +307,26 @@ assert_contains "${DEPLOY_IF}" "needs.backend-tests-b.result == 'success'" \
   "non-agentMode + coverage suite must have PASSED"
 
 # ENG-1371: the `needs.greptile-review.result == 'success'` clause was dropped
-# with the job when Greptile was retired as a vendor. The shape that ENG-754
-# actually bought is unchanged and still asserted above: every gate here reads
-# `result == 'success'`, never "did not fail", so a skipped or cancelled
-# upstream can never be mistaken for a pass.
-assert_not_contains "${DEPLOY_IF}" "greptile" \
-  "no reference to the retired Greptile gate remains in the deploy condition" \
-  "the greptile-review job no longer exists; a needs: on it would make this job unreachable"
+# with the job when Greptile was retired as a vendor.
+#
+# The first attempt at replacing it was `assert_not_contains "greptile"`, which
+# is PERMANENTLY VACUOUS — the job is deleted, so the string can never come
+# back, and the check can never fail. That is the exact anti-pattern this same
+# change removes from merge-evidence.test.sh, and it would have traded a live
+# gate assertion for decoration.
+#
+# What ENG-754 actually bought is the SHAPE, and the shape outlives the vendor:
+# every upstream clause reads `result == 'success'`, never "did not fail". That
+# is what stops a skipped or cancelled upstream from being read as a pass — the
+# ENG-757 false green, in the one job that can reach AWS. Assert it directly, so
+# a future clause written as `!= 'failure'` fails here.
+for _upstream in backend-tests-a backend-tests-b; do
+  assert_contains "${DEPLOY_IF}" "needs.${_upstream}.result == 'success'" \
+    "${_upstream} is gated on a positive success, not on the absence of failure"
+done
+assert_not_contains "${DEPLOY_IF}" "!= 'failure'" \
+  "no upstream is gated on 'did not fail' — skipped and cancelled are not passes" \
+  "a skipped or cancelled upstream satisfies != 'failure', which is the ENG-757 false green"
 
 # --- The ENG-991 guard. ------------------------------------------------------
 assert_contains "${DEPLOY_IF}" "github.event.pull_request.user.login != 'dependabot[bot]'" \
