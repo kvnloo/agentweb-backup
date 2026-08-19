@@ -857,12 +857,12 @@ const AUTO_MEDIA_CONTINUATION_MESSAGE =
  * attachInProcessCompletion above) — any failure here just leaves the manual "continue"
  * prompt as the fallback, exactly like today.
  */
-function scheduleAutoMediaContinuation(
+async function scheduleAutoMediaContinuation(
   sessionId: string,
   userId: string,
   llmModel: string,
   round: number
-): void {
+): Promise<void> {
   if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
     console.error(
       `AgentMode: media auto-continuation for session ${sessionId} still deferred after ` +
@@ -870,13 +870,55 @@ function scheduleAutoMediaContinuation(
     );
     return;
   }
+
+  // ENG-1239: every other generateSessionResponse call site gates on the customer's
+  // token/cost allowance before generating — this background entry point bypassed
+  // that gate entirely, letting an auto-continuation bill (and generate) an image for
+  // a customer whose allowance is already exhausted. Fail closed on a lookup error
+  // too, since this call is unawaited fire-and-forget and must never reject.
+  let usageStatus;
+  try {
+    usageStatus = await checkTokenUsage(userId);
+  } catch (usageErr) {
+    console.error(`AgentMode: media auto-continuation usage check failed for session ${sessionId}:`, usageErr);
+    return;
+  }
+  if (!usageStatus.allowed) {
+    console.error(
+      `AgentMode: media auto-continuation for session ${sessionId} skipped — usage limit ` +
+      `reached; leaving the manual "continue" prompt in place.`
+    );
+    return;
+  }
+
   // A real user request may already be running for this session (e.g. they replied
   // manually while we were about to auto-continue) — don't fight it. If that turn still
   // leaves the batch incomplete, its own response re-triggers this path.
   if (!tryClaimSessionGeneration(sessionId)) return;
 
   let stillDeferred = false;
-  generateSessionResponse(sessionId, AUTO_MEDIA_CONTINUATION_MESSAGE, userId, llmModel)
+  withGenerationTimeout(
+    generateSessionResponse(
+      sessionId,
+      AUTO_MEDIA_CONTINUATION_MESSAGE,
+      userId,
+      llmModel,
+      undefined, // attachments
+      undefined, // isInteractiveShare
+      undefined, // pageContext
+      undefined, // isDelegatedAccess
+      undefined, // ishareSenderInfo
+      undefined, // answerAck
+      undefined, // answeredQuestionMeta
+      undefined, // turnStartMs — no whole-turn deadline for this background continuation
+      undefined, // publishAuthorizationOverride
+      undefined, // transientFallbackModel
+      undefined, // modelPolicyDecisionForAudit
+      undefined, // approvedRevisionImageSources
+      'auto-continuation', // ENG-1239: hide this server-authored turn in the chat UI
+    ),
+    sessionId
+  )
     .then(async (resolved) => {
       markProgressComplete(sessionId);
       stillDeferred = hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
@@ -6101,6 +6143,10 @@ export async function generateSessionResponse(
   // ENG-936: approved image-source URLs for this run (currently used by
   // image-revision confirmation preflights). Passed into the worker only.
   approvedRevisionImageSources?: string[],
+  // ENG-1239: tags the persisted user-turn message as server-authored rather than
+  // customer-typed (e.g. 'auto-continuation'), so the customer-portal chat renderer
+  // can hide it instead of showing the raw [SYSTEM] directive as a user chat bubble.
+  userMessageKind?: string,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -6175,7 +6221,11 @@ export async function generateSessionResponse(
       } : {}),
       // ENG-396: structured record of the card selection this reply answered (from a
       // click, not the text). The card reads this to show which option was chosen.
-      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {})
+      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {}),
+      // ENG-1239: marks server-authored turns (e.g. the media auto-continuation
+      // directive) so the frontend can hide them instead of rendering them as a
+      // customer-typed chat bubble.
+      ...(userMessageKind ? { kind: userMessageKind } : {})
     }
   };
 
