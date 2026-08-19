@@ -671,6 +671,18 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         // email its owner to reconnect for nothing.
         if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
+        // Classify before notifying the owner — a timeout/5xx proves nothing about
+        // the session (probeAccountSession's own contract), so only a definitive
+        // 'disconnected' triggers the owner-facing path. Never let this block sync.
+        try {
+          const sessionState = await linkedInOutreachService.probeAccountSession(accountId);
+          if (sessionState === 'disconnected') {
+            const { notifyAccountOwnerOfDisconnect } = await import('../services/linkedInDisconnectNotifyService');
+            await notifyAccountOwnerOfDisconnect(accountId, ownerByAccountId.get(accountId));
+          }
+        } catch (notifyErr) {
+          console.error(`${TAG} Owner disconnect notify failed for account ${accountId}:`, notifyErr);
+        }
       }
       // A newly-detected connection means that person's invitation was accepted, so
       // it is no longer pending. Drop it now rather than leaving it for the hourly
