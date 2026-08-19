@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ENG-1371 — NO CALLER AS OF 2026-08-19. READ THIS BEFORE EXTENDING IT.
+# ENG-1382 — CALLER RESTORED. Read this before changing its contract.
 #
 # Its only caller was the `greptile-review` job's "Check whether this
 # Dependabot PR contains only Dependabot commits" step, which decided whether
@@ -8,16 +8,21 @@
 # job is deleted, so there is no review left to bypass: Dependabot PRs now run
 # the same suites as everything else, which is simpler and strictly safer.
 #
-# Kept rather than deleted, deliberately, for one reason: the REQUIRED
-# `Dependabot Integrity Check` (dependabot-integrity-check.sh, ENG-1287)
-# documents itself throughout as the trusted-base backstop for THIS script.
-# Removing this file without reworking that rationale would leave a required
-# security check whose stated purpose points at nothing. That rework is a
-# separate change against a required check, not a footnote to a vendor
-# removal.
+# ENG-1371 briefly left this with no caller at all: its only one had been the
+# `greptile-review` job's Dependabot bypass step, deleted with that job.
 #
-# ci-scripts-tests still runs its regression suite, so it cannot rot silently
-# while it waits for that decision.
+# ENG-1382 gave it a better one. `dependabot-integrity-check.sh` — the REQUIRED
+# check, run from the trusted BASE ref — now calls this to decide whether a
+# Dependabot PR touching GitHub Actions workflow YAML is a genuine automated pin
+# bump. That is a stronger position than the old one: the caller is no longer a
+# bypass this script's own header warns can be tampered with from the PR side,
+# but a base-ref check the PR cannot influence.
+#
+# The contract this must keep, because a required check now rests on it:
+# BOTH `.author.login == "dependabot[bot]"` AND
+# `.commit.verification.verified == true`, for EVERY commit, failing closed on
+# any ambiguity. Author metadata alone is forgeable by any repo writer; see the
+# two live findings recorded above.
 #
 # True iff EVERY commit in a PR was authored by dependabot[bot] — the actual
 # check the Greptile-review Dependabot bypass needs (ENG-1282).
