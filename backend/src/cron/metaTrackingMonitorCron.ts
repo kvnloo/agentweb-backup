@@ -46,6 +46,18 @@ export interface TrackingMonitorCronSummary {
   optimisationDormant: number;
   /** Full absence streak but delivery already stopped — past waste, reported not paged. */
   optimisationStaleDelivery: number;
+  /** §G generated landing pages — deployed sites WE built that carry no pixel this account
+   *  owns. Unlike destinationAlerts these need NO ad pointing at them, which is the point:
+   *  the page nothing points at today is the one someone launches against next week. */
+  landingPageAlerts: number;
+  /** Sites unreadable, or an account with no owned pixels to compare against. Logged only. */
+  landingPageUnverifiable: number;
+  /** Sites confirmed carrying a pixel this account owns. Printed even at zero. */
+  landingPageOk: number;
+  /** Sites not due in today's weekly rotation slot. Not a failure. */
+  landingPageDeferred: number;
+  /** HTML read as bare while the record claims an owned pixel. Logged, never paged. */
+  landingPageUnconfirmed: number;
   /** §G destinations — ACTIVE ads pointing at a page with no pixel, or a pixel the paying
    *  account does not own. */
   destinationAlerts: number;
@@ -71,9 +83,38 @@ export interface TrackingMonitorCronSummary {
   eventMixWatched: number;
   /** Families absent too long to still count as a regression. Logged, never paged. */
   eventMixStale: number;
+  /** Present ONLY on a dry run: every alert the sweep would have sent, in order.
+   *  Absent (not empty) on a real run, so the two are never confused. */
+  capturedAlerts?: CapturedAlert[];
 }
 
-export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSummary> {
+/** An alert a dry run intercepted instead of delivering. */
+export interface CapturedAlert {
+  subject: string;
+  message: string;
+  context?: Record<string, any>;
+}
+
+export interface TrackingMonitorRunOptions {
+  /**
+   * Capture alerts instead of sending them, and leave the alert-suppression map untouched.
+   *
+   * Exists because `monitorUserTracking` has exactly one caller — a 09:00 UTC timer with no
+   * run on boot — so before this, every §F/§G change was unverifiable in production until the
+   * next morning, and each fix-verify cycle cost another 24 hours.
+   */
+  dryRun?: boolean;
+  /** Restrict the sweep to one user record. */
+  userId?: string;
+  /** Restrict the sweep to one ad account. */
+  adAccountId?: string;
+}
+
+export async function runMetaTrackingMonitor(
+  options?: TrackingMonitorRunOptions,
+): Promise<TrackingMonitorCronSummary> {
+  const dryRun = options?.dryRun === true;
+  const capturedAlerts: CapturedAlert[] = [];
   const summary: TrackingMonitorCronSummary = {
     usersScanned: 0,
     accountsChecked: 0,
@@ -88,6 +129,11 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     optimisationAlerts: 0,
     optimisationDormant: 0,
     optimisationStaleDelivery: 0,
+    landingPageAlerts: 0,
+    landingPageUnverifiable: 0,
+    landingPageOk: 0,
+    landingPageDeferred: 0,
+    landingPageUnconfirmed: 0,
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
@@ -103,6 +149,20 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
   // filed once, rather than once per user record that happens to hold the connection.
   const sweptAccountIds = new Set<string>();
 
+  // ONE cache for the whole sweep. Wraps the gate's own SSRF-guarded fetcher rather than
+  // replacing it, so a page read by the destination check is not fetched again by the
+  // landing-page check — and a site shared across accounts is read once, not once per account.
+  const { createUrlFetchCache } = await import('../services/urlFetchCache');
+  const { defaultFetchHtml } = await import('../services/metaTrackingPreflight');
+  const urlCache = createUrlFetchCache(defaultFetchHtml);
+
+  // Per-sweep, alongside sweptAccountIds: lets a user whose ad account was already swept by
+  // another user record still get their own landing pages checked, without a repeat read.
+  const ownedPixelsByAccount = new Map<string, string[]>();
+
+  // Collected across every user and raised ONCE at the end. See raiseLandingPageRollup.
+  const landingPageFindings: Awaited<ReturnType<typeof monitorUserTracking>>['landingPageFindings'] = [];
+
   let users: any[];
   try {
     users = (await userDb.getAllUsers()) || [];
@@ -113,10 +173,33 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
 
   const unknownTypes = new Set<string>();
 
+  if (options?.userId) {
+    users = users.filter((u: any) => String(u?.userId) === String(options.userId));
+  }
+
   for (const user of users) {
     summary.usersScanned++;
     try {
-      const result = await monitorUserTracking(user, { sweptAccountIds });
+      const result = await monitorUserTracking(user, {
+        sweptAccountIds,
+        urlCache,
+        ownedPixelsByAccount,
+        dryRun,
+        onlyAdAccountId: options?.adAccountId,
+        // Capture in the SAME order the sweep would have sent, so the output reads as the
+        // run's actual alert stream rather than a set.
+        ...(dryRun
+          ? {
+              alertTransport: async (
+                subject: string,
+                message: string,
+                context?: Record<string, any>,
+              ) => {
+                capturedAlerts.push({ subject, message, context });
+              },
+            }
+          : {}),
+      });
       summary.accountsChecked += result.accountsChecked;
       summary.blackouts += result.blackouts;
       summary.tokenErrors += result.tokenErrors;
@@ -130,6 +213,14 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       summary.optimisationAlerts += result.optimisationAlerts ?? 0;
       summary.optimisationDormant += result.optimisationDormant ?? 0;
       summary.optimisationStaleDelivery += result.optimisationStaleDelivery ?? 0;
+      summary.landingPageAlerts += result.landingPageAlerts ?? 0;
+      summary.landingPageUnverifiable += result.landingPageUnverifiable ?? 0;
+      summary.landingPageOk += result.landingPageOk ?? 0;
+      summary.landingPageDeferred += result.landingPageDeferred ?? 0;
+      summary.landingPageUnconfirmed += result.landingPageUnconfirmed ?? 0;
+      if (result.landingPageFindings?.length) {
+        landingPageFindings.push(...result.landingPageFindings);
+      }
       summary.destinationAlerts += result.destinationAlerts ?? 0;
       summary.destinationUnverifiable += result.destinationUnverifiable ?? 0;
       summary.destinationOk += result.destinationOk ?? 0;
@@ -149,6 +240,10 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     // what Meta says it received. Its own try/catch, because it is a different question
     // from the spend check and one failing must not suppress the other.
     try {
+      // Skipped on a dry run: this check has its own alert path that does NOT route through
+      // the injected transport, so running it here would send a real alert from a run whose
+      // entire contract is "no side effects".
+      if (dryRun) continue;
       const divergence = await checkConversionDivergenceForUser(user);
       if (divergence.status === 'not-arriving') summary.conversionDivergences++;
     } catch (error: any) {
@@ -156,10 +251,31 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     }
   }
 
+  // §G's landing-page findings are fleet-shaped and low priority, so they become ONE alert
+  // rather than one per customer — the volume is 1 whether two customers are affected or
+  // twenty. Its own try/catch: a rollup failure must not lose the sweep's summary.
+  try {
+    const { raiseLandingPageRollup } = await import('../services/metaTrackingMonitor');
+    await raiseLandingPageRollup(landingPageFindings, {
+      dryRun,
+      ...(dryRun
+        ? {
+            transport: async (subject: string, message: string, context?: Record<string, any>) => {
+              capturedAlerts.push({ subject, message, context });
+            },
+          }
+        : {}),
+    });
+  } catch (error: any) {
+    console.error(`${TAG} landing-page rollup failed: ${error?.message}`);
+  }
+
+  const cacheStats = urlCache.stats();
   summary.unrecognizedActionTypes = [...unknownTypes];
+  if (dryRun) summary.capturedAlerts = capturedAlerts;
 
   console.log(
-    `${TAG} swept ${summary.usersScanned} user(s), ${summary.accountsChecked} ad account(s): ` +
+    `${TAG} ${dryRun ? '[DRY RUN] ' : ''}swept ${summary.usersScanned} user(s), ${summary.accountsChecked} ad account(s): ` +
     `${summary.healthy} healthy, ${summary.idle} idle, ${summary.blackouts} blackout, ` +
     `${summary.tokenErrors} token error, ${summary.unclassifiable} unclassifiable, ` +
     `${summary.fetchErrors} unavailable` +
@@ -189,6 +305,21 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
       : '') +
     // Printed even at zero: an account with nothing to watch and an account watched and found
     // healthy both report zero regressions, and only this number separates them.
+    (summary.landingPageAlerts > 0
+      ? `, ${summary.landingPageAlerts} generated landing page(s) that cannot report a conversion`
+      : '') +
+    // Printed even at zero, for the same reason destinationOk is: zero alerts reads the same
+    // whether every site was healthy or none was ever fetched.
+    `, ${summary.landingPageOk} generated site(s) verified` +
+    (summary.landingPageDeferred > 0
+      ? `, ${summary.landingPageDeferred} not due in today's rotation`
+      : '') +
+    (summary.landingPageUnconfirmed > 0
+      ? `, ${summary.landingPageUnconfirmed} reading as bare but recorded as installed`
+      : '') +
+    (summary.landingPageUnverifiable > 0
+      ? `, ${summary.landingPageUnverifiable} unreadable`
+      : '') +
     `, ${summary.eventMixWatched} conversion famil(ies) watched` +
     (summary.eventMixStale > 0
       ? `, ${summary.eventMixStale} long-dead conversion famil(ies) (not alerting)`
@@ -199,6 +330,8 @@ export async function runMetaTrackingMonitor(): Promise<TrackingMonitorCronSumma
     (summary.conversionDivergences > 0
       ? `, ${summary.conversionDivergences} account(s) relaying conversions Meta is not receiving`
       : '') +
+    `, ${cacheStats.fetches} page fetch(es) (${cacheStats.hits} served from cache)` +
+    (dryRun ? `, ${capturedAlerts.length} alert(s) captured and NOT sent` : '') +
     (summary.unrecognizedActionTypes.length
       ? ` — unknown action types seen: ${summary.unrecognizedActionTypes.join(', ')}`
       : ''),

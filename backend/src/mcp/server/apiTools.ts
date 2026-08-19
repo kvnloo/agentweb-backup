@@ -189,7 +189,7 @@ mcpToolRegistry.register({
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
         llm_model: { type: 'string', description: 'LLM model to use (optional)' },
-        backup_model: { type: 'string', description: 'Backup model to use if the preferred model is restricted by optimized usage (optional). The server remains authoritative.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 no threshold below the hard usage cap restricts or rewrites a model, so this is never consulted. The server remains authoritative on model eligibility and on the hard cap.' },
         media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
@@ -303,7 +303,7 @@ mcpToolRegistry.register({
   name: 'emma_list_models',
   definition: {
     name: 'emma_list_models',
-    description: 'List the Emma models currently selectable for this account, plus the eligible scheduled-chat backup models. The result is cost-policy aware: after optimized usage begins it omits restricted premium models, and when usage is paused canGenerate is false.',
+    description: 'List the Emma models currently selectable for this account. Every entitled model stays selectable right up to the hard usage cap; only a paused account returns an empty list with canGenerate false. scheduleBackupModels is a legacy field and no longer restricts anything.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
@@ -522,7 +522,7 @@ mcpToolRegistry.register({
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
         llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
-        backup_model: { type: 'string', description: 'Backup model for scheduled runs if the preferred model becomes unavailable or is restricted by optimized usage (create/update). If omitted, the server assigns the admin-configured optimized default and marks it for user confirmation.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
         revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
@@ -814,7 +814,7 @@ mcpToolRegistry.register({
         variable_values: { type: 'object', description: 'Variable values for the template placeholders' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
-        backup_model: { type: 'string', description: 'Backup model if the preferred model is restricted at run time. If omitted, the server assigns the admin-configured optimized default and marks it for confirmation.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted.' },
       },
       required: ['template_id']
     }
@@ -2720,6 +2720,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       syncMode: args.sync || false,
       truncated,
       modelMix,
+      // ENG-1332: requested-range/scored/skipped counts for sync=true calls, so
+      // a report can state its own coverage/denominator honestly instead of
+      // inferring one from sessions.length. Null when sync=false — no scoring
+      // pass ran, so there is nothing to report coverage on.
+      scoringCoverage: (data as any)?.scoringCoverage ?? null,
     });
   }
 });

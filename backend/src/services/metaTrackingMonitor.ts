@@ -34,6 +34,7 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+import { createHash } from 'crypto';
 import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
 
 
@@ -583,6 +584,7 @@ export const DESTINATION_ALERT_CLASS = 'meta-destination-unmeasured';
  *  send anything", and this says "something that used to arrive reliably has stopped" —
  *  including events nobody optimises for, which is the only one of the four that can catch a
  *  silently dropped event with no spend pointed at it. */
+export const LANDING_PAGE_ALERT_CLASS = 'meta-landing-page-unmeasured';
 export const EVENT_MIX_ALERT_CLASS = 'meta-event-mix-regression';
 /** Mirrors OPTIMISATION_RECENCY_DAYS for the log line, without importing the module at
  *  top level — this file only pulls metaOptimisationCoverage in lazily. */
@@ -597,6 +599,19 @@ export type AlertTransport = (
   message: string,
   context?: Record<string, any>,
 ) => Promise<void>;
+
+/**
+ * Where an alert goes, plus whether this run is allowed to have side effects.
+ *
+ * This is an OBJECT rather than a bare transport so the compiler forces every raise() call
+ * site to account for dry-run. A missed one would silently send a real oncall alert from a
+ * dry run — exactly the "fixed one of a pair" defect §48 records three times.
+ */
+export interface AlertSink {
+  transport: AlertTransport;
+  /** Capture-only. Suppression is skipped ENTIRELY — see raise(). */
+  dryRun: boolean;
+}
 
 /** Default transport: the canonical ops path — oncall email plus an auto-filed tracked
  *  issue, suppressed outside production by emailService itself. Lazily imported so this
@@ -648,6 +663,45 @@ export interface MonitorDeps {
     accessToken: string,
   ) => Promise<AdAccountActivity>;
   /**
+   * ONE URL fetch cache for the whole sweep, shared by every check that reads a customer page.
+   *
+   * Destination coverage and landing-page coverage overlap heavily — a generated lander an ad
+   * points at is in both sets — so without this the sweep fetches the same site twice a day.
+   * #2456 had just removed the duplicate-account sweep for that exact cost; a second checker
+   * would have reinstated it by another route.
+   *
+   * Omit it and each check falls back to the gate's own SSRF-guarded fetcher, i.e. the
+   * behaviour before this existed. The cache WRAPS that same fetcher; it never replaces it.
+   */
+  urlCache?: import('./urlFetchCache').UrlFetchCache;
+  /**
+   * Owned pixel ids per ad account, remembered across the sweep.
+   *
+   * The account-read dedupe (#2456) skips an account another user record already swept — which
+   * is right for the Meta reads, and WRONG for the landing-page check, because landing pages
+   * belong to the USER, not the account. Without this, a customer whose only ad account is
+   * shared with another user record has `anyAccountReadable === false` and their sites are
+   * never checked at all. Production has six such records (§45).
+   *
+   * Storing the list lets the second user reuse the first's read: no repeat Graph calls, and
+   * the user-level check still runs.
+   */
+  ownedPixelsByAccount?: Map<string, string[]>;
+  fetchLandingPages?: (
+    userId: string,
+    ownedPixelIds: string[],
+  ) => Promise<import('./metaLandingPageCoverage').LandingPageInputs>;
+  /**
+   * Capture alerts instead of sending them, and leave the suppression map untouched.
+   * Set only by the admin dry-run trigger; the cron never sets it.
+   */
+  dryRun?: boolean;
+  /**
+   * Restrict the sweep to ONE ad account. Used by the dry-run trigger so a change can be
+   * exercised against a single real account without reading the whole fleet.
+   */
+  onlyAdAccountId?: string;
+  /**
    * Ad accounts already swept SUCCESSFULLY this run, shared across every user in the sweep.
    *
    * The same ad account is connected under several user records in production — 21 connection
@@ -692,6 +746,32 @@ export interface MonitorSummary {
   /** No obtainable evidence: no pixel on the promoted object, or an optimisation §F cannot
    *  count. Logged only, and never allowed to look like a clean pass. */
   optimisationUnconfirmable: number;
+  /** §G generated landing pages — deployed sites WE built whose served HTML carries no pixel
+   *  this account owns. Distinct from destinationAlerts: those need an ACTIVE ad pointing at
+   *  the page; these are the pages nothing points at yet. */
+  landingPageAlerts: number;
+  /** Sites that could not be read, or an account with no owned pixels to compare against. */
+  landingPageUnverifiable: number;
+  /** Sites confirmed carrying a pixel this account owns. Printed even at zero — "checked
+   *  nothing" and "checked everything and found it healthy" both report zero alerts. */
+  landingPageOk: number;
+  /** Sites whose weekly rotation slot is not today (§G rotation). Not a failure. */
+  landingPageDeferred: number;
+  /** HTML read as bare, but the record says we installed an owned pixel. Logged, never paged. */
+  landingPageUnconfirmed: number;
+  /**
+   * The findings themselves, carried up to the CRON rather than paged here.
+   *
+   * These are LOW priority and fleet-shaped: nothing is being wasted today, because no ad
+   * points at these pages. Filing one alert per customer would put N tickets in the oncall
+   * channel for a condition nobody has to act on this hour — which is precisely how §F's
+   * history says a channel stops being read. The cron rolls them into ONE.
+   */
+  landingPageFindings: Array<{
+    userId?: string;
+    email?: string;
+    sites: Array<{ name: string; url: string; reason: string; detectedPixelIds: string[] }>;
+  }>;
   /** §G destinations — ACTIVE, conversion-optimised ads whose landing page carries no pixel,
    *  or carries one this ad account does not own. The only destination state that alerts. */
   destinationAlerts: number;
@@ -745,6 +825,12 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     optimisationUnconfirmed: 0,
     optimisationUnconfirmable: 0,
     optimisationStaleDelivery: 0,
+    landingPageAlerts: 0,
+    landingPageUnverifiable: 0,
+    landingPageOk: 0,
+    landingPageDeferred: 0,
+    landingPageUnconfirmed: 0,
+    landingPageFindings: [],
     destinationAlerts: 0,
     destinationUnverifiable: 0,
     destinationOk: 0,
@@ -758,7 +844,25 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   const fetchActivity =
     deps?.fetchActivity ??
     ((id: string, token: string, days: number) => fetchDailyAdAccountActivity(id, token, days));
-  const alertTransport = deps?.alertTransport ?? defaultAlertTransport;
+  const dryRun = deps?.dryRun === true;
+  // A dry run NEVER falls back to the real transport. Defaulting to `defaultAlertTransport`
+  // here made the whole no-side-effects contract depend on every caller remembering to inject
+  // a capture transport — and because a dry run also skips suppression, a caller who forgot
+  // would have sent real oncall email UNSUPPRESSED, on every account, which is worse than the
+  // behaviour before dry-run existed. The cron does inject one, so production was never
+  // exposed; the contract was, and a contract that only holds when callers are careful is not
+  // a contract. Capture-only is now the floor, and an injected transport merely observes.
+  const captured: Array<{ subject: string; message: string; context?: Record<string, any> }> = [];
+  const alertSink: AlertSink = {
+    transport:
+      deps?.alertTransport ??
+      (dryRun
+        ? async (subject, message, context) => {
+            captured.push({ subject, message, context });
+          }
+        : defaultAlertTransport),
+    dryRun,
+  };
   const now = deps?.now ?? Date.now();
 
   const accounts = (Array.isArray(user?.connected_accounts) ? user.connected_accounts : []).filter(
@@ -773,6 +877,12 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   const unknownTypes = new Set<string>();
   const excludedObjectives = new Set<string>();
   const unknownObjectives = new Set<string>();
+  // Union across every readable ad account this user has. §G's landing-page check asks
+  // "can ANY of this customer's accounts report a conversion from this page?", which is the
+  // right question and the only one that does not depend on which account we happened to be
+  // looping over when we asked.
+  const ownedPixelIdsAcrossAccounts: string[] = [];
+  let anyAccountReadable = false;
 
   for (const account of accounts) {
     const adAccountId = account?.account_id;
@@ -782,11 +892,24 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // connection that does not exist.
     if (!adAccountId || !accessToken) continue;
 
+    // Dry-run scoping. Deliberately BEFORE the duplicate check so a scoped run reports
+    // nothing about the accounts it never looked at — counting them as "skipped duplicates"
+    // would make a one-account probe read like a fleet sweep that deduped heavily.
+    if (deps?.onlyAdAccountId && String(adAccountId) !== String(deps.onlyAdAccountId)) continue;
+
     // Another user record already swept this exact ad account, successfully, this run. The
     // second pass would read the same Meta data, re-fetch the same landing pages, and file
     // findings under a different owner email for the same underlying account.
     if (deps?.sweptAccountIds?.has(String(adAccountId))) {
       summary.duplicateAccountsSkipped++;
+      // The ACCOUNT is already covered, but this USER's landing pages are not — those belong
+      // to the user, not the account. Reuse the earlier read's owned-pixel list so the
+      // user-level check below still runs, without repeating a single Graph call.
+      const remembered = deps?.ownedPixelsByAccount?.get(String(adAccountId));
+      if (remembered) {
+        anyAccountReadable = true;
+        ownedPixelIdsAcrossAccounts.push(...remembered);
+      }
       continue;
     }
 
@@ -804,7 +927,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     if (activity.status === 'token_error') {
       summary.tokenErrors++;
       await raise(
-        alertTransport,
+        alertSink,
         `${TOKEN_ALERT_CLASS}:${adAccountId}`,
         now,
         `Meta ad account ${adAccountId} cannot be read — token invalid`,
@@ -852,22 +975,30 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
     await checkOptimisationCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
     // Also before the blackout early returns, and for the same reason as Tier 1: an account
     // whose OTHER landers convert fine is `ok` by the blackout measure while one ad quietly
     // sends paid traffic to a page that cannot report anything. Gating this behind a blackout
     // verdict would hide exactly the case it exists to find.
-    await checkDestinationCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+    const ownedPixelIds = await checkDestinationCoverage(
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
+
+    // Landing pages belong to the USER, not to an ad account, so their check runs ONCE after
+    // this loop — see below. Here we only accumulate what each account can receive.
+    if (ownedPixelIds) {
+      anyAccountReadable = true;
+      ownedPixelIdsAcrossAccounts.push(...ownedPixelIds);
+      deps?.ownedPixelsByAccount?.set(String(adAccountId), ownedPixelIds);
+    }
 
     // Also before the blackout early returns. Tier 2's whole point is the event that stops
     // while the account's OTHER conversions keep flowing — which reads as perfectly healthy
     // to the blackout check, exactly as the August outage did for eight days.
     await checkEventMixCoverage(
-      adAccountId, accessToken, user, summary, alertTransport, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
     const verdict = evaluateAdAccountDays(activity.days);
@@ -913,7 +1044,7 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     );
 
     await raise(
-      alertTransport,
+      alertSink,
       `${BLACKOUT_ALERT_CLASS}:${adAccountId}`,
       now,
       `Meta ad account ${adAccountId} spent with zero attributed conversions`,
@@ -937,6 +1068,26 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
         // available at the moment it fired.
         ...enriched,
       },
+    );
+  }
+
+  // §G's sixth check, ONCE per user rather than once per ad account.
+  //
+  // Landing pages are owned by the USER; a customer with two connected ad accounts has one
+  // set of sites, not two. Running this inside the account loop listed and counted the same
+  // sites twice and would have filed one alert per account for a single fault — the
+  // per-user/per-account double-count §45 already diagnosed once, in a new place.
+  //
+  // Judged against the UNION of pixels across the user's readable accounts, because the
+  // question is "can ANY of this customer's accounts report a conversion from this page?".
+  // Judging per account would call a page "foreign" merely because we happened to be looking
+  // at the customer's OTHER ad account at the time.
+  //
+  // Skipped entirely when no account was readable: with no owned-pixel list, every site looks
+  // foreign, and that is our failed read manufacturing alerts (#2448's second defect).
+  if (anyAccountReadable) {
+    await checkLandingPageCoverage(
+      [...new Set(ownedPixelIdsAcrossAccounts)], user, summary, alertSink, now, deps,
     );
   }
 
@@ -969,16 +1120,24 @@ async function buildAccountAlertContext(
  *  failure is logged and swallowed: a broken mail server must not stop the sweep from
  *  checking the remaining accounts. */
 async function raise(
-  transport: AlertTransport,
+  sink: AlertSink,
   dedupeKey: string,
   now: number,
   subject: string,
   message: string,
   context: Record<string, any>,
 ): Promise<void> {
-  if (shouldSuppress(dedupeKey, now)) return;
+  // A dry run neither READS nor WRITES the suppression map, and both halves matter.
+  //
+  // Not reading: if the real sweep alerted on this account three hours ago, consulting the
+  // map would return "suppressed" and the dry run would report nothing wrong — the operator
+  // would read a clean result for an account that is actively alerting.
+  //
+  // Not writing: recording here would mark the alert as delivered, and the next REAL sweep
+  // would suppress it. A diagnostic run would have silenced the thing it was run to inspect.
+  if (!sink.dryRun && shouldSuppress(dedupeKey, now)) return;
   try {
-    await transport(subject, message, context);
+    await sink.transport(subject, message, context);
   } catch (error: any) {
     console.error(`${TAG} failed to send alert "${subject}": ${error?.message}`);
   }
@@ -1002,7 +1161,7 @@ async function checkOptimisationCoverage(
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
@@ -1083,7 +1242,7 @@ async function checkOptimisationCoverage(
       b.consecutiveAbsentSpendingDays > a.consecutiveAbsentSpendingDays ? b : a);
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day, not per ad set: several ad sets on one pixel are one
       // fault with one fix, and filing each separately is how a detector becomes a flood.
       `${OPTIMISATION_ALERT_CLASS}:${adAccountId}`,
@@ -1134,27 +1293,38 @@ async function checkOptimisationCoverage(
  * ENG-941 asks this once at launch. The card says that is not enough: a pixel that breaks in
  * week three, or a lander swapped after approval, is invisible to a launch-time gate.
  */
+/** Returns the ad account's owned pixel ids so the landing-page check can reuse them —
+ *  re-fetching would repeat this account's whole ads+pixels+insights read, which is the
+ *  duplicate-work cost #2456 removed and an existing dedupe test correctly catches. */
 async function checkDestinationCoverage(
   adAccountId: string,
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
-): Promise<void> {
+): Promise<string[] | null> {
   try {
     const {
       fetchDestinationInputs, evaluateDestinationCoverage,
     } = await import('./metaDestinationCoverage');
 
     const fetchDestinations =
-      deps?.fetchDestinations ?? ((id: string, token: string) => fetchDestinationInputs(id, token));
+      deps?.fetchDestinations ??
+      ((id: string, token: string) =>
+        fetchDestinationInputs(
+          id, token,
+          // Routed through the sweep's shared cache so a page already read by another check
+          // (or another account sharing a destination) is not fetched again. The cache wraps
+          // the gate's own SSRF-guarded fetcher, so the guard stays in the path.
+          deps?.urlCache ? { fetchHtml: deps.urlCache.fetchHtml } : undefined,
+        ));
     const inputs = await fetchDestinations(adAccountId, accessToken);
     if (inputs.status !== 'ok') {
       // Transient by definition — the same call §F makes on every other read failure.
       console.warn(`${TAG} ${adAccountId}: destinations unavailable for §G — ${inputs.error}`);
-      return;
+      return null;
     }
 
     const verdict = evaluateDestinationCoverage(
@@ -1164,6 +1334,7 @@ async function checkDestinationCoverage(
     summary.destinationOk += verdict.okCount;
     summary.destinationUnverifiable += verdict.unverifiable.length;
     summary.destinationUnconfirmed += verdict.unconfirmed.length;
+    const ownedForLandingPages = inputs.ownedPixelIds ?? [];
 
     if (verdict.unconfirmed.length) {
       console.log(
@@ -1186,7 +1357,7 @@ async function checkDestinationCoverage(
       );
     }
 
-    if (!verdict.alerting.length) return;
+    if (!verdict.alerting.length) return ownedForLandingPages;
     summary.destinationAlerts += verdict.alerting.length;
 
     const describe = (f: { adName?: string; adId: string; url: string; reason: string; detectedPixelIds: string[] }) =>
@@ -1198,7 +1369,7 @@ async function checkDestinationCoverage(
     const foreign = verdict.alerting.filter((f) => f.reason === 'foreign_pixel');
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day. Several ads on one bad lander are one fault with one
       // fix, and filing each separately is how a detector becomes a flood.
       `${DESTINATION_ALERT_CLASS}:${adAccountId}`,
@@ -1234,10 +1405,14 @@ async function checkDestinationCoverage(
         'Ads Manager': `https://business.facebook.com/adsmanager/manage/ads?act=${adAccountId}`,
       },
     );
+    return ownedForLandingPages;
   } catch (error: any) {
     // Same containment as Tier 1: this is an addition to a sweep that already works.
     console.warn(`${TAG} ${adAccountId}: §G destination check failed — ${error?.message}`);
   }
+  // Reached only on a thrown read: no trustworthy owned-pixel list, so the landing-page
+  // check must skip rather than judge every site against an empty set.
+  return null;
 }
 
 /**
@@ -1252,12 +1427,159 @@ async function checkDestinationCoverage(
  * instead would silently change what `evaluateAdAccountDays` streaks over, and that function
  * decides whether a customer gets paged.
  */
+/**
+ * ONE alert for every generated landing page across the whole fleet that cannot report a
+ * conversion — not one per customer.
+ *
+ * This is §51's undecided "middle option", built. The findings are real but LOW priority: no
+ * ad points at these pages, so nothing is being wasted this hour. Filing one ticket per
+ * affected customer would drop N tickets into oncall at once on the first run and teach
+ * people to skim the channel — §F's own history, and the reason PAUSED optimisation
+ * mismatches were made log-only in the first place.
+ *
+ * Rolled up, the volume is ONE regardless of whether two customers are affected or twenty,
+ * and the list is the payload.
+ */
+export async function raiseLandingPageRollup(
+  findings: MonitorSummary['landingPageFindings'],
+  opts: { transport?: AlertTransport; dryRun?: boolean; now?: number } = {},
+): Promise<void> {
+  if (!findings?.length) return;
+  const now = opts.now ?? Date.now();
+  const dryRun = opts.dryRun === true;
+  const sink: AlertSink = {
+    transport:
+      opts.transport ?? (dryRun ? async () => {} : defaultAlertTransport),
+    dryRun,
+  };
+
+  const totalSites = findings.reduce((n, f) => n + f.sites.length, 0);
+  const body: string[] = [
+    `${totalSites} landing page(s) generated by this platform, across ${findings.length}`,
+    'customer(s), serve HTML carrying no Meta pixel their own ad accounts can receive',
+    'conversions from.',
+    '',
+    'NOTHING IS BEING WASTED RIGHT NOW — no ad points at these pages. That is exactly what',
+    'makes this the cheapest moment to fix: the alternative is finding out after a launch.',
+    '',
+  ];
+  for (const f of findings) {
+    body.push(`${f.email ?? f.userId}:`);
+    for (const s of f.sites) {
+      body.push(
+        `  - ${s.name} (${s.url}) - ` +
+        (s.reason === 'no_pixel'
+          ? 'no Meta pixel in the served page'
+          : `carries pixel ${s.detectedPixelIds.join(', ')}, which none of their accounts owns`),
+      );
+    }
+    body.push('');
+  }
+  body.push('A pixel is one per SITE (the shared layout), so one fix covers every page on it.');
+  body.push('Pages are re-checked on a weekly rotation, so this list moves slowly by design.');
+
+  // Keyed on a FINGERPRINT of the findings, not the bare class.
+  //
+  // A bare class key suppresses for 24h, which is right while the picture is unchanged — one
+  // ticket a day however many customers appear in it. But `POST /api/admin/tracking-monitor/run`
+  // accepts `dryRun: false`, so a real sweep can legitimately run again inside that window; if
+  // it finds MORE customers or MORE sites, a bare key would suppress the WORSE picture and the
+  // operator would never see it. The fingerprint changes exactly when the finding set changes,
+  // so an unchanged set stays quiet and a grown one gets through.
+  const fingerprint = createHash('sha256')
+    .update(
+      findings
+        .map((f) => `${f.userId ?? f.email ?? ''}:${f.sites.map((s) => s.url).sort().join('|')}`)
+        .sort()
+        .join('\n'),
+    )
+    .digest('hex')
+    .slice(0, 12);
+
+  await raise(
+    sink,
+    `${LANDING_PAGE_ALERT_CLASS}:${fingerprint}`,
+    now,
+    `${totalSites} generated landing page(s) cannot report conversions, across ${findings.length} customer(s)`,
+    body.join('\n'),
+    {
+      'Alert Class': LANDING_PAGE_ALERT_CLASS,
+      'Alert Priority': 'low',
+      'Customers Affected': findings.length,
+      'Sites Affected': totalSites,
+    },
+  );
+}
+
+async function checkLandingPageCoverage(
+  ownedPixelIds: string[],
+  user: any,
+  summary: MonitorSummary,
+  alertSink: AlertSink,
+  now: number,
+  deps?: MonitorDeps,
+): Promise<void> {
+  try {
+    const {
+      fetchLandingPageInputs, evaluateLandingPageCoverage,
+    } = await import('./metaLandingPageCoverage');
+
+    const fetchPages =
+      deps?.fetchLandingPages ??
+      ((uid: string, owned: string[]) =>
+        fetchLandingPageInputs(
+          uid, owned,
+          deps?.urlCache ? { fetchHtml: deps.urlCache.fetchHtml } : undefined,
+        ));
+
+    const userId = String(user?.userId ?? '');
+    const inputs = await fetchPages(userId, ownedPixelIds);
+    if (inputs.status !== 'ok') {
+      console.warn(`${TAG} user ${userId}: landing pages unavailable for §G — ${inputs.error}`);
+      return;
+    }
+
+    const verdict = evaluateLandingPageCoverage(
+      inputs.sites, inputs.observations, ownedPixelIds, inputs.sitesNotChecked,
+    );
+
+    summary.landingPageOk += verdict.okCount;
+    summary.landingPageUnverifiable += verdict.unverifiable.length;
+    summary.landingPageUnconfirmed += verdict.unconfirmed.length;
+    summary.landingPageDeferred += inputs.sitesDeferred ?? 0;
+    summary.landingPageAlerts += verdict.alerting.length;
+
+    if (verdict.sitesNotChecked > 0) {
+      console.log(
+        `${TAG} user ${userId}: §G checked ${inputs.sites.length} site(s), ` +
+        `${verdict.sitesNotChecked} beyond the cap`,
+      );
+    }
+    if (verdict.alerting.length === 0) return;
+
+    // Carried up, NOT paged here. See MonitorSummary.landingPageFindings for why.
+    summary.landingPageFindings.push({
+      userId: user?.userId,
+      email: user?.email,
+      sites: verdict.alerting.map((f) => ({
+        name: f.pageName ?? f.pageId,
+        url: f.url,
+        reason: f.reason,
+        detectedPixelIds: f.detectedPixelIds,
+      })),
+    });
+  } catch (error: any) {
+    // Never allowed to break the sweep. §G is additive to §F, not a precondition for it.
+    console.warn(`${TAG} user ${user?.userId}: §G landing-page check failed - ${error?.message ?? error}`);
+  }
+}
+
 async function checkEventMixCoverage(
   adAccountId: string,
   accessToken: string,
   user: any,
   summary: MonitorSummary,
-  alertTransport: AlertTransport,
+  alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
@@ -1316,7 +1638,7 @@ async function checkEventMixCoverage(
       b.spendDuringAbsence > a.spendDuringAbsence ? b : a);
 
     await raise(
-      alertTransport,
+      alertSink,
       // One alert per ACCOUNT per day. Several families stopping together is almost always
       // ONE cause — a removed snippet, a broken deploy — and filing each separately is how a
       // detector becomes a flood.
