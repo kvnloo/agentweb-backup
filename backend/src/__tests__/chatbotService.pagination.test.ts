@@ -415,6 +415,27 @@ describe('DynamoDB pagination in chatbotService', () => {
       expect(queryPromiseMock).toHaveBeenCalledTimes(2);
     });
 
+    it('does not double-count a session at the exact endTime boundary returned by both the primary and gap query', async () => {
+      // DynamoDB's inclusive BETWEEN means a session with updatedAt === endTime
+      // legitimately matches both the primary [start, end] query and the gap
+      // query's [end, now] query — it must only appear once in the result.
+      const boundarySession = {
+        sessionId: 'boundary',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T13:00:00.000Z',
+        updatedAt: '2026-08-18T14:00:00.000Z', // exactly endTime
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [boundarySession] }) // primary query
+        .mockResolvedValueOnce({ Items: [boundarySession] }); // gap query (inclusive lower bound)
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(100, undefined, timeRange);
+
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['boundary']);
+    });
+
     it('skips the gap query when endTime is already at or after now', async () => {
       const currentWindowSession = {
         sessionId: 'current-window',

@@ -3692,21 +3692,31 @@ export class ChatbotDB {
         // created inside the window but last touched AFTER timeRange.endTime (e.g.
         // its final message landed a few seconds past the window boundary, or this
         // window is being re-queried well after it closed) is invisible to it even
-        // though it belongs in the requested range. Close that gap with a second,
-        // disjoint query over (endTime, now] — only sessions genuinely created in
-        // range are kept from it, so it can't pull in unrelated later activity.
-        // Skipped entirely when endTime is already at/after "now" (the common daily-
-        // report case, where nothing can have updatedAt in the future), so this adds
-        // no cost to the case the fix already handles.
+        // though it belongs in the requested range. Close that gap with a second
+        // query over [endTime, now] — only sessions genuinely created in range are
+        // kept from it, so it can't pull in unrelated later activity. DynamoDB
+        // KeyConditionExpression allows only one condition per key, so BETWEEN
+        // (inclusive both ends) is the only compound-range operator available;
+        // BETWEEN is inclusive on both ends, so a session with updatedAt exactly
+        // at endTime legitimately matches both this query and the primary one —
+        // dedupe by sessionId against what the primary query already returned
+        // (comparing the updatedAt strings directly is not reliable: DynamoDB
+        // always stores full-millisecond ISO timestamps, but a caller-supplied
+        // endTime without milliseconds, e.g. "...T14:00:00Z", would never
+        // string-equal the stored value even though they name the same instant).
+        // Skipped entirely when endTime is already at/after "now" (the common
+        // daily-report case, where nothing can have updatedAt in the future), so
+        // this adds no cost to the case the fix already handles.
         const nowIso = new Date().toISOString();
         if (timeRange.endTime < nowIso) {
+          const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
           const lateExpressionValues: Record<string, any> = {
             ":adminListPartition": "all",
             ":end": timeRange.endTime,
             ":now": nowIso,
           };
           const lateKeyCondition =
-            "adminListPartition = :adminListPartition AND updatedAt > :end AND updatedAt <= :now";
+            "adminListPartition = :adminListPartition AND updatedAt BETWEEN :end AND :now";
           let lateKey: AWS.DynamoDB.DocumentClient.Key | undefined;
           do {
             const lateParams: AWS.DynamoDB.DocumentClient.QueryInput = {
@@ -3722,6 +3732,7 @@ export class ChatbotDB {
 
             const lateResult = await dynamodb.query(lateParams).promise();
             for (const session of (lateResult.Items as ChatSession[]) || []) {
+              if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
               const createdAt = session.createdAt;
               if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
                 accumulated.push(session);
