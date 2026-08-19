@@ -974,8 +974,11 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
     // Haven's account was `ok` by the blackout measure every single day of its outage —
     // `lead` never stopped — so gating this behind a blackout would reproduce the exact
     // blind spot it exists to close.
+    // `activity.days` is passed for §G day-1 detection and costs NOTHING extra — §F already
+    // fetched this account's per-day history for the blackout check, so day-1 rides an
+    // existing read rather than adding a Graph call per account.
     await checkOptimisationCoverage(
-      adAccountId, accessToken, user, summary, alertSink, now, deps,
+      adAccountId, accessToken, user, summary, alertSink, now, deps, activity.days,
     );
 
     // Also before the blackout early returns, and for the same reason as Tier 1: an account
@@ -1164,6 +1167,9 @@ async function checkOptimisationCoverage(
   alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
+  /** The ACCOUNT's per-day history, already fetched by §F. Used only by day-1 detection;
+   *  omitted, the check behaves exactly as before. */
+  accountDays?: Array<{ date: string; spend: number; families: string[] }>,
 ): Promise<void> {
   try {
     const {
@@ -1184,7 +1190,7 @@ async function checkOptimisationCoverage(
     // rather than against the newest row Meta happened to return.
     const asOf = new Date(now).toISOString().slice(0, 10);
     const verdict = evaluateAccountOptimisationCoverage(
-      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet, asOf,
+      inputs.adSets, inputs.receivedEventsByPixel, inputs.spendingDaysByAdSet, asOf, accountDays,
     );
 
     summary.optimisationDormant += verdict.dormant.length;
@@ -1252,9 +1258,17 @@ async function checkOptimisationCoverage(
         `${verdict.alerting.length} ACTIVE ad set(s) on ad account ${adAccountId} are bidding toward`,
         `a conversion event that two independent signals agree is not arriving:`,
         '',
+        // Day-1 findings rest on DIFFERENT evidence and must say so. Reporting them with the
+        // streak wording would read "0 consecutive spending day(s)" — a confidently wrong
+        // diagnosis, which costs more than an honestly incomplete one because it sends the
+        // reader looking for a streak that was never the basis of the alert.
         ...verdict.alerting.map((m) =>
-          `  • ${describe(m)} — no "${m.expectedEventName}" on the pixel in the last 24h, and no ` +
-          `attributed ${m.insightsFamily} on ${m.consecutiveAbsentSpendingDays} consecutive spending day(s)`),
+          m.day1
+            ? `  • ${describe(m)} — FIRST spending day: no "${m.expectedEventName}" on the pixel ` +
+              `in the last 24h (the pixel IS live — it reported PageView), and this account has ` +
+              `never produced an attributed ${m.insightsFamily} across its whole insights window`
+            : `  • ${describe(m)} — no "${m.expectedEventName}" on the pixel in the last 24h, and no ` +
+              `attributed ${m.insightsFamily} on ${m.consecutiveAbsentSpendingDays} consecutive spending day(s)`),
         '',
         'This is the failure that cost a managed client 8+ days of spend in August 2026: a',
         'tracking wrapper was removed, the event it had been firing stopped arriving, nothing',
