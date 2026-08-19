@@ -454,6 +454,34 @@ describe('DynamoDB pagination in chatbotService', () => {
       expect(queryPromiseMock).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-1332 (Greptile): [endTime, now] is unbounded — a stale window
+    // re-queried long after it closed could otherwise force the gap query to
+    // page through months of unrelated activity before filtering. Once enough
+    // in-range sessions have been found to fill `limit`, further gap pages
+    // can't change the final (truncated) result, so the loop must stop early.
+    it('stops paging the gap query once enough in-range sessions have been found to fill the limit', async () => {
+      const firstLateTouch = {
+        sessionId: 'late-touch-1',
+        adminListPartition: 'all',
+        createdAt: '2026-08-18T13:50:00.000Z',
+        updatedAt: '2026-08-18T14:00:05.000Z',
+      };
+
+      queryPromiseMock
+        .mockResolvedValueOnce({ Items: [] }) // primary [start, end] query: nothing
+        .mockResolvedValueOnce({
+          Items: [firstLateTouch],
+          LastEvaluatedKey: { sessionId: 'late-touch-1' }, // more pages exist...
+        });
+
+      const timeRange = { startTime: '2026-08-17T14:00:00Z', endTime: '2026-08-18T14:00:00Z' };
+      const result = await chatbotDb.getRecentSessionsPage(1, undefined, timeRange);
+
+      // ...but limit=1 is already satisfied, so the second gap page is never fetched.
+      expect(result.sessions.map((s: any) => s.sessionId)).toEqual(['late-touch-1']);
+      expect(queryPromiseMock).toHaveBeenCalledTimes(2);
+    });
+
   });
 
   describe('getMessageCountFromMessagesTable', () => {

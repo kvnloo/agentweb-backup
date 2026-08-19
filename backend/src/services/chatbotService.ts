@@ -3707,9 +3707,19 @@ export class ChatbotDB {
         // Skipped entirely when endTime is already at/after "now" (the common
         // daily-report case, where nothing can have updatedAt in the future), so
         // this adds no cost to the case the fix already handles.
+        //
+        // [endTime, now] is unbounded in principle (a stale/old window re-queried
+        // much later can span months of unrelated activity), so this loop stops
+        // once enough in-range sessions have been found to fill `limit` — the
+        // final slice below never returns more than `limit` in-range sessions
+        // anyway, so scanning further pages can't change the response, only add
+        // cost.
         const nowIso = new Date().toISOString();
         if (timeRange.endTime < nowIso) {
           const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
+          let inRangeCount = accumulated.filter(
+            (s) => s.createdAt && s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime
+          ).length;
           const lateExpressionValues: Record<string, any> = {
             ":adminListPartition": "all",
             ":end": timeRange.endTime,
@@ -3736,10 +3746,11 @@ export class ChatbotDB {
               const createdAt = session.createdAt;
               if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
                 accumulated.push(session);
+                inRangeCount++;
               }
             }
             lateKey = lateResult.LastEvaluatedKey;
-          } while (lateKey);
+          } while (lateKey && inRangeCount < limit);
         }
 
         // ENG-1332: the query above orders by updatedAt, not createdAt — a
