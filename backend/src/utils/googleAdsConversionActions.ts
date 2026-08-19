@@ -56,7 +56,7 @@ export function assertCountingType(value: unknown): CountingType {
  * want: the action stops appearing in the UI's list and stops counting toward goals,
  * without severing history the way REMOVE does.
  */
-export const CONVERSION_ACTION_STATUSES = ['ENABLED', 'REMOVED', 'HIDDEN'] as const;
+export const CONVERSION_ACTION_STATUSES = ['ENABLED', 'REMOVED'] as const;
 export type ConversionActionStatus = (typeof CONVERSION_ACTION_STATUSES)[number];
 
 /**
@@ -78,6 +78,18 @@ export function assertConversionActionStatus(value: unknown): ConversionActionSt
   // value a caller is most likely to send.
   const normalised = value.trim().toUpperCase();
   if (!(CONVERSION_ACTION_STATUSES as readonly string[]).includes(normalised)) {
+    if (normalised === 'HIDDEN') {
+      // Proven twice against a real account: BLOCKED_VALUE on create.status AND
+      // update.status. HIDDEN is real in the enum but Google assigns it — a caller cannot
+      // set it. Refused here so the caller gets a usable answer instead of an opaque
+      // deny-list error from the API.
+      throw new Error(
+        'HIDDEN cannot be set through the API — Google assigns it, and a request carrying it '
+        + 'is rejected on both create and update. To stop a conversion action recording, use '
+        + 'CONVERSION_ACTION REMOVE (which needs confirm_conversion_action_removal=true). '
+        + 'Removal stops recording permanently; conversions already recorded stay in reporting.',
+      );
+    }
     if (normalised === 'PAUSED') {
       throw new Error(
         'A conversion action cannot be PAUSED — that is a campaign status, and Google\'s '
