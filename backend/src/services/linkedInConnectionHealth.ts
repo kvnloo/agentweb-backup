@@ -494,7 +494,31 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
  * times) is caught in one pass. Fails open like its sibling above — a repoint
  * failure must never break the reconnect response, since the account itself is
  * already saved by the time this runs.
+ *
+ * Two safety properties a blind text rewrite needs that a hand-written one gets
+ * for free:
+ *
+ * 1. The rewrite has no understanding of context — if a prompt ever narrated an
+ *    old account ("we tried X, it failed") rather than directing live use of it,
+ *    the swap could read strangely afterward. Detecting that distinction
+ *    reliably isn't practical without semantic understanding, and a fragile
+ *    heuristic risks silently under-fixing the genuine case this exists for. So
+ *    instead of guessing, every rewrite snapshots the PRE-repoint text into
+ *    `promptRevisions` first — the exact mechanism the customer's own manual
+ *    edit already uses (`agentModeController.ts`'s `updateScheduledChat`) — so
+ *    an unwanted rewrite is always visible and reversible, never silently lost.
+ * 2. Two near-simultaneous reconnects for the same user (or a human editing the
+ *    schedule at that exact moment) could both read the same stale text before
+ *    either writes. Without a check, the second write would silently clobber
+ *    whatever the first one produced. `updateSchedule`'s `expect` parameter
+ *    makes the write conditional on `startingMessage` still being exactly what
+ *    was just read — the loser gets `ConditionalCheckFailedException` instead
+ *    of a lost update, and is treated as a no-op: the writer that won already
+ *    left correct state, and a schedule that's still stale gets another chance
+ *    on the next reconnect or gate evaluation either way.
  */
+const REPOINT_REVISION_LIMIT = 10;
+
 export async function repointStaleAccountReferences(
   ownerUserId: string,
   newAccountId: string,
@@ -516,10 +540,30 @@ export async function repointStaleAccountReferences(
         if (updated.includes(oldId)) updated = updated.split(oldId).join(newAccountId);
       }
       if (updated === original) continue;
-      await scheduleDb.updateSchedule(s.scheduleId, {
-        startingMessage: updated,
-        updatedAt: new Date().toISOString(),
-      } as any);
+
+      const existingRevisions = Array.isArray(s?.promptRevisions) ? s.promptRevisions : [];
+      const nextRevisions = [
+        ...existingRevisions,
+        { startingMessage: original, updatedAt: new Date().toISOString() },
+      ].slice(-REPOINT_REVISION_LIMIT);
+
+      try {
+        await scheduleDb.updateSchedule(
+          s.scheduleId,
+          {
+            startingMessage: updated,
+            promptRevisions: nextRevisions,
+            updatedAt: new Date().toISOString(),
+          } as any,
+          { startingMessage: original },
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException') {
+          console.log(`${TAG} repoint for schedule ${s.scheduleId} lost a concurrent write, skipping`);
+          continue;
+        }
+        throw writeError;
+      }
       repointed += 1;
       console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);
     }
