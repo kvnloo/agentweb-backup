@@ -2720,6 +2720,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       syncMode: args.sync || false,
       truncated,
       modelMix,
+      // ENG-1332: requested-range/scored/skipped counts for sync=true calls, so
+      // a report can state its own coverage/denominator honestly instead of
+      // inferring one from sessions.length. Null when sync=false — no scoring
+      // pass ran, so there is nothing to report coverage on.
+      scoringCoverage: (data as any)?.scoringCoverage ?? null,
     });
   }
 });
