@@ -34319,7 +34319,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -34443,6 +34443,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
           await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
           return { success: true, message: 'Campaign criterion removed' };
+        }
+      }
+
+      // CONVERSION_ACTION (ENG-1322). CREATE / LIST / UPDATE only — REMOVE is
+      // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
+      // the customer's account and is the one operation we cannot undo from our
+      // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'CONVERSION_ACTION') {
+        if (action === 'LIST') {
+          const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
+          return { success: true, conversionActions };
+        }
+        if (action === 'CREATE') {
+          // counting_type is NOT defaulted here — the service refuses an absent one
+          // with a message naming both options and what choosing wrong costs.
+          const created = await googleAdsService.createConversionAction(userId, customer_id, {
+            name: args.name,
+            category: args.category,
+            countingType: args.counting_type,
+            status: args.status,
+            primaryForGoal: args.primary_for_goal,
+            clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+          });
+          return {
+            success: true,
+            conversionActionResourceName: created.resourceName,
+            // The pair the page actually needs — a resource name cannot be installed.
+            tag: created.tag,
+            tagUnavailable: created.tag
+              ? undefined
+              : 'Google has not generated tag snippets for this action yet. Re-run CONVERSION_ACTION LIST shortly to read the AW-<id>/<label> pair.',
+            stored: created.stored,
+            drift: created.drift,
+            driftWarning: created.drift.length > 0
+              ? `Google stored ${created.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'UPDATE') {
+          const updated = await googleAdsService.updateConversionAction(
+            userId, customer_id, args.conversion_action_resource_name, {
+              name: args.name,
+              status: args.status,
+              category: args.category,
+              countingType: args.counting_type,
+              primaryForGoal: args.primary_for_goal,
+              clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+            });
+          return {
+            success: true,
+            conversionActionResourceName: updated.resourceName,
+            stored: updated.stored,
+            drift: updated.drift,
+            driftWarning: updated.drift.length > 0
+              ? `Google stored ${updated.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'REMOVE') {
+          return {
+            success: false,
+            error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
+              + 'historical attribution in the account and cannot be undone. To stop an action from '
+              + 'recording, use CONVERSION_ACTION UPDATE with status=PAUSED instead.',
+          };
         }
       }
 
