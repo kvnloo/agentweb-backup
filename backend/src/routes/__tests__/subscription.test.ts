@@ -5,7 +5,7 @@ import subscriptionRoutes from '../subscription';
 import { authenticateToken } from '../../middleware/auth';
 import { resolveBillingUserId } from '../../services/tokenUsageService';
 import { listLlmChargeEvents } from '../../services/llmChargeAuditDb';
-import { usageRecordDb } from '../../services/usageRecordDb';
+import { readBilledLedgerRows } from '../../services/llmUsageLedgerReader';
 
 // Mock the middleware
 jest.mock('../../middleware/auth', () => ({
@@ -38,8 +38,20 @@ jest.mock('../../services/llmChargeAuditDb', () => ({
   listLlmChargeEvents: jest.fn(),
 }));
 
-jest.mock('../../services/usageRecordDb', () => ({
-  usageRecordDb: { queryByBillingUserDateRange: jest.fn() },
+// ENG-1217: the apply endpoint's error mapping is the unit under test here, so
+// the service is stubbed while its REAL error classes are kept — a mapping test
+// that matched on a hand-made error would pass even if the class it maps on were
+// renamed out from under it.
+jest.mock('../../services/llmModelChangeService', () => {
+  const actual = jest.requireActual('../../services/llmModelChangeService') as Record<string, unknown>;
+  return { ...actual, applyModelChange: jest.fn(), undoModelChange: jest.fn() };
+});
+
+// ENG-1251: the itemized endpoint now reads the UNION of the per-member
+// partition fan-out and the billingUserId attribute scan, so the seam under
+// test is the ledger reader rather than one raw table query.
+jest.mock('../../services/llmUsageLedgerReader', () => ({
+  readBilledLedgerRows: jest.fn(),
 }));
 
 // @jest/globals' bare `jest.Mock` defaults its return type to `unknown`, so
@@ -47,7 +59,7 @@ jest.mock('../../services/usageRecordDb', () => ({
 // real function's type gives it a real Promise<T> return to infer against.
 const mockResolveBillingUserId = resolveBillingUserId as jest.MockedFunction<typeof resolveBillingUserId>;
 const mockListLlmChargeEvents = listLlmChargeEvents as jest.MockedFunction<typeof listLlmChargeEvents>;
-const mockQueryByBillingUserDateRange = usageRecordDb.queryByBillingUserDateRange as jest.MockedFunction<typeof usageRecordDb.queryByBillingUserDateRange>;
+const mockReadBilledLedgerRows = readBilledLedgerRows as jest.MockedFunction<typeof readBilledLedgerRows>;
 
 let app: express.Application;
 
@@ -139,7 +151,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([]);
+    mockReadBilledLedgerRows.mockResolvedValue([]);
 
     const res = await request(app)
       .get('/api/subscription/usage/itemized?month=2026-08')
@@ -149,12 +161,12 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     expect(res.body.items).toHaveLength(1);
     expect(res.body.items[0].source).toBe('charge_event');
     // No aggregate query result should leak in when every day is charge-event covered.
-    expect(mockQueryByBillingUserDateRange).toHaveBeenCalled();
+    expect(mockReadBilledLedgerRows).toHaveBeenCalled();
   });
 
   it('returns daily_aggregate precision when no charge events exist yet this month', async () => {
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
     ]);
 
@@ -175,7 +187,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     // pooled member's, from while they were still pooled -- aggregate-only
     // usage reaches the owner's itemized report without a second query.
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 200, callCount: 3, costMicroUsd: 900 },
       // A different acting user's row, correctly stamped with THIS owner's
       // billingUserId at write time -- current pooled member, or a former
@@ -187,8 +199,8 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
       .get('/api/subscription/usage/itemized?month=2026-08')
       .expect(200);
 
-    expect(mockQueryByBillingUserDateRange).toHaveBeenCalledTimes(1);
-    expect(mockQueryByBillingUserDateRange).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
+    expect(mockReadBilledLedgerRows).toHaveBeenCalledTimes(1);
+    expect(mockReadBilledLedgerRows).toHaveBeenCalledWith('u1', '2026-08-01', '2026-08-31');
     expect(res.body.items).toHaveLength(2);
     const dates = res.body.items.map((item: any) => item.date).sort();
     expect(dates).toEqual(['2026-08-05', '2026-08-06']);
@@ -202,7 +214,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: '2026-08-10T12:00:00.000Z#a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-01#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-01T00:00:00.000Z', ttl: 0, date: '2026-08-01', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 50, callCount: 1, costMicroUsd: 200 },
       // Same (date, model, feature) as the charge event above, and its
       // dollar total is FULLY covered by it (500 <= 500) — must be EXCLUDED
@@ -242,7 +254,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-partial', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 1000, callCount: 10, costMicroUsd: 9999 },
     ]);
 
@@ -269,7 +281,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-a', actingUserId: 'u1', occurredAt: '2026-08-10T12:00:00.000Z', model: 'sonnet', provider: 'bedrock', feature: 'chat', tokens: 100, costMicroUsd: 500, sessionId: 's1' },
     ]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       // Fully covered — same date, model, feature, dollar amount.
       { userId: 'u1', sk: '2026-08-10#sonnet#chat', billingUserId: 'u1', updatedAt: '2026-08-10T00:00:00.000Z', ttl: 0, date: '2026-08-10', model: 'sonnet', provider: 'bedrock', feature: 'chat', totalTokens: 100, callCount: 1, costMicroUsd: 500 },
       // Same day, different model — never touched by the sonnet/chat event.
@@ -292,7 +304,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     // charge events", silently dropping real, positive token/call usage
     // that no charge event actually represents.
     mockListLlmChargeEvents.mockResolvedValue([]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 3, costMicroUsd: 0 },
     ]);
 
@@ -313,7 +325,7 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
     mockListLlmChargeEvents.mockResolvedValue([
       { billingUserId: 'u1', eventId: 'chatcmpl-unpriced', actingUserId: 'u1', occurredAt: '2026-08-05T12:00:00.000Z', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', tokens: 5000, costMicroUsd: 0, sessionId: 's1' },
     ]);
-    mockQueryByBillingUserDateRange.mockResolvedValue([
+    mockReadBilledLedgerRows.mockResolvedValue([
       { userId: 'u1', sk: '2026-08-05#unpriced-model#chat', billingUserId: 'u1', updatedAt: '2026-08-05T00:00:00.000Z', ttl: 0, date: '2026-08-05', model: 'unpriced-model', provider: 'bedrock', feature: 'chat', totalTokens: 5000, callCount: 1, costMicroUsd: 0 },
     ]);
 
@@ -339,5 +351,118 @@ describe('GET /api/subscription/usage/itemized (ENG-1251)', () => {
 
   it('returns 400 for a malformed month', async () => {
     await request(app).get('/api/subscription/usage/itemized?month=not-a-month').expect(400);
+  });
+});
+
+
+/**
+ * ENG-1217 — a lost race is a CONFLICT, not a server error.
+ *
+ * `applyModelChange` binds its write to the model it read, so a second confirm
+ * that arrives after the schedule moved is rejected rather than allowed to write
+ * a stale choice. The client needs to be told which of those happened: a 409 says
+ * "your view is out of date, reload", where a 500 says "we broke" and invites a
+ * blind retry that will lose the same race again.
+ */
+describe('POST /api/subscription/usage-runway/apply — error mapping', () => {
+  // Typed by the surface used rather than as `jest.Mock`: under @jest/globals an
+  // un-parameterised jest.Mock infers its argument as `never`, so every
+  // mockRejectedValue below would be a type error.
+  const { applyModelChange } = jest.requireMock('../../services/llmModelChangeService') as {
+    applyModelChange: {
+      mockReset: () => void;
+      mockRejectedValue: (value: unknown) => void;
+      mockResolvedValue: (value: unknown) => void;
+    };
+  };
+  const {
+    ModelChangeConflictError,
+    ModelChangeNotFoundError,
+    ModelNotAvailableError,
+  } = jest.requireActual('../../services/llmModelChangeService') as Record<string, new (m?: string) => Error>;
+
+  const body = { scope: 'schedule', scopeId: 'sched-a', toModel: 'anthropic.claude-haiku-4-5' };
+
+  beforeEach(() => {
+    applyModelChange.mockReset();
+  });
+
+  it('maps a concurrent-change conflict to 409, not 500', async () => {
+    applyModelChange.mockRejectedValue(new ModelChangeConflictError());
+
+    const res = await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(409);
+    expect(res.body.error).toMatch(/changed a moment ago/i);
+  });
+
+  it('still maps an unknown schedule to 404', async () => {
+    applyModelChange.mockRejectedValue(new ModelChangeNotFoundError('Scheduled chat not found'));
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(404);
+  });
+
+  it('still maps an ineligible model to 400', async () => {
+    applyModelChange.mockRejectedValue(new ModelNotAvailableError());
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(400);
+  });
+
+  it('leaves an unexpected failure as a 500', async () => {
+    // The conflict path must not swallow real errors into a reassuring status.
+    applyModelChange.mockRejectedValue(new Error('dynamo exploded'));
+    await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(500);
+  });
+
+  it('returns the result unchanged on success', async () => {
+    applyModelChange.mockResolvedValue({
+      applied: true, changeId: 'chg-1', modelBefore: null,
+      modelAfter: body.toModel, pinnedFromInherited: true,
+    });
+
+    const res = await request(app).post('/api/subscription/usage-runway/apply').send(body).expect(200);
+    expect(res.body).toMatchObject({ applied: true, changeId: 'chg-1', pinnedFromInherited: true });
+  });
+});
+
+describe('POST /api/subscription/usage-runway/undo — error mapping', () => {
+  const { undoModelChange } = jest.requireMock('../../services/llmModelChangeService') as {
+    undoModelChange: {
+      mockReset: () => void;
+      mockRejectedValue: (value: unknown) => void;
+      mockResolvedValue: (value: unknown) => void;
+    };
+  };
+  const { ModelChangeConflictError, ModelChangeNotFoundError } = jest.requireActual(
+    '../../services/llmModelChangeService',
+  ) as Record<string, new (m?: string) => Error>;
+
+  const body = { changeId: '2026-08-18T10:00:00.000Z#chg-1' };
+
+  beforeEach(() => {
+    undoModelChange.mockReset();
+  });
+
+  it('maps a superseded change to 409, not 500', async () => {
+    // Reachable only since the restore became conditional. A 500 here would tell
+    // the customer we broke, when in fact their schedule simply moved on.
+    undoModelChange.mockRejectedValue(new ModelChangeConflictError('That schedule has changed since.'));
+
+    const res = await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(409);
+    expect(res.body.error).toMatch(/changed since/i);
+  });
+
+  it('still maps an unknown change to 404', async () => {
+    undoModelChange.mockRejectedValue(new ModelChangeNotFoundError('Change not found'));
+    await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(404);
+  });
+
+  it('leaves an unexpected failure as a 500', async () => {
+    undoModelChange.mockRejectedValue(new Error('dynamo exploded'));
+    await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(500);
+  });
+
+  it('returns a plain no-op result unchanged', async () => {
+    // "Already undone" is a 200 with undone:false, not an error — the customer
+    // asked for a state that already holds.
+    undoModelChange.mockResolvedValue({ undone: false, restoredModel: null });
+    const res = await request(app).post('/api/subscription/usage-runway/undo').send(body).expect(200);
+    expect(res.body).toMatchObject({ undone: false });
   });
 });

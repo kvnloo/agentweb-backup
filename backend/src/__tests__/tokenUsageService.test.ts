@@ -307,11 +307,13 @@ describe("checkTokenUsage - versioned cost-only policy", () => {
     expect(result.usageMode).toBe("full_choice");
   });
 
-  it("enters optimized mode exactly at the configured cost threshold", async () => {
+  it("keeps full model choice at the former optimization threshold (ENG-1211)", async () => {
+    // Was: crossing the soft threshold entered `optimized` and coerced the model.
+    // Only the hard cap changes state now; the soft threshold is inert.
     mockCostState(30);
     const result = await checkTokenUsage("u1");
     expect(result.allowed).toBe(true);
-    expect(result.usageMode).toBe("optimized");
+    expect(result.usageMode).toBe("full_choice");
     expect(result.usagePolicyVersion).toBe("starter-v1");
   });
 
@@ -345,14 +347,17 @@ describe("checkTokenUsage - versioned cost-only policy", () => {
     expect(result.costUsed).toBe(0);
   });
 
-  it('purchased credit extends the hard cap while keeping optimized mode active', async () => {
+  it('purchased credit resumes admission without changing the model (ENG-1211 AC3)', async () => {
+    // A top-up used to resume work but keep the account pinned to the cheap
+    // catalog. It now returns full choice: credits buy allowance, not a
+    // downgrade.
     mockCostState(60, 300_000_000, {
       month: currentMonth(), totalPurchasedMicroUsd: 10_000_000, totalMigrationOffsetMicroUsd: 0,
       grantIds: ['stripe:1'], grants: [],
     });
     const result = await checkTokenUsage('u1');
     expect(result.allowed).toBe(true);
-    expect(result.usageMode).toBe('optimized');
+    expect(result.usageMode).toBe('full_choice');
     expect(result.costAllowance).toBe(70);
   });
 });

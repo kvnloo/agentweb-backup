@@ -64,6 +64,25 @@ export interface LinkedInOutreachConfig {
   // Premium LinkedIn accounts allow 300-char invitation notes (free accounts: 200).
   // User-set in Settings → Connected accounts. Absent/false = free tier.
   is_premium?: boolean;
+  /**
+   * Persisted session health (ENG-1197).
+   *
+   * Unipile owns this session's lifecycle, so `token_expires_at` is a sentinel and
+   * says nothing about liveness — only a live probe does. That probe's result used
+   * to live exclusively in an in-process 10-minute Map, which meant the moment a
+   * session died was observed and then thrown away: no stored state, therefore no
+   * connected→disconnected TRANSITION, therefore nothing an alert could key on. A
+   * daily scheduled run rediscovered it hours later and silently no-opped.
+   *
+   * Storing it turns a level ("is dead right now", true on every one of the 288
+   * daily poll cycles) into an edge ("just died"), which is the only thing safe to
+   * notify a customer about. `disconnect_notified_at` then paces the reminder for a
+   * session that stays dead for weeks.
+   */
+  needs_reconnect?: boolean;     // set when a probe proves the session dead; cleared on reconnect
+  disconnected_at?: string;      // ISO — when the disconnect was first observed
+  last_verified_at?: string;     // ISO — last time a probe proved the session live
+  disconnect_notified_at?: string; // ISO — last owner notification, for reminder pacing
 }
 
 /**

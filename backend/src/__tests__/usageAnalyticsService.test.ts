@@ -525,6 +525,46 @@ describe('usageAnalyticsService', () => {
       ]);
     });
 
+    it('keeps one feature bucket when rows carry a provenance qualifier (ENG-1210)', async () => {
+      // The metering tag appends `:interactive` / `:scheduled:<id>` to `feature`
+      // so the runway work can attribute spend. Bucketing on the raw string
+      // would shatter this cut: one `agent_task` line becomes one line per
+      // schedule — ~90 of them in production — and none of them aggregate with
+      // the untagged rows already in the table. `normaliseFeature` takes the
+      // segment before the first `:`, which is exactly what this dimension has
+      // always meant.
+      mockScan.mockResolvedValue([
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#agent_task', feature: 'agent_task', costMicroUsd: 1_000_000 }),
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#agent_task:interactive', feature: 'agent_task:interactive', costMicroUsd: 2_000_000 }),
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#agent_task:scheduled:sched-a', feature: 'agent_task:scheduled:sched-a', costMicroUsd: 4_000_000 }),
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#agent_task:scheduled:sched-b', feature: 'agent_task:scheduled:sched-b', costMicroUsd: 8_000_000 }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.byFeature.map((f) => [f.feature, f.costMicroUsd])).toEqual([
+        ['agent_task', 15_000_000],
+      ]);
+    });
+
+    it('still separates features that merely contain a colon (ENG-1210)', async () => {
+      // `x-account:<id>` is a real dimension, not a provenance tag, and it
+      // predates the tagging convention. Collapsing every `x-account:*` row into
+      // one bucket would erase the per-account cut the admin cost modal is built
+      // on — so grouping is by the leading segment for everyone, consistently,
+      // and the X rollup keeps its own dedicated cut.
+      // The X cut enriches @handles via getAccountById — return null (unresolved).
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#x-account:111', feature: 'x-account:111', costMicroUsd: 1_000_000 }),
+        aggRow({ sk: '2026-06-02#gpt-5-chat-2#emma', feature: 'emma', costMicroUsd: 5_000_000 }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.byFeature.map((f) => f.feature)).toEqual(['emma', 'x-account']);
+    });
+
     it('ranks top users by spend with a per-model breakdown, enriched with email', async () => {
       mockScan.mockResolvedValue([
         aggRow({ userId: 'user-1', costMicroUsd: 1_000_000 }),

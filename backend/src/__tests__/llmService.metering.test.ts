@@ -140,6 +140,35 @@ describe('llmService shadow metering', () => {
       );
     });
 
+    it('passes through the billing subject when the caller resolved one (ENG-1217)', async () => {
+      // The ledger row is partitioned by the ACTING user and carries the payer as
+      // an attribute. Without this hop that attribute silently defaulted back to
+      // the actor, so an org member's rows claimed they paid for themselves while
+      // the cap was being charged to the org root.
+      const svc = new LLMService('gpt-4-test');
+      await svc.generateRaw('sys', 'user', undefined, {
+        userId: 'member-a',
+        billingUserId: 'billing-root',
+        feature: 'agent_task',
+      });
+
+      expect(mockMeterUser).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'member-a', billingUserId: 'billing-root' })
+      );
+    });
+
+    it('leaves the billing subject undefined when the caller does not know it', async () => {
+      // Not a default of `userId`: "unknown" has to stay distinguishable from "the
+      // actor paid", because the reader treats a row naming its own actor as
+      // saying nothing and falls back to current membership.
+      const svc = new LLMService('gpt-4-test');
+      await svc.generateRaw('sys', 'user', undefined, { userId: 'user-9', feature: 'x' });
+
+      expect(mockMeterUser).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-9', billingUserId: undefined })
+      );
+    });
+
     it('meters generateJSONContent alongside the existing onUsage path', async () => {
       azureInvoke.mockResolvedValue(aiMessage({ content: '{"ok": true}' }));
       const svc = new LLMService('gpt-4-test');

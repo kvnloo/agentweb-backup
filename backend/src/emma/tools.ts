@@ -508,6 +508,8 @@ Actions:
 
 SHARED-ACCOUNT FALLBACK: search-people, get-profile, get-company, and search-parameters still work even when the user has no connected LinkedIn account (or it's disconnected) — they silently borrow a platform-wide shared account so discovery doesn't stall. When that happens the response carries usedSharedAccount:true and sharedAccountId. Treat this as a real signal, not a footnote: network_distance and any "already connected/pending" status are relative to the SHARED account's network, not the user's, so they are omitted from the response entirely — do not claim or infer a connection degree from a shared-account result. Proactively tell the user their LinkedIn account appears disconnected (discovery still worked, but outreach — send-invite/send-message/etc. — will fail) rather than silently continuing as if everything is normal.
 
+ANONYMIZED RESULTS: LinkedIn hides out-of-network people behind a placeholder profile. Those are dropped from search-people results, and the count is reported as anonymizedFiltered. If items is empty but anonymizedFiltered is greater than zero, the search WORKED and the niche is NOT empty — everyone matching was simply out of reach of the account used. Do not report that as "no results found" and do not escalate it as a broken search; broaden the query or use an account whose network reaches these people. On get-profile the row cannot be dropped, so it comes back with anonymized:true and no profile URL.
+
 For target person identification (send-invite, send-message, get-profile, update-conversation-history), pass EITHER:
 - profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
 - provider_id: the Unipile provider_id directly if you already have it`,
@@ -1844,7 +1846,12 @@ COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, video
         creatives: args.creatives,
       }
     );
-  }
+  },
+  // ENG-1276 follow-up: only fetches analytics (getAdAnalytics) — no
+  // write-capable action in this tool's schema at all, unlike its sibling
+  // call_linkedin_marketing_api (CREATE/UPDATE/UPLOAD/SEND), which stays
+  // unflagged on purpose.
+  readOnly: true
 });
 
 emmaToolRegistry.register({
@@ -2145,7 +2152,11 @@ emmaToolRegistry.register({
       args.focus_areas,
       context?.userId
     );
-  }
+  },
+  // ENG-1276 follow-up: performDeepResearchTool only calls Gemini Deep Research
+  // and uploads the result to internal S3 — no external publish, no CRM write,
+  // no third-party account action. Same shape as perform_data_analysis.
+  readOnly: true
 });
 
 // --- Tools from contentTools.ts ---
@@ -8726,6 +8737,11 @@ GAQL EXAMPLES:
   execute: async (args: any, context: any) => {
     return await agentModeService.handleCallGoogleAdsReportingApi(context?.userId || context?.agentUserId, args);
   },
+  // ENG-1276 follow-up: only fetches metrics/GAQL results (getQuickMetrics,
+  // queryReporting) — no write-capable action in this tool's schema at all,
+  // unlike its sibling call_google_ads_api (CREATE/UPDATE/REMOVE), which stays
+  // unflagged on purpose.
+  readOnly: true,
 });
 
 // ─── HubSpot ──────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@
  */
 
 import { fetchOptimisationInputs, MAX_PIXELS_CHECKED } from '../services/metaOptimisationCoverage';
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
 
 const ok = (body: any) => ({ ok: true, status: 200, json: async () => body });
 const fail = (error: any, status = 400) => ({ ok: false, status, json: async () => ({ error }) });
@@ -42,8 +43,17 @@ describe('fetchOptimisationInputs — the request shape', () => {
 
     const url = String(fetchImpl.mock.calls[0][0]);
     expect(url).toContain('act_123/adsets');
-    expect(decodeURIComponent(url)).toContain('promoted_object{custom_event_type,pixel_id}');
     expect(decodeURIComponent(url)).toContain('effective_status');
+
+    // Pinned individually rather than as one literal string, so reordering the sub-fields
+    // does not fail while DROPPING one silently passes.
+    const decoded = decodeURIComponent(url);
+    expect(decoded).toContain('custom_event_type');
+    expect(decoded).toContain('pixel_id');
+    // The load-bearing one: without it Meta returns `OTHER` with no name attached, and every
+    // custom-conversion ad set becomes unjudgeable. That blindness hid 8 of the 13 delivering
+    // conversion-optimised ad sets in production, all on the biggest-spending account.
+    expect(decoded).toContain('custom_event_str');
   });
 
   it('reads the pixel with aggregation=event', async () => {
@@ -258,5 +268,30 @@ describe('fetchOptimisationInputs — remaining shapes seen in the wild', () => 
     const result = await fetchOptimisationInputs('123', 'tok');
     expect(result.status).toBe('ok');
     spy.mockRestore();
+  });
+});
+
+describe('ENG-1326 — every Graph read is bounded', () => {
+  it('passes an abort deadline on EVERY request, not just the first', async () => {
+    // These are awaited inside a loop over every user and every ad account, and Node's fetch
+    // applies no default deadline. One connection that accepts a request and never completes
+    // the response stalls the rest of the daily sweep — which reads in the logs as "the cron
+    // did not run" rather than as a network fault.
+    const fetchImpl = jest.fn()
+      .mockResolvedValueOnce(ok({ data: [adSet('as1', 'pix1')] }))
+      .mockResolvedValue(ok(statsBody([{ Lead: 1 }])));
+
+    await fetchOptimisationInputs('act1', 'tok', { fetchImpl: fetchImpl as any });
+
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(1);
+    for (const call of fetchImpl.mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('uses the SHARED constant, so the three monitor modules cannot drift apart', () => {
+    // ENG-683: a map duplicated across four files diverged. One definition, imported.
+    expect(META_GRAPH_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(META_GRAPH_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
   });
 });

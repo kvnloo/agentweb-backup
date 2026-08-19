@@ -42,6 +42,7 @@ import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
 // the outreach-onboarding prospect preview cannot drift apart.
@@ -295,6 +296,13 @@ export function pressesIrreversiblePublishWrite(text: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import {
+  isAnonymizedIdentifier,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
+import { PACED_WRITE_ACTIONS, reserveWriteSlot } from './linkedInWritePacer';
 import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
@@ -815,6 +823,30 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Usage/cost tier for the model picker UI, ordered most- to least-expensive. Unset defaults to 'medium'. */
+  tier?: ModelTier;
+  /** Short, user-facing one-line description shown next to the model name in the picker. */
+  description?: string;
+  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
+  name?: string;
+  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
+  provider?: ModelProvider;
+}
+
+/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
+export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/** Underlying lab a model is from, for picking the right provider icon in the picker. */
+export type ModelProvider =
+  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
+
+/** Metadata for a model as returned to the frontend picker. */
+export interface SupportedModelInfo {
+  id: string;
+  name: string;
+  tier: ModelTier;
+  description: string;
+  provider: ModelProvider;
 }
 
 // Type for LLM call options
@@ -1578,8 +1610,10 @@ export class AgentModeService {
   // Model for the internal dedup judge (report_product_issues duplicate detection).
   // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
   // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
-  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
-  // model choice becomes gateway/routing config rather than provider-specific.
+  // configurable default model. ENG-9: this already becomes gateway/routing config
+  // for free — setting this to an `openrouter/<provider>/<model>` id routes through
+  // OpenRouter the same as any other prefix (see getClientForModel), no code change
+  // needed at this call site.
   async getDedupJudgeModel(): Promise<string> {
     return (
       (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
@@ -1785,6 +1819,8 @@ export class AgentModeService {
 
   private gemini_client: OpenAI | null = null;
   private gemini_client_promise: Promise<OpenAI> | null = null;
+  private openrouter_client: OpenAI | null = null;
+  private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
@@ -1857,6 +1893,51 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  // ENG-9: OpenRouter is an OpenAI-compatible endpoint, so it uses the exact same
+  // lazy-load/cache shape as getGeminiClient — no new abstraction, just another
+  // baseURL. HTTP-Referer/X-Title identify the app for OpenRouter's own analytics
+  // (openrouter.ai/docs/app-attribution); they carry no auth meaning.
+  public async getOpenRouterClient(): Promise<OpenAI> {
+    if (this.openrouter_client) {
+      return this.openrouter_client;
+    }
+    if (this.openrouter_client_promise) {
+      return this.openrouter_client_promise;
+    }
+
+    this.openrouter_client_promise = (async () => {
+      try {
+        let openRouterApiKey = process.env.OPENROUTER_API_KEY;
+
+        if (!openRouterApiKey) {
+          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          openRouterApiKey = await getSecret(`${environment}/AgentWeb/OpenRouter`);
+        }
+
+        if (!openRouterApiKey || !openRouterApiKey.trim()) {
+          throw new Error('OpenRouter API key is empty or not found in env/secrets');
+        }
+
+        this.openrouter_client = new OpenAI({
+          apiKey: openRouterApiKey.trim(),
+          baseURL: 'https://openrouter.ai/api/v1',
+          defaultHeaders: {
+            'HTTP-Referer': 'https://app.agentweb.pro',
+            'X-Title': 'AgentWeb',
+          },
+        });
+
+        return this.openrouter_client;
+      } catch (error) {
+        console.error('Error initializing OpenRouter client:', error);
+        this.openrouter_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.openrouter_client_promise;
   }
 
   /**
@@ -2093,6 +2174,12 @@ export class AgentModeService {
     }
     if (model.startsWith('claude-')) {
       return this.getVertexClient(model);
+    }
+    // ENG-9: openrouter/<provider>/<model> — the suffix after the prefix passes
+    // straight through as OpenRouter's own model id, so no per-model registry
+    // churn is needed to reach a new upstream model.
+    if (model.startsWith('openrouter/')) {
+      return this.getOpenRouterClient();
     }
     return this.getGeminiClient();
   }
@@ -2766,11 +2853,11 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2779,28 +2866,82 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
+    // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
+    // the suffix after the prefix passed straight through as OpenRouter's own model
+    // string, so a new upstream model is one registry line, not new routing code.
+    //
+    // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
+    // (2026-08-17), not guessed:
+    // - supportsTemperature: true iff `supported_parameters` includes "temperature"
+    //   for that model (all entries below do).
+    // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
+    //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
+    //   endpoints APIs expose no numeric tool-call limit for any model (checked
+    //   both), so setting a number here would be a guess, not evidence. (The
+    //   128 previously on this line was exactly that guess, copied from the Azure
+    //   convention without verification — removed.)
+    // - supportsVision: deliberately OMITTED even where `architecture.modality`
+    //   reports image/video input — this codebase's own convention for the flag
+    //   (see LLMModelConfig.supportsVision above) requires empirical verification
+    //   against the real describe_image path, which none of these have had yet.
+    //   Metadata-only vision support is not the bar this flag uses elsewhere.
+    // - adminOnly: true on every new entry below (not this starter one, which was
+    //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
+    //   matching the existing convention for other non-default/experimental models
+    //   (e.g. anthropic.claude-opus-4-6-v1 above).
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true },
+    // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
+    // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
+    // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
+    // deprecated, score collapsed 53→38, now below GLM-5.2/DeepSeek-V4-Pro/
+    // Kimi-K2.6 at a similar price), mistral-large-2512 (AA Index 16, weakest
+    // score checked), llama-4-maverick (AA Index 14, a year old, Meta has since
+    // moved to proprietary Muse Spark/Code), llama-4-scout (lowest cheap-tier
+    // score; Meta shipped Llama 5 in April 2026, making this a full generation
+    // behind), llama-3.1-8b-instruct (older sibling of the same superseded
+    // family), qwen3.7-flash (no coding-benchmark coverage — it's vision-language,
+    // not a coding model — and its pricing tiers up sharply past 32K-token
+    // prompts). qwen3.8-max is KEPT despite losing head-to-head to grok-4.6 at
+    // the same $2/$6 price — it's Alibaba's only current non-deprecated entrant
+    // (Qwen3.7 Max is independently confirmed deprecated too), so it stays for
+    // lab/family redundancy, not because it's the top pick in its tier.
+    // kimi-k2.6 is SWAPPED for kimi-k2.7-code (live-verified pricing/flags, not
+    // reused from the third pass).
+    //
+    // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
+    // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
+    // live) — this is a real, currently-unfillable gap, not an oversight.
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
-    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2811,6 +2952,29 @@ export class AgentModeService {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * Same entitlement/ordering as getSupportedModels, decorated with tier + description
+   * for the model-picker UI. Excludes live-voice models (isLive) — they are never
+   * selectable through the HTTP generate picker (see callLLM's isLive guard).
+   * Untiered entries default to 'medium' with a generic description rather than being
+   * dropped, so a newly-added model is never silently invisible in the picker.
+   */
+  async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
+    const ids = await this.getSupportedModels(isAdmin);
+    return ids
+      .filter(id => !this.llmModels[id]?.isLive)
+      .map(id => {
+        const config = this.llmModels[id];
+        return {
+          id,
+          name: config?.name ?? id,
+          tier: config?.tier ?? 'medium',
+          description: config?.description ?? 'General-purpose model',
+          provider: config?.provider ?? 'other',
+        };
+      });
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
@@ -2983,20 +3147,45 @@ export class AgentModeService {
       throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
     }
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
+    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed.
+    // ENG-700: providerLabel is set in the SAME model-id branch that decides
+    // which resolver produces `client`, so the metering label below can never
+    // independently drift from the resolver that actually serves the call —
+    // it is NOT derived from whether `client` happens to be cached yet (a
+    // Bedrock/Vertex client is cached on the registry after its first call,
+    // same as an Azure client is pre-populated at construction time, so
+    // "client is already set" cannot distinguish the providers).
     let client = this.llmModels[model].client;
+    let providerLabel: string;
     if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
-    } else if (!client) {
-      if (model.startsWith('anthropic.')) {
+      providerLabel = 'gemini';
+    } else if (model.startsWith('anthropic.')) {
+      providerLabel = 'bedrock';
+      if (!client) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
-      } else if (model.startsWith('claude-')) {
+      }
+    } else if (model.startsWith('claude-')) {
+      providerLabel = 'vertex';
+      if (!client) {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
-      } else {
+      }
+    } else if (model.startsWith('openrouter/')) {
+      // ENG-9: lazy-loaded and cached on the registry, same as Bedrock/Vertex —
+      // must be its own branch, not the azure-openai fallback below, since an
+      // openrouter/* entry is registered with client: null (see llmModels).
+      providerLabel = 'openrouter';
+      if (!client) {
+        client = await this.getOpenRouterClient();
+        this.llmModels[model].client = client;
+      }
+    } else {
+      providerLabel = 'azure-openai';
+      if (!client) {
         throw new Error(`Client not initialized for model: ${model}`);
       }
     }
@@ -3029,10 +3218,10 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
-                : model.startsWith('anthropic.') ? 'bedrock'
-                : model.startsWith('claude-') ? 'vertex'
-                : 'azure-openai',
+              // ENG-700: the label of the client that actually served this call
+              // (set above, alongside client resolution) — not re-derived from
+              // the model id, which can diverge for a vendor/model-namespaced id.
+              provider: providerLabel,
               feature: usageContext?.feature || 'agent_task',
               // ENG-1251: the response's own id is stable across a retried/
               // re-processed response and distinct across real calls — closes
@@ -3045,6 +3234,16 @@ export class AgentModeService {
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
+              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
+              // present, not opt-in) — ground truth from the vendor that actually
+              // billed us, not a static per-token guess our own price table (which
+              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
+              // otherwise have to estimate. Omitted for every other provider, so
+              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              costUsdOverride:
+                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                  ? usage.cost
+                  : undefined,
             });
           }
         } catch {
@@ -3380,12 +3579,33 @@ export class AgentModeService {
 
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       const { userDb: userDbForAdmin } = await import('./db');
+      // Lazy-imported for the same reason usageRecorderService lazy-requires it:
+      // tokenUsageService pulls in the db -> aws config graph, and a static import
+      // here would drag it into every suite that mocks this module.
+      //
+      // Everything is swallowed to the acting user. Several legacy suites replace
+      // this module with a partial mock that defines only `incrementUserTokenUsage`,
+      // so the export can genuinely be missing — and beyond that, a descriptive
+      // ledger attribute must never be the reason a customer's response fails.
+      // `userId` is the value the row carried before this existed, so the
+      // degraded path is the old behaviour exactly.
+      const resolveBillingSubject = async (): Promise<string> => {
+        try {
+          const { resolveBillingUserId } = await import('./tokenUsageService');
+          if (typeof resolveBillingUserId !== 'function') return userId;
+          return (await resolveBillingUserId(userId)) || userId;
+        } catch (err) {
+          console.error(`[AgentMode] Failed to resolve billing user for ${userId}:`, err);
+          return userId;
+        }
+      };
       let [
         currentSession,
         userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt,
-        currentUser
+        currentUser,
+        billingUserId
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
         getAllowedSkills(userId),
@@ -3394,7 +3614,18 @@ export class AgentModeService {
         userDbForAdmin.getUserById(userId).catch((err) => {
           console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
           return null;
-        })
+        }),
+        // ENG-1217: who this response's spend is BILLED to, resolved once and
+        // stamped on every ledger row it writes. The ledger has always carried a
+        // `billingUserId` attribute and this path has never filled it, so an org
+        // member's rows claimed they paid for themselves while
+        // `incrementUserTokenUsage` was charging the org root — the two stores
+        // disagreed, and a reader had nothing but today's membership to go on.
+        //
+        // Resolved here rather than inside `recordUsage` because it costs two
+        // reads: once per response is free alongside this fetch, once per LLM
+        // call would not be.
+        resolveBillingSubject()
       ]);
 
       // Log if user not found (indicates orphaned schedule or deleted user)
@@ -3519,8 +3750,11 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
+          // ENG-1310: no longer headed "facts" — these are unverified notes from prior
+          // sessions (buildMemoryContextMessage bookends them with a staleness caution
+          // that itself dictates how to label any figure not re-verified this session).
           const accountMemoryMessage = buildMemoryContextMessage(
-            'Account Memory (facts from previous sessions):',
+            'Account Memory (unverified notes from previous sessions):',
             relevantMemories,
             new Date()
           );
@@ -3540,7 +3774,7 @@ export class AgentModeService {
               );
             });
             const orgMemoryMessage = buildMemoryContextMessage(
-              `Organization Memory (shared facts for "${org.name}"):`,
+              `Organization Memory (unverified shared notes for "${org.name}"):`,
               relevantOrgMemories,
               new Date()
             );
@@ -3669,7 +3903,7 @@ export class AgentModeService {
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
-2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+2. To make progress, you may call ANY read-only or verification tool available to you in this session — this includes data-source reads (analytics, ads, CRM, search-console, and similar reporting tools) as well as read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Verification tools are NEVER restricted by this directive: if the repeated message is asking you to check or verify something (e.g. "don't guess", "verify first"), call the tool that actually checks it rather than answering from memory. Do NOT call install_skills or any tool that writes, publishes, sends, or otherwise changes external state, and do NOT take any irreversible action, just to appear productive.
 3. If that context is enough to complete the task, do so using it.
 4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
 5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
@@ -4091,7 +4325,11 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-1210 AC6: stamp scheduled-vs-interactive provenance at metering
+            // time. The ledger row is keyed `date#model#feature` and aggregates
+            // sessionId away, so `feature` is the only dimension that survives to
+            // answer "what is my scheduled work costing me".
+            usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn
           });
@@ -4167,7 +4405,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // Same provenance as the primary call this retries — a backup-model
+                // retry of a scheduled run is still scheduled spend.
+                usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn
               }), synthesisRetryDeadlineMs);
@@ -6246,6 +6486,22 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-1131: preserve the ENG-975 people-search-outage marker. Both tools that
+    // can raise it (`linkedin_outreach` search-people/search-parameters and the
+    // `find_leads` top-up loop) fall through to the `{}` default at the bottom of
+    // this method, which erased the only machine-readable evidence that a run
+    // sourced zero prospects because LinkedIn search was DOWN for the account
+    // rather than because nobody matched. The scheduled-run recorder reads it back
+    // off the tool ledger (detectRunBlockedReason) to record the run as blocked
+    // instead of as a clean success the owner reads as "no one matched".
+    //
+    // Deliberately keyed on the flag, not the tool name, so it survives wherever
+    // the guard is raised. The marker is stamped ONLY after the broad control
+    // query has confirmed the outage, so it can never fire on an honest empty.
+    if (result && result.searchUnavailable === true) {
+      return { searchUnavailable: true, message: 'LinkedIn people search is unavailable for this account' };
     }
 
     // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
@@ -11196,7 +11452,11 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} lead(s)`,
+        // ENG-1207: same contract as searchLeads — a truncated page must not be
+        // phrased as a total.
+        message: cursor
+          ? `Showing the first ${matchingLeads.length} lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} lead(s)`,
         leads: matchingLeads.map((lead: any) => ({
           leadId: lead.leadId,
           email: lead.email || '',
@@ -11494,7 +11754,16 @@ export class AgentModeService {
 
       return {
         success: true,
-        message: `Found ${matchingLeads.length} matching lead(s)`,
+        // ENG-1207: only an exhausted scan may be phrased as a total. When the
+        // scan stopped at the caller's limit, say so — a bare "Found 20" reads
+        // as "there are 20", which is how a weak model concluded a 98-match
+        // filter had 20 hits, wrote 17 of them and reported the job complete
+        // (prod session d5898ffd). The true total is deliberately NOT stated:
+        // the scan breaks at the limit, so it was never counted and any "of N"
+        // here would be invented.
+        message: cursorOut
+          ? `Showing the first ${matchingLeads.length} matching lead(s); more remain — pass next_cursor to continue.`
+          : `Found ${matchingLeads.length} matching lead(s)`,
         leads: matchingLeads.map((entry) => {
           // Per-field provenance sidecar — lets the agent cite source, provider,
           // URL and confidence per field for list-wide queries (e.g. "funding
@@ -23967,7 +24236,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
-          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          // ENG-1310: the recovery path (re-read via read_tool_response/search_tool_response,
+          // or re-run the source tool) already existed via the S3 key above, but nothing told
+          // the model to actually USE it instead of re-serving a number from its own earlier
+          // reply — a compressed result a few calls back just silently disappeared, and the
+          // model kept going with whatever it had already said, which the prompt elsewhere
+          // forbids ("never quote an analytics number until you have read it in THIS
+          // session") but this placeholder never enforced. Say so explicitly, every time.
+          const recoveryHint = s3Ref
+            ? 're-read the full result via read_tool_response/search_tool_response using the S3 key above'
+            : `re-run ${msg.name} if you need the full result`;
+          const compressed = `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`;
           return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
@@ -31665,8 +31944,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // Write actions must use an account that is either owned by the calling user or
     // explicitly shared with the org (sharedWithOrg: true). This prevents an LLM from
     // reusing a shared enrichment account_id from a prior get-profile call.
-    const WRITE_ACTIONS = ['send-invite', 'send-message', 'send-inmail', 'cancel-invitation', 'accept-invitation'];
-    if (WRITE_ACTIONS.includes(action)) {
+    // Same set the pacer uses, deliberately not a second hand-maintained copy: a
+    // sixth write action added to one list and not the other would be either
+    // silently unpaced or silently unauthorized.
+    if (PACED_WRITE_ACTIONS.has(action)) {
       const { getAccountsByUserIdIncludingOrgShared } = await import('./connectedAccountsDb');
       const userAccounts = await getAccountsByUserIdIncludingOrgShared(userId);
       const authorized = userAccounts.some((a: any) => a.platform === 'unipile' && a.account_id === account_id);
@@ -31742,11 +32023,58 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
     if (sessionState === 'disconnected') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      // Persist alongside the reactive handler below, so the owner alert doesn't
+      // depend on which of the two paths happened to observe the dead session first
+      // (ENG-1197).
+      const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+      await recordUnipileAccountHealth({
+        accountId: account_id,
+        ownerUserId: userId,
+        state: 'disconnected',
+      });
       return this.linkedInDisconnectedResponse();
     }
     if (sessionState === 'unknown') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
+
+    // ENG-1197: pace write actions so a drain cannot burst the session to death.
+    //
+    // Twice this schedule fired ten cancel-invitation calls in one parallel batch
+    // and LinkedIn revoked the account's session ~17 seconds later, locking the
+    // customer out for days. The model emits parallel tool calls because that is the
+    // efficient shape of the work, and an unattended run has nobody to notice it
+    // ignoring an instruction not to — so the spacing has to be structural, not
+    // prompted. Reads are untouched; only actions that mutate LinkedIn state queue.
+    // Deliberately NOT taken here, up front, for the whole action. Several paced
+    // actions return before they ever reach Unipile — send-invite skips a profile
+    // whose invite is already pending or whose identity fails the ENG-1026 check,
+    // send-message skips a stale-sync or duplicate-text send. Reserving at the top
+    // would spend a slot (and sleep the caller a full gap) on those no-ops, so a
+    // batch of already-invited leads would both crawl and eat the hourly ceiling
+    // that the genuinely-new invites later in the same run need. Each case below
+    // therefore calls this immediately before its own Unipile write.
+    const paceWrite = async (): Promise<{ refusal: any } | null> => {
+      if (!PACED_WRITE_ACTIONS.has(action)) return null;
+      const slot = await reserveWriteSlot(account_id);
+      if (slot.allowed) return null;
+      console.log(`[AgentMode] linkedinOutreach: ${action} on ${account_id} refused by write pacer — ${slot.reason}`);
+      return {
+        refusal: {
+          success: false,
+          message: 'LinkedIn write actions are being paced',
+          error: [
+            slot.reason,
+            '',
+            'This is a deliberate safety limit on our side, not a LinkedIn rejection: sending or',
+            'withdrawing too quickly is what causes LinkedIn to revoke the account\'s session, which',
+            'blocks ALL outreach until the account owner manually reconnects.',
+            '',
+            'Do NOT retry this action now. Report what was completed and leave the rest for the next run.',
+          ].join('\n'),
+        },
+      };
+    };
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
     // We know which one it is based on which arg was provided.
@@ -31793,7 +32121,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted results with
             // public_identifier literally the string 'undefined' — passing those
             // through yields unusable fake profile URLs like /in/undefined.
-            const usableItems = searchResult.items.filter((item: any) => item.public_identifier !== 'undefined');
+            const usableItems = searchResult.items.filter((item: any) => !isAnonymizedIdentifier(item.public_identifier));
+            // How many the filter removed. ENG-1198 dropped them silently, which
+            // turned "every match was out-of-network" into an empty list
+            // indistinguishable from "nobody matches" — and from the ENG-975
+            // account-cannot-search outage. The ENG-975 canary deliberately does not
+            // cover this case: it only fires when the RAW page was empty, and here
+            // the account searched fine and returned rows we then discarded. So the
+            // count has to be reported, or the agent is left guessing which of three
+            // very different situations it is in.
+            const anonymizedFiltered = searchResult.items.length - usableItems.length;
             const trimmedItems = usableItems.map((item: any) => {
               const trimmed: any = {
                 provider_id: item.provider_id,
@@ -31816,7 +32153,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               if (item.summary) trimmed.summary = item.summary.slice(0, 200);
               return trimmed;
             });
-            return { success: true, data: withAccountMeta({ ...searchResult, items: trimmedItems }) };
+            const searchData = withAccountMeta({
+              ...searchResult,
+              items: trimmedItems,
+              ...(anonymizedFiltered > 0 ? { anonymizedFiltered } : {}),
+            });
+            if (trimmedItems.length === 0 && anonymizedFiltered > 0) {
+              // Say plainly what happened, so this does not get reported to the
+              // user as "no prospects match" or escalated as a broken search.
+              return {
+                success: true,
+                message:
+                  `All ${anonymizedFiltered} result(s) were anonymized by LinkedIn (out-of-network), so none are usable. ` +
+                  `The search itself worked — this is a reach limit, not an outage and not an empty niche. ` +
+                  `Broaden the query, or search from an account whose network covers these people.`,
+                data: searchData,
+              };
+            }
+            return { success: true, data: searchData };
           }
           return { success: true, data: withAccountMeta(searchResult) };
         }
@@ -31851,17 +32205,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // viewer's connection state back into the shared cache and re-introduce the
           // very cross-viewer leak this fix closes.
           if (raw && typeof raw === 'object') {
+            // Both halves must reject the sentinel, because this URL is used as a
+            // DynamoDB GSI lookup key below. Unfiltered, EVERY anonymized profile
+            // queries the same `/in/undefined` key — and the connection-sync cron
+            // writes rows under exactly that key — so the lookup returns an
+            // unrelated person's connection row and their is_relationship /
+            // connected_at get presented as this user's, driving the agent's
+            // invite-vs-message decision off a stranger's state.
             const profileUrl =
-              raw.public_profile_url ||
-              (raw.public_identifier
-                ? `https://www.linkedin.com/in/${raw.public_identifier}`
-                : (isUrl ? target : null));
+              usableProfileUrl(raw.public_profile_url) ||
+              (usablePublicIdentifier(raw.public_identifier)
+                ? `https://www.linkedin.com/in/${usablePublicIdentifier(raw.public_identifier)}`
+                : (isUrl ? usableProfileUrl(target) : null));
             // ENG-1198: LinkedIn anonymizes out-of-network/restricted profiles
             // with public_identifier literally the string 'undefined' — mirrors
             // the search-people filtering above. get-profile can't drop the row
             // (the caller asked for this specific person), so flag it and drop
             // the fabricated /in/undefined URL instead.
-            const isAnonymized = raw.public_identifier === 'undefined';
+            const isAnonymized = isAnonymizedIdentifier(raw.public_identifier);
             let conn: { connectedAt?: number } | null = null;
             // A shared/site-wide account's connection state belongs to a
             // STRANGER, not the user — reconciling is_relationship/connected_at
@@ -31897,9 +32258,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const isConnected =
               !!conn || (!profileResult.fromCache && rawRelationship === true);
             const data = {
-              ...viewerIndependentRaw,
+              // Dropping the fabricated URL alone was not enough: `public_identifier`
+              // stayed on the object as the literal string 'undefined', so the agent
+              // was handed the exact slug needed to rebuild the dead link itself.
+              ...withoutFabricatedProfileFields(viewerIndependentRaw),
               // Never surface the fabricated /in/undefined URL for an anonymized profile.
-              ...(isAnonymized ? {} : { public_profile_url: rawPublicProfileUrl }),
+              ...(isAnonymized || !usableProfileUrl(rawPublicProfileUrl)
+                ? {}
+                : { public_profile_url: rawPublicProfileUrl }),
               // See ENG-1198 note above: is_relationship/connected_at are the
               // user's "already connected/pending" signal — only meaningful
               // relative to the user's own account, not a borrowed shared one.
@@ -31969,6 +32335,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const sharedSecret = args.shared_secret;
           if (!invitationId) throw new Error('invitation_id is required for accept-invitation');
           if (!sharedSecret) throw new Error('shared_secret is required for accept-invitation (use the value from list-received-invitations)');
+          const acceptPaced = await paceWrite();
+          if (acceptPaced) return acceptPaced.refusal;
           const acceptResult = await linkedInOutreachService.acceptInvitation(invitationId, account_id, sharedSecret);
           return { success: true, data: acceptResult };
         }
@@ -32125,6 +32493,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // explicitly authorized it via on_note_quota='send_without_note'.
           const onNoteQuota: 'send_without_note' | 'skip' =
             on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          // ENG-126's account-level cooldown short-circuits the network call inside
+          // sendInvitation, so a paced caller would sleep a full gap and burn one of
+          // the account's hourly writes for a request that never leaves the process —
+          // for the whole hour the breaker is armed, on every queued invite. Check it
+          // here, before the slot is taken.
+          if (linkedInOutreachService.isUnderInvitationCooldown(account_id)) {
+            return {
+              success: false,
+              error:
+                'Cannot resend yet — this LinkedIn Outreach account is under an active account-level '
+                + 'invitation cooldown (its invitation cap was hit on an earlier send this run). '
+                + 'Skip the remaining invites and report what was completed.',
+            };
+          }
+          // Past every skip path (already-pending, identity mismatch, cooldown): this
+          // call is going to reach LinkedIn, so now is when it should cost a slot.
+          const invitePaced = await paceWrite();
+          if (invitePaced) return invitePaced.refusal;
           try {
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
@@ -32275,6 +32661,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
           }
 
+          const messagePaced = await paceWrite();
+          if (messagePaced) return messagePaced.refusal;
           const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
 
           // Persist the sent message to the CRM so it shows up in engagement history.
@@ -32313,6 +32701,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const { subject } = args;
           if (!subject) throw new Error('subject is required for send-inmail action');
 
+          const inmailPaced = await paceWrite();
+          if (inmailPaced) return inmailPaced.refusal;
           const inmailResponse = await linkedInOutreachService.sendInMail(account_id, target, isUrl, subject, message);
 
           // Persist the sent InMail to the CRM so it shows up in engagement history.
@@ -32416,7 +32806,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'cancel-invitation': {
           const invitationId = args.invitation_id;
           if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelPaced = await paceWrite();
+          if (cancelPaced) return cancelPaced.refusal;
           const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          // We just ended this invitation, so we know it is no longer pending —
+          // don't make the cache wait for the next full-feed prune to find out
+          // (ENG-1197). Best-effort: a failed cleanup must not turn a successful
+          // withdrawal into a reported failure.
+          const { deleteSentInvitationByInvitationId } = await import('./unipileSentInvitationsDb');
+          await deleteSentInvitationByInvitationId(account_id, invitationId).catch((err) =>
+            console.error(`[AgentMode] Failed to drop withdrawn invitation ${invitationId}:`, err),
+          );
           return { success: true, data: cancelResult };
         }
 
@@ -32481,6 +32881,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // probe's 10-minute cache window), so the reactive path stays as the backstop.
         // Both return the identical response via one helper.
         linkedInOutreachService.clearStatusCache(account_id);
+        // Persist it as well (ENG-1197). This used to end here — the one place that
+        // learned a session was dead told the model and nobody else, so an unattended
+        // scheduled run discovered the outage, no-opped, and left no trace anything
+        // was wrong. Recording it is what gives the owner an alert and lets the next
+        // run skip instead of repeating the discovery. A no-op for shared accounts,
+        // which this user doesn't own.
+        const { recordUnipileAccountHealth } = await import('./linkedInConnectionHealth');
+        await recordUnipileAccountHealth({
+          accountId: account_id,
+          ownerUserId: userId,
+          state: 'disconnected',
+        });
         return this.linkedInDisconnectedResponse();
       }
 
