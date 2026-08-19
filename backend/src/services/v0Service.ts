@@ -824,6 +824,16 @@ export function buildBrandEnrichedPrompt(
    * net" pattern as metaPixelId (see bridgeOutVerified/validateBridgeOutRedirect).
    */
   bridgeOutUrl?: string,
+  /**
+   * The site's Google Ads conversion action, when one is configured. Both halves are
+   * required together — an id with no label fires a conversion that matches no
+   * conversion action, which reports as "fired" while attributing nothing (ENG-1328).
+   *
+   * Unlike metaPixelId this needs NO validation-retry safety net: v0 does not author the
+   * conversion call, it only passes two values into the platform-owned helper. That is
+   * the whole reason the helper takes a parameter rather than asking v0 for a gtag call.
+   */
+  googleAds?: { conversionId: string; conversionLabel: string },
 ): string {
   const parts: string[] = [];
 
@@ -885,18 +895,23 @@ export function buildBrandEnrichedPrompt(
     );
   }
 
-  if (leadListId && (metaPixelId || bridgeOutUrl)) {
+  // Both halves or neither: a conversion id without its label fires an event that
+  // matches no conversion action — reported as fired, attributing nothing.
+  const googleAdsArg = googleAds?.conversionId && googleAds?.conversionLabel ? googleAds : undefined;
+
+  if (leadListId && (metaPixelId || bridgeOutUrl || googleAdsArg)) {
     parts.push(
       `\n\nLEAD TRACKING — IMPORTANT ARCHITECTURE:\n` +
       `1. In the lead capture form component, generate a shared event id ONCE per submit: const eventId = crypto.randomUUID();\n` +
       `2. Include that same value as an "eventId" field in the JSON body of the fetch('/api/capture', ...) call.\n` +
       `3. On a SUCCESSFUL submission response, call: await fireLeadTracking({ email, eventId, ` +
         `${metaPixelId ? `pixelId: ${JSON.stringify(metaPixelId)}, ` : ""}` +
+        `${googleAdsArg ? `googleAds: { conversionId: ${JSON.stringify(googleAdsArg.conversionId)}, conversionLabel: ${JSON.stringify(googleAdsArg.conversionLabel)} }, ` : ""}` +
         `${bridgeOutUrl ? `bridgeOutUrl: ${JSON.stringify(bridgeOutUrl)}` : ""} });\n` +
       `   Import it via: import { fireLeadTracking } from "@/lib/agentweb-track";\n` +
-      `4. Do NOT hand-author your own fbq('track', ...) call or window.location.href redirect — ` +
-        `fireLeadTracking already does both correctly (including the required flush delay before any redirect). Only call fireLeadTracking; do not duplicate its logic.\n` +
-      `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout.`
+      `4. Do NOT hand-author your own fbq('track', ...) call, gtag('event', ...) call, or window.location.href redirect — ` +
+        `fireLeadTracking already does all of them correctly, in the right order, with the required flush and conversion callback before any redirect. Only call fireLeadTracking; do not duplicate its logic.\n` +
+      `5. Do NOT call fbq('init', ...) or gtag('config', ...) yourself — the platform already injects both base snippets in the root layout.`
     );
   }
 
@@ -1088,6 +1103,22 @@ export interface GenerateLandingPageOptions {
    * site-wide and written onto its root record, so later pages inherit it.
    */
   metaPixelOverride?: { pixelId: string; accountId: string };
+  /**
+   * ENG-1328: the site's Google Ads conversion action, when one is already known at
+   * generation time. Drives AC1 — the base gtag ships in app/layout.tsx on the FIRST
+   * commit, so a lander is measurable from its first deploy rather than after a
+   * follow-up call to the manual endpoint.
+   *
+   * Both halves are required together; an id without its label fires a conversion that
+   * matches no conversion action. `customerId` is carried for the offline import
+   * (ENG-1325), which needs to know which account to upload against.
+   *
+   * On the sub-page path this is NOT read: a conversion is site-wide by construction
+   * (shared root layout), so a sub-page inherits the site's pair rather than taking one
+   * per request — the same rule as metaPixelOverride, minus the fill-a-gap case, since
+   * the manual endpoint already covers a site that has none.
+   */
+  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string };
 }
 
 /**
@@ -1159,6 +1190,7 @@ export async function generateLandingPage(
   const mode = opts?.mode ?? "unified";
   const bridgeOutUrl = opts?.bridgeOutUrl;
   const metaPixelOverride = opts?.metaPixelOverride;
+  const googleAds = opts?.googleAds;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1182,7 +1214,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
       );
     }
 
@@ -1202,7 +1234,7 @@ export async function generateLandingPage(
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
     );
   }
 
@@ -1248,7 +1280,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
 }
 
 /**
@@ -1343,7 +1375,8 @@ async function generateFirstPage(
   existingId?: string,
   originatingSessionId?: string,
   bridgeOutUrl?: string,
-  metaPixelOverride?: { pixelId: string; accountId: string }
+  metaPixelOverride?: { pixelId: string; accountId: string },
+  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string }
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1385,7 +1418,9 @@ async function generateFirstPage(
     }
   }
 
-  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl);
+  // Both halves or neither — see GenerateLandingPageOptions.googleAds.
+  const googleAdsConfig = googleAds?.conversionId && googleAds?.conversionLabel ? googleAds : undefined;
+  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl, googleAdsConfig);
 
   const record: GeneratedLandingPage = {
     id,
@@ -1407,6 +1442,13 @@ async function generateFirstPage(
   if (originatingSessionId) record.originatingSessionId = originatingSessionId;
   if (metaPixelId) { record.metaPixelId = metaPixelId; record.metaAdAccountId = metaAdAccountId; }
   if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
+  // Set BEFORE the push: createGitHubRepoAndPush reads record.googleAdsConversionId to
+  // inject the base tag into the initial commit (AC1 — measurable from the first deploy).
+  if (googleAdsConfig) {
+    record.googleAdsConversionId = googleAdsConfig.conversionId;
+    record.googleAdsConversionLabel = googleAdsConfig.conversionLabel;
+    if (googleAdsConfig.customerId) record.googleAdsCustomerId = googleAdsConfig.customerId;
+  }
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1719,6 +1761,15 @@ async function addPageToExistingRepo(
   const effectiveMetaAccountId = inheritedPixelId
     ? existingPage.metaAdAccountId
     : (applyingPixelOverride ? metaPixelOverride!.accountId : undefined);
+  /*
+   * A Google Ads conversion is site-wide for the same reason a pixel is: the base tag
+   * lives in the shared root layout. So a sub-page inherits the site's pair — there is no
+   * per-page override, and both halves are required together (an id without its label
+   * fires an event matching no conversion action). ENG-1328.
+   */
+  const subPageGoogleAds = existingPage.googleAdsConversionId && existingPage.googleAdsConversionLabel
+    ? { conversionId: existingPage.googleAdsConversionId, conversionLabel: existingPage.googleAdsConversionLabel }
+    : undefined;
   if (applyingPixelOverride) {
     console.log(
       `[V0 SERVICE] Site ${existingPage.siteId ?? existingPage.id} has no Meta pixel — applying the ` +
@@ -1787,7 +1838,7 @@ async function addPageToExistingRepo(
     // untouched, from the first page's push) — but the Lead-event prompt instruction is still
     // needed here since each page has its OWN form component. Just read whatever the site's
     // root already resolved, no fresh Meta API call.
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, effectivePixelId, bridgeOutUrl);
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, effectivePixelId, bridgeOutUrl, subPageGoogleAds);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -2044,13 +2095,14 @@ async function addPageToExistingRepo(
     // fire-and-forget — a stale LIST_BY_PATH only breaks a lead SUBMIT, not the BUILD), this
     // page's own form imports `@/lib/agentweb-track` (per the updated buildBrandEnrichedPrompt
     // instruction) ONLY when that instruction was actually included — same gate
-    // buildBrandEnrichedPrompt itself uses (leadListId && (metaPixelId || bridgeOutUrl)). When
+    // buildBrandEnrichedPrompt itself uses (leadListId && (metaPixelId || bridgeOutUrl ||
+    // googleAds)). When
     // it applies, the import is a genuine build-time dependency: a repo created before this
     // file existed (or one whose deferred sync hasn't landed yet) fails this page's Vercel
     // build OUTRIGHT with "Module not found" if the file isn't in THIS commit — live-repro'd
     // exactly this by adding a page to a pre-existing test-env repo. Must ride in the SAME
     // commit whose build status this function actually checks, not a later async sync.
-    if (leadListId && (effectivePixelId || bridgeOutUrl)) {
+    if (leadListId && (effectivePixelId || bridgeOutUrl || subPageGoogleAds)) {
       filesToCommit.push({ path: "lib/agentweb-track.ts", content: Buffer.from(buildTrackingHelper()) });
     }
 
