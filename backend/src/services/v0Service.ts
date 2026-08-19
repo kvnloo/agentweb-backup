@@ -7,6 +7,7 @@ import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig }
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
+import { injectGoogleAdsIntoLayoutFiles } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
@@ -501,6 +502,40 @@ export interface GeneratedLandingPage {
    * means the lander shipped with no Meta conversion tracking at all.
    */
   metaTrackingInstalled?: boolean;
+  /**
+   * The site's Google Ads conversion id — the `AW-…` half of a conversion action's
+   * `send_to`. Site-level (root record only), mirroring `gtmContainerId` and
+   * `metaPixelId`. This is what goes in the base gtag snippet in the layout.
+   */
+  googleAdsConversionId?: string;
+  /**
+   * The half of `send_to` AFTER the slash, which identifies WHICH conversion action
+   * fires. Stored separately from the id because the label is per-conversion-action,
+   * not per-account: one `AW-` id serves both "lead form" and "book demo", with a
+   * different label each. Modelled as a single value for v1; a site needing several
+   * wants a list, and that is a deliberate later change (ENG-1328).
+   */
+  googleAdsConversionLabel?: string;
+  /**
+   * Which connected Google Ads customer the id/label were resolved from — the exact
+   * analogue of `metaAdAccountId`, and needed for the same reason: the offline
+   * conversion import (ENG-1325) is Google's server-side leg and must know which
+   * customer to upload to and mint a fresh token for. Without this it would have to
+   * re-resolve or guess.
+   */
+  googleAdsCustomerId?: string;
+  /**
+   * Whether the Google Ads base tag was injected into the generated layout at push
+   * time. Mirrors `trackingInstalled` / `metaTrackingInstalled`'s "fail loud, never
+   * silently skip" contract.
+   *
+   * This one carries more weight than its two siblings. A failed Meta injection
+   * degrades to "server-side only", because the CAPI leg still fires from the capture
+   * route. Google Ads has no server-side leg until ENG-1325, so `false` here means the
+   * lander shipped with NO Google measurement at all — which is precisely what RULE 7.5
+   * exists to refuse a launch over.
+   */
+  googleAdsTrackingInstalled?: boolean;
   /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
@@ -3004,7 +3039,7 @@ export async function deployLandingPage(
       }
     }
 
-    const { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected } = await createGitHubRepoAndPush(
+    const { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected, googleAdsInjected } = await createGitHubRepoAndPush(
       repoName,
       zipBuffer,
       record.name,
@@ -3012,11 +3047,13 @@ export async function deployLandingPage(
       record.gtmContainerId,
       metaPixelId,
       metaAdAccountId,
+      record.googleAdsConversionId,
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
     record.trackingInstalled = gtmInjected;
     record.metaTrackingInstalled = pixelInjected;
+    record.googleAdsTrackingInstalled = googleAdsInjected;
     record.metaPixelId = metaPixelId;
     record.metaAdAccountId = metaAdAccountId;
     if (pixelLeadEventVerified !== undefined) record.pixelLeadEventVerified = pixelLeadEventVerified;
@@ -3031,7 +3068,8 @@ export async function deployLandingPage(
         Key: { id },
         UpdateExpression:
           "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, " +
-          "metaTrackingInstalled = :metaTrackingInstalled, updatedAt = :updatedAt" +
+          "metaTrackingInstalled = :metaTrackingInstalled, " +
+          "googleAdsTrackingInstalled = :googleAdsTrackingInstalled, updatedAt = :updatedAt" +
           (metaPixelId ? ", metaPixelId = :metaPixelId, metaAdAccountId = :metaAdAccountId" : "") +
           (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : "") +
           (bridgeOutVerified !== undefined ? ", bridgeOutVerified = :bridgeOutVerified" : ""),
@@ -3041,6 +3079,7 @@ export async function deployLandingPage(
           ":repoUrl": githubRepoUrl,
           ":trackingInstalled": gtmInjected,
           ":metaTrackingInstalled": pixelInjected,
+          ":googleAdsTrackingInstalled": googleAdsInjected,
           ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
           ...(bridgeOutVerified !== undefined ? { ":bridgeOutVerified": bridgeOutVerified } : {}),
           ":updatedAt": new Date().toISOString(),
@@ -4324,7 +4363,13 @@ async function createGitHubRepoAndPush(
    *  generated capture route (as a public identifier, not a secret) so `forward-lead` can look
    *  up a fresh access token for the CAPI send. */
   metaAdAccountId?: string,
-): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean }> {
+  /**
+   * The site's Google Ads conversion id (`AW-…`). When set, the base gtag snippet is
+   * injected into the root layout before the initial commit, mirroring GTM and Meta.
+   * When absent, NOTHING is injected — no fallback tag on a customer page.
+   */
+  googleAdsConversionId?: string,
+): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -4494,6 +4539,21 @@ async function createGitHubRepoAndPush(
       : `[V0 SERVICE] No Meta Pixel configured for this site — pushing WITHOUT Meta conversion tracking`,
   );
 
+  // Auto-inject the site's Google Ads base tag into the root layout BEFORE the initial
+  // commit, mirroring GTM and Meta above. Absent a conversion id, nothing is injected and
+  // the caller records a "no Google Ads tracking installed" signal.
+  //
+  // Unlike the two above, a false here is not a partial degrade. Meta keeps working
+  // server-side via CAPI when its layout install fails; Google Ads has no server-side leg
+  // until ENG-1325, so this flag going false means no Google measurement at all — the exact
+  // condition RULE 7.5 refuses a launch over (ENG-1328).
+  const googleAdsInjected = injectGoogleAdsIntoLayoutFiles(finalFiles, googleAdsConversionId);
+  console.log(
+    googleAdsInjected
+      ? `[V0 SERVICE] Injected Google Ads tag ${googleAdsConversionId} into app/layout.tsx`
+      : `[V0 SERVICE] No Google Ads conversion id configured for this site — pushing WITHOUT Google Ads conversion tracking`,
+  );
+
   // Push files to the repo using the Git Trees API (single commit for all files)
   // Step A: Get the default branch SHA
   const refRes = await axios.get<any>(
@@ -4552,7 +4612,7 @@ async function createGitHubRepoAndPush(
 
   console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
-  return { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected };
+  return { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected, googleAdsInjected };
 }
 
 /**
