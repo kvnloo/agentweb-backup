@@ -3326,12 +3326,23 @@ router.get("/chat-sessions", async (req, res) => {
           session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
       ).length;
 
+      // ENG-1332 (Greptile): backfill.skipped counts across the FULL fetched
+      // set (in-range + historical), the same population mismatch as
+      // alreadyScored/newlyScored above. What the report actually needs — "how
+      // many requested-window sessions remain unscored" — is fully derivable
+      // from the counts already scoped to inRangeSessions: every in-range
+      // session is accounted for by exactly one of alreadyScored (had a score
+      // already), newlyScored (scored this run), or neither (still unscored,
+      // whether skipped for budget or a scoring error) — so the remainder is
+      // the honest, correctly-scoped count.
+      const skippedForBudget = requestedRangeCount - alreadyScoredIds.size - newlyScored;
+
       scoringCoverage = {
         requestedRangeCount,
         totalFetched: sessionsWithMessages.length,
         alreadyScored: alreadyScoredIds.size,
         newlyScored,
-        skippedForBudget: backfill.skipped,
+        skippedForBudget,
         timedOut: backfill.timedOut,
       };
     }

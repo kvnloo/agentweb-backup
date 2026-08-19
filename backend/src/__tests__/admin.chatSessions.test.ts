@@ -442,6 +442,67 @@ describe("Admin chat sessions endpoint", () => {
       });
     });
 
+    // ENG-1332 (Greptile): backfill.skipped is a raw count over the FULL
+    // fetched set (in-range + historical), the same population mismatch
+    // alreadyScored/newlyScored had. skippedForBudget must report only how
+    // many REQUESTED-WINDOW sessions remain unscored, not the historical ones.
+    it("scopes skippedForBudget to unscored in-range sessions, excluding out-of-range history", async () => {
+      const originalBudgetMs = process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS;
+      // "0.5" (not "0"): envInt's `raw > 0` validation rejects a literal 0 and
+      // falls back to the 4-minute default, which this test's near-instant
+      // mocked scorer would sail through undetected. "0.5" passes that check
+      // but floors to an actual 0ms budget, deterministically skipping every
+      // session before the first is dispatched (no timing flakiness).
+      process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS = "0.5";
+
+      try {
+        const inRangeUnscoredA = {
+          ...makeSession("in-range-a"),
+          createdAt: "2026-08-18T08:00:00.000Z",
+          updatedAt: "2026-08-18T08:00:00.000Z",
+        };
+        const inRangeUnscoredB = {
+          ...makeSession("in-range-b"),
+          createdAt: "2026-08-18T09:00:00.000Z",
+          updatedAt: "2026-08-18T09:00:00.000Z",
+        };
+        const outOfRangeHistorical = {
+          ...makeSession("historical"),
+          createdAt: "2026-02-21T10:30:00.000Z",
+          updatedAt: "2026-08-18T13:00:00.000Z",
+        };
+
+        const sessions = [inRangeUnscoredA, inRangeUnscoredB, outOfRangeHistorical];
+        mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+        mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+          sessions.find((s) => s.sessionId === id) as any
+        );
+        mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+        const res = await request(app)
+          .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+          .expect(200);
+
+        // The zero budget skips all 3 fetched sessions (backfill.skipped === 3),
+        // but only 2 of them are in the requested window — skippedForBudget
+        // must report 2, not 3.
+        expect(res.body.scoringCoverage).toEqual({
+          requestedRangeCount: 2,
+          totalFetched: 3,
+          alreadyScored: 0,
+          newlyScored: 0,
+          skippedForBudget: 2,
+          timedOut: true,
+        });
+      } finally {
+        if (originalBudgetMs === undefined) {
+          delete process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS;
+        } else {
+          process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS = originalBudgetMs;
+        }
+      }
+    });
+
   });
 
   describe("sessionId search", () => {
