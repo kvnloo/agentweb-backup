@@ -1,0 +1,183 @@
+/**
+ * ENG-1322 — service-boundary behaviour for CONVERSION_ACTION.
+ *
+ * The pure rules are covered in utils/__tests__/googleAdsConversionActions.test.ts.
+ * What matters here is what the service does AROUND them: that it refuses before it
+ * writes, that a create hands back the tag pair rather than just a resource name,
+ * and that it reads the action back instead of trusting the create.
+ *
+ * The Google boundary is mocked. These are the failure paths first, per Rule 2.
+ */
+import { googleAdsService } from '../googleAdsService';
+
+const CUSTOMER = '2883029950';
+const RESOURCE = `customers/${CUSTOMER}/conversionActions/7724987234`;
+
+const storedRow = (over: Record<string, any> = {}) => ({
+  conversionAction: {
+    resourceName: RESOURCE,
+    id: '7724987234',
+    name: 'Submit lead form',
+    status: 'ENABLED',
+    type: 'WEBPAGE',
+    category: 'SUBMIT_LEAD_FORM',
+    countingType: 'ONE_PER_CLICK',
+    primaryForGoal: true,
+    tagSnippets: [{
+      type: 'WEBPAGE',
+      pageFormat: 'HTML',
+      eventSnippet: `<script>gtag('event','conversion',{'send_to':'AW-18192751758/qAnwCOLmx-McEI65_eJD'});</script>`,
+    }],
+    ...over,
+  },
+});
+
+let mutateSpy: jest.SpyInstance;
+let searchSpy: jest.SpyInstance;
+
+beforeEach(() => {
+  jest.restoreAllMocks();
+  jest.spyOn(googleAdsService as any, 'getAccountCredentials').mockResolvedValue({
+    accessToken: 'tok', customerId: CUSTOMER, currency: 'INR', loginCustomerId: '5331614095',
+  });
+  mutateSpy = jest.spyOn(googleAdsService, 'mutate').mockResolvedValue({ results: [{ resourceName: RESOURCE }] });
+  searchSpy = jest.spyOn(googleAdsService, 'search').mockResolvedValue([storedRow()]);
+});
+
+describe('createConversionAction — refuses before it writes (ENG-1322 AC3)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('refuses a missing counting_type and sends nothing to Google', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, countingType: undefined as any }))
+      .rejects.toThrow(/counting_type/i);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unrecognised counting_type and sends nothing', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, countingType: 'ONCE' }))
+      .rejects.toThrow(/ONCE/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a missing category, naming it as never inferred', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, category: '' }))
+      .rejects.toThrow(/category is required/i);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a blank name', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, name: '   ' }))
+      .rejects.toThrow(/name is required/i);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('createConversionAction — hands back the tag pair (ENG-1322 AC2)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('returns the AW id and label, not merely a resource name', async () => {
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.resourceName).toBe(RESOURCE);
+    expect(out.tag).toEqual({
+      conversionId: 'AW-18192751758',
+      conversionLabel: 'qAnwCOLmx-McEI65_eJD',
+      sendTo: 'AW-18192751758/qAnwCOLmx-McEI65_eJD',
+    });
+  });
+
+  it('reads the action back rather than trusting the create', async () => {
+    await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    // One mutate to write, one search to verify. Skipping the read is how ENG-1293
+    // shipped an ENABLED object off a PAUSED request.
+    expect(mutateSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy).toHaveBeenCalledTimes(1);
+    expect(searchSpy.mock.calls[0][2]).toContain('conversion_action.tag_snippets');
+  });
+
+  it('reports tag as null when Google has not generated snippets yet', async () => {
+    searchSpy.mockResolvedValue([storedRow({ tagSnippets: [] })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.tag).toBeNull();
+    // The action still exists — a missing tag is "not available yet", not a failure.
+    expect(out.resourceName).toBe(RESOURCE);
+  });
+
+  it('survives a read-back that returns no row at all', async () => {
+    searchSpy.mockResolvedValue([]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.tag).toBeNull();
+    expect(out.stored).toBeNull();
+    // Every requested field is unverifiable, so all of them read as drift.
+    expect(out.drift.map((d) => d.field).sort()).toEqual(['category', 'countingType', 'name', 'status']);
+  });
+});
+
+describe('createConversionAction — surfaces drift (ENG-1322 AC4)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('reports nothing when Google stored what was asked', async () => {
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.drift).toEqual([]);
+  });
+
+  it('catches the ENG-1293 shape — a status stored as something else', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'PAUSED' });
+    expect(out.drift).toEqual([{ field: 'status', requested: 'PAUSED', stored: 'ENABLED' }]);
+  });
+
+  it('catches a counting_type Google did not honour', async () => {
+    searchSpy.mockResolvedValue([storedRow({ countingType: 'MANY_PER_CLICK' })]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(out.drift).toEqual([{ field: 'countingType', requested: 'ONE_PER_CLICK', stored: 'MANY_PER_CLICK' }]);
+  });
+});
+
+describe('listConversionActions', () => {
+  it('returns an empty list for an account with none, rather than throwing', async () => {
+    searchSpy.mockResolvedValue([]);
+    await expect(googleAdsService.listConversionActions('u', CUSTOMER)).resolves.toEqual([]);
+  });
+
+  it('parses the tag pair onto each row so the caller never re-derives it', async () => {
+    const rows = await googleAdsService.listConversionActions('u', CUSTOMER);
+    expect(rows[0].tag.sendTo).toBe('AW-18192751758/qAnwCOLmx-McEI65_eJD');
+    expect(rows[0].countingType).toBe('ONE_PER_CLICK');
+  });
+});
+
+describe('updateConversionAction', () => {
+  it('refuses an update that changes nothing', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, {}))
+      .rejects.toThrow(/at least one field/i);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a missing resource name', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, '', { status: 'PAUSED' }))
+      .rejects.toThrow(/resource_name is required/i);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a bad counting_type on update, and writes nothing', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { countingType: 'ONCE' }))
+      .rejects.toThrow(/ONCE/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('sends only the fields supplied, so an omitted field is left alone', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'PAUSED' })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'PAUSED' });
+    const op = mutateSpy.mock.calls[0][3][0];
+    expect(op.updateMask).toBe('status');
+    expect(op.update).toEqual({ resourceName: RESOURCE, status: 'PAUSED' });
+    expect(op.update.name).toBeUndefined();
+  });
+
+  it('pausing is the supported alternative to removal, and reads back clean', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'PAUSED' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'PAUSED' });
+    expect(out.drift).toEqual([]);
+    expect(out.stored.status).toBe('PAUSED');
+  });
+});
