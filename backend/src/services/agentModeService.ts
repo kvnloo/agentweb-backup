@@ -35,6 +35,7 @@ import {
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -5089,6 +5090,52 @@ export class AgentModeService {
               break;
             }
           }
+        }
+      }
+
+      // ENG-1207 AC3: a run must not finish silently on an unread page.
+      //
+      // Same shape as the two reconcilers above and placed alongside them
+      // deliberately: deterministic, always-on, append-only, patched into the last
+      // assistant message so the persisted transcript matches what the user sees.
+      // It never rewrites the model's text and never claims success — it only adds
+      // the fact that some of the data was not looked at.
+      //
+      // NOT folded into the finalize guard, which is the established
+      // claimed-vs-executed seam: that guard is seen only when AGENT_FINALIZE_GUARD
+      // and AGENT_RUNTIME_SPINE_ENABLED are both on, and both are off in production.
+      // An acceptance criterion that cannot run is the defect it is meant to fix.
+      // The detection lives in a PURE module so the guard can absorb it unchanged
+      // the day those flags flip.
+      //
+      // Why this exists at all when AC1/AC2 already fixed the wording: during
+      // ENG-1200 the response ALREADY carried `has_more: true` and a cursor, and the
+      // model re-ran the identical unpaged query six times, then wrote 17 of 107
+      // records and reported the job complete. A clearer message makes noticing
+      // possible; it does not make it certain.
+      //
+      // Kill switch, not a gate: set AGENT_UNCONSUMED_CURSOR_NOTICE=false to disable.
+      // Absent means ON, so this cannot quietly become inert the way the guard did.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_UNCONSUMED_CURSOR_NOTICE !== 'false') {
+        try {
+          // Same predicate the finalize ledger uses, so the two cannot disagree
+          // about which calls actually executed.
+          const reconciled = reconcileUnconsumedCursors(content, toolCalls, toolCallNeverExecuted);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (cursorError) {
+          // Advisory. A bug here must never block delivery of a reply the user is
+          // waiting on — the failure mode this prevents is a silent overclaim, which
+          // is strictly less bad than losing the message.
+          console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
         }
       }
 
