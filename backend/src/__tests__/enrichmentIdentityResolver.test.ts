@@ -2478,4 +2478,34 @@ describe('resolveIdentity — placeholder/test email addresses (ENG-968)', () =>
     );
     expect(deps.resolveCompanyDomainViaWebSearch).toHaveBeenCalled();
   });
+
+  it('FAIL CASE: a stale placeholder lead.emailDomain must not re-enter resolution once the email itself is dropped', async () => {
+    // A lead enriched before this guard existed can carry emailDomain:
+    // 'example.com' independently of email (Tier 0.5 persists it separately —
+    // see enrichmentIdentityResolver.ts's `resolved.emailDomain` writes). The
+    // placeholder email is dropped as usual, but the stale field must not
+    // re-introduce the same domain to Apollo, enrich.so or web search.
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'seed@example.com',
+          emailDomain: 'example.com',
+          firstName: 'Jane',
+          lastName: 'Doe',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+    expect(deps.enrichSoFindEmail).not.toHaveBeenCalled();
+    expect(deps.apolloBrokerChain).not.toHaveBeenCalled();
+    expect(deps.findEmailViaPatterns).not.toHaveBeenCalled();
+  });
 });
