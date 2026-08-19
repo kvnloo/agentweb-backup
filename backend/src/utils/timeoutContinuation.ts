@@ -208,21 +208,29 @@ export function hasPersistedMediaBudgetDeferral(
  * condition from session history alone — no new persistence — and re-fire the resume.
  *
  * Deliberately looks ONLY at the LAST message (cheap enough to call from a
- * frequently-polled endpoint) and requires it to be one of THREE shapes an unresolved
+ * frequently-polled endpoint) and requires it to be one of FOUR shapes an unresolved
  * media pause actually leaves behind:
  *  - the whole-turn-timeout partial-delivery notice, tagged `mediaBudgetDeferred: true`
  *    (added alongside `kind: 'generation-timeout-continuation'` specifically for this —
  *    the generic non-media salvage variant shares the same `kind` but is NOT tagged, so
  *    it correctly returns false here)
  *  - the model's own successful reply whose toolCalls ledger still shows a deferred call
+ *  - the RAW tool-role deferral marker toolDispatch persists the instant it defers
+ *    (CodeRabbit, PR #2479): incremental checkpointing can persist this marker BEFORE
+ *    the model's own follow-up narration is ever composed, so a process death in exactly
+ *    that window leaves it as the tail — a shape neither of the two assistant-authored
+ *    checks above matches. Safe to key off `mediaBudgetDeferred` alone here: toolDispatch
+ *    only ever sets that flag for a genuine media-budget pause — a handler-supplied
+ *    deferral (e.g. ENG-822's anonymous-account-scoped refusal) is deliberately left
+ *    untagged, so it can never be mistaken for a resumable timing pause.
  *  - OUR OWN synthetic auto-continuation directive (role: 'user', kind:
  *    'auto-continuation') dangling with no reply — a process death can kill the
  *    continuation's own turn AFTER it persists that directive but BEFORE it replies,
- *    which neither of the two assistant-authored shapes above matches (verified live:
- *    killing the backend right after the directive saved left getSession blind to it
- *    until this branch was added). Scoped to the `auto-continuation` kind specifically —
- *    a REAL customer message dangling with no reply is a different, unrelated problem
- *    and must never be mistaken for a media pause.
+ *    which none of the shapes above matches (verified live: killing the backend right
+ *    after the directive saved left getSession blind to it until this branch was added).
+ *    Scoped to the `auto-continuation` kind specifically — a REAL customer message
+ *    dangling with no reply is a different, unrelated problem and must never be mistaken
+ *    for a media pause.
  * Anything else — including the round-cap exhaustion notice (`kind:
  * 'auto-continuation-exhausted'`) superseding an earlier pause — returns false, so this
  * can never retry forever once the bounded round cap has already given up once.
@@ -245,8 +253,10 @@ export function hasUnresolvedMediaDeferral(
   if (!last) return false;
   const isUnresolvedShape = last.role === 'user'
     ? last.metadata?.kind === 'auto-continuation'
-    : last.role === 'assistant'
-      && (last.metadata?.mediaBudgetDeferred === true || hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls));
+    : last.role === 'tool'
+      ? last.metadata?.mediaBudgetDeferred === true
+      : last.role === 'assistant'
+        && (last.metadata?.mediaBudgetDeferred === true || hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls));
   if (!isUnresolvedShape) return false;
   if (sinceMs <= 0) return true;
   const rawTs = last.timestamp || last.metadata?.timestamp;

@@ -945,11 +945,21 @@ async function scheduleAutoMediaContinuation(
     }).catch((persistErr) =>
       console.error('AgentMode: failed to persist auto-continuation-exhausted message:', persistErr),
     );
-    const { io } = await import('../server');
-    io.to(`user:${userId}`).emit('session-message-appended', {
-      sessionId,
-      message: { role: 'assistant', content: exhaustedMsg },
-    });
+    // CodeRabbit (PR #2479): this ran unguarded — scheduleAutoMediaContinuation must
+    // never reject (it's always invoked as a floating promise; see the .catch below
+    // and every setImmediate kickoff site), but an emit failure here would reject it
+    // anyway, and an unhandled rejection on a fire-and-forget call crashes the whole
+    // backend process under Node's default --unhandled-rejections=throw, not just this
+    // one session's turn.
+    try {
+      const { io } = await import('../server');
+      io.to(`user:${userId}`).emit('session-message-appended', {
+        sessionId,
+        message: { role: 'assistant', content: exhaustedMsg },
+      });
+    } catch (emitErr) {
+      console.error(`AgentMode: failed to emit auto-continuation-exhausted message for session ${sessionId}:`, emitErr);
+    }
     await sendAgentModeOncallAlert({
       subject: 'Media auto-continuation exhausted its retry cap',
       message:
@@ -1069,7 +1079,13 @@ async function scheduleAutoMediaContinuation(
       autoContinuationSessions.delete(sessionId);
       releaseSessionGeneration(sessionId);
       if (stillDeferred) {
-        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1);
+        // CodeRabbit (PR #2479): defense-in-depth — the function should never reject
+        // (the try/catch above now guards its one known throw point), but every
+        // fire-and-forget call site catches defensively anyway, so a future,
+        // unanticipated throw logs instead of becoming an unhandled rejection.
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1).catch((chainErr) =>
+          console.error(`AgentMode: media auto-continuation chain failed for session ${sessionId}:`, chainErr),
+        );
       }
     });
 }
@@ -7092,6 +7108,8 @@ export const agentModeController = {
           session.userId,
           session.llmModel || agentModeService.default_model,
           1,
+        ).catch((err) =>
+          console.error(`AgentMode: media auto-continuation (durability backstop) failed for session ${session.sessionId}:`, err),
         ));
       }
 
@@ -7616,7 +7634,9 @@ export const agentModeController = {
               // slow turn that merely made images along the way doesn't get an unwanted
               // extra continuation call.
               if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs)) {
-                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1));
+                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+                  console.error(`AgentMode: media auto-continuation (whole-turn timeout) failed for session ${sessionId}:`, err),
+                ));
               }
               return;
             }
@@ -7664,7 +7684,9 @@ export const agentModeController = {
       // past this request's own `finally` below, so scheduleAutoMediaContinuation
       // claims the generation lock only after THIS request has released it.
       if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
-        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1));
+        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1).catch((err) =>
+          console.error(`AgentMode: media auto-continuation (soft deferral) failed for session ${sessionId}:`, err),
+        ));
       }
 
       // Compute page invalidations for emma-sidebar sessions so the frontend
@@ -8640,7 +8662,9 @@ export const agentModeController = {
             if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
               const continuationUserId = timedOutSession!.userId;
               const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
-              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1));
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1).catch((err) =>
+                console.error(`AgentMode: media auto-continuation (ishare whole-turn timeout) failed for session ${shareId}:`, err),
+              ));
             }
             return;
           }

@@ -1160,7 +1160,15 @@ export async function executePreparedTools(
         role: 'tool',
         name: toolCall.function.name,
         content: deferContent,
-        metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+        // CodeRabbit (PR #2479): mediaBudgetDeferred must mean exactly what it says — a
+        // genuine per-turn media time-budget pause — not any deferral. A handler-supplied
+        // deferral (ENG-822's anonymous-account-scoped refusal, or any future one) carries
+        // its own unrelated reason and is a deliberate, permanent policy decision, never
+        // meant to be auto-retried. Durability checks (hasPersistedMediaBudgetDeferral,
+        // hasUnresolvedMediaDeferral) key off exactly this flag to decide whether to
+        // auto-resume, so tagging it unconditionally would have made those checks retry a
+        // policy refusal as if it were a timing issue.
+        metadata: { timestamp: new Date().toISOString(), ...(handlerDeferral ? {} : { mediaBudgetDeferred: true }) },
       });
     } else {
       const { toolCall, functionArgs, error, duration } = toolResult;
