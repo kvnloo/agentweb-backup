@@ -400,20 +400,21 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
 
   // ENG-1045 follow-up: a grant for post_on_connected_account alone used to leave the
   // model believing twitter_manage_post was categorically off-limits, so it never
-  // attempted the thread/reply/quote-tweet route the completion checker's equivalence
-  // fix exists to credit — live-verified on preview 2026-08-17 (the model narrated
-  // "only pre-authorized to publish using post_on_connected_account" and silently
+  // attempted the thread route the completion checker's equivalence fix exists to
+  // credit — live-verified on preview 2026-08-17 (the model narrated "only
+  // pre-authorized to publish using post_on_connected_account" and silently
   // collapsed a requested 2-tweet thread into one tweet).
   it('tells the model the equivalent-outcome route is ALSO covered by the same grant', () => {
     const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
     expect(scoped).toContain('twitter_manage_post');
-    expect(scoped).toContain('post_thread/reply/quote_tweet only');
+    expect(scoped).toContain('post_thread only');
     expect(scoped.toLowerCase()).toContain('do not silently shrink or merge');
   });
 
-  // retweet is deliberately NOT part of the equivalence route (it reshares someone
-  // else's content, a different act from the mandated publish) — the directive must
-  // not blanket-authorize the whole tool.
+  // reply/quote_tweet/retweet are deliberately NOT part of the equivalence route
+  // (each responds to or reshares someone ELSE's content, not the schedule's own
+  // mandated content going out, ENG-1276 follow-up) — the directive must not
+  // blanket-authorize the whole tool.
   it('does not blanket-name the equivalent tool as fully authorized — only its specific actions', () => {
     const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
     expect(scoped).not.toContain('you MUST call post_on_connected_account / twitter_manage_post');

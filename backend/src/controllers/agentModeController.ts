@@ -28,7 +28,9 @@ import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePu
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
+import { ACCOUNT_DISCONNECTED_STATUS, MAX_CONSECUTIVE_ACCOUNT_SKIPS, AccountGateResult, buildAccountSkipReason, countTrailingAccountSkips, evaluateAccountGate } from '../utils/scheduledRunAccountGate';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -85,6 +87,7 @@ import {
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
+import { emmaToolRegistry } from '../emma/registry';
 import { DynamoDB } from 'aws-sdk';
 import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
 import {
@@ -329,27 +332,19 @@ async function resolveEffectiveModelForUser(input: {
     supportedModelIds,
     policy: usage.policy,
   });
-  let transientFallbackModel: string | null | undefined;
-  let transientFallbackSource: ModelBackupSource | null | undefined;
-  if (usage.mode.usageMode === 'optimized') {
-    const optimizedModels = new Set(usage.policy?.optimizedModelIds || []);
-    const fallback = [
-      decision.backupModel
-        ? { model: decision.backupModel, source: (decision.backupSource || 'system') as ModelBackupSource }
-        : null,
-      usage.policy?.optimizedDefaultModel
-        ? { model: usage.policy.optimizedDefaultModel, source: 'system' as ModelBackupSource }
-        : null,
-      ...[...optimizedModels].map((model) => ({ model, source: 'system' as ModelBackupSource })),
-    ].find((candidate): candidate is { model: string; source: ModelBackupSource } => Boolean(
-      candidate &&
-      candidate.model !== decision.effectiveModel &&
-      optimizedModels.has(candidate.model) &&
-      supportedModelIds.includes(candidate.model)
-    ));
-    transientFallbackModel = fallback?.model || null;
-    transientFallbackSource = fallback?.source || null;
-  }
+  // ENG-1211: the policy-owned transient fallback existed only to keep an
+  // optimized-mode retry inside the cheap catalog. With optimized mode deleted
+  // these stay `undefined`, which `getBackupModel` reads as "preserve the
+  // admin-managed global backup" — i.e. a transient provider failure retries the
+  // way it did before usage caps, unconstrained by any catalog.
+  //
+  // Consequence worth knowing: the audit branch that rewrote the session's model
+  // when a policy fallback answered is now unreachable, so a global-backup retry
+  // is not written back to the session. That is pre-existing behavior for the
+  // unrestricted path, not a new gap — recording the model that actually ran on
+  // every path is ENG-1205 AC1.
+  const transientFallbackModel: string | null | undefined = undefined;
+  const transientFallbackSource: ModelBackupSource | null | undefined = undefined;
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
@@ -362,7 +357,7 @@ async function resolveEffectiveModelForUser(input: {
 async function resolveScheduleBackup(input: {
   userId: string;
   requestedBackupModel?: string | null;
-}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
+}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource | null; llmBackupNeedsConfirmation: boolean }> {
   const usage = await getEffectiveLlmUsagePolicy(input.userId);
   const scheduledDefault = typeof agentModeService.getScheduledChatsDefaultModel === 'function'
     ? await agentModeService.getScheduledChatsDefaultModel()
@@ -373,28 +368,29 @@ async function resolveScheduleBackup(input: {
     : [input.requestedBackupModel, systemDefaultModel].filter((model): model is string => Boolean(model));
   const supported = new Set(supportedModelIds);
   const requested = input.requestedBackupModel?.trim();
-  const optimized = new Set(usage.policy?.optimizedModelIds || []);
-  if (requested && supported.has(requested) && (!usage.policy || optimized.has(requested))) {
-    return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
+
+  // ENG-1211: a backup is now only ever a user's explicit preference, and nothing
+  // below the hard cap consults it. Two behaviors are therefore deleted:
+  //
+  //  1. Inventing a system default when none was asked for. That is what
+  //     stamped `gemini-3.1-flash-lite` + `needsConfirmation: true` onto 177
+  //     rows, and leaving it in would keep manufacturing dead artifacts and
+  //     corrupting ENG-1209's inventory with rows nobody chose.
+  //  2. Rejecting a requested backup for not being in the optimized catalog.
+  //     Restricting which models a user may pick, below the hard cap, is exactly
+  //     the class of behavior AC1 removes — the catalog no longer gates anything.
+  //
+  // A requested model is still validated against the supported registry, because
+  // an unknown id would fail at dispatch rather than at configuration time.
+  if (!requested) {
+    return { llmBackupModel: '', llmBackupSource: null, llmBackupNeedsConfirmation: false };
   }
-  if (requested) {
-    const error = new Error('Backup model is not available for optimized usage');
+  if (!supported.has(requested)) {
+    const error = new Error(`Backup model '${requested}' is not a supported model`);
     error.name = 'InvalidScheduledBackupModelError';
     throw error;
   }
-  const configuredDefault = usage.policy?.optimizedDefaultModel || systemDefaultModel;
-  if (
-    !configuredDefault ||
-    !supported.has(configuredDefault) ||
-    (usage.policy && !optimized.has(configuredDefault))
-  ) {
-    throw new Error('No valid optimized backup model is configured for this account');
-  }
-  return {
-    llmBackupModel: configuredDefault,
-    llmBackupSource: 'system',
-    llmBackupNeedsConfirmation: true,
-  };
+  return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
 }
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
@@ -549,18 +545,138 @@ export function zeroAssistantIncompleteMessage(error: unknown): string {
 // run-history panel. getScheduledChats deliberately strips the full runResults array
 // for payload size, so the client can't derive this itself; we compute it server-side.
 export interface ScheduleRunHealth {
-  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  // Widened to the statuses runScheduledChat can actually store: computeScheduleRunHealth
+  // forwards `last.status` verbatim, so any status the run path writes can appear here.
+  // 'skipped_no_content' (ENG-1259) already exceeded the old union; 'skipped_account_disconnected'
+  // (ENG-1197) would have been the second.
+  lastRunStatus:
+    | 'success'
+    | 'failure'
+    | 'pending_user_input'
+    | 'skipped_no_content'
+    | 'skipped_account_disconnected'
+    | null;
   lastRunAt: string | null;
   // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
   // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
   // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
   consecutiveFailures: number;
+  // ENG-1131: why the most recent run could not do its real work, when it could
+  // not. Distinct from `lastRunStatus` on purpose: a prospecting run blocked by
+  // the LinkedIn people-search outage still writes a report and still records
+  // `status: 'success'`, so the owner's card is green while sourcing is down.
+  // Null when the last run was unblocked.
+  lastRunBlockedBy: string | null;
+}
+
+// ENG-1131: defined in ./utils/scheduleRunBlockedReason (not here) so
+// emailService.ts can also import it without a circular dependency — this
+// controller already imports emailService. Re-exported below (as a normal
+// import + export, not `export ... from`, so detectRunBlockedReason further
+// down can still reference it as a local binding) so existing importers of
+// this constant from this file keep working.
+export { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON };
+
+/**
+ * ENG-1131: read the run's tool ledger for proof that its sourcing path was down.
+ *
+ * The ENG-975 guard stamps `searchUnavailable: true` on the tool result once a
+ * maximally broad control query has confirmed the account cannot search — so this
+ * can never fire on a search that genuinely matched nobody. `linkedin_outreach`
+ * raises it with `success: false` (the dispatcher downgrades that entry to an
+ * error but still stores its minimal result), `find_leads` raises it on a
+ * `success: true` response; both are read the same way here.
+ */
+// The only tools the ENG-975 guard is wired into. Checked by name, not just by
+// the presence of `searchUnavailable`, so an unrelated tool whose result
+// object happens to carry a field with that exact name can never be
+// misattributed as a LinkedIn search outage (CodeRabbit, PR #2383).
+const LINKEDIN_SOURCING_TOOL_NAMES = new Set(['linkedin_outreach', 'find_leads']);
+
+export function detectRunBlockedReason(toolCalls: any[] | undefined | null): string | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const blocked = toolCalls.some(
+    (call: any) => call && typeof call === 'object'
+      && LINKEDIN_SOURCING_TOOL_NAMES.has(call.name)
+      && call.result?.searchUnavailable === true,
+  );
+  return blocked ? LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON : null;
+}
+
+// ENG-1131 follow-up: minimum real time since the schedule's last observed
+// blocked-state transition before alerting on a new one. Guards against a
+// borderline account whose search-capability probe oscillates right at its
+// pass/fail boundary (or a burst of manual re-tests) firing an alert on every
+// toggle. Short enough that a genuine new/distinct outage is still reported
+// promptly (worst case: delayed by less than this window).
+const DEFAULT_SOURCING_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * ENG-1131 follow-up: true when this run's blocked-state differs from the
+ * IMMEDIATELY PRECEDING run's — i.e. an edge, not a level. `priorRunResults`
+ * is the schedule's history from BEFORE this run (its last element is the
+ * previous run); `currentBlockedBy` is this run's own `detectRunBlockedReason`
+ * result.
+ *
+ * Deliberately edge-triggered so a schedule can proactively alert its owner
+ * the moment sourcing breaks or recovers, without alerting again on every
+ * subsequent run of a multi-day outage — that would just be spam once the
+ * owner already knows. A schedule's very first run counts as a transition
+ * into the blocked state (no prior run = treated as previously healthy), but
+ * not a transition if its first run is healthy.
+ *
+ * Anti-flap cooldown: an edge is only reported if the schedule's most recent
+ * PRIOR transition (found by scanning the full history, not just the last
+ * run) happened at least `cooldownMs` ago. This deliberately does NOT require
+ * N consecutive consistent prior runs — a genuinely settled "broke, fully
+ * recovered, broke again" sequence separated by real time must still alert;
+ * only rapid back-to-back toggling is dampened. No known prior-transition
+ * timestamp (old fixtures with no `createdAt`, or nothing found) never
+ * suppresses — cooldown can only apply against a timestamp we actually have.
+ */
+export function didSourcingBlockStateChange(
+  priorRunResults: any[] | undefined | null,
+  currentBlockedBy: string | null,
+  options: { now?: string | number | Date; cooldownMs?: number } = {},
+): boolean {
+  const results = Array.isArray(priorRunResults) ? priorRunResults : [];
+  if (results.length === 0) {
+    return Boolean(currentBlockedBy);
+  }
+  const last = results[results.length - 1];
+  const previousBlockedBy = last && typeof last === 'object' ? last.blockedBy : undefined;
+  if (Boolean(currentBlockedBy) === Boolean(previousBlockedBy)) {
+    return false;
+  }
+
+  // Scan the WHOLE history once for the most recent point where blocked-state
+  // itself changed run-over-run, to find when the state we're about to leave
+  // actually began.
+  let priorState: boolean | undefined;
+  let lastTransitionAt: number | null = null;
+  for (const run of results) {
+    const state = Boolean(run && typeof run === 'object' ? run.blockedBy : undefined);
+    if (priorState !== undefined && state !== priorState) {
+      const parsed = run && typeof run === 'object' ? Date.parse(run.createdAt) : NaN;
+      if (!Number.isNaN(parsed)) lastTransitionAt = parsed;
+    }
+    priorState = state;
+  }
+
+  if (lastTransitionAt !== null) {
+    const cooldownMs = options.cooldownMs ?? DEFAULT_SOURCING_ALERT_COOLDOWN_MS;
+    const now = options.now !== undefined ? new Date(options.now).getTime() : Date.now();
+    if (!Number.isNaN(now) && now - lastTransitionAt < cooldownMs) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
   const results = Array.isArray(runResults) ? runResults : [];
   if (results.length === 0) {
-    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null };
   }
   const last = results[results.length - 1] || {};
   let consecutiveFailures = 0;
@@ -572,6 +688,7 @@ export function computeScheduleRunHealth(runResults: any[] | undefined | null): 
     lastRunStatus: last.status ?? null,
     lastRunAt: last.createdAt ?? null,
     consecutiveFailures,
+    lastRunBlockedBy: last.blockedBy ?? null,
   };
 }
 
@@ -1530,11 +1647,23 @@ const WEEKDAY_WORD_TO_INDEX: Record<string, number> = {
   friday: 5, fri: 5,
   saturday: 6, sat: 6,
 };
-// Whole-token weekday matcher — full names or the exact accepted abbreviations,
-// never an arbitrary word that merely starts with those three letters.
-const WEEKDAY_TOKEN = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
-// A range like "Mon-Fri" / "Monday to Friday" / "Monday through Friday".
-const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// Whole-token weekday matcher — full names (singular OR plural — "publishes on
+// Wednesdays" is the single most natural way an owner phrases a recurring
+// cadence, and a fresh production live-verification for ENG-1276 found the
+// singular-only regex parsed that clause to zero days, silently dropping the
+// cadence and sending the run into the full 20-attempt retry press this ticket
+// exists to prevent) or the exact accepted abbreviations — never an arbitrary
+// word that merely starts with those three letters.
+const WEEKDAY_TOKEN = /\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// A range like "Mon-Fri" / "Monday to Friday" / "Mondays through Fridays".
+const WEEKDAY_RANGE = /\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sundays?|saturdays?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// Look up a matched weekday token's index, falling back to stripping a trailing
+// plural "s" when the exact token (e.g. "wednesdays") isn't itself a map key.
+function weekdayIndexFromToken(token: string): number | undefined {
+  const key = token.toLowerCase();
+  if (WEEKDAY_WORD_TO_INDEX[key] !== undefined) return WEEKDAY_WORD_TO_INDEX[key];
+  return key.endsWith('s') ? WEEKDAY_WORD_TO_INDEX[key.slice(0, -1)] : undefined;
+}
 
 // A singleton weekday counts as a cadence day only if what immediately follows it
 // marks it as a LIST ITEM — end of clause, a separator/connective, or a cadence
@@ -1566,8 +1695,8 @@ function weekdaysInFragment(fragment: string): number[] {
   const out: number[] = [];
   const followsHere = (matchEnd: number) => followsAsCadenceDay(fragment.slice(matchEnd));
   for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
-    const a = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
-    const b = WEEKDAY_WORD_TO_INDEX[m[2].toLowerCase()];
+    const a = weekdayIndexFromToken(m[1]);
+    const b = weekdayIndexFromToken(m[2]);
     if (a === undefined || b === undefined) continue;
     if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     for (let i = a, steps = 0; steps < 7; i = (i + 1) % 7, steps++) {
@@ -1576,7 +1705,7 @@ function weekdaysInFragment(fragment: string): number[] {
     }
   }
   for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
-    const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
+    const idx = weekdayIndexFromToken(m[1]);
     if (idx === undefined) continue;
     if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     out.push(idx);
@@ -1682,10 +1811,25 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 // anchor to the leading token — otherwise a write like `add_leads_to_list` or
 // `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
 // word. Irregular read names that don't lead with a read verb are listed exactly.
+// perform_data_analysis belongs here too (ENG-1276): it runs code on caller-supplied
+// data with no external side effects — the same as analyze_*/read_* — but its name
+// doesn't lead with a recognized verb, so without this it was misclassified as a
+// write and vetoed a legitimate skip whose FIRST step is calling it to compute
+// today's weekday (real prod session 17834849…, 2026-08-16).
 const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
-const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search', 'perform_data_analysis']);
+// ENG-1276 follow-up: the exact-name allowlist above is reactive — it only grows
+// once a new read-only tool's odd name has ALREADY broken a real schedule
+// (perform_data_analysis was one such case). perform_deep_research is a live,
+// still-unpatched analog: same "no external side effects" shape, same
+// non-read-verb name, just not yet observed breaking a run. Rather than wait for
+// that, the tool's OWN registration can declare `readOnly: true` (see
+// McpToolHandler in mcp/server/registry.ts) when EVERY possible call is
+// side-effect-free, and this consults it. Checked last, after the free name
+// checks — cheaper and requires no registry state for the common case.
 function isReadOnlyToolName(name: string): boolean {
-  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+  if (READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name)) return true;
+  return emmaToolRegistry.getTool(name)?.readOnly === true;
 }
 function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
@@ -1883,10 +2027,115 @@ export function scheduledRunSignalsConditionalSkip(
   // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
   // often, never less — and the real production ledger is unaffected because every
   // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  // A NEGATED failure/error mention — "not by failure", "no errors", "without any
+  // failure", "not a single failure", "never any failure" — DENIES a failure
+  // happened; it is not evidence of one. HARD_FAILURE_PATTERNS below matches
+  // these words ANYWHERE in the turn with no negation awareness, so a clean skip
+  // that merely denies a failure ("Posts published: 0 (by design, not by
+  // failure)") tripped the veto exactly like a real failure would (real prod
+  // regression, session 7f95530d, 2026-08-15 — the run made ZERO tool calls and
+  // still hit the 20-attempt nudge cap, ENG-1276 follow-up).
+  //
+  // A tempered greedy token, not a fixed adjacency pattern: the negation cue,
+  // then any run of text that does NOT cross a clause boundary, then the
+  // failure/error word. An earlier version only matched the cue landing
+  // DIRECTLY on the noun (an optional article/"by", nothing else), which caught
+  // "not by failure" but missed equally natural phrasings like "not a SINGLE
+  // failure" or "no REAL error" — the same underlying bug, just a wording the
+  // model hadn't happened to use yet (ENG-1276 follow-up #2).
+  //
+  // The clause-boundary exclusion is what keeps this fail-CLOSED as the span
+  // widens: a negation cue must never reach ACROSS a semicolon/sentence break or
+  // a contrastive conjunction ("but"/"however"/"though"/"yet"/"except") to
+  // neutralize an unrelated, genuine failure on the far side — "not a great day,
+  // BUT the post failed to publish" and "no post today; auth failed" both stop
+  // the match before reaching "failed", so it stays intact and still vetoes.
+  // Matching is also non-overlapping and left-to-right, so once a match
+  // consumes up to its NEAREST failure word, a later, un-negated failure word in
+  // the same sentence (no cue of its own) is untouched — "not a failure of the
+  // schedule, but image generation failed" neutralizes only the first mention.
+  //
+  // Two more guards, found on a fresh adversarial re-audit (ENG-1276 follow-up
+  // #3) of the widening above — NOT a production incident, but a real gap in
+  // the same direction as the one that already broke twice:
+  //   (1) A BARE "no" immediately followed by a comma is grammatically an
+  //       INTERJECTION introducing an independent clause ("the answer is no;
+  //       separately, X happened"), not a negator of whatever follows it.
+  //       Without this, "No, unfortunately, today's run failed for unknown
+  //       reasons." bridged clean across the comma (no "but"/semicolon in the
+  //       way) and wrongly neutralized a genuine, unrelated failure.
+  //       Deliberately scoped to "no" ONLY, not "not"/"never"/"without" — an
+  //       independent review (ENG-1276 follow-up, not a production incident)
+  //       found that those three keep negating ACROSS a comma-set-off
+  //       parenthetical ("Without, admittedly, any failure occurring..." still
+  //       means no failure happened), so excluding the comma there wrongly
+  //       reverted legitimate cases to vetoing.
+  //   (2) The span is capped at 20 characters — every legitimate case here
+  //       needs at most ~9 ("a single ") — as an independent backstop. This
+  //       is a DELIBERATE trade-off, not just a safety margin: the same review
+  //       found the cap also blocks a long parenthetical after "never"/"not"
+  //       ("Never, in this case, did we see a failure" — 28 characters to the
+  //       failure word), which stays un-neutralized (an unusual phrasing still
+  //       causes a retry — safe direction). Widening the cap to accommodate
+  //       that would reopen a MORE realistic and MORE dangerous gap in the
+  //       other direction: "Not entirely sure why the deployment failed
+  //       today" is a genuine failure report (the hedge is about the CAUSE,
+  //       not a denial it happened) that must NOT get silently waived.
+  //
+  // DOUBLE NEGATION (found on the same review, not a production incident):
+  // "It is not true that there was no failure today" re-asserts a real
+  // failure, but a single-pass regex only sees the INNER "no failure" and has
+  // no concept of the OUTER negation flipping it back. Properly PARSING this
+  // would mean tracking negation-of-negation depth — a materially bigger,
+  // riskier change bolted onto an already-layered pattern, for phrasing that
+  // doesn't match any real production transcript behind this function's other
+  // tests (every one is direct: "Sunday. No.", "not by failure"). Instead this
+  // FAILS CLOSED: neutralizeNegatedFailureMentions() below skips any SENTENCE
+  // that itself negates a truth claim ("it is not true that...", "that's
+  // false...") entirely — a failure word inside such a sentence is left
+  // untouched and still vetoes via the normal HARD_FAILURE_PATTERNS check.
+  // Safe because it doesn't need to understand the sentence, only recognize
+  // the shape and decline to be clever about it — the dangerous direction
+  // (silently waiving a real failure) is closed even without real parsing.
+  //
+  // UNCERTAINTY HEDGE (independent CodeRabbit review finding, ENG-1276): "not
+  // sure it failed" / "not certain there was an error" express UNCERTAINTY
+  // about whether a failure happened — fundamentally different from "not by
+  // failure" (a confident DENIAL). Without excluding these, a cadence response
+  // with NO tool calls could get accepted as a clean skip even though the
+  // actual outcome is unresolved — the dangerous direction again. The 20-char
+  // span cap only accidentally blocked the one longer example already covered
+  // ("Not entirely sure why the deployment failed today" — coincidence of word
+  // count, not real understanding), so a shorter phrasing like "not sure it
+  // failed" needed its own explicit guard: reject the cue when immediately
+  // followed by an uncertainty word.
+  const NEGATED_FAILURE_MENTION =
+    /\b(?:no(?!\s*,)|not|never|without)\b(?!\s+(?:sure|certain|confident|convinced|clear)\b)(?:(?!\b(?:but|however|though|yet|except|excluding)\b)[^.;!?\n—–:]){0,20}?\b(?:failed|failures?|errors?|errored)\b/gi;
+  // "not" is REQUIRED before true/the case/accurate/correct — self-caught on a
+  // fresh re-audit before shipping: an earlier version made it optional
+  // ((?:not\s+)?), so a plain, non-negated "it is true that there was no
+  // failure" also matched this meta-negation shape and wrongly suppressed
+  // neutralization for a legitimate, single-negation denial. Over-cautious
+  // (still vetoes when it could safely waive) rather than dangerous, but still
+  // a real behavior change from what the earlier negation audits establish —
+  // "isn't/wasn't" already carry the negation in the contraction, so they get
+  // their own branch with no separate "not" required.
+  const META_NEGATION_OF_TRUTH =
+    /\b(?:is|was)\s+not\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:isn['’]?t|wasn['’]?t)\s+(?:true|the\s+case|accurate|correct)\s+that\b|\b(?:that['’]?s|that\s+is|it['’]?s|it\s+is)\s+false\b|\bfalse\s+that\b/i;
+  function neutralizeNegatedFailureMentions(input: string): string {
+    return input
+      .split(/([.;!?\n]+)/)
+      .map((segment, i) =>
+        i % 2 === 1 || META_NEGATION_OF_TRUTH.test(segment) ? segment : segment.replace(NEGATED_FAILURE_MENTION, ' ')
+      )
+      .join('');
+  }
   const failureScan = expandContractions(
-    text
-      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    neutralizeNegatedFailureMentions(
+      text
+        .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+        .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
+    )
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
@@ -2621,10 +2870,24 @@ export async function runVerifiedChat(
   // remaining attempt — with a SECOND, irreversible post to a live timeline as the
   // only way to clear it. countCallsSatisfyingRequirement keeps exact-name matching
   // and additionally credits a SUCCESSFUL equivalent publish route.
+  //
+  // ENG-1276 (CodeRabbit): a schedule that requires BOTH names of an equivalence
+  // pair (e.g. post_on_connected_account AND twitter_manage_post, or email AND
+  // send_email_from_sender) as separate line items wants two distinct actions, not
+  // one call silently satisfying both — requiredFunctionNames lets
+  // countCallsSatisfyingRequirement suppress the equivalence credit in exactly that
+  // case; the exact-name match still credits the call toward its own requirement.
+  // Captured ONCE here and does not shrink if consent narrows mid-run — investigated
+  // and left as-is (ENG-1276): the FINAL persisted record re-derives its own held-to
+  // list fresh from `effectivePublishAuthorization` (see `heldToFunctionNames` in
+  // runScheduledChat), so THAT value — the one the owner actually sees — is never
+  // stale. This list only feeds the double-credit suppression, and a stale (wider)
+  // list there can only make suppression MORE conservative, never double-credit.
+  const requiredFunctionNames = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
   const countCallsForRequirement = (
     functionName: string,
     calls: RequiredCallLedgerEntry[]
-  ): number => countCallsSatisfyingRequirement(functionName, calls);
+  ): number => countCallsSatisfyingRequirement(functionName, calls, requiredFunctionNames);
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -3464,6 +3727,168 @@ async function notifyScheduleOwnerOfFailure(
   }
 }
 
+/**
+ * Wiring only — the decision lives in `scheduledRunAccountGate.evaluateAccountGate`
+ * so it can be tested without standing up a scheduled run (ENG-1197). Same split as
+ * the ENG-1259 pre-check gate.
+ */
+async function evaluateLinkedInAccountGate(
+  schedule: any,
+  userId: string,
+): Promise<AccountGateResult> {
+  return evaluateAccountGate(schedule?.startingMessage, userId, {
+    listUnipileAccounts: async (uid) => {
+      const { getAccountsByUserId } = await import('../services/connectedAccountsDb');
+      return (await getAccountsByUserId(uid)).filter((acc: any) => acc.platform === 'unipile') as any;
+    },
+    probeSession: async (accountId) => {
+      const { linkedInOutreachService } = await import('../services/linkedInOutreachService');
+      return linkedInOutreachService.probeAccountSession(accountId);
+    },
+  });
+}
+
+/**
+ * Stop a schedule that has now been skipped for a disconnected account this many
+ * times in a row. Best-effort and loudly logged: failing to pause leaves the
+ * schedule skipping cheaply, which is a tolerable end state, so this must never
+ * break the run path.
+ */
+async function pauseScheduleForDisconnectedAccount(
+  schedule: any,
+  userId: string,
+  consecutiveSkips: number,
+  gate: AccountGateResult,
+): Promise<void> {
+  try {
+    await scheduleDb.updateSchedule(schedule.scheduleId, {
+      status: 'paused',
+      // Marks WHY, so a later reconnect can resume exactly the schedules this gate
+      // stopped and nothing a human paused deliberately (ENG-1197).
+      pausedReason: 'linkedin_disconnected',
+      updatedAt: new Date().toISOString(),
+    } as any);
+    console.error(
+      `runScheduledChat: PAUSED schedule ${schedule.scheduleId} — ${consecutiveSkips} consecutive runs `
+      + `skipped for disconnected LinkedIn Outreach account(s) ${gate.accountIds.join(', ')}.`,
+    );
+    // Unlike the per-run skip, a pause is a state change the owner cannot infer
+    // from anything they already received, so it gets its own message.
+    //
+    // Deliberately NOT notifyScheduleOwnerOfFailure: that sends the generic
+    // run-failed email, which says the schedule "will not be retried until its next
+    // scheduled run" and, for the 'system' class, to contact support. Both are wrong
+    // here — a paused schedule has no next run, and the remedy is a reconnect plus
+    // re-enabling it, not support.
+    try {
+      const recipients: string[] = Array.isArray(schedule.emailNotifications)
+        ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+        : [];
+      // The owner is UNIONED in, not used as a fallback. Only the account owner can
+      // re-authenticate and re-enable the schedule, so a schedule configured to
+      // report to, say, marketing@company.com would otherwise stop permanently
+      // without the one person who can restart it ever being told.
+      const { userDb } = await import('../services/db');
+      const owner = await userDb.getUserById(userId).catch(() => null);
+      const notifyEmails = Array.from(new Set(
+        [...recipients, owner?.email].filter((e): e is string => typeof e === 'string' && !!e.trim()),
+      ));
+      if (notifyEmails.length > 0) {
+        const { emailService } = await import('../services/emailService');
+        // Read the real disconnect time rather than stamping "now": the account has
+        // typically been dead for several runs by the time a pause fires, and telling
+        // the customer it just dropped is both wrong and unhelpful for diagnosis.
+        const { getUnipileHealth } = await import('../services/linkedInConnectionHealth');
+        const health = gate.accountIds[0]
+          ? await getUnipileHealth(gate.accountIds[0], userId).catch(() => null)
+          : null;
+        // Falling back to "now" would say the account dropped this instant, which is
+        // the opposite of true by the time five runs have been skipped — and is
+        // exactly what the comment above says this email must not do. The oldest
+        // trailing skip is a real lower bound on how long this has been broken.
+        const trailingSkipResults = Array.isArray(schedule.runResults)
+          ? schedule.runResults.filter((r: any) => r?.status === ACCOUNT_DISCONNECTED_STATUS)
+          : [];
+        const oldestSkipAt = trailingSkipResults.length > 0
+          ? trailingSkipResults[0]?.createdAt
+          : undefined;
+        const disconnectedAt = health?.disconnected_at || oldestSkipAt || undefined;
+        const since = disconnectedAt ? Date.parse(disconnectedAt) : NaN;
+        const daysDisconnected = Number.isFinite(since)
+          ? Math.max(0, Math.floor((Date.now() - since) / (24 * 60 * 60 * 1000)))
+          : 0;
+        await emailService.sendLinkedInAccountDisconnectedEmail(notifyEmails, {
+          accountName: gate.accountNames[0] || 'your LinkedIn Outreach account',
+          disconnectedAt,  // may be undefined — the email omits the line rather than inventing one
+          isReminder: true,
+          // These are different units and were previously conflated: the copy read
+          // "N days of skipped runs" off a RUN count. A schedule firing every 3 days
+          // understated it threefold; one firing twice a day overstated it.
+          daysDisconnected,
+          skippedRunCount: consecutiveSkips,
+          pausedScheduleName: schedule.scheduleName,
+        });
+      }
+    } catch (notifyError) {
+      console.error(`Failed to send pause notification for ${schedule.scheduleId}:`, notifyError);
+    }
+    await sendAgentModeOncallAlert({
+      subject: `Schedule paused — LinkedIn Outreach account disconnected: ${schedule.scheduleName}`,
+      message:
+        `Schedule ${schedule.scheduleId} was paused after ${consecutiveSkips} consecutive runs skipped `
+        + `because its pinned Unipile account(s) ${gate.accountIds.join(', ')} have no live LinkedIn `
+        + `session. It will not resume until someone reactivates it, so a reconnect alone is no longer enough.`,
+      context: { scheduleId: schedule.scheduleId, userId, accountIds: gate.accountIds },
+      dedupeKey: `schedule_paused_unipile:${schedule.scheduleId}`,
+      dedupeWindowMs: 24 * 60 * 60 * 1000,
+    });
+  } catch (error) {
+    console.error(`Failed to pause schedule ${schedule.scheduleId} for disconnected account:`, error);
+  }
+}
+
+/**
+ * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+ * schedule's LinkedIn sourcing capability changes state — call only when
+ * `didSourcingBlockStateChange` is true, so this fires once per transition,
+ * not once per run of a multi-day outage. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort
+ * by design — a notification failure must never break the run.
+ *
+ * Respects `schedule.disableSourcingBlockAlerts` — an owner opt-out for this
+ * specific alert. Does NOT affect the schedule-card badge, per-run emails, or
+ * run history, which stay on regardless (those are informational surfaces on
+ * data the owner is already looking at; this is the one that reaches into
+ * their inbox unprompted).
+ */
+async function notifyScheduleOwnerOfSourcingBlockTransition(
+  schedule: any,
+  userId: string,
+  detail: { isNowBlocked: boolean }
+): Promise<void> {
+  if (schedule.disableSourcingBlockAlerts === true) return;
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduleSourcingBlockTransitionEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail.isNowBlocked
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; sourcing-block transition alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send sourcing-block transition alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -3491,7 +3916,12 @@ export async function runScheduledChat(
   // invoking the primary generation model — distinct from 'failure' (which means
   // the full flow ran and did not meet its requirements) so cost/waste analysis
   // can tell the two apart without re-deriving it from message counts.
-  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content';
+  // ENG-1197: 'skipped_account_disconnected' likewise exits before the model, but
+  // for an external precondition rather than a judgement about content — the
+  // LinkedIn account the schedule pins has no live session, so the run cannot do
+  // the thing it exists to do. Kept separate from 'skipped_no_content' because the
+  // remedy is a customer reconnect, not a prompt or cadence change.
+  status: 'success' | 'failure' | 'pending_user_input' | 'skipped_no_content' | 'skipped_account_disconnected';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -3499,6 +3929,10 @@ export async function runScheduledChat(
   keywordMisses: string[];
   functionCallMatches: string[];
   functionCallMisses: string[];
+  // Pre-existing at runtime (finalFunctionCallDetails, ENG-947) but missing from
+  // this type until a test needed to assert on it directly (CodeRabbit review,
+  // ENG-1276) — declaring it changes no behavior, only lets TS see a field the
+  // object has always returned.
   functionCallDetails?: { [functionName: string]: { actual: number; required: number } };
   executionTime: number;
   sessionId: string;
@@ -3893,6 +4327,93 @@ export async function runScheduledChat(
         attempt: 0,
         createdAt: new Date().toISOString(),
       };
+    }
+
+    // ENG-1197: don't spend a run on an account that cannot act.
+    //
+    // This schedule fired daily against a LinkedIn account whose session LinkedIn
+    // had revoked. Each fire loaded skills, paged the CRM, ran discovery against a
+    // borrowed shared account, and sent nothing — ~$5 of model spend for a
+    // guaranteed no-op, recorded as a SUCCESS so no failure path ever fired.
+    //
+    // Placed AFTER the in-flight lease deliberately. Both prod instances dispatch
+    // the same schedule, and `addRunResult` is a blind `list_append` with no runId
+    // dedupe — so a gate sitting before the lease had BOTH dispatchers writing a
+    // skip row and both computing the same streak. That doubled every skip in
+    // `runResults` and made MAX_CONSECUTIVE_ACCOUNT_SKIPS arrive in about three
+    // fires instead of five, with two identical pause emails at the end of it. The
+    // lease already answers "who owns this run"; the loser has returned above
+    // without writing anything, so gating here needs no CAS of its own. Skipping
+    // returns through the outer `finally`, which clears the lease and the
+    // heartbeat, leaving the schedule free for its next fire.
+    //
+    // Still ahead of session creation, skill loading and the CRM paging, which is
+    // where the ~$5 actually goes.
+    //
+    // Never gates a test run or a resume. The ENG-1259 pre-check makes the same
+    // exclusion for the same reason: a human is waiting on a manual test and must
+    // see the flow exercised, not a silent no-op — and worse, a test skip would be
+    // written into runResults and inflate the very streak that triggers the
+    // auto-pause, so repeatedly testing a schedule could pause it. A resume is
+    // excluded because its session is already parked mid-flight; withholding it
+    // strands that session rather than saving anything.
+    const lastRunResult = Array.isArray(schedule.runResults) && schedule.runResults.length > 0
+      ? schedule.runResults[schedule.runResults.length - 1]
+      : null;
+    // Both markers, because they identify different parked runs. A `pending_user_input`
+    // result is a run waiting on the customer; `pendingResumeSessionId` is one the
+    // ENG-657/971 reconciler marked resumable after an abandoned run, whose last
+    // recorded result is typically a `failure`. Keying on the run result alone let
+    // that second kind reach the gate and be skipped — stranding exactly the
+    // mid-flight session this exclusion exists to protect.
+    const isResumingParkedRun =
+      lastRunResult?.status === 'pending_user_input' ||
+      (typeof schedule.pendingResumeSessionId === 'string' && !!schedule.pendingResumeSessionId);
+    const accountGate = (isTest || isResumingParkedRun)
+      ? { blocked: false, accountIds: [], accountNames: [] }
+      : await evaluateLinkedInAccountGate(schedule, userId);
+    if (accountGate.blocked) {
+      console.log(
+        `runScheduledChat: schedule ${schedule.scheduleId} skipped before invoking the model — `
+        + `pinned LinkedIn Outreach account(s) ${accountGate.accountIds.join(', ')} disconnected`,
+      );
+      const skipResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: ACCOUNT_DISCONNECTED_STATUS,
+        passed: false,
+        actualResponse: buildAccountSkipReason(accountGate.accountNames),
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        // The gate probes Unipile over the network, so this is not free. Reporting 0
+        // would hide it, and the sibling ENG-1259 skip records real elapsed time.
+        executionTime: Date.now() - now.getTime(),
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, skipResult);
+      } catch (saveError) {
+        console.error(`Error saving account-gate skip result for schedule ${schedule.scheduleId}:`, saveError);
+      }
+
+      // The skip is deliberately NOT accompanied by its own email. The owner is
+      // already told once, on the disconnect edge, by linkedInConnectionHealth —
+      // and one notification authority is the whole reason that path exists. A
+      // second one here would mail them on every fire of every affected schedule.
+      //
+      // Leaving the schedule active is what makes this self-healing: a reconnect
+      // resumes it with no human action. The pause below exists only for the case
+      // that never comes.
+      const trailingSkips = countTrailingAccountSkips(schedule.runResults);
+      if (trailingSkips + 1 >= MAX_CONSECUTIVE_ACCOUNT_SKIPS) {
+        await pauseScheduleForDisconnectedAccount(schedule, userId, trailingSkips + 1, accountGate);
+      }
+      return skipResult;
     }
 
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
@@ -4498,25 +5019,39 @@ export async function runScheduledChat(
     // next to an empty functionCallMisses on a passing run. Nothing downstream can
     // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
     // ENG-764 had to unpick.
-    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
-      .forEach((functionName: string) => {
-        finalFunctionCallDetails[functionName] = {
-          // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
-          // made in the ABANDONED portion, carried in via `resumePriorToolCalls` — the
-          // same list `runVerifiedChat` folded in above to decide functionCallMatches.
-          // Recounting from `result.toolCalls` alone here reintroduces the same
-          // self-contradicting record the surrounding comment warns about: `passed:
-          // true` next to `actual: 0` for a requirement functionCallMatches already
-          // credits.
-          actual: countCallsSatisfyingRequirement(functionName, [...resumePriorToolCalls, ...result.toolCalls]),
-          required: functionCallMinCalls[functionName] || 1
-        };
-      });
+    // ENG-1276 follow-up: also the SAME held-to set the equivalence-route
+    // double-credit suppression checks against below, so a run authorized for only
+    // ONE of an equivalence pair (e.g. post_on_connected_account but not
+    // twitter_manage_post) is scoped identically here and in the checker — not the
+    // wider, unfiltered `requiredFunctionNames` computed earlier in this function.
+    const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
+    heldToFunctionNames.forEach((functionName: string) => {
+      finalFunctionCallDetails[functionName] = {
+        // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
+        // made in the ABANDONED portion, carried in via `resumePriorToolCalls` — the
+        // same list `runVerifiedChat` folded in above to decide functionCallMatches.
+        // Recounting from `result.toolCalls` alone here reintroduces the same
+        // self-contradicting record the surrounding comment warns about: `passed:
+        // true` next to `actual: 0` for a requirement functionCallMatches already
+        // credits.
+        actual: countCallsSatisfyingRequirement(functionName, [...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames),
+        required: functionCallMinCalls[functionName] || 1
+      };
+    });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
     // is surfaced (auto-issue + oncall) instead of scored as a clean run.
     const runDelivered = result.success && !result.deferredUnresolved;
+
+    // ENG-1131: read off this run's tool ledger before it is trimmed for storage.
+    const blockedBy = detectRunBlockedReason(result.toolCalls);
+    if (blockedBy) {
+      console.log(
+        `AgentMode: scheduled run ${schedule.scheduleId} was blocked by ${blockedBy} — ` +
+        `sourcing was unavailable, not empty`,
+      );
+    }
 
     const finalResult = {
       scheduleId: schedule.scheduleId,
@@ -4542,6 +5077,15 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-1131: a prospecting run whose only sourcing path is LinkedIn
+      // people-search still delivers a report when that endpoint is down for the
+      // account, so it lands here as a plain `success` and the owner's schedule
+      // card stays green while zero prospects were sourced — reading exactly like
+      // "nobody matched your filters". Persist WHY it was blocked so the card can
+      // say so. Kept separate from `status` deliberately: the outage is upstream
+      // and self-clearing, so flipping these runs to failures would bury the
+      // owner's real failure signal under a fleet-wide vendor incident.
+      ...(blockedBy ? { blockedBy } : {}),
       // ENG-947: the run ended early because its publish-press budget ran out with
       // the publish tool still uncalled — the content was drafted and held, not
       // published. Still a `failure` (nothing shipped, so the streak/oncall
@@ -4563,6 +5107,50 @@ export async function runScheduledChat(
       // that is empty, when what they need is to reconnect the account.
       ...(result.publishToolFailing ? { publishToolFailing: true } : {}),
     };
+
+    // ENG-1131 follow-up: re-fetch the schedule immediately before deciding on a
+    // sourcing-block transition, instead of using `schedule` as loaded at the
+    // top of this (often multi-minute) function. Two runs of the same schedule
+    // racing concurrently — e.g. a manual Test click overlapping a cron trigger
+    // — would otherwise both read the SAME stale prior-run snapshot and both
+    // fire the alert. This doesn't eliminate the race (a true fix needs a
+    // DB-level conditional write), but narrows the window from run-duration
+    // down to a single DB round-trip. Deliberately NOT a persisted "already
+    // alerted" flag: that write can't be atomic with the email send either, and
+    // would trade a rare, harmless duplicate for the strictly worse failure mode
+    // of a silently missed alert — the same reasoning already established in
+    // this file for notifyScheduleOwnerOfFailure's zero-output path.
+    //
+    // Scoped to REAL scheduled runs only (!isTest), same as every sibling
+    // owner notification in this function (notifyScheduleOwnerOfFailure). A
+    // manual "Test this schedule" click must never send this unsolicited
+    // alert — the owner is already looking at the run they just triggered,
+    // and testing repeatedly while debugging a suspected outage would
+    // otherwise spam an email they didn't ask for. Also skips the re-fetch
+    // entirely on a test run, since it would go unused.
+    if (!isTest) {
+      let freshSchedule: any = null;
+      try {
+        freshSchedule = await scheduleDb.getScheduleById(schedule.scheduleId);
+      } catch (refetchError) {
+        console.error(
+          `Failed to re-fetch schedule ${schedule.scheduleId} for sourcing-block transition check:`, refetchError,
+        );
+        // Fall back to the (possibly stale) `schedule` already in scope below.
+      }
+      const priorRunResultsForTransitionCheck: any[] | undefined =
+        freshSchedule ? freshSchedule.runResults : schedule.runResults;
+
+      if (didSourcingBlockStateChange(priorRunResultsForTransitionCheck, blockedBy)) {
+        // Notify using the freshly re-fetched schedule, not the function-entry
+        // copy — we already paid for this read, so a mid-run edit to
+        // emailNotifications or disableSourcingBlockAlerts is honored at zero
+        // extra cost, rather than ignored until the schedule's next run.
+        await notifyScheduleOwnerOfSourcingBlockTransition(freshSchedule || schedule, userId, {
+          isNowBlocked: Boolean(blockedBy),
+        });
+      }
+    }
 
     // Save the result to database (without actualResponse to save space)
     const resultToStore = { ...finalResult };
@@ -7076,7 +7664,7 @@ export const agentModeController = {
   async getSupportedModels(req: Request, res: Response) {
     try {
       const { user } = await getUserFromToken(req);
-      const models = await agentModeService.getSupportedModels(user?.isAdmin === true);
+      const models = await agentModeService.getSupportedModelsWithMetadata(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
@@ -7095,11 +7683,11 @@ export const agentModeController = {
       const optimizedModels = usage.policy
         ? usage.policy.optimizedModelIds.filter((model) => supported.has(model))
         : supportedModels;
-      const selectableModels = usage.mode.usageMode === 'optimized'
-        ? optimizedModels
-        : usage.mode.usageMode === 'paused'
-          ? []
-          : supportedModels;
+      // ENG-1211 AC1: nothing below the hard cap may hide a model. Only a paused
+      // account has an empty picker; every other state offers the full entitled
+      // set. `optimizedModels` is still returned as `scheduleBackupModels` for
+      // the legacy backup field and for the ENG-1213 recommendation catalog.
+      const selectableModels = usage.mode.usageMode === 'paused' ? [] : supportedModels;
       res.json({
         usageMode: usage.mode.usageMode,
         canGenerate: usage.mode.admissionAllowed,
@@ -8811,6 +9399,11 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
+        // ENG-1131 follow-up: owner opt-OUT for the proactive "LinkedIn search
+        // blocked/recovered" transition email specifically — does not affect the
+        // schedule-card badge, per-run emails, or run history, which stay on.
+        // Default false = alerts on, matching every existing schedule's behavior.
+        disableSourcingBlockAlerts: req.body.disableSourcingBlockAlerts === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -8953,6 +9546,7 @@ export const agentModeController = {
         selfImprove,
         fullAutonomy,
         requirePublishApproval,
+        disableSourcingBlockAlerts,
         timezone
       } = req.body;
 
@@ -9046,6 +9640,11 @@ export const agentModeController = {
         ...(requirePublishApproval !== undefined
           ? { requirePublishApproval: requirePublishApproval === true }
           : {}),
+        // ENG-1131 follow-up: partial-update safe, same pattern as selfImprove —
+        // preserve the existing value when this request doesn't touch it.
+        disableSourcingBlockAlerts: disableSourcingBlockAlerts !== undefined
+          ? (disableSourcingBlockAlerts === true)
+          : ((existingSchedule as any).disableSourcingBlockAlerts || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

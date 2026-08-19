@@ -122,19 +122,39 @@ else
        "surface its sibling's verdict, or the output is empty for one branch."
 fi
 
-FAIL_STEP="$(awk '
-  /Fail the gate unless Greptile returned 5\/5/ { found = 1; next }
-  found && /if:/ { print; exit }
+# 2026-08-18: this step's own if:/run: no longer gates on `!= 'pass'` inline —
+# it hands the raw verdict string to greptile-verdict-policy.sh, which is the
+# one place that now decides pass/fail (see that script's own tests). The
+# invariant this block protects is unchanged: whichever form the step takes,
+# it must still read BOTH steps.gate.outputs.verdict AND
+# steps.dependabot_skip.outputs.verdict — never just the first, or a
+# Dependabot PR (where `gate` never ran) hands the policy script an empty
+# string instead of the skip step's `pass`, and greptile-verdict-policy.sh
+# fails closed on exactly that ("unrecognized verdict ''"), making the
+# bypass a no-op again in a new place.
+POLICY_STEP="$(awk '
+  /Apply the Greptile verdict policy/ { found = 1; next }
+  found && /- name:/ { exit }
+  found { print }
 ' "${WORKFLOW}")"
-if printf '%s' "${FAIL_STEP}" | grep -qF 'steps.gate.outputs.verdict' \
-  && printf '%s' "${FAIL_STEP}" | grep -qF 'steps.dependabot_skip.outputs.verdict'; then
-  pass "the 'Fail the gate unless...' step also checks both step outputs"
+if printf '%s' "${POLICY_STEP}" | grep -qF 'steps.gate.outputs.verdict' \
+  && printf '%s' "${POLICY_STEP}" | grep -qF 'steps.dependabot_skip.outputs.verdict'; then
+  pass "the 'Apply the Greptile verdict policy' step also reads both step outputs"
 else
-  fail "the fail-step's if: condition does not reference both steps.gate and steps.dependabot_skip." \
-       "Found: '${FAIL_STEP}'" \
-       "If this only checks steps.gate.outputs.verdict, a Dependabot PR (where that" \
-       "step never ran) reads verdict as empty, empty != 'pass' is true, and the job" \
-       "fails anyway — the bypass would be a no-op."
+  fail "the verdict-policy step does not reference both steps.gate and steps.dependabot_skip." \
+       "Found: '${POLICY_STEP}'" \
+       "If this only reads steps.gate.outputs.verdict, a Dependabot PR (where that" \
+       "step never ran) hands greptile-verdict-policy.sh an empty string, which it" \
+       "fails closed on ('unrecognized verdict') — the bypass would be a no-op."
+fi
+
+if printf '%s' "${POLICY_STEP}" | grep -qF 'greptile-verdict-policy.sh'; then
+  pass "the policy step actually calls greptile-verdict-policy.sh (not a re-inlined pass/fail check)"
+else
+  fail "the verdict-policy step does not call .github/scripts/greptile-verdict-policy.sh." \
+       "That script is the one place pass/refused/unavailable -> exit code is tested" \
+       "(greptile-verdict-policy.test.sh) — re-inlining the logic here means it drifts" \
+       "from its own test coverage, the exact failure mode this whole suite exists to catch."
 fi
 
 # greptile.json must actually carry the exclusion this whole bypass exists

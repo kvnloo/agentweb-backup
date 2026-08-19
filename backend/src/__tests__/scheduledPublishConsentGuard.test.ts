@@ -108,27 +108,20 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       ).toBeNull();
     });
 
-    it('ALLOWS a reply and a quote-tweet through the same equivalence route', async () => {
-      const d1 = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
-      expect(
-        await refuseUnauthorizedScheduledPublish('twitter_manage_post', { sessionId: 'sess-1' }, d1, { action: 'reply' })
-      ).toBeNull();
-      const d2 = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
-      expect(
-        await refuseUnauthorizedScheduledPublish('twitter_manage_post', { sessionId: 'sess-1' }, d2, { action: 'quote_tweet' })
-      ).toBeNull();
-    });
-
-    // retweet is NOT in post_on_connected_account's equivalence list — resharing
-    // someone else's content is a different act the owner never approved. Granting
-    // the whole tool name would authorize more than the literal consent covers.
-    it('still REFUSES a retweet through the same tool — that action is not an equivalent route', async () => {
-      const d = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
-      const refusal = await refuseUnauthorizedScheduledPublish(
-        'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'retweet' }
-      );
-      expect(refusal).not.toBeNull();
-      expect(refusal!.error).toContain('post_on_connected_account');
+    // reply/quote_tweet/retweet are NOT in post_on_connected_account's
+    // equivalence list — each responds to or reshares someone ELSE's content,
+    // not the schedule's own standalone content going out (ENG-1276 follow-up).
+    // Granting the whole tool name would authorize more than the literal
+    // consent covers.
+    it('still REFUSES a reply, quote-tweet, or retweet through the same tool — none is an equivalent route', async () => {
+      for (const action of ['reply', 'quote_tweet', 'retweet']) {
+        const d = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+        const refusal = await refuseUnauthorizedScheduledPublish(
+          'twitter_manage_post', { sessionId: 'sess-1' }, d, { action }
+        );
+        expect([action, refusal]).toEqual([action, expect.objectContaining({ success: false })]);
+        expect([action, refusal!.error]).toEqual([action, expect.stringContaining('post_on_connected_account')]);
+      }
     });
 
     it('still REFUSES once consent is revoked, even for an equivalent route', async () => {

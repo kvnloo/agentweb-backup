@@ -101,6 +101,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatErrorEmail: jest.fn(),
     sendScheduledChatTokenLimitEmail: jest.fn(),
     sendScheduledRunFailedEmail: jest.fn(),
+    sendScheduleSourcingBlockTransitionEmail: jest.fn(),
   },
 }));
 
@@ -540,7 +541,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(result.passed).toBe(true);
         // ...and the verify loop does NOT retry (which could have re-driven the tool).
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
-        // Greptile (ENG-1045): the persisted functionCallDetails count must agree with
+        // Greptile (ENG-1045) / CodeRabbit (ENG-1276), same finding independently:
+        // the persisted functionCallDetails count must agree with
         // functionCallMatches/passed — not recount from only the continuation turn's
         // (empty) toolCalls and silently report `actual: 0` next to `passed: true`.
         expect(result.functionCallDetails?.[priorCall]).toEqual({ actual: 1, required: 1 });
@@ -3612,7 +3614,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // ENG-827: consent is always on the wire as a boolean, never an absent key —
       // see agentModeController.scheduledChatConsentShape.test.ts for why.
       autopublishAuthorized: s.autopublishAuthorized === true,
-      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
+      // ENG-1131 adds lastRunBlockedBy (why the last run could not source), null here.
+      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0, lastRunBlockedBy: null },
     });
 
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
@@ -3857,6 +3860,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {
@@ -3892,6 +3897,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleNoEmails = {
@@ -3925,6 +3932,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: null,
         costPercentUsed: 0,
         costEnforced: false,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -3950,6 +3959,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costAllowance: 40,
         costPercentUsed: 106,
         costEnforced: true,
+        // Always present on a real response (ENG-1214 AC5).
+        alertThresholds: { usagePercent: 90, onForecastShortfall: true },
       });
 
       const scheduleWithEmails = {
@@ -4311,6 +4322,99 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           emailNotifications: ['admin@example.com'],
         })
       );
+    });
+  });
+
+  // ENG-1131 follow-up: end-to-end proof that the sourcing-block transition alert
+  // actually wires up through the real runScheduledChat flow, not just the pure
+  // helper functions it's built from in isolation. This is the exact gap that let
+  // a real bug (the alert firing on manual "Test this schedule" runs, with no
+  // !isTest guard) ship unnoticed — every other coverage for this feature tested
+  // detectRunBlockedReason/didSourcingBlockStateChange/the email template as
+  // isolated pure functions, never the actual wiring inside runScheduledChat.
+  describe('sourcing-block transition alert wiring (ENG-1131 follow-up)', () => {
+    const blockedToolCallsResponse = {
+      ...mockResponse,
+      toolCalls: [
+        { name: 'linkedin_outreach', arguments: {}, result: { searchUnavailable: true } },
+      ],
+    };
+
+    it('fires the transition alert on a REAL scheduled run when sourcing just became blocked', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      // Prior run was healthy (no blockedBy) — the schedule re-fetched mid-run must
+      // see this via getScheduleById, since that's what the transition check reads.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false); // isTest=false: a real run
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [, , , isNowBlocked] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(isNowBlocked).toBe(true);
+    });
+
+    it('does NOT fire the transition alert on a manual "Test this schedule" run (isTest=true)', async () => {
+      // Same blocked-transition shape as the test above — the ONLY difference is
+      // isTest=true. A manual test click must never send this unsolicited alert.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, true); // isTest=true
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    it('does NOT fire the alert on a real run when there is no transition (already blocked last run too)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...baseSchedule,
+        runResults: [{ status: 'success', passed: true, blockedBy: 'linkedin_search_unavailable', createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
+    });
+
+    // A user can edit a schedule's notification settings WHILE a run (which can take
+    // minutes) is already in flight. The transition check already re-fetches the
+    // schedule for its runResults — reusing that SAME fresh copy for recipients and
+    // the opt-out check costs nothing extra and honors the edit immediately, instead
+    // of silently applying it only starting from the NEXT run.
+    it('uses the freshly re-fetched schedule, not the stale function-entry copy, for recipients', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, emailNotifications: ['stale@example.com'] };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        emailNotifications: ['fresh@example.com'], // edited mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).toHaveBeenCalledTimes(1);
+      const [recipients] = mockEmailService.sendScheduleSourcingBlockTransitionEmail.mock.calls[0];
+      expect(recipients).toEqual(['fresh@example.com']);
+    });
+
+    it('honors a mid-run opt-out edit: suppresses the alert using the freshly re-fetched disableSourcingBlockAlerts', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(blockedToolCallsResponse);
+      const staleSchedule = { ...baseSchedule, disableSourcingBlockAlerts: false };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...staleSchedule,
+        disableSourcingBlockAlerts: true, // owner just turned this on mid-run
+        runResults: [{ status: 'success', passed: true, blockedBy: undefined, createdAt: new Date().toISOString() }],
+      });
+
+      await runScheduledChat(staleSchedule, mockUserId, false);
+
+      expect(mockEmailService.sendScheduleSourcingBlockTransitionEmail).not.toHaveBeenCalled();
     });
   });
 });

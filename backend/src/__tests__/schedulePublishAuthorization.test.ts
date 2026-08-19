@@ -466,12 +466,6 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
     expect(
       isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'post_thread' }, ['post_on_connected_account'])
     ).toBe(true);
-    expect(
-      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'reply' }, ['post_on_connected_account'])
-    ).toBe(true);
-    expect(
-      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'quote_tweet' }, ['post_on_connected_account'])
-    ).toBe(true);
   });
 
   it('normalizes a hyphenated action spelling the same way the completion checker does', () => {
@@ -480,10 +474,15 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
     ).toBe(true);
   });
 
-  it('does NOT authorize an equivalent-route tool for an action outside the equivalence list (retweet is a different act)', () => {
-    expect(
-      isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'retweet' }, ['post_on_connected_account'])
-    ).toBe(false);
+  // ENG-1276 follow-up: reply/quote_tweet respond to someone else's tweet, not
+  // the schedule's own standalone content — they are NOT in the equivalence
+  // route (see requiredCallSatisfaction.ts), same as retweet.
+  it('does NOT authorize an equivalent-route tool for an action outside the equivalence list (reply/quote_tweet/retweet are different acts)', () => {
+    ['reply', 'quote_tweet', 'retweet'].forEach((action) => {
+      expect(
+        isPublishCallWithinAuthorizedScope('twitter_manage_post', { action }, ['post_on_connected_account'])
+      ).toBe(false);
+    });
   });
 
   it('does NOT authorize an unrelated tool the grant never named or has no equivalence route to', () => {
