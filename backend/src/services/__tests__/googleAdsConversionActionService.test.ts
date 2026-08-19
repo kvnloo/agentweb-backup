@@ -126,6 +126,9 @@ describe('createConversionAction — surfaces drift (ENG-1322 AC4)', () => {
     // storing something OTHER than what a valid request asked for — which is exactly the
     // ENG-1293 shape: createAdGroup/createAd returned success and stored a different
     // status than requested.
+    // Stored value differs from the requested one — that IS the ENG-1293 shape. HIDDEN is
+    // a status Google can legitimately report back even though a caller cannot set it,
+    // which makes it a realistic drift value here.
     searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
     const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'ENABLED' });
     expect(out.drift).toEqual([{ field: 'status', requested: 'ENABLED', stored: 'HIDDEN' }]);
@@ -159,11 +162,11 @@ describe('optional fields are sent only when supplied', () => {
 
   it('updates every supported field, building the mask from what was supplied', async () => {
     searchSpy.mockResolvedValue([storedRow({
-      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK', primaryForGoal: false, status: 'HIDDEN',
+      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK', primaryForGoal: false, status: 'ENABLED',
     })]);
     await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, {
       name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK',
-      primaryForGoal: false, clickThroughLookbackWindowDays: 30, status: 'HIDDEN',
+      primaryForGoal: false, clickThroughLookbackWindowDays: 30, status: 'ENABLED',
     });
     const op = mutateSpy.mock.calls[0][3][0];
     expect(op.updateMask.split(',').sort()).toEqual(
@@ -247,7 +250,7 @@ describe('updateConversionAction', () => {
   });
 
   it('refuses a missing resource name', async () => {
-    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, '', { status: 'HIDDEN' }))
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, '', { status: 'ENABLED' }))
       .rejects.toThrow(/resource_name is required/i);
     expect(mutateSpy).not.toHaveBeenCalled();
   });
@@ -259,19 +262,19 @@ describe('updateConversionAction', () => {
   });
 
   it('sends only the fields supplied, so an omitted field is left alone', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
-    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'ENABLED' });
     const op = mutateSpy.mock.calls[0][3][0];
     expect(op.updateMask).toBe('status');
-    expect(op.update).toEqual({ resourceName: RESOURCE, status: 'HIDDEN' });
+    expect(op.update).toEqual({ resourceName: RESOURCE, status: 'ENABLED' });
     expect(op.update.name).toBeUndefined();
   });
 
-  it('HIDDEN is the supported alternative to removal, and reads back clean', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
-    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+  it('a settable status reads back clean', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'ENABLED' });
     expect(out.drift).toEqual([]);
-    expect(out.stored.status).toBe('HIDDEN');
+    expect(out.stored.status).toBe('ENABLED');
   });
 });
 
@@ -298,11 +301,11 @@ describe('status is validated before it reaches Google (ENG-1329 e2e)', () => {
       .rejects.toThrow(/HIDDEN/);
   });
 
-  it('accepts the three real values and normalises case', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
-    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'hidden' });
+  it('accepts a settable value and normalises case', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'enabled' });
     const op = mutateSpy.mock.calls[0][3][0];
-    expect(op.update.status).toBe('HIDDEN');
+    expect(op.update.status).toBe('ENABLED');
   });
 });
 
@@ -333,7 +336,7 @@ describe('CREATE refuses a non-ENABLED status before calling Google (ENG-1329 e2
 
   it('refuses HIDDEN on create without issuing a mutate', async () => {
     await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'HIDDEN' }))
-      .rejects.toThrow(/deny-lists that value on create/);
+      .rejects.toThrow(/Google assigns it/);
     expect(mutateSpy).not.toHaveBeenCalled();
   });
 
@@ -349,29 +352,60 @@ describe('CREATE refuses a non-ENABLED status before calling Google (ENG-1329 e2
     expect(mutateSpy.mock.calls[0][3][0].create.status).toBe('ENABLED');
   });
 
-  it('UPDATE to HIDDEN is still allowed — that is the supported hide path', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
-    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
+  it('UPDATE to HIDDEN is refused too — it is not settable anywhere', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' }))
+      .rejects.toThrow(/Google assigns it/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('UPDATE routes retirement through the confirmed REMOVE path (ENG-1329 e2e)', () => {
+  // Not "REMOVE is forbidden" — that was the earlier, wrong model. REMOVED is the ONLY
+  // settable retire value; it just has to go through the confirmation gate rather than
+  // slipping in as an ordinary field update.
+  it('refuses status=REMOVED on UPDATE and names the confirmed path', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/confirm_conversion_action_removal=true/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('still allows an ordinary ENABLED update', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'ENABLED' });
     expect(out.drift).toEqual([]);
   });
 });
 
-describe('UPDATE cannot retire an action by the back door (ENG-1329 e2e)', () => {
-  it('refuses status=REMOVED, which is REMOVE by another name', async () => {
-    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
-      .rejects.toThrow(/same irreversible outcome as REMOVE/);
+describe('removeConversionAction — the only working retire path (ENG-1329 e2e)', () => {
+  it('issues a remove operation against conversionActions', async () => {
+    await googleAdsService.removeConversionAction('u', CUSTOMER, RESOURCE);
+    expect(mutateSpy).toHaveBeenCalledTimes(1);
+    expect(mutateSpy.mock.calls[0][2]).toBe('conversionActions');
+    expect(mutateSpy.mock.calls[0][3]).toEqual([{ remove: RESOURCE }]);
+  });
+
+  it('refuses an empty resource name without calling Google', async () => {
+    await expect(googleAdsService.removeConversionAction('u', CUSTOMER, ''))
+      .rejects.toThrow(/conversion_action_resource_name is required/);
     expect(mutateSpy).not.toHaveBeenCalled();
   });
 
-  it('points at HIDDEN as the retire path', async () => {
+  it('UPDATE status=REMOVED routes to REMOVE rather than acting as an unconfirmed back door', async () => {
     await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
-      .rejects.toThrow(/status=HIDDEN/);
+      .rejects.toThrow(/confirm_conversion_action_removal=true/);
+    expect(mutateSpy).not.toHaveBeenCalled();
   });
 
-  it('still allows HIDDEN — the whole point of the two-step', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
-    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
-    expect(out.drift).toEqual([]);
-    expect(mutateSpy.mock.calls[0][3][0].update.status).toBe('HIDDEN');
+  it('says what removal actually does — not that it destroys history', async () => {
+    // The old wording claimed it "severs historical attribution". It does not, and saying
+    // so would talk someone out of a safe operation.
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'REMOVED' }))
+      .rejects.toThrow(/already recorded stay in your reports/);
+  });
+
+  it('refuses HIDDEN on update with the not-settable explanation', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' }))
+      .rejects.toThrow(/Google assigns it/);
+    expect(mutateSpy).not.toHaveBeenCalled();
   });
 });

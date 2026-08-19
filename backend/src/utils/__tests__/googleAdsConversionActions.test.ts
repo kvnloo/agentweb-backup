@@ -265,8 +265,10 @@ describe('assertConversionActionStatus — a conversion action does not pause', 
   // assuming the two enums match is the obvious mistake — the ENG-1329 verification plan
   // made it too.
 
-  it('accepts the three values Google actually defines', () => {
-    for (const s of ['ENABLED', 'REMOVED', 'HIDDEN']) {
+  it('accepts the two values a caller can actually set', () => {
+    // HIDDEN is in Google's enum but is assigned by Google, not settable — proven by
+    // BLOCKED_VALUE on both create and update against a real account.
+    for (const s of ['ENABLED', 'REMOVED']) {
       expect(assertConversionActionStatus(s)).toBe(s);
     }
   });
@@ -281,8 +283,8 @@ describe('assertConversionActionStatus — a conversion action does not pause', 
     expect(() => assertConversionActionStatus('PAUSED')).toThrow(/HIDDEN/);
   });
 
-  it('refuses any other unknown value, listing the valid ones', () => {
-    expect(() => assertConversionActionStatus('ARCHIVED')).toThrow(/ENABLED, REMOVED, HIDDEN/);
+  it('refuses any other unknown value, listing the settable ones', () => {
+    expect(() => assertConversionActionStatus('ARCHIVED')).toThrow(/ENABLED, REMOVED/);
   });
 
   it('refuses a non-string rather than coercing it', () => {
@@ -484,9 +486,8 @@ describe('assertCreatableConversionActionStatus — CREATE only accepts ENABLED'
     expect(assertCreatableConversionActionStatus('  enabled ')).toBe('ENABLED');
   });
 
-  it('refuses HIDDEN and names the two-step', () => {
-    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow(/HIDDEN/);
-    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow(/UPDATE it to HIDDEN/);
+  it('refuses HIDDEN because it is not settable at all, on create or update', () => {
+    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow(/Google assigns it/);
   });
 
   it('refuses REMOVED — creating something already removed is meaningless', () => {
@@ -504,8 +505,41 @@ describe('assertCreatableConversionActionStatus — CREATE only accepts ENABLED'
     }
   });
 
-  it('leaves UPDATE unrestricted — HIDDEN is what UPDATE is for', () => {
-    expect(assertConversionActionStatus('HIDDEN')).toBe('HIDDEN');
+  it('leaves REMOVED available on UPDATE — the only settable retire value', () => {
     expect(assertConversionActionStatus('REMOVED')).toBe('REMOVED');
+  });
+});
+
+describe('only ENABLED and REMOVED are settable — HIDDEN is Google-assigned (ENG-1329 e2e)', () => {
+  // Proven twice against the real account: status=HIDDEN is rejected with
+  //   fieldError: BLOCKED_VALUE on operations[0].create.status  AND  …update.status
+  // HIDDEN is a status Google assigns, not one a caller sets. Every earlier fix in this
+  // chain recommended it, so every one of them pointed at something that cannot succeed.
+  //
+  // REMOVED is a SOFT stop-recording state, not deletion. This account proves it: four
+  // campaigns sit at REMOVED and still return from reporting with their metrics intact.
+
+  it('accepts ENABLED and REMOVED', () => {
+    expect(assertConversionActionStatus('ENABLED')).toBe('ENABLED');
+    expect(assertConversionActionStatus('REMOVED')).toBe('REMOVED');
+  });
+
+  it('refuses HIDDEN locally rather than letting Google return BLOCKED_VALUE', () => {
+    expect(() => assertConversionActionStatus('HIDDEN')).toThrow(/HIDDEN/);
+    expect(() => assertConversionActionStatus('HIDDEN')).toThrow(/Google assigns it/);
+  });
+
+  it('tells the caller what to do instead of HIDDEN', () => {
+    expect(() => assertConversionActionStatus('HIDDEN')).toThrow(/REMOVE/);
+  });
+
+  it('still refuses PAUSED with the campaign-status explanation', () => {
+    expect(() => assertConversionActionStatus('PAUSED')).toThrow(/campaign status/);
+  });
+
+  it('CREATE still only accepts ENABLED', () => {
+    expect(assertCreatableConversionActionStatus('ENABLED')).toBe('ENABLED');
+    expect(() => assertCreatableConversionActionStatus('REMOVED')).toThrow();
+    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow();
   });
 });
