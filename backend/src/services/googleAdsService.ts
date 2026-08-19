@@ -6,6 +6,8 @@ import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, ut
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
+  assertConversionActionStatus,
+  describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
   type ConversionActionDrift,
@@ -86,9 +88,19 @@ export class GoogleAdsService {
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
-      throw err;
+      // Google's 400 body names the exact field and why; axios's own message is only
+      // "Request failed with status code 400". Rethrowing raw left that detail in the log
+      // and nowhere else, so the caller was told nothing at the one moment it mattered.
+      const described = describeGoogleAdsError(err);
+      const wrapped: any = new Error(described);
+      wrapped.status = err?.response?.status;
+      wrapped.googleAdsDetail = detail?.error ?? undefined;
+      throw wrapped;
     }
   }
 
@@ -431,7 +443,9 @@ export class GoogleAdsService {
       type: 'WEBPAGE',
       category: params.category,
       countingType,
-      status: params.status || 'ENABLED',
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      status: params.status ? assertConversionActionStatus(params.status) : 'ENABLED',
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
@@ -480,7 +494,10 @@ export class GoogleAdsService {
     const requested: Record<string, unknown> = {};
 
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
-    if (params.status !== undefined) { update.status = params.status; updateMask.push('status'); requested.status = params.status; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
     if (params.countingType !== undefined) {
       const countingType = assertCountingType(params.countingType);

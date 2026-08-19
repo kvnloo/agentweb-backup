@@ -43,6 +43,89 @@ export function assertCountingType(value: unknown): CountingType {
   return normalised;
 }
 
+/**
+ * The only values Google's ConversionActionStatus defines. There is no PAUSED.
+ *
+ * Found by the ENG-1329 end-to-end against a real account, not by review: CREATE with
+ * status PAUSED came back a bare 400, and Google's own body named the cause —
+ *   Invalid value at 'operations[0].create.status'
+ *   (ConversionActionStatusEnum.ConversionActionStatus), "PAUSED"
+ *
+ * PAUSED is a CAMPAIGN status. Assuming the two enums line up is the natural mistake, and
+ * the ENG-1329 verification plan made it as well. HIDDEN is the value people actually
+ * want: the action stops appearing in the UI's list and stops counting toward goals,
+ * without severing history the way REMOVE does.
+ */
+export const CONVERSION_ACTION_STATUSES = ['ENABLED', 'REMOVED', 'HIDDEN'] as const;
+export type ConversionActionStatus = (typeof CONVERSION_ACTION_STATUSES)[number];
+
+/**
+ * Validate a conversion action status before it reaches Google.
+ *
+ * Same discipline as `assertCountingType`, applied for a different reason. A wrong
+ * counting_type fails SILENTLY, so it must never be inferred. A wrong status fails
+ * LOUDLY — but as an opaque 400 that names no field unless you read the server log, so
+ * the caller is left guessing at exactly the moment they need telling.
+ */
+export function assertConversionActionStatus(value: unknown): ConversionActionStatus {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(
+      `status must be one of ${CONVERSION_ACTION_STATUSES.join(', ')}.`,
+    );
+  }
+  // Compared as a plain string before the cast: narrowing it to the union first makes
+  // the PAUSED check look like dead code to the compiler, when PAUSED is exactly the
+  // value a caller is most likely to send.
+  const normalised = value.trim().toUpperCase();
+  if (!(CONVERSION_ACTION_STATUSES as readonly string[]).includes(normalised)) {
+    if (normalised === 'PAUSED') {
+      throw new Error(
+        'A conversion action cannot be PAUSED — that is a campaign status, and Google\'s '
+        + 'ConversionActionStatus does not define it. Use HIDDEN to stop it counting toward '
+        + 'goals and drop it from the UI list while keeping its history, or REMOVED to retire '
+        + 'it permanently (which severs historical attribution and cannot be undone).',
+      );
+    }
+    throw new Error(
+      `Unrecognised conversion action status "${value}". Supported values: `
+      + `${CONVERSION_ACTION_STATUSES.join(', ')}.`,
+    );
+  }
+  return normalised as ConversionActionStatus;
+}
+
+/**
+ * Turn a Google Ads API failure into something the caller can act on.
+ *
+ * The REST API answers a bad field with a 400 whose BODY names the exact field and why —
+ * but axios's own `message` is only "Request failed with status code 400". `callApi`
+ * logged the body and rethrew the raw error, so that detail reached the server log and
+ * nothing else. An operator saw an opaque 400 precisely when Google had already told us
+ * which argument was wrong.
+ *
+ * Reads ONLY the response body. Never the error object at large: axios attaches the full
+ * request config, headers included, so serialising the whole error would push request
+ * details into logs and API responses that have no business being there.
+ */
+export function describeGoogleAdsError(err: any): string {
+  const error = err?.response?.data?.error;
+  if (!error) return String(err?.message || 'Google Ads API request failed.');
+
+  const parts: string[] = [];
+  if (error.status) parts.push(String(error.status));
+  if (error.message) parts.push(String(error.message));
+
+  const violations: string[] = [];
+  for (const detail of Array.isArray(error.details) ? error.details : []) {
+    for (const v of Array.isArray(detail?.fieldViolations) ? detail.fieldViolations : []) {
+      if (v?.field) violations.push(`${v.field}: ${v.description ?? 'invalid'}`);
+    }
+  }
+  if (violations.length > 0) parts.push(violations.join('; '));
+
+  return parts.join(' — ') || String(err?.message || 'Google Ads API request failed.');
+}
+
 export interface ConversionTagPair {
   /** The `AW-…` half — the Google tag id that goes in the page's base snippet. */
   conversionId: string;
