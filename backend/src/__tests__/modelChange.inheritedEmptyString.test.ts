@@ -84,7 +84,11 @@ jest.mock('../services/llmUsageTelemetry', () => ({
   },
 }));
 
-import { applyModelChange, undoModelChange } from '../services/llmModelChangeService';
+import {
+  applyModelChange,
+  undoModelChange,
+  ModelChangeConflictError,
+} from '../services/llmModelChangeService';
 
 /** `undefined` omits the attribute; `''` stores the empty string. They differ. */
 const seedSchedule = (llmModel?: string) => {
@@ -198,10 +202,11 @@ describe('the other two representations still behave exactly as before', () => {
     expect(result.pinnedFromInherited).toBe(false);
   });
 
-  it('a pinned model is still NOT treated as unset — the guard has not gone slack', async () => {
-    // The widened condition accepts absent-or-empty. It must still refuse a row
-    // that holds a real model, or a stale "unset" decision could overwrite a pin
-    // somebody else just made.
+  it('a second switch reads the NEW model, so its condition is an equality check', async () => {
+    // Sequential, so the interesting condition never arises: by the time the second
+    // switch reads, the schedule holds SONNET, and it expects SONNET. Kept because
+    // it pins that ordinary chaining still works — but it is NOT the safety
+    // property, which the test below covers (CodeRabbit, #2480).
     seedSchedule(OPUS);
     await applyModelChange(OWNER, { scope: 'schedule', scopeId: 'sched-a', toModel: SONNET });
 
@@ -215,5 +220,53 @@ describe('the other two representations still behave exactly as before', () => {
     expect(again.applied).toBe(true);
     expect(again.modelBefore).toBe(SONNET);
     expect(schedule().llmModel).toBe(HAIKU);
+  });
+
+  it('an UNSET decision still loses to a concurrent pin — the guard has not gone slack', async () => {
+    // The property the widened condition has to keep, and the one nothing else here
+    // exercised: a write decided from "unset" must fail when another writer pinned a
+    // model in between. Seeding the pin up front would prove nothing — the read
+    // would see HAIKU, `modelBefore` would be HAIKU, and the condition would be an
+    // ordinary equality check. The dangerous path is specifically an EXPECT_UNSET
+    // condition meeting an attribute that has since acquired a value, so the writer
+    // has to be interleaved BETWEEN this caller's read and its write.
+    seedSchedule('');
+
+    // `documentClient` is a GETTER that mints a fresh class per access, so the one
+    // to patch is the class captured at module load — the same object the aws-sdk
+    // mock hands the service.
+    const DocumentClient = (global as any).__inMemoryDocumentClient;
+    const realGet = DocumentClient.prototype.get;
+    let pinned = false;
+    DocumentClient.prototype.get = function (params: any) {
+      return {
+        promise: async () => {
+          const result = await realGet.call(this, params).promise();
+          if (!pinned) {
+            pinned = true; // only the FIRST read; the post-failure re-read must see the pin
+            db.seed(SCHEDULES_TABLE, {
+              scheduleId: 'sched-a',
+              userId: OWNER,
+              scheduleName: 'Lead list enrichment',
+              llmModel: HAIKU,
+            });
+          }
+          return result;
+        },
+      };
+    };
+
+    try {
+      await expect(
+        applyModelChange(OWNER, { scope: 'schedule', scopeId: 'sched-a', toModel: SONNET }),
+      ).rejects.toBeInstanceOf(ModelChangeConflictError);
+    } finally {
+      DocumentClient.prototype.get = realGet;
+    }
+
+    // The other writer's pin survives untouched, and no audit row claims a switch
+    // that never happened.
+    expect(schedule().llmModel).toBe(HAIKU);
+    expect(auditRows()).toHaveLength(0);
   });
 });
