@@ -52,6 +52,7 @@ import {
   buildTimeoutContinuationMessage,
   collectTurnWorkSince,
   buildTimeoutPartialWorkMessage,
+  hasDeferredMediaBudgetToolCall,
 } from '../utils/timeoutContinuation';
 import {
   reconcileFalseFailureReport,
@@ -820,6 +821,84 @@ function attachInProcessCompletion(
     .catch((err: any) =>
       console.error(`AgentMode: in-process completion hook failed for page ${pageId}:`, err)
     );
+}
+
+// ENG-1239: cap on consecutive automatic continuations for one deferred media batch, so a
+// persistently slow/broken provider can't turn one request into an unbounded background
+// retry loop. Comfortably covers the reported case (one deferral, one resume) with headroom
+// for a larger batch that defers more than once.
+const AUTO_MEDIA_CONTINUATION_MAX_ROUNDS = 4;
+
+// ENG-1239: the turn that hit the per-turn media budget already told the user (via the
+// model's own reply) that some assets are still missing and invited "continue" — this
+// message is that continuation, fired by the SERVER instead of waiting for the customer to
+// notice and retype it. Marked [SYSTEM] (same convention as SCHEDULED_RUN_RESUME_MESSAGE) so
+// the model treats it as an automated instruction, not a real user turn. The ENG-510
+// already-generated-assets awareness block makes replaying this safe: only the assets still
+// missing from the original request are (re)generated.
+const AUTO_MEDIA_CONTINUATION_MESSAGE =
+  '[SYSTEM] This is an automatic continuation, not a message from the user — the previous ' +
+  'turn paused only because it was approaching its per-response time limit, not because ' +
+  'anything failed. Do NOT re-generate any asset already shown as done above and do NOT ' +
+  'ask the user to reply "continue" again. Generate ONLY the assets still missing from the ' +
+  'original request, then confirm the batch is complete.';
+
+/**
+ * ENG-1239: when a media-heavy interactive turn defers a generate_image/video call because
+ * the per-turn soft time budget is running out (see hasDeferredMediaBudgetToolCall), the
+ * images already done ARE saved, but the turn ends by asking the user to reply "continue".
+ * Left alone, that shifts the recovery work onto the customer — the reported bug had three
+ * of four requested images delivered and the fourth silently left for the user to notice.
+ *
+ * Fire the continuation ourselves instead, detached from the request that just returned —
+ * reusing generateSessionResponse exactly as a real "continue" reply would, so the existing
+ * ENG-510 asset-dedup (already-generated-assets awareness) makes this idempotent: no asset
+ * is ever regenerated. Best-effort and fire-and-forget by design (mirrors
+ * attachInProcessCompletion above) — any failure here just leaves the manual "continue"
+ * prompt as the fallback, exactly like today.
+ */
+function scheduleAutoMediaContinuation(
+  sessionId: string,
+  userId: string,
+  llmModel: string,
+  round: number
+): void {
+  if (round > AUTO_MEDIA_CONTINUATION_MAX_ROUNDS) {
+    console.error(
+      `AgentMode: media auto-continuation for session ${sessionId} still deferred after ` +
+      `${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} rounds — leaving the manual "continue" prompt in place.`
+    );
+    return;
+  }
+  // A real user request may already be running for this session (e.g. they replied
+  // manually while we were about to auto-continue) — don't fight it. If that turn still
+  // leaves the batch incomplete, its own response re-triggers this path.
+  if (!tryClaimSessionGeneration(sessionId)) return;
+
+  let stillDeferred = false;
+  generateSessionResponse(sessionId, AUTO_MEDIA_CONTINUATION_MESSAGE, userId, llmModel)
+    .then(async (resolved) => {
+      markProgressComplete(sessionId);
+      stillDeferred = hasDeferredMediaBudgetToolCall(resolved?.toolCalls);
+      if (resolved?.content) {
+        const { io } = await import('../server');
+        io.to(`user:${userId}`).emit('session-message-appended', {
+          sessionId,
+          message: { role: 'assistant', content: resolved.content },
+        });
+      }
+    })
+    .catch((err: any) =>
+      console.error(`AgentMode: media auto-continuation failed for session ${sessionId}:`, err)
+    )
+    .finally(() => {
+      // Release BEFORE recursing — the next round's tryClaimSessionGeneration would
+      // otherwise always lose to this round's still-held lock.
+      releaseSessionGeneration(sessionId);
+      if (stillDeferred) {
+        scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1);
+      }
+    });
 }
 
 /**
@@ -7223,6 +7302,17 @@ export const agentModeController = {
       }
 
       markProgressComplete(sessionId);
+
+      // ENG-1239: this turn deferred a generate_image/video call to stay under the
+      // per-turn media time budget (toolDispatch's media_generation_time_budget
+      // deferral) — the model's own reply asks the user to say "continue", but nothing
+      // forces them to notice. Auto-fire that continuation ourselves so the batch
+      // finishes without the customer's involvement. setImmediate defers the kickoff
+      // past this request's own `finally` below, so scheduleAutoMediaContinuation
+      // claims the generation lock only after THIS request has released it.
+      if (hasDeferredMediaBudgetToolCall(response.toolCalls)) {
+        setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1));
+      }
 
       // Compute page invalidations for emma-sidebar sessions so the frontend
       // can refresh the underlying page after a mutating tool call.

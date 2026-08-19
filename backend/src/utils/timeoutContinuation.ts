@@ -141,6 +141,30 @@ export function collectTurnWorkSince(
   return { narrationCount, toolNames };
 }
 
+/**
+ * ENG-1239: toolDispatch's per-turn media-budget deferral (toolDispatch.ts, `makeDeferred`)
+ * stops short of the whole-turn hard cap and asks the user to reply "continue" — it never
+ * throws, so the interactive route sees a normal 200 response, not a timeout. This detects
+ * that specific deferral on a settled turn's toolCalls ledger so the caller can resume the
+ * batch itself instead of waiting on the user to notice and retype "continue".
+ *
+ * Scoped to `reason === 'media_generation_time_budget'` specifically — the same 'deferred'
+ * status also covers ENG-822's handler-supplied refusals (e.g. an anonymous-account-scoped
+ * decline), which carry their own reason and must NOT be auto-retried the same way.
+ */
+export interface DeferredToolCallLike {
+  result?: { deferred?: boolean; reason?: string; [key: string]: unknown } | null;
+}
+
+export function hasDeferredMediaBudgetToolCall(
+  toolCalls: DeferredToolCallLike[] | undefined | null,
+): boolean {
+  if (!Array.isArray(toolCalls)) return false;
+  return toolCalls.some(
+    (tc) => tc?.result?.deferred === true && tc.result?.reason === 'media_generation_time_budget',
+  );
+}
+
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */
 const MAX_LISTED_TOOLS = 6;
 
