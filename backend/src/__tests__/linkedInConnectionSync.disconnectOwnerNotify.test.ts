@@ -15,6 +15,10 @@ jest.mock('../services/linkedInOutreachService', () => ({
     listConnections: jest.fn(),
     probeAccountSession: jest.fn(),
   },
+  // The cron always calls this before probeAccountSession's definitive check —
+  // stub it out so the mock module shape matches the real one (ENG-1351 PR was
+  // opened before main gained this export; see tasks/lessons.md).
+  isProvenDisconnectError: jest.fn().mockReturnValue(false),
 }));
 
 jest.mock('../services/unipileConnectionsDb', () => ({
