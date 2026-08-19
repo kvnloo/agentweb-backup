@@ -843,6 +843,12 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
   const unknownTypes = new Set<string>();
   const excludedObjectives = new Set<string>();
   const unknownObjectives = new Set<string>();
+  // Union across every readable ad account this user has. §G's landing-page check asks
+  // "can ANY of this customer's accounts report a conversion from this page?", which is the
+  // right question and the only one that does not depend on which account we happened to be
+  // looping over when we asked.
+  const ownedPixelIdsAcrossAccounts: string[] = [];
+  let anyAccountReadable = false;
 
   for (const account of accounts) {
     const adAccountId = account?.account_id;
@@ -938,13 +944,12 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
       adAccountId, accessToken, user, summary, alertSink, now, deps,
     );
 
-    // §G's sixth check. Also before the blackout early returns, and for a reason unique to it:
-    // it inspects pages NO ad currently points at, so there is no spend signal to gate on at
-    // all — an account can be perfectly `idle` and still be serving a lander we built that
-    // cannot report a conversion the moment someone launches at it.
-    await checkLandingPageCoverage(
-      adAccountId, ownedPixelIds, user, summary, alertSink, now, deps,
-    );
+    // Landing pages belong to the USER, not to an ad account, so their check runs ONCE after
+    // this loop — see below. Here we only accumulate what each account can receive.
+    if (ownedPixelIds) {
+      anyAccountReadable = true;
+      ownedPixelIdsAcrossAccounts.push(...ownedPixelIds);
+    }
 
     // Also before the blackout early returns. Tier 2's whole point is the event that stops
     // while the account's OTHER conversions keep flowing — which reads as perfectly healthy
@@ -1020,6 +1025,26 @@ export async function monitorUserTracking(user: any, deps?: MonitorDeps): Promis
         // available at the moment it fired.
         ...enriched,
       },
+    );
+  }
+
+  // §G's sixth check, ONCE per user rather than once per ad account.
+  //
+  // Landing pages are owned by the USER; a customer with two connected ad accounts has one
+  // set of sites, not two. Running this inside the account loop listed and counted the same
+  // sites twice and would have filed one alert per account for a single fault — the
+  // per-user/per-account double-count §45 already diagnosed once, in a new place.
+  //
+  // Judged against the UNION of pixels across the user's readable accounts, because the
+  // question is "can ANY of this customer's accounts report a conversion from this page?".
+  // Judging per account would call a page "foreign" merely because we happened to be looking
+  // at the customer's OTHER ad account at the time.
+  //
+  // Skipped entirely when no account was readable: with no owned-pixel list, every site looks
+  // foreign, and that is our failed read manufacturing alerts (#2448's second defect).
+  if (anyAccountReadable) {
+    await checkLandingPageCoverage(
+      [...new Set(ownedPixelIdsAcrossAccounts)], user, summary, alertSink, now, deps,
     );
   }
 
@@ -1360,19 +1385,13 @@ async function checkDestinationCoverage(
  * decides whether a customer gets paged.
  */
 async function checkLandingPageCoverage(
-  adAccountId: string,
-  ownedPixelIds: string[] | null,
+  ownedPixelIds: string[],
   user: any,
   summary: MonitorSummary,
   alertSink: AlertSink,
   now: number,
   deps?: MonitorDeps,
 ): Promise<void> {
-  // Null means the destination read failed, so we have no owned-pixel list. Judging against an
-  // absent list would make every site look foreign — our own failed read manufacturing alerts,
-  // which is #2448's second defect exactly. Skip instead.
-  if (ownedPixelIds === null) return;
-
   try {
     const {
       fetchLandingPageInputs, evaluateLandingPageCoverage,
@@ -1386,9 +1405,10 @@ async function checkLandingPageCoverage(
           deps?.urlCache ? { fetchHtml: deps.urlCache.fetchHtml } : undefined,
         ));
 
-    const inputs = await fetchPages(String(user?.userId ?? ''), ownedPixelIds);
+    const userId = String(user?.userId ?? '');
+    const inputs = await fetchPages(userId, ownedPixelIds);
     if (inputs.status !== 'ok') {
-      console.warn(`${TAG} ${adAccountId}: landing pages unavailable for §G — ${inputs.error}`);
+      console.warn(`${TAG} user ${userId}: landing pages unavailable for §G — ${inputs.error}`);
       return;
     }
 
@@ -1402,7 +1422,7 @@ async function checkLandingPageCoverage(
 
     if (verdict.sitesNotChecked > 0) {
       console.log(
-        `${TAG} ${adAccountId}: §G checked ${inputs.sites.length} site(s), ` +
+        `${TAG} user ${userId}: §G checked ${inputs.sites.length} site(s), ` +
         `${verdict.sitesNotChecked} beyond the cap`,
       );
     }
@@ -1412,17 +1432,20 @@ async function checkLandingPageCoverage(
       `  - ${f.pageName ?? f.pageId} (${f.url}) - ` +
       (f.reason === 'no_pixel'
         ? 'no Meta pixel in the served page'
-        : `carries pixel ${f.detectedPixelIds.join(', ')}, which ad account ${adAccountId} does not own`));
+        : `carries pixel ${f.detectedPixelIds.join(', ')}, which none of this customer's ` +
+          'connected ad accounts owns'));
 
     await raise(
       alertSink,
-      // One alert per ACCOUNT per day. Several landers on one site are one fault with one fix.
-      `${LANDING_PAGE_ALERT_CLASS}:${adAccountId}`,
+      // One alert per CUSTOMER per day, not per ad account: the sites belong to the user, and
+      // a customer with two connected accounts has one set of pages and one fix.
+      `${LANDING_PAGE_ALERT_CLASS}:${userId}`,
       now,
-      `${verdict.alerting.length} landing page(s) we built cannot report a conversion to ad account ${adAccountId}`,
+      `${verdict.alerting.length} landing page(s) we built cannot report a conversion for ${user?.email ?? userId}`,
       [
         `${verdict.alerting.length} DEPLOYED landing page(s) generated by this platform serve HTML`,
-        `carrying no pixel that ad account ${adAccountId} can receive conversions from:`,
+        'carrying no pixel that ANY of this customer\'s connected ad accounts can receive',
+        'conversions from:',
         '',
         ...lines,
         '',
@@ -1433,16 +1456,20 @@ async function checkLandingPageCoverage(
         'A pixel is one per SITE (the shared layout), so one fix covers every page on it.',
       ].join('\n'),
       {
+        // Every other alert in this file carries these two; downstream routing and filtering
+        // by class cannot classify an alert that omits them.
+        'Alert Class': LANDING_PAGE_ALERT_CLASS,
         'Alert Priority': 'low',
-        'Ad Account': adAccountId,
+        'Owner User Id': user?.userId,
         'Owner Email': user?.email,
+        'Account Pixels Considered': ownedPixelIds.join(', ') || 'none',
         'Sites Affected': verdict.alerting.length,
         'Sites Verified Healthy': verdict.okCount,
       },
     );
   } catch (error: any) {
     // Never allowed to break the sweep. §G is additive to §F, not a precondition for it.
-    console.warn(`${TAG} ${adAccountId}: §G landing-page check failed - ${error?.message ?? error}`);
+    console.warn(`${TAG} user ${user?.userId}: §G landing-page check failed - ${error?.message ?? error}`);
   }
 }
 
