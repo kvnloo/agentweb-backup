@@ -193,6 +193,10 @@ describe('run verdict carries the model that produced it', () => {
 
     expect(failedEvent.dimensions.llmModel).toBe(HAIKU);
     expect(failedEvent.dimensions.modelSubstituted).toBe(true);
+    // BOTH sides of the substitution, not just the end state. A failed run is
+    // where the pair matters most: "Haiku failed" and "Opus failed, then Haiku
+    // failed too" are different findings, and only `modelAtStart` separates them.
+    expect(failedEvent.dimensions.modelAtStart).toBe(OPUS);
     // The error detail the failed event already carried must survive.
     expect(failedEvent.dimensions.errorMessage).toContain('boom');
   });

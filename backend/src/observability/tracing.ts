@@ -210,6 +210,7 @@ export function endInvokeAgentSpan(
     activeRunSpans.delete(runId);
     if (outcome.verdict) span.setAttribute(ATTR_RUN_VERDICT, outcome.verdict);
     if (outcome.responseModel) span.setAttribute(ATTR_GEN_AI_RESPONSE_MODEL, outcome.responseModel);
+
     if (outcome.error !== undefined) {
       span.recordException(outcome.error instanceof Error ? outcome.error : String(outcome.error));
       span.setStatus({

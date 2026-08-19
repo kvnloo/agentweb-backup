@@ -242,6 +242,31 @@ describe('tracing: happy path span topology + attributes', () => {
     expect(span.attributes[ATTR_RUN_VERDICT]).toBe('ok');
   });
 
+  it('records the served model on a FAILED run too', async () => {
+    // Raised by CodeRabbit on PR #2447. The success path and the omitted-model
+    // path were covered; the error path was not -- and that is the one where
+    // model attribution earns its keep, since "which model was serving when this
+    // failed" is the whole question a failed run raises.
+    //
+    // It is also the path most likely to regress: `endInvokeAgentSpan` sets the
+    // error and status before ending the span, so a future edit that returns
+    // early on error would silently drop the model and nothing else would notice.
+    startInvokeAgentSpan('run-err-model', { sessionId: 's', llmModel: 'claude-opus-4-8' });
+    endInvokeAgentSpan('run-err-model', {
+      verdict: 'failed',
+      error: new Error('provider exploded'),
+      responseModel: 'gemini-3.1-flash-lite',
+    });
+    await flushTelemetry();
+
+    const [span] = exporter.getFinishedSpans();
+    expect(span.attributes[ATTR_GEN_AI_RESPONSE_MODEL]).toBe('gemini-3.1-flash-lite');
+    // The pre-existing failure semantics must survive alongside it.
+    expect(span.attributes[ATTR_RUN_VERDICT]).toBe('failed');
+    expect(span.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span.events.some((e) => e.name === 'exception')).toBe(true);
+  });
+
   it('getRunTraceId returns the active trace id while the run is open, undefined after end', async () => {
     startInvokeAgentSpan('run-tid', { sessionId: 's' });
     const traceId = getRunTraceId('run-tid');
