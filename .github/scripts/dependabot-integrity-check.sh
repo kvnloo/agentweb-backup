@@ -102,6 +102,13 @@
 
 set -euo pipefail
 
+# ENG-1382: resolved once so the workflow-YAML branch below can invoke its
+# sibling dependabot-only-pr.sh regardless of the caller's cwd. This resolves
+# against THIS file's location — which, under
+# .github/workflows/dependabot-integrity-check.yml, is always the trusted BASE
+# checkout, never the PR's copy.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # Recognized dependency-manifest basenames across the ecosystems Dependabot
 # supports that this org could plausibly use. Matched by basename so any
 # depth (root, backend/, partner-portal/, agent-engine/, etc.) is covered
@@ -135,6 +142,19 @@ require_env() {
   if [ -z "${!name:-}" ]; then
     fail "required environment variable ${name} is empty or unset."
   fi
+}
+
+# ENG-1382: the ONE path class a `github-actions`-ecosystem Dependabot bump
+# legitimately touches, and which the manifest allowlist above can never cover.
+#
+# Deliberately NOT `.github/**`. That would also admit `.github/scripts/*.sh`
+# and this check's own workflow file — precisely the tampering surface ENG-1287
+# exists to protect. Only workflow YAML, where a bump rewrites a `uses:` pin.
+is_actions_workflow() {
+  case "$1" in
+    .github/workflows/*.yml|.github/workflows/*.yaml) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 is_allowed() {
@@ -185,7 +205,7 @@ main() {
     fail "could not extract the changed-files list for ${REPO}#${PR_NUMBER}."
   fi
 
-  local disallowed_hits=()
+  local disallowed_hits=() actions_workflow_hits=()
   local f status
   while IFS=$'\t' read -r f status; do
     [ -z "${f}" ] && continue
@@ -203,15 +223,58 @@ main() {
       disallowed_hits+=("${f} (status=${status} — a rename/copy onto any path is never a genuine dependency bump)")
       continue
     fi
-    if ! is_allowed "${f}"; then
-      disallowed_hits+=("${f}")
+    if is_allowed "${f}"; then
+      continue
     fi
+    if is_actions_workflow "${f}"; then
+      actions_workflow_hits+=("${f}")
+      continue
+    fi
+    disallowed_hits+=("${f}")
   done <<<"${file_rows}"
 
   if [ "${#disallowed_hits[@]}" -gt 0 ]; then
     echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${#disallowed_hits[@]} changed path(s) are not a recognized dependency manifest — not bypass-eligible:"
     printf '  %s\n' "${disallowed_hits[@]}"
     fail "a Dependabot-authored PR changed path(s) outside the recognized dependency-manifest allowlist: ${disallowed_hits[*]}. A genuine automated dependency bump only ever touches manifest files — this fails closed regardless of what the Dependabot-only-commit classifier itself reports, and regardless of how convincingly commit metadata claims Dependabot authorship."
+  fi
+
+  # ENG-1382: a `github-actions`-ecosystem bump only ever rewrites `uses:` pins
+  # in workflow YAML, so it can NEVER satisfy the manifest allowlist above. This
+  # repo configures that ecosystem exclusively (.github/dependabot.yml), so every
+  # Dependabot PR it can produce reached here and failed — 0 of 4 ever merged,
+  # and the SHA pins ENG-895 took have been rotting since 2026-08-04.
+  #
+  # Exiting 1 conflated "integrity violated" with "not bypass-eligible". This job
+  # is a REQUIRED check, so the second silently became "merge blocked" — not what
+  # the header above intended ("that PR merges through the normal test gates").
+  #
+  # Passing on the PATHS alone would be too weak: a repo writer can push to a
+  # Dependabot-opened branch, and post-ENG-1371 the required set is thin enough
+  # that a tampered tests.yml could then merge. So this demands proof of
+  # AUTHORSHIP over the whole history, via dependabot-only-pr.sh, which requires
+  # every commit to be BOTH dependabot[bot]-authored AND
+  # `commit.verification.verified == true`. A human can set Dependabot's public
+  # noreply address as their git email; they cannot forge a signature GitHub
+  # attributes to Dependabot's own signing identity. One human commit anywhere in
+  # the history disqualifies the PR permanently.
+  #
+  # Safe to invoke here specifically because THIS workflow checks out the trusted
+  # BASE ref (dependabot-integrity-check.yml passes no `ref:`), so it runs base's
+  # copy of that script, never the PR's. The ENG-1287 self-tampering concern
+  # applies to the `pull_request`-triggered job, not to this one. This also gives
+  # dependabot-only-pr.sh a caller again, which ENG-1371 had left it without.
+  if [ "${#actions_workflow_hits[@]}" -gt 0 ]; then
+    echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${#actions_workflow_hits[@]} changed path(s) are GitHub Actions workflow YAML:"
+    printf '  %s\n' "${actions_workflow_hits[@]}"
+
+    if ! bash "${SCRIPT_DIR}/dependabot-only-pr.sh"; then
+      fail "a Dependabot-authored PR changed GitHub Actions workflow YAML (${actions_workflow_hits[*]}), and its commit history is NOT provably dependabot[bot]-authored-and-signature-verified. A human commit anywhere in the history disqualifies it: workflow YAML is the most CI-security-relevant path in the repo, and this job runs from the trusted base ref precisely so that judgement cannot be tampered with."
+    fi
+
+    printf '::warning::[dependabot-integrity-check] %s#%s changed GitHub Actions workflow YAML. Every commit is dependabot[bot]-authored AND signature-verified, so this is a genuine automated pin bump and is not blocked. This check proves authorship, not correctness — read the diff as normal review evidence.\n' "${REPO}" "${PR_NUMBER}"
+    echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: ${total} changed file(s) are manifests or Actions workflow YAML, and every commit is dependabot-authored and signature-verified. Untampered."
+    return 0
   fi
 
   echo "[dependabot-integrity-check] ${REPO}#${PR_NUMBER}: all ${total} changed file(s) are recognized dependency manifests. Untampered."
