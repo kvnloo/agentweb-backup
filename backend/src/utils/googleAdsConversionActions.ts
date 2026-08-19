@@ -134,7 +134,9 @@ export function describeGoogleAdsError(err: any): string {
   }
   if (violations.length > 0) parts.push(violations.join('; '));
 
-  return parts.join(' — ') || String(err?.message || 'Google Ads API request failed.');
+  // `err?.` would be dead here: reaching this line means err.response.data.error was
+  // truthy, so err cannot be null.
+  return parts.join(' — ') || String(err.message || 'Google Ads API request failed.');
 }
 
 export interface ConversionTagPair {

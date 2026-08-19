@@ -382,3 +382,89 @@ describe('describeGoogleAdsError — Google Ads business errors, not just proto 
     expect(out).toContain('TOO_LOW');
   });
 });
+
+describe('describeGoogleAdsError — malformed payloads must not throw', () => {
+  // This runs inside a catch block. If it throws on a shape it did not expect, it
+  // replaces a real API error with its own stack trace and the original cause is lost.
+  it('handles details that is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: 'nope' } } } })).toContain('X');
+  });
+
+  it('handles a details entry whose fieldViolations is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: 'nope' }] } } } })).toContain('m');
+  });
+
+  it('handles a details entry whose errors is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: 7 }] } } } })).toContain('X');
+  });
+
+  it('skips a fieldViolation with no field', () => {
+    const out = describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [{ description: 'orphan' }] }] } } } });
+    expect(out).not.toContain('orphan');
+  });
+
+  it('defaults a fieldViolation with no description', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [{ field: 'a.b' }] }] } } } }))
+      .toContain('a.b: invalid');
+  });
+
+  it('handles an errorCode that is not an object', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [{ errorCode: 'FLAT', message: 'boom' }] }] } } } }))
+      .toContain('boom');
+  });
+
+  it('defaults an error entry with no message', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [{}] }] } } } })).toContain('error');
+  });
+
+  it('falls back when the body carries an error object with nothing usable in it', () => {
+    // parts is empty, so the join yields '' — the fallback must still produce a string.
+    expect(describeGoogleAdsError({ message: 'axios said so', response: { data: { error: {} } } }))
+      .toBe('axios said so');
+  });
+
+  it('produces a message even when there is no message anywhere', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {} } } }))
+      .toBe('Google Ads API request failed.');
+  });
+
+  it('produces a message for an error with no response at all', () => {
+    expect(describeGoogleAdsError({})).toBe('Google Ads API request failed.');
+  });
+});
+
+describe('describeGoogleAdsError — null receivers', () => {
+  // Every optional chain in here has a null path, and this runs inside a catch block:
+  // `throw null` and `Promise.reject()` are both legal, and an axios interceptor can
+  // hand back a details array with holes in it.
+  it('survives a null error', () => {
+    expect(describeGoogleAdsError(null)).toBe('Google Ads API request failed.');
+  });
+
+  it('survives an undefined error', () => {
+    expect(describeGoogleAdsError(undefined)).toBe('Google Ads API request failed.');
+  });
+
+  it('survives null entries in details', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [null, undefined] } } } })).toContain('X');
+  });
+
+  it('survives null entries inside fieldViolations', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [null] }] } } } })).toContain('m');
+  });
+
+  it('survives null entries inside errors', () => {
+    const out = describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [null] }] } } } });
+    expect(out).toContain('error');
+  });
+});
