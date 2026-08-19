@@ -2559,8 +2559,16 @@ describe('resolveIdentity — placeholder/test email addresses (ENG-968)', () =>
       expect(result.resolved.website).toBeUndefined();
       expect(result.resolved.emailDomain).toBeUndefined();
     }
+    // Confirms Tier 0.5 actually ran (not skipped) with the expected signal —
+    // otherwise the resolved-field assertions above would pass vacuously.
+    expect(deps.resolveCompanyDomainViaWebSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ company: 'Acme' }),
+    );
     for (const call of apolloPeopleMatch.mock.calls) {
       expect(call[0].domain).not.toBe('example.com');
     }
+    // Nothing was resolved to persist (mode defaults to 'enrich' in makeInput),
+    // so the rejected website/domain cannot have been written separately.
+    expect(deps.writeLeadFields).not.toHaveBeenCalled();
   });
 });
