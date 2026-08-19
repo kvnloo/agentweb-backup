@@ -5963,6 +5963,77 @@ export async function updateLandingPageTrackingInstalled(
 }
 
 /**
+ * Persist (or clear) the site's Google Ads conversion config on a page record.
+ *
+ * Mirrors updateLandingPageGtm / updateLandingPageMetaPixel. All three Google Ads
+ * identity fields move together on purpose: an id without its label fires a conversion
+ * that matches no conversion action, and a label without the customer id leaves the
+ * offline import (ENG-1325) unable to find the account to upload to. Clearing removes
+ * all three rather than leaving a half-configured record behind.
+ */
+export async function updateLandingPageGoogleAds(
+  id: string,
+  userId: string,
+  conversionId: string,
+  conversionLabel?: string,
+  customerId?: string,
+): Promise<void> {
+  const record = await getLandingPage(id, userId);
+  if (!record) throw new Error("Landing page not found");
+
+  if (conversionId) {
+    const sets = ["googleAdsConversionId = :cid", "updatedAt = :now"];
+    const values: Record<string, any> = { ":cid": conversionId, ":now": new Date().toISOString() };
+    const removes: string[] = [];
+    if (conversionLabel) { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
+    else removes.push("googleAdsConversionLabel");
+    if (customerId) { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
+    else removes.push("googleAdsCustomerId");
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeValues: values,
+      })
+      .promise();
+  } else {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "REMOVE googleAdsConversionId, googleAdsConversionLabel, googleAdsCustomerId SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  }
+}
+
+/**
+ * Update the `googleAdsTrackingInstalled` signal on a single page record. Split out for
+ * the same reason as updateLandingPageTrackingInstalled: the base tag lives in the SHARED
+ * root layout, so installing it changes the answer for every page on the site, not just
+ * the one the request named.
+ */
+export async function updateLandingPageGoogleAdsInstalled(
+  id: string,
+  googleAdsTrackingInstalled: boolean,
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET googleAdsTrackingInstalled = :g, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":g": googleAdsTrackingInstalled,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
  * Mirrors updateLandingPageGtm for the Meta pixel manual-override path.
  */
 export async function updateLandingPageMetaPixel(

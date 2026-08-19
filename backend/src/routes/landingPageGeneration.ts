@@ -43,12 +43,15 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
   updateLandingPageTrackingInstalled,
+  updateLandingPageGoogleAds,
+  updateLandingPageGoogleAdsInstalled,
   updateLandingPageMetaPixel,
   updateLandingPageMetaTrackingInstalled,
   buildCaptureRoute,
   commitFilesToRepoMain,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
+import { injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
@@ -2224,6 +2227,194 @@ async function saveGtmForPage(
     }
   }
 }
+
+/**
+ * Install (or remove) the Google Ads base tag in a page's shared root layout, persist the
+ * conversion config, and redeploy. Mirrors `saveGtmForPage` step for step, including the
+ * 409-retry loop around GitHub's SHA race and the sibling sync.
+ *
+ * The sibling sync is not optional bookkeeping. The base tag lives in the SHARED root
+ * layout, so this one commit changes the answer for every page on the site. Leaving the
+ * other records stale would have RULE 7.5 refuse a launch on a page that is, in fact,
+ * measurable — which trains people to reach for override_tracking_check.
+ */
+async function saveGoogleAdsForPage(
+  page: GeneratedLandingPage,
+  conversionId: string,
+  conversionLabel?: string,
+  customerId?: string,
+): Promise<void> {
+  if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repoRaw] = repoMatch;
+  const repo = repoRaw.replace(".git", "");
+
+  const { getGitHubOrgToken } = await import("../utils/secretsManager");
+  const { token } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+  const GITHUB_TIMEOUT_MS = 30_000;
+  const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+  const layoutPath = "app/layout.tsx";
+  const MAX_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      // Fetched inside the loop so each retry gets a fresh SHA.
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      const currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      const fileSha = fileRes.data.sha;
+
+      // Already exactly right? Then there is nothing to commit. Check this SEMANTICALLY,
+      // not by comparing bytes before and after: strip-then-reinject is idempotent in
+      // effect but not byte-for-byte — when the block sits flush against the next tag a
+      // newline shifts on the second pass — so a byte compare would push a pointless
+      // commit and a full Vercel rebuild on every repeat click.
+      if (conversionId && verifyGoogleAdsInjection(currentContent, conversionId)) {
+        break;
+      }
+
+      const updatedContent = injectGoogleAdsIntoLayout(currentContent, conversionId);
+
+      // Fail loud, not silent: a layout with no <head>/<body> anchor leaves the insertion a
+      // no-op, and without this we would commit unchanged content and still report success
+      // for a tag that was never installed.
+      if (!verifyGoogleAdsInjection(updatedContent, conversionId)) {
+        console.error(
+          `[LP GENERATION] Google Ads ${conversionId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        // The technical reason is logged, never surfaced: a marketer cannot act on
+        // "<head>", and it is not anything they did wrong.
+        throw Object.assign(
+          new Error(
+            conversionId
+              ? "We couldn't add Google Ads tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove Google Ads tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
+      }
+
+      // Nothing to commit when the layout already says exactly this. Saves a pointless
+      // Vercel rebuild on a repeat click, which the idempotent injection makes common.
+      if (updatedContent !== currentContent) {
+        await axios.put<any>(
+          `${repoBase}/contents/${layoutPath}`,
+          {
+            message: conversionId
+              ? `chore: install Google Ads tag ${conversionId}`
+              : "chore: remove Google Ads tag",
+            content: Buffer.from(updatedContent, "utf-8").toString("base64"),
+            sha: fileSha,
+          },
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+      }
+      break;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
+      if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+      throw err;
+    }
+  }
+
+  await updateLandingPageGoogleAds(page.id, page.userId, conversionId, conversionLabel, customerId);
+
+  // Every sibling shares the layout we just committed, so every sibling just became
+  // tracked (or untracked). Best-effort per page — a sync failure must never undo the
+  // GitHub commit that already succeeded.
+  const siteId = page.siteId ?? page.id;
+  try {
+    const siblings = await listLandingPages(page.userId);
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageGoogleAdsInstalled(p.id, !!conversionId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync googleAdsTrackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to list sibling pages for googleAdsTrackingInstalled sync: ${err.message}`);
+  }
+
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (vercelProjectId) {
+    try {
+      await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Google Ads inject: ${deployErr.message}`);
+    }
+  }
+}
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/google-ads
+ * Install the Google Ads base tag in the root layout.tsx of the page's GitHub repo and
+ * persist the conversion config. The manual counterpart to /gtm and /meta-pixel, and the
+ * third seam ENG-1328 needs — this is the path a customer uses when the conversion action
+ * is created after the site was generated.
+ *
+ * Body: { googleAdsConversionId: string, googleAdsConversionLabel?: string,
+ *         googleAdsCustomerId?: string }
+ *
+ * Send an empty googleAdsConversionId to REMOVE the tag — the injection strips before it
+ * inserts, so removal is the same code path.
+ */
+router.post("/generated/:id/google-ads", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
+
+    const { googleAdsConversionId, googleAdsConversionLabel, googleAdsCustomerId } = req.body as {
+      googleAdsConversionId?: string; googleAdsConversionLabel?: string; googleAdsCustomerId?: string;
+    };
+    if (typeof googleAdsConversionId !== "string") {
+      return res.status(400).json({ error: "googleAdsConversionId is required (send an empty string to remove)" });
+    }
+    const conversionId = googleAdsConversionId.trim();
+    // Same shape RULE 7.5's detector looks for, so a tag we install is a tag the
+    // pre-flight gate will actually recognise on the served page.
+    if (conversionId && !/^AW-[0-9]{6,}$/.test(conversionId)) {
+      return res.status(400).json({ error: "Invalid Google Ads conversion ID. Expected format: AW-123456789" });
+    }
+    const label = typeof googleAdsConversionLabel === "string" ? googleAdsConversionLabel.trim() : undefined;
+    // The label is not needed to INSTALL the base tag, but without it no conversion can
+    // ever be attributed — so this is a warning on the response, not a refusal.
+    const warning = conversionId && !label
+      ? "Base tag installed, but no conversion label was provided — conversions cannot be attributed until one is set."
+      : undefined;
+
+    await saveGoogleAdsForPage(page, conversionId, label, googleAdsCustomerId?.trim() || undefined);
+
+    res.json({
+      success: true,
+      googleAdsConversionId: conversionId,
+      ...(label ? { googleAdsConversionLabel: label } : {}),
+      ...(warning ? { warning } : {}),
+      message: conversionId
+        ? `Google Ads tag ${conversionId} installed. Your site will redeploy shortly.`
+        : "Google Ads tag removed. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error installing Google Ads tag:", error);
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to install Google Ads tag" });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Helper: inject a Meta pixel into a page's layout.tsx + regenerate its capture
