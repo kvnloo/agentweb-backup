@@ -954,9 +954,13 @@ SPEND CAP (campaign hard money stop):
 
 DATASET USAGE:
   LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
-  GET_MATCH_QUALITY → Returns Event Match Quality (EMQ) scores per event type for a specific dataset. Requires params.dataset_id.
+  GET_MATCH_QUALITY → Asks Meta for Event Match Quality (EMQ) scores per event type. Requires params.dataset_id.
   WORKFLOW: First LIST to discover pixel/dataset IDs, then GET_MATCH_QUALITY with the dataset_id.
-  NOTE: Match quality data is only available if the advertiser has Conversions API (CAPI) set up.
+  ⚠ META USUALLY RETURNS NOTHING HERE. Its event_stats field comes back empty on live pixels, and no other EMQ API exists.
+     When that happens the response sets meta_event_match_quality_available: false and includes send_side_identity_coverage
+     instead — the share of conversions WE sent that carried each identity parameter (em, ph, fn, ln, fbc, fbp, IP, user agent).
+     That is OUR send-side measurement, NOT Meta's match-quality score. Never report it as Meta's EMQ, and never state or imply
+     an EMQ score when meta_event_match_quality_available is false — say Meta does not expose the number and give the coverage.
 
 REQUIRED IDs PER ACTION:
   CAMPAIGN UPDATE/DELETE  → campaign_id required
@@ -8603,6 +8607,7 @@ ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
   CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days)
     status on a CONVERSION_ACTION is ENABLED, REMOVED or HIDDEN only — there is NO PAUSED. PAUSED is a campaign status; sending it on a conversion action is rejected. To stop an action counting toward goals while keeping its history, use HIDDEN. REMOVED is permanent and severs historical attribution.
+    On CREATE the status must be ENABLED (omit it and it defaults there). Google deny-lists HIDDEN and REMOVED on create — you cannot create an action already hidden. Create it, then UPDATE it to HIDDEN.
               counting_type is REQUIRED and never inferred: ONE_PER_CLICK counts one conversion per ad click (lead forms, sign-ups); MANY_PER_CLICK counts every conversion (purchases). Choosing wrong inflates reported conversions and silently misdirects smart bidding — nothing errors, so ASK the user rather than guessing.
               CREATE returns tag = {conversionId, conversionLabel, sendTo}, read back from the action's own tag snippets. That AW-<id>/<label> pair is what goes on the page — a resource name cannot be installed. If Google has not generated snippets yet, tag is null and tagUnavailable explains it; re-run LIST shortly to get it.
               CREATE and UPDATE both read the action back and return drift (fields Google stored differently from what was requested) plus driftWarning. Relay drift to the user — do not assume the write took.
