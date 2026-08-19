@@ -93,14 +93,18 @@ export class GoogleAdsService {
       // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
-      // Google's 400 body names the exact field and why; axios's own message is only
-      // "Request failed with status code 400". Rethrowing raw left that detail in the log
-      // and nowhere else, so the caller was told nothing at the one moment it mattered.
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
       const described = describeGoogleAdsError(err);
-      const wrapped: any = new Error(described);
-      wrapped.status = err?.response?.status;
-      wrapped.googleAdsDetail = detail?.error ?? undefined;
-      throw wrapped;
+      if (described) err.message = described;
+      throw err;
     }
   }
 

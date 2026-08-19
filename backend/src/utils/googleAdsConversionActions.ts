@@ -115,10 +115,21 @@ export function describeGoogleAdsError(err: any): string {
   if (error.status) parts.push(String(error.status));
   if (error.message) parts.push(String(error.message));
 
+  // Two different shapes arrive here. Proto-level validation failures — a bad enum, a
+  // malformed field — carry `fieldViolations`. Google Ads BUSINESS errors carry `errors[]`
+  // with an errorCode object. Reading only one leaves half of all failures as a bare
+  // status line.
   const violations: string[] = [];
   for (const detail of Array.isArray(error.details) ? error.details : []) {
     for (const v of Array.isArray(detail?.fieldViolations) ? detail.fieldViolations : []) {
       if (v?.field) violations.push(`${v.field}: ${v.description ?? 'invalid'}`);
+    }
+    for (const e of Array.isArray(detail?.errors) ? detail.errors : []) {
+      const code = e?.errorCode && typeof e.errorCode === 'object'
+        ? Object.values(e.errorCode)[0]
+        : undefined;
+      const msg = e?.message ?? 'error';
+      violations.push(code ? `${code}: ${msg}` : String(msg));
     }
   }
   if (violations.length > 0) parts.push(violations.join('; '));
