@@ -347,3 +347,38 @@ describe('describeGoogleAdsError — Google says which field is wrong; surface i
     expect(out).toContain('a.category');
   });
 });
+
+describe('describeGoogleAdsError — Google Ads business errors, not just proto validation', () => {
+  // Two shapes arrive from the same endpoint. The PAUSED failure was proto-level and
+  // carried `fieldViolations`. A permission or policy failure is a Google Ads BUSINESS
+  // error and carries `errors[]` with an errorCode object instead. Handling only the
+  // first left half of all failures as a bare status line.
+  it('reports an errorCode and message from the errors[] shape', () => {
+    const err: any = { response: { data: { error: { code: 403, status: 'PERMISSION_DENIED',
+      message: 'The caller does not have permission',
+      details: [{ errors: [{
+        errorCode: { authorizationError: 'USER_PERMISSION_DENIED' },
+        message: 'User does not have permission to access customer.',
+      }] }] } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('USER_PERMISSION_DENIED');
+    expect(out).toContain('User does not have permission to access customer.');
+  });
+
+  it('falls back to the message when an error carries no errorCode', () => {
+    const err: any = { response: { data: { error: { status: 'INTERNAL', message: 'boom',
+      details: [{ errors: [{ message: 'something broke' }] }] } } } };
+    expect(describeGoogleAdsError(err)).toContain('something broke');
+  });
+
+  it('reads both shapes when a response somehow carries each', () => {
+    const err: any = { response: { data: { error: { status: 'INVALID_ARGUMENT', message: 'm',
+      details: [
+        { fieldViolations: [{ field: 'a.status', description: 'bad' }] },
+        { errors: [{ errorCode: { rangeError: 'TOO_LOW' }, message: 'too low' }] },
+      ] } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('a.status');
+    expect(out).toContain('TOO_LOW');
+  });
+});
