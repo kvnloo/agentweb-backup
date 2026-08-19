@@ -385,8 +385,18 @@ describe('ENG-1209 AC4 — the failure modes, which is when a backup would be us
       userId, false, 'run-bound',
     );
 
+    // Assert the POSITIVE, not just the absence (CodeRabbit, #2485). "not the
+    // backup" is satisfied by a dispatch that kept `retired-model-v0`, or picked
+    // some third model — both of which would mean the ENG-46 rescue never ran and
+    // this test was pinning nothing about the boundary it names.
+    const resolved = (mockAgentModeService.resolveGenerationModel as jest.Mock).mock.calls
+      .map((c) => c[0]);
+    expect(resolved).toContain('retired-model-v0');
+    // The registry is also asked about the stored backup, which is fine and is the
+    // point: it is RESOLVED as data and still never dispatched. Pinning the
+    // dispatched model is what separates "the rescue ran" from "nothing happened".
+    expect(dispatched().llmModel).toBe(PLATFORM_DEFAULT);
     expectNoDispatchArmedTheBackup();
-    expect(dispatched().llmModel).not.toBe(SYSTEM_BACKUP);
   }, 30000);
 
   it('INVALID INPUT: a malformed stored backup is ignored, not dispatched or crashed on', async () => {
