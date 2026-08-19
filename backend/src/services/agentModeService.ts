@@ -330,7 +330,7 @@ import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
-import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
 import {
   endChatSpan,
@@ -515,7 +515,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
+  info: RunTerminalInfo,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -524,6 +524,7 @@ function recordAgentModeRunCompleted(
       failedToolCalls: info.failedToolCalls ?? 0,
       maxSameToolFailures: info.maxSameToolFailures,
     }).verdict,
+    responseModel: info.llmModel,
   });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -550,9 +551,9 @@ function recordAgentModeClaimCheckError(runId: string, sessionId: string, error:
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: RunTerminalInfo & { error: unknown },
 ): void {
-  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -3547,6 +3548,11 @@ export class AgentModeService {
     let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
     const runEmitter = new RunEmitter(agentRuntimeRunId, () => {}, onProgress);
+    // Hoisted above the try so BOTH terminal paths can report it (ENG-1210 AC14):
+    // the model the run actually began under, after id resolution but before any
+    // backup-model substitution. The catch below cannot see try-scoped locals, and
+    // a run that fails after substituting is exactly the case worth distinguishing.
+    let originalLlmModel: string | undefined;
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,
@@ -3570,7 +3576,7 @@ export class AgentModeService {
         recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
       }
       // Track backup model usage
-      const originalLlmModel = llmModel;
+      originalLlmModel = llmModel;
       let backupModelUsed = false;
 
       // Track memory usage for optimization
@@ -5130,6 +5136,10 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-1210 AC14: grade the run against the model that produced it. These
+        // differ exactly when a transient error moved the run onto the backup.
+        llmModel,
+        modelAtStart: originalLlmModel,
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
@@ -5217,6 +5227,8 @@ export class AgentModeService {
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
+        llmModel,
+        modelAtStart: originalLlmModel,
       });
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
@@ -22753,11 +22765,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
         docId: doc.id,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error creating ClickUp doc:', error);
+
+      // ENG-1354: ClickUp's own API error body ({ err, ECODE }) is the only thing
+      // that can distinguish an OAuth-scope problem from a workspace-side
+      // permission restriction from a malformed request — Axios's generic
+      // "Request failed with status code N" collapses all three into the same
+      // unreadable message. Mirrors the error.response?.data extraction already
+      // used in publishBlogArticle.
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const clickUpError = error?.response?.data;
+      if (clickUpError?.err) {
+        errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
+      }
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
       };
     }
   }
