@@ -24,6 +24,10 @@ export interface TimeoutContinuationMessage {
     // own work and must never be counted as salvageable output.
     isErrorMessage?: boolean;
     isDiagnosticMessage?: boolean;
+    // ENG-1239: set on the tool-role message toolDispatch persists the instant it
+    // defers a generate_image/video call for the per-turn media budget (see
+    // hasPersistedMediaBudgetDeferral below).
+    mediaBudgetDeferred?: boolean;
   } | null;
   timestamp?: string;
   role?: string;
@@ -163,6 +167,33 @@ export function hasDeferredMediaBudgetToolCall(
   return toolCalls.some(
     (tc) => tc?.result?.deferred === true && tc.result?.reason === 'media_generation_time_budget',
   );
+}
+
+/**
+ * ENG-1239: the whole-turn hard-timeout catch branch (agentModeController.ts) never gets
+ * a settled `response` — `withGenerationTimeout` rejected, so there is no `toolCalls`
+ * ledger for hasDeferredMediaBudgetToolCall to inspect. This reads the same "a media call
+ * was deferred" signal off the PERSISTED session history instead: toolDispatch writes a
+ * tool-role message with `metadata.mediaBudgetDeferred: true` the instant it defers a
+ * call (before the turn can go on to time out), so it survives even when the turn's own
+ * final response never arrives. Confirmed against the real production incident (session
+ * 822c1ed4, 2026-08-14T18:20:51.907Z): the deferral marker persisted, then the whole-turn
+ * cap fired ~21s later — this is exactly the marker that scenario left behind.
+ *
+ * Scoped to `sinceMs` (the turn's own start) so an EARLIER turn's already-resolved
+ * deferral is never mistaken for this turn's.
+ */
+export function hasPersistedMediaBudgetDeferral(
+  messages: TimeoutContinuationMessage[] | undefined | null,
+  sinceMs: number,
+): boolean {
+  if (!Array.isArray(messages)) return false;
+  return messages.some((message) => {
+    if (!message?.metadata?.mediaBudgetDeferred) return false;
+    const rawTs = message.timestamp || message.metadata.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    return Number.isFinite(ts) && ts >= sinceMs;
+  });
 }
 
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */

@@ -53,6 +53,7 @@ import {
   collectTurnWorkSince,
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
+  hasPersistedMediaBudgetDeferral,
 } from '../utils/timeoutContinuation';
 import {
   reconcileFalseFailureReport,
@@ -7315,6 +7316,19 @@ export const agentModeController = {
                 void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
               }
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              // ENG-1239: this is the WHOLE-TURN hard-timeout variant of the same batch —
+              // the turn never got far enough to return a `response.toolCalls` ledger for
+              // the success-path hook below to inspect, so hasDeferredMediaBudgetToolCall
+              // can't see it. hasPersistedMediaBudgetDeferral reads the same "a media call
+              // was deferred" signal off what toolDispatch already persisted before the cap
+              // fired (the real production incident, session 822c1ed4, hit exactly this
+              // branch — see the test simulating it). Only fire when a deferral actually
+              // happened this turn, not for every media-bearing timeout, so an unrelated
+              // slow turn that merely made images along the way doesn't get an unwanted
+              // extra continuation call.
+              if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, turnStartMs)) {
+                setImmediate(() => scheduleAutoMediaContinuation(sessionId, session.userId, modelToUse, 1));
+              }
               return;
             }
 
@@ -8324,6 +8338,19 @@ export const agentModeController = {
             // Progress was already completed above; the session lock is released in the
             // inner finally, so this early return is safe.
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            // ENG-1239: same whole-turn hard-timeout auto-continuation as the regular
+            // /generate path above — see that branch's comment for why
+            // hasDeferredMediaBudgetToolCall can't see this case. `session`/`modelToUse`
+            // were declared inside the outer try above and aren't visible in this catch
+            // (same reason `shareId` is re-derived from req.params instead of reused) —
+            // timedOutSession's strongly-consistent read already carries both fields,
+            // since updateSessionLlmModel persisted the effective model before generation
+            // started and continuationMsg being non-null guarantees timedOutSession exists.
+            if (hasPersistedMediaBudgetDeferral(timedOutSession?.messages, sharedTurnStartMs)) {
+              const continuationUserId = timedOutSession!.userId;
+              const continuationModel = timedOutSession!.llmModel || agentModeService.default_model;
+              setImmediate(() => scheduleAutoMediaContinuation(shareId, continuationUserId, continuationModel, 1));
+            }
             return;
           }
 
