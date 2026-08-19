@@ -305,8 +305,10 @@ describe('Gmail OAuth Routes', () => {
         .post('/api/oauth/gmail/connect')
         .send({ tokenSessionId });
 
-      expect(connectRes.status).not.toBe(500);
-      expect(connectRes.status).toBeGreaterThanOrEqual(400);
+      // Exact status, not a range (CodeRabbit, PR #2500 review): a >=400 range also passes
+      // for 401, which is the "invalid/expired session" response — a regression that
+      // misclassified this as an ordinary invalid session would slip through a range check.
+      expect(connectRes.status).toBe(503);
       expect(connectRes.body.error).toBeDefined();
       expect(JSON.stringify(connectRes.body)).not.toMatch(/google-access-token|google-refresh-token/);
     });

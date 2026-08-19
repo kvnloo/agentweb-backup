@@ -216,6 +216,26 @@ describe('oauthTokenSessionStore — atomic one-time-use consumption (ENG-965)',
     expect(await retrieveTokenSession(id, 'u1', 'outlook')).not.toBeNull();
     expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
   });
+
+  // CodeRabbit (PR #2500 review): a wrong/unknown sessionId against a row with other live
+  // siblings still triggered a "prune" write even though nothing was pruned — that pointless
+  // rewrite changes the row's raw value and can make a CONCURRENT, legitimate consume for a
+  // sibling session lose its own conditional race for no reason.
+  it('does not touch the row at all for an unknown session id when there is nothing to prune (no false conditional-write race)', async () => {
+    const first = await storeTokenSession('u1', 'gmail', tokens, profile);
+    await storeTokenSession('u1', 'gmail', tokens, profile); // a second, still-live sibling
+
+    const before = table.get('oauth_token_session_gmail_u1');
+    expect(await retrieveTokenSession('not-a-real-session', 'u1', 'gmail')).toBeNull();
+
+    expect(mockSetIfMatches).not.toHaveBeenCalled();
+    expect(mockDeleteIfMatches).not.toHaveBeenCalled();
+    expect(table.get('oauth_token_session_gmail_u1')).toBe(before);
+
+    // Concretely: a concurrent legitimate consume of the OTHER session is unaffected —
+    // it still succeeds, because the wrong-id lookup never touched the row it read.
+    expect(await retrieveTokenSession(first, 'u1', 'gmail')).not.toBeNull();
+  });
 });
 
 // The previous (single-session-per-row) design broke this: a second popup overwrote the

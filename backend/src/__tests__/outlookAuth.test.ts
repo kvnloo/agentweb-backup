@@ -306,8 +306,10 @@ describe('POST /connect', () => {
 
     const res = await request(app).post('/api/oauth/outlook/connect').send({ tokenSessionId });
 
-    expect(res.status).not.toBe(500);
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    // Exact status, not a range (CodeRabbit, PR #2500 review): a >=400 range also passes
+    // for 401, which is the "invalid/expired session" response — a regression that
+    // misclassified this as an ordinary invalid session would slip through a range check.
+    expect(res.status).toBe(503);
     expect(res.body.error).toBeDefined();
     expect(JSON.stringify(res.body)).not.toMatch(/refresh-1|access-1/);
   });

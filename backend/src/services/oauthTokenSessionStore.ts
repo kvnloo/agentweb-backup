@@ -203,6 +203,15 @@ export async function retrieveTokenSession(
   // touched the row since (see doc comment above).
   const remaining = sessions.filter((s) => live(s, now) && s !== match);
 
+  // Nothing to consume and nothing to prune (e.g. an unknown/wrong sessionId against a row
+  // of otherwise-live siblings): skip the write entirely. Rewriting the row here would only
+  // change its `updatedAt`, but that still changes the raw `settingValue` this write is
+  // conditioned on — which would invalidate a concurrent LEGITIMATE consume's own read and
+  // make it lose its conditional race for no reason. A no-op stays a no-op.
+  if (!match && remaining.length === sessions.length) {
+    return null;
+  }
+
   try {
     if (remaining.length === 0) {
       await settingsService.deleteSettingIfValueMatches(key, setting.settingValue);
