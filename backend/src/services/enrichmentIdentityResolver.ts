@@ -260,6 +260,18 @@ export async function resolveIdentity(
     console.log(`${logTag} placeholder/test email domain — ignoring email as an identity signal`);
     email = '';
   }
+  // A lead enriched before this guard existed (or imported with the field set
+  // directly) can carry a placeholder emailDomain independently of email —
+  // Tier 0.5 and step 3.6 below persist `resolved.emailDomain` back onto the
+  // lead whenever they resolve a domain with no email to derive it from. Every
+  // downstream read of `lead.emailDomain` must go through this sanitized value
+  // instead of the raw field, or a stale `emailDomain: "example.com"` reaches
+  // Apollo's org match, enrich.so, the broker chain and pattern-matching on
+  // every later run even after email itself is dropped above.
+  const leadEmailDomain =
+    typeof lead.emailDomain === 'string' && !CrmEnrichmentService.isPlaceholderDomain(lead.emailDomain)
+      ? lead.emailDomain
+      : undefined;
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
   const hasName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
@@ -393,7 +405,7 @@ export async function resolveIdentity(
           resolved.website = domainResult.website;
           meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           const derivedDomain = deriveDomainFromWebsite(domainResult.website);
-          if (derivedDomain && !lead.emailDomain && !resolved.emailDomain) {
+          if (derivedDomain && !leadEmailDomain && !resolved.emailDomain) {
             resolved.emailDomain = derivedDomain;
             meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           }
@@ -489,7 +501,7 @@ export async function resolveIdentity(
   const firstNameEff = lead.firstName || resolved.firstName;
   const lastNameEff = lead.lastName || resolved.lastName;
   const domainForApollo =
-    lead.emailDomain || resolved.emailDomain ||
+    leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
     deriveDomainFromWebsite(lead.website || resolved.website || '') ||
     undefined;
@@ -647,7 +659,7 @@ export async function resolveIdentity(
   // it the domain is only discovered later in the waterfall, so email
   // resolution would otherwise need a second enrichment run.
   const domainKnown = !!(
-    lead.emailDomain || resolved.emailDomain ||
+    leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && hasBusinessEmailDomain) ||
     lead.website || resolved.website
   );
@@ -678,11 +690,11 @@ export async function resolveIdentity(
   }
 
   // 4. Derive emailDomain from email if present. Pure local op, no API call.
-  if (email && !lead.emailDomain) {
+  if (email && !leadEmailDomain) {
     const derived = extractDomainFromEmail(email);
     if (derived) resolved.emailDomain = derived;
   }
-  const emailDomain = lead.emailDomain || resolved.emailDomain;
+  const emailDomain = leadEmailDomain || resolved.emailDomain;
 
   // (Tier 5 merged into unified Apollo call above.)
 
@@ -720,7 +732,7 @@ export async function resolveIdentity(
   // (emailDomain or company). Respects the same emailStatus gate as the
   // unified Apollo Tier 3: weak signal (no linkedin) → only verified/unverified/
   // extrapolated accepted; strong signal (has linkedin) → anything except guessed.
-  const emailDomainForBroker = lead.emailDomain || resolved.emailDomain;
+  const emailDomainForBroker = leadEmailDomain || resolved.emailDomain;
   const firstNameForBroker = lead.firstName || resolved.firstName;
   const lastNameForBroker = lead.lastName || resolved.lastName;
   const companyForBroker = lead.company || resolved.company;
@@ -759,7 +771,7 @@ export async function resolveIdentity(
   // firstName + lastName are known. Does NOT require leadHint. Quality is
   // inherent (enrich.so deliverability check); no emailStatus gate needed.
   let emailPattern: string | undefined;
-  const emailDomainForPatterns = lead.emailDomain || resolved.emailDomain;
+  const emailDomainForPatterns = leadEmailDomain || resolved.emailDomain;
   const firstNameForPatterns = lead.firstName || resolved.firstName;
   const lastNameForPatterns = lead.lastName || resolved.lastName;
   if (!email && emailDomainForPatterns && firstNameForPatterns && lastNameForPatterns) {
@@ -788,7 +800,7 @@ export async function resolveIdentity(
 
   // After Tier 6.5 / 7: re-derive emailDomain from the newly-found email
   // when neither the lead nor the resolved object already has one.
-  if (email && !lead.emailDomain && !resolved.emailDomain) {
+  if (email && !leadEmailDomain && !resolved.emailDomain) {
     const derived = extractDomainFromEmail(email);
     if (derived) resolved.emailDomain = derived;
   }
