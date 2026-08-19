@@ -2288,6 +2288,29 @@ async function addPageToExistingRepo(
        * ENG-1325, so this flag is the ONLY signal that a page shipped unmeasured, and RULE 7.5
        * needs it to refuse the launch.
        */
+    }
+
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      [...filesToCommit, ...repairs],
+      repairs.length > 0
+        ? `Add new page: ${name} (/${slug}) + repair ${repairs.length} broken import(s)`
+        : `Add new page: ${name} (/${slug})`
+    );
+
+    /*
+     * Recorded only now the commit has actually landed. Writing it before the push meant
+     * a throwing commit left the record claiming the base tag was installed while the
+     * layout never received it — which is precisely the ENG-1182 condition this flag
+     * exists to detect, produced by the detector itself. The Meta leg already persists
+     * after its push for the same reason.
+     *
+     * `false` here is not bookkeeping: there is no server-side leg until ENG-1325, so it
+     * means the page shipped with no Google measurement at all, and RULE 7.5 needs it to
+     * refuse the launch.
+     */
+    if (subPageGoogleAdsId) {
       const googleAdsTagLive = googleAdsTagPresent && !googleAdsInstallAbandoned;
       record.googleAdsTrackingInstalled = googleAdsTagLive;
       try {
@@ -2301,15 +2324,6 @@ async function addPageToExistingRepo(
         console.warn(`[V0 SERVICE] Could not persist googleAdsTrackingInstalled for /${slug}: ${persistErr?.message}`);
       }
     }
-
-    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
-      repoFullName,
-      ghHeaders,
-      [...filesToCommit, ...repairs],
-      repairs.length > 0
-        ? `Add new page: ${name} (/${slug}) + repair ${repairs.length} broken import(s)`
-        : `Add new page: ${name} (/${slug})`
-    );
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
 
@@ -4166,7 +4180,13 @@ export async function fireLeadTracking(opts: {
     await new Promise((resolve) => setTimeout(resolve, 800));
   }
 
-  if (opts.googleAds && opts.googleAds.conversionId && opts.googleAds.conversionLabel) {
+  // eventId is REQUIRED for the Google leg, unlike Meta's. It is the offline import's
+  // dedup key (ENG-1325 uploads it as order_id), so firing without it would record a
+  // browser conversion that nothing can be matched against — and the same lead uploaded
+  // later would count twice. Skipping the conversion is the lesser failure: one missing
+  // conversion is visible in reporting, a double-counted one silently inflates it and
+  // misdirects smart bidding.
+  if (opts.googleAds && opts.googleAds.conversionId && opts.googleAds.conversionLabel && opts.eventId) {
     // @ts-ignore — gtag is injected globally by the platform-owned base tag in layout.tsx
     if (typeof window !== "undefined" && typeof window.gtag === "function") {
       // Wait for Google's own event_callback rather than a blind sleep: the bridge-out
@@ -4190,6 +4210,8 @@ export async function fireLeadTracking(opts: {
     // No else: a missing window.gtag means the base tag never installed. That is recorded
     // server-side as googleAdsTrackingInstalled=false; silently sleeping here would only
     // delay the redirect without recording anything.
+  } else if (opts.googleAds && !opts.eventId) {
+    console.warn('fireLeadTracking: googleAds configured but no eventId — skipping the conversion rather than sending one that cannot be deduplicated.');
   }
 
   if (opts.bridgeOutUrl) {

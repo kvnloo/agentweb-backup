@@ -2408,6 +2408,16 @@ router.post("/generated/:id/google-ads", editRateLimiter, async (req, res: Respo
     if (conversionId && !/^AW-[0-9]{6,}$/.test(conversionId)) {
       return res.status(400).json({ error: "Invalid Google Ads conversion ID. Expected format: AW-123456789" });
     }
+    // Rejected, not coerced. A non-string label silently became `undefined`, which
+    // updateLandingPageGoogleAds reads as "clear the stored label" — so a malformed
+    // request would strip a working conversion pair and leave an id that attributes
+    // nothing. A non-string customer id reached .trim() and 500'd.
+    if (googleAdsConversionLabel !== undefined && typeof googleAdsConversionLabel !== "string") {
+      return res.status(400).json({ error: "googleAdsConversionLabel must be a string" });
+    }
+    if (googleAdsCustomerId !== undefined && typeof googleAdsCustomerId !== "string") {
+      return res.status(400).json({ error: "googleAdsCustomerId must be a string" });
+    }
     const label = typeof googleAdsConversionLabel === "string" ? googleAdsConversionLabel.trim() : undefined;
     // The label is not needed to INSTALL the base tag, but without it no conversion can
     // ever be attributed — so this is a warning on the response, not a refusal.

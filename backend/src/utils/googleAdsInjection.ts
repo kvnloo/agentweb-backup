@@ -25,6 +25,22 @@
 const MAX_LAYOUT_SIZE_BYTES = 500_000;
 
 /**
+ * The only shape a Google Ads conversion id takes, and the same one RULE 7.5's detector
+ * looks for — so a tag we install is a tag the pre-flight gate will recognise.
+ *
+ * This is a security boundary, not a tidiness check. The id is interpolated into a JSX
+ * template literal AND into a `dangerouslySetInnerHTML` template literal, so a backtick,
+ * `${`, or quote terminates the literal and lands arbitrary code on the customer's
+ * deployed page. Reproduced before this guard existed: an id of `AW-1\`); alert(1); //`
+ * emitted a layout containing a live alert(1).
+ *
+ * The manual endpoint validates its input too, but this module is also driven by the
+ * generation and sub-page paths straight from the site record, so the guard belongs where
+ * the string becomes source code — not only at one caller.
+ */
+const CONVERSION_ID = /^AW-[0-9]{6,}$/;
+
+/**
  * Inject (or strip) the Google Ads base tag in a Next.js root layout's source.
  *
  * Pure and idempotent: it ALWAYS strips any existing Google Ads block first, then
@@ -37,6 +53,18 @@ const MAX_LAYOUT_SIZE_BYTES = 500_000;
  */
 export function injectGoogleAdsIntoLayout(currentContent: string, conversionId: string): string {
   if (currentContent.length > MAX_LAYOUT_SIZE_BYTES) return currentContent;
+
+  // Anything that is neither a valid id nor the empty-string removal path is refused
+  // outright, BEFORE the strip. Stripping first would tear a working tag out of a live
+  // layout and then decline to replace it — silently un-tracking a measured page in the
+  // name of rejecting bad input.
+  if (conversionId !== '' && !CONVERSION_ID.test(conversionId)) {
+    console.error(
+      `[GOOGLE ADS INJECTION] Refusing to install conversion id ${JSON.stringify(conversionId)} — `
+      + 'not a valid AW-<digits> value. Layout left untouched.',
+    );
+    return currentContent;
+  }
 
   const adsSnippet =
     `        {/* Google Ads Tag */}\n` +
@@ -99,6 +127,11 @@ export function verifyGoogleAdsInjection(content: string, conversionId: string):
   if (!conversionId) {
     return blocks.length === 0;
   }
+
+  // An id the injector would refuse can never be installed, so it can never verify.
+  // Without this, a hostile id whose payload happened to appear inside an existing block
+  // could read as installed.
+  if (!CONVERSION_ID.test(conversionId)) return false;
 
   return (
     blocks.length === 1 &&
