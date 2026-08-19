@@ -112,12 +112,23 @@ export function normalizeCacheDetails(cacheDetails: any): Record<string, number>
   return Object.keys(byTtl).length > 0 ? byTtl : undefined;
 }
 
-/** Gemini: usageMetadata{promptTokenCount, candidatesTokenCount, cachedContentTokenCount}. */
+/**
+ * Gemini: usageMetadata{promptTokenCount, candidatesTokenCount, cachedContentTokenCount}.
+ *
+ * ENG-1301: promptTokenCount is INCLUSIVE of cachedContentTokenCount (a subset, not
+ * additive) — unlike Bedrock/Anthropic's inputTokens, which EXCLUDES cache read/write
+ * tokens. Every caller of this normalizer bills inputTokens at full price and
+ * cacheReadTokens again on top at the (discounted) cache-read rate, so passing Google's
+ * raw total through as inputTokens double-bills every cached token. Subtract here so
+ * inputTokens reports only the non-cached remainder, matching every other provider.
+ */
 export function normalizeGeminiUsage(usageMetadata: any): NormalizedUsage {
+  const cacheReadTokens = usageMetadata?.cachedContentTokenCount || 0;
+  const totalPromptTokens = usageMetadata?.promptTokenCount || 0;
   return {
-    inputTokens: usageMetadata?.promptTokenCount || 0,
+    inputTokens: Math.max(0, totalPromptTokens - cacheReadTokens),
     outputTokens: usageMetadata?.candidatesTokenCount || 0,
-    cacheReadTokens: usageMetadata?.cachedContentTokenCount || 0,
+    cacheReadTokens,
   };
 }
 

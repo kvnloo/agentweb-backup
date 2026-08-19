@@ -545,15 +545,37 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gemini-2.5-pro');
       const out = await svc.generateJSONContentWithWebSearch('sys', 'user', { feature: 'search' });
       expect(out).toEqual({ answer: 42 });
+      // ENG-1301: promptTokenCount (11) is INCLUSIVE of cachedContentTokenCount (4) —
+      // inputTokens must report only the non-cached remainder (7), else the cached
+      // tokens get billed twice (full price inside inputTokens, again via
+      // cacheReadTokens' discounted rate).
       expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           provider: 'gemini',
           model: 'gemini-2.5-pro',
-          inputTokens: 11,
+          inputTokens: 7,
           outputTokens: 7,
           cacheReadTokens: 4,
           feature: 'search',
         })
+      );
+    });
+
+    it('boundary: fully-cached prompt floors inputTokens at 0 (ENG-1301)', async () => {
+      process.env.GEMINI_API_KEY = 'gem-key';
+      mockGeminiGenerateContent.mockResolvedValue({
+        text: '{"answer": 1}',
+        usageMetadata: {
+          promptTokenCount: 500,
+          candidatesTokenCount: 3,
+          totalTokenCount: 503,
+          cachedContentTokenCount: 500,
+        },
+      });
+      const svc = new LLMService('gemini-2.5-pro');
+      await svc.generateJSONContentWithWebSearch('sys', 'user', { feature: 'search' });
+      expect(mockMeterUser).toHaveBeenCalledWith(
+        expect.objectContaining({ inputTokens: 0, cacheReadTokens: 500 })
       );
     });
 

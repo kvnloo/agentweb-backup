@@ -80,6 +80,11 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+const mockMeterUserUsage = jest.fn();
+jest.mock('../services/usageRecorderService', () => ({
+  meterUserUsage: (...args: any[]) => mockMeterUserUsage(...args),
+}));
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -466,6 +471,83 @@ describe('incoming audio relay', () => {
       sessionId: 'session-audiotranscript',
       text: 'Your campaigns are performing well.',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shadow usage metering (ENG-1301)
+// ---------------------------------------------------------------------------
+
+describe('incoming message shadow usage metering (ENG-1301)', () => {
+  // Gemini's usageMetadata.promptTokenCount is INCLUSIVE of cachedContentTokenCount
+  // (a subset, not additive) — unlike Bedrock/Anthropic's inputTokens, which EXCLUDES
+  // cache tokens. meterUserUsage/computeCostMicroUsd assume the exclusive convention,
+  // so passing the raw total through as inputTokens double-bills every cached token.
+
+  it('boundary: fully-cached prompt floors inputTokens at 0, not negative', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-cache-full', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      usageMetadata: { promptTokenCount: 500, candidatesTokenCount: 10, cachedContentTokenCount: 500 },
+    });
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 0, outputTokens: 10, cacheReadTokens: 500 })
+    );
+  });
+
+  it('boundary: cachedContentTokenCount reported greater than promptTokenCount (defensive) still floors at 0', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-cache-over', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 5, cachedContentTokenCount: 150 },
+    });
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 0 })
+    );
+  });
+
+  it('invalid input: missing cachedContentTokenCount leaves inputTokens as the full count', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-cache-none', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 10 },
+    });
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 200, cacheReadTokens: 0 })
+    );
+  });
+
+  it('success: partially-cached prompt reports inputTokens as the non-cached remainder', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-cache-partial', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      usageMetadata: {
+        promptTokenCount: 150312,
+        responseTokenCount: 153,
+        cachedContentTokenCount: 146573,
+      },
+    });
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'gemini',
+        inputTokens: 3739, // 150312 - 146573
+        outputTokens: 153,
+        cacheReadTokens: 146573,
+        sessionId: 'session-cache-partial',
+      })
+    );
   });
 });
 

@@ -16,6 +16,7 @@ import {
   createGeminiNativeClient,
   type OpenAIChatParams,
 } from '../geminiNativeClient';
+import { computeCostMicroUsd } from '../../../usageRecorderService';
 
 const OPTS = { defaultMaxTokens: 32000 };
 
@@ -325,12 +326,104 @@ describe('fromGeminiResponse', () => {
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 8, thoughtsTokenCount: 40, cachedContentTokenCount: 3, totalTokenCount: 58 },
     };
     const out = fromGeminiResponse(resp);
+    // promptTokenCount (10) is INCLUSIVE of cachedContentTokenCount (3) per Google's API
+    // contract, so prompt_tokens reports only the non-cached remainder (7) here — see the
+    // dedicated describe block below (ENG-1301) for why.
     expect(out.usage).toEqual({
-      prompt_tokens: 10,
+      prompt_tokens: 7,
       completion_tokens: 48,
       total_tokens: 58,
       cache_read_input_tokens: 3,
       cache_creation_input_tokens: 0,
+    });
+  });
+
+  describe('prompt_tokens excludes cache_read_input_tokens (ENG-1301)', () => {
+    // Google's usageMetadata.promptTokenCount is the TOTAL prompt size, INCLUSIVE of
+    // cachedContentTokenCount (a subset, not additive) — unlike Bedrock/Anthropic, whose
+    // usage.inputTokens EXCLUDES cache read/write tokens. Every downstream cost formula
+    // in this codebase (agentModeService.estimateCost, usageRecorderService.
+    // computeCostMicroUsd) assumes the Bedrock convention: prompt_tokens is billed at
+    // full price AND cache_read_input_tokens is billed again on top at the (discounted)
+    // cache-read rate. Passing Google's raw total through as prompt_tokens therefore
+    // double-bills every cached token. Verified against real production data from the
+    // ENG-1188 incident session (session 1a206833): the double-billed formula reproduced
+    // the recorded estimated_cost EXACTLY across every sampled turn.
+
+    it('boundary: fully-cached prompt (cachedContentTokenCount === promptTokenCount) floors prompt_tokens at 0, not negative', () => {
+      const resp = {
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'hi' }] } }],
+        usageMetadata: { promptTokenCount: 500, candidatesTokenCount: 10, cachedContentTokenCount: 500, totalTokenCount: 510 },
+      };
+      const out = fromGeminiResponse(resp);
+      expect(out.usage.prompt_tokens).toBe(0);
+      expect(out.usage.cache_read_input_tokens).toBe(500);
+    });
+
+    it('boundary: cachedContentTokenCount reported greater than promptTokenCount (defensive) still floors at 0', () => {
+      const resp = {
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'hi' }] } }],
+        usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 5, cachedContentTokenCount: 150, totalTokenCount: 105 },
+      };
+      const out = fromGeminiResponse(resp);
+      expect(out.usage.prompt_tokens).toBe(0);
+    });
+
+    it('invalid input: missing cachedContentTokenCount leaves prompt_tokens as the full count (cache_read_input_tokens 0)', () => {
+      const resp = {
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'hi' }] } }],
+        usageMetadata: { promptTokenCount: 200, candidatesTokenCount: 10, totalTokenCount: 210 },
+      };
+      const out = fromGeminiResponse(resp);
+      expect(out.usage.prompt_tokens).toBe(200);
+      expect(out.usage.cache_read_input_tokens).toBe(0);
+    });
+
+    it('success: partially-cached prompt reports prompt_tokens as the non-cached remainder, total_tokens unaffected', () => {
+      // Shapes taken from the real ENG-1188 incident session's message index 100.
+      const resp = {
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'done' }] } }],
+        usageMetadata: {
+          promptTokenCount: 150312,
+          candidatesTokenCount: 153,
+          cachedContentTokenCount: 146573,
+          totalTokenCount: 150465,
+        },
+      };
+      const out = fromGeminiResponse(resp);
+      expect(out.usage).toEqual({
+        prompt_tokens: 3739, // 150312 - 146573
+        completion_tokens: 153,
+        total_tokens: 150465,
+        cache_read_input_tokens: 146573,
+        cache_creation_input_tokens: 0,
+      });
+    });
+
+    it('regression: computeCostMicroUsd no longer double-bills cached tokens for gemini-3.1-pro-preview', () => {
+      const resp = {
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'done' }] } }],
+        usageMetadata: {
+          promptTokenCount: 150312,
+          candidatesTokenCount: 153,
+          cachedContentTokenCount: 146573,
+          totalTokenCount: 150465,
+        },
+      };
+      const { usage } = fromGeminiResponse(resp);
+      const costMicroUsd = computeCostMicroUsd(
+        'gemini-3.1-pro-preview',
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens
+      );
+      // Correct (non-double-billed) cost at $2/$12/$0.20-per-1M (in/out/cache-read):
+      // 3739*2 + 153*12 + 146573*0.2 = 7478 + 1836 + 29314.6 = 38628.6 -> rounds to 38629.
+      // The prior (buggy) formula billed the full 150312 prompt tokens at $2 PLUS the
+      // 146573 cache-read tokens again at $0.20, i.e. ~331775 microUSD for this one turn
+      // — 8.6x the corrected figure.
+      expect(costMicroUsd).toBe(38629);
     });
   });
 

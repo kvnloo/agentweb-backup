@@ -925,14 +925,19 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   if (message.usageMetadata) {
     try {
       const um: any = message.usageMetadata;
+      const cacheReadTokens = um.cachedContentTokenCount || 0;
+      // ENG-1301: promptTokenCount is INCLUSIVE of cachedContentTokenCount (a subset,
+      // not additive) — meterUserUsage/computeCostMicroUsd assume the Bedrock/Anthropic
+      // convention where inputTokens EXCLUDES cache tokens, so passing the raw total
+      // through double-bills every cached token.
       void meterUserUsage({
         userId: entry.userId,
         model: LIVE_MODEL.replace(/^models\//, ''),
         provider: 'gemini',
         feature: 'agent_task',
-        inputTokens: um.promptTokenCount || 0,
+        inputTokens: Math.max(0, (um.promptTokenCount || 0) - cacheReadTokens),
         outputTokens: um.responseTokenCount || um.candidatesTokenCount || 0,
-        cacheReadTokens: um.cachedContentTokenCount || 0,
+        cacheReadTokens,
         sessionId,
       });
     } catch {

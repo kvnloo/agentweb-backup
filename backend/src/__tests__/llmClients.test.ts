@@ -160,14 +160,56 @@ describe('llmClients normalizers', () => {
     ).toEqual({ inputTokens: 11, outputTokens: 22, cacheReadTokens: 3, cacheWriteTokens: 4 });
   });
 
-  it('normalizes Gemini usageMetadata', () => {
+  it('normalizes Gemini usageMetadata, excluding cached tokens from inputTokens (ENG-1301)', () => {
+    // promptTokenCount is INCLUSIVE of cachedContentTokenCount (a subset, not
+    // additive) — inputTokens must report only the non-cached remainder (7) to
+    // match the Bedrock/Anthropic convention every downstream cost formula assumes,
+    // else cached tokens get billed twice (see geminiNativeClient.test.ts ENG-1301).
     expect(
       normalizeGeminiUsage({
         promptTokenCount: 9,
         candidatesTokenCount: 18,
         cachedContentTokenCount: 2,
       })
-    ).toEqual({ inputTokens: 9, outputTokens: 18, cacheReadTokens: 2 });
+    ).toEqual({ inputTokens: 7, outputTokens: 18, cacheReadTokens: 2 });
+  });
+
+  describe('normalizeGeminiUsage — inputTokens excludes cached tokens (ENG-1301)', () => {
+    it('boundary: fully-cached prompt floors inputTokens at 0', () => {
+      expect(
+        normalizeGeminiUsage({
+          promptTokenCount: 500,
+          candidatesTokenCount: 10,
+          cachedContentTokenCount: 500,
+        })
+      ).toEqual({ inputTokens: 0, outputTokens: 10, cacheReadTokens: 500 });
+    });
+
+    it('boundary: cachedContentTokenCount reported greater than promptTokenCount (defensive) still floors at 0', () => {
+      expect(
+        normalizeGeminiUsage({
+          promptTokenCount: 100,
+          candidatesTokenCount: 5,
+          cachedContentTokenCount: 150,
+        })
+      ).toEqual({ inputTokens: 0, outputTokens: 5, cacheReadTokens: 150 });
+    });
+
+    it('invalid input: missing cachedContentTokenCount leaves inputTokens as the full count', () => {
+      expect(
+        normalizeGeminiUsage({ promptTokenCount: 200, candidatesTokenCount: 10 })
+      ).toEqual({ inputTokens: 200, outputTokens: 10, cacheReadTokens: 0 });
+    });
+
+    it('success: partially-cached prompt reports inputTokens as the non-cached remainder', () => {
+      expect(
+        normalizeGeminiUsage({
+          promptTokenCount: 150312,
+          candidatesTokenCount: 153,
+          cachedContentTokenCount: 146573,
+        })
+      ).toEqual({ inputTokens: 3739, outputTokens: 153, cacheReadTokens: 146573 });
+    });
   });
 
   it('normalizes embeddings usage with outputTokens 0', () => {
@@ -282,7 +324,7 @@ describe('normalizeUsageFromResponse (shape detection)', () => {
       normalizeUsageFromResponse({
         usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 18, cachedContentTokenCount: 2 },
       })
-    ).toEqual({ inputTokens: 9, outputTokens: 18, cacheReadTokens: 2 });
+    ).toEqual({ inputTokens: 7, outputTokens: 18, cacheReadTokens: 2 });
   });
 
   it('detects the OpenAI/Azure shape via usage.prompt_tokens', () => {
@@ -377,7 +419,7 @@ describe('meterUsageFromResponse', () => {
       { usageMetadata: { promptTokenCount: 40, candidatesTokenCount: 60, cachedContentTokenCount: 5 } }
     );
     expect(mockMeterUserUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ inputTokens: 40, outputTokens: 60, cacheReadTokens: 5 })
+      expect.objectContaining({ inputTokens: 35, outputTokens: 60, cacheReadTokens: 5 })
     );
   });
 
@@ -1190,7 +1232,7 @@ describe('getGeminiClient', () => {
       expect.objectContaining({
         provider: 'gemini',
         model: 'gemini-3.5-flash',
-        inputTokens: 40,
+        inputTokens: 36,
         outputTokens: 8,
         cacheReadTokens: 4,
       })

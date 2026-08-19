@@ -516,14 +516,20 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
         },
       });
       const usageMeta = (response as any)?.usageMetadata;
-      const geminiIn = usageMeta?.promptTokenCount || 0;
+      const geminiTotalIn = usageMeta?.promptTokenCount || 0;
       const geminiOut = usageMeta?.candidatesTokenCount || 0;
+      const geminiCacheRead = usageMeta?.cachedContentTokenCount || 0;
+      // ENG-1301: promptTokenCount is INCLUSIVE of cachedContentTokenCount (a subset,
+      // not additive) — meterUsage/computeCostMicroUsd assume the Bedrock/Anthropic
+      // convention where inputTokens EXCLUDES cache tokens, so passing the raw total
+      // through double-bills every cached token.
+      const geminiIn = Math.max(0, geminiTotalIn - geminiCacheRead);
       this.meterUsage({
         inputTokens: geminiIn,
         outputTokens: geminiOut,
-        totalTokens: usageMeta?.totalTokenCount || (geminiIn + geminiOut),
+        totalTokens: usageMeta?.totalTokenCount || (geminiTotalIn + geminiOut),
         model: this.modelName,
-        cacheReadTokens: usageMeta?.cachedContentTokenCount || 0,
+        cacheReadTokens: geminiCacheRead,
       }, usageContext);
       const text = response.text ?? '';
       return extractJson<T>(text);

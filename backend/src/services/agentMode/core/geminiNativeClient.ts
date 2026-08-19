@@ -538,11 +538,21 @@ export function fromGeminiResponse(resp: any): any {
   if (hasToolCalls && !truncatedToolCall) message.tool_calls = toolCalls;
 
   const usage = resp?.usageMetadata || {};
-  const promptTokens = usage.promptTokenCount || 0;
+  const totalPromptTokens = usage.promptTokenCount || 0;
   // Thinking tokens are billed as output even when not returned, so fold
   // thoughtsTokenCount into completion_tokens for correct cost/quota accounting.
   const completionTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
   const cacheReadTokens = usage.cachedContentTokenCount || 0;
+  // ENG-1301: Google's promptTokenCount is INCLUSIVE of cachedContentTokenCount (a
+  // subset, not additive) — unlike Bedrock/Anthropic's inputTokens, which EXCLUDES
+  // cache read/write tokens. Every downstream cost formula (agentModeService.
+  // estimateCost, usageRecorderService.computeCostMicroUsd) assumes the Bedrock
+  // convention: prompt_tokens is billed at full price and cache_read_input_tokens is
+  // billed again on top at the (discounted) cache-read rate. Passing Google's raw
+  // total through as prompt_tokens double-bills every cached token — verified against
+  // the real ENG-1188 incident session, where it reproduced the recorded cost exactly.
+  // Math.max(0, ...) guards a cachedContentTokenCount reported >= promptTokenCount.
+  const promptTokens = Math.max(0, totalPromptTokens - cacheReadTokens);
 
   return {
     id: `gemini-native-${candidate?.index ?? 0}`,
@@ -557,7 +567,7 @@ export function fromGeminiResponse(resp: any): any {
     usage: {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
-      total_tokens: usage.totalTokenCount || (promptTokens + completionTokens),
+      total_tokens: usage.totalTokenCount || (totalPromptTokens + completionTokens),
       cache_read_input_tokens: cacheReadTokens,
       // ENG-1188/ENG-1301: always 0, not a measurement. Unlike Bedrock/Anthropic,
       // Gemini's generateContent response carries no "cache write" counter — a
