@@ -177,6 +177,12 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // priced at $0/free-by-omission) and to render an estimate before a call completes.
   // Rates per openrouter.ai/models list pricing, Aug 2026.
   'openrouter/openai/gpt-4o-mini': withDerivedCache(0.15, 0.6),
+  // GPT-5.6 family (Sol/Terra/Luna) — real pricing from artificialanalysis.ai,
+  // live-fetched 2026-08-19 (same research pass that sourced the picker's
+  // qualityScore/costScore for these models in agentModeService.ts).
+  'openrouter/openai/gpt-5.6-sol': withDerivedCache(5.0, 30.0),
+  'openrouter/openai/gpt-5.6-terra': withDerivedCache(2.0, 12.0),
+  'openrouter/openai/gpt-5.6-luna': withDerivedCache(0.2, 1.2),
   'openrouter/x-ai/grok-4.6': withDerivedCache(3, 15),
   'openrouter/deepseek/deepseek-v4-pro': withDerivedCache(0.55, 2.19),
   'openrouter/deepseek/deepseek-v4-flash': withDerivedCache(0.14, 0.28),

@@ -282,6 +282,80 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
     });
 
+    /*
+     * 2026-08-19 — real quality/cost scores for the picker's meters. Sourced
+     * live from Artificial Analysis (Intelligence Index) + real per-token
+     * pricing, computed via a documented formula (see costScoreSource on
+     * each entry) — never estimated. `gpt-5-chat-2` genuinely does not exist
+     * under that name on AA, OpenRouter, or OpenAI's docs (confirmed via
+     * multiple direct URL probes during research), so it correctly carries
+     * neither field rather than a guess.
+     */
+    describe('2026-08-19 — quality/cost meter scores', () => {
+      const SCORED_IDS = [
+        'anthropic.claude-opus-5', 'anthropic.claude-opus-4-8', 'anthropic.claude-opus-4-6-v1',
+        'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+        'gpt-5.5', 'gpt-5.4', 'gpt-5.2-chat', 'gpt-5.4-nano',
+        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.1-flash-lite',
+        'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
+        'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
+        'openrouter/qwen/qwen3.8-max', 'openrouter/mistralai/mistral-small-2603',
+        'openrouter/moonshotai/kimi-k3', 'openrouter/moonshotai/kimi-k2.7-code',
+        'openrouter/z-ai/glm-5.2', 'openrouter/z-ai/glm-4.7-flash',
+        'openrouter/openai/gpt-5.6-sol', 'openrouter/openai/gpt-5.6-terra', 'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(SCORED_IDS)('%s has an in-range (0-100) qualityScore and costScore, each with a source note', (id) => {
+        const config = (agentModeService as any).llmModels[id];
+        expect(config.qualityScore).toBeGreaterThanOrEqual(0);
+        expect(config.qualityScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(config.qualityScore)).toBe(true);
+        expect(config.qualityScoreSource).toEqual(expect.any(String));
+        expect(config.costScore).toBeGreaterThanOrEqual(0);
+        expect(config.costScore).toBeLessThanOrEqual(100);
+        expect(Number.isInteger(config.costScore)).toBe(true);
+        expect(config.costScoreSource).toEqual(expect.any(String));
+      });
+
+      // Regression pins on a few real, hand-verified values (AA Intelligence
+      // Index v4.1.1, live-fetched 2026-08-19) — catches an accidental
+      // reshuffle without re-deriving the whole table in the assertion.
+      it('pins Claude Opus 5 at the real AA-sourced quality/cost values', () => {
+        const config = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
+        expect(config.qualityScore).toBe(63);
+        expect(config.costScore).toBe(70); // $5/$25 blended 75:25 -> $10.00/1M, log-normalized
+      });
+
+      it('pins GPT-4o Mini (the cheapest, weakest scored model) at the real AA-sourced values', () => {
+        const config = (agentModeService as any).llmModels['openrouter/openai/gpt-4o-mini'];
+        expect(config.qualityScore).toBe(7);
+        expect(config.costScore).toBe(22);
+      });
+
+      it('does NOT assign a quality or cost score to gpt-5-chat-2 — confirmed missing on AA/OpenRouter/OpenAI, never guessed', () => {
+        const config = (agentModeService as any).llmModels['gpt-5-chat-2'];
+        expect(config.qualityScore).toBeUndefined();
+        expect(config.qualityScoreSource).toBeUndefined();
+        expect(config.costScore).toBeUndefined();
+        expect(config.costScoreSource).toBeUndefined();
+      });
+
+      it('does not lower a legacy model\'s quality score merely for being legacy', () => {
+        // Claude Opus 4.8 (legacy: true) scores lower than Opus 5 because it
+        // IS a weaker model per AA, not because `legacy` itself penalizes it —
+        // Opus 4.6 (also legacy) is correctly lower still, tracking real
+        // capability, not recency/legacy-ness.
+        const opus5 = (agentModeService as any).llmModels['anthropic.claude-opus-5'];
+        const opus48 = (agentModeService as any).llmModels['anthropic.claude-opus-4-8'];
+        const opus46 = (agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'];
+        expect(opus48.qualityScore).toBe(57);
+        expect(opus46.qualityScore).toBe(45);
+        expect(opus5.qualityScore).toBeGreaterThan(opus48.qualityScore);
+        expect(opus48.qualityScore).toBeGreaterThan(opus46.qualityScore);
+      });
+    });
+
     describe('ENG-744 — withdrawn model removal', () => {
       it('no longer offers the shut-down gemini-3-pro-preview to anyone', async () => {
         for (const isAdmin of [true, false]) {
