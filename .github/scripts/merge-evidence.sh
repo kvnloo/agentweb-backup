@@ -43,8 +43,8 @@
 #
 # This gate's own PR hit it (agentweb#2231, captured verbatim in the tests):
 # pushed, flipped ready 13s later, `cancel-in-progress` killed run 4936 while
-# run 4937 carried the real result. Both suites came back, so `Require Greptile
-# Review` appeared twice — success from 4937, skipped from 4936 — the
+# run 4937 carried the real result. Both suites came back, so the discriminator
+# job appeared twice — success from 4937, skipped from 4936 — the
 # discriminator read the superseded `skipped`, and the gate returned NO_EVIDENCE
 # for a fully green PR. A gate that rejects legitimate PRs gets switched off
 # within a week, so that false negative is as disqualifying as a false positive.
@@ -60,8 +60,20 @@
 # `.github/workflows/tests.yml` gates the backend jobs on
 # `backend == 'true' && draft == false`, collapsing both reasons into one
 # `if`, so both render identically as `conclusion: skipped`. One job
-# disambiguates them: `Require Greptile Review` is gated on `draft == false`
+# disambiguates them: `Detect changed projects` is gated on `draft == false`
 # ALONE, with no path filter. Therefore:
+#
+# ENG-1371: this used to be `Require Greptile Review`, which had the same
+# shape — draft-gated, never path-filtered. When Greptile was dropped as a
+# vendor that job was deleted, and because the discriminator is matched by
+# exact name and FAILS CLOSED on absence, leaving the old default would have
+# turned every PR into NO_EVIDENCE. `Detect changed projects` was verified as
+# an exact substitute before the switch: both discriminators were run against
+# all 18 open agentweb PRs and returned identical verdicts on 18/18.
+#
+# Whatever this points at must be gated on the draft flag and NOTHING else. A
+# job with a path filter would report `skipped` on a perfectly real run, which
+# this gate would then read as a draft-time run and reject.
 #
 #   discriminator skipped  -> this was a draft-time run; every draft-gated
 #                             job skipped for that reason. Not evidence.
@@ -74,8 +86,11 @@
 #
 # Why an executed discriminator is no longer enough on its own (ENG-915)
 # ----------------------------------------------------------------------
-# The backend test jobs are now gated on `greptile-review` as well, so their
-# `skipped` carries a third possible meaning: the Greptile gate did not pass.
+# ENG-915 additionally gated the backend test jobs on the reviewer check, so
+# their `skipped` carried a third possible meaning: the gate did not pass.
+# ENG-1039 removed that coupling and ENG-1371 deleted the gate, but the rule
+# below is KEPT — it never depended on that gate existing, and it is what makes
+# a path-filter skip provable rather than inferred.
 # That defeats every attempt to infer the reason from the payload. Suite ids
 # do not separate the cases either — `re-run failed jobs` appends the new
 # results to the SAME suite, so a re-run in which only the gate turned green
@@ -89,7 +104,7 @@
 # NO_EVIDENCE. The diff is read from `pulls/{n}/files`, which is the same
 # input `dorny/paths-filter` decides on, and the path list below mirrors the
 # `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: the
-# Greptile gate may reorder work, it must not reduce merge evidence.
+# a gate may reorder work, it must not reduce merge evidence.
 #
 # Why a CLI and not a CI job
 # --------------------------
@@ -116,7 +131,7 @@
 #   PR_NUMBER                   pull request number
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
-#                               (default "Require Greptile Review")
+#                               (default "Detect changed projects")
 #   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
 #                               `success` when the diff touches the backend
 #                               paths (ENG-915)
@@ -125,7 +140,7 @@ set -uo pipefail
 
 REPO="${REPO:?REPO must be set}"
 PR_NUMBER="${PR_NUMBER:?PR_NUMBER must be set}"
-DRAFT_JOB="${MERGE_EVIDENCE_DRAFT_JOB:-Require Greptile Review}"
+DRAFT_JOB="${MERGE_EVIDENCE_DRAFT_JOB:-Detect changed projects}"
 
 # Mirrors the `backend` filter in .github/workflows/tests.yml, including the two
 # CI-path entries that filter counts as backend changes (ENG-743). A prefix here
@@ -470,7 +485,7 @@ fi
 #
 # The first version had `bad` as a fixed list and simply ignored anything not in
 # it, so a `neutral` check sitting beside one success produced PASS with the
-# neutral silently dropped (caught by Greptile on this PR). That is the exact
+# neutral silently dropped (caught in review on this PR). That is the exact
 # defect this script exists to eliminate: a conclusion the control cannot
 # account for, omitted, yielding a green.
 #
@@ -594,7 +609,7 @@ fi
 # Reached only once the run is known real and nothing failed or is pending, so
 # this converts exactly one verdict: a PASS that would have been read off a
 # `skipped` backend suite. See the header for why the skip's reason cannot be
-# inferred from the payload now that those jobs are Greptile-gated.
+# inferred from the payload.
 
 # Endpoint first, flags after: every other call in this script passes the
 # endpoint as the first argument, and the test mock dispatches on it.
@@ -653,7 +668,7 @@ if [ -n "${touches_backend}" ]; then
     # "Did it ever pass at this head", not "is the newest entry a pass".
     #
     # Without this, re-running the workflow at a head whose suite had already
-    # gone green reports NO_EVIDENCE the moment the re-run's Greptile gate
+    # gone green reports NO_EVIDENCE the moment the re-run's discriminator
     # comes back below 5/5: the tests skip, the skip is newer than the success,
     # and a real green run at this exact SHA is discarded. That verdict is
     # wrong on the facts — the suite did execute against this code — and it is
@@ -682,7 +697,7 @@ if [ -n "${touches_backend}" ]; then
   done <<<"${BACKEND_JOBS}"
 
   if [ -n "${missing}" ]; then
-    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. Those jobs are gated on '${DRAFT_JOB}' as well as the path filter (ENG-915), so a skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Re-run the workflow at this head once the Greptile gate passes. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. A skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
     exit 3
   fi
 fi
@@ -712,7 +727,7 @@ fi
 # independence. Two PRs can break each other while editing different files. That
 # is a real gap — but it is a gap `strict` does not close either, because
 # `strict` only forces the branch to be current, and the two REQUIRED contexts
-# here (`Detect changed projects`, `Require Greptile Review`) do not run the test
+# here (`Detect changed projects`) does not run the test
 # suite at all. So this is strictly more evidence than the repo has today, not
 # less. Turning `strict` off is a separate, human decision (ENG-1003); this block
 # is what makes that decision safe to take rather than a silent loss of a gate.
@@ -813,6 +828,6 @@ fi
 # explicit rather than inferred.
 verdict 'PASS' "${n_success} job(s) executed successfully against head ${head_sha}: ${success_names}"
 if [ -n "${skipped_names}" ]; then
-  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, and any Greptile-gated job it covers carries a success): ${skipped_names}"
+  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, and every job it covers carries a success): ${skipped_names}"
 fi
 exit 0

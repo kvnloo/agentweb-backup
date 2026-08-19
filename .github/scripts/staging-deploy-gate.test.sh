@@ -305,8 +305,15 @@ assert_contains "${DEPLOY_IF}" "needs.backend-tests-a.result == 'success'" \
   "agentMode suite must have PASSED, not merely not-failed"
 assert_contains "${DEPLOY_IF}" "needs.backend-tests-b.result == 'success'" \
   "non-agentMode + coverage suite must have PASSED"
-assert_contains "${DEPLOY_IF}" "needs.greptile-review.result == 'success'" \
-  "Greptile gate must have PASSED (ENG-754)"
+
+# ENG-1371: the `needs.greptile-review.result == 'success'` clause was dropped
+# with the job when Greptile was retired as a vendor. The shape that ENG-754
+# actually bought is unchanged and still asserted above: every gate here reads
+# `result == 'success'`, never "did not fail", so a skipped or cancelled
+# upstream can never be mistaken for a pass.
+assert_not_contains "${DEPLOY_IF}" "greptile" \
+  "no reference to the retired Greptile gate remains in the deploy condition" \
+  "the greptile-review job no longer exists; a needs: on it would make this job unreachable"
 
 # --- The ENG-991 guard. ------------------------------------------------------
 assert_contains "${DEPLOY_IF}" "github.event.pull_request.user.login != 'dependabot[bot]'" \
@@ -321,15 +328,15 @@ assert_not_contains "${DEPLOY_IF}" "github.actor" \
   "github.actor is the triggering actor and changes when a human touches a Dependabot branch"
 
 # --- Containment: the guard belongs on the deploy job and nowhere else. ------
-# Dependabot PRs must still run the full backend suite and the Greptile gate.
+# Dependabot PRs must still run the full backend suite.
 # They change .github/workflows/tests.yml, which the `backend` filter counts as
 # a backend change precisely so the CI path gates its own changes (ENG-743);
 # skipping the tests for Dependabot would make that self-gating vacuous and let
 # an action bump land having exercised nothing.
-for job in backend-tests-a backend-tests-b greptile-review; do
+for job in backend-tests-a backend-tests-b; do
   assert_not_contains "$(job_if "${job}")" "dependabot" \
     "${job} still runs for Dependabot PRs" \
-    "Dependabot bumps must be tested and reviewed like any other PR"
+    "Dependabot bumps must be tested like any other PR"
 done
 
 # --- ENG-1041: the deploy decision and the test decision are separate. -------
