@@ -262,4 +262,65 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
     expect(mockIoEmit).not.toHaveBeenCalled();
   });
+
+  it('stops after AUTO_MEDIA_CONTINUATION_MAX_ROUNDS rounds instead of retrying forever', async () => {
+    const AUTO_MEDIA_CONTINUATION_MAX_ROUNDS = 4;
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    // A persistently slow/broken provider: the customer's own turn AND every single
+    // auto-continuation round come back still deferring the 4th image.
+    mockWorkerService.runInWorker.mockResolvedValue(
+      workerResponse(
+        '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+        [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+      ),
+    );
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush(200);
+
+    // 1 customer turn + AUTO_MEDIA_CONTINUATION_MAX_ROUNDS auto-continuation rounds — the
+    // cap stops the (round + 1) recursion from ever firing a 5th continuation attempt.
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1 + AUTO_MEDIA_CONTINUATION_MAX_ROUNDS);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} rounds`),
+    );
+    // The last round's lock still released — the cap doesn't leave the session wedged.
+    expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('releases the lock and does not recurse when a continuation call rejects outright', async () => {
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    mockWorkerService.runInWorker
+      // Turn 1: the customer's real request, 3 of 4 delivered, the 4th deferred.
+      .mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      )
+      // Turn 2: the auto-continuation itself fails outright (e.g. a provider outage),
+      // not just another deferral.
+      .mockRejectedValueOnce(new Error('provider outage'));
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(), res);
+    await flush();
+
+    // Exactly one continuation attempt was made — the hard failure must not be treated
+    // as "still deferred" and retried.
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('media auto-continuation failed'),
+      expect.any(Error),
+    );
+    // The lock from the failed continuation attempt was released, not left held.
+    expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+
+    consoleErrorSpy.mockRestore();
+  });
 });
