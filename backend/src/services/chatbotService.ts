@@ -3650,7 +3650,15 @@ export class ChatbotDB {
     limit: number,
     lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key,
     timeRange?: { startTime: string; endTime: string }
-  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+  ): Promise<{
+    sessions: ChatSession[];
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key;
+    // ENG-1332 (Greptile): the gap query's page cap can stop before reaching a
+    // qualifying late-touched session, silently understating the requested
+    // range. This says so, rather than leaving the caller to trust an
+    // unqualified count.
+    gapQueryTruncated?: boolean;
+  }> {
     const expressionValues: Record<string, any> = {
       ":adminListPartition": "all",
     };
@@ -3723,6 +3731,7 @@ export class ChatbotDB {
         // an unbounded amount of latency for a small chance of catching one
         // more late-touched session, so this stops and logs instead.
         const nowIso = new Date().toISOString();
+        let gapQueryTruncated = false;
         if (timeRange.endTime < nowIso) {
           const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
           let inRangeCount = accumulated.filter(
@@ -3764,6 +3773,7 @@ export class ChatbotDB {
           } while (lateKey && inRangeCount < limit && pageCount < MAX_GAP_QUERY_PAGES);
 
           if (lateKey && pageCount >= MAX_GAP_QUERY_PAGES) {
+            gapQueryTruncated = true;
             console.warn(
               `[chatbotService] getRecentSessionsPage: gap query hit its ${MAX_GAP_QUERY_PAGES}-page cap scanning [${timeRange.endTime}, ${nowIso}] for a sparse range — some late-touched in-range sessions past this point may be missing from this page`
             );
@@ -3793,6 +3803,7 @@ export class ChatbotDB {
         return {
           sessions: [...inRange, ...outOfRange].slice(0, limit),
           lastEvaluatedKey: undefined,
+          gapQueryTruncated,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);
