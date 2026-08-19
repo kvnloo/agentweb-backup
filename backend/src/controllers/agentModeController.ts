@@ -54,6 +54,7 @@ import {
   buildTimeoutPartialWorkMessage,
   hasDeferredMediaBudgetToolCall,
   hasPersistedMediaBudgetDeferral,
+  hasUnresolvedMediaDeferral,
 } from '../utils/timeoutContinuation';
 import {
   reconcileFalseFailureReport,
@@ -742,6 +743,46 @@ export function releaseSessionGeneration(sessionId: string): void {
 }
 
 /**
+ * ENG-1239: subset of activeSessionGenerations sessions whose lock is currently held by
+ * a background media auto-continuation (scheduleAutoMediaContinuation) rather than a real
+ * customer request. Before this existed, a genuine customer message that happened to
+ * arrive while an auto-continuation was running just got a flat 409 SESSION_BUSY — for a
+ * request the customer had every right to make, caused by background work they never
+ * asked for or knew was happening. Exported so tests can inspect/reset it.
+ */
+export const autoContinuationSessions = new Set<string>();
+
+/** Bounded window a real customer request waits for a preempted auto-continuation to
+ * actually release the lock. Cancellation is cooperative (the worker only notices between
+ * steps, same as the existing manual-stop path), so this can't be instant, but it must
+ * stay short enough that the customer's own request doesn't feel hung. Env-overridable
+ * (mirrors AGENT_MODE_MEDIA_BUDGET_MS) so tests aren't forced into multi-second waits. */
+const AUTO_CONTINUATION_PREEMPT_WAIT_MS = parseInt(process.env.AUTO_CONTINUATION_PREEMPT_WAIT_MS || '4000', 10);
+const AUTO_CONTINUATION_PREEMPT_POLL_MS = parseInt(process.env.AUTO_CONTINUATION_PREEMPT_POLL_MS || '150', 10);
+
+/**
+ * ENG-1239: called when a real customer request collides with the generation lock. If the
+ * lock is held by a background auto-continuation (not another real request), a genuine
+ * customer message takes priority — cancel it (the same requestCancel + cancelSession
+ * primitives already used to stop an orphaned timed-out generation) and give it a bounded
+ * window to actually release before falling back to the existing 409. Never proceeds
+ * without actually re-claiming the lock, so this can never race a second concurrent write
+ * into the same session — worst case, it behaves exactly like before this fix existed.
+ * Exported so tests can drive it directly instead of racing real generation timing.
+ */
+export async function preemptAutoContinuationAndWait(sessionId: string): Promise<boolean> {
+  if (!autoContinuationSessions.has(sessionId)) return false;
+  requestCancel(sessionId);
+  generateMarketingResponseWorkerService.cancelSession(sessionId);
+  const deadline = Date.now() + AUTO_CONTINUATION_PREEMPT_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (tryClaimSessionGeneration(sessionId)) return true;
+    await new Promise((resolve) => setTimeout(resolve, AUTO_CONTINUATION_PREEMPT_POLL_MS));
+  }
+  return tryClaimSessionGeneration(sessionId);
+}
+
+/**
  * Wall-clock timeout for a single agent-mode generation. Without this, a hung
  * LLM call (stuck await, runaway tool loop, never-resolving upstream) keeps
  * the activeSessionGenerations lock held indefinitely — every subsequent
@@ -869,6 +910,45 @@ async function scheduleAutoMediaContinuation(
       `AgentMode: media auto-continuation for session ${sessionId} still deferred after ` +
       `${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} rounds — leaving the manual "continue" prompt in place.`
     );
+    // ENG-1239: a persistently slow/broken provider must not fail SILENTLY. Two things
+    // were missing until now: (1) the customer's last visible signal was indistinguishable
+    // from an ordinary single deferral — nothing told them automatic retries had actually
+    // been exhausted; (2) nobody but this console.error would ever know a provider was
+    // this degraded. Fix both: leave an explicit, distinct closing message (also doubles
+    // as the durability backstop's stop signal — see hasUnresolvedMediaDeferral, which
+    // does NOT match `kind: 'auto-continuation-exhausted'`, so a later session touch does
+    // not retry forever) and page on-call.
+    const exhaustedMsg =
+      `⚠️ I wasn't able to finish this batch automatically after several attempts — the ` +
+      `remaining asset(s) may be taking longer than usual. Reply here whenever you're ` +
+      `ready and I'll pick up where I left off; nothing already generated is lost.`;
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content: exhaustedMsg,
+      timestamp: new Date().toISOString(),
+      metadata: { timestamp: new Date().toISOString(), kind: 'auto-continuation-exhausted' },
+    }).catch((persistErr) =>
+      console.error('AgentMode: failed to persist auto-continuation-exhausted message:', persistErr),
+    );
+    const { io } = await import('../server');
+    io.to(`user:${userId}`).emit('session-message-appended', {
+      sessionId,
+      message: { role: 'assistant', content: exhaustedMsg },
+    });
+    await sendAgentModeOncallAlert({
+      subject: 'Media auto-continuation exhausted its retry cap',
+      message:
+        `Session ${sessionId} still had a deferred media-gen call after ` +
+        `${AUTO_MEDIA_CONTINUATION_MAX_ROUNDS} automatic continuation rounds — likely a ` +
+        `persistently slow/broken image or video provider. The customer was left an ` +
+        `explicit closing message; automatic retries have stopped.`,
+      context: { sessionId, userId, rounds: AUTO_MEDIA_CONTINUATION_MAX_ROUNDS },
+      sessionId,
+      dedupeKey: `media_auto_continuation_exhausted:${sessionId}`,
+      dedupeWindowMs: 60 * 60 * 1000,
+    }).catch((alertErr) =>
+      console.error('AgentMode: failed to send media auto-continuation-exhausted alert:', alertErr),
+    );
     return;
   }
 
@@ -896,6 +976,10 @@ async function scheduleAutoMediaContinuation(
   // manually while we were about to auto-continue) — don't fight it. If that turn still
   // leaves the batch incomplete, its own response re-triggers this path.
   if (!tryClaimSessionGeneration(sessionId)) return;
+  // ENG-1239: mark the lock as continuation-held so a real customer request that collides
+  // with it (the OTHER direction from the check above) can preempt instead of just
+  // 409ing — see preemptAutoContinuationAndWait.
+  autoContinuationSessions.add(sessionId);
 
   let stillDeferred = false;
   withGenerationTimeout(
@@ -937,6 +1021,7 @@ async function scheduleAutoMediaContinuation(
     .finally(() => {
       // Release BEFORE recursing — the next round's tryClaimSessionGeneration would
       // otherwise always lose to this round's still-held lock.
+      autoContinuationSessions.delete(sessionId);
       releaseSessionGeneration(sessionId);
       if (stillDeferred) {
         scheduleAutoMediaContinuation(sessionId, userId, llmModel, round + 1);
@@ -6813,6 +6898,22 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
+      // ENG-1239: durability backstop for the in-process media auto-continuation chain —
+      // it only fires right after the deferred turn, so a process death in between (a
+      // deploy, a crash) silently loses it. Any later touch of the session re-checks the
+      // tail of history and re-fires if it's still unresolved. Gated on the session NOT
+      // being actively generated (a real request or an already-running continuation holds
+      // that lock) so this never races a resume already in flight — best-effort, must
+      // never block or fail this response.
+      if (!activeSessionGenerations.has(session.sessionId) && hasUnresolvedMediaDeferral(session.messages)) {
+        setImmediate(() => scheduleAutoMediaContinuation(
+          session.sessionId,
+          session.userId,
+          session.llmModel || agentModeService.default_model,
+          1,
+        ));
+      }
+
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
@@ -7047,7 +7148,11 @@ export const agentModeController = {
       // Reject concurrent requests for the same session. The claim is atomic
       // (check-and-set in one call) so two near-simultaneous requests can never
       // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
-      if (!tryClaimSessionGeneration(sessionId)) {
+      // ENG-1239: UNLESS the lock is held by a background media auto-continuation, not
+      // another real request — a genuine customer message takes priority over that, so
+      // preempt it instead of flatly rejecting a request the customer had every right to
+      // make (see preemptAutoContinuationAndWait).
+      if (!tryClaimSessionGeneration(sessionId) && !(await preemptAutoContinuationAndWait(sessionId))) {
         // A DIFFERENT message on a busy session: give back the idem claim we
         // just took so the user's retry (after the busy run finishes) is accepted.
         if (idemKeyHeld) {
@@ -7308,7 +7413,10 @@ export const agentModeController = {
                 role: 'assistant',
                 content: continuationMsg,
                 timestamp: new Date().toISOString(),
-                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+                // ENG-1239: mediaBudgetDeferred distinguishes this media-batch pause from
+                // the generic (non-media) salvage variant below, which shares the same
+                // `kind` but must NOT be picked up by hasUnresolvedMediaDeferral.
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation', mediaBudgetDeferred: true },
               }).catch((persistErr) =>
                 console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
               );
@@ -8183,7 +8291,9 @@ export const agentModeController = {
       // Reject concurrent requests for the same session. Atomic check-and-set
       // (see tryClaimSessionGeneration) — two near-simultaneous requests can
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
-      if (!tryClaimSessionGeneration(session.sessionId)) {
+      // ENG-1239: unless it's a background media auto-continuation holding the lock —
+      // preempt that instead (see the regular /generate path above).
+      if (!tryClaimSessionGeneration(session.sessionId) && !(await preemptAutoContinuationAndWait(session.sessionId))) {
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -8329,7 +8439,7 @@ export const agentModeController = {
               role: 'assistant',
               content: continuationMsg,
               timestamp: new Date().toISOString(),
-              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation', mediaBudgetDeferred: true },
             });
             handledPartialTimeout = true;
             // ENG-510: return the partial delivery as a normal 200 (mirrors the regular

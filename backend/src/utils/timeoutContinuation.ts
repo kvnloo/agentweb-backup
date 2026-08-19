@@ -28,6 +28,10 @@ export interface TimeoutContinuationMessage {
     // defers a generate_image/video call for the per-turn media budget (see
     // hasPersistedMediaBudgetDeferral below).
     mediaBudgetDeferred?: boolean;
+    // ENG-1239: an assistant message's own settled toolCalls ledger, checked by
+    // hasUnresolvedMediaDeferral for the "soft" deferral shape (see
+    // hasDeferredMediaBudgetToolCall).
+    toolCalls?: DeferredToolCallLike[];
   } | null;
   timestamp?: string;
   role?: string;
@@ -194,6 +198,35 @@ export function hasPersistedMediaBudgetDeferral(
     const ts = rawTs ? Date.parse(rawTs) : NaN;
     return Number.isFinite(ts) && ts >= sinceMs;
   });
+}
+
+/**
+ * ENG-1239: durability backstop for the in-process auto-continuation chain. Firing the
+ * continuation only right after the deferred turn means a process death in between (a
+ * deploy, a crash) loses it silently with no record it was ever attempted. This lets ANY
+ * later touch of the session (getSession, on the next page load) detect the same
+ * condition from session history alone — no new persistence — and re-fire the resume.
+ *
+ * Deliberately looks ONLY at the LAST message (cheap enough to call from a
+ * frequently-polled endpoint) and requires it to be one of the two shapes an unresolved
+ * media pause actually leaves behind:
+ *  - the whole-turn-timeout partial-delivery notice, tagged `mediaBudgetDeferred: true`
+ *    (added alongside `kind: 'generation-timeout-continuation'` specifically for this —
+ *    the generic non-media salvage variant shares the same `kind` but is NOT tagged, so
+ *    it correctly returns false here)
+ *  - the model's own successful reply whose toolCalls ledger still shows a deferred call
+ * Anything else — including the round-cap exhaustion notice (`kind:
+ * 'auto-continuation-exhausted'`) superseding an earlier pause — returns false, so this
+ * can never retry forever once the bounded round cap has already given up once.
+ */
+export function hasUnresolvedMediaDeferral(
+  messages: TimeoutContinuationMessage[] | undefined | null,
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'assistant') return false;
+  if (last.metadata?.mediaBudgetDeferred === true) return true;
+  return hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls);
 }
 
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */
