@@ -15,6 +15,7 @@
 import {
   assertCountingType,
   assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
   describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
@@ -466,5 +467,45 @@ describe('describeGoogleAdsError — null receivers', () => {
     const out = describeGoogleAdsError({ response: { data: { error: {
       status: 'X', message: 'm', details: [{ errors: [null] }] } } } });
     expect(out).toContain('error');
+  });
+});
+
+describe('assertCreatableConversionActionStatus — CREATE only accepts ENABLED', () => {
+  // Second finding from the ENG-1329 end-to-end, distinct from PAUSED. HIDDEN IS a valid
+  // ConversionActionStatus, so the enum check passed it — and Google refused the create
+  // with a field error on operations[0].create.status:
+  //   fieldError: BLOCKED_VALUE — "The field's value is on a deny-list for this field."
+  // You cannot create an action already hidden. You create it enabled and hide it after.
+  it('accepts ENABLED', () => {
+    expect(assertCreatableConversionActionStatus('ENABLED')).toBe('ENABLED');
+  });
+
+  it('normalises case and whitespace', () => {
+    expect(assertCreatableConversionActionStatus('  enabled ')).toBe('ENABLED');
+  });
+
+  it('refuses HIDDEN and names the two-step', () => {
+    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow(/HIDDEN/);
+    expect(() => assertCreatableConversionActionStatus('HIDDEN')).toThrow(/UPDATE it to HIDDEN/);
+  });
+
+  it('refuses REMOVED — creating something already removed is meaningless', () => {
+    expect(() => assertCreatableConversionActionStatus('REMOVED')).toThrow(/REMOVED/);
+  });
+
+  it('still gives PAUSED its own campaign-status explanation, not the create one', () => {
+    // Order matters: the enum check runs first, so PAUSED keeps the more useful message.
+    expect(() => assertCreatableConversionActionStatus('PAUSED')).toThrow(/campaign status/);
+  });
+
+  it('refuses non-strings and blanks', () => {
+    for (const bad of [undefined, null, 42, '', '   ']) {
+      expect(() => assertCreatableConversionActionStatus(bad)).toThrow();
+    }
+  });
+
+  it('leaves UPDATE unrestricted — HIDDEN is what UPDATE is for', () => {
+    expect(assertConversionActionStatus('HIDDEN')).toBe('HIDDEN');
+    expect(assertConversionActionStatus('REMOVED')).toBe('REMOVED');
   });
 });
