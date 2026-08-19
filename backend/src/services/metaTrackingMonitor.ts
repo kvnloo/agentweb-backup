@@ -34,6 +34,7 @@
  *      dormant only because its insights call never requests the `actions` field.)
  */
 
+import { createHash } from 'crypto';
 import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
 
 
@@ -1455,11 +1456,27 @@ export async function raiseLandingPageRollup(
   body.push('A pixel is one per SITE (the shared layout), so one fix covers every page on it.');
   body.push('Pages are re-checked on a weekly rotation, so this list moves slowly by design.');
 
+  // Keyed on a FINGERPRINT of the findings, not the bare class.
+  //
+  // A bare class key suppresses for 24h, which is right while the picture is unchanged — one
+  // ticket a day however many customers appear in it. But `POST /api/admin/tracking-monitor/run`
+  // accepts `dryRun: false`, so a real sweep can legitimately run again inside that window; if
+  // it finds MORE customers or MORE sites, a bare key would suppress the WORSE picture and the
+  // operator would never see it. The fingerprint changes exactly when the finding set changes,
+  // so an unchanged set stays quiet and a grown one gets through.
+  const fingerprint = createHash('sha256')
+    .update(
+      findings
+        .map((f) => `${f.userId ?? f.email ?? ''}:${f.sites.map((s) => s.url).sort().join('|')}`)
+        .sort()
+        .join('\n'),
+    )
+    .digest('hex')
+    .slice(0, 12);
+
   await raise(
     sink,
-    // ONE key for the whole fleet, so this is one ticket a day at most however many
-    // customers appear in it.
-    LANDING_PAGE_ALERT_CLASS,
+    `${LANDING_PAGE_ALERT_CLASS}:${fingerprint}`,
     now,
     `${totalSites} generated landing page(s) cannot report conversions, across ${findings.length} customer(s)`,
     body.join('\n'),

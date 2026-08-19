@@ -60,8 +60,13 @@ beforeEach(() => {
   evaluateDestinationCoverage.mockReset().mockReturnValue({
     alerting: [], unverifiable: [], unconfirmed: [], okCount: 0,
   });
+  // `unconfirmed` is NOT optional: checkLandingPageCoverage reads `verdict.unconfirmed.length`.
+  // Omitting it made that line throw, the try/catch swallow it, and every counter update be
+  // silently skipped — while the call-count assertions still passed, because the throw happens
+  // AFTER the fetch. A mock that does not match the real shape is a test passing for the wrong
+  // reason.
   evaluateLandingPageCoverage.mockReset().mockReturnValue({
-    alerting: [], unverifiable: [], okCount: 0, sitesNotChecked: 0,
+    alerting: [], unconfirmed: [], unverifiable: [], okCount: 0, sitesNotChecked: 0,
   });
   fetchDestinationInputs.mockResolvedValue({
     status: 'ok', ads: [], ownedPixelIds: ['px-a'], observations: {},
@@ -194,5 +199,69 @@ describe('landing-page findings roll up into ONE fleet alert — risk 3, fixed',
     await raiseLandingPageRollup([], { transport });
     await raiseLandingPageRollup(undefined as any, { transport });
     expect(transport).not.toHaveBeenCalled();
+  });
+});
+
+describe('the rollup dedupe key tracks the FINDINGS, not just the class', () => {
+  // `POST /api/admin/tracking-monitor/run` accepts `dryRun: false`, so a real sweep can run
+  // again inside the 24h suppression window. A bare class key would suppress a WORSE picture.
+  const f = (email: string, urls: string[]) => ({
+    userId: `u-${email}`, email,
+    sites: urls.map((u) => ({ name: u, url: u, reason: 'no_pixel', detectedPixelIds: [] })),
+  });
+
+  it('suppresses an IDENTICAL finding set inside the window', async () => {
+    const { raiseLandingPageRollup, __resetTrackingAlertStateForTests: reset } =
+      require('../services/metaTrackingMonitor');
+    reset();
+    const transport = jest.fn().mockResolvedValue(undefined);
+    const now = Date.parse('2026-08-19T09:00:00Z');
+
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/'])], { transport, now });
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/'])], { transport, now: now + 60_000 });
+
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+
+  it('RE-ALERTS when another customer appears', async () => {
+    const { raiseLandingPageRollup, __resetTrackingAlertStateForTests: reset } =
+      require('../services/metaTrackingMonitor');
+    reset();
+    const transport = jest.fn().mockResolvedValue(undefined);
+    const now = Date.parse('2026-08-19T09:00:00Z');
+
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/'])], { transport, now });
+    await raiseLandingPageRollup(
+      [f('a@x.test', ['https://a/']), f('b@x.test', ['https://b/'])],
+      { transport, now: now + 60_000 },
+    );
+
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it('RE-ALERTS when an existing customer gains a site', async () => {
+    const { raiseLandingPageRollup, __resetTrackingAlertStateForTests: reset } =
+      require('../services/metaTrackingMonitor');
+    reset();
+    const transport = jest.fn().mockResolvedValue(undefined);
+    const now = Date.parse('2026-08-19T09:00:00Z');
+
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/'])], { transport, now });
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/', 'https://a2/'])], { transport, now: now + 60_000 });
+
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it('is order-independent — the same set in a different order stays suppressed', async () => {
+    const { raiseLandingPageRollup, __resetTrackingAlertStateForTests: reset } =
+      require('../services/metaTrackingMonitor');
+    reset();
+    const transport = jest.fn().mockResolvedValue(undefined);
+    const now = Date.parse('2026-08-19T09:00:00Z');
+
+    await raiseLandingPageRollup([f('a@x.test', ['https://a/']), f('b@x.test', ['https://b/'])], { transport, now });
+    await raiseLandingPageRollup([f('b@x.test', ['https://b/']), f('a@x.test', ['https://a/'])], { transport, now: now + 60_000 });
+
+    expect(transport).toHaveBeenCalledTimes(1);
   });
 });
