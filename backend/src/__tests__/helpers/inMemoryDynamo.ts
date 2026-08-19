@@ -64,7 +64,14 @@ function resolveName(token: string, names: Record<string, string>): string {
   return token.startsWith('#') ? names[token] ?? token.slice(1) : token;
 }
 
-/** `attribute_exists(x) AND attribute_not_exists(y) AND #a = :b AND size(#l) = :n` */
+/**
+ * `attribute_exists(x) AND attribute_not_exists(y) AND #a = :b AND size(#l) = :n`,
+ * plus one parenthesised disjunction: `(attribute_not_exists(#a) OR #a = :a)`.
+ *
+ * ENG-1363 added the OR — "still unset" has to match both an absent attribute and
+ * an empty string. Splitting only on AND silently treated the whole disjunction as
+ * one unrecognised clause, so the harness has to learn it or it throws.
+ */
 function evaluateCondition(
   expression: string | undefined,
   item: Record<string, any> | undefined,
@@ -72,8 +79,29 @@ function evaluateCondition(
   values: Record<string, any>,
 ): boolean {
   if (!expression) return true;
-  return expression.split(/\s+AND\s+/i).every((rawClause) => {
-    const clause = rawClause.trim();
+  return expression.split(/\s+AND\s+/i).every((rawClause) =>
+    evaluateClause(rawClause.trim(), item, names, values),
+  );
+}
+
+function evaluateClause(
+  clause: string,
+  item: Record<string, any> | undefined,
+  names: Record<string, string>,
+  values: Record<string, any>,
+): boolean {
+  {
+    // A parenthesised disjunction. Only unwrapped when it actually contains OR, so
+    // any other parenthesised form still reaches the matchers below and throws
+    // rather than being silently accepted.
+    if (clause.startsWith('(') && clause.endsWith(')')) {
+      const inner = clause.slice(1, -1).trim();
+      if (/\s+OR\s+/i.test(inner)) {
+        return inner
+          .split(/\s+OR\s+/i)
+          .some((part) => evaluateClause(part.trim(), item, names, values));
+      }
+    }
 
     let match = clause.match(/^attribute_not_exists\(\s*([^)]+?)\s*\)$/i);
     if (match) {
@@ -100,7 +128,7 @@ function evaluateCondition(
     }
 
     throw new Error(`inMemoryDynamo: unsupported ConditionExpression clause: ${clause}`);
-  });
+  }
 }
 
 /** `SET a = :x, b = :y REMOVE #c, #d` — the only forms this codebase emits. */
