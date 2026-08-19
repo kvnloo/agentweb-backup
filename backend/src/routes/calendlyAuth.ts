@@ -341,7 +341,20 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = await retrieveTokenSession(tokenSessionId, userId, 'calendly');
+  let session;
+  try {
+    session = await retrieveTokenSession(tokenSessionId, userId, 'calendly');
+  } catch (error: any) {
+    // ENG-965 (same class, applied here for parity — the shared store now surfaces a
+    // genuine consume failure instead of silently swallowing it): a failure consuming the
+    // one-time-use session must never surface as an unhandled rejection / generic 500.
+    console.error('[Calendly OAuth /connect] failed to consume token session', error);
+    const details = IS_PRODUCTION ? undefined : error.message;
+    return res.status(503).json({
+      error: 'Temporarily unable to complete the Calendly connection. Please try again.',
+      ...(details && { details }),
+    });
+  }
   if (!session) {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
