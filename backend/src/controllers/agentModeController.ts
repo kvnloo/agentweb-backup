@@ -56,6 +56,7 @@ import {
   hasPersistedMediaBudgetDeferral,
   hasUnresolvedMediaDeferral,
 } from '../utils/timeoutContinuation';
+import { MEDIA_GEN_TOOLS, mediaGenProducedAsset } from '../services/agentMode/core/toolDispatch';
 import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
@@ -1020,6 +1021,36 @@ async function scheduleAutoMediaContinuation(
           sessionId,
           message: { role: 'assistant', content: resolved.content },
         });
+      } else if (resolved?.cancelled) {
+        // ENG-1239 (rework, found live): a continuation preempted by a genuine customer
+        // message (preemptAutoContinuationAndWait) sends a cooperative cancel, but an
+        // already-dispatched provider call can't be aborted — the image finishes and is
+        // correctly saved regardless. The loop then stops before composing a closing
+        // reply, so `content` comes back empty even though a new asset landed, leaving a
+        // bare, unexplained image-generated marker with no "batch complete" narration.
+        const newAssets = (resolved?.toolCalls || []).filter(
+          (tc: any) => tc?.name && MEDIA_GEN_TOOLS.has(tc.name)
+            && !tc?.error && tc?.result?.deferred !== true && tc?.result?.success !== false
+            && mediaGenProducedAsset(tc.name, tc.result),
+        );
+        if (newAssets.length > 0) {
+          const closingMsg = newAssets.length === 1
+            ? '✅ One more asset finished after all — your batch is complete.'
+            : `✅ ${newAssets.length} more assets finished after all — your batch is complete.`;
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'assistant',
+            content: closingMsg,
+            timestamp: new Date().toISOString(),
+            metadata: { timestamp: new Date().toISOString() },
+          }).catch((persistErr) =>
+            console.error(`AgentMode: failed to persist preempted-continuation closing note for session ${sessionId}:`, persistErr),
+          );
+          const { io } = await import('../server');
+          io.to(`user:${userId}`).emit('session-message-appended', {
+            sessionId,
+            message: { role: 'assistant', content: closingMsg },
+          });
+        }
       }
     })
     .catch((err: any) =>
@@ -6258,6 +6289,10 @@ export async function generateSessionResponse(
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
   // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
+  // ENG-1239: true when the run was cooperatively cancelled (e.g. preempted by a genuine
+  // customer message) before it could compose a closing reply — content may be empty
+  // even though toolCalls shows real work (an already-dispatched call can't be aborted).
+  cancelled?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
