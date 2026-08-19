@@ -16794,7 +16794,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
-          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+
+          // Meta declines to answer this in TWO different ways, and the first version of this
+          // fix only handled one of them. It returns an empty `event_stats` on some pixels, and
+          // on others the call THROWS — observed on a real production pixel, where the throw
+          // escaped before the fallback could run and the tool answered nothing at all, which
+          // is the exact defect it was written to remove.
+          //
+          // ⚠ An AUTH error is deliberately NOT caught here. A dead token is a fact the caller
+          // must see so it can prompt a re-authorisation; converting it into send-side coverage
+          // would turn "your credentials are gone" into a quiet, plausible-looking answer —
+          // the could-not-ask/received-nothing conflation this module exists to prevent.
+          let stats: any = {};
+          let statsError: string | undefined;
+          try {
+            stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          } catch (statsErr: any) {
+            if (statsErr?.isMetaAuthError) throw statsErr;
+            statsError = statsErr?.message || 'Meta returned an error for event_stats';
+            console.warn(
+              `[AgentMode] GET_MATCH_QUALITY: Meta errored on event_stats for dataset ${datasetId}: ${statsError}`,
+            );
+          }
 
           // Meta's `event_stats` is the only EMQ surface that exists, and on live busy
           // pixels it comes back EMPTY — probed on two pixels, two tokens, two Business
@@ -16806,7 +16827,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // half we can actually measure — what WE sent (ENG-926 §F).
           const { isEmptyEventStats, computeCapiKeyCoverage } = await import('./metaCapiKeyCoverage');
 
-          if (!isEmptyEventStats(stats.event_stats)) {
+          // Only a SUCCESSFUL, non-empty read is Meta's own answer. If it errored we never
+          // saw one, so `statsError` short-circuits ahead of the emptiness test.
+          if (!statsError && !isEmptyEventStats(stats.event_stats)) {
             return {
               success: true,
               message: `Event match quality for dataset ${stats.name || datasetId}`,
@@ -16820,6 +16843,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           const sendSide = await computeCapiKeyCoverage([String(datasetId)], 30, {
             queryRows: (pixelId, oldestDate) => queryCapiKeyCoverageRows(pixelId, oldestDate),
           });
+
+          // ⚠ A Meta ERROR stays an ERROR. An existing test caught the first version of this
+          // turning "Dataset not found" into `success: true` — which would have answered a
+          // question about a dataset that does not exist, with coverage for it. The caller
+          // still gets the send-side numbers, but the verdict reports what actually happened.
+          if (statsError) {
+            return {
+              success: false,
+              message:
+                `${statsError} — Meta could not serve Event Match Quality for dataset ` +
+                `${datasetId}. Send-side identity coverage is included below: it is what WE ` +
+                `attached to the conversions we sent, NOT Meta's match-quality score, and Meta ` +
+                `does not expose that number through any API.`,
+              dataset_id: datasetId,
+              meta_event_match_quality_available: false,
+              meta_event_stats_status: 'error',
+              meta_event_stats_error: statsError,
+              send_side_identity_coverage: sendSide
+            };
+          }
 
           return {
             success: true,
@@ -16836,6 +16879,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             dataset_name: stats.name,
             event_stats: stats.event_stats,
             meta_event_match_quality_available: false,
+            // 'error' and 'empty' are DIFFERENT facts and are reported as such — collapsing
+            // them would let a Meta outage read as "Meta has no data for you".
+            meta_event_stats_status: 'empty',
             send_side_identity_coverage: sendSide
           };
         }
