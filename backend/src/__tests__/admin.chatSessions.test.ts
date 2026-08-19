@@ -338,6 +338,64 @@ describe("Admin chat sessions endpoint", () => {
       expect(res.body.sessions[0].satisfactionScore).toEqual(newScore);
     });
 
+    // ENG-1332: report an honest scoring denominator instead of making the
+    // caller infer one from sessions.length.
+    it("returns scoringCoverage reflecting requested-range, already-scored, and newly-scored counts", async () => {
+      const inRangeUnscored = {
+        ...makeSession("in-range-unscored"),
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T08:00:00.000Z",
+      };
+      const inRangeAlreadyScored = {
+        ...makeSession("in-range-scored"),
+        createdAt: "2026-08-17T20:00:00.000Z",
+        updatedAt: "2026-08-17T20:00:00.000Z",
+        satisfactionScore: {
+          score: 4,
+          reason: "Good",
+          evaluatedAt: "2026-03-01T00:00:00.000Z",
+          evaluatedMessageIndex: 2,
+          dimensions: { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 },
+        },
+      };
+      const outOfRangeHistorical = {
+        ...makeSession("historical"),
+        createdAt: "2026-02-21T10:30:00.000Z",
+        updatedAt: "2026-08-18T13:00:00.000Z",
+      };
+
+      const sessions = [inRangeUnscored, inRangeAlreadyScored, outOfRangeHistorical];
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
+      mockScoreSessionIfNeeded.mockImplementation(async (session: any) =>
+        session.sessionId === "in-range-unscored" ? newScore : null
+      );
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+        .expect(200);
+
+      expect(res.body.scoringCoverage).toEqual({
+        requestedRangeCount: 2,
+        totalFetched: 3,
+        alreadyScored: 1,
+        newlyScored: 1,
+        skippedForBudget: 0,
+        timedOut: false,
+      });
+    });
+
+    it("omits scoringCoverage when sync is not set", async () => {
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(res.body.scoringCoverage).toBeUndefined();
+    });
+
   });
 
   describe("sessionId search", () => {

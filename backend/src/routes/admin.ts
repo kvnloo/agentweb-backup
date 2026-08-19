@@ -3259,6 +3259,20 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    // ENG-1332: coverage metadata travels with the response so a caller (e.g.
+    // the Daily Satisfaction Score Report) can state its own denominator
+    // honestly instead of inferring one from sessions.length.
+    let scoringCoverage:
+      | {
+          requestedRangeCount: number;
+          totalFetched: number;
+          alreadyScored: number;
+          newlyScored: number;
+          skippedForBudget: number;
+          timedOut: boolean;
+        }
+      | undefined;
+
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3270,6 +3284,20 @@ router.get("/chat-sessions", async (req, res) => {
       } catch (error) {
         console.error("Error loading scoring judges for sync mode:", error);
       }
+
+      const requestedRangeCount = timeRange
+        ? sessionsWithMessages.filter(
+            (session: any) =>
+              session.createdAt &&
+              session.createdAt >= timeRange.startTime &&
+              session.createdAt <= timeRange.endTime
+          ).length
+        : sessionsWithMessages.length;
+      const alreadyScoredIds = new Set(
+        sessionsWithMessages
+          .filter((session: any) => session.satisfactionScore?.evaluatedAt)
+          .map((session: any) => session.sessionId)
+      );
 
       // ENG-291: score with bounded concurrency under a wall-clock budget and
       // apply the results in-memory. This returns before the tool timeout even on
@@ -3286,6 +3314,20 @@ router.get("/chat-sessions", async (req, res) => {
           `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
         );
       }
+
+      const newlyScored = sessionsWithMessages.filter(
+        (session: any) =>
+          session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
+      ).length;
+
+      scoringCoverage = {
+        requestedRangeCount,
+        totalFetched: sessionsWithMessages.length,
+        alreadyScored: alreadyScoredIds.size,
+        newlyScored,
+        skippedForBudget: backfill.skipped,
+        timedOut: backfill.timedOut,
+      };
     }
 
     const nextCursor = nextKey
@@ -3299,7 +3341,11 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringCoverage ? { scoringCoverage } : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
