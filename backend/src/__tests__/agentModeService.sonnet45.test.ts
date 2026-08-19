@@ -409,7 +409,10 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should NOT expose any older/stale Grok generation, per AC1', async () => {
       const llmModels = (agentModeService as any).llmModels;
       const grokKeys = Object.keys(llmModels).filter(k => k.toLowerCase().includes('grok'));
-      expect(grokKeys).toEqual(['xai.grok-4.3']);
+      // xai.grok-4.3 (this PR, Bedrock Mantle) and openrouter/x-ai/grok-4.6 (added
+      // independently on main after this branch was cut) are both current-generation;
+      // neither is the stale grok this AC guards against.
+      expect(grokKeys.sort()).toEqual(['openrouter/x-ai/grok-4.6', 'xai.grok-4.3']);
     });
 
     it('should return only anthropic models from getReportsModelOptions', async () => {

@@ -64,7 +64,7 @@ jest.mock('aws-sdk', () => {
   };
 });
 
-import { scheduleDb } from '../services/db';
+import { scheduleDb, EXPECT_UNSET } from '../services/db';
 
 /** The genuine SDK, not the mock above — its marshaller is the thing under test. */
 const realAws = jest.requireActual('aws-sdk');
@@ -292,6 +292,45 @@ describe('updateSchedule builds requests DynamoDB accepts', () => {
 
     const params = soleRequest();
     expect(requestProblems(params)).toEqual([]);
+  });
+
+  it('ENG-1363: expecting an attribute to be UNSET emits a valid disjunction', async () => {
+    // The condition this adds is the first one in the file with an OR, and the
+    // first to compare against an EMPTY STRING. Both are places a request can be
+    // rejected server-side while every mock happily accepts it: an unbalanced or
+    // mis-parenthesised disjunction is a syntax error, and a value the marshaller
+    // dropped would leave `:expected0` dangling — which is the ORIGINAL ENG-1217
+    // bug's exact shape, now on the condition instead of the update.
+    await scheduleDb.updateSchedule('sch-14', { llmModel: 'gemini-3.1-flash-lite' }, {
+      llmModel: EXPECT_UNSET,
+    } as never);
+
+    const params = soleRequest();
+    expect(requestProblems(params)).toEqual([]);
+    expect(params.ConditionExpression).toMatch(
+      /^\(attribute_not_exists\(#\w+\) OR #\w+ = :\w+\)$/,
+    );
+    // The empty string must be REAL and present, not dropped and not coerced to
+    // null — `#a = :a` against a missing value is the failure mode this file exists
+    // for, and against null it would never match the rows it is meant to match.
+    const values = Object.values(params.ExpressionAttributeValues as Record<string, unknown>);
+    expect(values).toContain('');
+  });
+
+  it('ENG-1363: an UNSET expectation composes with an ordinary one', async () => {
+    // Two entries in `expect` join with AND. If the disjunction were emitted
+    // without its parentheses, AND would bind tighter than OR and the condition
+    // would quietly mean something else entirely — still valid SQL-ish syntax, so
+    // nothing would error; it would just stop guarding.
+    await scheduleDb.updateSchedule('sch-15', { llmModel: 'gemini-3.1-flash-lite' }, {
+      llmModel: EXPECT_UNSET,
+      status: 'active',
+    } as never);
+
+    const params = soleRequest();
+    expect(requestProblems(params)).toEqual([]);
+    expect(params.ConditionExpression).toContain(' AND ');
+    expect(params.ConditionExpression).toMatch(/\(attribute_not_exists\(#\w+\) OR #\w+ = :\w+\)/);
   });
 
   it('removing an attribute that is also expected to hold a value', async () => {

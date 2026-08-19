@@ -330,7 +330,7 @@ import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
-import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+import { computeRunVerdict, type RunTerminalInfo } from '../loops/instances/agent-mode/runRecorder';
 // OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
 import {
   endChatSpan,
@@ -515,7 +515,7 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
+  info: RunTerminalInfo,
 ): void {
   endInvokeAgentSpan(runId, {
     verdict: computeRunVerdict({
@@ -524,6 +524,7 @@ function recordAgentModeRunCompleted(
       failedToolCalls: info.failedToolCalls ?? 0,
       maxSameToolFailures: info.maxSameToolFailures,
     }).verdict,
+    responseModel: info.llmModel,
   });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
@@ -550,9 +551,9 @@ function recordAgentModeClaimCheckError(runId: string, sessionId: string, error:
 
 function recordAgentModeRunFailed(
   runId: string,
-  info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: RunTerminalInfo & { error: unknown },
 ): void {
-  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error, responseModel: info.llmModel });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -823,6 +824,30 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Usage/cost tier for the model picker UI, ordered most- to least-expensive. Unset defaults to 'medium'. */
+  tier?: ModelTier;
+  /** Short, user-facing one-line description shown next to the model name in the picker. */
+  description?: string;
+  /** Clean, user-facing display name for the picker — e.g. "Grok 4.6", not the raw id. */
+  name?: string;
+  /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
+  provider?: ModelProvider;
+}
+
+/** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
+export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/** Underlying lab a model is from, for picking the right provider icon in the picker. */
+export type ModelProvider =
+  | 'anthropic' | 'openai' | 'google' | 'xai' | 'deepseek' | 'qwen' | 'mistral' | 'moonshot' | 'zai' | 'other';
+
+/** Metadata for a model as returned to the frontend picker. */
+export interface SupportedModelInfo {
+  id: string;
+  name: string;
+  tier: ModelTier;
+  description: string;
+  provider: ModelProvider;
 }
 
 // Type for LLM call options
@@ -2835,11 +2860,11 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2848,10 +2873,10 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.5-flash': { client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2877,7 +2902,7 @@ export class AgentModeService {
     //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
     //   matching the existing convention for other non-default/experimental models
     //   (e.g. anthropic.claude-opus-4-6-v1 above).
-    'openrouter/openai/gpt-4o-mini': { client: null, supportsTemperature: true },
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -2899,33 +2924,33 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
-    'openrouter/x-ai/grok-4.6': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-pro': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-flash': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/qwen/qwen3.8-max': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/mistralai/mistral-small-2603': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k3': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k2.7-code': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-5.2': { client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-4.7-flash': { client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
-    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true },
     // AWS Bedrock Mantle — OpenAI-compatible endpoint, API-key auth.
-    'xai.grok-4.3': { client: null, supportsTemperature: false, maxTools: 128, supportsVision: true },
+    'xai.grok-4.3': { name: 'Grok 4.3', provider: 'xai', tier: 'pro', description: 'Fast frontier model via Bedrock Mantle', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2936,6 +2961,29 @@ export class AgentModeService {
       return [defaultModel, ...models.filter(m => m !== defaultModel)];
     }
     return models;
+  }
+
+  /**
+   * Same entitlement/ordering as getSupportedModels, decorated with tier + description
+   * for the model-picker UI. Excludes live-voice models (isLive) — they are never
+   * selectable through the HTTP generate picker (see callLLM's isLive guard).
+   * Untiered entries default to 'medium' with a generic description rather than being
+   * dropped, so a newly-added model is never silently invisible in the picker.
+   */
+  async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
+    const ids = await this.getSupportedModels(isAdmin);
+    return ids
+      .filter(id => !this.llmModels[id]?.isLive)
+      .map(id => {
+        const config = this.llmModels[id];
+        return {
+          id,
+          name: config?.name ?? id,
+          tier: config?.tier ?? 'medium',
+          description: config?.description ?? 'General-purpose model',
+          provider: config?.provider ?? 'other',
+        };
+      });
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
@@ -3518,6 +3566,11 @@ export class AgentModeService {
     let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
     const runEmitter = new RunEmitter(agentRuntimeRunId, () => {}, onProgress);
+    // Hoisted above the try so BOTH terminal paths can report it (ENG-1210 AC14):
+    // the model the run actually began under, after id resolution but before any
+    // backup-model substitution. The catch below cannot see try-scoped locals, and
+    // a run that fails after substituting is exactly the case worth distinguishing.
+    let originalLlmModel: string | undefined;
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,
@@ -3541,7 +3594,7 @@ export class AgentModeService {
         recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
       }
       // Track backup model usage
-      const originalLlmModel = llmModel;
+      originalLlmModel = llmModel;
       let backupModelUsed = false;
 
       // Track memory usage for optimization
@@ -5101,6 +5154,10 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-1210 AC14: grade the run against the model that produced it. These
+        // differ exactly when a transient error moved the run onto the backup.
+        llmModel,
+        modelAtStart: originalLlmModel,
         // ENG-143: an unresolved claim mismatch grades the run degraded
         // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
         ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
@@ -5188,6 +5245,8 @@ export class AgentModeService {
         toolCalls: _toolCallsForTelemetry.length,
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
+        llmModel,
+        modelAtStart: originalLlmModel,
       });
       // ENG-102: drain telemetry before the error propagates / worker tears down.
       await flushAgentRunRecorderSafe();
@@ -22728,11 +22787,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
         docId: doc.id,
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error creating ClickUp doc:', error);
+
+      // ENG-1354: ClickUp's own API error body ({ err, ECODE }) is the only thing
+      // that can distinguish an OAuth-scope problem from a workspace-side
+      // permission restriction from a malformed request — Axios's generic
+      // "Request failed with status code N" collapses all three into the same
+      // unreadable message. Mirrors the error.response?.data extraction already
+      // used in publishBlogArticle.
+      let errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const clickUpError = error?.response?.data;
+      if (clickUpError?.err) {
+        errorMessage = `${clickUpError.err}${clickUpError.ECODE ? ` (ClickUp code: ${clickUpError.ECODE})` : ''}`;
+      }
+
       return {
         success: false,
-        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+        message: `Failed to create ClickUp document "${name}": ${errorMessage}`
       };
     }
   }
@@ -34269,7 +34341,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -34393,6 +34465,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
           await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
           return { success: true, message: 'Campaign criterion removed' };
+        }
+      }
+
+      // CONVERSION_ACTION (ENG-1322). CREATE / LIST / UPDATE only — REMOVE is
+      // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
+      // the customer's account and is the one operation we cannot undo from our
+      // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'CONVERSION_ACTION') {
+        if (action === 'LIST') {
+          const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
+          return { success: true, conversionActions };
+        }
+        if (action === 'CREATE') {
+          // counting_type is NOT defaulted here — the service refuses an absent one
+          // with a message naming both options and what choosing wrong costs.
+          const created = await googleAdsService.createConversionAction(userId, customer_id, {
+            name: args.name,
+            category: args.category,
+            countingType: args.counting_type,
+            status: args.status,
+            primaryForGoal: args.primary_for_goal,
+            clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+          });
+          return {
+            success: true,
+            conversionActionResourceName: created.resourceName,
+            // The pair the page actually needs — a resource name cannot be installed.
+            tag: created.tag,
+            tagUnavailable: created.tag
+              ? undefined
+              : 'Google has not generated tag snippets for this action yet. Re-run CONVERSION_ACTION LIST shortly to read the AW-<id>/<label> pair.',
+            stored: created.stored,
+            drift: created.drift,
+            driftWarning: created.drift.length > 0
+              ? `Google stored ${created.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'UPDATE') {
+          const updated = await googleAdsService.updateConversionAction(
+            userId, customer_id, args.conversion_action_resource_name, {
+              name: args.name,
+              status: args.status,
+              category: args.category,
+              countingType: args.counting_type,
+              primaryForGoal: args.primary_for_goal,
+              clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+            });
+          return {
+            success: true,
+            conversionActionResourceName: updated.resourceName,
+            stored: updated.stored,
+            drift: updated.drift,
+            driftWarning: updated.drift.length > 0
+              ? `Google stored ${updated.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'REMOVE') {
+          return {
+            success: false,
+            error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
+              + 'historical attribution in the account and cannot be undone. To stop an action from '
+              + 'recording, use CONVERSION_ACTION UPDATE with status=PAUSED instead.',
+          };
         }
       }
 

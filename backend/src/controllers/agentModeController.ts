@@ -25,7 +25,8 @@ import { isCronEnabled } from '../utils/instanceState';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, classifyPublishStall } from '../utils/publishPressCircuitBreaker';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
-import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
+import { countCallsSatisfyingRequirement, RequiredCallLedgerEntry } from '../utils/requiredCallSatisfaction';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 import { shouldRunPreCheckGate, shouldForceProceedAfterSkipStreak, countTrailingGateSkips, countTrailingNoActionableOutputRuns, resolvePreCheckDecision, ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
@@ -161,14 +162,20 @@ async function applyScheduleEditWithConsentNarrowing(
   // history is never deleted for an edit that then fails, and bound to the history the
   // count was measured against so it cannot take a second prefix off a list another
   // writer already shortened.
-  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any }
+  shedRunResults?: { count: number; expectedLength: number; expectedLast?: any },
+  // ENG-1365: attributes to REMOVE as part of THIS write. Restoring inheritance is a
+  // removal, not a value, and it has to ride the same write as the edit that asked
+  // for it -- a second call could leave the rename applied with the model still
+  // pinned, or the reverse, with nothing to say which landed.
+  removeAttributes?: string[]
 ): Promise<void> {
+  const removals = removeAttributes && removeAttributes.length ? removeAttributes : undefined;
   // Pass only the arguments this write actually needs, so an ordinary edit stays an
   // ordinary two-argument update.
   const write = async (payload: any, expectation?: Record<string, any>) => {
     if (shedRunResults && shedRunResults.count > 0) {
       try {
-        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults);
+        await scheduleDb.updateSchedule(scheduleId, payload, expectation, shedRunResults, removals);
       } catch (writeError: any) {
         // The shed count belongs to the history it was measured against; it cannot be
         // replayed against a different one. Hand back a conflict instead of retrying.
@@ -184,8 +191,8 @@ async function applyScheduleEditWithConsentNarrowing(
       }
       return;
     }
-    if (expectation) {
-      await scheduleDb.updateSchedule(scheduleId, payload, expectation);
+    if (expectation || removals) {
+      await scheduleDb.updateSchedule(scheduleId, payload, expectation, undefined, removals);
       return;
     }
     await scheduleDb.updateSchedule(scheduleId, payload);
@@ -1842,21 +1849,96 @@ function isWriteToolCall(toolCall: any): boolean {
 // drop a FAILED abandoned call's error, which the conditional-skip error-veto needs
 // to reject a failed run (Greptile P1, ENG-844). Falls back to the request list
 // only for a message that has no executed ledger. Each returned entry keeps the
-// name and, when the call failed, its error.
-export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; error?: any }> {
+// name, the call's arguments, and — when the call failed — its error.
+//
+// ENG-1045: the arguments matter as much as the name. The publish-outcome check
+// reads `arguments.action` to recognise that a `twitter_manage_post` /
+// `post_thread` satisfied a mandated `post_on_connected_account`. Dropping the
+// arguments here made that route unreachable on the ENG-657 resume path, so a run
+// that published a thread and was then abandoned came back to the nudge loop —
+// and its pressure to publish a duplicate — all over again.
+function reconstructedToolCallArguments(tc: any): any {
+  // Executed-ledger entries carry parsed `arguments`; a request-list entry carries
+  // `function.arguments` as a JSON string (and the ledger falls back to that raw
+  // string when parsing failed at dispatch time).
+  const raw = tc?.arguments ?? tc?.function?.arguments;
+  if (raw == null) return undefined;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch {
+    // Unparseable arguments are simply unknown — the entry still counts by name.
+    return undefined;
+  }
+}
+
+// The executed ledger is persisted on the message that CLOSES a turn and it is
+// CUMULATIVE for that whole turn, while each intermediate assistant message keeps
+// its own request-only `tool_calls`. So the per-message preference above is not
+// enough on its own: walking the messages emits every call of the turn TWICE —
+// once from the intermediate message that requested it, once from the closing
+// message's ledger. (Verified on the ENG-1045 session 555bb0a4: 26 real calls,
+// 52 reconstructed entries.) Since these entries seed the required-call COUNTS,
+// the doubling lets one real call satisfy a `minCount: 2` requirement — on a
+// publishing schedule that silently waives a post the owner is paying for.
+//
+// Both sources carry the SAME provider tool-call `id`, so identity is exact.
+// Where an id appears in both, the executed-ledger entry wins for the reason
+// above (only it carries the result/error markers). Entries with no id are never
+// collapsed — an unknown identity is not evidence of sameness.
+//
+// ENG-1045/ENG-947: `result` and `duplicateOf` are carried through too, not just
+// `error`. toolCallSucceeded (which callSatisfiesRequirement's exact-name-match
+// branch now calls for every publish requirement, per ENG-947) also fails a call
+// on `result.success === false` and on `duplicateOf`/`result.deferred` — a
+// preflight rejection commonly comes back this way, with NO top-level `error` at
+// all (see agentModeService's per-tool result extraction, e.g. publish_blog_article).
+// Dropping `result` here made that failure mode invisible on an ENG-657 resume: a
+// publish that failed in the abandoned portion reconstructed as a bare
+// `{name, arguments}` entry, which toolCallSucceeded reads as success — crediting a
+// publish that never happened, the exact false-success ENG-947 exists to prevent.
+export function reconstructPriorToolCalls(messages: any[]): RequiredCallLedgerEntry[] {
   if (!Array.isArray(messages)) return [];
-  return messages.flatMap((m: any) => {
+  const out: RequiredCallLedgerEntry[] = [];
+  const positionById = new Map<string, number>();
+
+  for (const m of messages) {
     const executed = Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : [];
     const requested = Array.isArray(m?.tool_calls) ? m.tool_calls : [];
-    const calls = executed.length ? executed : requested;
-    return calls
-      .map((tc: any) => {
-        const name = tc?.function?.name || tc?.name;
-        if (!name) return null;
-        return (tc && typeof tc === 'object' && tc.error != null) ? { name, error: tc.error } : { name };
-      })
-      .filter(Boolean);
-  }) as Array<{ name: string; error?: any }>;
+    const fromExecutedLedger = executed.length > 0;
+    const calls = fromExecutedLedger ? executed : requested;
+
+    for (const tc of calls) {
+      const name = tc?.function?.name || tc?.name;
+      if (!name) continue;
+      const args = reconstructedToolCallArguments(tc);
+      const entry: RequiredCallLedgerEntry = {
+        name,
+        ...(args !== undefined ? { arguments: args } : {}),
+        ...(tc && typeof tc === 'object' && tc.error != null ? { error: tc.error } : {}),
+        ...(tc && typeof tc === 'object' && tc.result !== undefined ? { result: tc.result } : {}),
+        ...(tc && typeof tc === 'object' && tc.duplicateOf != null ? { duplicateOf: tc.duplicateOf } : {}),
+      };
+
+      const id = typeof tc?.id === 'string' && tc.id ? tc.id : '';
+      if (!id) {
+        out.push(entry);
+        continue;
+      }
+      const seenAt = positionById.get(id);
+      if (seenAt === undefined) {
+        positionById.set(id, out.length);
+        out.push(entry);
+      } else if (fromExecutedLedger) {
+        // Same call, now seen with its execution markers — upgrade in place rather
+        // than appending, so the count stays at one and the error is not lost.
+        out[seenAt] = entry;
+      }
+    }
+  }
+  return out;
 }
 
 export function scheduledRunSignalsConditionalSkip(
@@ -2586,8 +2668,11 @@ export async function runVerifiedChat(
     // retry loop could re-prompt the model into re-running a completed side-effect.
     // `error` is preserved (ENG-844) so the conditional-skip error-veto can reject a
     // resumed run whose ABANDONED portion had a failed tool call — reconstructing only
-    // names would hide that failure and let it be recorded as a clean skip.
-    priorToolCalls?: Array<{ name: string; error?: any }>;
+    // names would hide that failure and let it be recorded as a clean skip. `result`
+    // is preserved (ENG-947/ENG-1045) so toolCallSucceeded can also catch a publish
+    // that failed WITHOUT a top-level error (a `result.success: false` preflight
+    // rejection) — otherwise a resumed failed publish reads as a bare success.
+    priorToolCalls?: RequiredCallLedgerEntry[];
     // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
     // Production leaves it undefined (the detector uses `new Date()`); tests pin it
     // so the cadence-vs-today check is deterministic regardless of the day CI runs.
@@ -2780,10 +2865,35 @@ export async function runVerifiedChat(
     }
   }
 
-  // Count how many times a required function was called.
-  const countCallsForRequirement = (functionName: string, calls: string[]): number => {
-    return calls.filter(c => c === functionName).length;
-  };
+  // Count how many times a required function's OUTCOME was achieved.
+  //
+  // ENG-1045: this used to compare tool NAMES only, which made the requirement
+  // unsatisfiable for any schedule whose mandated publish had to route through a
+  // different tool. A 2+ tweet thread can only go out via twitter_manage_post
+  // (post_on_connected_account is single-tweet; the backend rejects a 1-item
+  // thread), so after a successful thread the count stayed at 0 and the loop
+  // re-sent "Make sure to post_on_connected_account (1 more time needed)" on every
+  // remaining attempt — with a SECOND, irreversible post to a live timeline as the
+  // only way to clear it. countCallsSatisfyingRequirement keeps exact-name matching
+  // and additionally credits a SUCCESSFUL equivalent publish route.
+  //
+  // ENG-1276 (CodeRabbit): a schedule that requires BOTH names of an equivalence
+  // pair (e.g. post_on_connected_account AND twitter_manage_post, or email AND
+  // send_email_from_sender) as separate line items wants two distinct actions, not
+  // one call silently satisfying both — requiredFunctionNames lets
+  // countCallsSatisfyingRequirement suppress the equivalence credit in exactly that
+  // case; the exact-name match still credits the call toward its own requirement.
+  // Captured ONCE here and does not shrink if consent narrows mid-run — investigated
+  // and left as-is (ENG-1276): the FINAL persisted record re-derives its own held-to
+  // list fresh from `effectivePublishAuthorization` (see `heldToFunctionNames` in
+  // runScheduledChat), so THAT value — the one the owner actually sees — is never
+  // stale. This list only feeds the double-credit suppression, and a stale (wider)
+  // list there can only make suppression MORE conservative, never double-credit.
+  const requiredFunctionNames = new Set(requiredFunctions.map((reqFunc) => reqFunc.functionName));
+  const countCallsForRequirement = (
+    functionName: string,
+    calls: RequiredCallLedgerEntry[]
+  ): number => countCallsSatisfyingRequirement(functionName, calls, requiredFunctionNames);
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -2792,32 +2902,20 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts. ENG-657: on a resume, seed with the
+  // Track all tool calls across attempts. ENG-657: on a resume, seed with the
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  //
-  // CodeRabbit review (ENG-1276) also flagged that `requiredFunctions` — and so
-  // this derived name list, used only for the ENG-1276 alias double-credit
-  // suppression — is captured ONCE here and does not shrink if consent narrows
-  // mid-run (`livePublishAuthorization`/`effectivePublishAuthorization` below).
-  // Investigated and left as-is: the FINAL persisted record already re-derives
-  // its own held-to list fresh from `effectivePublishAuthorization` at the end
-  // of the run (see `heldToFunctionNames` in runScheduledChat) — that is the
-  // value that actually reaches the schedule owner, and it is not stale. The
-  // only consumer of THIS list is the alias suppression, and a stale (wider)
-  // list there can only make suppression MORE likely to apply, never less —
-  // i.e. it can under-credit a name nobody ends up requiring, never
-  // double-credit one. Safe direction, and currently unreachable in practice
-  // besides: no evidenced schedule requires both names of any alias pair to
-  // begin with, so this is two unevidenced conditions compounded. Making it
-  // fully live would mean re-deriving this list at each of the three
-  // requirementEvidenceNames call sites from whatever authorization is active
-  // AT THAT MOMENT — a real change to a part of this function's mid-run
-  // consent-narrowing plumbing, not a quick win, for a currently-unreachable
-  // gap in the safe direction.
-  const requiredFunctionNames = requiredFunctions.map((reqFunc) => reqFunc.functionName);
-  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? [], requiredFunctionNames);
+  // ENG-1045: kept as ENTRIES rather than bare names — the outcome check needs each
+  // call's action argument and its success/error marker, which a name list discards.
+  // Resumed entries carry name/arguments/error (see reconstructPriorToolCalls), so a
+  // thread published before the abandonment credits the mandated publish on resume
+  // instead of restarting the nudge loop. callSatisfiesRequirement (ENG-947) applies
+  // the same success gate to these entries that requirementEvidenceNames used to
+  // apply here, so a failed resumed publish still isn't credited.
+  const allActualFunctionCallsForReporting: RequiredCallLedgerEntry[] = Array.isArray(params.priorToolCalls)
+    ? params.priorToolCalls.filter((c) => c && c.name)
+    : [];
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -3062,7 +3160,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...requirementEvidenceNames(continuationToolCalls, requiredFunctionNames)
+          ...continuationToolCalls.filter((call: any) => call?.name)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -3204,7 +3302,8 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls, requiredFunctionNames));
+
+      allActualFunctionCallsForReporting.push(...toolCalls.filter((call: any) => call?.name));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -4332,7 +4431,7 @@ export async function runScheduledChat(
     let isResumeRun = false;
     // ENG-657: tool calls the abandoned portion already made, seeded into the
     // resumed run's verification so requiredFunctionCalls counts the whole task.
-    let resumePriorToolCalls: Array<{ name: string; error?: any }> = [];
+    let resumePriorToolCalls: RequiredCallLedgerEntry[] = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
@@ -4902,44 +5001,46 @@ export async function runScheduledChat(
     // tool errored" is exactly what someone reading run history needs to see.
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
-    // Calculate final function call details. Counted off the requirement evidence,
-    // NOT the audit list above (ENG-947): a failed publish must not report
-    // `actual: 1, required: 1` next to a functionCallMisses entry naming the same
-    // tool. The two fields would contradict each other in run history and in the
-    // result email, and the reassuring one is the one that is wrong.
+    // Calculate final function call details. ENG-1045/ENG-947: counted through the
+    // same outcome-aware helper the checker uses (countCallsSatisfyingRequirement),
+    // so the persisted record cannot say `post_on_connected_account {actual: 0,
+    // required: 1}` on a run the checker passed because the mandated post went out
+    // as a thread, NOR can it report `actual: 1` next to a functionCallMisses entry
+    // naming the same tool because a failed publish attempt was counted as a send —
+    // the same self-contradicting shape ENG-827 removed from this record below.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
-    const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    // ENG-827: filter to the requirements this run was actually HELD TO —
-    // publish-scope-filtered, not the raw schedule config — BEFORE building the
-    // requirement evidence, so a run authorized for only one of a
-    // twitter_manage_post/post_on_connected_account pair (ENG-1276 follow-up)
-    // sees the same held-to set the alias suppression checks against. Reading
-    // the unfiltered config here persisted a self-contradicting record on an
-    // unauthorized run: `post_on_connected_account {required: 1, actual: 0}`
-    // sitting next to an empty functionCallMisses and passed: true. Nothing
-    // downstream can tell that apart from a genuine silent miss, which is the
-    // false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
-    // feeds the checker, the prompt, the evidence ledger, and this record.
-    // ENG-827: filtered against `effectivePublishAuthorization` — the authorization
-    // the run FINISHED under, which differs from the admitted one when the owner
-    // revoked consent mid-run.
+
+    // ENG-827: report the requirements this run was actually HELD TO, which is the
+    // publish-scope-filtered list the checker used above — not the raw schedule
+    // config. Reading the unfiltered config here persisted a self-contradicting
+    // record on an unauthorized run: `post_on_connected_account {required: 1,
+    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
+    // Nothing downstream can tell that apart from a genuine silent miss, which is
+    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt and this record.
+    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
+    // run FINISHED under, which differs from the admitted one when the owner revoked
+    // consent mid-run. Reading the raw schedule config here instead persisted a
+    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
+    // next to an empty functionCallMisses on a passing run. Nothing downstream can
+    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
+    // ENG-764 had to unpick.
+    // ENG-1276 follow-up: also the SAME held-to set the equivalence-route
+    // double-credit suppression checks against below, so a run authorized for only
+    // ONE of an equivalence pair (e.g. post_on_connected_account but not
+    // twitter_manage_post) is scoped identically here and in the checker — not the
+    // wider, unfiltered `requiredFunctionNames` computed earlier in this function.
     const heldToFunctionNames = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization);
-    // ENG-657, applied here too (CodeRabbit review, ENG-1276): a RESUMED run's
-    // verification already seeds its evidence with resumePriorToolCalls (see
-    // `priorToolCalls: resumePriorToolCalls` passed into runVerifiedChat below),
-    // so the pass/fail DECISION correctly counts the abandoned portion's calls.
-    // This persisted record was built from `result.toolCalls` alone — only the
-    // calls made in the resumed portion — so a resumed run that passed because
-    // an EARLIER call satisfied a requirement could still write
-    // `{required: 1, actual: 0}` here: a self-contradicting record next to an
-    // empty functionCallMisses, the exact false-failure shape ENG-479/ENG-764/
-    // ENG-827 already had to unpick for a different stale-snapshot cause.
-    requirementEvidenceNames([...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames).forEach((call: string) => {
-      actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
-    });
     heldToFunctionNames.forEach((functionName: string) => {
       finalFunctionCallDetails[functionName] = {
-        actual: actualFunctionCallCounts[functionName] || 0,
+        // ENG-1045 (Greptile): a resumed run's requirement can be satisfied by a call
+        // made in the ABANDONED portion, carried in via `resumePriorToolCalls` — the
+        // same list `runVerifiedChat` folded in above to decide functionCallMatches.
+        // Recounting from `result.toolCalls` alone here reintroduces the same
+        // self-contradicting record the surrounding comment warns about: `passed:
+        // true` next to `actual: 0` for a requirement functionCallMatches already
+        // credits.
+        actual: countCallsSatisfyingRequirement(functionName, [...resumePriorToolCalls, ...result.toolCalls], heldToFunctionNames),
         required: functionCallMinCalls[functionName] || 1
       };
     });
@@ -7569,7 +7670,7 @@ export const agentModeController = {
   async getSupportedModels(req: Request, res: Response) {
     try {
       const { user } = await getUserFromToken(req);
-      const models = await agentModeService.getSupportedModels(user?.isAdmin === true);
+      const models = await agentModeService.getSupportedModelsWithMetadata(user?.isAdmin === true);
       res.json(models);
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
@@ -9552,7 +9653,21 @@ export const agentModeController = {
           : ((existingSchedule as any).disableSourcingBlockAlerts || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
-        llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        // ENG-1365: partial-update safe, for the reason the requirePublishApproval
+        // comment above already gives. The previous form was
+        // `llmModel !== undefined ? llmModel : (existingSchedule.llmModel || '')`,
+        // whose fallback wrote `''` whenever the request stayed silent AND the
+        // stored attribute was absent -- so a rename, a cadence change, any edit at
+        // all, converted "inherits the platform default" into "stores an empty
+        // string". It only moved one way, and the empty string is the state that
+        // made every model switch 409 permanently (ENG-1363).
+        //
+        // Silent request -> omit the key entirely; the partial SET leaves whatever
+        // is stored exactly as it is, including an existing `''`, which is a data
+        // question and not a rename's business.
+        // Explicit empty -> a REMOVAL below, because inheritance is the ABSENCE of
+        // the attribute, not a blank value in it.
+        ...(llmModel !== undefined && llmModel !== '' ? { llmModel } : {}),
         ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
@@ -9712,7 +9827,10 @@ export const agentModeController = {
               expectedLength: observedRunResults.length,
               expectedLast: observedRunResults[observedRunResults.length - 1],
             }
-          : undefined
+          : undefined,
+        // ENG-1365: only when the request EXPLICITLY clears the model. A silent
+        // request removes nothing, because it was never asked to.
+        llmModel === '' ? ['llmModel'] : undefined
       );
 
       res.json({

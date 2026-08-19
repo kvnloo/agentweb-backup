@@ -27,7 +27,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { scheduleDb } from "./db";
+import { scheduleDb, EXPECT_UNSET } from "./db";
 import { getEffectiveLlmUsagePolicy } from "./llmUsagePolicyResolverService";
 import { agentModeService } from "./agentModeService";
 import {
@@ -227,7 +227,12 @@ export async function applyModelChange(
     await scheduleDb.updateSchedule(
       input.scopeId,
       { llmModel: input.toModel },
-      { llmModel: modelBefore ?? undefined },
+      // ENG-1363: `EXPECT_UNSET`, not `undefined`. Inheriting is stored two ways —
+      // the attribute absent, or holding `""` — and `undefined` asserts only the
+      // first. The 48 active schedules spelling it the second way failed this
+      // condition on every attempt, which the catch below could only read as a
+      // conflict, so the switch 409'd permanently on the majority of schedules.
+      { llmModel: modelBefore ?? EXPECT_UNSET },
     );
   } catch (error) {
     if (!isConditionalCheckFailure(error)) throw error;

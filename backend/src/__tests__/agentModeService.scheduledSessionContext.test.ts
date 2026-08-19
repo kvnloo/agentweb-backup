@@ -394,8 +394,36 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   it('names the exact publish tools the owner approved, and scopes to them', () => {
     const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
     expect(scoped).toContain('approved post_on_connected_account');
-    expect(scoped).toContain('covers ONLY post_on_connected_account');
+    expect(scoped).toContain('The authorization covers post_on_connected_account');
     expect(scoped).not.toContain('publish_landing_page_changes');
+  });
+
+  // ENG-1045 follow-up: a grant for post_on_connected_account alone used to leave the
+  // model believing twitter_manage_post was categorically off-limits, so it never
+  // attempted the thread route the completion checker's equivalence fix exists to
+  // credit — live-verified on preview 2026-08-17 (the model narrated "only
+  // pre-authorized to publish using post_on_connected_account" and silently
+  // collapsed a requested 2-tweet thread into one tweet).
+  it('tells the model the equivalent-outcome route is ALSO covered by the same grant', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+    expect(scoped).toContain('twitter_manage_post');
+    expect(scoped).toContain('post_thread only');
+    expect(scoped.toLowerCase()).toContain('do not silently shrink or merge');
+  });
+
+  // reply/quote_tweet/retweet are deliberately NOT part of the equivalence route
+  // (each responds to or reshares someone ELSE's content, not the schedule's own
+  // mandated content going out, ENG-1276 follow-up) — the directive must not
+  // blanket-authorize the whole tool.
+  it('does not blanket-name the equivalent tool as fully authorized — only its specific actions', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+    expect(scoped).not.toContain('you MUST call post_on_connected_account / twitter_manage_post');
+  });
+
+  it('does NOT append the equivalence note for a grant with no known equivalent route', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['publish_landing_page_changes']);
+    expect(scoped).toContain('The authorization covers publish_landing_page_changes.');
+    expect(scoped).not.toContain('twitter_manage_post');
   });
 
   // Consent is tool-scoped, so authorization with no approved tool has unknown scope
