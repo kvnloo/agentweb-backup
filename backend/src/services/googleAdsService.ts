@@ -506,6 +506,17 @@ export class GoogleAdsService {
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
     if (params.status !== undefined) {
       const status = assertConversionActionStatus(params.status);
+      // REMOVE is refused as an operation (ENG-1329: it severs historical attribution and
+      // cannot be undone). status=REMOVED does exactly the same thing by another route, so
+      // allowing it here would refuse the front door and leave the window open.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'Setting status=REMOVED retires the conversion action permanently and severs its '
+          + 'historical attribution — the same irreversible outcome as REMOVE, which this tool '
+          + 'deliberately does not support. Use status=HIDDEN to stop it counting toward goals '
+          + 'while keeping its history.',
+        );
+      }
       update.status = status; updateMask.push('status'); requested.status = status;
     }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }

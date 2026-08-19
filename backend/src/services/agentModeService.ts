@@ -34542,7 +34542,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             success: false,
             error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
               + 'historical attribution in the account and cannot be undone. To stop an action from '
-              + 'recording, use CONVERSION_ACTION UPDATE with status=PAUSED instead.',
+              + 'recording, use CONVERSION_ACTION UPDATE with status=HIDDEN instead (NOT PAUSED — a '
+              + 'conversion action has no PAUSED status; that is a campaign status).',
           };
         }
       }
