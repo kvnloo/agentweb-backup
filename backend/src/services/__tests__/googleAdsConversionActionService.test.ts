@@ -88,7 +88,7 @@ describe('createConversionAction — hands back the tag pair (ENG-1322 AC2)', ()
   it('reads the action back rather than trusting the create', async () => {
     await googleAdsService.createConversionAction('u', CUSTOMER, valid);
     // One mutate to write, one search to verify. Skipping the read is how ENG-1293
-    // shipped an ENABLED object off a PAUSED request.
+    // shipped an ENABLED object off a non-default status request.
     expect(mutateSpy).toHaveBeenCalledTimes(1);
     expect(searchSpy).toHaveBeenCalledTimes(1);
     expect(searchSpy.mock.calls[0][2]).toContain('conversion_action.tag_snippets');
@@ -122,8 +122,8 @@ describe('createConversionAction — surfaces drift (ENG-1322 AC4)', () => {
 
   it('catches the ENG-1293 shape — a status stored as something else', async () => {
     searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
-    const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'PAUSED' });
-    expect(out.drift).toEqual([{ field: 'status', requested: 'PAUSED', stored: 'ENABLED' }]);
+    const out = await googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'HIDDEN' });
+    expect(out.drift).toEqual([{ field: 'status', requested: 'HIDDEN', stored: 'ENABLED' }]);
   });
 
   it('catches a counting_type Google did not honour', async () => {
@@ -154,11 +154,11 @@ describe('optional fields are sent only when supplied', () => {
 
   it('updates every supported field, building the mask from what was supplied', async () => {
     searchSpy.mockResolvedValue([storedRow({
-      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK', primaryForGoal: false, status: 'PAUSED',
+      name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK', primaryForGoal: false, status: 'HIDDEN',
     })]);
     await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, {
       name: 'Renamed', category: 'SIGNUP', countingType: 'MANY_PER_CLICK',
-      primaryForGoal: false, clickThroughLookbackWindowDays: 30, status: 'PAUSED',
+      primaryForGoal: false, clickThroughLookbackWindowDays: 30, status: 'HIDDEN',
     });
     const op = mutateSpy.mock.calls[0][3][0];
     expect(op.updateMask.split(',').sort()).toEqual(
@@ -242,7 +242,7 @@ describe('updateConversionAction', () => {
   });
 
   it('refuses a missing resource name', async () => {
-    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, '', { status: 'PAUSED' }))
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, '', { status: 'HIDDEN' }))
       .rejects.toThrow(/resource_name is required/i);
     expect(mutateSpy).not.toHaveBeenCalled();
   });
@@ -254,18 +254,71 @@ describe('updateConversionAction', () => {
   });
 
   it('sends only the fields supplied, so an omitted field is left alone', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'PAUSED' })]);
-    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'PAUSED' });
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
     const op = mutateSpy.mock.calls[0][3][0];
     expect(op.updateMask).toBe('status');
-    expect(op.update).toEqual({ resourceName: RESOURCE, status: 'PAUSED' });
+    expect(op.update).toEqual({ resourceName: RESOURCE, status: 'HIDDEN' });
     expect(op.update.name).toBeUndefined();
   });
 
-  it('pausing is the supported alternative to removal, and reads back clean', async () => {
-    searchSpy.mockResolvedValue([storedRow({ status: 'PAUSED' })]);
-    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'PAUSED' });
+  it('HIDDEN is the supported alternative to removal, and reads back clean', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    const out = await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'HIDDEN' });
     expect(out.drift).toEqual([]);
-    expect(out.stored.status).toBe('PAUSED');
+    expect(out.stored.status).toBe('HIDDEN');
+  });
+});
+
+describe('status is validated before it reaches Google (ENG-1329 e2e)', () => {
+  // The end-to-end run found this, not review. CREATE with PAUSED returned a bare 400 and
+  // Google's body named the field. These pin that the refusal now happens locally, with
+  // an explanation, and that nothing is sent.
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('refuses PAUSED on create without issuing a mutate', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'PAUSED' }))
+      .rejects.toThrow(/cannot be PAUSED/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses PAUSED on update without issuing a mutate', async () => {
+    await expect(googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'PAUSED' }))
+      .rejects.toThrow(/cannot be PAUSED/);
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('points the caller at HIDDEN rather than just refusing', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: 'PAUSED' }))
+      .rejects.toThrow(/HIDDEN/);
+  });
+
+  it('accepts the three real values and normalises case', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'HIDDEN' })]);
+    await googleAdsService.updateConversionAction('u', CUSTOMER, RESOURCE, { status: 'hidden' });
+    const op = mutateSpy.mock.calls[0][3][0];
+    expect(op.update.status).toBe('HIDDEN');
+  });
+});
+
+describe('an empty status is invalid input, not an omitted field (CodeRabbit, #2482)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('refuses status "" on create instead of quietly creating an ENABLED action', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: '' }))
+      .rejects.toThrow();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a whitespace-only status on create', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: '   ' }))
+      .rejects.toThrow();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('still defaults to ENABLED when status is genuinely omitted', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(mutateSpy.mock.calls[0][3][0].create.status).toBe('ENABLED');
   });
 });

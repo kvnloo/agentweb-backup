@@ -71,3 +71,33 @@ describe('the action matrix documents the entity for the model', () => {
     expect(matrix()).toMatch(/counting_type is REQUIRED and never inferred/);
   });
 });
+
+describe('the tool matrix warns off PAUSED (ENG-1329 e2e)', () => {
+  // The model will reach for PAUSED — every other Google Ads entity uses it. The schema
+  // cannot enumerate `status` (it is shared across entities, and campaigns really do
+  // pause), so the matrix text is the only place this can be said.
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const text = `${tool.definition?.description ?? ''}`;
+
+  it('states that a conversion action has no PAUSED', () => {
+    expect(text).toMatch(/NO PAUSED|no PAUSED/);
+  });
+
+  it('names the three real values', () => {
+    expect(text).toContain('ENABLED, REMOVED or HIDDEN');
+  });
+
+  it('points at HIDDEN as the alternative, and warns REMOVED is permanent', () => {
+    expect(text).toMatch(/use HIDDEN/i);
+    expect(text).toMatch(/REMOVED is permanent/i);
+  });
+
+  it('no longer tells the caller to stop an action with status=PAUSED', () => {
+    // The REMOVE-refusal advice said exactly that. It would have walked every agent
+    // straight into the 400 this ticket exists to prevent.
+    // Checks what is RECOMMENDED, not every mention — the text now names PAUSED in order
+    // to warn against it, which is the point.
+    expect(text).not.toMatch(/UPDATE it with status=PAUSED/);
+    expect(text).toMatch(/UPDATE it with status=HIDDEN/);
+  });
+});
