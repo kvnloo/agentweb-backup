@@ -118,3 +118,52 @@ describe('the matrix states the create/update status split (ENG-1329 e2e)', () =
     expect(text).toMatch(/Create it, then UPDATE it to HIDDEN/);
   });
 });
+
+describe('HIDDEN is actually reachable through the tool schema (ENG-1329 e2e)', () => {
+  // The e2e found the real blocker: the server accepted HIDDEN but the SCHEMA enum was
+  // ['ENABLED','PAUSED'], so the model could never send it. Net effect was no reachable
+  // way to retire a conversion action at all — the REMOVE refusal pointed at PAUSED, the
+  // docs said PAUSED was invalid, and the valid value was not in the enum.
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const status = () => tool.definition.inputSchema.properties.status;
+
+  it('offers HIDDEN', () => {
+    expect(status().enum).toContain('HIDDEN');
+  });
+
+  it('keeps PAUSED for campaigns, ad groups and ads', () => {
+    expect(status().enum).toContain('PAUSED');
+    expect(status().enum).toContain('ENABLED');
+  });
+
+  it('does NOT offer REMOVED — that is REMOVE by another name', () => {
+    expect(status().enum).not.toContain('REMOVED');
+  });
+
+  it('says which values a conversion action actually takes', () => {
+    expect(status().description).toMatch(/CONVERSION_ACTION takes ENABLED or HIDDEN only/);
+    expect(status().description).toMatch(/never PAUSED/);
+  });
+});
+
+describe('the REMOVE refusal points somewhere reachable (ENG-1329 e2e)', () => {
+  // The refusal recommended status=PAUSED while the same tool's docs said PAUSED is
+  // invalid on a conversion action. Following the advice produced an error; the working
+  // value was not in the enum. Three sources of truth, no consistent path.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '../services/agentModeService.ts'), 'utf8');
+
+  it('no longer recommends status=PAUSED', () => {
+    expect(src).not.toMatch(/CONVERSION_ACTION UPDATE with status=PAUSED/);
+  });
+
+  it('recommends status=HIDDEN', () => {
+    expect(src).toMatch(/CONVERSION_ACTION UPDATE with status=HIDDEN/);
+  });
+
+  it('says why PAUSED is wrong, so the advice is not just swapped silently', () => {
+    // Matched within a single source literal — the sentence spans a concatenation, so a
+    // contiguous regex over the file would fail for a reason unrelated to the message.
+    expect(src).toMatch(/conversion action has no PAUSED status/);
+  });
+});
