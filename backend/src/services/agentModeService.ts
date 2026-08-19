@@ -22794,8 +22794,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Create as a standalone doc at workspace root
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      // Create as a standalone doc at workspace root, then attach the content as its
+      // first page. ClickUp's doc-create endpoint has no `content` param — content
+      // must be added via a separate page-create call, mirroring the parentDocId branch above.
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name);
+      try {
+        await createClickUpPageInDoc(clickUpToken, workspaceId, doc.id, name, content);
+      } catch (pageError) {
+        // The doc itself already exists in ClickUp at this point. Reporting a hard
+        // failure would risk the caller retrying and creating a second, duplicate
+        // empty doc — report partial success with the doc id instead.
+        console.error('AgentMode: Created ClickUp doc but failed to add its content page:', pageError);
+        return {
+          success: true,
+          message: `Created ClickUp document "${name}" in workspace "${workspace.name}", but failed to save its content: ${pageError instanceof Error ? pageError.message : 'Unknown error'}. Retry by calling write_clickup_doc with parent_doc_id="${doc.id}" to add the content as a page.`,
+          docId: doc.id,
+        };
+      }
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
