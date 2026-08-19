@@ -1,3 +1,70 @@
+## ENG-1309: fixing a "prompt bloat causes verbosity" regression without adding to the pile (2026-08-18)
+
+Fix for ENG-1306 (two customers, four sessions, quantified 2x completion-token growth since the
+Opus 5 default switch). Human-written behavioral contract (drafted by Fable from Ed Mongiovi's and
+Vince Magaline's own words, confirmed by Harsha on ENG-1305): yes/no questions get a yes/no first
+line; an explicit stated length is honored within ~20% on the first attempt; factual/config
+questions stay under ~150 words by default; the verified/unverified distinction becomes a compact
+per-claim tag, not two separate lists. Findings, because the shape generalizes:
+
+- **The contract itself said not to do the obvious thing.** ENG-1305's audit named the last two
+  "fix this failure mode" prompt additions (ENG-829, ENG-1187) as contributors to the very
+  regression being fixed here — each one grew the reply by adding a rule that had to be obeyed on
+  every turn. Bolting a third CRITICAL block on top of the same pile would be the identical move
+  that produced ENG-1306. So this PR's one new section (`## Answer Directness & Length`) is
+  offset by removing two already-proven-ineffective instructions it makes redundant: a generic
+  "keep responses concise but informative" bullet (dead weight — the customer complaints are
+  direct proof it was never followed) and a 7-line "Important formatting rules" numbered list that
+  had three separate rules all restating "minimal spacing" and a fourth restating "concise."
+  Net result: **+961 chars / +163 words** on the 66,893-char (now 67,854) `AGENT_MODE_SYSTEM_PROMPT`
+  constant — a real, disclosed increase (+1.4%), not zero, but roughly an order of magnitude
+  smaller than treating this as "just add another block" would have produced, and the new section
+  constrains *output shape* rather than adding another thing to check before answering — a
+  different failure mode than the additive pattern ENG-1305 flagged.
+
+- **Two instructions asking for opposite formats is worse than either alone.** The ENG-829 bullet
+  literally said "keep the two lists visibly separate" — the exact anti-pattern criterion 3 of this
+  ticket's own contract asks to fix. Adding a new "use a compact tag, never two lists" rule
+  *alongside* the old "keep two lists separate" rule would have left the model with two live,
+  contradictory formatting instructions for the same claim-labeling behavior — genuinely
+  underdetermined, and a worse outcome than not fixing it. The old bullet was edited in place
+  (same file, same PR) rather than left for a future cleanup; `agentModeSystemPrompt.answerDirectness.test.ts`
+  asserts the old phrase is gone, not just that the new one exists, specifically to catch a
+  reviewer or future edit reintroducing it as an "addition."
+
+- **The thinking-budget/model-config lever was deliberately not used here**, despite
+  `AGENT_MODE_MAX_OUTPUT_TOKENS` (`agentModeService.ts:197`, raised 12,384→32,000 on ENG-403,
+  07-21) and Bedrock's `ConverseCommand` having no thinking-budget cap (`agentModeService.ts` Claude
+  path, ~L2248) both being named as root-cause contributors in ENG-1305's audit, and Harsha's own
+  decision comment naming "length/thinking-budget config where available" as a preferred lever
+  over prompt prose. Reasons for staying prompt-only in *this* PR: (1) `AGENT_MODE_MAX_OUTPUT_TOKENS`
+  is a single global ceiling shared by every AgentMode feature, including ones that legitimately
+  need long output (GTM plans, audit reports, blog articles) — lowering it to fix short-answer
+  verbosity risks truncating unrelated legitimate long-form generation; a targeted fix needs a
+  per-request-shape cap, not a global one, which is a bigger design than this ticket's contract
+  asks for. (2) Adding a Bedrock `thinking` budget is a live-behavior change across every Opus 5
+  call in the product, not just the four named replay fixtures, and needs its own scoped
+  investigation/testing — Harsha's ENG-1305 decision comment frames ENG-1309 itself as "the fix"
+  (the harness contract), not as the vehicle for that separate lever. Flagging both here so a
+  follow-up isn't accidentally treated as novel: if the harness-only contract proves insufficient
+  once ENG-1314 unblocks real replay evidence, the next lever is a per-request output-length hint
+  derived from the new contract's own thresholds (e.g. cap `max_tokens` lower when no explicit
+  depth was requested), not a global constant change.
+
+- **The real behavioral evidence (replay against the four named production sessions) is
+  infrastructure-blocked, not skipped.** `loops/eval/agentModeReplayFixtures.ts` (ENG-1312,
+  already merged) is the deterministic char/word-threshold harness this contract's own criterion 4
+  calls for ("measured in characters/tokens, not judge score") — it already cites this ticket's
+  exact thresholds (`ENG-1309 criterion 1/2/3`) in `thresholdSource`, and already proves the
+  mechanism catches a regression using a synthetic `'x'.repeat(10524)` payload standing in for the
+  real "today 10,524 chars" figure from criterion 2. It runs on synthetic placeholder content
+  because the real transcript content is a data-exposure decision (ENG-1314), not a code decision —
+  see that module's own doc comment. This PR's tests therefore characterize the only surface a unit
+  test actually owns: that the system prompt *states* the contract in terms an LLM can follow
+  (same idiom `agentModeSystemPrompt.followExplicitDirection.test.ts` established for ENG-1311) —
+  pinned RED (absent) before this change, GREEN (present) after. `agentModeReplayFixtures.test.ts`
+  was re-run unchanged and stays green; this PR doesn't touch that module.
+
 ## ENG-1312: the satisfaction judge's blind spot, and a real fixture is a data-exposure decision, not a code one (2026-08-17)
 
 Two customers both reported the judge rewarding exactly the behavior they
