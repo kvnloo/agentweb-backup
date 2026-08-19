@@ -5482,7 +5482,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
       adminOverride: true as const,
     };
 
-    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore);
+    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore, { allowOverride: true });
 
     res.json({ satisfactionScore });
   } catch (error: any) {

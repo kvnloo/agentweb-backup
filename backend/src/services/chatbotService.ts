@@ -2552,11 +2552,21 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1332: guarded by default against clobbering an admin override. The
+   * caller (scoreSessionIfNeeded) already skips adminOverride rows using the
+   * session it read, but that read happens once before scoring — a concurrent
+   * admin override written in between is a TOCTOU race the in-process check
+   * can't catch. Pass `allowOverride: true` only for an explicit human
+   * override write (the admin PUT route), which must be allowed to replace
+   * anything, including a prior override.
+   */
   async updateSessionSatisfactionScore(
     sessionId: string,
-    satisfactionScore: ChatSession["satisfactionScore"]
-  ): Promise<ChatSession> {
-    const params = {
+    satisfactionScore: ChatSession["satisfactionScore"],
+    options?: { allowOverride?: boolean }
+  ): Promise<ChatSession | null> {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -2568,10 +2578,18 @@ export class ChatbotDB {
       ReturnValues: "ALL_NEW",
     };
 
+    if (!options?.allowOverride) {
+      params.ConditionExpression = "attribute_not_exists(satisfactionScore.adminOverride)";
+    }
+
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      // Lost the race: an admin override landed on this row after it was read
+      // for scoring, so there is nothing to persist. Not an error — the row
+      // still holds the human's score.
+      if (!options?.allowOverride && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session satisfaction score:", error);
       throw error;
     }
