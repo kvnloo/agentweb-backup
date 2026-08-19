@@ -34,13 +34,17 @@ const stateKey = (accountId: string) => `linkedin-disconnect-notify:${accountId}
 
 const isNotifyEnabled = (): boolean => process.env.LINKEDIN_DISCONNECT_NOTIFY === 'true';
 
-async function readState(accountId: string): Promise<DisconnectNotifyState | null> {
+const STATE_READ_ERROR = Symbol('linkedin-disconnect-notify-state-read-error');
+
+async function readState(
+  accountId: string,
+): Promise<DisconnectNotifyState | null | typeof STATE_READ_ERROR> {
   try {
     const setting = await settingsService.getSetting(stateKey(accountId));
     if (!setting?.settingValue) return null;
     return JSON.parse(setting.settingValue) as DisconnectNotifyState;
   } catch {
-    return null;
+    return STATE_READ_ERROR;
   }
 }
 
@@ -99,6 +103,11 @@ export async function notifyAccountOwnerOfDisconnect(
 
   // AC3: cooldown gates only the owner email; the oncall path above is untouched by it.
   const state = await readState(accountId);
+  if (state === STATE_READ_ERROR) {
+    // Can't confirm whether a cooldown is active — fail closed and skip this
+    // owner email rather than risk sending a duplicate on every failed read.
+    return;
+  }
   if (state?.sentToOwner && state.lastOwnerNotifiedAt) {
     const elapsed = Date.now() - new Date(state.lastOwnerNotifiedAt).getTime();
     if (elapsed < OWNER_NOTIFY_COOLDOWN_MS) return;

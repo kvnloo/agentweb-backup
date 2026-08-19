@@ -87,6 +87,16 @@ describe('notifyAccountOwnerOfDisconnect', () => {
     expect(sendEmail).not.toHaveBeenCalled();
   });
 
+  it('AC3: a persisted cooldown state that fails to read fails closed — no owner email is sent', async () => {
+    process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
+    getSetting.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    await notifyAccountOwnerOfDisconnect('acct-3b', 'user-1');
+
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(setSetting).not.toHaveBeenCalled();
+  });
+
   it('AC3: the internal/oncall path is unaffected by the owner cooldown — a missing owner email still alerts every call', async () => {
     process.env.LINKEDIN_DISCONNECT_NOTIFY = 'true';
     getUserById.mockResolvedValue(undefined);
