@@ -205,3 +205,56 @@ describe('injectGoogleAdsIntoLayoutFiles', () => {
     expect(f[1].content.toString('utf-8')).toBe('export default function P(){return null}');
   });
 });
+
+describe('conversionId is untrusted input spliced into generated source (CodeRabbit, #2481)', () => {
+  // Reproduced before fixing: injectGoogleAdsIntoLayout('...', 'AW-1`); alert(1); //')
+  // emitted a layout containing alert(1). The value is interpolated into a JSX template
+  // literal AND into dangerouslySetInnerHTML, so a backtick, ${ or quote terminates the
+  // literal and lands arbitrary code on the customer's deployed page.
+  //
+  // The route validates the format, but the module is also called from the generation and
+  // sub-page paths with whatever the site record holds — so the guard belongs here, at
+  // the point the string becomes source code, not only at one caller.
+
+  const hostile = [
+    'AW-1`); alert(1); //',
+    'AW-1${alert(1)}',
+    "AW-1'); alert(1); //",
+    'AW-1</script><script>alert(1)</script>',
+    'AW-1"; alert(1); //',
+  ];
+
+  it.each(hostile)('leaves the layout untouched for %j', (bad) => {
+    expect(injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, bad)).toBe(LAYOUT_WITH_HEAD);
+  });
+
+  it.each(hostile)('never emits the payload for %j', (bad) => {
+    expect(injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, bad)).not.toContain('alert(1)');
+  });
+
+  it.each(hostile)('reports not-installed for %j rather than claiming success', (bad) => {
+    expect(verifyGoogleAdsInjection(injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, bad), bad)).toBe(false);
+  });
+
+  it('refuses a well-formed-looking id that is too short', () => {
+    // Matches RULE 7.5's own detector: AW- plus at least six digits.
+    expect(injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, 'AW-123')).toBe(LAYOUT_WITH_HEAD);
+  });
+
+  it('refuses a GTM container id in the Google Ads slot', () => {
+    expect(injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, 'GTM-ABCD123')).toBe(LAYOUT_WITH_HEAD);
+  });
+
+  it('does not strip an existing valid block when handed a hostile id', () => {
+    // Strip-then-reinject would otherwise remove a working tag and refuse to replace it,
+    // silently un-tracking a live page.
+    const installed = injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, AW);
+    expect(injectGoogleAdsIntoLayout(installed, 'AW-1`); alert(1); //')).toBe(installed);
+    expect(verifyGoogleAdsInjection(installed, AW)).toBe(true);
+  });
+
+  it('still allows the empty string, which is the documented removal path', () => {
+    const installed = injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, AW);
+    expect(injectGoogleAdsIntoLayout(installed, '')).not.toContain('Google Ads Tag');
+  });
+});

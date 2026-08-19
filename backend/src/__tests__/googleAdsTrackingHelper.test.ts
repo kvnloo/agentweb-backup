@@ -12,7 +12,7 @@ import { buildTrackingHelper } from '../services/v0Service';
 const helper = buildTrackingHelper();
 
 describe('buildTrackingHelper — emitted source is valid', () => {
-  it('compiles as TypeScript with no syntactic diagnostics', () => {
+  it('parses as TypeScript with no syntactic diagnostics', () => {
     // The helper is built inside a template literal, so an unescaped ${...} or a stray
     // backtick would silently corrupt it. Parsing is the only honest check.
     const sf = ts.createSourceFile('agentweb-track.ts', helper, ts.ScriptTarget.ES2020, true);
@@ -60,7 +60,7 @@ describe('buildTrackingHelper — Google Ads conversion (AC3)', () => {
   });
 
   it('does nothing at all when googleAds is absent — no fallback conversion', () => {
-    expect(helper).toContain('if (opts.googleAds && opts.googleAds.conversionId && opts.googleAds.conversionLabel)');
+    expect(helper).toContain('if (opts.googleAds && opts.googleAds.conversionId && opts.googleAds.conversionLabel');
   });
 
   it('fires the conversion BEFORE the bridge-out redirect tears the page down', () => {
@@ -82,5 +82,60 @@ describe('buildTrackingHelper — Google Ads conversion (AC3)', () => {
   it('still tells v0 not to hand-author the calls, now naming gtag too', () => {
     expect(helper).toContain('DO NOT hand-author');
     expect(helper).toContain('gtag()');
+  });
+});
+
+describe('the Google leg requires eventId (CodeRabbit, #2481)', () => {
+  it('gates the conversion on eventId, not just the pair', () => {
+    // transaction_id: undefined would record a browser conversion nothing can be matched
+    // against, so ENG-1325's upload of the same lead would count twice.
+    expect(helper).toContain('opts.googleAds.conversionLabel && opts.eventId');
+  });
+
+  it('warns rather than firing an undeduplicable conversion', () => {
+    expect(helper).toContain('skipping the conversion rather than sending one that cannot be deduplicated');
+  });
+
+  it('leaves the Meta leg ungated on eventId, which is deliberate', () => {
+    // fbq carries eventID as an optional dedup hint; Meta still records the event
+    // without it. Google's transaction_id is the whole matching key.
+    expect(helper).toContain('if (opts.pixelId) {');
+  });
+});
+
+describe('the emitted helper must type-check inside the customer repo (CodeRabbit, #2481)', () => {
+  // `window.gtag` is not on lib.dom's Window. The generated repo runs `next build`, which
+  // type-checks — so an unguarded access there is not a lint nit, it is a customer site
+  // that fails to build. The parse test above cannot catch this: it is a semantic error,
+  // not a syntactic one. Asserting the guard directly is the honest check.
+  const lines = helper.split('\n');
+  // Comments mention these names too; only real code needs the guard.
+  const isCode = (l: string) => !/^\s*(\/\/|\*|\/\*)/.test(l);
+
+  it('precedes every window.gtag access with @ts-ignore', () => {
+    const unguarded = lines
+      .map((line, i) => ({ line, i }))
+      .filter(({ line }) => isCode(line) && /\bwindow\.gtag\b/.test(line))
+      .filter(({ i }) => !/@ts-ignore/.test(lines[i - 1] ?? ''));
+    expect(unguarded.map((u) => u.line.trim())).toEqual([]);
+  });
+
+  it('accesses window.gtag at least twice — the guard and the call', () => {
+    // Guards against the test above passing vacuously if the leg is ever removed.
+    expect(lines.filter((l) => isCode(l) && /\bwindow\.gtag\b/.test(l)).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keeps the same protection on the Meta leg', () => {
+    const unguarded = lines
+      .map((line, i) => ({ line, i }))
+      .filter(({ line }) => isCode(line) && /\bwindow\.fbq\b/.test(line))
+      .filter(({ i }) => !/@ts-ignore/.test(lines[i - 1] ?? ''));
+    expect(unguarded.map((u) => u.line.trim())).toEqual([]);
+  });
+
+  it('never touches window without a typeof guard', () => {
+    // SSR: the helper is imported by a client component but Next still evaluates the
+    // module server-side, where `window` does not exist.
+    expect(helper).toContain('typeof window !== "undefined"');
   });
 });

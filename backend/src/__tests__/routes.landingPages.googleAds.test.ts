@@ -269,3 +269,28 @@ describe('config lands on the site ROOT, not just the page named (Greptile, #248
     expect(res.status).toBe(200);
   });
 });
+
+describe('optional fields are rejected, not coerced (CodeRabbit, #2481)', () => {
+  it('400s a non-string label instead of silently clearing the stored one', async () => {
+    // undefined is how updateLandingPageGoogleAds is told to CLEAR the label, so coercing
+    // a malformed value to undefined would strip a working pair and leave an id that
+    // attributes nothing.
+    for (const bad of [42, true, {}, []]) {
+      const res = await post({ googleAdsConversionId: AW, googleAdsConversionLabel: bad });
+      expect(res.status).toBe(400);
+    }
+    expect(mockAxiosPut).not.toHaveBeenCalled();
+    expect(mockUpdateGoogleAds).not.toHaveBeenCalled();
+  });
+
+  it('400s a non-string customer id instead of 500ing on .trim()', async () => {
+    const res = await post({ googleAdsConversionId: AW, googleAdsConversionLabel: LABEL, googleAdsCustomerId: 99 });
+    expect(res.status).toBe(400);
+    expect(mockAxiosPut).not.toHaveBeenCalled();
+  });
+
+  it('still accepts both fields genuinely omitted', async () => {
+    const res = await post({ googleAdsConversionId: AW });
+    expect(res.status).toBe(200);
+  });
+});

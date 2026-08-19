@@ -257,3 +257,40 @@ describe('ENG-1328 — the coding-agent sub-page path carries the conversion pai
     expect(task).toMatch(/captures leads that report no conversion/);
   });
 });
+
+describe('ENG-1328 — a partial pair is never persisted or instructed (CodeRabbit, #2481)', () => {
+  // FAIL cases first, per the repo's test rule: invalid inputs, boundary values, and the
+  // half-configured record that is the realistic failure here.
+  const { buildSubPageTask } = require('../services/codingAgentSubpageService') as any;
+  const brand = { brandName: 'Acme' } as any;
+  const AWID = 'AW-18192751758';
+
+  it('emits no Google Ads instructions for an id with no label', () => {
+    const task = buildSubPageTask('p', 'P', 'brief', brand, 'list1',
+      { conversionId: AWID, conversionLabel: '' } as any);
+    expect(task).not.toContain('fireLeadTracking');
+  });
+
+  it('emits none for a label with no id', () => {
+    const task = buildSubPageTask('p', 'P', 'brief', brand, 'list1',
+      { conversionId: '', conversionLabel: 'lbl' } as any);
+    expect(task).not.toContain('fireLeadTracking');
+  });
+
+  it('emits none when both halves are empty strings', () => {
+    const task = buildSubPageTask('p', 'P', 'brief', brand, 'list1',
+      { conversionId: '', conversionLabel: '' } as any);
+    expect(task).not.toContain('fireLeadTracking');
+  });
+
+  it('emits none when the pair object itself is undefined', () => {
+    expect(buildSubPageTask('p', 'P', 'brief', brand, 'list1', undefined)).not.toContain('fireLeadTracking');
+  });
+
+  it('still emits the rest of the task when the pair is absent', () => {
+    // Boundary: dropping the tracking block must not drop the page brief with it.
+    const task = buildSubPageTask('p', 'P', 'the brief text', brand, 'list1', undefined);
+    expect(task).toContain('the brief text');
+    expect(task).toContain('app/p/page.tsx');
+  });
+});
