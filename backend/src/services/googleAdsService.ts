@@ -6,6 +6,8 @@ import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, ut
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
+  assertConversionActionStatus,
+  describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
   type ConversionActionDrift,
@@ -86,8 +88,22 @@ export class GoogleAdsService {
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
+      const described = describeGoogleAdsError(err);
+      if (described) err.message = described;
       throw err;
     }
   }
@@ -431,7 +447,14 @@ export class GoogleAdsService {
       type: 'WEBPAGE',
       category: params.category,
       countingType,
-      status: params.status || 'ENABLED',
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
@@ -480,7 +503,10 @@ export class GoogleAdsService {
     const requested: Record<string, unknown> = {};
 
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
-    if (params.status !== undefined) { update.status = params.status; updateMask.push('status'); requested.status = params.status; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
     if (params.countingType !== undefined) {
       const countingType = assertCountingType(params.countingType);

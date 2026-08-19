@@ -14,6 +14,8 @@
  */
 import {
   assertCountingType,
+  assertConversionActionStatus,
+  describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
 } from '../googleAdsConversionActions';
@@ -250,5 +252,219 @@ describe('diffConversionAction — Google Ads INT64 fields arrive as JSON string
       { clickThroughLookbackWindowDays: 90 },
       { clickThroughLookbackWindowDays: 90 },
     )).toEqual([]);
+  });
+});
+
+describe('assertConversionActionStatus — a conversion action does not pause', () => {
+  // Found by the ENG-1329 end-to-end against the real account, not by review. CREATE with
+  // status PAUSED returned a bare 400; Google's own body named it:
+  //   Invalid value at 'operations[0].create.status'
+  //   (ConversionActionStatusEnum.ConversionActionStatus), "PAUSED"
+  // ConversionActionStatus is ENABLED | REMOVED | HIDDEN. PAUSED is a CAMPAIGN status, and
+  // assuming the two enums match is the obvious mistake — the ENG-1329 verification plan
+  // made it too.
+
+  it('accepts the three values Google actually defines', () => {
+    for (const s of ['ENABLED', 'REMOVED', 'HIDDEN']) {
+      expect(assertConversionActionStatus(s)).toBe(s);
+    }
+  });
+
+  it('normalises case and surrounding whitespace', () => {
+    expect(assertConversionActionStatus('  enabled ')).toBe('ENABLED');
+  });
+
+  it('refuses PAUSED by name, and says what to use instead', () => {
+    // The whole point: PAUSED is the value a human will reach for first.
+    expect(() => assertConversionActionStatus('PAUSED')).toThrow(/PAUSED/);
+    expect(() => assertConversionActionStatus('PAUSED')).toThrow(/HIDDEN/);
+  });
+
+  it('refuses any other unknown value, listing the valid ones', () => {
+    expect(() => assertConversionActionStatus('ARCHIVED')).toThrow(/ENABLED, REMOVED, HIDDEN/);
+  });
+
+  it('refuses a non-string rather than coercing it', () => {
+    for (const bad of [undefined, null, 42, {}, []]) {
+      expect(() => assertConversionActionStatus(bad)).toThrow();
+    }
+  });
+
+  it('refuses an empty string rather than defaulting', () => {
+    expect(() => assertConversionActionStatus('   ')).toThrow();
+  });
+});
+
+describe('describeGoogleAdsError — Google says which field is wrong; surface it', () => {
+  // callApi logged the detail and rethrew the raw axios error, so the caller only ever saw
+  // "Request failed with status code 400". The field-level cause existed the whole time and
+  // was invisible exactly when it mattered most.
+
+  it('extracts the message and the offending field', () => {
+    const err: any = { message: 'Request failed with status code 400', response: { data: { error: {
+      code: 400, status: 'INVALID_ARGUMENT',
+      message: 'Invalid value at \'operations[0].create.status\'',
+      details: [{ '@type': 'type.googleapis.com/google.rpc.BadRequest', fieldViolations: [
+        { field: 'operations[0].create.status', description: 'Invalid value ... "PAUSED"' },
+      ] }],
+    } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('INVALID_ARGUMENT');
+    expect(out).toContain('operations[0].create.status');
+  });
+
+  it('never echoes request headers back out of the axios config', () => {
+    // The raw error carries the whole request config, headers included. Anything that
+    // serialises the error wholesale drags them along into logs and API responses.
+    const err: any = {
+      message: 'Request failed with status code 400',
+      config: { headers: { Authorization: 'Bearer ya29.SECRET', 'developer-token': 'DEVTOKEN' } },
+      response: { data: { error: { code: 400, status: 'INVALID_ARGUMENT', message: 'bad' } } },
+    };
+    const out = describeGoogleAdsError(err);
+    expect(out).not.toContain('ya29.SECRET');
+    expect(out).not.toContain('DEVTOKEN');
+    expect(out).not.toContain('Bearer');
+  });
+
+  it('falls back to the plain message when there is no structured detail', () => {
+    expect(describeGoogleAdsError({ message: 'socket hang up' })).toContain('socket hang up');
+  });
+
+  it('survives an error with no message at all', () => {
+    expect(typeof describeGoogleAdsError({})).toBe('string');
+    expect(describeGoogleAdsError({}).length).toBeGreaterThan(0);
+  });
+
+  it('reports several field violations, not just the first', () => {
+    const err: any = { response: { data: { error: { code: 400, status: 'INVALID_ARGUMENT', message: 'm',
+      details: [{ fieldViolations: [
+        { field: 'a.status', description: 'bad status' },
+        { field: 'a.category', description: 'bad category' },
+      ] }] } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('a.status');
+    expect(out).toContain('a.category');
+  });
+});
+
+describe('describeGoogleAdsError — Google Ads business errors, not just proto validation', () => {
+  // Two shapes arrive from the same endpoint. The PAUSED failure was proto-level and
+  // carried `fieldViolations`. A permission or policy failure is a Google Ads BUSINESS
+  // error and carries `errors[]` with an errorCode object instead. Handling only the
+  // first left half of all failures as a bare status line.
+  it('reports an errorCode and message from the errors[] shape', () => {
+    const err: any = { response: { data: { error: { code: 403, status: 'PERMISSION_DENIED',
+      message: 'The caller does not have permission',
+      details: [{ errors: [{
+        errorCode: { authorizationError: 'USER_PERMISSION_DENIED' },
+        message: 'User does not have permission to access customer.',
+      }] }] } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('USER_PERMISSION_DENIED');
+    expect(out).toContain('User does not have permission to access customer.');
+  });
+
+  it('falls back to the message when an error carries no errorCode', () => {
+    const err: any = { response: { data: { error: { status: 'INTERNAL', message: 'boom',
+      details: [{ errors: [{ message: 'something broke' }] }] } } } };
+    expect(describeGoogleAdsError(err)).toContain('something broke');
+  });
+
+  it('reads both shapes when a response somehow carries each', () => {
+    const err: any = { response: { data: { error: { status: 'INVALID_ARGUMENT', message: 'm',
+      details: [
+        { fieldViolations: [{ field: 'a.status', description: 'bad' }] },
+        { errors: [{ errorCode: { rangeError: 'TOO_LOW' }, message: 'too low' }] },
+      ] } } } };
+    const out = describeGoogleAdsError(err);
+    expect(out).toContain('a.status');
+    expect(out).toContain('TOO_LOW');
+  });
+});
+
+describe('describeGoogleAdsError — malformed payloads must not throw', () => {
+  // This runs inside a catch block. If it throws on a shape it did not expect, it
+  // replaces a real API error with its own stack trace and the original cause is lost.
+  it('handles details that is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: 'nope' } } } })).toContain('X');
+  });
+
+  it('handles a details entry whose fieldViolations is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: 'nope' }] } } } })).toContain('m');
+  });
+
+  it('handles a details entry whose errors is not an array', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: 7 }] } } } })).toContain('X');
+  });
+
+  it('skips a fieldViolation with no field', () => {
+    const out = describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [{ description: 'orphan' }] }] } } } });
+    expect(out).not.toContain('orphan');
+  });
+
+  it('defaults a fieldViolation with no description', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [{ field: 'a.b' }] }] } } } }))
+      .toContain('a.b: invalid');
+  });
+
+  it('handles an errorCode that is not an object', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [{ errorCode: 'FLAT', message: 'boom' }] }] } } } }))
+      .toContain('boom');
+  });
+
+  it('defaults an error entry with no message', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [{}] }] } } } })).toContain('error');
+  });
+
+  it('falls back when the body carries an error object with nothing usable in it', () => {
+    // parts is empty, so the join yields '' — the fallback must still produce a string.
+    expect(describeGoogleAdsError({ message: 'axios said so', response: { data: { error: {} } } }))
+      .toBe('axios said so');
+  });
+
+  it('produces a message even when there is no message anywhere', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {} } } }))
+      .toBe('Google Ads API request failed.');
+  });
+
+  it('produces a message for an error with no response at all', () => {
+    expect(describeGoogleAdsError({})).toBe('Google Ads API request failed.');
+  });
+});
+
+describe('describeGoogleAdsError — null receivers', () => {
+  // Every optional chain in here has a null path, and this runs inside a catch block:
+  // `throw null` and `Promise.reject()` are both legal, and an axios interceptor can
+  // hand back a details array with holes in it.
+  it('survives a null error', () => {
+    expect(describeGoogleAdsError(null)).toBe('Google Ads API request failed.');
+  });
+
+  it('survives an undefined error', () => {
+    expect(describeGoogleAdsError(undefined)).toBe('Google Ads API request failed.');
+  });
+
+  it('survives null entries in details', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [null, undefined] } } } })).toContain('X');
+  });
+
+  it('survives null entries inside fieldViolations', () => {
+    expect(describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ fieldViolations: [null] }] } } } })).toContain('m');
+  });
+
+  it('survives null entries inside errors', () => {
+    const out = describeGoogleAdsError({ response: { data: { error: {
+      status: 'X', message: 'm', details: [{ errors: [null] }] } } } });
+    expect(out).toContain('error');
   });
 });
