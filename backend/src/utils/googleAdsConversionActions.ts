@@ -81,11 +81,11 @@ export function parseTagSnippets(
   for (const snippet of snippets) {
     const source = snippet?.eventSnippet;
     if (typeof source !== 'string') continue;
-    // Both halves must be present and non-empty — `AW-123/` is an id with no label.
+    // The label group is one-or-more, so a match cannot yield an empty label —
+    // `AW-123/` simply fails to match and falls through to the next snippet.
     const match = source.match(/['"]?send_to['"]?\s*:\s*['"](AW-[0-9]+)\/([^'"\s]+)['"]/);
     if (!match) continue;
     const [, conversionId, conversionLabel] = match;
-    if (!conversionLabel) continue;
     return { conversionId, conversionLabel, sendTo: `${conversionId}/${conversionLabel}` };
   }
   return null;

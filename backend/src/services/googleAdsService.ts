@@ -446,6 +446,11 @@ export class GoogleAdsService {
       name: params.name, category: params.category, countingType, status: create.status,
     };
     if (params.primaryForGoal !== undefined) requested.primaryForGoal = params.primaryForGoal;
+    // Every field we SEND has to be a field we CHECK, or drift on it is invisible.
+    // A silently-widened attribution window misattributes conversions for weeks.
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
 
     return {
       resourceName,
