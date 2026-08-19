@@ -300,3 +300,25 @@ describe('status is validated before it reaches Google (ENG-1329 e2e)', () => {
     expect(op.update.status).toBe('HIDDEN');
   });
 });
+
+describe('an empty status is invalid input, not an omitted field (CodeRabbit, #2482)', () => {
+  const valid = { name: 'Submit lead form', category: 'SUBMIT_LEAD_FORM', countingType: 'ONE_PER_CLICK' };
+
+  it('refuses status "" on create instead of quietly creating an ENABLED action', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: '' }))
+      .rejects.toThrow();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses a whitespace-only status on create', async () => {
+    await expect(googleAdsService.createConversionAction('u', CUSTOMER, { ...valid, status: '   ' }))
+      .rejects.toThrow();
+    expect(mutateSpy).not.toHaveBeenCalled();
+  });
+
+  it('still defaults to ENABLED when status is genuinely omitted', async () => {
+    searchSpy.mockResolvedValue([storedRow({ status: 'ENABLED' })]);
+    await googleAdsService.createConversionAction('u', CUSTOMER, valid);
+    expect(mutateSpy.mock.calls[0][3][0].create.status).toBe('ENABLED');
+  });
+});

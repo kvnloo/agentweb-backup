@@ -449,7 +449,12 @@ export class GoogleAdsService {
       countingType,
       // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
       // unvalidated value returns an opaque 400 (ENG-1329 e2e).
-      status: params.status ? assertConversionActionStatus(params.status) : 'ENABLED',
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
