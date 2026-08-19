@@ -396,6 +396,52 @@ describe("Admin chat sessions endpoint", () => {
       expect(res.body.scoringCoverage).toBeUndefined();
     });
 
+    // ENG-1332 (Greptile): a historical session merely touched (not created) in
+    // the requested window is fetched by the primary updatedAt-index query and
+    // can get scored, but it is NOT part of the requested-range population.
+    // alreadyScored/newlyScored must stay scoped to requestedRangeCount's
+    // population or the reported scored total can exceed its own denominator.
+    it("excludes an out-of-range historical session from alreadyScored/newlyScored even when it gets scored", async () => {
+      const inRangeUnscored = {
+        ...makeSession("in-range-unscored"),
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T08:00:00.000Z",
+      };
+      const outOfRangeHistorical = {
+        ...makeSession("historical"),
+        createdAt: "2026-02-21T10:30:00.000Z",
+        updatedAt: "2026-08-18T13:00:00.000Z",
+      };
+
+      const sessions = [inRangeUnscored, outOfRangeHistorical];
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
+      // Both sessions get freshly scored by this backfill run.
+      mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+        .expect(200);
+
+      // requestedRangeCount counts only the in-range session; newlyScored must
+      // match that same population even though the historical session was also
+      // scored by this run — otherwise newlyScored (2) would exceed
+      // requestedRangeCount (1).
+      expect(res.body.scoringCoverage).toEqual({
+        requestedRangeCount: 1,
+        totalFetched: 2,
+        alreadyScored: 0,
+        newlyScored: 1,
+        skippedForBudget: 0,
+        timedOut: false,
+      });
+    });
+
   });
 
   describe("sessionId search", () => {

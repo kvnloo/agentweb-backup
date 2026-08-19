@@ -3285,16 +3285,22 @@ router.get("/chat-sessions", async (req, res) => {
         console.error("Error loading scoring judges for sync mode:", error);
       }
 
-      const requestedRangeCount = timeRange
+      // ENG-1332 (Greptile): alreadyScored/newlyScored must be counted over the
+      // same population as requestedRangeCount, or a time-range sync that also
+      // fetched historical sessions (touched, not created, in the window) can
+      // report a scored total that exceeds its own denominator. Scope both to
+      // sessions actually created in the requested range.
+      const inRangeSessions = timeRange
         ? sessionsWithMessages.filter(
             (session: any) =>
               session.createdAt &&
               session.createdAt >= timeRange.startTime &&
               session.createdAt <= timeRange.endTime
-          ).length
-        : sessionsWithMessages.length;
+          )
+        : sessionsWithMessages;
+      const requestedRangeCount = inRangeSessions.length;
       const alreadyScoredIds = new Set(
-        sessionsWithMessages
+        inRangeSessions
           .filter((session: any) => session.satisfactionScore?.evaluatedAt)
           .map((session: any) => session.sessionId)
       );
@@ -3315,7 +3321,7 @@ router.get("/chat-sessions", async (req, res) => {
         );
       }
 
-      const newlyScored = sessionsWithMessages.filter(
+      const newlyScored = inRangeSessions.filter(
         (session: any) =>
           session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
       ).length;
