@@ -231,6 +231,21 @@ function deriveDomainFromWebsite(website: string): string | null {
   }
 }
 
+// A domain is usable as a company-domain signal only when it could actually
+// be a real employer — CrmEnrichmentService.isPersonalDomain() already folds
+// in reserved/placeholder domains (ENG-968: example.com, company.com, ...)
+// alongside free-mail and institutional ones, so this single check is the
+// same bar `rawEmailDomain`/`hasBusinessEmailDomain` already apply. Every
+// domain that reaches Apollo, enrich.so, the broker chain, pattern-matching,
+// or gets persisted onto the lead's emailDomain field must go through this —
+// whether it came from the lead record directly or was derived from a
+// website/web-search result (CodeRabbit review on PR #2302).
+function sanitizeBusinessDomain(domain: string | null | undefined): string | undefined {
+  const d = typeof domain === 'string' ? domain.trim() : '';
+  if (!d || CrmEnrichmentService.isPersonalDomain(d)) return undefined;
+  return d;
+}
+
 export async function resolveIdentity(
   input: ResolveIdentityInput,
   deps: IdentityResolverDeps,
@@ -261,17 +276,16 @@ export async function resolveIdentity(
     email = '';
   }
   // A lead enriched before this guard existed (or imported with the field set
-  // directly) can carry a placeholder emailDomain independently of email —
-  // Tier 0.5 and step 3.6 below persist `resolved.emailDomain` back onto the
-  // lead whenever they resolve a domain with no email to derive it from. Every
-  // downstream read of `lead.emailDomain` must go through this sanitized value
-  // instead of the raw field, or a stale `emailDomain: "example.com"` reaches
+  // directly) can carry a placeholder OR personal emailDomain independently of
+  // email — Tier 0.5 and step 3.6 below persist `resolved.emailDomain` back
+  // onto the lead whenever they resolve a domain with no email to derive it
+  // from. Every downstream read of `lead.emailDomain` must go through this
+  // sanitized value instead of the raw field, or a stale `emailDomain` reaches
   // Apollo's org match, enrich.so, the broker chain and pattern-matching on
-  // every later run even after email itself is dropped above.
-  const leadEmailDomain =
-    typeof lead.emailDomain === 'string' && !CrmEnrichmentService.isPlaceholderDomain(lead.emailDomain)
-      ? lead.emailDomain
-      : undefined;
+  // every later run even after email itself is dropped above. This is a
+  // company-domain SIGNAL, same as rawEmailDomain below, not an identity
+  // anchor — held to the same isPersonalDomain bar, not just placeholder.
+  const leadEmailDomain = sanitizeBusinessDomain(lead.emailDomain);
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
   const hasName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
@@ -401,6 +415,16 @@ export async function resolveIdentity(
             websiteAccepted = false;
           }
         }
+        // A "resolved" website is not real when it isn't even a plausible
+        // business domain — a hallucinated https://example.com is exactly
+        // how ENG-968's original fabrication started. Reject it outright
+        // (website, company and emailDomain all gated on the same accept)
+        // rather than only filtering the derived emailDomain, so a bad
+        // result can't still poison `resolved.website`/`resolved.company`.
+        if (websiteAccepted && !sanitizeBusinessDomain(deriveDomainFromWebsite(domainResult.website))) {
+          console.warn(`${logTag} tier 0.5 resolved website is not a business domain — rejecting`);
+          websiteAccepted = false;
+        }
         if (websiteAccepted) {
           resolved.website = domainResult.website;
           meta.website = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
@@ -503,7 +527,7 @@ export async function resolveIdentity(
   const domainForApollo =
     leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && !CrmEnrichmentService.isPersonalDomain(rawEmailDomain) ? rawEmailDomain : undefined) ||
-    deriveDomainFromWebsite(lead.website || resolved.website || '') ||
+    sanitizeBusinessDomain(deriveDomainFromWebsite(lead.website || resolved.website || '')) ||
     undefined;
   const companyForApollo = lead.company || resolved.company;
   const hasNameOrg = !!(firstNameEff && lastNameEff && (domainForApollo || companyForApollo));
@@ -661,7 +685,7 @@ export async function resolveIdentity(
   const domainKnown = !!(
     leadEmailDomain || resolved.emailDomain ||
     (rawEmailDomain && hasBusinessEmailDomain) ||
-    lead.website || resolved.website
+    sanitizeBusinessDomain(deriveDomainFromWebsite(lead.website || resolved.website || ''))
   );
   if (!email && needsPersonFields && resolved.company && !lead.company && !domainKnown) {
     try {
@@ -673,7 +697,10 @@ export async function resolveIdentity(
         lastName: lead.lastName || resolved.lastName || undefined,
       });
       if (dr?.website) {
-        const derived = deriveDomainFromWebsite(dr.website);
+        // Same standard as Tier 0.5: a resolved website that isn't even a
+        // plausible business domain (a hallucinated example.com) must not
+        // be stored as website OR derived into emailDomain.
+        const derived = sanitizeBusinessDomain(deriveDomainFromWebsite(dr.website));
         if (derived) {
           if (!lead.website && !resolved.website) {
             resolved.website = dr.website;
@@ -682,6 +709,8 @@ export async function resolveIdentity(
           resolved.emailDomain = derived;
           meta.emailDomain = { source: 'web_search', provider: 'llm_web_search', enrichedAt: new Date().toISOString() };
           console.log(`${logTag} step 3.6 domain-from-company website=${dr.website} emailDomain=${derived}`);
+        } else {
+          console.warn(`${logTag} step 3.6 resolved website is not a business domain — rejecting`);
         }
       }
     } catch (err) {
@@ -691,7 +720,7 @@ export async function resolveIdentity(
 
   // 4. Derive emailDomain from email if present. Pure local op, no API call.
   if (email && !leadEmailDomain) {
-    const derived = extractDomainFromEmail(email);
+    const derived = sanitizeBusinessDomain(extractDomainFromEmail(email));
     if (derived) resolved.emailDomain = derived;
   }
   const emailDomain = leadEmailDomain || resolved.emailDomain;
@@ -801,7 +830,7 @@ export async function resolveIdentity(
   // After Tier 6.5 / 7: re-derive emailDomain from the newly-found email
   // when neither the lead nor the resolved object already has one.
   if (email && !leadEmailDomain && !resolved.emailDomain) {
-    const derived = extractDomainFromEmail(email);
+    const derived = sanitizeBusinessDomain(extractDomainFromEmail(email));
     if (derived) resolved.emailDomain = derived;
   }
 
