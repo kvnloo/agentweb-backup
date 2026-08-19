@@ -1095,11 +1095,13 @@ export async function scoreSessionIfNeeded(
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
   };
 
-  // Persist to DB
-  await chatbotDb.updateSessionSatisfactionScore(
+  // Persist to DB. A null return means an admin override landed on this row
+  // between the read above and this write (ENG-1332) — nothing was persisted,
+  // so report no score rather than claiming one that isn't actually stored.
+  const persisted = await chatbotDb.updateSessionSatisfactionScore(
     session.sessionId,
     satisfactionScore
   );
 
-  return satisfactionScore;
+  return persisted ? satisfactionScore : null;
 }
