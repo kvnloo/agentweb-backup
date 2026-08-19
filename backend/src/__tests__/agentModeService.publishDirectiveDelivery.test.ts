@@ -151,7 +151,7 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     });
     const last = messages[messages.length - 1];
     expect(last.content).toContain('PRE-AUTHORIZED to publish');
-    expect(last.content).toContain('covers ONLY post_on_connected_account');
+    expect(last.content).toContain('The authorization covers post_on_connected_account');
   });
 
   it('WITHHELD: says so, on the same delivered path', async () => {
@@ -183,7 +183,7 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
 
     const last = messages[messages.length - 1];
     expect(last.content).toContain('PRE-AUTHORIZED to publish');
-    expect(last.content).toContain('covers ONLY post_on_connected_account');
+    expect(last.content).toContain('The authorization covers post_on_connected_account');
   });
 
   it('WITHHELD: a run admitted draft-only cannot be widened by a mid-run grant', async () => {
