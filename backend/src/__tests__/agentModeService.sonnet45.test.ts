@@ -223,8 +223,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
      * LLMModelConfig.legacy; resolveGenerationModel/resolveFallbackModel are
      * untouched, so no existing session or schedule pinned to one of these
      * ids changes behavior), and the new GPT-5.6 tiers are added via
-     * OpenRouter, adminOnly per the existing unverified-in-our-stack
-     * convention for new OpenRouter entries.
+     * OpenRouter. Originally adminOnly per the existing unverified-in-our-
+     * stack convention for new OpenRouter entries; opened to all users
+     * 2026-08-19 (Harsha: "i'm fine to include open source / open router
+     * stuff for all users not just isadmin") — see the "opened to everyone"
+     * describe block below.
      */
     describe('2026-08-19 — legacy flag + GPT-5.6 (Sol/Terra/Luna) addition', () => {
       const LEGACY_IDS = [
@@ -263,9 +266,12 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(models).toContain(id);
       });
 
-      it.each(GPT_5_6)('does NOT offer %s to non-admins (adminOnly, matching other new OpenRouter entries)', async (id) => {
+      // 2026-08-19: Harsha opened every OpenRouter entry (including this
+      // GPT-5.6 family) to all users, not just admins — see the dedicated
+      // "opened to everyone" block below for the full OpenRouter list.
+      it.each(GPT_5_6)('also offers %s to non-admins', async (id) => {
         const models = await agentModeService.getSupportedModels(false);
-        expect(models).not.toContain(id);
+        expect(models).toContain(id);
       });
 
       // 2026-08-19: tier is now derived live from costScore (see
@@ -286,6 +292,44 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         const config = (agentModeService as any).llmModels[id];
         expect(config.provider).toBe('openai');
         expect(config.name).toMatch(/^GPT-5\.6 (Sol|Terra|Luna)$/);
+      });
+    });
+
+    /*
+     * 2026-08-19 — every OpenRouter entry opened to everyone. Harsha: "i'm
+     * fine to include open source / open router stuff for all users not
+     * just isadmin." Was `adminOnly: true` on each (gated as
+     * unproven-in-our-stack); removed. Does NOT touch adminOnly gates
+     * elsewhere in the registry that exist for unrelated reasons (e.g.
+     * anthropic.claude-opus-4-6-v1, still Bedrock-Claude-tier-gated).
+     */
+    describe('2026-08-19 — OpenRouter models opened to everyone (no longer adminOnly)', () => {
+      const OPENROUTER_IDS = [
+        'openrouter/x-ai/grok-4.6',
+        'openrouter/deepseek/deepseek-v4-pro',
+        'openrouter/deepseek/deepseek-v4-flash',
+        'openrouter/qwen/qwen3.8-max',
+        'openrouter/mistralai/mistral-small-2603',
+        'openrouter/moonshotai/kimi-k3',
+        'openrouter/moonshotai/kimi-k2.7-code',
+        'openrouter/z-ai/glm-5.2',
+        'openrouter/z-ai/glm-4.7-flash',
+        'openrouter/openai/gpt-5.6-sol',
+        'openrouter/openai/gpt-5.6-terra',
+        'openrouter/openai/gpt-5.6-luna',
+      ];
+
+      it.each(OPENROUTER_IDS)('%s carries no adminOnly flag', (id) => {
+        expect((agentModeService as any).llmModels[id].adminOnly).toBeUndefined();
+      });
+
+      it.each(OPENROUTER_IDS)('%s is offered to a non-admin caller', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(id);
+      });
+
+      it('does NOT touch an adminOnly gate that exists for a non-OpenRouter reason', () => {
+        expect((agentModeService as any).llmModels['anthropic.claude-opus-4-6-v1'].adminOnly).toBe(true);
       });
     });
 
@@ -363,7 +407,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(info.qualityScore).toBe(15);
         expect(info.qualityScoreSource).toMatch(/inferred match/i);
         expect(info.costScore).toBe(56); // $1.25 in / $10.00 out blended 75:25 -> $3.4375/1M
-        expect(info.tier).toBe('pro'); // 56 falls in the 51-70 "pro" cost band, not its static 'medium' fallback
+        expect(info.tier).toBe('medium'); // 56 falls in the 51-63 "medium" cost band, not its static 'medium' fallback (same value, different reason)
       });
 
       it('does not lower a legacy model\'s quality score merely for being legacy', () => {
