@@ -217,3 +217,43 @@ describe("buildSubPageTask — reference-first, verify-last prompt", () => {
     expect(t).toMatch(/existing site/i);
   });
 });
+
+describe('ENG-1328 — the coding-agent sub-page path carries the conversion pair', () => {
+  // Greptile on #2481: this path received no Google Ads config at all. It relied purely
+  // on "mirror the home page's form" to carry the tracking call across — inference, not
+  // instruction. An agent can reasonably build a clean form and drop the call, and
+  // nothing notices until a campaign reports zero conversions.
+  const { buildSubPageTask } = require('../services/codingAgentSubpageService') as any;
+  const brand = { brandName: 'Acme' } as any;
+  const ga = { conversionId: 'AW-18192751758', conversionLabel: 'qAnwCOLmx-McEI65_eJD' };
+
+  it('names the exact pair in the task, rather than leaving it to be inferred', () => {
+    const task = buildSubPageTask('pricing', 'Pricing', 'brief', brand, 'list1', ga);
+    expect(task).toContain('conversionId: "AW-18192751758"');
+    expect(task).toContain('conversionLabel: "qAnwCOLmx-McEI65_eJD"');
+    expect(task).toContain('fireLeadTracking');
+  });
+
+  it('requires the shared eventId so the offline import cannot double-count', () => {
+    const task = buildSubPageTask('pricing', 'Pricing', 'brief', brand, 'list1', ga);
+    expect(task).toContain('crypto.randomUUID()');
+    expect(task).toMatch(/eventId/);
+  });
+
+  it('forbids hand-authored gtag calls', () => {
+    const task = buildSubPageTask('pricing', 'Pricing', 'brief', brand, 'list1', ga);
+    expect(task).toMatch(/Do NOT hand-author a gtag\(\) call/);
+    expect(task).toMatch(/gtag\('config', \.\.\.\)/);
+  });
+
+  it('says nothing about Google Ads when the site has none', () => {
+    const task = buildSubPageTask('pricing', 'Pricing', 'brief', brand, 'list1', undefined);
+    expect(task).not.toContain('fireLeadTracking');
+    expect(task).not.toContain('googleAds');
+  });
+
+  it('states the consequence, so the instruction is not silently dropped as boilerplate', () => {
+    const task = buildSubPageTask('pricing', 'Pricing', 'brief', brand, 'list1', ga);
+    expect(task).toMatch(/captures leads that report no conversion/);
+  });
+});

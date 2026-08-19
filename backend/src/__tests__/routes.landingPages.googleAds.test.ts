@@ -204,3 +204,68 @@ describe('POST /generated/:id/google-ads — removal and failure', () => {
     expect(mockAxiosPut).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('config lands on the site ROOT, not just the page named (Greptile, #2481)', () => {
+  // addSubPage reads the pair off the ROOT record. A manual install targeting a sub-page
+  // that wrote only to that sub-page would leave the root blank — and every later
+  // sub-page would inherit nothing and capture leads firing no conversion. That is the
+  // exact failure ENG-1328 exists to remove, reintroduced by the fix for it.
+  const subPage = { ...validPage, id: 'p2', siteId: 'p1' };
+
+  beforeEach(() => {
+    mockGetLandingPageById.mockResolvedValue(subPage);
+    mockListLandingPages.mockResolvedValue([
+      { ...validPage, id: 'p1', siteId: 'p1' },
+      subPage,
+      { ...validPage, id: 'p3', siteId: 'p1' },
+    ]);
+  });
+
+  const postToSubPage = (body: any) =>
+    request(app).post('/api/landing-pages/v0/generated/p2/google-ads').send(body);
+
+  it('writes the config to the root when the request targeted a sub-page', async () => {
+    const res = await postToSubPage({ googleAdsConversionId: AW, googleAdsConversionLabel: LABEL });
+    expect(res.status).toBe(200);
+    const targets = mockUpdateGoogleAds.mock.calls.map((c: any[]) => c[0]);
+    expect(targets).toContain('p1');
+  });
+
+  it('writes it to every page of the site, so any record is self-describing', async () => {
+    await postToSubPage({ googleAdsConversionId: AW, googleAdsConversionLabel: LABEL });
+    const targets = mockUpdateGoogleAds.mock.calls.map((c: any[]) => c[0]).sort();
+    expect(targets).toEqual(['p1', 'p2', 'p3']);
+    for (const call of mockUpdateGoogleAds.mock.calls) {
+      expect(call[2]).toBe(AW);
+      expect(call[3]).toBe(LABEL);
+    }
+  });
+
+  it('clears the config site-wide on removal', async () => {
+    const { injectGoogleAdsIntoLayout } = jest.requireActual('../utils/googleAdsInjection');
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from(injectGoogleAdsIntoLayout(LAYOUT, AW)).toString('base64') },
+    });
+    await postToSubPage({ googleAdsConversionId: '' });
+    const targets = mockUpdateGoogleAds.mock.calls.map((c: any[]) => c[0]).sort();
+    expect(targets).toEqual(['p1', 'p2', 'p3']);
+    for (const call of mockUpdateGoogleAds.mock.calls) expect(call[2]).toBe('');
+  });
+
+  it('fails the request when the ROOT write fails, rather than reporting success', async () => {
+    // Sibling failures are best-effort — the commit already landed. The root is not:
+    // it is the record addSubPage inherits from, so losing it silently is the one
+    // failure that propagates to every page created afterwards.
+    mockUpdateGoogleAds.mockRejectedValueOnce(new Error('dynamo down'));
+    const res = await postToSubPage({ googleAdsConversionId: AW, googleAdsConversionLabel: LABEL });
+    expect(res.status).toBeGreaterThanOrEqual(500);
+  });
+
+  it('a SIBLING write failure still returns success', async () => {
+    mockUpdateGoogleAds
+      .mockResolvedValueOnce(undefined)          // root
+      .mockRejectedValue(new Error('dynamo down')); // siblings
+    const res = await postToSubPage({ googleAdsConversionId: AW, googleAdsConversionLabel: LABEL });
+    expect(res.status).toBe(200);
+  });
+});
