@@ -118,6 +118,7 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
+import { callSatisfiesRequirement, countCallsSatisfyingRequirement } from '../utils/requiredCallSatisfaction';
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools';
 
@@ -1181,6 +1182,137 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
   it('drops nameless calls and tolerates non-array input', () => {
     expect(reconstructPriorToolCalls(undefined as any)).toEqual([]);
     expect(reconstructPriorToolCalls([{ metadata: { toolCalls: [{}, { name: 'get_leads' }] } }])).toEqual([{ name: 'get_leads' }]);
+  });
+
+  // ENG-1045: the publish-outcome check reads arguments.action, so the reconstruction
+  // must carry the arguments through — otherwise a resumed run that already published
+  // a thread falls back into the "post_on_connected_account (1 more time needed)" loop.
+  it('carries the action argument from the executed ledger', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } },
+    ]);
+  });
+
+  it('parses the JSON-string arguments of a request-list fallback', () => {
+    const messages = [{ tool_calls: [{ function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
+    ]);
+  });
+
+  it('omits unparseable arguments but keeps the entry and its error', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: '{not json', error: 'boom' }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'twitter_manage_post', error: 'boom' }]);
+  });
+
+  it('lets a resumed post_thread entry satisfy a post_on_connected_account requirement', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: { success: true } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(true);
+
+    // A resumed thread that FAILED still leaves the publish owed.
+    const [failed] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', failed)).toBe(false);
+  });
+
+  // ENG-1045: the real persisted shape — the executed ledger is CUMULATIVE and lands
+  // on the message that CLOSES the turn, while each intermediate assistant message
+  // keeps its own request-only tool_calls. Verified against prod session 555bb0a4,
+  // where 26 real calls reconstructed as 52 entries. Because these entries seed the
+  // required-call counts, the doubling let ONE real publish satisfy a minCount of 2.
+  it('counts a call once when the request list and the closing turn ledger both carry it', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'you_search_web', arguments: '{"q":"x"}' } }] },
+      { tool_calls: [{ id: 'call_2', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      {
+        metadata: {
+          toolCalls: [
+            { id: 'call_1', name: 'you_search_web', arguments: { q: 'x' }, result: {} },
+            { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          ],
+        },
+      },
+    ];
+
+    const entries = reconstructPriorToolCalls(messages);
+    expect(entries).toHaveLength(2);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', entries)).toBe(1);
+  });
+
+  it('upgrades a request-list entry to the ledger entry so a later-recorded failure still vetoes', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      { metadata: { toolCalls: [{ id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' }] } },
+    ];
+
+    // One entry, and it is the one carrying the error — so the publish stays owed.
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' },
+    ]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', reconstructPriorToolCalls(messages))).toBe(0);
+  });
+
+  it('never collapses distinct calls, and keeps un-identified entries separate', () => {
+    // Two genuine publishes with distinct ids must both count.
+    const distinct = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', distinct)).toBe(2);
+
+    // No id means unknown identity, which is not evidence of sameness — keep both.
+    const noIds = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(noIds).toHaveLength(2);
+  });
+
+  // ENG-947/ENG-1045: a preflight rejection commonly comes back as
+  // `result.success: false` with NO top-level `error` at all (e.g. publish_blog_article's
+  // result extraction only sets `error` when the tool itself supplied one). callSatisfiesRequirement's
+  // exact-name-match branch now calls toolCallSucceeded for every publish requirement, which reads
+  // `result.success`, so dropping `result` on reconstruction would silently credit an abandoned
+  // portion's failed publish as a success on resume.
+  it('carries the result through so a resumed publish that failed WITHOUT a top-level error still vetoes', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: false, message: 'Multiple twitter accounts connected' } }] },
+    }]);
+    expect(entry).toEqual({
+      name: 'post_on_connected_account',
+      result: { success: false, message: 'Multiple twitter accounts connected' },
+    });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
+
+    // Control: the same shape but result.success: true — must be credited.
+    const [succeeded] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: true, tweetId: '1' } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', succeeded)).toBe(true);
+  });
+
+  it('carries duplicateOf through so a resumed suppressed same-turn duplicate is not credited', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', duplicateOf: 'call_1' }] },
+    }]);
+    expect(entry).toEqual({ name: 'post_on_connected_account', duplicateOf: 'call_1' });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
   });
 });
 
