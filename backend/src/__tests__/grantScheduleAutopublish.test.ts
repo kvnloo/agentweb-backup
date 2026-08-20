@@ -230,6 +230,103 @@ describe("ENG-827 grant-schedule-autopublish — the allowlist decides", () => {
     expect(result.rejected[0].reason).toBe("duplicate allowlist entry");
   });
 
+  /**
+   * ENG-1245 — the exact shape that used to be un-grantable. Schedule
+   * 1d001fba-0fb7-4bcd-80f6-6041b244a442's requiredFunctionCalls is
+   * ["twitter_outreach"], so it fails "no publishing tool designated" and never
+   * became a candidate — meaning even a confirmed allowlist line for it was
+   * rejected with that same reason, granting nothing. tools= lets the operator
+   * record the owner's actual answer independent of requiredFunctionCalls.
+   */
+  describe("explicit tools= grants a schedule requiredFunctionCalls never named (ENG-1245)", () => {
+    const notCandidate = () => schedule({ requiredFunctionCalls: ["twitter_outreach"] });
+    const EXPLICIT = [
+      { scheduleId: "sched-1", ownerUserId: "user-1", tools: ["post_on_connected_account"], note: "Harsha confirmed in Linear" },
+    ];
+
+    it("without tools=, the schedule is not even a candidate (pins the original bug)", async () => {
+      const result = await run([notCandidate()], []);
+      expect(result.candidates).toEqual([]);
+      expect(result.skipped[0].reason).toBe("no publishing tool designated");
+    });
+
+    it("with tools=, the confirmed line grants it despite requiredFunctionCalls naming no publish tool", async () => {
+      const update = jest.fn();
+      const result = await run([notCandidate()], EXPLICIT, true, update);
+
+      expect(result.granted).toEqual([
+        { scheduleId: "sched-1", scheduleName: "Kevin — Daily LinkedIn Post", userId: "user-1", tools: ["post_on_connected_account"] },
+      ]);
+      expect(update).toHaveBeenCalledTimes(1);
+      const [id, patch] = update.mock.calls[0];
+      expect(id).toBe("sched-1");
+      expect(patch).toMatchObject({
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ["post_on_connected_account"],
+        autopublishAuthorizedBy: "user-1",
+      });
+    });
+
+    it("still enforces every existing safety gate — an explicit tools= grant is not a bypass", async () => {
+      const update = jest.fn();
+
+      const heldResult = await run(
+        [schedule({ requiredFunctionCalls: ["twitter_outreach"], requirePublishApproval: true })],
+        EXPLICIT,
+        true,
+        update,
+      );
+      expect(heldResult.granted).toEqual([]);
+      expect(heldResult.rejected[0].reason).toBe("owner requires approval");
+
+      const mismatchResult = await run(
+        [schedule({ requiredFunctionCalls: ["twitter_outreach"], userId: "someone-else" })],
+        EXPLICIT,
+        true,
+        update,
+      );
+      expect(mismatchResult.granted).toEqual([]);
+      expect(mismatchResult.rejected[0].reason).toMatch(/owner mismatch/);
+
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a tools= entry naming something that is not a real publish-capable tool", async () => {
+      const update = jest.fn();
+      const result = await run(
+        [notCandidate()],
+        [{ scheduleId: "sched-1", ownerUserId: "user-1", tools: ["not_a_real_tool"], note: "confirmed" }],
+        true,
+        update,
+      );
+
+      expect(result.granted).toEqual([]);
+      expect(update).not.toHaveBeenCalled();
+      expect(result.rejected[0].reason).toMatch(/not_a_real_tool/);
+    });
+
+    it("de-duplicates an explicit tools= list", async () => {
+      const update = jest.fn();
+      await run(
+        [notCandidate()],
+        [{ scheduleId: "sched-1", ownerUserId: "user-1", tools: ["post_on_connected_account", "post_on_connected_account"], note: "confirmed" }],
+        true,
+        update,
+      );
+
+      expect(update.mock.calls[0][1].autopublishAuthorizedTools).toEqual(["post_on_connected_account"]);
+    });
+
+    it("a dry run reports the grant but writes nothing", async () => {
+      const update = jest.fn();
+      const result = await run([notCandidate()], EXPLICIT, false, update);
+
+      expect(update).not.toHaveBeenCalled();
+      expect(result.applied).toBe(false);
+      expect(result.granted).toHaveLength(1);
+    });
+  });
+
   // =========================================================================
   // The apply pass writes one schedule at a time and can run long, while owners
   // keep editing. A grant DERIVED from the scan must not land against a schedule
@@ -344,5 +441,50 @@ describe("ENG-827 grant-schedule-autopublish — parseConsentAllowlist", () => {
   it("treats an empty file as no confirmations rather than an error", () => {
     expect(parseConsentAllowlist("")).toEqual([]);
     expect(parseConsentAllowlist("\n#only a comment\n")).toEqual([]);
+  });
+
+  /**
+   * ENG-1245 — schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442 ("Harsha Daily X Post
+   * (Autonomous)") has posted nothing since 2026-08-13: its requiredFunctionCalls
+   * (["twitter_outreach"]) names no publish tool, so it fails the "no publishing tool
+   * designated" gate and this script — as originally written — rejects even an
+   * allowlist line naming it, granting nothing. `tools=` lets the operator record
+   * exactly which tools the owner confirmed, independent of requiredFunctionCalls.
+   */
+  describe("explicit tools= (ENG-1245)", () => {
+    it("parses a tools= token as the explicit grant scope, not part of the note", () => {
+      expect(
+        parseConsentAllowlist("sched-1  user-1  tools=post_on_connected_account  Harsha confirmed in Linear"),
+      ).toEqual([
+        {
+          scheduleId: "sched-1",
+          ownerUserId: "user-1",
+          tools: ["post_on_connected_account"],
+          note: "Harsha confirmed in Linear",
+        },
+      ]);
+    });
+
+    it("splits a comma-separated tools= list (no spaces — it is one whitespace-delimited token)", () => {
+      expect(
+        parseConsentAllowlist("sched-1  user-1  tools=post_on_connected_account,twitter_manage_post  confirmed"),
+      ).toEqual([
+        {
+          scheduleId: "sched-1",
+          ownerUserId: "user-1",
+          tools: ["post_on_connected_account", "twitter_manage_post"],
+          note: "confirmed",
+        },
+      ]);
+    });
+
+    it("omits tools entirely (not an empty array) when the line has no tools= token", () => {
+      const [entry] = parseConsentAllowlist("sched-1  user-1  confirmed in #ops");
+      expect(entry.tools).toBeUndefined();
+    });
+
+    it("stops the run on an empty tools= list", () => {
+      expect(() => parseConsentAllowlist("sched-1  user-1  tools=  confirmed")).toThrow(/Allowlist line 1/);
+    });
   });
 });
