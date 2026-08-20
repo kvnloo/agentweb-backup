@@ -125,6 +125,15 @@ describe('reconciler over a MINIMIZED ledger — the live failure', () => {
     // Saying 0 is worse than saying nothing: it reads as "this found nothing",
     // which is the opposite of what happened.
     const toolCalls = [ledgerEntry('search_leads', { list_id: 'l1' }, searchLeadsPage)];
+
+    // Prove WHICH path produced the number (CodeRabbit, #2520). Asserting only the
+    // notice cannot tell `rowCount` from the array fallback: if the minimizer ever
+    // stopped stripping `leads`, `rowsFrom` would count the array, still print
+    // "20 row(s)", and this test would pass while the fix under test did nothing.
+    // Pin the minimized payload itself.
+    expect(toolCalls[0].result.rowCount).toBe(20);
+    expect(toolCalls[0].result.leads).toBeUndefined();
+
     const out = reconcileUnconsumedCursors('Summarised.', toolCalls);
     expect(out).not.toMatch(/undefined|NaN/);
     expect(out).not.toMatch(/returned 0 row/);
