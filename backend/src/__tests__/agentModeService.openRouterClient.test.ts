@@ -153,12 +153,15 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
-  it('gates every new-roster entry adminOnly — unproven-in-our-stack models are opt-in, not default-on', () => {
+  // 2026-08-19: was adminOnly: true on every new-roster entry (gated as
+  // unproven-in-our-stack). Harsha: "i'm fine to include open source /
+  // open router stuff for all users not just isadmin" — removed from all
+  // of them, matching the already-smoke-tested starter model.
+  it('does NOT gate any new-roster entry adminOnly anymore — every OpenRouter model is opt-in to everyone', () => {
     const service = new AgentModeService();
     for (const modelId of NEW_ROSTER_MODELS) {
-      expect((service as any).llmModels[modelId].adminOnly).toBe(true);
+      expect((service as any).llmModels[modelId].adminOnly).toBeFalsy();
     }
-    // The already-smoke-tested starter model is intentionally NOT admin-gated.
     expect((service as any).llmModels['openrouter/openai/gpt-4o-mini'].adminOnly).toBeFalsy();
   });
 

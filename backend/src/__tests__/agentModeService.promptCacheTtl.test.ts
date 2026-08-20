@@ -228,11 +228,11 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       // API, where Azure returns 400 on an unrecognised argument. Only the
       // Bedrock wrapper may ever see this field.
       const created: any[] = [];
-      (agentModeService as any).llmModels['gpt-5-chat-2'].client = {
+      (agentModeService as any).llmModels['gpt-5.5'].client = {
         chat: { completions: { create: async (p: any) => { created.push(p); return { choices: [{ message: { content: 'ok' } }] }; } } },
       };
 
-      await (agentModeService as any).callLLM('gpt-5-chat-2', CONVERSATION, { humanPaced: true });
+      await (agentModeService as any).callLLM('gpt-5.5', CONVERSATION, { humanPaced: true });
 
       expect(created).toHaveLength(1);
       expect(created[0]).not.toHaveProperty('humanPaced');
