@@ -7106,6 +7106,7 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
+  'get_scheduled_chat_storage_diagnostics',
   // Schedule Template tools
   'list_schedule_templates',
   'manage_schedule_template',
@@ -7641,6 +7642,15 @@ emmaToolRegistry.register({
         // the server pulls the telemetry it already has. Best-effort — a
         // failed lookup must never block the report.
         let description: string = issue.description;
+        // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
+        // report (an internal reviewer surfacing a telemetry/satisfaction-report pattern from a
+        // customer's session). When it does, THAT user — not the reviewer — is the affected
+        // reporter, or the ENG-170 "your bug shipped" notification addresses the wrong person.
+        // `affectedUser` resolved -> attach them as the reporter; `affectedUserUnresolved` (a
+        // known mismatch we couldn't resolve) -> file without defaulting to the reviewer (AC4).
+        let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
+        let affectedSessionId: string | undefined;
+        let affectedUserUnresolved = false;
         if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
@@ -7664,10 +7674,56 @@ emmaToolRegistry.register({
                 ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
               ].join('\n');
               issueContext['AgentRun ID'] = run.runId;
+
+              if (run.userId && run.userId !== userId) {
+                // The run's session id is known regardless of whether the OWNER resolves — keep
+                // it so eng can still trace to the actual analysed session even on an unresolved
+                // lookup, instead of silently falling back to the caller's own chat session.
+                affectedSessionId = run.sessionId;
+                try {
+                  const affected = await userDb.getUserById(run.userId);
+                  if (affected?.email) {
+                    affectedUser = { email: affected.email, displayName: affected.displayName, funnelStatus: affected.funnelStatus };
+                  } else {
+                    affectedUserUnresolved = true;
+                  }
+                } catch (e) {
+                  console.warn('[report_product_issues] affected-user resolution failed (filing without a reporter):', e instanceof Error ? e.message : e);
+                  affectedUserUnresolved = true;
+                }
+              }
             }
           } catch (e) {
             console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
           }
+        }
+
+        // Realign the eng-facing context to the affected user, never overwriting who surfaced it.
+        let issueFunnelStatusLabel = funnelStatusLabel;
+        let issueFunnelStatusTags = funnelStatusTags;
+        if (affectedUser) {
+          issueFunnelStatusLabel = getUserFunnelStatusLabel(affectedUser.funnelStatus);
+          issueFunnelStatusTags = getUserFunnelStatusIssueTags(affectedUser.funnelStatus);
+          issueContext['User Name'] = affectedUser.displayName || affectedUser.email;
+          issueContext['User Email'] = affectedUser.email;
+          issueContext['Surfaced By'] = user.email;
+          if (affectedSessionId) issueContext['Session ID'] = affectedSessionId;
+          if (issueFunnelStatusLabel) {
+            issueContext['User Status'] = issueFunnelStatusLabel;
+          } else {
+            delete issueContext['User Status'];
+          }
+        } else if (affectedUserUnresolved) {
+          // A KNOWN cross-user report whose owner didn't resolve — the context must not keep
+          // showing the CALLER as "User Name"/"User Email"/"User ID", or the auto-generated
+          // description reads as an ordinary self-report and silently contradicts the explicit
+          // "Affected user: unresolved" line `fileBugReport` writes for this case.
+          issueContext['User Name'] = 'unresolved (telemetry/satisfaction-report review)';
+          issueContext['User Email'] = 'unresolved';
+          delete issueContext['User ID'];
+          issueContext['Surfaced By'] = user.email;
+          if (affectedSessionId) issueContext['Session ID'] = affectedSessionId;
+          delete issueContext['User Status'];
         }
 
         if (isDelegatedAdmin && adminEmail) {
@@ -7687,22 +7743,33 @@ emmaToolRegistry.register({
             type: itemType,
             title: issue.title,
             description,
-            userEmail: user.email,
-            userName: user.displayName || user.email,
-            reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
-            sessionId: context?.sessionId,
+            // ENG-939: the affected user (from the analysed run), not the caller, is the
+            // reporter when the two differ. `reportedByAdmin` reuses the existing "acted on
+            // their behalf" mechanism to record whoever surfaced it, distinct from who it affects.
+            userEmail: affectedUser?.email ?? user.email,
+            userName: affectedUser ? (affectedUser.displayName || affectedUser.email) : (user.displayName || user.email),
+            // Preserve the surfacing actor whenever we KNOW this is a cross-user report — resolved
+            // or not — so an unresolved-affected-user filing still records who surfaced it, rather
+            // than silently losing that fact along with the affected user's identity.
+            reportedByAdmin: (affectedUser || affectedUserUnresolved)
+              ? user.email
+              : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
+            sessionId: affectedSessionId ?? context?.sessionId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
             // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
-            funnelStatus: user.funnelStatus,
+            funnelStatus: affectedUser ? affectedUser.funnelStatus : user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
             notionTags: [
               context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
-              ...funnelStatusTags,
+              ...issueFunnelStatusTags,
             ],
             notionContext: issueContext,
+            // ENG-939 AC4: a run_id KNOWN to belong to a different user whose account we could
+            // not resolve — never default the reporter slot to the surfacing caller.
+            noResolvableReporter: affectedUserUnresolved || undefined,
           }),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
@@ -8605,6 +8672,12 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
+  OFFLINE_CONVERSION → UPLOAD (gclid, conversion_action_resource_name, conversion_at; conversion_value?+currency_code?, order_id?, validate_only?)
+    For a conversion that completes OFF the page — a booking that confirms later, a CRM qualification, a closed deal. Browser tracking cannot see those, so without this Google optimises toward form submits and bids toward the cheapest low-intent leads.
+    conversion_at is when the conversion HAPPENED (ISO 8601), not when you noticed it. Google attributes it to that moment and rejects future dates.
+    order_id should be the SAME eventId the browser sent as transaction_id — Google dedupes the pair, which is what stops one lead counting twice across the two channels.
+    A conversion_value REQUIRES a currency_code; without one Google assumes the account currency and misstates revenue.
+    validate_only=true asks Google to check the payload and write nothing. Use it to rehearse a batch before committing it.
   CONVERSION_ACTION → LIST, CREATE (name, category, counting_type; status?, primary_for_goal?, click_through_lookback_window_days?), UPDATE (conversion_action_resource_name; any of name/status/category/counting_type/primary_for_goal/click_through_lookback_window_days), REMOVE (conversion_action_resource_name, confirm_conversion_action_removal)
     A CONVERSION_ACTION has NO PAUSED status — that is a campaign status and is rejected. It is always created ENABLED (omit status and it defaults there); Google deny-lists every other value on create.
     HIDDEN cannot be set through the API at all — Google assigns it, and sending it is rejected on both create and update. Do not suggest it.
@@ -8653,7 +8726,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY', 'CONVERSION_ACTION', 'OFFLINE_CONVERSION'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -8670,6 +8743,13 @@ ACTION MATRIX:
         primary_for_goal: { type: 'boolean', description: 'CONVERSION_ACTION CREATE/UPDATE: whether this action is a primary goal (counts toward the Conversions column and drives smart bidding).' },
         click_through_lookback_window_days: { type: 'number', description: 'CONVERSION_ACTION CREATE/UPDATE: how many days after an ad click a conversion still attributes to it.' },
         confirm_conversion_action_removal: { type: 'boolean', description: 'Required true for CONVERSION_ACTION REMOVE. Removal is permanent — the action stops recording and cannot be re-enabled — so confirm with the user first. Conversions already recorded stay in reporting.' },
+        gclid: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: the click id captured at first touch and stored on the lead. Without it there is no click to attribute the conversion to.' },
+        conversion_at: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: ISO 8601 timestamp of when the conversion HAPPENED, not when it was noticed. Future dates are rejected.' },
+        conversion_value: { type: 'number', description: 'OFFLINE_CONVERSION UPLOAD: the conversion value. Requires currency_code.' },
+        currency_code: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: ISO currency for conversion_value, e.g. INR. Required whenever a value is given.' },
+        order_id: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: the same eventId the browser sent as transaction_id, so Google dedupes the browser conversion against this upload.' },
+        time_zone: { type: 'string', description: 'OFFLINE_CONVERSION UPLOAD: override the account time zone (IANA). Normally omit — it is read from the account.' },
+        validate_only: { type: 'boolean', description: 'OFFLINE_CONVERSION UPLOAD: ask Google to validate the payload and write NOTHING. Use to rehearse before committing.' },
         conversion_action_resource_name: { type: 'string', description: 'Required for CONVERSION_ACTION UPDATE. From CONVERSION_ACTION LIST or CREATE.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY and AD_GROUP LIST.' },
         radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
