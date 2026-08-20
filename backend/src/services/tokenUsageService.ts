@@ -8,6 +8,7 @@ import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
+import { isAnonymousUserId } from '../mcp/anonymousToolAccess';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -161,6 +162,32 @@ export async function getUserTokenAllowance(
  * For org members, quota is checked against the org owner's subscription and usage.
  */
 export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
+  // ENG-1163: an anonymous predefined-work-plan session (createSessionWithPlan)
+  // is owned by a synthetic `anon_<uuid>` id that has no AW-Users row and never
+  // will — resolveBillingUserId returns it unchanged (no org to pool onto), and
+  // getUserTokenUsage then throws "User not found", which generateSharedResponse
+  // does not catch specially: the visitor's very first reply on an anonymous
+  // work-plan session came back as a raw error instead of the agent's response.
+  // There is no owner to gate spend against here, so let it through uncapped
+  // rather than crash the turn.
+  if (isAnonymousUserId(userId)) {
+    return {
+      allowed: true,
+      warning: false,
+      used: 0,
+      allowance: null,
+      bonus: 0,
+      effectiveAllowance: null,
+      percentUsed: 0,
+      month: getCurrentMonth(),
+      costUsed: 0,
+      costAllowance: null,
+      costPercentUsed: 0,
+      costEnforced: false,
+      alertThresholds: resolveAlertThresholds(null),
+    };
+  }
+
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
   const [{ allowance, bonus, effectiveAllowance, costAllowance, llmUsagePolicy }, billingUser] = await Promise.all([
