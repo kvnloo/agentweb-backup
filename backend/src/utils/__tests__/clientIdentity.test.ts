@@ -157,7 +157,7 @@ describe('resolveClientIdentity', () => {
 
 describe('isPublicIpAddress', () => {
   it('accepts ordinary public IPv4', () => {
-    for (const ip of ['203.0.113.7', '45.253.245.23', '34.105.84.37', '8.8.8.8']) {
+    for (const ip of ['45.253.245.23', '34.105.84.37', '8.8.8.8', '13.107.42.14']) {
       expect(isPublicIpAddress(ip)).toBe(true);
     }
   });
@@ -195,20 +195,43 @@ describe('isPublicIpAddress', () => {
     // would let it through as "a valid v6 address".
     expect(isPublicIpAddress('::ffff:127.0.0.1')).toBe(false);
     expect(isPublicIpAddress('::ffff:10.0.0.1')).toBe(false);
-    expect(isPublicIpAddress('::ffff:203.0.113.7')).toBe(true);
+    expect(isPublicIpAddress('::ffff:45.253.245.23')).toBe(true);
   });
 
   it('rejects anything that is not an address at all', () => {
-    for (const v of ['', '   ', 'unknown', 'not-an-ip', '203.0.113', '203.0.113.7.8',
-                     '999.0.0.1', '203.0.113.7:443', undefined, null, 12345, {}]) {
+    for (const v of ['', '   ', 'unknown', 'not-an-ip', '45.253.245', '45.253.245.23.8',
+                     '999.0.0.1', '45.253.245.23:443', undefined, null, 12345, {}]) {
       expect(isPublicIpAddress(v as any)).toBe(false);
     }
   });
 
   it('tolerates surrounding whitespace on an otherwise valid address', () => {
-    expect(isPublicIpAddress('  203.0.113.7  ')).toBe(true);
+    expect(isPublicIpAddress('  45.253.245.23  ')).toBe(true);
+  });
+
+  it('rejects the special-use ranges a first pass missed — all found by review', () => {
+    // Each of these passed the original validator. Kept as named regressions rather than
+    // folded into the list above, because the reason each is non-public differs.
+    expect(isPublicIpAddress('198.18.0.1')).toBe(false);    // benchmarking 198.18/15
+    expect(isPublicIpAddress('198.19.255.1')).toBe(false);  // ...its upper half
+    expect(isPublicIpAddress('192.0.0.1')).toBe(false);     // IETF protocol assignments
+    expect(isPublicIpAddress('192.0.2.5')).toBe(false);     // TEST-NET-1
+    expect(isPublicIpAddress('198.51.100.5')).toBe(false);  // TEST-NET-2
+    expect(isPublicIpAddress('203.0.113.7')).toBe(false);   // TEST-NET-3
+    expect(isPublicIpAddress('ff02::1')).toBe(false);       // IPv6 multicast
+    expect(isPublicIpAddress('2001:db8::1')).toBe(false);   // IPv6 documentation
+    expect(isPublicIpAddress('100::1')).toBe(false);        // discard-only
+  });
+
+  it('decodes the HEX IPv4-mapped spelling, not just the dotted one', () => {
+    // ::ffff:7f00:1 and ::ffff:127.0.0.1 are the SAME loopback address. Understanding only
+    // the dotted form let the hex one through as a valid global IPv6.
+    expect(isPublicIpAddress('::ffff:7f00:1')).toBe(false);        // 127.0.0.1
+    expect(isPublicIpAddress('::ffff:a00:1')).toBe(false);         // 10.0.0.1
+    expect(isPublicIpAddress('::ffff:2dfd:f517')).toBe(true);      // 45.253.245.23
   });
 });
+
 
 describe('resolveClientIdentityWithForwarded', () => {
   const BROWSER =
@@ -232,7 +255,7 @@ describe('resolveClientIdentityWithForwarded', () => {
     // declaring one. A direct caller's identity is observed, never self-reported.
     expect(
       resolveClientIdentityWithForwarded(BROWSER, VISITOR_IP, {
-        clientIp: '203.0.113.99',
+        clientIp: '34.105.84.37',
         clientUserAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0 Safari/537.36',
       }),
     ).toEqual({ clientIp: VISITOR_IP, clientUserAgent: BROWSER });

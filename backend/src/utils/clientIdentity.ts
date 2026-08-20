@@ -162,11 +162,31 @@ function isPublicIpv4(addr: string): boolean {
   if (o[0] === 192 && o[1] === 168) return false;            // private 192.168/16
   if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return false; // CGNAT 100.64/10
   if (o[0] >= 224) return false;                             // multicast, reserved, broadcast
+  if (o[0] === 192 && o[1] === 0 && o[2] === 0) return false; // IETF protocol assignments
+  if (o[0] === 198 && (o[1] === 18 || o[1] === 19)) return false; // benchmarking 198.18/15
+  // Documentation ranges. Non-routable, so they cannot describe a real visitor either.
+  if (o[0] === 192 && o[1] === 0 && o[2] === 2) return false;      // TEST-NET-1
+  if (o[0] === 198 && o[1] === 51 && o[2] === 100) return false;   // TEST-NET-2
+  if (o[0] === 203 && o[1] === 0 && o[2] === 113) return false;    // TEST-NET-3
 
-  // Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are deliberately NOT
-  // rejected: they are a spec nicety rather than a match hazard, and this repo's fixtures use
-  // 203.0.113.x throughout. Rejecting them would buy nothing and break every test that reads.
   return true;
+}
+
+/**
+ * Decode every IPv4-mapped IPv6 spelling to its dotted IPv4, or null if it is not one.
+ *
+ * ⚠ BOTH TAILS ARE REAL. `::ffff:127.0.0.1` and `::ffff:7f00:1` are the SAME loopback
+ * address, and a check that only understood the dotted spelling let the hex one through as
+ * "a valid global IPv6". Found by review, not by the tests that existed.
+ */
+function mappedIpv4(lower: string): string | null {
+  const dotted = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+  if (dotted) return dotted[1];
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+  if (!hex) return null;
+  const hi = parseInt(hex[1], 16);
+  const lo = parseInt(hex[2], 16);
+  return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
 }
 
 /** Reject the IPv6 ranges that cannot be a visitor's public address. */
@@ -175,6 +195,9 @@ function isPublicIpv6(lower: string): boolean {
   const head = lower.split(':')[0];
   if (head.startsWith('fc') || head.startsWith('fd')) return false;  // unique-local fc00::/7
   if (/^fe[89ab]/.test(head)) return false;                          // link-local fe80::/10
+  if (head.startsWith('ff')) return false;                           // multicast ff00::/8
+  if (head === '100') return false;                                  // discard-only 100::/64
+  if (head === '2001' && /^0?db8$/.test(lower.split(':')[1] ?? '')) return false; // doc 2001:db8::/32
   return true;
 }
 
@@ -195,10 +218,10 @@ export function isPublicIpAddress(value: unknown): boolean {
   if (kind !== 6) return false;
 
   const lower = raw.toLowerCase();
-  // An IPv4-mapped address is IPv4 wearing a v6 costume — ::ffff:127.0.0.1 is loopback.
-  // Judge it by what it actually contains, not by the fact that it parses as v6.
-  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
-  if (mapped) return isPublicIpv4(mapped[1]);
+  // An IPv4-mapped address is IPv4 wearing a v6 costume — ::ffff:127.0.0.1 is loopback, and
+  // so is ::ffff:7f00:1. Judge it by what it CONTAINS, not by the fact that it parses as v6.
+  const mapped = mappedIpv4(lower);
+  if (mapped) return isPublicIpv4(mapped);
 
   return isPublicIpv6(lower);
 }
