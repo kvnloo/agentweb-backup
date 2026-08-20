@@ -272,6 +272,49 @@ describe("checkTokenUsage", () => {
   });
 });
 
+describe("checkTokenUsage - anonymous session owner (ENG-1163)", () => {
+  it("does not throw for an anon_ userId with no AW-Users row", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049")).resolves.not.toThrow();
+  });
+
+  it("allows an anon_ userId unconditionally, with no allowance to exhaust", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(true);
+    expect(result.warning).toBe(false);
+    expect(result.effectiveAllowance).toBeNull();
+    expect(result.percentUsed).toBe(0);
+  });
+
+  it("never queries user/subscription records for an anon_ userId (short-circuits before any lookup)", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(mockGetUserById).not.toHaveBeenCalled();
+    expect(mockGetUserSubscriptionType).not.toHaveBeenCalled();
+  });
+
+  it("treats a missing/empty userId as anonymous too (fail-closed), not as a real-user lookup", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    const result = await checkTokenUsage("");
+
+    expect(result.allowed).toBe(true);
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("still throws for a real (non-anonymous) userId with no AW-Users row — data-integrity errors must not be swallowed", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(checkTokenUsage("1746747115266")).rejects.toThrow("User not found");
+  });
+});
+
 describe("checkTokenUsage - versioned cost-only policy", () => {
   const llmUsagePolicy = {
     version: "starter-v1",
