@@ -25,6 +25,19 @@ describe("getAllocatedRate", () => {
     expect(getAllocatedRate("apollo", "")).toBeNull();
   });
 
+  it.each(["__proto__", "constructor"])(
+    "returns null for inherited provider name %s",
+    (provider) => {
+      expect(
+        getAllocatedRate(provider as VendorRateProvider, "toString")
+      ).toBeNull();
+    }
+  );
+
+  it("returns null for an inherited rate key", () => {
+    expect(getAllocatedRate("v0", "toString")).toBeNull();
+  });
+
   // ── SUCCESS / happy-path rate cases (from the approved table) ────────────
   it("prices v0 landing-page generation at $2.00", () => {
     expect(getAllocatedRate("v0", "landing_page_generation")).toBe(2.0);
@@ -90,6 +103,10 @@ describe("computeAllocatedCost", () => {
 
   it("clamps a negative quantity to 0 (never a negative charge)", () => {
     expect(computeAllocatedCost("v0", "landing_page_generation", -3)).toBe(0);
+  });
+
+  it("returns 0 for a zero quantity", () => {
+    expect(computeAllocatedCost("v0", "landing_page_generation", 0)).toBe(0);
   });
 
   it("treats a non-finite quantity as 0", () => {

@@ -39,62 +39,71 @@ export type VendorRateProvider =
   | "remotion";
 
 interface VendorRateEntry {
-  /** Human unit label, matches RecordVendorUsageContext.unit convention. */
-  unit: string;
+  /** Human unit label written to RecordVendorUsageContext.unit. */
+  recordingUnit: string;
   /** Allocated USD per unit. */
   usdPerUnit: number;
 }
 
 const RATE_CARD: Record<VendorRateProvider, Record<string, VendorRateEntry>> = {
   v0: {
-    landing_page_generation: { unit: "generation", usdPerUnit: 2.0 },
+    landing_page_generation: { recordingUnit: "generation", usdPerUnit: 2.0 },
   },
   "you.com": {
-    query: { unit: "query", usdPerUnit: 0.0125 },
+    query: { recordingUnit: "query", usdPerUnit: 0.0125 },
   },
   google_cse: {
-    query: { unit: "query", usdPerUnit: 0.0125 },
+    query: { recordingUnit: "query", usdPerUnit: 0.0125 },
   },
   apollo: {
-    email_reveal: { unit: "reveal", usdPerUnit: 0.0495 },
-    phone_reveal: { unit: "reveal", usdPerUnit: 0.395 },
-    full_enrichment: { unit: "enrichment", usdPerUnit: 0.445 },
+    email_reveal: { recordingUnit: "reveal", usdPerUnit: 0.0495 },
+    phone_reveal: { recordingUnit: "reveal", usdPerUnit: 0.395 },
+    full_enrichment: { recordingUnit: "enrichment", usdPerUnit: 0.445 },
   },
   "enrich.so": {
-    email_lookup: { unit: "lookup", usdPerUnit: 0.005 },
-    phone_finder: { unit: "lookup", usdPerUnit: 0.25 },
-    email_validation: { unit: "validation", usdPerUnit: 0.0005 },
+    email_lookup: { recordingUnit: "lookup", usdPerUnit: 0.005 },
+    phone_finder: { recordingUnit: "lookup", usdPerUnit: 0.25 },
+    email_validation: { recordingUnit: "validation", usdPerUnit: 0.0005 },
   },
   "2captcha": {
-    solve: { unit: "solve", usdPerUnit: 0.00725 },
+    solve: { recordingUnit: "solve", usdPerUnit: 0.00725 },
   },
   elevenlabs: {
-    characters_flash_turbo: { unit: "1k_characters", usdPerUnit: 0.125 },
-    characters_multilingual: { unit: "1k_characters", usdPerUnit: 0.25 },
+    characters_flash_turbo: { recordingUnit: "1k_characters", usdPerUnit: 0.125 },
+    characters_multilingual: { recordingUnit: "1k_characters", usdPerUnit: 0.25 },
   },
   placid: {
-    image_render: { unit: "render", usdPerUnit: 0.095 },
-    video_render_30s: { unit: "render", usdPerUnit: 3.325 },
-    pdf_page: { unit: "page", usdPerUnit: 0.19 },
+    image_render: { recordingUnit: "render", usdPerUnit: 0.095 },
+    video_render_30s: { recordingUnit: "render", usdPerUnit: 3.325 },
+    pdf_page: { recordingUnit: "page", usdPerUnit: 0.19 },
   },
   remotion: {
-    render: { unit: "render", usdPerUnit: 0.1375 },
+    render: { recordingUnit: "render", usdPerUnit: 0.1375 },
   },
 };
 
 /**
- * Look up the allocated USD-per-unit rate for a vendor/unit pair.
- * Returns null for an unknown provider or unit — callers must not default a
+ * Look up the allocated USD-per-unit rate for a vendor/rate-key pair.
+ * Callers pass the configured key unchanged (for example,
+ * `landing_page_generation`, not its human recording unit `generation`).
+ * Returns null for an unknown provider or rate key — callers must not default a
  * missing rate to $0 or any other value (see computeAllocatedCost).
  */
 export function getAllocatedRate(
   provider: VendorRateProvider,
-  unit: string
+  rateKey: string
 ): number | null {
+  if (
+    !rateKey ||
+    !Object.prototype.hasOwnProperty.call(RATE_CARD, provider)
+  ) {
+    return null;
+  }
   const providerCard = RATE_CARD[provider];
-  if (!providerCard || !unit) return null;
-  const entry = providerCard[unit];
-  return entry ? entry.usdPerUnit : null;
+  if (!Object.prototype.hasOwnProperty.call(providerCard, rateKey)) {
+    return null;
+  }
+  return providerCard[rateKey].usdPerUnit;
 }
 
 /**
@@ -105,13 +114,13 @@ export function getAllocatedRate(
  */
 export function computeAllocatedCost(
   provider: VendorRateProvider,
-  unit: string,
+  rateKey: string,
   quantity: number
 ): number {
-  const rate = getAllocatedRate(provider, unit);
+  const rate = getAllocatedRate(provider, rateKey);
   if (rate === null) {
     throw new Error(
-      `No allocated rate for vendor "${provider}" unit "${unit}" — add it to vendorRateCard.ts before metering this call`
+      `No allocated rate for vendor "${provider}" rate key "${rateKey}" — add it to vendorRateCard.ts before metering this call`
     );
   }
   const safeQuantity = Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
