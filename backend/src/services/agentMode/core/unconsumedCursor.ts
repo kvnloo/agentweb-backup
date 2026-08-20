@@ -45,8 +45,36 @@ const CURSOR_RESULT_KEYS = ['next_cursor', 'nextCursor'] as const;
 /** Row-bearing keys, so "how much did we actually read" is answerable. */
 const ROW_KEYS = ['leads', 'engagements', 'results', 'items', 'rows'] as const;
 
-function toolNameOf(entry: CursorLedgerEntry): string {
-  return entry?.toolCall?.function?.name || entry?.toolCall?.name || 'a tool';
+/**
+ * The tool's name, or null when the entry does not carry one.
+ *
+ * A notice naming "a tool" cannot be acted on — there is nothing for the reader to
+ * resume — so an unnameable entry is malformed input, and this module's contract
+ * for malformed input is to ignore it (CodeRabbit, #2493).
+ */
+function toolNameOf(entry: CursorLedgerEntry): string | null {
+  return entry?.toolCall?.function?.name || entry?.toolCall?.name || null;
+}
+
+/**
+ * Every string appearing anywhere in a call's arguments.
+ *
+ * Matched on VALUE rather than on a list of parameter names: tools spell it
+ * `cursor`, `next_cursor`, `start_cursor`, and a tool adopting a fourth spelling
+ * must not silently look consumed. Depth is bounded — arguments are shallow by
+ * construction, and an unbounded walk over model-supplied input is a denial of
+ * service waiting to happen.
+ */
+function argValues(args: unknown, depth = 0, out: Set<string> = new Set()): Set<string> {
+  if (depth > 4 || args === null || typeof args !== 'object') {
+    if (typeof args === 'string') out.add(args);
+    return out;
+  }
+  for (const value of Object.values(args as Record<string, unknown>)) {
+    if (typeof value === 'string') out.add(value);
+    else if (value && typeof value === 'object') argValues(value, depth + 1, out);
+  }
+  return out;
 }
 
 function cursorFrom(result: unknown): string | null {
@@ -82,38 +110,54 @@ export function findUnconsumedCursors(
 ): UnconsumedCursor[] {
   if (!Array.isArray(ledger) || ledger.length === 0) return [];
 
-  const byTool = new Map<string, { cursor: string; returned: number }>();
+  const rowsPerTool = new Map<string, number>();
+  const emitted: { tool: string; cursor: string; index: number }[] = [];
 
-  for (const entry of ledger) {
+  for (let i = 0; i < ledger.length; i++) {
+    const entry = ledger[i];
     // A failed call read nothing, so it has nothing unread. Warning here would
     // tell the user to resume a query that never ran.
     if (entry?.status && entry.status !== 'success') continue;
 
-    const rows = rowsFrom(entry?.result);
-    const cursor = cursorFrom(entry?.result);
     const tool = toolNameOf(entry);
-    const prior = byTool.get(tool);
+    if (!tool) continue; // unnameable: nothing a reader could resume
 
-    if (cursor) {
-      byTool.set(tool, { cursor, returned: (prior?.returned ?? 0) + rows });
-    } else if (prior) {
-      // A final page closes the chain: rows still count toward what was read, but
-      // there is no longer anything outstanding for this tool.
-      byTool.set(tool, { cursor: '', returned: prior.returned + rows });
-    }
+    rowsPerTool.set(tool, (rowsPerTool.get(tool) ?? 0) + rowsFrom(entry?.result));
+
+    const cursor = cursorFrom(entry?.result);
+    if (cursor) emitted.push({ tool, cursor, index: i });
   }
 
-  // Consumption needs no argument matching, and an earlier draft's attempt at it
-  // was dead code: a cursor that WAS passed back produces a further call for the
-  // same tool, which either carries the next cursor (the chain advances) or carries
-  // none (the chain closes above). Either way the tool's final state already tells
-  // the truth, and scanning later arguments could not change a single outcome —
-  // mutating that scan to read the wrong field failed no test, which is how it was
-  // found. Removed rather than left in looking load-bearing.
+  // Consumption is tracked by cursor VALUE, not by tool name.
+  //
+  // An earlier revision closed a tool's chain as soon as that tool returned a page
+  // with no cursor, on the reasoning that a consumed cursor always produces a
+  // further call whose result advances or closes the chain. That is true only when
+  // every call for a tool belongs to the SAME paging chain. It does not hold for an
+  // independent query: page 1 of list A leaves a cursor unread, the model then runs
+  // a fresh unrelated search with the same tool against list B, and list B's
+  // complete result closed list A's chain — silently reporting A as fully read when
+  // its page 2 was never fetched (CodeRabbit, #2493).
+  //
+  // Mutating the value matching away failed no test at the time, which I took as
+  // proof it was unreachable. It only proved the suite had no independent-call
+  // case. It has one now.
   const unconsumed: UnconsumedCursor[] = [];
-  for (const [tool, state] of byTool) {
-    if (state.cursor) unconsumed.push({ tool, cursor: state.cursor, returned: state.returned });
+  const lastPerTool = new Map<string, UnconsumedCursor>();
+  for (const pending of emitted) {
+    const used = ledger
+      .slice(pending.index + 1)
+      .some((later) => later?.status !== 'error' && argValues(later?.functionArgs).has(pending.cursor));
+    if (used) continue;
+    // One entry per tool: paging three deep and stopping is one unread remainder,
+    // and the DEEPEST outstanding cursor is the one worth resuming from.
+    lastPerTool.set(pending.tool, {
+      tool: pending.tool,
+      cursor: pending.cursor,
+      returned: rowsPerTool.get(pending.tool) ?? 0,
+    });
   }
+  unconsumed.push(...lastPerTool.values());
   return unconsumed;
 }
 
