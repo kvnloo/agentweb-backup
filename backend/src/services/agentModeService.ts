@@ -34759,7 +34759,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     action: string,
     override: boolean,
     sessionId?: string,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
@@ -34781,7 +34781,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     newFinalUrls: Array<string | undefined>,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     if (campaignStatus !== 'ENABLED') return { proceed: true };
     const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
     if (urls.length === 0) return { proceed: true };
@@ -34800,15 +34800,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     finalUrls: string[],
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const gate = await preflightTrackingGate(finalUrls);
     const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
     if (gate.ok) {
+      /*
+       * ENG-1358: measurable, but nothing on the page proves an Ads conversion can be
+       * recorded — only a GTM container or a GA4 property. Recorded under its own outcome
+       * so the run history distinguishes "verified" from "we could not tell", and
+       * returned so the caller surfaces it instead of the gate quietly swallowing it.
+       *
+       * A warning that is computed and discarded is the same as no warning at all, which
+       * is exactly how the AC1 wiring gap survived 111 green tests.
+       */
+      const warned = (gate.warnings?.length ?? 0) > 0;
       await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
-        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+        customerId, campaignResourceName, action,
+        outcome: warned ? 'passed_with_warning' : 'passed',
+        urlResults, checkedAt: new Date().toISOString(),
       });
-      return { proceed: true };
+      return warned ? { proceed: true, warning: gate.message } : { proceed: true };
     }
 
     if (override) {
@@ -34881,8 +34893,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
           const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
           if (!gate.proceed) return gate.blockResult;
+          const resumeTrackingWarning = gate.warning;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
-          return { success: true, message: 'Campaign resumed' };
+          // Relayed, not swallowed: the launch is permitted, but the operator has to be
+          // told the page proves only that SOME Google tag is present (ENG-1358).
+          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -34919,10 +34934,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          let trackingWarning: string | undefined;
           // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
           if (args.status === 'ENABLED') {
             const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
             if (!gate.proceed) return gate.blockResult;
+            trackingWarning = gate.warning;
           }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
@@ -34935,7 +34952,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrlSuffix: args.final_url_suffix,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
-          return { success: true, message: 'Campaign updated' };
+          // Same relay as RESUME: permitted, but the operator is told what could not be
+          // verified rather than reading a bare success (ENG-1358).
+          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
