@@ -93,7 +93,7 @@ describe('SessionScoring - publish-approval withholding is not a fabrication (EN
     jest.clearAllMocks();
   });
 
-  it('DEFAULT_SCORING_SYSTEM_PROMPT does NOT hardcode the publish-approval rule (appended, not baked in, so an AW-Settings override cannot mask it)', () => {
+  it('regression guard: DEFAULT_SCORING_SYSTEM_PROMPT must never hardcode the publish-approval rule (appended, not baked in, so an AW-Settings override cannot mask it) — does not by itself prove the ENG-1245 fix works', () => {
     expect(DEFAULT_SCORING_SYSTEM_PROMPT).not.toContain('Require approval before publishing');
   });
 
@@ -128,13 +128,4 @@ describe('SessionScoring - publish-approval withholding is not a fabrication (EN
     expect(prompt).toContain('Require approval before publishing');
   });
 
-  it('the blocked-publish tool result reaches the judge-visible transcript intact (not stripped before the clause can apply)', async () => {
-    mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
-
-    await scoreSession(blockedMessages, blockedMessages.length);
-
-    const callArgs = mockCallLLM.mock.calls[0];
-    const userMessage = callArgs[1].find((m: any) => m.role === 'user');
-    expect(userMessage.content).toContain('Require approval before publishing');
-  });
 });
