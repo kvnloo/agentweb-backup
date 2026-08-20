@@ -21926,7 +21926,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: 'No search query provided.',
           query: query || '',
           results: [],
-          totalResults: 0,
+          returnedResults: 0,
+          hasMore: false,
         };
       }
 
@@ -22067,7 +22068,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: `No knowledge base results found for "${query}"`,
           query,
           results: [],
-          totalResults: 0
+          returnedResults: 0,
+          hasMore: false
         };
       }
 
@@ -22076,12 +22078,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // list can be several times larger than requested — cap it to avoid context bloat.
       const boundedResults = results.slice(0, limitedMaxResults);
 
+      // ENG-1207: never present a page as a total. `totalResults` was the worst
+      // instance of this in the file — a structured field NAMED "total" carrying a
+      // page count reads as authoritative in a way prose does not, so a model has
+      // no reason to doubt it. Renamed to `returnedResults`, which is what it
+      // always actually held, plus an explicit `hasMore`.
+      //
+      // Unlike `get_lead_engagements`, no honest total is available here and none
+      // is invented. Each source (Vertex, Drive, ClickUp docs/tasks) is collected
+      // up to `limitedMaxResults` INDEPENDENTLY before merging, so `results.length`
+      // is a floor rather than a count of what matched — a source that returned
+      // exactly its own cap may well have had more. `hasMore` therefore reports
+      // only what is certain: that the merge itself was cut. It can be false while
+      // more exists upstream, which is why the message says "raise max_results"
+      // rather than promising a specific remainder.
+      const hasMore = results.length > boundedResults.length;
       return {
         success: true,
-        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
+        message: hasMore
+          ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
         results: boundedResults,
-        totalResults: boundedResults.length
+        returnedResults: boundedResults.length,
+        hasMore
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
