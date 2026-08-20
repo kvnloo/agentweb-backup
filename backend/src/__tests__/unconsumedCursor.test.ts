@@ -133,15 +133,23 @@ describe('findUnconsumedCursors', () => {
     expect(findUnconsumedCursors(ledger)).toHaveLength(1);
   });
 
-  it('a CANCELLED later call has not consumed the cursor either', () => {
-    // The emit side only accepts `success`; the consume side must agree, or a
-    // deferred or cancelled entry silently closes a page that was never read.
-    const ledger = [
-      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
-      call('search_leads', { list_id: 'A', cursor: 'C1' }, {}, 'deferred'),
-    ];
-    expect(findUnconsumedCursors(ledger)).toHaveLength(1);
-  });
+  it.each(['deferred', 'cancelled'])(
+    'a %s later call has not consumed the cursor either',
+    (status) => {
+      // The emit side accepts only `success`; the consume side must agree, or an
+      // entry for a call that never ran silently closes a page nobody read.
+      //
+      // Both statuses are covered rather than one, because the predicate makes a
+      // claim about EVERY explicit non-success status, not about a particular
+      // string — the previous single case was named CANCELLED while passing
+      // 'deferred', which asserted neither (CodeRabbit, #2493).
+      const ledger = [
+        call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+        call('search_leads', { list_id: 'A', cursor: 'C1' }, {}, status),
+      ];
+      expect(findUnconsumedCursors(ledger)).toHaveLength(1);
+    },
+  );
 
   it('a later call that FAILED while carrying the cursor has not consumed it', () => {
     // Attempting to read page 2 is not reading it. If the retry errored, the page
