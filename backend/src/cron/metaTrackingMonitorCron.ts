@@ -240,11 +240,23 @@ export async function runMetaTrackingMonitor(
     // what Meta says it received. Its own try/catch, because it is a different question
     // from the spend check and one failing must not suppress the other.
     try {
-      // Skipped on a dry run: this check has its own alert path that does NOT route through
-      // the injected transport, so running it here would send a real alert from a run whose
-      // entire contract is "no side effects".
-      if (dryRun) continue;
-      const divergence = await checkConversionDivergenceForUser(user);
+      // ⚠ On a dry run this is handed a CAPTURING transport rather than being skipped.
+      // It used to `continue` here, because the wrapper hardcoded a real oncall-email
+      // transport and running it would have sent live alerts from a run whose entire
+      // contract is "no side effects". The cost of skipping was worse than it looked: the
+      // FIRST execution of this detector against real relay data would have been in
+      // production, unattended, at 09:00 UTC — the same testability gap the admin dry-run
+      // trigger exists to close for every other check.
+      // Passing `undefined` on a real run keeps the real transport, so forgetting this
+      // argument can never silence production.
+      const divergence = await checkConversionDivergenceForUser(
+        user,
+        dryRun
+          ? async (subject: string, message: string, context?: Record<string, any>) => {
+              capturedAlerts.push({ subject, message, context });
+            }
+          : undefined,
+      );
       if (divergence.status === 'not-arriving') summary.conversionDivergences++;
     } catch (error: any) {
       console.error(`${TAG} divergence check failed for user ${user?.userId}: ${error?.message}`);
