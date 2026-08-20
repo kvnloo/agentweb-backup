@@ -62,12 +62,69 @@ describe('the action matrix documents the entity for the model', () => {
     expect(matrix()).toMatch(/CONVERSION_ACTION\s*→\s*LIST, CREATE/);
   });
 
-  it('states that REMOVE is unsupported and names the alternative', () => {
-    expect(matrix()).toMatch(/NO REMOVE/);
-    expect(matrix()).toMatch(/status=PAUSED/);
+  it('states that REMOVE is supported behind a confirmation', () => {
+    // Was "NO REMOVE … use status=PAUSED". Both halves are now known wrong: REMOVE is the
+    // only working retire path, and PAUSED is not a conversion-action status at all.
+    expect(matrix()).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal\)/);
+    expect(matrix()).toMatch(/Ask the user before setting the flag/);
   });
 
   it('warns that counting_type is never inferred', () => {
     expect(matrix()).toMatch(/counting_type is REQUIRED and never inferred/);
+  });
+});
+
+describe('the tool stops recommending an impossible action (ENG-1329 e2e)', () => {
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const text = `${tool.definition?.description ?? ''}`;
+  const props = () => tool.definition.inputSchema.properties;
+
+  it('no longer offers HIDDEN in the status enum', () => {
+    // Rejected by Google on BOTH create and update — offering it invites a guaranteed error.
+    expect(props().status.enum).not.toContain('HIDDEN');
+  });
+
+  it('exposes the removal confirmation flag', () => {
+    expect(props().confirm_conversion_action_removal).toBeDefined();
+    expect(props().confirm_conversion_action_removal.type).toBe('boolean');
+  });
+
+  it('lists REMOVE as a supported CONVERSION_ACTION operation', () => {
+    expect(text).toMatch(/REMOVE \(conversion_action_resource_name, confirm_conversion_action_removal\)/);
+  });
+
+  it('tells the model not to suggest HIDDEN', () => {
+    expect(text).toMatch(/HIDDEN cannot be set through the API at all/);
+    expect(text).toMatch(/Do not suggest it/);
+  });
+
+  it('describes removal accurately rather than as data loss', () => {
+    expect(text).toMatch(/conversions already recorded stay in reporting/i);
+    expect(text).not.toMatch(/severs historical attribution/);
+  });
+});
+
+describe('the matrix describes the corrected status model (ENG-1329 e2e)', () => {
+  // Replaces three earlier blocks that asserted HIDDEN was the retire path. The real
+  // account rejected HIDDEN on create AND update, so those tests were pinning a belief,
+  // not a behaviour — and they passed the whole time because mocks agree with you.
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const text = `${tool.definition?.description ?? ''}`;
+
+  it('says a conversion action has no PAUSED status', () => {
+    expect(text).toMatch(/NO PAUSED status/);
+  });
+
+  it('says it is always created ENABLED', () => {
+    expect(text).toMatch(/always created ENABLED/);
+  });
+
+  it('no longer offers PAUSED or HIDDEN as the way to stop an action', () => {
+    expect(text).not.toMatch(/UPDATE it with status=PAUSED/);
+    expect(text).not.toMatch(/UPDATE it to HIDDEN/);
+  });
+
+  it('names REMOVE plus its confirmation flag as the retire path', () => {
+    expect(text).toMatch(/CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true/);
   });
 });

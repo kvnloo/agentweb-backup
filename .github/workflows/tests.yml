@@ -7,11 +7,14 @@ on:
 permissions:
   contents: read
   checks: read
-  # Greptile's verdict lives in a PR comment, which is served by the issues
-  # comments endpoint (.github/scripts/greptile-gate.sh).
+  # The coverage comment in `backend-tests-b` reads and writes a PR comment,
+  # which is served by the issues comments endpoint.
   issues: read
   pull-requests: write
-  id-token: write
+  # ENG-1371: `id-token: write` removed. It was never used — no step in this
+  # file requests an OIDC token; `Configure AWS credentials` below authenticates
+  # with static `secrets.AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, not
+  # `role-to-assume`. Restore it if a job ever moves to OIDC federation.
 
 env:
   AWS_REGION: 'us-west-2'
@@ -45,6 +48,9 @@ jobs:
     # required checks as passing. An untested change merged. With the draft
     # flag in the group name, a still-draft run and a ready run on the same
     # ref can never occupy the same group and so can never cancel each other.
+    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
+    # 360-minute default before anyone notices.
+    timeout-minutes: 10
     concurrency:
       group: ${{ github.workflow }}-detect-changes-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
@@ -69,7 +75,7 @@ jobs:
       # `fetch-depth: 0` on a repo this size made its checkout the most
       # expensive step in the run — 14s at best but 159s, 188s and 247s on
       # sampled runs, against a steady 7-9s for the depth-1 checkouts elsewhere
-      # in this same file (`Require Greptile Review`).
+      # in this same file (`Backend tests (agentMode)`).
       #
       # The checkout could be dropped outright per those docs; a shallow one is
       # kept so the workspace is still populated for anything added here later.
@@ -148,10 +154,16 @@ jobs:
           filters: |
             backend_src:
               - 'backend/**'
-              # All 23 test directories are `__tests__`, nested throughout the
+              # All 13 SOURCE test directories are `__tests__`, nested throughout the
               # tree (backend/src/__tests__, backend/src/services/__tests__,
               # backend/src/services/agentMode/core/__tests__, …) — excluding
-              # only backend/src/__tests__ would miss most of them. The
+              # only backend/src/__tests__ would miss most of them.
+              #
+              # A `find backend -type d -name __tests__` returns 24, not 13.
+              # The extra 11 are stale copies under `backend/dist/`, which is
+              # gitignored build output with 0 tracked files — they can never
+              # appear in a PR diff, so they are irrelevant to this filter.
+              # Count `backend/src` only when checking this number. The
               # *.test.ts globs match nothing today (there are zero colocated
               # test files); they keep the rule true if that convention changes.
               - '!backend/**/__tests__/**'
@@ -175,21 +187,19 @@ jobs:
     # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
     # fires `ready_for_review` (see triggers) → one authoritative full run.
     #
-    # ENG-1039: DECOUPLED from the Greptile gate, reversing ENG-915's ordering.
-    # ENG-915 serialized these jobs behind `greptile-review` to save the
-    # runner-minutes a below-5/5 review invalidated. Measured 2026-08-01..10,
-    # the coupling cost more than it saved: the Greptile check failed 61% of
-    # the time (247 failures / 160 successes, 947 min billed on failed polls),
-    # and every failure skipped the test jobs entirely — 303 skipped
-    # executions. Each skip destroyed the run's test evidence, so authors
-    # re-pushed to recover, costing a whole fresh ~31-min backend pair plus
-    # another Greptile poll. A flaky *reviewer* check was deciding whether
-    # *test* evidence exists.
-    #
-    # The merge gate is unchanged: `greptile-review` remains a required check
-    # and still fails on anything but a true 5/5 (ENG-754/757 fail-closed
-    # shape intact). Only the execution ordering is gone — tests now produce
-    # evidence independently of whether Greptile answered.
+    # ENG-1039 decoupled these jobs from the Greptile gate, and ENG-1371
+    # deleted that gate outright when Greptile was dropped as a vendor. The
+    # lesson survives the vendor and is why nothing should be put back in
+    # front of these two jobs: ENG-915 had serialized them behind
+    # `greptile-review` to save the runner-minutes a below-bar review
+    # invalidated, and measured 2026-08-01..10 the coupling cost more than it
+    # saved — the reviewer check failed 61% of the time (247 failures / 160
+    # successes, 947 min billed on failed polls), and every failure skipped
+    # the test jobs entirely (303 skipped executions). Each skip destroyed the
+    # run's test evidence, so authors re-pushed to recover, costing a whole
+    # fresh ~31-min backend pair. A flaky *reviewer* check was deciding
+    # whether *test* evidence exists. Gate these jobs on the path filter and
+    # the draft flag, and on nothing else.
     #
     # A `skipped` here is still ambiguous — path filter or draft — so
     # merge-evidence.sh keeps demanding a positive `success` from these two
@@ -202,6 +212,9 @@ jobs:
     # Distinct group from backend-tests-b so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run. Draft flag
     # in the group name per ENG-1277 — see the detect-changes job comment.
+    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
+    # 360-minute default before anyone notices.
+    timeout-minutes: 30
     concurrency:
       group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
@@ -247,9 +260,8 @@ jobs:
   backend-tests-b:
     name: Backend tests (all other + coverage)
     needs: [detect-changes]
-    # Same gates as backend-tests-a (see above): drafts skip the heavy suite;
-    # per ENG-1039 the suite is no longer held behind the Greptile gate — test
-    # evidence is produced independently of the reviewer check.
+    # Same gates as backend-tests-a (see above): drafts skip the heavy suite,
+    # and nothing else stands in front of it (ENG-1039, ENG-1371).
     if: >-
       needs.detect-changes.outputs.backend == 'true'
       && github.event.pull_request.draft == false
@@ -257,6 +269,9 @@ jobs:
     # Distinct group from backend-tests-a so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run. Draft flag
     # in the group name per ENG-1277 — see the detect-changes job comment.
+    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
+    # 360-minute default before anyone notices.
+    timeout-minutes: 30
     concurrency:
       group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
@@ -285,11 +300,45 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
 
+      # ENG-1371: `/__tests__/twins/` restored to this list. A CLI
+      # `--testPathIgnorePatterns` REPLACES the array in jest.config.js rather
+      # than extending it, so passing this flag silently dropped the config's
+      # twins exclusion and loaded both twin suites into this job. They
+      # self-skip without `.env.twins.json`, so it was benign — but they are
+      # opt-in by design (src/__tests__/twins/README.md) and should not sit in a
+      # required suite by accident. Coverage-neutral: a skipped suite executes
+      # nothing and therefore contributes nothing.
+      #
+      # `/__tests__/agentMode` is deliberately LEFT ALONE, and the mismatch it
+      # creates is deliberately accepted. Job A selects with
+      # `--testPathPattern="agentMode"`, which matches that substring anywhere
+      # in the path; this ignore requires the literal `/__tests__/agentMode`, so
+      # it only excludes the 263 files named `agentMode*` sitting DIRECTLY under
+      # a `__tests__/` dir. The other 23 — everything under
+      # `services/agentMode/**/__tests__/`, plus names like
+      # `loops.agentModeWiring.test.ts` — run in BOTH backend jobs, on every
+      # backend PR.
+      #
+      # Making the two lists exact complements was tried here and reverted,
+      # because it is not the cost cleanup it looks like. Coverage is collected
+      # ONLY from `src/utils/**` (jest.config.js `collectCoverageFrom`) and ONLY
+      # by this job — job A produces none. Two files in that 23 are
+      # `src/__tests__/utils/agentModeAlerts.test.ts` and
+      # `.../agentModeErrors.test.ts`, whose targets `src/utils/agentModeAlerts.ts`
+      # and `src/utils/agentModeErrors.ts` are inside the coverage scope; every
+      # other test touching those two modules is also `agentMode`-named. So
+      # excluding the 23 sends both modules to zero coverage and the gate below
+      # fails — measured on PR #2491: branches 95.2% -> 93.99%, statements
+      # 98.35% -> 97.55%.
+      #
+      # Deduplicating the split therefore cannot be done without first deciding
+      # what coverage measures. Tracked with that decision on ENG-1376; do not
+      # "fix" this line in isolation.
       - name: Run tests with coverage (non-agentMode files)
         working-directory: backend
         run: >
           npm run test:coverage --
-          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/agentMode"
+          --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/twins/" "/__tests__/agentMode"
           --coverageThreshold='{}'
           --coverageReporters=text --coverageReporters=json-summary
 
@@ -353,7 +402,7 @@ jobs:
             }
 
   # These scripts are the ones that decide whether a deploy really happened
-  # (ENG-734), whether Greptile really passed (ENG-754), whether CI ever ran
+  # (ENG-734), whether CI ever ran
   # at all (ENG-757), and whether anyone finds out a production deploy failed
   # (ENG-865), so they get their own regression suites. All run the real script
   # against a mocked CLI — no AWS access, no GitHub access, no Slack, ~30s.
@@ -380,20 +429,24 @@ jobs:
       - name: Run eb-deploy.sh regression suite
         run: bash .github/scripts/eb-deploy.test.sh
 
-      - name: Run greptile-gate.sh regression suite
-        run: bash .github/scripts/greptile-gate.test.sh
-
-      - name: Run greptile-verdict-policy.sh regression suite
-        run: bash .github/scripts/greptile-verdict-policy.test.sh
-
-      - name: Run greptile-request-review.sh regression suite
-        run: bash .github/scripts/greptile-request-review.test.sh
-
-      - name: Run greptile-review Dependabot bypass invariants
-        run: bash .github/scripts/greptile-dependabot-bypass.test.sh
-
       - name: Run dependabot-only-pr.sh regression suite
         run: bash .github/scripts/dependabot-only-pr.test.sh
+
+      # ENG-1371: this suite existed in the repo but no job ran it, so the only
+      # genuinely security-relevant required check (`Dependabot Integrity
+      # Check`, ENG-1287) was the one with no regression coverage in CI.
+      - name: Run dependabot-integrity-check.sh regression suite
+        run: bash .github/scripts/dependabot-integrity-check.test.sh
+
+      # No script under test — asserts the github-actions grouping in
+      # .github/dependabot.yml itself, so it cannot be quietly "cleaned up"
+      # back to one PR per action without a red check (ENG-1042). Placed here,
+      # grouped with its sibling Dependabot suites and ahead of every later
+      # step: a `run:` step failure skips the rest of the job by default, so a
+      # step placed after a flaky or already-red suite can silently stop
+      # proving anything without the job itself going green-then-red to say so.
+      - name: Run dependabot-config contract suite
+        run: bash .github/scripts/dependabot-config.test.sh
 
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
@@ -433,7 +486,24 @@ jobs:
     if: needs.detect-changes.outputs.ebconfig == 'true'
     # ENG-1277: ubuntu-slim — a git diff + bash classifier, no docker.
     runs-on: ubuntu-slim
-    timeout-minutes: 5
+    # ENG-1371: raised 5 -> 12. The classifier itself is seconds, but this job
+    # needs `fetch-depth: 0` (see the checkout below — a DELETED config is
+    # classified by what it declared in the base revision, which requires
+    # history), and full-history checkout on this repo is measured at 14s at
+    # best but 159s, 188s and 247s on sampled runs — see the ENG-729 note on
+    # detect-changes' checkout. The 5-minute ceiling was set below this job's
+    # own worst case.
+    #
+    # It survived because the job is path-gated and had only executed 6 times
+    # in 197 runs, so it had never drawn the tail. It drew it on PR #2491:
+    # `Checkout PR head` ran 4m59s, the job was killed, the classifier step
+    # never executed, and GitHub reported the result as `cancelled` — which
+    # merge-evidence.sh correctly refuses to read as a pass.
+    #
+    # 12 rather than 15: ubuntu-slim's job cap is 15 minutes, and a ceiling AT
+    # the cap gives the runner no room to report a diagnosable timeout of its
+    # own before being killed from outside.
+    timeout-minutes: 12
     concurrency:
       group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
@@ -467,189 +537,6 @@ jobs:
           git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" \
             | bash .github/scripts/eb-config-conflict.sh
 
-  # This job used to poll Greptile's own `Greptile Review` check-run and pass on
-  # conclusion=success. Greptile marks that check-run success for every completed
-  # review regardless of confidence score, so the job went green on 3/5 and 4/5
-  # reviews carrying live P1s. The 5/5 bar was held up by an agent choosing to
-  # open the comment and read the score — discipline, not a control (ENG-754).
-  # It now reads the score and the reviewed-commit pointer out of the comment
-  # body and fails closed. See .github/scripts/greptile-gate.sh for why the
-  # comment is the only source of the score.
-  #
-  # ENG-1282: greptile.json sets `triggerOnUpdates: false`, so Greptile no
-  # longer auto-reviews every push to an already-ready PR — only `opened` and
-  # `ready_for_review` do (Greptile's own default; PRs here averaged 6.4 pushes
-  # before merge, max 50, and Greptile bills $1/review past 50/seat/month, so
-  # that was $1 per push, not per PR). A push after the first review therefore
-  # leaves this job polling for a review that will never arrive until someone
-  # deliberately asks for one via `.github/scripts/greptile-request-review.sh`
-  # — call it once per batch of fixes, not once per push, or this reintroduces
-  # the exact cost it removes. Until that's called, this job polls and finds
-  # no verdict (unavailable) — which, per greptile-verdict-policy.sh above,
-  # now PASSES with a loud warning rather than failing closed; see that
-  # script's header for the full policy and the incident that prompted it.
-  # ENG-1277: reordered to run AFTER the two backend test jobs, not in
-  # parallel with them — the reverse of what ENG-915/ENG-1039 fought over.
-  # ENG-915 made TESTS wait on Greptile (skip tests if Greptile refused);
-  # ENG-1039 killed that because a 61%-flaky reviewer check was deciding
-  # whether test evidence exists. This is not that: backend-tests-a/b are
-  # UNCHANGED — they still never wait on Greptile and never skip because of
-  # it. What moved is the POLL: it now waits on the TESTS instead of racing
-  # them. By the time the ~15-17 min test pair finishes, Greptile has almost
-  # always already posted its review (~2.5 min latency), so this job's own
-  # wait collapses from ~3 standard-min to under 1 slim-min.
-  #
-  # `always()` is mandatory, not decoration. GitHub implicitly ANDs an `if:`
-  # with `success()` unless the expression names a status-check function
-  # explicitly — so without `always()`, a skipped backend-tests-a/b (e.g. a
-  # non-backend PR, where the path filter skips them) would silently skip
-  # this required check too, and a skipped required check satisfies branch
-  # protection. `always()` restores "runs unless draft" exactly as before,
-  # just later in the graph.
-  #
-  # Side benefit: this closes a real hole. With Greptile running in parallel,
-  # GitHub's own two required contexts (`Detect changed projects`,
-  # `Require Greptile Review`) could both go green minutes before the backend
-  # tests finished, so a human merging from GitHub's UI on "all checks
-  # passed" (bypassing merge-evidence.sh, which is not itself a required
-  # check) could merge before tests completed. Both required contexts now
-  # correctly wait for the tests.
-  greptile-review:
-    name: Require Greptile Review
-    needs: [detect-changes, backend-tests-a, backend-tests-b]
-    if: always() && github.event.pull_request.draft == false
-    # ENG-1277: ubuntu-slim — this job is a bash poll against the GitHub API,
-    # no docker, no build.
-    runs-on: ubuntu-slim
-    # ENG-1039: the poll deadline is 10 minutes (GREPTILE_GATE_TIMEOUT_SECONDS
-    # below), down from 20. Greptile reviews land in ~2 min when it answers at
-    # all, and failed polls billed 947 runner-minutes over 2026-08-01..10 —
-    # most of the timeout window was buying nothing. A false timeout is also
-    # far cheaper than it used to be: since the test jobs no longer wait on
-    # this gate (see backend-tests-a), a timeout re-runs only this ~free poll
-    # on the next push, never a 31-min test pair. The 2-minute headroom keeps
-    # the ENG-734 shape: the script's deadline stays under the job timeout so
-    # the gate fails with a diagnosable message instead of being killed
-    # mid-poll. ENG-1277: 12 min still fits ubuntu-slim's 15-min job cap.
-    timeout-minutes: 12
-    # A newer commit on the same PR cancels this superseded Greptile-wait job.
-    # Draft flag in the group name per ENG-1277 — see detect-changes' comment.
-    concurrency:
-      group: ${{ github.workflow }}-greptile-review-${{ github.ref }}-${{ github.event.pull_request.draft }}
-      cancel-in-progress: true
-    # `verdict` is pass | refused | unavailable. Since 2026-08-18
-    # (greptile-verdict-policy.sh) the job FAILS on `refused` — a genuine
-    # below-bar review — but PASSES (with a loud ::warning::) on
-    # `unavailable`, where Greptile never returned any verdict for this head
-    # at all. See that script's header for the full policy and the incident
-    # that prompted it. Since ENG-1039 nothing downstream consumes this
-    # output (the test jobs no longer wait on this gate); it is kept for the
-    # job log and any future consumer.
-    outputs:
-      verdict: ${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}
-    steps:
-      # Deliberately the PR's own copy of the gate, not main's: whatever gates
-      # merges has to gate its own changes, or the fix ships unexercised
-      # (the ENG-743 lesson).
-      - name: Checkout PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # ENG-1282: greptile.json now excludes dependabot[bot] from review
-      # (excludeAuthors) — a version bump doesn't need a full LLM review, and
-      # dependabot PRs were ~4.6% of Greptile's billed reviews for something
-      # tests + Dependabot's own compatibility scoring already cover. Without
-      # this step, excluding the author means Greptile NEVER posts a verdict
-      # for these PRs, and greptile-gate.sh polls its full 10-minute timeout
-      # every single time before returning UNAVAILABLE — turning every
-      # dependabot PR's required check permanently red.
-      #
-      # This bypass went through TWO prior designs, both caught live by
-      # Greptile reviewing this exact PR, both on the same principle: an
-      # event-metadata check (who opened the PR, who triggered this push)
-      # tells you nothing about what's actually IN the current head.
-      #   v1 — `pull_request.user.login` alone: never changes even after a
-      #        human pushes onto an existing Dependabot branch, so a human's
-      #        unreviewed commit rides the bypass forever.
-      #   v2 — v1 AND `github.actor` (this push's trigger) both dependabot:
-      #        closes the direct case, but not the laundering case — a human
-      #        push correctly fails ITS OWN actor check and gets reviewed,
-      #        but if Dependabot performs a LATER routine update of the same
-      #        PR, THAT push's actor is dependabot again, and the bypass
-      #        fires for the CURRENT head — which still contains the human's
-      #        earlier, still-unreviewed commit.
-      # Neither version asked the only question that actually matters: does
-      # this PR's commit history contain anything other than Dependabot
-      # commits, full stop. dependabot-only-pr.sh asks exactly that — it
-      # walks every commit in the PR via the GitHub API and fails closed on
-      # a single non-Dependabot (or unresolvable) author anywhere in the
-      # history, not just the most recent event.
-      - name: Check whether this Dependabot PR contains only Dependabot commits
-        id: dependabot_only
-        if: github.event.pull_request.user.login == 'dependabot[bot]'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set +e
-          bash .github/scripts/dependabot-only-pr.sh
-          rc=$?
-          set -e
-          if [ "${rc}" -eq 0 ]; then
-            echo "all_dependabot=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "all_dependabot=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Skip the Greptile gate for Dependabot (excluded from review)
-        id: dependabot_skip
-        if: steps.dependabot_only.outputs.all_dependabot == 'true'
-        run: |
-          echo "verdict=pass" >> "$GITHUB_OUTPUT"
-          echo "[greptile-review] every commit in this PR is authored by dependabot[bot]: excluded from Greptile review by greptile.json, so no verdict will ever land here. Gate short-circuits to pass — tests + Dependabot's own compatibility score are the review for a dependency bump."
-
-      # Split across two steps on purpose. A step that fails cannot publish an
-      # output, and `continue-on-error` would mark the JOB successful, silently
-      # deleting the merge gate. So this step records the verdict and always
-      # succeeds, and the next one converts it back into the job's result.
-      - name: Require a true Greptile 5/5 on this head
-        id: gate
-        if: steps.dependabot_only.outputs.all_dependabot != 'true'
-        env:
-          # ENG-1039 fail-fast: see the job comment above.
-          GREPTILE_GATE_TIMEOUT_SECONDS: '600'
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set +e
-          bash .github/scripts/greptile-gate.sh
-          rc=$?
-          set -e
-          case "${rc}" in
-            0)  verdict=pass ;;
-            75) verdict=unavailable ;;
-            *)  verdict=refused ;;
-          esac
-          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
-          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
-          echo "greptile-gate verdict=${verdict} (exit ${rc})"
-
-      # 2026-08-18: PR #2425 sat blocked most of a day by a real Greptile-side
-      # outage (reviews stuck on a stale head for hours, retrigger requests
-      # 400ing, unrelated PRs reviewed normally in the same window) despite
-      # the code being independently proven the whole time. `refused` (a
-      # genuine below-bar review) still hard-fails, unchanged; `unavailable`
-      # (Greptile never answered for this head at all) now passes with a
-      # loud warning instead. See greptile-verdict-policy.sh's header for the
-      # full policy — CodeRabbit needed no equivalent change; it was already
-      # advisory-only (never a required check, always reports `pass`).
-      - name: Apply the Greptile verdict policy
-        run: |
-          bash .github/scripts/greptile-verdict-policy.sh \
-            '${{ steps.gate.outputs.verdict || steps.dependabot_skip.outputs.verdict }}'
-
   # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
   # unchanged (ENG-991). GitHub isolates repository secrets from Dependabot on
   # `pull_request`: `secrets.AWS_ACCESS_KEY_ID` and `secrets.AWS_SECRET_ACCESS_KEY`
@@ -660,8 +547,8 @@ jobs:
   # circumstances, and re-running never changes that.
   #
   # Measured on the three open bumps (runs 31349777138 / 31349778959 / 31349790654,
-  # 2026-08-10): every other job passed — including both backend suites and the
-  # Greptile gate — and only this job failed, twice with "Could not load credentials
+  # 2026-08-10): every other job passed — both backend suites included — and
+  # only this job failed, twice with "Could not load credentials
   # from any providers" after 5m01s and 4m01s of checkout, npm ci, build and
   # packaging done before reaching the credentials step. 12 runs over 7 days, 0
   # successes.
@@ -690,21 +577,23 @@ jobs:
   # This removes no merge evidence. merge-evidence.sh requires a positive
   # `success` from "Backend tests (agentMode)" and "Backend tests (all other +
   # coverage)" only (MERGE_EVIDENCE_BACKEND_JOBS); the staging deploy has never
-  # been in that set, so a Dependabot PR still has to pass the same tests and the
-  # same Greptile 5/5 as anything else. Contract pinned by
+  # been in that set, so a Dependabot PR still has to pass the same tests as
+  # anything else. Contract pinned by
   # .github/scripts/staging-deploy-gate.test.sh.
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
-    needs: [detect-changes, backend-tests-a, backend-tests-b, greptile-review]
+    needs: [detect-changes, backend-tests-a, backend-tests-b]
     if: >-
       github.event.pull_request.draft == false
       && github.event.pull_request.user.login != 'dependabot[bot]'
       && needs.detect-changes.outputs.backend_deployable == 'true'
       && needs.backend-tests-a.result == 'success'
       && needs.backend-tests-b.result == 'success'
-      && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
+    # ENG-1371: the deploy step itself allows 35 min (EB_TOTAL_TIMEOUT_SECONDS
+    # 1800 + headroom); this is the whole-job ceiling above it.
+    timeout-minutes: 60
     concurrency:
       group: backend-staging-deploy
       cancel-in-progress: false
@@ -846,6 +735,9 @@ jobs:
     runs-on: ubuntu-latest
     # A newer commit on the same PR cancels this superseded test job. Draft
     # flag in the group name per ENG-1277 — see detect-changes' comment.
+    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
+    # 360-minute default before anyone notices.
+    timeout-minutes: 20
     concurrency:
       group: ${{ github.workflow }}-partner-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
