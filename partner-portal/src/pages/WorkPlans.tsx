@@ -862,13 +862,19 @@ export default function WorkPlans() {
                         <Stack spacing={1} sx={{ mt: 1 }}>
                           <TextField label="Card title" value={step.inputRequest.title} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, title: e.target.value })} size="small" fullWidth />
                           <TextField label="What should we ask?" value={step.inputRequest.prompt} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, prompt: e.target.value })} size="small" fullWidth helperText="This appears in the chat card, not as a wall of instructions." />
-                          <TextField label="Answer label" value={step.inputRequest.fields[0]?.label || ''} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [{ ...step.inputRequest!.fields[0], id: 'details', label: e.target.value, type: step.inputRequest!.fields[0]?.type || 'text', required: true }] })} size="small" fullWidth />
-                          <FormControl size="small" fullWidth>
-                            <InputLabel>Answer type</InputLabel>
-                            <Select label="Answer type" value={step.inputRequest.fields[0]?.type || 'text'} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [{ ...step.inputRequest!.fields[0], id: 'details', label: step.inputRequest!.fields[0]?.label || 'Details', type: e.target.value as 'text' | 'url' | 'number' | 'boolean', required: true }] })}>
-                              <MenuItem value="text">Short text</MenuItem><MenuItem value="url">Link (URL)</MenuItem><MenuItem value="number">Number</MenuItem><MenuItem value="boolean">Yes / no</MenuItem>
-                            </Select>
-                          </FormControl>
+                          {step.inputRequest.fields.map((field, fieldIndex) => (
+                            <Box key={`${field.id}-${fieldIndex}`} sx={{ display: 'grid', gridTemplateColumns: '1fr 150px auto', gap: 1, alignItems: 'start' }}>
+                              <TextField label="Answer label" value={field.label} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.map((candidate, index) => index === fieldIndex ? { ...candidate, label: e.target.value } : candidate) })} size="small" fullWidth />
+                              <FormControl size="small" fullWidth>
+                                <InputLabel>Answer type</InputLabel>
+                                <Select label="Answer type" value={field.type} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.map((candidate, index) => index === fieldIndex ? { ...candidate, type: e.target.value as typeof candidate.type } : candidate) })}>
+                                  <MenuItem value="text">Short text</MenuItem><MenuItem value="url">Link (URL)</MenuItem><MenuItem value="number">Number</MenuItem><MenuItem value="boolean">Yes / no</MenuItem>
+                                </Select>
+                              </FormControl>
+                              <IconButton aria-label="Remove answer field" disabled={step.inputRequest!.fields.length === 1} onClick={() => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.filter((_, index) => index !== fieldIndex) })}><CloseIcon fontSize="small" /></IconButton>
+                            </Box>
+                          ))}
+                          <Button size="small" variant="text" startIcon={<AddIcon />} disabled={step.inputRequest!.fields.length >= 8} onClick={() => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [...step.inputRequest!.fields, { id: `field_${step.inputRequest!.fields.length + 1}`, label: 'New detail', type: 'text', required: true }] })}>Add another answer</Button>
                         </Stack>
                       )}
                     </Box>
