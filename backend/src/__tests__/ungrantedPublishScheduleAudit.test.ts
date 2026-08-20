@@ -59,6 +59,11 @@ describe('scheduleSignalsPublishIntent', () => {
     expect(scheduleSignalsPublishIntent({ startingMessage: undefined, scheduleName: undefined })).toBe(false);
   });
 
+  it('is false when the schedule argument itself is null/undefined, never throws', () => {
+    expect(scheduleSignalsPublishIntent(undefined as any)).toBe(false);
+    expect(scheduleSignalsPublishIntent(null as any)).toBe(false);
+  });
+
   /**
    * ENG-1245 — deliberately OVER-inclusive, unlike the customer-portal hint's
    * identical-looking function of the same name (ScheduleFormPanel.tsx). The two
@@ -258,11 +263,34 @@ describe('findUngrantedPublishingSchedules (ENG-1245)', () => {
     expect(() => findUngrantedPublishingSchedules([schedule({ runResults: null })], NOW)).not.toThrow();
     const findings = findUngrantedPublishingSchedules([schedule({ runResults: [{}, { actualFunctionCalls: null }] })], NOW);
     expect(findings[0].daysSinceLastPublish).toBeUndefined();
+    expect(findings[0].everPublished).toBe(false);
   });
 
-  it('is safe on an empty or malformed schedule list', () => {
+  it('is safe when a runResults ELEMENT itself (not just its properties) is null/undefined', () => {
+    expect(() =>
+      findUngrantedPublishingSchedules([schedule({ runResults: [undefined, null] as any })], NOW)
+    ).not.toThrow();
+    const findings = findUngrantedPublishingSchedules([schedule({ runResults: [undefined, null] as any })], NOW);
+    expect(findings[0].everPublished).toBe(false);
+    expect(findings[0].lastRunAt).toBeUndefined();
+  });
+
+  it('is safe on an empty or malformed schedule list, including the whole argument being missing', () => {
     expect(findUngrantedPublishingSchedules([], NOW)).toEqual([]);
     expect(findUngrantedPublishingSchedules([null, undefined, {}] as any, NOW)).toEqual([]);
+    expect(findUngrantedPublishingSchedules(undefined as any, NOW)).toEqual([]);
+    expect(findUngrantedPublishingSchedules(null as any, NOW)).toEqual([]);
+  });
+
+  it('defaults `now` to the current time when the caller omits it', () => {
+    // Not asserting an exact day count (real time is nondeterministic) — just that
+    // the default-arg path runs cleanly and still resolves a sane, non-negative
+    // count against a fixed past publish date.
+    const findings = findUngrantedPublishingSchedules([
+      schedule({ runResults: [{ createdAt: '2026-01-01T00:00:00.000Z', actualFunctionCalls: ['post_on_connected_account'] }] }),
+    ]);
+    expect(findings[0].everPublished).toBe(true);
+    expect(findings[0].daysSinceLastPublish).toBeGreaterThan(0);
   });
 
   it('flags multiple independent schedules, unaffected by each other', () => {
@@ -276,5 +304,19 @@ describe('findUngrantedPublishingSchedules (ENG-1245)', () => {
     );
 
     expect(findings.map((f) => f.scheduleId).sort()).toEqual(['sched-1', 'sched-3']);
+  });
+
+  it('falls back to `name` when scheduleName is absent, and to "(unnamed)" when neither is set', () => {
+    const [byName] = findUngrantedPublishingSchedules(
+      [schedule({ scheduleName: undefined, name: 'Legacy Name Field' } as any)],
+      NOW,
+    );
+    expect(byName.scheduleName).toBe('Legacy Name Field');
+
+    const [unnamed] = findUngrantedPublishingSchedules(
+      [schedule({ scheduleName: undefined, name: undefined } as any)],
+      NOW,
+    );
+    expect(unnamed.scheduleName).toBe('(unnamed)');
   });
 });

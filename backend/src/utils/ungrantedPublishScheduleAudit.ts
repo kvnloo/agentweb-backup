@@ -124,8 +124,12 @@ export function findUngrantedPublishingSchedules(
     for (let i = runResults.length - 1; i >= 0; i--) {
       const calls = Array.isArray(runResults[i]?.actualFunctionCalls) ? (runResults[i]!.actualFunctionCalls as unknown[]) : [];
       if (calls.some((c) => typeof c === 'string' && isPublishCapableTool(c))) {
+        // runResults[i] is proven defined here — `calls` came from it via the
+        // `!` cast above, so a match means it was a real object, not undefined.
+        // TypeScript's own array-element type already guarantees this too; no
+        // optional chaining needed.
         everPublished = true;
-        lastPublishAt = runResults[i]?.createdAt;
+        lastPublishAt = runResults[i].createdAt;
         break;
       }
     }
