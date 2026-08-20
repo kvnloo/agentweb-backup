@@ -81,6 +81,45 @@ describe('findUnconsumedCursors', () => {
     expect(out[0].returned).toBe(60); // the whole chain's rows, not just the last page
   });
 
+  it('an INDEPENDENT later call to the same tool does not close an unread chain', () => {
+    // The case that proves cursor-VALUE tracking is load-bearing (CodeRabbit,
+    // #2493). Page 1 of list A leaves C1 unread; the model then runs a fresh,
+    // unrelated query against list B which happens to use the same tool and
+    // returns everything. Closing the chain on "same tool, no cursor" silently
+    // marks list A complete when its page 2 was never fetched.
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('search_leads', { list_id: 'B' }, { leads: new Array(3) }),
+    ];
+    const out = findUnconsumedCursors(ledger);
+    expect(out).toHaveLength(1);
+    expect(out[0].cursor).toBe('C1');
+  });
+
+  it('a later call that FAILED while carrying the cursor has not consumed it', () => {
+    // Attempting to read page 2 is not reading it. If the retry errored, the page
+    // is still unread and the notice must still fire — otherwise a transient
+    // failure silently converts an incomplete run into a complete-looking one,
+    // which is this ticket's entire failure mode.
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('search_leads', { list_id: 'A', cursor: 'C1' }, { error: 'timeout' }, 'error'),
+    ];
+    const out = findUnconsumedCursors(ledger);
+    expect(out).toHaveLength(1);
+    expect(out[0].cursor).toBe('C1');
+  });
+
+  it('INVALID INPUT: an entry with no tool name is skipped, not reported as "a tool"', () => {
+    // A notice naming "a tool" cannot be acted on — the user has nothing to resume
+    // (CodeRabbit, #2493). An unnameable entry is malformed input, and the file's
+    // contract for malformed input is to ignore it.
+    const ledger = [
+      { status: 'success', result: { next_cursor: 'C1', leads: new Array(20) } } as any,
+    ];
+    expect(findUnconsumedCursors(ledger)).toHaveLength(0);
+  });
+
   it('ERROR PATH: a failed call carrying a cursor is not an unread page', () => {
     // Nothing was read, so nothing is unread. Warning here would tell the user to
     // resume a query that never ran, which is a different and worse claim.
