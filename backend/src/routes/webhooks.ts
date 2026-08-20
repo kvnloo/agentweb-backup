@@ -18,7 +18,7 @@ import { emmaEmailService } from '../services/emmaEmailService';
 import { TEMP_EMAIL_PREFIX, TEMP_EMAIL_DOMAIN } from '../config';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { pruneClickIds } from '../utils/leadSchema';
-import { resolveClientIdentity } from '../utils/clientIdentity';
+import { resolveClientIdentityWithForwarded } from '../utils/clientIdentity';
 import { normalizeAttribution, promoteAttributionFromCustomFields } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
@@ -503,6 +503,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // capture route (buildCaptureRoute) — NOT server CAPI-send time. Validated below
       // before ever being trusted.
       capturedAtMs,
+      // ENG-926 §B: the visitor's OWN ip/user-agent, declared by the platform-owned capture
+      // route (buildCaptureRoute) which is the only place they are knowable — the browser
+      // posts to the site's own domain, we only ever see Vercel. Accepted through the
+      // guarded path in clientIdentity.ts, never trusted as-is; see its doc comment for why
+      // a body-supplied value is safe here only under three conditions.
+      //
+      // ⚠ NAMED `visitorIp`/`visitorUserAgent`, NOT `clientIp`/`clientUserAgent`, on purpose.
+      // Any key this handler starts consuming stops appearing in customFields, where the
+      // passthrough collector would otherwise put it. `clientIp` is a plausible enough name
+      // that some existing caller may already be sending it and reading it back out of
+      // customFields, and this route is public — we cannot enumerate its callers. A name
+      // nobody is already using cannot silently take a field away from anyone. It also says
+      // what the value actually is: the VISITOR, not whoever made this request.
+      visitorIp: declaredClientIp,
+      visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
     // Validate required field (email)
@@ -557,12 +572,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // `44.202.76.171` + `node` for a lead that came from an actual iPhone. A wrong IP is
     // worse than no IP — Meta reads it as a match signal and a datacenter address matches
     // nobody — and these attributes are WRITE-ONCE in db.ts, so a wrong one is permanent.
-    // resolveClientIdentity drops BOTH when the caller is not a browser.
+    // resolveClientIdentityWithForwarded drops BOTH when the caller is not a browser AND has
+    // declared nothing — and when it HAS declared, validates the declaration before use.
     const rawClientIp = (
       req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? ''
     ).trim();
     const { clientIp: capturedClientIp, clientUserAgent: capturedUserAgent } =
-      resolveClientIdentity(req.headers['user-agent'], rawClientIp);
+      resolveClientIdentityWithForwarded(req.headers['user-agent'], rawClientIp, {
+        clientIp: declaredClientIp,
+        clientUserAgent: declaredClientUserAgent,
+      });
     if (capturedClientIp) leadData.clientIp = capturedClientIp;
     if (capturedUserAgent) leadData.clientUserAgent = capturedUserAgent;
 
@@ -584,6 +603,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       'listId', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes',
       'linkedin', 'source', 'customFields', 'attribution', 'utm', 'pixelId',
       'metaAccountId', 'eventId', 'fbp', 'fbc', 'capturedAtMs',
+      // ENG-926 §B. Absent from this set they would fall through into customFields as junk
+      // instead of being read as identity — the passthrough collector is deliberately
+      // "anything not handled above", so a newly-handled key MUST be added here too.
+      // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
+      'visitorIp', 'visitorUserAgent',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
