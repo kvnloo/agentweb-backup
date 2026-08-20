@@ -58,6 +58,43 @@ describe('scheduleSignalsPublishIntent', () => {
     expect(scheduleSignalsPublishIntent({})).toBe(false);
     expect(scheduleSignalsPublishIntent({ startingMessage: undefined, scheduleName: undefined })).toBe(false);
   });
+
+  /**
+   * ENG-1245 — "post"/"posts" is the one ambiguous word in the pattern: it is
+   * both the verb (the actual instruction) and a common noun ("recent posts",
+   * "blog post", "the post"). A pure read-only/reporting schedule that happens
+   * to analyze or summarize existing posts would otherwise trip both this
+   * function and the customer-portal hint for having nothing to do with
+   * publishing. "publish"/"tweet"/"reply" don't get this treatment — they are
+   * effectively always verbs in a scheduling-prompt context.
+   */
+  describe('does not false-positive on "post(s)" used as a noun', () => {
+    it.each([
+      'Analyze recent posts and their engagement',
+      'Summarize the latest blog post for the newsletter',
+      'Read the post and extract key quotes',
+      'Report on our social posts from last week',
+      'Which LinkedIn posts got the most reach this month?',
+    ])('%s', (text) => {
+      expect(scheduleSignalsPublishIntent({ startingMessage: text })).toBe(false);
+    });
+  });
+
+  it('still matches "post" used as a verb, including at the start of an instruction', () => {
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Post directly to X. No approval needed.' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Draft the content, then post it to LinkedIn.' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Please post this update immediately.' })).toBe(true);
+  });
+
+  it('still matches when a verb "post" appears alongside a noun-shaped "recent posts" mention', () => {
+    // An instruction can legitimately reference past posts (context) while also
+    // instructing a new one (the actual intent) — the noun mention must not mask it.
+    expect(
+      scheduleSignalsPublishIntent({
+        startingMessage: 'Check our recent posts for tone, then post a new update in the same style.',
+      })
+    ).toBe(true);
+  });
 });
 
 describe('findUngrantedPublishingSchedules (ENG-1245)', () => {

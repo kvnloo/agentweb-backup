@@ -37,7 +37,18 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 // publishing-shaped... 21 whose prompt says post/publish/tweet/reply") — kept
 // deliberately simple and over-inclusive: a false positive here just means a schedule
 // gets a second look, while a false negative means a broken schedule goes unseen.
-const PUBLISH_INTENT_PATTERN = /\b(posts?|publish(es|ing|ed)?|tweets?|repl(y|ies|ied))\b/i;
+//
+// "post"/"posts" is the one ambiguous word: both the verb (the actual instruction) and
+// a common noun ("recent posts", "blog post", "the post"). A schedule that only
+// ANALYZES or SUMMARIZES existing posts — no intent to publish anything — would
+// otherwise be flagged for having nothing to do with this bug class. A short exclusion
+// list of common noun-phrase precursors immediately before "post(s)" cuts the real
+// false positives without full grammatical parsing; "publish"/"tweet"/"reply" don't
+// need this — they are effectively always verbs in a scheduling-prompt context.
+const OTHER_PUBLISH_VERBS_PATTERN = /\b(publish(es|ing|ed)?|tweets?|repl(y|ies|ied))\b/i;
+const POST_PATTERN = /\bposts?\b/i;
+const POST_AS_NOUN_PATTERN =
+  /\b(?:the|a|an|this|that|these|those|recent|latest|new|old|blog|social|linkedin|instagram|facebook|twitter|x)\s+posts?\b/gi;
 
 interface AuditableSchedule extends SchedulePublishAuthorizationInput {
   scheduleId: string;
@@ -61,7 +72,12 @@ export interface UngrantedPublishingScheduleFinding {
 /** Does this schedule's own configuration say it means to publish unattended? */
 export function scheduleSignalsPublishIntent(schedule: { startingMessage?: string; scheduleName?: string; name?: string }): boolean {
   const text = `${schedule?.startingMessage || ''} ${schedule?.scheduleName || schedule?.name || ''}`;
-  return PUBLISH_INTENT_PATTERN.test(text);
+  if (OTHER_PUBLISH_VERBS_PATTERN.test(text)) return true;
+  if (!POST_PATTERN.test(text)) return false;
+  // Strip every noun-phrase occurrence of "post(s)" and see if a bare, verb-shaped one
+  // still remains — e.g. "Check our recent posts, then post a new update" keeps the
+  // second "post" after "recent posts" is stripped.
+  return POST_PATTERN.test(text.replace(POST_AS_NOUN_PATTERN, ''));
 }
 
 function daysBetween(iso: string | undefined, now: Date): number | undefined {
