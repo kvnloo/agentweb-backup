@@ -384,5 +384,19 @@ run_check "$(cd "${SCRIPT_DIR}/../.." && pwd)" \
   backend/.ebextensions/timeout.config
 check 'ENG-836: the live repo timeout.config alone is not a conflict' 0 ''
 
+# ENG-1412: every shell script must avoid the pipefail/SIGPIPE shape that made
+# the mixed-class fixture report a false green.  A structural assertion is
+# deterministic even though the original timing race is not.
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+PIPE_GREP_MATCHES="$(rg -n -U 'printf[^\n]*\|\s*grep\s+-q' "${SCRIPT_DIR}" --glob '*.sh' || true)"
+if [ -z "${PIPE_GREP_MATCHES}" ]; then
+  printf '  ok   %s\n' 'ENG-1412: no CI shell script pipes printf into grep -q under pipefail'
+else
+  printf '  FAIL %s\n       forbidden matches:\n%s\n' \
+    'ENG-1412: no CI shell script pipes printf into grep -q under pipefail' \
+    "${PIPE_GREP_MATCHES}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1
