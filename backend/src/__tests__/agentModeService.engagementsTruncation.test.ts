@@ -54,9 +54,18 @@ const buildEngagements = (n: number) =>
 describe('ENG-1207 — get_lead_engagements must not report a page as a total', () => {
   let service: AgentModeService;
 
+  // Silenced and restored through the LIFECYCLE, not inline. An inline
+  // `mockRestore()` is skipped whenever the test throws first, leaking a muted
+  // console.error into every later test in the process — and a muted error channel
+  // is exactly the kind of thing that hides the next failure (CodeRabbit, #2490).
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     service = new AgentModeService();
+    jest.spyOn(console, 'error').mockImplementation(() => {});
     (mockCrmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId, userId, name: 'L' });
     (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
     (mockCrmDb.getLeadById as jest.Mock).mockResolvedValue({
@@ -224,7 +233,6 @@ describe('ENG-1207 — get_lead_engagements must not report a page as a total', 
     // entirely from the JSON the model reads, so it cannot tell "this lead has no
     // engagements" from "we could not count them" — a milder version of the exact
     // ambiguity this PR exists to remove. Explicit null plus a flag says which.
-    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     (mockCrmDb.getLeadEngagementCount as jest.Mock).mockRejectedValue(new Error('count query failed'));
     (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
       engagements: buildEngagements(143),
@@ -243,8 +251,7 @@ describe('ENG-1207 — get_lead_engagements must not report a page as a total', 
     expect(result.engagementSummary.totalAllMessages).toBeNull();
     // Loud, not silent — the same contract the rest of this file's best-effort
     // catches follow.
-    expect(errSpy).toHaveBeenCalled();
-    errSpy.mockRestore();
+    expect(console.error).toHaveBeenCalled();
   });
 
   it('a SUCCESSFUL count query carries no unavailable flag and real numbers', async () => {
