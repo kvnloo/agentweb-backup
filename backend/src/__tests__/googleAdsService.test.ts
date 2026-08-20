@@ -1697,3 +1697,29 @@ describe('createCampaign — PMax with brand guidelines', () => {
     expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
   });
 });
+
+describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', () => {
+  // callApi had none. An axios request without a timeout waits forever on a stalled
+  // connection — which blocks the agent-mode tool call that made it, and on the
+  // offline-conversion path would stall a background sweep with no error anywhere.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '../services/googleAdsService.ts'), 'utf8');
+
+  it('passes a timeout on both the GET and POST paths', () => {
+    const calls = src.match(/axios\.(get|post)\([^)]*timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS/g) || [];
+    expect(calls).toHaveLength(2);
+  });
+
+  it('leaves no bare axios call in callApi', () => {
+    expect(src).not.toMatch(/await axios\.get\(url, \{ headers \}\)/);
+    expect(src).not.toMatch(/await axios\.post\(url, body, \{ headers \}\)/);
+  });
+
+  it('sets a ceiling generous enough not to fire on a normal slow GAQL read', () => {
+    // A timeout that trips on legitimate traffic turns a slow read into a spurious
+    // failure, which is worse than not having one.
+    const m = src.match(/const GOOGLE_ADS_HTTP_TIMEOUT_MS = ([0-9_]+);/);
+    expect(m).toBeTruthy();
+    expect(Number(m[1].replace(/_/g, ''))).toBeGreaterThanOrEqual(30_000);
+  });
+});

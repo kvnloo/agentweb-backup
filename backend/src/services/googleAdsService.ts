@@ -20,6 +20,21 @@ import {
 } from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
+
+/**
+ * Every Google Ads call goes through callApi, and it had no timeout at all — an axios
+ * request with none waits forever on a stalled connection.
+ *
+ * That is not an abstract risk here. A hung call blocks the agent-mode tool call that
+ * made it, and on the offline-conversion path (ENG-1325) it would stall a background
+ * sweep with nobody watching, so the symptom is "conversions stopped uploading" with no
+ * error anywhere.
+ *
+ * 60s rather than something tighter: a GAQL search over a large account is legitimately
+ * slow, and a timeout that fires on normal traffic is worse than none — it turns a slow
+ * read into a spurious failure. This is a ceiling on hanging, not a latency target.
+ */
+const GOOGLE_ADS_HTTP_TIMEOUT_MS = 60_000;
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
 
 export interface GoogleAdAccount {
@@ -86,8 +101,8 @@ export class GoogleAdsService {
     }
     try {
       const response = method === 'GET'
-        ? await axios.get(url, { headers })
-        : await axios.post(url, body, { headers });
+        ? await axios.get(url, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS })
+        : await axios.post(url, body, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS });
       if (process.env.NODE_ENV !== 'production') {
         console.log('[GoogleAds] callApi response:', JSON.stringify(response.data, null, 2));
       }
