@@ -35,6 +35,7 @@ import {
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -5348,6 +5349,52 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1207 AC3: a run must not finish silently on an unread page.
+      //
+      // Same shape as the two reconcilers above and placed alongside them
+      // deliberately: deterministic, always-on, append-only, patched into the last
+      // assistant message so the persisted transcript matches what the user sees.
+      // It never rewrites the model's text and never claims success — it only adds
+      // the fact that some of the data was not looked at.
+      //
+      // NOT folded into the finalize guard, which is the established
+      // claimed-vs-executed seam: that guard is seen only when AGENT_FINALIZE_GUARD
+      // and AGENT_RUNTIME_SPINE_ENABLED are both on, and both are off in production.
+      // An acceptance criterion that cannot run is the defect it is meant to fix.
+      // The detection lives in a PURE module so the guard can absorb it unchanged
+      // the day those flags flip.
+      //
+      // Why this exists at all when AC1/AC2 already fixed the wording: during
+      // ENG-1200 the response ALREADY carried `has_more: true` and a cursor, and the
+      // model re-ran the identical unpaged query six times, then wrote 17 of 107
+      // records and reported the job complete. A clearer message makes noticing
+      // possible; it does not make it certain.
+      //
+      // Kill switch, not a gate: set AGENT_UNCONSUMED_CURSOR_NOTICE=false to disable.
+      // Absent means ON, so this cannot quietly become inert the way the guard did.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_UNCONSUMED_CURSOR_NOTICE !== 'false') {
+        try {
+          // Same predicate the finalize ledger uses, so the two cannot disagree
+          // about which calls actually executed.
+          const reconciled = reconcileUnconsumedCursors(content, toolCalls, toolCallNeverExecuted);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (cursorError) {
+          // Advisory. A bug here must never block delivery of a reply the user is
+          // waiting on — the failure mode this prevents is a silent overclaim, which
+          // is strictly less bad than losing the message.
+          console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -7140,6 +7187,48 @@ export class AgentModeService {
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
       };
     }
+
+    // ENG-1207: pagination markers survive minimization, for EVERY tool.
+    //
+    // The default branch returned {}, which is right for storage and wrong for the
+    // one consumer that reads this ledger to decide whether a run finished on an
+    // unread page (`reconcileUnconsumedCursors`, at the finalize seam). With the
+    // cursor stripped it saw {} for every call and never fired — the feature was
+    // inert in production while its unit tests passed, because those tests built
+    // ledger entries by hand with un-minimized results and so never crossed this
+    // function. Found by live verification, not by the suite.
+    //
+    // Deliberately GENERIC rather than a list of tool names: a tool that paginates
+    // is describable by its response, and a future one must not have to be
+    // remembered here to be covered.
+    //
+    // Proportionate to the purpose of this function — a cursor string and a boolean,
+    // never the rows. The heavy payload is still dropped.
+    const paginationMarkers: Record<string, unknown> = {};
+    if (result && typeof result === 'object') {
+      for (const key of ['next_cursor', 'nextCursor', 'has_more', 'hasMore']) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === 'string' ? value.trim() : typeof value === 'boolean') {
+          paginationMarkers[key] = value;
+        }
+      }
+      // The COUNT survives too, as a number — the rows themselves do not.
+      //
+      // Without it the notice said "search_leads returned 0 row(s) and more remain
+      // unread" on a call that returned 20, because the row array it counted had
+      // already been stripped here. Found in production; the unit test asserted
+      // only "no undefined/NaN", so zero passed.
+      //
+      // Zero is worse than silence in that sentence: it reads as "this found
+      // nothing", the opposite of what happened.
+      if (Object.keys(paginationMarkers).length > 0) {
+        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+          const value = (result as Record<string, unknown>)[key];
+          if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
+        }
+      }
+    }
+    if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
 
     // For other tools, return empty object to minimize storage
     return {};
@@ -13092,22 +13181,70 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      const [engagementCount, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId),
+      // ENG-1207: the count is fetched alongside the engagements, so a rejection
+      // there rejected BOTH -- taking down a tool whose actual payload was sitting
+      // in the other promise. It is a summary field, not the answer, and since the
+      // message no longer derives its total from it (see below), nothing the caller
+      // asked for depends on it. Degrade the summary, not the tool.
+      const [engagementCountResult, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch((countError) => {
+          // Loud, not silent (CodeRabbit). The bare swallow kept the tool alive but
+          // left no trace, so a count query failing repeatedly would be invisible.
+          console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
+          return null;
+        }),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCountAvailable = engagementCountResult !== null;
+      const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
 
+      // ENG-1207: never report a truncated page as a total. `searchLeads` and
+      // `getLeads` were corrected in #2407; this tool kept saying "Found 20
+      // engagement(s)" for a lead with 143, and a model reads that as "there are
+      // 20" and stops -- the same misread that wrote 17 of 107 records and called
+      // the job done.
+      //
+      // The total is `engagements.length`, NOT `engagementCount.total`, and the
+      // distinction matters. `engagements` is the exact population being sliced,
+      // and it is complete: both of its sources paginate fully (the email-events
+      // query loops on LastEvaluatedKey and returns everything; the rest is a lead
+      // attribute). `engagementCount` is a SEPARATE query that may count a
+      // different population, which would make "20 of 143" inconsistent with the
+      // 20 rows actually returned beside it -- and it can fail independently,
+      // leaving a total that has to be omitted or invented.
+      //
+      // Counting the array we truncated keeps the two numbers describing the same
+      // thing by construction, and removes the failure mode entirely.
+      const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      // A lead with neither name collapses the label to '', leaving
+      // "... engagement(s) for  — raise limit": a double space and a dangling
+      // preposition in a sentence a model parses. Trimming the whole message does
+      // not help, because the gap is in the middle. Drop the clause instead.
+      const forLead = leadLabel ? ` for ${leadLabel}` : '';
+      const truncated = engagements.length > limitedEngagements.length;
+      const engagementMessage = truncated
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s)${forLead} — raise limit to see more.`
+        : `Found ${limitedEngagements.length} engagement(s)${forLead}`;
+
       return {
         success: true,
-        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        message: engagementMessage,
+        // ENG-1207 (CodeRabbit): explicit null, never undefined, plus a flag when
+        // the count is unavailable. An undefined field vanishes from the serialised
+        // payload, so the model cannot tell "this lead has no engagements" from "we
+        // could not count them" -- a milder form of the very ambiguity this change
+        // exists to remove. `?? null` also normalises a partial count object.
         engagementSummary: {
-          total: engagementCount.total,
-          last7Days: engagementCount.last7Days,
-          totalAllMessages: engagementCount.totalAllMessages
+          total: engagementCount.total ?? null,
+          last7Days: engagementCount.last7Days ?? null,
+          totalAllMessages: engagementCount.totalAllMessages ?? null
         },
+        // Only when it actually failed. Stamping it unconditionally would train the
+        // model to ignore it, which is how `has_more` came to be ignored.
+        ...(engagementCountAvailable ? {} : { engagementCountUnavailable: true }),
         engagements: limitedEngagements.map((eng: any) => ({
           eventId: eng.eventId,
           eventType: eng.eventType,
@@ -21878,7 +22015,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: 'No search query provided.',
           query: query || '',
           results: [],
-          totalResults: 0,
+          returnedResults: 0,
+          hasMore: false,
         };
       }
 
@@ -22019,7 +22157,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: `No knowledge base results found for "${query}"`,
           query,
           results: [],
-          totalResults: 0
+          returnedResults: 0,
+          hasMore: false
         };
       }
 
@@ -22028,12 +22167,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // list can be several times larger than requested — cap it to avoid context bloat.
       const boundedResults = results.slice(0, limitedMaxResults);
 
+      // ENG-1207: never present a page as a total. `totalResults` was the worst
+      // instance of this in the file — a structured field NAMED "total" carrying a
+      // page count reads as authoritative in a way prose does not, so a model has
+      // no reason to doubt it. Renamed to `returnedResults`, which is what it
+      // always actually held, plus an explicit `hasMore`.
+      //
+      // Unlike `get_lead_engagements`, no honest total is available here and none
+      // is invented. Each source (Vertex, Drive, ClickUp docs/tasks) is collected
+      // up to `limitedMaxResults` INDEPENDENTLY before merging, so `results.length`
+      // is a floor rather than a count of what matched — a source that returned
+      // exactly its own cap may well have had more. `hasMore` therefore reports
+      // only what is certain: that the merge itself was cut. It can be false while
+      // more exists upstream, which is why the message says "raise max_results"
+      // rather than promising a specific remainder.
+      const hasMore = results.length > boundedResults.length;
       return {
         success: true,
-        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
+        message: hasMore
+          ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
         results: boundedResults,
-        totalResults: boundedResults.length
+        returnedResults: boundedResults.length,
+        hasMore
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -34690,7 +34847,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -34828,6 +34985,58 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
       // the customer's account and is the one operation we cannot undo from our
       // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'OFFLINE_CONVERSION') {
+        if (action !== 'UPLOAD') {
+          return { success: false, error: `OFFLINE_CONVERSION supports UPLOAD only, not ${action}.` };
+        }
+        if (!args.gclid || !args.conversion_action_resource_name || !args.conversion_at) {
+          return {
+            success: false,
+            error: 'gclid, conversion_action_resource_name and conversion_at are all required. '
+              + 'conversion_at is when the conversion HAPPENED (ISO 8601), not when you noticed it — '
+              + 'Google attributes it to that moment.',
+          };
+        }
+        const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
+        /*
+         * The account's own time zone, read from Google rather than assumed. Google
+         * interprets the timestamp in it, so guessing UTC would silently shift every
+         * conversion by the account's real offset — and the only symptom is conversions
+         * landing on the wrong day, which nobody reads as a bug.
+         */
+        const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
+        let conversion: Record<string, unknown>;
+        try {
+          conversion = buildClickConversion({
+            gclid: args.gclid,
+            conversionActionResourceName: args.conversion_action_resource_name,
+            conversionAt: new Date(args.conversion_at),
+            timeZone: tz,
+            value: args.conversion_value,
+            currencyCode: args.currency_code,
+            orderId: args.order_id,
+          });
+        } catch (err: any) {
+          // Refused locally, before the network. An upload runs from a background sweep
+          // with nobody watching, so a rejected batch surfaces days later as "conversions
+          // never appeared".
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+        const out = await googleAdsService.uploadClickConversions(
+          userId, customer_id, [conversion], { validateOnly: args.validate_only === true },
+        );
+        return {
+          success: out.failures.length === 0,
+          validateOnly: args.validate_only === true,
+          uploaded: out.uploaded,
+          failures: out.failures,
+          conversion,
+          ...(out.failures.length > 0
+            ? { error: out.failures.map((f) => `row ${f.index}: ${f.errorCode ?? ''} ${f.message}`.trim()).join('; ') }
+            : {}),
+        };
+      }
+
       if (entity_type === 'CONVERSION_ACTION') {
         if (action === 'LIST') {
           const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
