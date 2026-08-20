@@ -523,6 +523,15 @@ describe('AgentModeService - Social Media Tools', () => {
 
     beforeEach(() => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
+      // ENG-1385: existence is now gated by resolveAccessibleAccount, which reads
+      // getAccountsWithOwnerIncludingOrgShared, not getAccountsByUserId directly.
+      // Every test in this block is an "own account" case (org-shared coverage
+      // lives in agentModeService.socialOrgShared.test.ts) — mirror whatever the
+      // test configures on getAccountsByUserId, tagged with the caller as owner,
+      // so the account resolves the same way through both lookups.
+      mockGetAccountsWithOwnerIncludingOrgShared.mockImplementation(async (uid: string) =>
+        (await mockGetAccountsByUserId(uid)).map((a: any) => ({ ...a, userId: uid }))
+      );
     });
 
     it('should load posts for company page account', async () => {
