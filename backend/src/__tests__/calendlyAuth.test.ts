@@ -820,3 +820,150 @@ describe('refreshCalendlyAccessToken', () => {
     expect(axios.post).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('POST /connect — ENG-1403: a reconnect must not wipe attribution settings', () => {
+  // routes/calendlyAuth.ts rebuilt `config` FROM SCRATCH on every reconnect, so four
+  // settings were silently destroyed. The worst is `attributionDisabled`: a customer who
+  // explicitly opted OUT of Meta tracking (a real, shipped control — connectedAccounts.ts
+  // sets it, calendlyWebhook.ts:294 honours it) was silently opted back IN, and we resumed
+  // sending their booking conversions to Meta.
+  //
+  // Only the OAuth /connect path is affected. Ordinary token refreshes were always safe,
+  // because updateAccountConfig merges with compare-and-swap.
+  //
+  // ⚠ No backfill is possible: nothing recorded what was previously chosen, so anyone who
+  // had already reconnected had already lost these permanently.
+  const USER_URI = 'https://api.calendly.com/users/AAAAAAAAAAAAAAAA';
+
+  const priorAccount = (config: Record<string, unknown>) => ({
+    platform: 'calendly',
+    account_id: 'jane@customer.com',
+    config: {
+      account_type: 'calendly',
+      user_uri: USER_URI,
+      // Stale credentials that must NOT be carried forward — this is why the fix has to be
+      // an allowlist rather than a spread of the prior config.
+      access_token: 'STALE-access-token',
+      refresh_token: 'STALE-refresh-token',
+      webhook_id: 'https://api.calendly.com/webhook_subscriptions/STALE',
+      ...config,
+    },
+  });
+
+  const reconnectWith = async (config: Record<string, unknown>) => {
+    const fin = await initAndFinalize();
+    getAccountsByUserId.mockResolvedValueOnce([priorAccount(config)] as any);
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+    expect(res.status).toBe(200);
+    return createAccount.mock.calls[0][2].config;
+  };
+
+  it('PRESERVES an explicit opt-out across a reconnect', async () => {
+    const cfg = await reconnectWith({ attributionDisabled: true });
+    expect(cfg.attributionDisabled).toBe(true);
+  });
+
+  it('preserves attributionDisabled: FALSE — it is a real value, not an absence', async () => {
+    // A truthiness check would drop this and make the record silently forget that the
+    // customer had deliberately opted back IN.
+    const cfg = await reconnectWith({ attributionDisabled: false });
+    expect(cfg.attributionDisabled).toBe(false);
+  });
+
+  it('preserves the chosen pixel, ad account and booking lead list', async () => {
+    const cfg = await reconnectWith({
+      attributionPixelId: '1430870751246428',
+      attributionAccountId: '922903076601160',
+      booking_lead_list_id: 'list_1784283371141_3jtajhue5',
+    });
+    expect(cfg.attributionPixelId).toBe('1430870751246428');
+    expect(cfg.attributionAccountId).toBe('922903076601160');
+    expect(cfg.booking_lead_list_id).toBe('list_1784283371141_3jtajhue5');
+  });
+
+  it('⚠ does NOT carry forward stale credentials or the old webhook id', async () => {
+    // The reason the fix is an allowlist. A blanket `...prior` spread would resurrect a
+    // dead access_token and an orphaned webhook_id, turning a settings bug into a
+    // credentials bug.
+    const cfg = await reconnectWith({ attributionDisabled: true });
+    expect(cfg.access_token).toBe('access-1');
+    expect(cfg.refresh_token).toBe('refresh-1');
+    expect(cfg.webhook_id).toBe(
+      'https://api.calendly.com/webhook_subscriptions/CCCCCCCCCCCCCCCC',
+    );
+    expect(cfg.access_token).not.toBe('STALE-access-token');
+  });
+
+  it('⚠ does NOT resurrect an ORPHANED webhook_id when the reconnect provisions none', async () => {
+    // This is the case a blanket `...prior` spread genuinely breaks, and the reason the
+    // allowlist matters. Every other field is re-stated explicitly below the spread and so
+    // would be overwritten — but `webhook_id`/`webhook_signing_key` are written ONLY when
+    // booking tracking is active. On a downgraded plan the spread would carry a webhook id
+    // that no longer exists on Calendly's side, and the webhook route would then verify
+    // deliveries against a signing key for a subscription that is gone.
+    //
+    // Found by a surviving mutation, not by review: the earlier "stale credentials" test
+    // passed against a spread, because the tokens are re-stated and override it.
+    const fin = await initAndFinalize();
+    getAccountsByUserId.mockResolvedValueOnce([
+      priorAccount({ attributionDisabled: true }),
+    ] as any);
+    axios.post.mockRejectedValueOnce({
+      response: { status: 403, data: { message: 'You must be on a paid plan to use this feature.' } },
+    });
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+    expect(res.status).toBe(200);
+
+    const cfg = createAccount.mock.calls[0][2].config;
+    expect(cfg.booking_tracking_active).toBe(false);
+    expect(cfg.webhook_id).toBeUndefined();
+    expect(cfg.webhook_signing_key).toBeUndefined();
+    // ...while the customer's choice still survives.
+    expect(cfg.attributionDisabled).toBe(true);
+  });
+
+  it('omits the keys entirely on a FIRST connection, rather than writing undefined', async () => {
+    const fin = await initAndFinalize();
+    getAccountsByUserId.mockResolvedValueOnce([] as any);
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    const cfg = createAccount.mock.calls[0][2].config;
+    expect('attributionDisabled' in cfg).toBe(false);
+    expect('attributionPixelId' in cfg).toBe(false);
+    expect('booking_lead_list_id' in cfg).toBe(false);
+  });
+
+  it('ignores another Calendly identity\'s settings — matching stays on user_uri', async () => {
+    // Tenant safety: a different user_uri is a different person's connection.
+    const fin = await initAndFinalize();
+    getAccountsByUserId.mockResolvedValueOnce([
+      {
+        platform: 'calendly',
+        account_id: 'someone-else@customer.com',
+        config: {
+          account_type: 'calendly',
+          user_uri: 'https://api.calendly.com/users/ZZZZZZZZZZZZZZZZ',
+          attributionDisabled: true,
+          attributionPixelId: 'SOMEONE-ELSES-PIXEL',
+        },
+      },
+    ] as any);
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    const cfg = createAccount.mock.calls[0][2].config;
+    expect('attributionDisabled' in cfg).toBe(false);
+    expect('attributionPixelId' in cfg).toBe(false);
+  });
+});
