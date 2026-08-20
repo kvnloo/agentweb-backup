@@ -242,7 +242,20 @@ describe('isPublicIpAddress', () => {
     // ...while real global unicast still passes.
     expect(isPublicIpAddress('2606:4700:4700::1111')).toBe(true);
     expect(isPublicIpAddress('2001:4860:4860::8888')).toBe(true);
-    expect(isPublicIpAddress('3ffe::1')).toBe(true);
+  });
+
+  it('rejects special-purpose ranges INSIDE 2000::/3 — global unicast is not enough', () => {
+    // ⚠ My own first version asserted 3ffe::1 was ACCEPTABLE. It is not: 3ffe::/16 is IANA
+    // reserved (the deprecated 6bone). Caught by CodeRabbit on #2535 — a wrong assertion in a
+    // test is worse than a missing one, because it actively certifies the bug.
+    expect(isPublicIpAddress('3ffe::1')).toBe(false);      // reserved, former 6bone
+    expect(isPublicIpAddress('3fff::1')).toBe(false);      // documentation 3fff::/20
+    expect(isPublicIpAddress('2001:2::1')).toBe(false);    // benchmarking
+    expect(isPublicIpAddress('2001::1')).toBe(false);      // Teredo / IETF protocol assignments
+    expect(isPublicIpAddress('2002::1')).toBe(false);      // 6to4, deprecated
+    // ...while real allocated global unicast is untouched.
+    expect(isPublicIpAddress('2001:4860:4860::8888')).toBe(true); // Google, 2001:4860 > 2001:01ff
+    expect(isPublicIpAddress('2606:4700:4700::1111')).toBe(true); // Cloudflare
   });
 
   it('parses every valid spelling of the SAME global address identically', () => {

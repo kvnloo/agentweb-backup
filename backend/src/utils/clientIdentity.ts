@@ -242,7 +242,22 @@ function isPublicIpv6(hextets: number[]): boolean {
   }
 
   if (hextets[0] < 0x2000 || hextets[0] > 0x3fff) return false; // not global unicast
-  if (hextets[0] === 0x2001 && hextets[1] === 0x0db8) return false; // documentation
+
+  // Special-purpose ranges that sit INSIDE 2000::/3 and are not globally reachable.
+  // Global unicast is the right allowlist, but it is not sufficient on its own.
+  if (hextets[0] === 0x2001 && hextets[1] <= 0x01ff) return false; // IETF protocol assignments
+                                                                  // 2001::/23 — Teredo, ORCHID,
+                                                                  // benchmarking 2001:2::/48
+  if (hextets[0] === 0x2001 && hextets[1] === 0x0db8) return false; // documentation 2001:db8::/32
+  if (hextets[0] === 0x2002) return false;                          // 6to4, deprecated
+  if (hextets[0] === 0x3ffe) return false;                          // reserved (former 6bone)
+  if (hextets[0] === 0x3fff && hextets[1] <= 0x0fff) return false;  // documentation 3fff::/20
+
+  // ⚠ DELIBERATELY NOT tracking IANA's unassigned space. Rejecting everything not yet
+  // allocated would mean rejecting legitimately routable addresses as the space IS allocated,
+  // and a hardcoded allocation table goes stale silently — the failure mode would be dropping
+  // real visitors' IPs, which is worse than accepting an address nobody can route. Known
+  // special-purpose ranges are rejected; unassigned global unicast is accepted.
   return true;
 }
 
