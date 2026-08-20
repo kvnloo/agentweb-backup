@@ -798,7 +798,10 @@ export default function WorkPlans() {
 
             <Box>
               <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
-                <Typography variant="subtitle2">Steps</Typography>
+                <Box>
+                  <Typography variant="subtitle2">Customer journey</Typography>
+                  <Typography variant="caption" color="text.secondary">Write what the customer sees first. Keep agent-only instructions tucked away.</Typography>
+                </Box>
                 <Button size="small" startIcon={<AddIcon />} onClick={addStep}>Add Step</Button>
               </Box>
               {steps.map((step, i) => (
@@ -808,15 +811,8 @@ export default function WorkPlans() {
                     <TextField
                       value={step.title}
                       onChange={(e) => updateStep(i, "title", e.target.value)}
-                      placeholder={`Step ${i + 1} title`}
-                      size="small"
-                      fullWidth
-                      sx={{ mb: 0.5 }}
-                    />
-                    <TextField
-                      value={step.description || ""}
-                      onChange={(e) => updateStep(i, "description", e.target.value)}
-                      placeholder="LLM prompt for this step (not shown to users)"
+                      label="Step name"
+                      placeholder={`e.g., Share your event guest list`}
                       size="small"
                       fullWidth
                       sx={{ mb: 0.5 }}
@@ -827,7 +823,8 @@ export default function WorkPlans() {
                         const next = e.target.value.slice(0, USER_INSTRUCTIONS_MAX_LENGTH);
                         updateStep(i, "userInstructions", next);
                       }}
-                      placeholder="User Instructions: what should the user do at this step? What should they expect? (Shown to users when they expand this step.)"
+                      label="What should the customer do?"
+                      placeholder="e.g., Paste the guest-list link. Emma will pull in recent registrations."
                       size="small"
                       fullWidth
                       multiline
@@ -847,6 +844,22 @@ export default function WorkPlans() {
                       }}
                       sx={{ mb: 0.5 }}
                     />
+                    <Box component="details" sx={{ mb: 1 }}>
+                      <Box component="summary" sx={{ cursor: "pointer", color: "text.secondary", fontSize: "0.8rem", mb: 1 }}>
+                        Advanced agent instructions
+                      </Box>
+                      <TextField
+                        value={step.description || ""}
+                        onChange={(e) => updateStep(i, "description", e.target.value)}
+                        label="Instructions for Emma only"
+                        placeholder="Optional context, rules, or constraints for the agent"
+                        size="small"
+                        fullWidth
+                        multiline
+                        minRows={2}
+                        helperText="Customers never see this text."
+                      />
+                    </Box>
                     <Autocomplete
                       multiple
                       freeSolo
