@@ -20,6 +20,7 @@ const WORK_PLAN_STEP_FIELDS = new Set([
   'requiredFunctionCalls',
   'skillIds',
   'expectedAssetCount',
+  'inputRequest',
 ]);
 
 export interface NormalizedWorkPlanSteps {
@@ -88,6 +89,7 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       requiredFunctionCalls: listOf('requiredFunctionCalls'),
       skillIds: listOf('skillIds'),
       ...(keepAssetCount && { expectedAssetCount: assetCount }),
+      ...(s.inputRequest !== undefined && { inputRequest: s.inputRequest }),
     };
   });
 
@@ -123,6 +125,7 @@ const STEP_CONTENT_FIELDS = [
   'skillIds',
   'userInstructions',
   'expectedAssetCount',
+  'inputRequest',
 ] as const;
 
 function isEmptyStepValue(value: unknown): boolean {

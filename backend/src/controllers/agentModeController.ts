@@ -14,6 +14,7 @@ import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -7194,7 +7195,7 @@ export const agentModeController = {
     let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
+      const { sessionId, llmModel, llmBackupModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer, workPlanInputAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -7322,6 +7323,29 @@ export const agentModeController = {
           // the REAL answer rather than silently discarding it.
           const fresh = await chatbotDb.getChatSession(sessionId);
           session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
+      }
+
+      // Work-plan details are validated and persisted as structured values before
+      // Emma receives the continuation. This keeps chat and MCP answers identical
+      // and makes duplicate submits fail closed instead of overwriting the first.
+      if (workPlanInputAnswer) {
+        try {
+          const answered = resolveWorkPlanInputAnswer(
+            session.pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          userMessage = `${userMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
         }
       }
 
@@ -11715,6 +11739,7 @@ export const agentModeController = {
           // panel. Without this, the field set in the partner-portal
           // editor never reaches the customer portal.
           ...(step.userInstructions !== undefined && { userInstructions: step.userInstructions }),
+          ...(step.inputRequest !== undefined && { inputRequest: step.inputRequest }),
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
@@ -11734,6 +11759,14 @@ export const agentModeController = {
         requireLogin: predefinedPlan.requireLogin || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+      const firstInput = predefinedPlan.steps[0]?.inputRequest;
+      if (firstInput) {
+        await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, buildWorkPlanInputRequest({
+          ...firstInput,
+          requestId: uuidv4(),
+          stepCount: 1,
+        }), { failIfAwaitingExists: true });
+      }
 
       // Auto-install ALL skills from ALL work plan steps upfront.
       // Skills need to be available from the start because tool filtering is computed
