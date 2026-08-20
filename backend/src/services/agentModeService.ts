@@ -34599,12 +34599,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
         if (action === 'REMOVE') {
+          if (!args.conversion_action_resource_name) {
+            return { success: false, error: 'conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.' };
+          }
+          /*
+           * Permanent and not re-enableable, so it goes through an explicit confirmation —
+           * the follow-up shape ENG-1329 anticipated ("if REMOVE is needed later, it's a
+           * small additive follow-up with its own explicit confirmation step").
+           *
+           * The message states what removal ACTUALLY does. The previous wording said it
+           * "severs historical attribution", which is not true and would talk someone out
+           * of a safe operation: Google models this as a soft state — the action stops
+           * recording, and conversions already recorded stay in reporting, exactly as a
+           * REMOVED campaign still returns its historical metrics.
+           */
+          if (args.confirm_conversion_action_removal !== true) {
+            return {
+              success: false,
+              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
+                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
+                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
+                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+            };
+          }
+          await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
           return {
-            success: false,
-            error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
-              + 'historical attribution in the account and cannot be undone. To stop an action from '
-              + 'recording, use CONVERSION_ACTION UPDATE with status=HIDDEN instead (NOT PAUSED — a '
-              + 'conversion action has no PAUSED status; that is a campaign status).',
+            success: true,
+            message: `Conversion action removed. It has stopped recording and cannot be re-enabled; `
+              + `conversions it already recorded remain in reporting.`,
           };
         }
       }
