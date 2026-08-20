@@ -255,9 +255,22 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
 
   it('treats "no longer needed" as a reason to annotate, never a license to withhold', () => {
     const lower = directive.toLowerCase();
-    expect(lower).toMatch(/withholding a required deliverable is justified only when/);
+    expect(lower).toMatch(/withholding is justified only when/);
     expect(lower).toContain('factually false');
-    expect(lower).not.toMatch(/stale.{0,40}(withhold|omit|suppress)/);
+    expect(lower).not.toMatch(/\bstale\b.{0,40}(withhold|omit|suppress)/);
+  });
+
+  // CodeRabbit flagged the "withholding is justified only when factually false"
+  // framing as a merge risk: read as a general rule (rather than scoped to the
+  // staleness case), it could appear to override the PUBLISH AUTHORIZATION
+  // contract or the DATA-MINIMIZATION guard on billing/Stripe fields elsewhere
+  // in this same directive — neither of which withholds for factual-falseness
+  // reasons. The rule must explicitly disclaim jurisdiction over those.
+  it('does not let the factually-false carve-out override publish authorization or data-minimization withholding', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toMatch(/governs only the staleness case/);
+    expect(lower).toContain('publish authorization');
+    expect(lower).toContain('data-minimization');
   });
 
   it('requires the correction to be an addition to the required output, not a replacement for it', () => {
