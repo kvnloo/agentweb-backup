@@ -240,4 +240,56 @@ describe('Slack internal-author guard (ENG-1263)', () => {
     );
     expect(internalSkipLog).toBeDefined();
   });
+
+  // CodeRabbit (PR #2508): the top-level-message guard above and this monitored triggered-thread
+  // reply path independently re-implemented the same "is this internal" check, and only the
+  // top-level one was fixed initially — an allowlisted internal user replying in a monitored
+  // thread with an unresolved email still fell through the exact same fail-open gap. Both paths
+  // now share `isInternalSlackAuthor()`; these tests cover the thread-reply path directly.
+  describe('monitored triggered-thread reply path', () => {
+    const threadReply = (user: string, text: string) =>
+      request(app)
+        .post('/api/slack/events')
+        .send({
+          type: 'event_callback',
+          event: {
+            type: 'message',
+            user,
+            text,
+            channel: 'C12345',
+            ts: '1234567891.000000',
+            thread_ts: '1234567890.123456',
+          },
+        });
+
+    beforeEach(() => {
+      // Thread mapping marks this as a monitored (email-only) session
+      settingsService.getSetting.mockResolvedValue({
+        settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123', type: 'triggered' }),
+      });
+      chatbotDb.getChatSession.mockResolvedValue({ sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o' });
+    });
+
+    it('skips a known-internal reply even when the email cannot be resolved (the exact gap CodeRabbit flagged)', async () => {
+      mockGetSlackUserEmail.mockResolvedValue(null);
+
+      const res = await threadReply(HARSHA_SLACK_ID, 'Following up on the numbers');
+      expect(res.status).toBe(200);
+      await flushAsync();
+
+      expect(generateSessionResponse).not.toHaveBeenCalled();
+      expect(mockSendSlackTriggeredSessionEmail).not.toHaveBeenCalled();
+    });
+
+    it('still generates a response and emails for a genuine external reply whose email fails to resolve (no over-correction)', async () => {
+      mockGetSlackUserEmail.mockResolvedValue(null);
+
+      const res = await threadReply('U_CUSTOMER_UNRESOLVED', 'Following up on this');
+      expect(res.status).toBe(200);
+      await flushAsync();
+
+      expect(generateSessionResponse).toHaveBeenCalled();
+      expect(mockSendSlackTriggeredSessionEmail).toHaveBeenCalled();
+    });
+  });
 });

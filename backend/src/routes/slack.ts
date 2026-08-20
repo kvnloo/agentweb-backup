@@ -57,6 +57,19 @@ const INTERNAL_SLACK_USER_IDS = new Set(
     .filter(Boolean)
 );
 
+// Shared by every path that gates on "is this our own team talking, not the customer" — the
+// initial top-level message check and the monitored triggered-thread reply check both need the
+// same two-signal predicate (CodeRabbit flagged the latter still being email-only on PR #2508:
+// an allowlisted internal user replying in a monitored thread with an unresolved email fell
+// through the same fail-open gap this row exists to close). Email comparison is
+// case-insensitive — Slack profile emails aren't guaranteed lowercase.
+function isInternalSlackAuthor(slackUserId: string, senderEmail: string | null): boolean {
+  return (
+    INTERNAL_SLACK_USER_IDS.has(slackUserId) ||
+    (!!senderEmail && senderEmail.toLowerCase().endsWith('@agentweb.pro'))
+  );
+}
+
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -166,10 +179,8 @@ async function handleSlackTriggeredSession(params: {
     // Two independent signals, either one is sufficient: a resolved @agentweb.pro email, or a known
     // internal Slack user ID (checked first — it doesn't depend on email resolution succeeding).
     const senderEmail = await getSlackUserEmail(slackUserId);
-    const isInternalById = INTERNAL_SLACK_USER_IDS.has(slackUserId);
-    const isInternalByEmail = !!senderEmail && senderEmail.endsWith('@agentweb.pro');
 
-    if (isInternalById || isInternalByEmail) {
+    if (isInternalSlackAuthor(slackUserId, senderEmail)) {
       console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${slackUserId}${senderEmail ? `, ${senderEmail}` : ''})`);
       return;
     }
@@ -973,10 +984,12 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             if (isTriggered) {
               // Monitored (email-only) session — continue it and send email, do NOT post to Slack
               if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
+                // Skip replies from AgentWeb team members — no suggest needed for our own team's
+                // comments. Same two-signal predicate as the top-level message guard (ENG-1263):
+                // a known-internal ID doesn't depend on email resolution succeeding.
                 const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
+                if (isInternalSlackAuthor(slackUserId, replySenderEmail)) {
+                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${slackUserId}${replySenderEmail ? `, ${replySenderEmail}` : ''})`);
                   return;
                 }
 
