@@ -160,27 +160,30 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
 
       /*
-       * SUPERSEDED by ENG-759 (approved by Harsha 2026-07-30: "opus 5 as default
-       * is fine"). ENG-744's AC #5 was "merely ADDING the Claude 5 family must not
-       * re-route the default" — that guard was correct for ENG-744 and is still
-       * the intent here: the default only moves by an explicit, approved decision.
-       * ENG-759 is that decision, so the expected value changes from 'gpt-5.5' to
-       * Opus 5 while the guard itself is kept (it would still catch an accidental
-       * re-route caused by a future catalog addition).
+       * SUPERSEDED again 2026-08-19 (Harsha, live picker review: default moved
+       * off Opus, through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — see
+       * the comment above the default_model field and
+       * agentModeService.defaultModelGemini37Flash.test.ts). ENG-744's AC #5
+       * was "merely ADDING the Claude 5 family must not re-route the default"
+       * — that guard is still the intent here: the default only moves by an
+       * explicit, approved decision. This is that decision, so the expected
+       * value changes to Gemini 3.7 Flash while the guard itself is kept (it
+       * would still catch an accidental re-route caused by a future catalog
+       * addition).
        */
-      it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
+      it('AC #5 — default model only moves by explicit decision (now Gemini 3.7 Flash, 2026-08-19)', async () => {
         // `default_model` is a field initializer and
         // AZURE_OPENAI_DEPLOYMENT_AGENT_MODE takes precedence over the literal,
         // so any runner exporting a deployment override (backend/.env sets one)
         // silently defeated this guard — it asserted the environment rather than
         // the code. Establish the no-override state and construct AFTER clearing,
-        // or the field is already resolved. Same reasoning as the ENG-759 suite
-        // in agentModeService.defaultModelOpus5.test.ts.
+        // or the field is already resolved. Same reasoning as the suite in
+        // agentModeService.defaultModelGemini37Flash.test.ts.
         const envOverride = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
         const savedOverride = process.env[envOverride];
         delete process.env[envOverride];
         try {
-          expect(new AgentModeService().default_model).toBe('anthropic.claude-opus-5');
+          expect(new AgentModeService().default_model).toBe('gemini-3.7-flash');
         } finally {
           if (savedOverride === undefined) {
             delete process.env[envOverride];
@@ -350,7 +353,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         'anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-4-6', 'anthropic.claude-sonnet-4-5-20250929-v1:0',
         'anthropic.claude-haiku-4-5-20251001-v1:0',
         'gpt-5.5', 'gpt-5.4', 'gpt-5.4-nano',
-        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.1-flash-lite',
+        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.7-flash', 'gemini-3.1-flash-lite',
         'openrouter/openai/gpt-4o-mini', 'openrouter/x-ai/grok-4.6',
         'openrouter/deepseek/deepseek-v4-pro', 'openrouter/deepseek/deepseek-v4-flash',
         'openrouter/qwen/qwen3.8-max', 'openrouter/mistralai/mistral-small-2603',
@@ -457,16 +460,14 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(sonnet5.legacy).toBeUndefined();
       });
 
-      // Gemini 3.1 Pro Preview and Gemini 3.5 Flash land in the same cost
-      // band with Flash scoring higher quality at a lower cost — if they
-      // shared a `family`, Flash would dominate Pro Preview by the same
-      // rule that flags GPT-5.4 Nano above. They don't share one (no
-      // Gemini model carries a `family` tag at all), so Flash correctly
-      // never marks Flash-Lite/Flash legacy either way.
-      it('does NOT flag Gemini 3.5 Flash as legacy — no `family` tag on any Gemini model, so never auto-dominated', async () => {
+      // Gemini 3.1 Flash Lite is deliberately kept out of the `gemini-flash`
+      // family (3.5/3.7 Flash) — it's a distinct "lightest/fastest"
+      // positioning, same reasoning as gpt5-chat vs gpt5-nano — so it must
+      // never be auto-dominated no matter what lands in the same cost band.
+      it('does NOT flag Gemini 3.1 Flash Lite as legacy — no `family` tag, so never auto-dominated', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        const flash = models.find((m) => m.id === 'gemini-3.5-flash')!;
-        expect(flash.legacy).toBeUndefined();
+        const flashLite = models.find((m) => m.id === 'gemini-3.1-flash-lite')!;
+        expect(flashLite.legacy).toBeUndefined();
       });
 
       it('still marks the pre-existing manually-legacy models legacy regardless of dominance', async () => {
@@ -486,9 +487,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         }
       });
 
-      it('does NOT mark the non-preview Gemini models legacy', async () => {
+      it('does NOT mark the non-preview, non-dominated Gemini models legacy', async () => {
         const models = await agentModeService.getSupportedModelsWithMetadata(false);
-        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.5-flash']) {
+        // gemini-3.5-flash is deliberately excluded here — it's now correctly
+        // legacy, dominated band-for-band by gemini-3.7-flash (see above).
+        for (const id of ['gemini-3.1-flash-lite', 'gemini-3.7-flash']) {
           expect(models.find((m) => m.id === id)!.legacy).toBeUndefined();
         }
       });
@@ -523,6 +526,35 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect(terra.qualityScore).toBeGreaterThanOrEqual(gpt55.qualityScore!);
         expect(terra.costScore!).toBeLessThanOrEqual(gpt55.costScore!);
         expect(gpt55.legacy).toBe(true);
+      });
+
+      // Harsha: "did you add Gemini 3.7 Flash, and then make legacy what it
+      // beats band for band?" — Gemini 3.5 Flash is exactly that case: same
+      // `gemini-flash` family, Gemini 3.7 Flash is both cheaper (cost tier
+      // 'cheap' vs 3.5's 'medium') and higher quality (56 vs 52).
+      it('flags Gemini 3.5 Flash as legacy — Gemini 3.7 Flash beats it band for band', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash35 = models.find((m) => m.id === 'gemini-3.5-flash')!;
+        const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
+        expect(flash37.qualityScore).toBeGreaterThan(flash35.qualityScore!);
+        expect(flash37.tier).not.toBe(flash35.tier);
+        expect(flash35.legacy).toBe(true);
+      });
+
+      it('Gemini 3.7 Flash itself is never auto-flagged legacy — it is the dominator, not the dominated', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flash37 = models.find((m) => m.id === 'gemini-3.7-flash')!;
+        expect(flash37.legacy).toBeUndefined();
+      });
+
+      // Gemini 3.1 Flash Lite is a distinct "lightest/fastest" positioning
+      // (same reasoning as gpt5-chat vs gpt5-nano), so it deliberately does
+      // NOT share a family with Flash/Flash Lite — it must not get swept into
+      // legacy just because it happens to share Gemini 3.7 Flash's cost band.
+      it('does NOT flag Gemini 3.1 Flash Lite as legacy from Gemini 3.7 Flash — different positioning, no shared family', async () => {
+        const models = await agentModeService.getSupportedModelsWithMetadata(true);
+        const flashLite = models.find((m) => m.id === 'gemini-3.1-flash-lite')!;
+        expect(flashLite.legacy).toBeUndefined();
       });
     });
 

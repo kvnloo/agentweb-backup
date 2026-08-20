@@ -155,6 +155,9 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.1-pro-preview': withDerivedCache(2, 12), // was 1.25/10 — stale
   'gemini-3.1-flash-lite': withDerivedCache(0.25, 1.5), // was 0.075/0.3 — stale
   'gemini-3.5-flash': withDerivedCache(1.5, 9), // was 0.15/0.6 — stale
+  // Google's official introductory rate (ai.google.dev), verified live 2026-08-19.
+  // Scheduled to increase to $1.50/$7.50 on 2027-01-01 — not modeled here yet.
+  'gemini-3.7-flash': withDerivedCache(0.75, 3.75),
   'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
   'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // $0.75/$4.50 text tokens — verified (langcopilot/cloudprice, 2026). SCOPE: audio/video tokens on the Live API bill at higher per-modality rates not modeled here; this is the text-token approximation used for cost metering.
   // Deep Research agents (Gemini) report usage via usageMetadata and run on

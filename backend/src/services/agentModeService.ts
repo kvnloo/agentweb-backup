@@ -1162,7 +1162,12 @@ export class AgentModeService {
   // `agent_mode_default_model` setting when one is configured (getDefaultModel).
   // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
   // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
+  // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
+  // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
+  // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
+  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // every other model in the `gemini-flash` family band for band.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -3032,7 +3037,19 @@ export class AgentModeService {
     'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
+    // live against three independent sources (ai.google.dev/deepmind.google/
+    // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
+    // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
+    // of it — 3.6 is deliberately skipped (never added to this registry) since
+    // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
+    // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
+    // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
+    // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
+    // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
+    // Flash is now correctly auto-flagged legacy.
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
