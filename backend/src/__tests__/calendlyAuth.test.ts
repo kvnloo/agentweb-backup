@@ -846,6 +846,10 @@ describe('POST /connect — ENG-1403: a reconnect must not wipe attribution sett
       access_token: 'STALE-access-token',
       refresh_token: 'STALE-refresh-token',
       webhook_id: 'https://api.calendly.com/webhook_subscriptions/STALE',
+      // Paired with webhook_id on purpose: a spread that retained the id would retain THIS
+      // too, and the webhook route verifies deliveries against it. A fixture without it
+      // cannot catch that, which is what made the assertion below weaker than it looked.
+      webhook_signing_key: 'STALE-webhook-signing-key',
       ...config,
     },
   });
@@ -924,6 +928,7 @@ describe('POST /connect — ENG-1403: a reconnect must not wipe attribution sett
     expect(cfg.booking_tracking_active).toBe(false);
     expect(cfg.webhook_id).toBeUndefined();
     expect(cfg.webhook_signing_key).toBeUndefined();
+    expect(cfg.webhook_signing_key).not.toBe('STALE-webhook-signing-key');
     // ...while the customer's choice still survives.
     expect(cfg.attributionDisabled).toBe(true);
   });
@@ -939,6 +944,7 @@ describe('POST /connect — ENG-1403: a reconnect must not wipe attribution sett
     const cfg = createAccount.mock.calls[0][2].config;
     expect('attributionDisabled' in cfg).toBe(false);
     expect('attributionPixelId' in cfg).toBe(false);
+    expect('attributionAccountId' in cfg).toBe(false);
     expect('booking_lead_list_id' in cfg).toBe(false);
   });
 
