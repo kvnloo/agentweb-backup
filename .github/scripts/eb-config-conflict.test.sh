@@ -390,6 +390,25 @@ check 'ENG-836: the live repo timeout.config alone is not a conflict' 0 ''
 # detector broad enough to cover continued lines, combined short options, and
 # the long quiet option.
 PIPE_GREP_PATTERN='printf(?:[^\n]|\\\n)*\|\s*grep\s+(?:-[^\s]*q[^\s]*|--quiet(?:\s|$))'
+# Keep this assertion dependency-free: GitHub's stock runner does not install
+# ripgrep. Python is already required by the repository's CI tooling and lets
+# the detector safely span shell line continuations.
+find_pipe_grep_matches() {
+  python3 - "${PIPE_GREP_PATTERN}" "$@" <<'PY'
+import pathlib
+import re
+import sys
+
+pattern = re.compile(sys.argv[1])
+for raw_path in sys.argv[2:]:
+    path = pathlib.Path(raw_path)
+    text = path.read_text(encoding="utf-8")
+    for match in pattern.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        snippet = match.group(0).replace("\n", r"\n")
+        print(f"{path}:{line}:{snippet}")
+PY
+}
 PIPE_GREP_FIXTURES="${WORKDIR}/pipe-grep-fixtures"
 mkdir -p "${PIPE_GREP_FIXTURES}"
 cat >"${PIPE_GREP_FIXTURES}/combined-short.sh" <<'EOF'
@@ -402,9 +421,9 @@ cat >"${PIPE_GREP_FIXTURES}/continued.sh" <<'EOF'
 printf '%s' "value" \
   | grep -qF "value"
 EOF
-PIPE_GREP_FIXTURE_MATCHES="$(rg -n -U "${PIPE_GREP_PATTERN}" "${PIPE_GREP_FIXTURES}" --glob '*.sh' || true)"
+PIPE_GREP_FIXTURE_MATCHES="$(find_pipe_grep_matches "${PIPE_GREP_FIXTURES}"/*.sh || true)"
 TESTS_RUN=$(( TESTS_RUN + 1 ))
-if [ "$(rg -l -U "${PIPE_GREP_PATTERN}" "${PIPE_GREP_FIXTURES}" --glob '*.sh' | wc -l)" -eq 3 ]; then
+if [ "$(find_pipe_grep_matches "${PIPE_GREP_FIXTURES}"/*.sh | wc -l)" -eq 3 ]; then
   printf '  ok   %s\n' 'ENG-1412: detector catches combined, long, and continued printf-to-grep forms'
 else
   printf '  FAIL %s\n       detector output:\n%s\n' \
@@ -413,8 +432,9 @@ else
   TESTS_FAILED=$(( TESTS_FAILED + 1 ))
 fi
 
-PIPE_GREP_MATCHES="$(rg -n -U "${PIPE_GREP_PATTERN}" "${SCRIPT_DIR}" \
-  --glob '*.sh' --glob '!eb-config-conflict.test.sh' || true)"
+mapfile -t CI_SHELL_SCRIPTS < <(find "${SCRIPT_DIR}" -maxdepth 1 -name '*.sh' \
+  ! -name 'eb-config-conflict.test.sh' -print)
+PIPE_GREP_MATCHES="$(find_pipe_grep_matches "${CI_SHELL_SCRIPTS[@]}" || true)"
 TESTS_RUN=$(( TESTS_RUN + 1 ))
 if [ -z "${PIPE_GREP_MATCHES}" ]; then
   printf '  ok   %s\n' 'ENG-1412: no CI shell script pipes printf into grep -q under pipefail'
