@@ -21,12 +21,15 @@
  * reporting lag, timezone slop, or sampling — it means the events are not landing.
  */
 
+const sendOncallAlert = jest.fn().mockResolvedValue(undefined);
+jest.mock('../services/emailService', () => ({ emailService: { sendOncallAlert } }));
+
 import {
   evaluateDivergence,
   DIVERGENCE_MIN_SAMPLE,
   countPixelRelayEvents,
   countLoggedRelaysInWindow,
-  resolveDivergenceAlertTransport,
+  buildDivergenceDeps,
 } from '../services/metaConversionDivergence';
 
 describe('evaluateDivergence', () => {
@@ -395,34 +398,84 @@ describe('checkUserConversionDivergence — the comparison', () => {
   });
 });
 
-describe('resolveDivergenceAlertTransport — ENG-926 §F, the dry-run seam', () => {
+describe('buildDivergenceDeps — ENG-926 §F, the dry-run seam', () => {
   /**
-   * ⚠ THIS EXISTS BECAUSE A MUTATION SURVIVED. Ignoring the override passed the ENTIRE suite:
-   * the cron tests `jest.mock` this whole module, and every other test here exercises the
-   * INJECTABLE `checkUserConversionDivergence`, never the wrapper that chooses the transport.
-   * The consequence of that gap is not academic — it is a dry run sending real oncall alerts,
-   * the exact footgun CodeRabbit caught in this codebase on #2469.
+   * ⚠ THIS EXISTS BECAUSE TWO MUTATIONS SURVIVED THE FULL SUITE. Both derivations here were
+   * inline in the wrapper and unreachable by every test — the cron suite `jest.mock`s this
+   * module, and everything else calls the injectable function with explicit deps.
+   * The two unpinned regressions were: ignoring the transport override (a dry run sends REAL
+   * oncall alerts — the #2469 footgun) and dropping the dry-run flag (a dry run WRITES the
+   * re-alert map and silences the next real 09:00 sweep for 24h).
    */
 
-  it('returns the caller\'s override EXACTLY, so a dry run captures instead of sending', () => {
-    const captured: any[] = [];
-    const override = async (subject: string, message: string, context?: Record<string, any>) => {
-      captured.push({ subject, message, context });
-    };
+  it('uses the caller\'s transport EXACTLY, and marks the run as a dry run', async () => {
+    const override = async () => {};
+    const deps = await buildDivergenceDeps(override);
 
-    expect(resolveDivergenceAlertTransport(override)).toBe(override);
+    expect(deps.alertTransport).toBe(override);
+    // Derived from the override, never a second argument, so the two cannot disagree.
+    expect(deps.dryRun).toBe(true);
   });
 
-  it('falls back to a REAL transport when omitted — never to a silent no-op', async () => {
-    // A caller that forgets the argument must keep production behaviour. Going quiet would be
-    // the worse failure: the detector would look healthy while alerting nobody.
-    const sendOncallAlert = jest.fn().mockResolvedValue(undefined);
-    jest.doMock('../services/emailService', () => ({ emailService: { sendOncallAlert } }));
+  it('with no override: a REAL transport that actually alerts, and NOT a dry run', async () => {
+    sendOncallAlert.mockClear();
+    const deps = await buildDivergenceDeps();
 
-    const transport = resolveDivergenceAlertTransport();
-    expect(typeof transport).toBe('function');
-    await transport('subject', 'message', { userId: 'u1' });
-    expect(sendOncallAlert).toHaveBeenCalledWith('subject', 'message', { userId: 'u1' });
+    expect(deps.dryRun).toBe(false);
+
+    // ⚠ INVOKE it. Asserting `typeof === 'function'` is satisfied by a silent no-op too —
+    // a mutation replacing the real transport with `async () => {}` survived that check.
+    // A forgotten argument must keep ALERTING, and going quiet is the worse failure: the
+    // detector would look healthy while telling nobody.
+    await deps.alertTransport('subject', 'body', { userId: 'u1' });
+    expect(sendOncallAlert).toHaveBeenCalledWith('subject', 'body', { userId: 'u1' });
+  });
+});
+
+describe('the re-alert window and DRY RUNS — ENG-926 §F', () => {
+  /**
+   * ⚠ FOUND WHILE REVIEWING MY OWN CHANGE, not by a test. Making the check dry-run-able
+   * meant it started REACHING the per-process re-alert map that it previously never touched,
+   * because the cron skipped it outright. The two halves fail in opposite directions:
+   *
+   *   WRITING it  → a diagnostic run SILENCES the next real 09:00 sweep for 24h.
+   *   READING it  → a dry run reports "no alert" for a user the real sweep IS alerting on.
+   *
+   * This is the exact hazard the sweep's suppression map already documents, reintroduced
+   * through a different door. On a dry run the window is bypassed in both directions.
+   */
+  const alertingDeps = (over: any = {}) => ({
+    ...divDeps,
+    getLeads: jest.fn().mockResolvedValue({
+      items: [leadWithRelays([IN_WINDOW, IN_WINDOW, IN_WINDOW])],
+      lastEvaluatedKey: null,
+    }),
+    ...over,
+  });
+
+  it('a REAL run still suppresses its own repeat inside the window', async () => {
+    // The existing behaviour must be untouched: still at most one real alert per user per day.
+    await checkUserConversionDivergence(relayUser(true), alertingDeps());
+    await checkUserConversionDivergence(relayUser(true), alertingDeps());
+    expect(alerts).toHaveLength(1);
+  });
+
+  it('⚠ a DRY RUN does not WRITE the window — the next real sweep still alerts', async () => {
+    await checkUserConversionDivergence(relayUser(true), alertingDeps({ dryRun: true }));
+    expect(alerts).toHaveLength(1); // captured
+
+    // The real sweep that follows must be unaffected by the diagnostic.
+    await checkUserConversionDivergence(relayUser(true), alertingDeps());
+    expect(alerts).toHaveLength(2);
+  });
+
+  it('⚠ a DRY RUN does not READ the window — it reports even when a real alert already fired', async () => {
+    await checkUserConversionDivergence(relayUser(true), alertingDeps());
+    expect(alerts).toHaveLength(1);
+
+    // A diagnostic must show the CURRENT state, not "clean because we already told someone".
+    await checkUserConversionDivergence(relayUser(true), alertingDeps({ dryRun: true }));
+    expect(alerts).toHaveLength(2);
   });
 });
 

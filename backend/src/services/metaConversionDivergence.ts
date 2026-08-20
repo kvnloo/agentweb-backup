@@ -220,6 +220,16 @@ export interface DivergenceDeps {
     window: { sinceMs: number; untilMs: number },
   ) => Promise<number | null>;
   alertTransport: (subject: string, message: string, context?: Record<string, any>) => Promise<void>;
+  /**
+   * ⚠ A DRY RUN MUST NEITHER READ NOR WRITE THE RE-ALERT MAP, and the two halves fail in
+   * opposite directions:
+   *   - WRITING it would make a diagnostic run SILENCE the next real 09:00 sweep for 24h.
+   *   - READING it would make a dry run report "no alert" for a user the real sweep is
+   *     actively alerting on — clean output for a broken account.
+   * So on a dry run the window is bypassed entirely: always evaluate, always hand the
+   * verdict to the transport (which is capturing, not sending).
+   */
+  dryRun?: boolean;
   now?: number;
 }
 
@@ -325,9 +335,11 @@ export async function checkUserConversionDivergence(
     return { status: verdict.status, crmSent, metaSeen };
   }
 
-  const last = lastAlertAtByUser.get(user.userId);
+  // See DivergenceDeps.dryRun — the re-alert window is per-PROCESS alerting state, so a
+  // diagnostic run must not participate in it in either direction.
+  const last = deps.dryRun ? undefined : lastAlertAtByUser.get(user.userId);
   if (last === undefined || now - last >= DIVERGENCE_REALERT_WINDOW_MS) {
-    lastAlertAtByUser.set(user.userId, now);
+    if (!deps.dryRun) lastAlertAtByUser.set(user.userId, now);
     try {
       await deps.alertTransport(
         `CRM conversions are not reaching Meta for pixel ${resolution.pixelId}`,
@@ -367,64 +379,62 @@ export async function checkUserConversionDivergence(
  * and `metaConversionRelay` both use.
  */
 /**
- * Pick the alert transport: the caller's override, or the real oncall email.
+ * Build the real dependency set for a divergence check.
  *
- * ⚠ EXTRACTED SO IT CAN BE TESTED AT ALL. Inline in the wrapper below, this choice was
- * unreachable by every existing test — the cron suite `jest.mock`s this whole module, and the
- * divergence suite exercises the INJECTABLE `checkUserConversionDivergence`, never the
- * wrapper. A mutation that ignored the override therefore passed the entire suite, while dry
- * runs would have silently sent real oncall alerts. Found by that surviving mutation.
+ * ⚠ EXTRACTED AND EXPORTED SO THE WIRING CAN BE TESTED AT ALL. Both derivations below were
+ * previously inline in the wrapper, where NO test could reach them: the cron suite
+ * `jest.mock`s this whole module, and every test here calls the injectable
+ * `checkUserConversionDivergence` with explicit deps. Two separate mutations survived the
+ * full suite because of that — one ignoring the transport override (dry runs would send REAL
+ * oncall alerts) and one dropping the dry-run flag (dry runs would WRITE the re-alert map and
+ * silence the next real sweep). Both are load-bearing and neither was pinned.
  *
- * ⚠ Defaults to the REAL transport, never to a no-op: a caller that forgets the argument must
- * keep production behaviour, not go quiet.
+ * ⚠ `dryRun` is DERIVED from the override rather than taken as a second argument, so the two
+ * can never disagree. An override is only ever supplied by a diagnostic run; a real sweep
+ * supplies none and keeps today's production behaviour.
+ *
+ * ⚠ The transport defaults to the REAL oncall email, never a no-op — a caller that forgets
+ * the argument must keep alerting, not go quiet.
  */
-export function resolveDivergenceAlertTransport(
-  override?: DivergenceDeps['alertTransport'],
-): DivergenceDeps['alertTransport'] {
-  return (
-    override ??
-    (async (subject, message, context) => {
-      const { emailService } = await import('./emailService');
-      await emailService.sendOncallAlert(subject, message, context);
-    })
-  );
-}
-
-export async function checkConversionDivergenceForUser(
-  user: any,
-  /**
-   * ENG-926 §F: let a caller substitute the alert transport.
-   *
-   * Everything else in the sweep routes alerts through an injected `AlertSink`, which is what
-   * makes a dry run side-effect-free. This check did not, so the cron had to SKIP it on a dry
-   * run — and the cost was not just a missing diagnostic. It meant the first time this
-   * detector ever ran against real relay data would be in production, unattended, sending an
-   * alert whose shape nobody had ever seen.
-   *
-   * ⚠ Defaults to the REAL oncall transport when omitted, so a caller that forgets this
-   * argument keeps today's production behaviour rather than silently going quiet.
-   */
+export async function buildDivergenceDeps(
   alertTransport?: DivergenceDeps['alertTransport'],
-): Promise<DivergenceResult> {
+): Promise<DivergenceDeps> {
   const [{ crmDb }, { metaService }, { getMetaAccountCredentials }] = await Promise.all([
     import('./db'),
     import('./metaService'),
     import('./metaAccountCredentials'),
   ]);
 
-  return checkUserConversionDivergence(user, {
+  return {
     getLeadLists: (userId) => crmDb.getLeadListsByUserId(userId),
     getLeads: (listId, limit, startKey) => crmDb.getLeadsByListId(listId, limit, startKey),
     // The SAME resolver §C sends through, so the pixel read back from is the pixel written
     // to. Reading a different one would compare two unrelated numbers.
     // `stored` is explicitly undefined: there is no per-surface pixel override for the CRM
-    // relay, so this resolves the same default §C sends through. The parameter is required
-    // rather than optional, and passing it explicitly is what keeps the two paths aligned.
+    // relay, so this resolves the same default §C sends through.
     resolvePixel: (owner, userId) => metaService.resolveMetaPixelWithDefault(owner, userId, undefined),
     getCredentials: (owner, userId, accountId) =>
       getMetaAccountCredentials(owner, userId, accountId),
     countPixelEvents: (pixelId, accessToken, eventNames, window) =>
       countPixelRelayEvents(pixelId, accessToken, eventNames, window),
-    alertTransport: resolveDivergenceAlertTransport(alertTransport),
-  });
+    alertTransport:
+      alertTransport ??
+      (async (subject, message, context) => {
+        const { emailService } = await import('./emailService');
+        await emailService.sendOncallAlert(subject, message, context);
+      }),
+    dryRun: alertTransport !== undefined,
+  };
+}
+
+export async function checkConversionDivergenceForUser(
+  user: any,
+  /**
+   * Supplying a transport marks this as a DIAGNOSTIC run: alerts are handed to the caller
+   * instead of sent, and the per-process re-alert window is bypassed in both directions.
+   * See buildDivergenceDeps.
+   */
+  alertTransport?: DivergenceDeps['alertTransport'],
+): Promise<DivergenceResult> {
+  return checkUserConversionDivergence(user, await buildDivergenceDeps(alertTransport));
 }
