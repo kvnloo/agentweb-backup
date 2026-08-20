@@ -309,15 +309,17 @@ describe('ENG-1358 — every launch route relays the warning, not just RESUME/UP
 
   it('AD CREATE on an ENABLED campaign relays the warning', async () => {
     (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
-    (googleAdsService.getAdGroupParentCampaign as jest.Mock)?.mockResolvedValue?.({
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({
       campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED',
     });
+    (googleAdsService.createAd as jest.Mock).mockResolvedValue({ resourceName: `${CAMPAIGN}/ads/1` });
     const result: any = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890', entity_type: 'AD', action: 'CREATE',
       ad_group_resource_name: 'customers/1234567890/adGroups/1', type: 'SEARCH',
       headlines: ['a', 'b', 'c'], descriptions: ['d', 'e'], final_url: 'https://acme.com/compare',
     }, { sessionId: 'sess-1' });
-    if (result.success) expect(result.trackingWarning).toContain('GTM-NFWK798Z');
+    expect(result.success).toBe(true);
+    expect(result.trackingWarning).toContain('GTM-NFWK798Z');
   });
 
   it('the two creative routes read gate.warning at all', () => {
