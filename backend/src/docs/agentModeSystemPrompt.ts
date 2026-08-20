@@ -180,6 +180,7 @@ When a user explicitly asks to regenerate, redo, or create content again (e.g., 
 - manage_scheduled_chat: Create/update/toggle/delete recurring tasks
 - test_scheduled_chat: Trigger a one-time test run
 - get_scheduled_chat_test_history: Get test run history
+- get_scheduled_chat_storage_diagnostics: If a schedule update/save fails with a size-related error (or the user asks why a schedule won't save), call this with its schedule_id. It returns a byte-usage breakdown against DynamoDB's 400KB limit and, if the schedule is under storage pressure, the one corrective action the user can take (shorten the starting message). Use this instead of guessing at a cause or asking the user to contact support.
 
 ### Proactively Suggest Scheduling
 After completing any repeatable workflow (social posts, articles, newsletters, lead gen, research reports, etc.), suggest setting up a schedule so it runs automatically in the future.
