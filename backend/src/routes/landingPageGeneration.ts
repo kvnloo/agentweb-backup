@@ -392,7 +392,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url, meta_pixel_override } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url, meta_pixel_override, google_ads } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
@@ -450,6 +450,51 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         );
         metaPixelOverride = undefined;
       }
+    }
+
+    /*
+     * ENG-1328 AC1: the site's Google Ads conversion action, supplied at creation so the
+     * base gtag ships in the FIRST commit rather than needing a follow-up call to the
+     * manual endpoint. Without this the parameter threaded through
+     * GenerateLandingPageOptions was unreachable — every generated lander shipped
+     * untagged and AC1 could not happen at all.
+     *
+     * Never trusts the client, same stance as meta_pixel_override: the customer id has to
+     * be one of the caller's own connected Google Ads accounts, or a request could point a
+     * lander's conversions at an account the caller does not own.
+     *
+     * Both halves or neither. An id without its label fires a conversion that matches no
+     * conversion action — reported as fired, attributing nothing.
+     */
+    let googleAds: { conversionId: string; conversionLabel: string; customerId?: string } | undefined;
+    if (google_ads !== undefined && google_ads !== null) {
+      if (
+        typeof google_ads !== "object" ||
+        typeof google_ads.conversionId !== "string" || !google_ads.conversionId.trim() ||
+        typeof google_ads.conversionLabel !== "string" || !google_ads.conversionLabel.trim()
+      ) {
+        return res.status(400).json({ error: "google_ads must be an object with conversionId and conversionLabel" });
+      }
+      const conversionId = google_ads.conversionId.trim();
+      // Same shape RULE 7.5's detector looks for, so a tag we install is a tag the
+      // pre-flight gate will recognise on the served page.
+      if (!/^AW-[0-9]{6,}$/.test(conversionId)) {
+        return res.status(400).json({ error: "google_ads.conversionId must look like AW-123456789" });
+      }
+      let customerId: string | undefined;
+      if (google_ads.customerId !== undefined && google_ads.customerId !== null) {
+        if (typeof google_ads.customerId !== "string" || !google_ads.customerId.trim()) {
+          return res.status(400).json({ error: "google_ads.customerId must be a string" });
+        }
+        customerId = google_ads.customerId.trim();
+        const { getAccountsWithOwnerIncludingOrgShared } = await import("../services/connectedAccountsDb");
+        const owned = (await getAccountsWithOwnerIncludingOrgShared(userId))
+          .some((a: any) => a.platform === "google_ads" && a.config?.customer_id === customerId);
+        if (!owned) {
+          return res.status(400).json({ error: "google_ads.customerId is not one of your connected Google Ads accounts" });
+        }
+      }
+      googleAds = { conversionId, conversionLabel: google_ads.conversionLabel.trim(), customerId };
     }
 
     // If template_id provided (user picked a template), look it up from DynamoDB
@@ -574,6 +619,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       mode: effectiveMode,
       bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
       metaPixelOverride,
+      googleAds,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
