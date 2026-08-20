@@ -508,8 +508,16 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // posts to the site's own domain, we only ever see Vercel. Accepted through the
       // guarded path in clientIdentity.ts, never trusted as-is; see its doc comment for why
       // a body-supplied value is safe here only under three conditions.
-      clientIp: declaredClientIp,
-      clientUserAgent: declaredClientUserAgent,
+      //
+      // ⚠ NAMED `visitorIp`/`visitorUserAgent`, NOT `clientIp`/`clientUserAgent`, on purpose.
+      // Any key this handler starts consuming stops appearing in customFields, where the
+      // passthrough collector would otherwise put it. `clientIp` is a plausible enough name
+      // that some existing caller may already be sending it and reading it back out of
+      // customFields, and this route is public — we cannot enumerate its callers. A name
+      // nobody is already using cannot silently take a field away from anyone. It also says
+      // what the value actually is: the VISITOR, not whoever made this request.
+      visitorIp: declaredClientIp,
+      visitorUserAgent: declaredClientUserAgent,
     } = req.body;
 
     // Validate required field (email)
@@ -598,7 +606,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // ENG-926 §B. Absent from this set they would fall through into customFields as junk
       // instead of being read as identity — the passthrough collector is deliberately
       // "anything not handled above", so a newly-handled key MUST be added here too.
-      'clientIp', 'clientUserAgent',
+      // (`clientIp`/`clientUserAgent` are deliberately NOT handled — see the destructure.)
+      'visitorIp', 'visitorUserAgent',
     ]);
     const PASSTHROUGH_MAX_KEYS = 50;
     const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;

@@ -115,6 +115,7 @@ jest.mock("../middleware/auth", () => ({
 import express, { Application } from "express";
 import request from "supertest";
 import router from "../routes/landingPageGeneration";
+import { findOrphanedCaptureEntries } from "../services/v0Service";
 
 // The REAL implementation under test (the module mock above replaces it for the route,
 // so reach past it here). Its axios / aws-sdk / secrets deps are still mocked.
@@ -315,6 +316,91 @@ describe("syncLeadCaptureFilesToRepo", () => {
 
     expect(result.committed).toBe(true);
     expect(treePaths()).toContain("domainMap.ts");
+  });
+
+  it("PRESERVES a hand-added path instead of deleting it — the live Every.io shape", async () => {
+    // The live Every.io shape: the deployed route maps "/" to a list by hand, because the
+    // record that owned "/" was archived while the frontend stayed up. Rewriting from the DB
+    // would delete that mapping and the root form would 422 for real visitors.
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      "app/api/capture/route.ts": buildCaptureRoute({
+        "/": "list_root_handmade",
+        "/pricing": "list_p",
+      }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(true);
+    // The route IS rewritten — freezing it would stop new sub-pages registering, which
+    // 422s their forms: the same breakage through the other door.
+    expect(treePaths()).toContain("app/api/capture/route.ts");
+    // ...and the hand-added mapping survives the rebuild.
+    expect(blobForPath("app/api/capture/route.ts")).toBe(
+      buildCaptureRoute({ "/": "list_root_handmade", "/pricing": "list_p" }),
+    );
+  });
+
+  it("refuses to rewrite ONLY when the deployed map cannot be read at all", async () => {
+    // A map we cannot parse is a map we cannot preserve. This is the fail-closed half, and
+    // it is distinct from a pre-ENG-308 route with no map at all — that one has nothing to
+    // lose and must still be overwritten (asserted in the findOrphanedCapturePaths block).
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      // Values that are not JSON — we cannot preserve what we cannot read, so this is the
+      // one case that still leaves the file alone.
+      "app/api/capture/route.ts":
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};\n',
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).not.toContain("app/api/capture/route.ts");
+    expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts"]));
+  });
+
+  it("commits the capture route normally when the deployed map has no extra paths", async () => {
+    // The guard must not become "never update anything". A deployed map that is a subset of
+    // ours (a page was added) is not hand-edited and must still be rewritten.
+    mockGitHub({
+      "middleware.ts": "// stale middleware\n",
+      "app/api/capture/route.ts": buildCaptureRoute({ "/pricing": "list_p" }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({
+      "/pricing": "list_p",
+      "/new": "list_n",
+    }));
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toContain("app/api/capture/route.ts");
+    expect(blobForPath("app/api/capture/route.ts")).toBe(
+      buildCaptureRoute({ "/pricing": "list_p", "/new": "list_n" }),
+    );
+  });
+
+  it("makes NO commit when preserving leaves the deployed route byte-identical", async () => {
+    // Every.io's steady state: the rebuilt route (DB pages + the preserved "/") equals what
+    // is already deployed, so there is no commit and no live redeploy — on every sync.
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "lib/agentweb-track.ts": buildTrackingHelper(),
+      "app/api/capture/route.ts": buildCaptureRoute({
+        "/": "list_root_handmade",
+        "/pricing": "list_p",
+      }),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_p" }));
+
+    expect(result.committed).toBe(false);
+    expect(result.reason).toBe("up-to-date");
   });
 
   it("commits the FULL site map, not just one page", async () => {
@@ -569,5 +655,75 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+});
+
+/**
+ * ENG-926 §B — a hand-edited capture route must never be silently overwritten.
+ *
+ * Every.io's root path "/" is hand-added to its deployed LIST_BY_PATH: the AW-LandingPages
+ * record that owned "/" was archived while the frontend stayed live, so the entry exists in
+ * the repo and in no database. Regenerating from the DB drops it and the site's root form
+ * answers 422 to real visitors on a live managed client.
+ *
+ * This was always true of any regeneration. It stayed asleep only because the idempotence
+ * check usually found the file already up to date and made no commit — so ANY change to
+ * buildCaptureRoute wakes it, for this repo and for any other hand-edited one that nothing
+ * tracks. Failing closed is the only safe reading of "we cannot tell a deliberate hand-edit
+ * from a page legitimately deleted".
+ */
+describe('ENG-926 §B — findOrphanedCaptureEntries', () => {
+  const routeWith = (map: Record<string, string>) =>
+    buildCaptureRoute(map, undefined, undefined, undefined);
+
+  it('finds nothing when the deployed map matches ours', () => {
+    const map = { '/a': 'list_a', '/b': 'list_b' };
+    expect(findOrphanedCaptureEntries(routeWith(map), map)).toEqual({});
+  });
+
+  it('finds nothing when OUR map has grown — a new page is not an orphan', () => {
+    const deployed = routeWith({ '/a': 'list_a' });
+    expect(findOrphanedCaptureEntries(deployed, { '/a': 'list_a', '/b': 'list_b' })).toEqual({});
+  });
+
+  it('returns the hand-added entry WITH its list id — the real Every.io shape', () => {
+    // The list id is what makes preserving possible; a bare path could not be carried.
+    const deployed = routeWith({ '/': 'list_root_handmade', '/pricing': 'list_p' });
+    expect(findOrphanedCaptureEntries(deployed, { '/pricing': 'list_p' })).toEqual({
+      '/': 'list_root_handmade',
+    });
+  });
+
+  it('parses a SINGLE-LINE map, not just the pretty-printed one', () => {
+    // A deployed file may be single-line, from an older builder or a hand-edit. A regex
+    // that only matched the pretty form read those as unreadable and froze the site —
+    // caught by 14 real test failures, not by review.
+    expect(
+      findOrphanedCaptureEntries(
+        'const LIST_BY_PATH: Record<string, string> = {"/features":"list_features"};',
+        { '/pricing': 'list_p' },
+      ),
+    ).toEqual({ '/features': 'list_features' });
+  });
+
+  it('returns null when a map exists but its VALUES are not JSON', () => {
+    expect(
+      findOrphanedCaptureEntries(
+        'const LIST_BY_PATH: Record<string, string> = { "/": someIdentifier\n};',
+        {},
+      ),
+    ).toBeNull();
+  });
+
+  it('treats a PRE-ENG-308 route with no map at all as nothing to preserve', () => {
+    // Those routes hardcode a single list id and have no LIST_BY_PATH. Overwriting them is
+    // exactly what ENG-310 is for — PMPS's repo is this shape, and refusing here would
+    // silently stop the UTM-repair path for every old customer repo.
+    expect(findOrphanedCaptureEntries('const LEAD_LIST_ID = "list_old";', {})).toEqual({});
+    expect(findOrphanedCaptureEntries('export const nothing = 1', {})).toEqual({});
+  });
+
+  it('treats an ABSENT file as nothing to preserve, so a first-time sync still writes', () => {
+    expect(findOrphanedCaptureEntries(null, { '/a': 'list_a' })).toEqual({});
   });
 });

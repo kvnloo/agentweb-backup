@@ -309,6 +309,7 @@ async function submitLeadForm(
   form: Record<string, string>,
   /** What the BROWSER sent to the site's own capture route — the visitor, not Vercel. */
   visitorHeaders: Record<string, string> = {
+    'x-vercel-forwarded-for': VISITOR_IP,
     'x-forwarded-for': VISITOR_IP,
     'user-agent': VISITOR_UA,
   },
@@ -594,8 +595,8 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
     });
 
     // Declared by the capture route, top-level.
-    expect(forwarded.body.clientIp).toBe(VISITOR_IP);
-    expect(forwarded.body.clientUserAgent).toBe(VISITOR_UA);
+    expect(forwarded.body.visitorIp).toBe(VISITOR_IP);
+    expect(forwarded.body.visitorUserAgent).toBe(VISITOR_UA);
 
     // Accepted by forward-lead and written to AW-Leads.
     expect(lead.clientIp).toBe(VISITOR_IP);
@@ -614,7 +615,7 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
       clickUrlFromMetaAd(LANDING_PAGE),
       { email: 'forwarder-declared@acme.io' },
       undefined,
-      { 'x-forwarded-for': '127.0.0.1', 'user-agent': 'node' },
+      { 'x-vercel-forwarded-for': '127.0.0.1', 'x-forwarded-for': '127.0.0.1', 'user-agent': 'node' },
     );
 
     expect(lead.clientIp).toBeUndefined();
@@ -627,7 +628,7 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
       clickUrlFromMetaAd(LANDING_PAGE),
       { email: 'private-ip@acme.io' },
       undefined,
-      { 'x-forwarded-for': '10.0.0.4', 'user-agent': VISITOR_UA },
+      { 'x-vercel-forwarded-for': '10.0.0.4', 'x-forwarded-for': '10.0.0.4', 'user-agent': VISITOR_UA },
     );
 
     expect(lead.clientIp).toBeUndefined();
@@ -641,7 +642,29 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
       clickUrlFromMetaAd(LANDING_PAGE),
       { email: 'multihop@acme.io' },
       undefined,
-      { 'x-forwarded-for': `${VISITOR_IP}, 10.0.0.9, 172.31.0.31`, 'user-agent': VISITOR_UA },
+      {
+        'x-vercel-forwarded-for': `${VISITOR_IP}, 10.0.0.9, 172.31.0.31`,
+        'user-agent': VISITOR_UA,
+      },
+    );
+
+    expect(lead.clientIp).toBe(VISITOR_IP);
+  });
+
+  it('prefers x-vercel-forwarded-for over an x-forwarded-for a fronting proxy rewrote', async () => {
+    // Vercel overwrites x-forwarded-for and does not forward external IPs, "to prevent IP
+    // spoofing" — so a VISITOR cannot forge it. But Vercel's own docs note that header "could
+    // be overwritten if you're using a proxy on top of Vercel", which a customer on a custom
+    // domain plausibly has. x-vercel-forwarded-for stays Vercel's own determination.
+    const { lead } = await clickThroughToCrm(
+      clickUrlFromMetaAd(LANDING_PAGE),
+      { email: 'fronting-proxy@acme.io' },
+      undefined,
+      {
+        'x-vercel-forwarded-for': VISITOR_IP,
+        'x-forwarded-for': '198.18.0.7',
+        'user-agent': VISITOR_UA,
+      },
     );
 
     expect(lead.clientIp).toBe(VISITOR_IP);
@@ -659,7 +682,7 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
     );
 
     expect(forwarded.status).toBe(201);
-    expect(forwarded.body.clientIp).toBeUndefined();
-    expect(forwarded.body.clientUserAgent).toBeUndefined();
+    expect(forwarded.body.visitorIp).toBeUndefined();
+    expect(forwarded.body.visitorUserAgent).toBeUndefined();
   });
 });

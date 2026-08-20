@@ -127,6 +127,21 @@ export function resolveClientIdentity(
  * validation buys is correctness for real traffic: it stops a forwarder from mistakenly
  * declaring its own datacenter identity, which is the precise failure the guard above exists for.
  */
+/**
+ * ⚠ ONE-LINE KILL SWITCH, and the reason it exists is COMPLIANCE, not correctness.
+ *
+ * Accepting a declaration widens the population whose IP we store from "leads that posted to
+ * us from a browser" to "every landing-page lead" — a materially larger set. It is not a new
+ * data CLASS (the browser leg has stored IPs since ENG-926 §B's first half), but GDPR
+ * requires consent BEFORE collection, and §B's `marketingConsent` field is still unbuilt and
+ * blocked on a business decision about which customers and which regions.
+ *
+ * That decision is not engineering's to make, so the whole behaviour sits behind one constant:
+ * flip this to `false` and lander leads immediately go back to storing nothing, with no code
+ * archaeology and no revert. Same pattern this codebase already uses for LDU.
+ */
+export const ACCEPT_DECLARED_CLIENT_IDENTITY = true;
+
 export interface ForwardedClientIdentity {
   clientIp?: unknown;
   clientUserAgent?: unknown;
@@ -201,6 +216,9 @@ export function resolveClientIdentityWithForwarded(
 ): ClientIdentity {
   // A caller we can observe directly never gets to describe itself.
   if (!isServerSideUserAgent(userAgent)) return resolveClientIdentity(userAgent, ip);
+
+  // Compliance kill switch — see the constant. Off means we behave exactly as before.
+  if (!ACCEPT_DECLARED_CLIENT_IDENTITY) return {};
 
   // The caller is a forwarder, so its own IP and agent are its own — already refused above.
   // The only identity worth having is one it explicitly declares for the visitor.

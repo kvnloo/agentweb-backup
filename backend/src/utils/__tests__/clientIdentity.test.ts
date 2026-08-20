@@ -25,6 +25,7 @@ import {
   isServerSideUserAgent,
   isPublicIpAddress,
   resolveClientIdentityWithForwarded,
+  ACCEPT_DECLARED_CLIENT_IDENTITY,
 } from '../clientIdentity';
 
 describe('isServerSideUserAgent', () => {
@@ -302,5 +303,20 @@ describe('resolveClientIdentityWithForwarded', () => {
         clientUserAgent: `  ${BROWSER}  `,
       }),
     ).toEqual({ clientIp: VISITOR_IP, clientUserAgent: BROWSER });
+  });
+});
+
+describe('ACCEPT_DECLARED_CLIENT_IDENTITY', () => {
+  // ⚠ A TRIPWIRE, not a behavioural test — say which it is. The constant's OFF path returns
+  // `{}` for a forwarding caller, which is byte-for-byte the pre-existing behaviour the
+  // "drops BOTH when the caller is a forwarding server" cases above already pin. What this
+  // asserts is that the switch still EXISTS and is still ON, so flipping it can only happen
+  // deliberately and shows up in a diff rather than drifting.
+  //
+  // It exists because accepting a declaration widens the population whose IP we store to
+  // every landing-page lead, while §B's consent field is unbuilt and blocked on a business
+  // decision about which customers and which regions. That decision is not engineering's.
+  it('is present and ON, so disabling it is a one-line, visible change', () => {
+    expect(ACCEPT_DECLARED_CLIENT_IDENTITY).toBe(true);
   });
 });
