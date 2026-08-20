@@ -35,6 +35,7 @@ import {
 import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -5353,6 +5354,52 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1207 AC3: a run must not finish silently on an unread page.
+      //
+      // Same shape as the two reconcilers above and placed alongside them
+      // deliberately: deterministic, always-on, append-only, patched into the last
+      // assistant message so the persisted transcript matches what the user sees.
+      // It never rewrites the model's text and never claims success — it only adds
+      // the fact that some of the data was not looked at.
+      //
+      // NOT folded into the finalize guard, which is the established
+      // claimed-vs-executed seam: that guard is seen only when AGENT_FINALIZE_GUARD
+      // and AGENT_RUNTIME_SPINE_ENABLED are both on, and both are off in production.
+      // An acceptance criterion that cannot run is the defect it is meant to fix.
+      // The detection lives in a PURE module so the guard can absorb it unchanged
+      // the day those flags flip.
+      //
+      // Why this exists at all when AC1/AC2 already fixed the wording: during
+      // ENG-1200 the response ALREADY carried `has_more: true` and a cursor, and the
+      // model re-ran the identical unpaged query six times, then wrote 17 of 107
+      // records and reported the job complete. A clearer message makes noticing
+      // possible; it does not make it certain.
+      //
+      // Kill switch, not a gate: set AGENT_UNCONSUMED_CURSOR_NOTICE=false to disable.
+      // Absent means ON, so this cannot quietly become inert the way the guard did.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_UNCONSUMED_CURSOR_NOTICE !== 'false') {
+        try {
+          // Same predicate the finalize ledger uses, so the two cannot disagree
+          // about which calls actually executed.
+          const reconciled = reconcileUnconsumedCursors(content, toolCalls, toolCallNeverExecuted);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (cursorError) {
+          // Advisory. A bug here must never block delivery of a reply the user is
+          // waiting on — the failure mode this prevents is a silent overclaim, which
+          // is strictly less bad than losing the message.
+          console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -7145,6 +7192,48 @@ export class AgentModeService {
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
       };
     }
+
+    // ENG-1207: pagination markers survive minimization, for EVERY tool.
+    //
+    // The default branch returned {}, which is right for storage and wrong for the
+    // one consumer that reads this ledger to decide whether a run finished on an
+    // unread page (`reconcileUnconsumedCursors`, at the finalize seam). With the
+    // cursor stripped it saw {} for every call and never fired — the feature was
+    // inert in production while its unit tests passed, because those tests built
+    // ledger entries by hand with un-minimized results and so never crossed this
+    // function. Found by live verification, not by the suite.
+    //
+    // Deliberately GENERIC rather than a list of tool names: a tool that paginates
+    // is describable by its response, and a future one must not have to be
+    // remembered here to be covered.
+    //
+    // Proportionate to the purpose of this function — a cursor string and a boolean,
+    // never the rows. The heavy payload is still dropped.
+    const paginationMarkers: Record<string, unknown> = {};
+    if (result && typeof result === 'object') {
+      for (const key of ['next_cursor', 'nextCursor', 'has_more', 'hasMore']) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === 'string' ? value.trim() : typeof value === 'boolean') {
+          paginationMarkers[key] = value;
+        }
+      }
+      // The COUNT survives too, as a number — the rows themselves do not.
+      //
+      // Without it the notice said "search_leads returned 0 row(s) and more remain
+      // unread" on a call that returned 20, because the row array it counted had
+      // already been stripped here. Found in production; the unit test asserted
+      // only "no undefined/NaN", so zero passed.
+      //
+      // Zero is worse than silence in that sentence: it reads as "this found
+      // nothing", the opposite of what happened.
+      if (Object.keys(paginationMarkers).length > 0) {
+        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+          const value = (result as Record<string, unknown>)[key];
+          if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
+        }
+      }
+    }
+    if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
 
     // For other tools, return empty object to minimize storage
     return {};
@@ -21931,7 +22020,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: 'No search query provided.',
           query: query || '',
           results: [],
-          totalResults: 0,
+          returnedResults: 0,
+          hasMore: false,
         };
       }
 
@@ -22072,7 +22162,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: `No knowledge base results found for "${query}"`,
           query,
           results: [],
-          totalResults: 0
+          returnedResults: 0,
+          hasMore: false
         };
       }
 
@@ -22081,12 +22172,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // list can be several times larger than requested — cap it to avoid context bloat.
       const boundedResults = results.slice(0, limitedMaxResults);
 
+      // ENG-1207: never present a page as a total. `totalResults` was the worst
+      // instance of this in the file — a structured field NAMED "total" carrying a
+      // page count reads as authoritative in a way prose does not, so a model has
+      // no reason to doubt it. Renamed to `returnedResults`, which is what it
+      // always actually held, plus an explicit `hasMore`.
+      //
+      // Unlike `get_lead_engagements`, no honest total is available here and none
+      // is invented. Each source (Vertex, Drive, ClickUp docs/tasks) is collected
+      // up to `limitedMaxResults` INDEPENDENTLY before merging, so `results.length`
+      // is a floor rather than a count of what matched — a source that returned
+      // exactly its own cap may well have had more. `hasMore` therefore reports
+      // only what is certain: that the merge itself was cut. It can be false while
+      // more exists upstream, which is why the message says "raise max_results"
+      // rather than promising a specific remainder.
+      const hasMore = results.length > boundedResults.length;
       return {
         success: true,
-        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
+        message: hasMore
+          ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
         results: boundedResults,
-        totalResults: boundedResults.length
+        returnedResults: boundedResults.length,
+        hasMore
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -34655,7 +34764,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     action: string,
     override: boolean,
     sessionId?: string,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
@@ -34677,7 +34786,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     newFinalUrls: Array<string | undefined>,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     if (campaignStatus !== 'ENABLED') return { proceed: true };
     const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
     if (urls.length === 0) return { proceed: true };
@@ -34696,15 +34805,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     finalUrls: string[],
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const gate = await preflightTrackingGate(finalUrls);
     const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
     if (gate.ok) {
+      /*
+       * ENG-1358: measurable, but nothing on the page proves an Ads conversion can be
+       * recorded — only a GTM container or a GA4 property. Recorded under its own outcome
+       * so the run history distinguishes "verified" from "we could not tell", and
+       * returned so the caller surfaces it instead of the gate quietly swallowing it.
+       *
+       * A warning that is computed and discarded is the same as no warning at all, which
+       * is exactly how the AC1 wiring gap survived 111 green tests.
+       */
+      const warned = (gate.warnings?.length ?? 0) > 0;
       await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
-        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+        customerId, campaignResourceName, action,
+        outcome: warned ? 'passed_with_warning' : 'passed',
+        urlResults, checkedAt: new Date().toISOString(),
       });
-      return { proceed: true };
+      return warned ? { proceed: true, warning: gate.message } : { proceed: true };
     }
 
     if (override) {
@@ -34731,7 +34852,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -34777,8 +34898,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
           const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
           if (!gate.proceed) return gate.blockResult;
+          const resumeTrackingWarning = gate.warning;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
-          return { success: true, message: 'Campaign resumed' };
+          // Relayed, not swallowed: the launch is permitted, but the operator has to be
+          // told the page proves only that SOME Google tag is present (ENG-1358).
+          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -34815,10 +34939,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          let trackingWarning: string | undefined;
           // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
           if (args.status === 'ENABLED') {
             const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
             if (!gate.proceed) return gate.blockResult;
+            trackingWarning = gate.warning;
           }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
@@ -34831,7 +34957,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrlSuffix: args.final_url_suffix,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
-          return { success: true, message: 'Campaign updated' };
+          // Same relay as RESUME: permitted, but the operator is told what could not be
+          // verified rather than reading a bare success (ENG-1358).
+          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
@@ -34862,6 +34990,58 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
       // the customer's account and is the one operation we cannot undo from our
       // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'OFFLINE_CONVERSION') {
+        if (action !== 'UPLOAD') {
+          return { success: false, error: `OFFLINE_CONVERSION supports UPLOAD only, not ${action}.` };
+        }
+        if (!args.gclid || !args.conversion_action_resource_name || !args.conversion_at) {
+          return {
+            success: false,
+            error: 'gclid, conversion_action_resource_name and conversion_at are all required. '
+              + 'conversion_at is when the conversion HAPPENED (ISO 8601), not when you noticed it — '
+              + 'Google attributes it to that moment.',
+          };
+        }
+        const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
+        /*
+         * The account's own time zone, read from Google rather than assumed. Google
+         * interprets the timestamp in it, so guessing UTC would silently shift every
+         * conversion by the account's real offset — and the only symptom is conversions
+         * landing on the wrong day, which nobody reads as a bug.
+         */
+        const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
+        let conversion: Record<string, unknown>;
+        try {
+          conversion = buildClickConversion({
+            gclid: args.gclid,
+            conversionActionResourceName: args.conversion_action_resource_name,
+            conversionAt: new Date(args.conversion_at),
+            timeZone: tz,
+            value: args.conversion_value,
+            currencyCode: args.currency_code,
+            orderId: args.order_id,
+          });
+        } catch (err: any) {
+          // Refused locally, before the network. An upload runs from a background sweep
+          // with nobody watching, so a rejected batch surfaces days later as "conversions
+          // never appeared".
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+        const out = await googleAdsService.uploadClickConversions(
+          userId, customer_id, [conversion], { validateOnly: args.validate_only === true },
+        );
+        return {
+          success: out.failures.length === 0,
+          validateOnly: args.validate_only === true,
+          uploaded: out.uploaded,
+          failures: out.failures,
+          conversion,
+          ...(out.failures.length > 0
+            ? { error: out.failures.map((f) => `row ${f.index}: ${f.errorCode ?? ''} ${f.message}`.trim()).join('; ') }
+            : {}),
+        };
+      }
+
       if (entity_type === 'CONVERSION_ACTION') {
         if (action === 'LIST') {
           const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);

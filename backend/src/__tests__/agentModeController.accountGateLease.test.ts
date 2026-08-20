@@ -244,14 +244,30 @@ describe('the gate runs behind the in-flight lease', () => {
     // The gate probes Unipile over the network; reporting 0 hides that cost from run
     // history, where the sibling ENG-1259 skip records it. Asserting `>= 0` would
     // pass ON the defect, so give the probe measurable duration and require it back.
+    //
+    // The delay and the bound are deliberately NOT the same number. They were both
+    // 25, which made this a knife-edge: `setTimeout(n)` may fire at n-1 because of
+    // internal rounding, and `Date.now()` has coarse resolution on some platforms,
+    // so a loaded CI runner could measure 24ms against a 25ms floor and fail. It
+    // did, on an unrelated PR, costing a red check and an investigation.
+    //
+    // `executionTime` is wall-clock BY DESIGN — it exists to record what the probe
+    // really cost in production — so the fix belongs in the tolerance, not in the
+    // clock. `nowOverride` is not usable here either: it feeds only the ENG-844
+    // run-date cross-check, not this measurement.
+    //
+    // Double the delay, keep the bound: a hard-coded 0 (the defect under test) and
+    // any truncated-to-zero value still fail, while timer rounding no longer can.
+    const PROBE_DELAY_MS = 50;
+    const MIN_REPORTED_MS = 25;
     mockProbe.mockImplementation(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, PROBE_DELAY_MS));
       return 'disconnected';
     });
 
     const result: any = await runScheduledChat({ ...dream100, runResults: [] }, USER_ID, false);
 
-    expect(result.executionTime).toBeGreaterThanOrEqual(25);
+    expect(result.executionTime).toBeGreaterThanOrEqual(MIN_REPORTED_MS);
   });
 });
 

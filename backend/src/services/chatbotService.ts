@@ -583,8 +583,15 @@ export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
   action: string;
-  /** Overall outcome of the gate for this launch attempt. */
-  outcome: 'passed' | 'blocked' | 'overridden';
+  /**
+   * Overall outcome of the gate for this launch attempt.
+   *
+   * `passed_with_warning` (ENG-1358) is deliberately distinct from `passed`: the launch
+   * was permitted, but the page carried only a GTM container or a GA4 property and no
+   * Google Ads conversion tag. Collapsing the two would make the audit trail claim the
+   * conversion path was verified when all we verified was that some Google tag exists.
+   */
+  outcome: 'passed' | 'passed_with_warning' | 'blocked' | 'overridden';
   /** Per-URL check results (url + status + detected mechanisms). */
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
   checkedAt: string;
