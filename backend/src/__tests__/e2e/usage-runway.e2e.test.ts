@@ -360,7 +360,7 @@ async function seedSwitchableSchedule(pinnedModel: string): Promise<string> {
 
   // Spend on the pinned model, tagged to this schedule, across enough complete
   // days for the recommendation ranking to have something to rank.
-  for (let i = 6; i >= 1; i--) {
+  for (let i = Math.min(6, completeDaysAvailable()); i >= 1; i--) {
     await seedLedgerDay({
       date: utcDay(-i),
       costMicroUsd: 8_000_000,
@@ -371,9 +371,24 @@ async function seedSwitchableSchedule(pinnedModel: string): Promise<string> {
   return scheduleId;
 }
 
-/** A steady burn across `days` complete days, ending yesterday. */
+/**
+ * How many COMPLETE days back a seed can reach without falling out of the cycle.
+ *
+ * `resolveUsageRunway` reads rows from `cycleStartDate` to today, and the cycle is the
+ * calendar month — so a row dated before the 1st is written successfully and then never
+ * looked at. Run this suite on the 3rd and an eight-day burn puts most of its spend
+ * outside the window; scenario 2 reports onTrack and scenario 9 gets a withheld baseline,
+ * both failing for a calendar reason that has nothing to do with the product.
+ */
+function completeDaysAvailable(): number {
+  const today = new Date();
+  return Math.max(1, today.getUTCDate() - 1);
+}
+
+/** A steady burn across `days` complete days, ending yesterday, clamped to the cycle. */
 async function seedSteadyBurn(days: number, perDayMicroUsd: number): Promise<void> {
-  for (let i = days; i >= 1; i--) {
+  const span = Math.min(days, completeDaysAvailable());
+  for (let i = span; i >= 1; i--) {
     await seedLedgerDay({ date: utcDay(-i), costMicroUsd: perDayMicroUsd });
   }
 }
@@ -433,10 +448,18 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
 
     // Undo before deleting the ledger: an applied change outlives the rows that
     // justified it, and `afterAll` restores usage counters only.
+    // `api` awaits fetch, so a rejected request would throw straight out of this hook and
+    // skip the ledger deletion below — leaving seeded spend in the table to change the burn
+    // rate for every later scenario, which is the precise outcome this hook exists to
+    // prevent. Caught and recorded so cleanup always continues.
     for (const changeId of appliedChangeIds.splice(0)) {
-      const undone = await api('POST', '/api/subscription/usage-runway/undo', { changeId });
-      if (undone.status !== 200 || undone.data?.undone !== true) {
-        failures.push(`undo ${changeId} -> ${undone.status} ${JSON.stringify(undone.data)}`);
+      try {
+        const undone = await api('POST', '/api/subscription/usage-runway/undo', { changeId });
+        if (undone.status !== 200 || undone.data?.undone !== true) {
+          failures.push(`undo ${changeId} -> ${undone.status} ${JSON.stringify(undone.data)}`);
+        }
+      } catch (error) {
+        failures.push(`undo ${changeId} -> request failed: ${(error as Error).message}`);
       }
     }
 
@@ -459,6 +482,13 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
   afterAll(async () => {
     // Put the test user back exactly as found. Leaving a seeded cap behind would
     // pause a shared dev account for whoever uses it next.
+    //
+    // KNOWN HAZARD on a SHARED account: this restores the value captured in `beforeAll`,
+    // so any real spend recorded by someone else DURING the run is overwritten and their
+    // usage silently rolled back. Observed live — a scheduled chat billed $0.73 to this
+    // account mid-run — it simply landed after the restore rather than before. The real
+    // remedy is an account whose ledger this suite owns (E2E_TEST_EMAIL), which scenario 8
+    // already requires for its own reasons.
     if (!userId) return;
     const failures: string[] = [];
 
@@ -621,18 +651,23 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     expect(target.recommendedModel).toEqual(expect.any(String));
     expect(target.recommendedModel).not.toBe(target.effectiveModel);
 
+    // `selections`, not `switches`. The route reads `req.body.selections` and takes only
+    // `fromModel`/`toModel`; an unrecognised key left the list EMPTY, and on that path
+    // `persisted: false` and `isEstimate: true` are constants — so both assertions below
+    // passed while nothing was previewed at all. Same disease this suite exists to catch.
     const preview = await api('POST', '/api/subscription/usage-runway/preview', {
-      switches: [
-        {
-          scope: 'schedule',
-          scopeId: scheduleId,
-          fromModel: target.effectiveModel,
-          toModel: target.recommendedModel,
-        },
+      selections: [
+        { fromModel: target.effectiveModel, toModel: target.recommendedModel },
       ],
     });
 
     expect(preview.status).toBe(200);
+    // The switch must have been ACCEPTED, not silently dropped — otherwise the two
+    // constants below say nothing about a preview that never happened.
+    expect(preview.data.applied).toEqual([
+      { fromModel: target.effectiveModel, toModel: target.recommendedModel },
+    ]);
+    expect(preview.data.rejected).toEqual([]);
     expect(preview.data.persisted).toBe(false);
     expect(preview.data.isEstimate).toBe(true);
 
