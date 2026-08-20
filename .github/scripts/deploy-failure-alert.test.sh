@@ -165,7 +165,16 @@ done
 
 if [ -n "$cfg_file" ] && [ -f "$cfg_file" ]; then
   cat "$cfg_file" >>"${MOCK_DIR}/curl_config"
-  data_ref=$(sed -n 's/^data = @//p' "$cfg_file" | head -n 1)
+  # ENG-1412: sed stops itself with `q`, so nothing pipes into `head` and there
+  # is no early-exiting reader to break. Under pipefail the old form could
+  # return 141 and abort this helper mid-capture.
+  #
+  # The address must wrap the substitution, not follow it: `s/…//p;/^data = @/q`
+  # looks equivalent and is not, because by the time the second address is
+  # tested the `s` has already stripped the prefix it matches on, so `q` never
+  # fires and BOTH lines print. The current fixtures have one `data = @` line,
+  # so the suite passed either way — verified by hand against a two-line file.
+  data_ref=$(sed -n '/^data = @/{s///p;q}' "$cfg_file")
   if [ -n "$data_ref" ] && [ -f "$data_ref" ]; then
     cp "$data_ref" "${MOCK_DIR}/payload_seen.json"
   fi

@@ -133,6 +133,31 @@ content_of() {
   fi
 }
 
+# ENG-1412: these two helpers test membership with a HERE-STRING, never
+# `printf ... | grep -q`.
+#
+# `grep -q` exits the instant it matches, closing the read end of the pipe. If
+# the writer has not finished, it takes EPIPE/SIGPIPE, and under `set -o
+# pipefail` (line 67) that failure becomes the pipeline's status — so the `if`
+# takes the FALSE branch and A SUCCESSFUL MATCH IS REPORTED AS NO MATCH.
+#
+# Not hypothetical. Observed in CI on agentweb#2523, in the ENG-836 fixture
+# where one .ebextensions file carries both an `option_settings:` resource
+# change and a `commands:` instance change:
+#
+#   .github/scripts/eb-config-conflict.sh: line 156: printf: write error: Broken pipe
+#   [eb-config-conflict] Resource-config change detected, with no instance-config
+#     change alongside it
+#
+# `contains_any` missed the instance side, the conflict was not raised, and the
+# script EXITED 0 — declaring safe the exact change shape that left main
+# undeployable for ~50 minutes (#2277, named in this file's own output). A gate
+# that can silently answer "safe" is worse than no gate, because it is trusted.
+#
+# A here-string is a temp file on stdin, not a second process, so there is no
+# pipe to break and no status to lose. ENG-1277 made the same fix in
+# trunk-deploy-state.test.sh; pipefail-hygiene.test.sh now asserts it.
+#
 # Echoes every needle from the named array that appears in $1, one per line.
 # The warning below names the namespaces a PR actually touches, rather than
 # assuming the load-balancer one: a PR changing `aws:autoscaling:asg` that was
@@ -142,7 +167,7 @@ matched_needles() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       printf '%s\n' "${needle}"
     fi
   done
@@ -153,7 +178,7 @@ contains_any() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       return 0
     fi
   done

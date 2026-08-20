@@ -405,13 +405,18 @@ else
   fi
   assert_contains "${DEPLOY_CI_PATTERNS}" ".github/{workflows/tests.yml,scripts/eb-deploy.sh}" \
     "one brace pattern independently matches either deploy-path file (ENG-743)"
-  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/workflows/tests.yml"; then
+  # ENG-1412: here-strings, not `printf | grep -Fxq`. This pair is the worst
+  # shape the bug can take: `grep -Fxq` exits on match, the writer takes EPIPE,
+  # pipefail turns the pipeline non-zero, the `if` goes FALSE — and the false
+  # branch here calls pass_test. The assertion would report OK precisely when
+  # the condition it guards against is true.
+  if grep -Fxq ".github/workflows/tests.yml" <<<"${DEPLOY_CI_PATTERNS}"; then
     fail_test "tests.yml is not a separate deploy_ci entry" \
       "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
   else
     pass_test "tests.yml is not a separate deploy_ci entry"
   fi
-  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/scripts/eb-deploy.sh"; then
+  if grep -Fxq ".github/scripts/eb-deploy.sh" <<<"${DEPLOY_CI_PATTERNS}"; then
     fail_test "eb-deploy.sh is not a separate deploy_ci entry" \
       "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
   else

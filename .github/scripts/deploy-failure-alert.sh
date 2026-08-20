@@ -302,9 +302,14 @@ resolve_failure_reason() {
       break
     fi
 
+    # ENG-1412: `first(...)` inside jq, not `jq ... | head -n 1`. `head` exits
+    # after one line while jq may still be writing, and this script runs under
+    # `set -e` with an assignment (not an `if`), so the resulting 141 would ABORT
+    # THE ALERTER — losing the Slack notification for a failed production deploy,
+    # which is the one moment it exists for. Limiting inside jq leaves no pipe.
     step="$(jq -r --arg id "${job_id}" \
-      '(.jobs // [])[] | select((.id|tostring) == $id) | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name' \
-      "${jobs_file}" 2>/dev/null | head -n 1)"
+      'first((.jobs // [])[] | select((.id|tostring) == $id) | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name)' \
+      "${jobs_file}" 2>/dev/null)"
 
     # NO `break` here, deliberately. A classified EB_DEPLOY_FAILED annotation on
     # ANY failed job beats a generic fallback from whichever job the API happened

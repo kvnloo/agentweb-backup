@@ -466,6 +466,21 @@ jobs:
       - name: Run staging-deploy gate contract suite
         run: bash .github/scripts/staging-deploy-gate.test.sh
 
+      # ENG-1412. Also no script under test: this greps every script in the
+      # directory for a pipeline feeding a reader that exits early (`grep -q`,
+      # `head`), which under `set -o pipefail` turns a successful match into a
+      # failed pipeline and silently inverts the branch.
+      #
+      # It ran red in CI on #2523 — eb-config-conflict.sh missed the
+      # instance-config side of a mixed .ebextensions file and exited 0,
+      # declaring safe the change shape that once left main undeployable for
+      # ~50 minutes. The same shape sat in front of eb-deploy.sh's terminal
+      # rejection check and in a test assertion whose false branch calls
+      # pass_test. shellcheck does not flag any of it (SC2216 covers a
+      # different case), and it reads fine in review, so it needs a grep.
+      - name: Run pipefail hygiene suite
+        run: bash .github/scripts/pipefail-hygiene.test.sh
+
   # ENG-836: prod deploys immutable, which forbids changing resource config and
   # instance config in one operation. PR #2237 did exactly that, EB accepted the
   # request then refused it, and production sat undeployable for ~29 hours while

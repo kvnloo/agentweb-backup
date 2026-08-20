@@ -197,7 +197,15 @@ fi
 
 TRUNK_HEAD_SHA="${TRUNK_HEAD_SHA:-}"
 if [ -z "${TRUNK_HEAD_SHA}" ] && [ -n "${TRUNK_COMMITS}" ]; then
-  TRUNK_HEAD_SHA="$(printf '%s\n' "${TRUNK_COMMITS}" | head -n 1)"
+  # ENG-1412: parameter expansion, not `printf | head -n 1`. `head` exits after
+  # one line while the writer still has up to TRUNK_COMMIT_LOOKBACK (50) more to
+  # push, so this is the highest-probability SIGPIPE site in the repo — far more
+  # likely than the `grep -q` ones, because the reader is guaranteed to leave
+  # data unread. It happens to be harmless today (no `set -e` here, and head
+  # still emits the correct first line before dying, so the value is right and
+  # only the status is lost) — but "correct by accident, in two ways" is not a
+  # property to leave standing in a deploy-state gate. This form spawns nothing.
+  TRUNK_HEAD_SHA="${TRUNK_COMMITS%%$'\n'*}"
 fi
 
 LATEST=''

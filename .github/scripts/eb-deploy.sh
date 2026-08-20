@@ -499,8 +499,17 @@ scan_for_terminal_events() {
 
   EB_LAST_ERROR_EVENTS="${out}"
 
+  # ENG-1412: HERE-STRING, not `printf ... | grep -q`. `grep -q` exits on the
+  # first match and closes the pipe; under `set -o pipefail` the writer's
+  # EPIPE becomes the pipeline's status, so a MATCH is read as NO MATCH.
+  #
+  # Here that inverts the safety property this function exists for: a terminal
+  # EB rejection would go undetected, the deploy would carry on, and the job
+  # would report success on an update Elastic Beanstalk had refused — the
+  # ENG-734/ENG-837 false green, reintroduced by a pipe race. Confirmed to fire
+  # in CI on agentweb#2523 (in eb-config-conflict.sh, same shape).
   for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${out}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${out}"; then
       fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
     fi
   done
@@ -519,7 +528,7 @@ events_show_recoverable_abort() {
     return 1
   fi
   for pattern in "${EB_ABORT_EVENT_PATTERNS[@]}"; do
-    if printf '%s' "${EB_LAST_ERROR_EVENTS}" | grep -qF "${pattern}"; then
+    if grep -qF "${pattern}" <<<"${EB_LAST_ERROR_EVENTS}"; then
       return 0
     fi
   done
@@ -541,7 +550,7 @@ create_application_version() {
     return 0
   fi
 
-  if printf '%s' "${out}" | grep -qiF 'already exists'; then
+  if grep -qiF 'already exists' <<<"${out}"; then
     log "Application version '${EB_VERSION_LABEL}' already exists; reusing the existing version. AWS reported: ${out}"
     return 0
   fi
@@ -640,7 +649,7 @@ update_environment() {
     # EB rejects an update while another is running with "Environment named X is
     # in an invalid state for this operation. Must be Ready." That is the one
     # error worth retrying, because the environment settling makes it go away.
-    if printf '%s' "${out}" | grep -qiE 'invalid state|concurrentupdate|concurrent update'; then
+    if grep -qiE 'invalid state|concurrentupdate|concurrent update' <<<"${out}"; then
       log "Environment '${EB_ENVIRONMENT_NAME}' was mid-update on attempt ${attempt}/${EB_UPDATE_MAX_ATTEMPTS}; waiting for it to settle and retrying. AWS reported: ${out}"
       attempt=$(( attempt + 1 ))
       continue
