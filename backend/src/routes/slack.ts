@@ -41,6 +41,22 @@ function citeForSlack(response: any): string {
 
 const router = express.Router();
 
+// ENG-1263: known-internal Slack user IDs, checked independently of email resolution.
+// getSlackUserEmail() returns null on several paths that do NOT mean "external author" — rate
+// limiting, a missing users:read.email scope, or (most relevant for customer channels, which are
+// Slack-Connect/externally-shared) a cross-workspace profile users.info can't resolve an email
+// for. Gating solely on a resolved @agentweb.pro email means any of those failures silently falls
+// through as "external", which is how Harsha's own outbound weekly reports got classified as
+// inbound client questions on 2026-08-16. A positive ID allowlist doesn't depend on email
+// resolution succeeding at all. Comma-separated env override; defaults to Harsha's Slack ID
+// (reference-ids.md).
+const INTERNAL_SLACK_USER_IDS = new Set(
+  (process.env.AGENTWEB_INTERNAL_SLACK_USER_IDS || 'U08TM4QFQ1L')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -146,11 +162,26 @@ async function handleSlackTriggeredSession(params: {
 
     if (!rawMessage) return;
 
-    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
+    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments.
+    // Two independent signals, either one is sufficient: a resolved @agentweb.pro email, or a known
+    // internal Slack user ID (checked first — it doesn't depend on email resolution succeeding).
     const senderEmail = await getSlackUserEmail(slackUserId);
-    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
-      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
+    const isInternalById = INTERNAL_SLACK_USER_IDS.has(slackUserId);
+    const isInternalByEmail = !!senderEmail && senderEmail.endsWith('@agentweb.pro');
+
+    if (isInternalById || isInternalByEmail) {
+      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${slackUserId}${senderEmail ? `, ${senderEmail}` : ''})`);
       return;
+    }
+
+    if (!senderEmail) {
+      // Author identity could not be resolved (rate limit, missing users:read.email scope, or a
+      // cross-workspace profile in a Slack-Connect channel) and the ID isn't on the known-internal
+      // list. Do NOT fail closed here — treating "unresolvable" as "internal" would silently drop
+      // genuine customer questions with no signal, which is strictly worse than the noise this row
+      // is fixing. Fall through to triage as before, but log distinguishably from both the internal
+      // skip above and the normal triage-continues path so a repeat is diagnosable from logs.
+      console.log(`📨 [slack-triggered] could not resolve author identity for Slack user ${slackUserId} — proceeding as external (unresolved)`);
     }
 
     // Look up user by slackChannel field (with cache)
