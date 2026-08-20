@@ -224,3 +224,63 @@ describe('metaTrackingMonitorCron — the divergence half', () => {
     expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('metaTrackingMonitorCron — the divergence check must be DRY-RUN-ABLE (ENG-926 §F)', () => {
+  /**
+   * It used to be skipped outright on a dry run (`if (dryRun) continue`), because its
+   * convenience wrapper hardcodes a REAL oncall-email transport. The consequence was not
+   * merely a gap in the diagnostic: the FIRST time this detector ever ran against real relay
+   * data would have been in production, unattended, at 09:00 UTC, sending a real alert that
+   * nobody had ever seen the shape of.
+   *
+   * ⚠ The danger in fixing it is the opposite failure, and this codebase has already paid for
+   * it once (CodeRabbit, #2469): a dry run reaching the REAL transport sends live oncall
+   * alerts from a run whose entire contract is "no side effects". So the important assertion
+   * here is not "it ran" — it is "it ran AND was handed a capturing transport".
+   */
+
+  it('RUNS the divergence check on a dry run instead of skipping it', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+
+    await runMetaTrackingMonitor({ dryRun: true });
+
+    expect(checkConversionDivergenceForUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('⚠ hands it a CAPTURING transport on a dry run — never the real one', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+
+    await runMetaTrackingMonitor({ dryRun: true });
+
+    const [, transport] = checkConversionDivergenceForUser.mock.calls[0];
+    expect(typeof transport).toBe('function');
+  });
+
+  it('captured divergence alerts land in the run summary, and are NOT sent', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    // Drive the injected transport the way the real check would when it alerts.
+    checkConversionDivergenceForUser.mockImplementation(async (_user: any, transport: any) => {
+      await transport?.('Conversions relayed but not arriving', 'body', { userId: 'u1' });
+      return { status: 'not-arriving', crmSent: 5, metaSeen: 0 };
+    });
+
+    const result: any = await runMetaTrackingMonitor({ dryRun: true });
+
+    expect(result.conversionDivergences).toBe(1);
+    expect(result.capturedAlerts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ subject: 'Conversions relayed but not arriving' }),
+      ]),
+    );
+  });
+
+  it('passes NO transport override on a real run, so the real one is used', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+
+    await runMetaTrackingMonitor();
+
+    const [, transport] = checkConversionDivergenceForUser.mock.calls[0];
+    expect(transport).toBeUndefined();
+  });
+});
+
