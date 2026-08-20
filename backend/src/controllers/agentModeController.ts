@@ -7331,8 +7331,12 @@ export const agentModeController = {
       // and makes duplicate submits fail closed instead of overwriting the first.
       if (workPlanInputAnswer) {
         try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
           const answered = resolveWorkPlanInputAnswer(
-            session.pendingWorkPlanInput,
+            pendingWorkPlanInput,
             workPlanInputAnswer.values,
             new Date().toISOString(),
           );
