@@ -26,6 +26,37 @@ const FORBIDDEN_PATTERNS: Array<{ name: string; re: RegExp }> = [
 ];
 
 /**
+ * Finds both literal SDK construction and the common import-alias bypass.
+ * This is intentionally source-level rather than a lint rule: it runs in the
+ * existing Jest gate and covers TypeScript's default and named import forms.
+ */
+function findForbiddenSdkConstruction(content: string): string[] {
+  const found = FORBIDDEN_PATTERNS
+    .filter(({ re }) => re.test(content))
+    .map(({ name }) => name);
+
+  const aliases: Array<{ packageName: string; exportName?: string }> = [
+    { packageName: 'openai' },
+    { packageName: '@google/genai', exportName: 'GoogleGenAI' },
+    { packageName: '@aws-sdk/client-bedrock-runtime', exportName: 'BedrockRuntimeClient' },
+    { packageName: '@azure/openai', exportName: 'AzureOpenAI' },
+  ];
+
+  for (const { packageName, exportName } of aliases) {
+    const escapedPackage = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const aliasMatch = exportName
+      ? new RegExp(`import\\s+\\{[^}]*\\b${exportName}\\s+as\\s+([A-Za-z_$][\\w$]*)[^}]*\\}\\s+from\\s+['\"]${escapedPackage}['\"]`).exec(content)
+      : new RegExp(`import\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+['\"]${escapedPackage}['\"]`).exec(content);
+    const alias = aliasMatch?.[1];
+    if (alias && new RegExp(`new\\s+${alias}\\s*\\(`).test(content)) {
+      found.push(`aliased ${exportName || packageName} construction (${alias})`);
+    }
+  }
+
+  return found;
+}
+
+/**
  * Files allowed to construct SDK clients directly, relative to src/.
  *
  * - utils/llmClients.ts — the metered factory itself (the ONLY long-term home)
@@ -76,10 +107,9 @@ describe('SDK construction guard', () => {
     for (const file of listSourceFiles(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file).split(path.sep).join('/');
       const content = fs.readFileSync(file, 'utf8');
-      for (const { name, re } of FORBIDDEN_PATTERNS) {
-        if (re.test(content) && !ALLOWLIST.has(rel)) {
-          violations.push(`${rel} contains "${name}"`);
-        }
+      const constructions = findForbiddenSdkConstruction(content);
+      if (constructions.length > 0 && !ALLOWLIST.has(rel)) {
+        violations.push(`${rel} contains ${constructions.map((name) => `"${name}"`).join(', ')}`);
       }
     }
 
@@ -110,6 +140,20 @@ describe('SDK construction guard', () => {
       }
     }
     expect(stale).toEqual([]);
+  });
+});
+
+describe('SDK construction guard alias resistance (ENG-1414)', () => {
+  it.each([
+    ["import Client from 'openai';\nnew Client({ apiKey: 'x' });"],
+    ["import { GoogleGenAI as Client } from '@google/genai';\nnew Client({ apiKey: 'x' });"],
+    ["import { BedrockRuntimeClient as Client } from '@aws-sdk/client-bedrock-runtime';\nnew Client({});"],
+  ])('detects a forbidden SDK import alias', (source) => {
+    expect(findForbiddenSdkConstruction(source)).not.toEqual([]);
+  });
+
+  it('does not flag a type-only SDK import without construction', () => {
+    expect(findForbiddenSdkConstruction("import type OpenAI from 'openai';")).toEqual([]);
   });
 });
 
