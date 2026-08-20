@@ -273,6 +273,26 @@ describe('SkillService', () => {
       expect(mockCreateSet).toHaveBeenCalledWith(['tool1', 'tool2']);
     });
 
+    it('returns the updatedAt actually persisted, without mutating the passed-in object', async () => {
+      const skillToUpdate = {
+        skillId: 'skill-1',
+        name: 'Test',
+        description: 'Desc',
+        toolNames: [],
+        isPublished: false,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z', // stale — the write computes a fresh one
+      };
+
+      const result = await skillService.updateSkill(skillToUpdate);
+
+      expect(result).toBe(mockTimestamp);
+      expect(mockPut.mock.calls[0][0].Item.updatedAt).toBe(mockTimestamp);
+      // The caller's own object is untouched — callers that need to stay in
+      // sync must apply the returned value themselves (see withdrawFromReview).
+      expect(skillToUpdate.updatedAt).toBe('2026-01-01T00:00:00.000Z');
+    });
+
     /**
      * ENG-947: a bulk migration cannot make a read-then-write safe by re-reading —
      * the row can still change between the read and the put. `expectedUpdatedAt`
@@ -337,6 +357,136 @@ describe('SkillService', () => {
     it('should delete skill by skillId', async () => {
       await skillService.deleteSkill('skill-1');
       expect(mockDelete).toHaveBeenCalled();
+    });
+  });
+
+  describe('withdrawFromReview (ENG-932)', () => {
+    const pendingSkill = {
+      skillId: 'skill-1',
+      name: 'Test Skill',
+      description: 'Description',
+      toolNames: ['tool1'],
+      isPublished: true, // stale flag from a hypothetical prior approve — must be cleared on withdraw
+      ownerId: 'owner-1',
+      visibility: 'pending_review',
+      reviewFeedback: 'Add validation details.',
+      createdAt: mockTimestamp,
+      updatedAt: mockTimestamp,
+    };
+
+    it('moves a pending_review skill back to private, owned by the requester', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill }) // getSkill
+        .mockResolvedValueOnce({}); // updateSkill put
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(result.visibility).toBe('private');
+      expect(result.reviewFeedback).toBeUndefined();
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        Item: expect.objectContaining({ visibility: 'private' }),
+      }));
+      // The persisted item must clear reviewFeedback too, not just the returned object.
+      expect(mockPut.mock.calls[0][0].Item.reviewFeedback).toBeUndefined();
+    });
+
+    it('returns the skill with the updatedAt the write actually persisted, not the stale read value', async () => {
+      const staleFixture = { ...pendingSkill, updatedAt: '2020-01-01T00:00:00.000Z' };
+      mockPromise
+        .mockResolvedValueOnce({ Item: staleFixture })
+        .mockResolvedValueOnce({});
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      // updateSkill's internal Date.prototype.toISOString mock returns mockTimestamp —
+      // the returned skill must reflect that, not the 2020 value from the read.
+      expect(result.updatedAt).toBe(mockTimestamp);
+      expect(result.updatedAt).not.toBe('2020-01-01T00:00:00.000Z');
+    });
+
+    it('resets a stale isPublished flag so a withdrawn skill can never read as public', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      const result = await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(result.isPublished).toBe(false);
+      expect(mockPut.mock.calls[0][0].Item.isPublished).toBe(false);
+    });
+
+    it('writes the update conditionally on the read updatedAt (concurrent-modification guard)', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ExpressionAttributeValues: { ':expectedUpdatedAt': pendingSkill.updatedAt },
+      }));
+    });
+
+    it('throws a conflict error when the skill changed between read and write', async () => {
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockRejectedValueOnce(conditionalError);
+
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill was changed by someone else — refresh and try again');
+    });
+
+    it('rejects and returns nothing when the persistence write fails for an unrelated reason', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('DynamoDB unavailable');
+    });
+
+    it('leaves the skill content unchanged aside from visibility/isPublished/reviewFeedback', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: pendingSkill })
+        .mockResolvedValueOnce({});
+
+      await skillService.withdrawFromReview('skill-1', 'owner-1');
+
+      const putCall = mockPut.mock.calls[0][0];
+      expect(putCall.Item.name).toBe(pendingSkill.name);
+      expect(putCall.Item.description).toBe(pendingSkill.description);
+      expect(putCall.Item.skillId).toBe(pendingSkill.skillId);
+    });
+
+    it('throws "Skill not found" for a missing skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: undefined });
+      await expect(skillService.withdrawFromReview('nope', 'owner-1'))
+        .rejects.toThrow('Skill not found');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Not authorized" when the requester does not own the skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pendingSkill });
+      await expect(skillService.withdrawFromReview('skill-1', 'someone-else'))
+        .rejects.toThrow('Not authorized');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Skill is not pending review" for a private skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: { ...pendingSkill, visibility: 'private' } });
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill is not pending review');
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('throws "Skill is not pending review" for an already-public skill', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: { ...pendingSkill, visibility: 'public' } });
+      await expect(skillService.withdrawFromReview('skill-1', 'owner-1'))
+        .rejects.toThrow('Skill is not pending review');
+      expect(mockPut).not.toHaveBeenCalled();
     });
   });
 

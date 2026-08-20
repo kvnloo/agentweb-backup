@@ -438,6 +438,16 @@ jobs:
       - name: Run dependabot-integrity-check.sh regression suite
         run: bash .github/scripts/dependabot-integrity-check.test.sh
 
+      # No script under test — asserts the github-actions grouping in
+      # .github/dependabot.yml itself, so it cannot be quietly "cleaned up"
+      # back to one PR per action without a red check (ENG-1042). Placed here,
+      # grouped with its sibling Dependabot suites and ahead of every later
+      # step: a `run:` step failure skips the rest of the job by default, so a
+      # step placed after a flaky or already-red suite can silently stop
+      # proving anything without the job itself going green-then-red to say so.
+      - name: Run dependabot-config contract suite
+        run: bash .github/scripts/dependabot-config.test.sh
+
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
