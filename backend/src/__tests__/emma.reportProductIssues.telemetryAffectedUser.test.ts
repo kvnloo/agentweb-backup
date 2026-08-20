@@ -135,12 +135,15 @@ describe('report_product_issues — telemetry-affected-user attribution (ENG-939
     // The surfacing reviewer is still recorded, even though the affected user isn't.
     expect(call.reportedByAdmin).toBe('rui@agentweb.pro');
     // notionContext must not silently present the REVIEWER as the affected user — that would
-    // make the auto-generated Linear description read as an ordinary self-report.
-    expect(call.notionContext['User Email']).not.toBe('rui@agentweb.pro');
+    // make the auto-generated Linear description read as an ordinary self-report. Pin the exact
+    // sanitized shape, not just "isn't the reviewer's email".
+    expect(call.notionContext['User Email']).toBe('unresolved');
+    expect(call.notionContext['User Name']).toBe('unresolved (telemetry/satisfaction-report review)');
+    expect(call.notionContext['User ID']).toBeUndefined();
     expect(call.notionContext['Surfaced By']).toBe('rui@agentweb.pro');
     // Still files — report_product_issues does not fail the report over an unresolved affected user.
     expect(fileUserIssue).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(result)).not.toContain('"success":false');
+    expect(result).toMatchObject({ success: true });
   });
 
   it('affected-user lookup throwing (DB error) degrades to noResolvableReporter, preserves the run session + surfacing reviewer, never crashes the report', async () => {
@@ -160,7 +163,10 @@ describe('report_product_issues — telemetry-affected-user attribution (ENG-939
     expect(call.noResolvableReporter).toBe(true);
     expect(call.sessionId).toBe('sess-x');
     expect(call.reportedByAdmin).toBe('rui@agentweb.pro');
-    expect(call.notionContext['User Email']).not.toBe('rui@agentweb.pro');
-    expect(JSON.stringify(result)).not.toContain('"success":false');
+    expect(call.notionContext['User Email']).toBe('unresolved');
+    expect(call.notionContext['User Name']).toBe('unresolved (telemetry/satisfaction-report review)');
+    expect(call.notionContext['User ID']).toBeUndefined();
+    expect(call.notionContext['Surfaced By']).toBe('rui@agentweb.pro');
+    expect(result).toMatchObject({ success: true });
   });
 });
