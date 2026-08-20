@@ -237,6 +237,80 @@ describe('AgentModeService - Meta Datasets (Match Quality)', () => {
       expect(result.message).toMatch(/does not expose that number/i);
     });
 
+    // ─── ENG-926 §F follow-up: Meta ERRORING is a second failure shape ──────────────
+    //
+    // The first fix handled "Meta returns empty". Live production showed the OTHER shape on a
+    // real pixel: `getDatasetEventStats` THROWS, which escaped before the fallback could run,
+    // so the tool still answered nothing. Handling only the documented shape is what made the
+    // original fix partial.
+
+    it('falls back to send-side coverage when the Meta call THROWS, not just when it is empty', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.getDatasetEventStats as jest.Mock).mockRejectedValue(
+        new Error('An unknown error has occurred.')
+      );
+
+      const result = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined, { dataset_id: 'ds_100' }
+      );
+
+      // ⚠ The verdict stays FAILURE. An existing test caught the first version of this
+      // reporting success on a Meta error, which would have answered a question about a
+      // dataset that may not even exist. The caller gets the coverage AND the truth.
+      expect(result.success).toBe(false);
+      expect((result as any).meta_event_match_quality_available).toBe(false);
+      expect((result as any).send_side_identity_coverage).toBeDefined();
+      expect(result.message).toContain('An unknown error has occurred.');
+      expect(queryCapiKeyCoverageRows).toHaveBeenCalledWith('ds_100', expect.any(String));
+    });
+
+    it('distinguishes "Meta errored" from "Meta returned empty" — they are not the same fact', async () => {
+      // Collapsing them would let a real outage read as "Meta has no data for you", which is
+      // the could-not-ask/received-nothing conflation this whole area exists to prevent.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      (metaService.getDatasetEventStats as jest.Mock).mockRejectedValue(new Error('boom'));
+      const errored: any = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined, { dataset_id: 'ds_100' }
+      );
+
+      (metaService.getDatasetEventStats as jest.Mock).mockResolvedValue({
+        id: 'ds_100', name: 'My Dataset', event_stats: '{}'
+      });
+      const empty: any = await agentModeService.callMetaMarketingApi(
+        'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+        undefined, undefined, undefined, { dataset_id: 'ds_100' }
+      );
+
+      expect(errored.meta_event_stats_status).toBe('error');
+      expect(errored.success).toBe(false);
+      expect(empty.meta_event_stats_status).toBe('empty');
+      expect(empty.success).toBe(true);
+      expect(errored.meta_event_stats_error).toContain('boom');
+      // Both hand back coverage — the difference is the verdict, not the payload.
+      expect(errored.send_side_identity_coverage).toBeDefined();
+      expect(empty.send_side_identity_coverage).toBeDefined();
+    });
+
+    it('does NOT swallow a Meta AUTH error — a dead token must not read as "no data"', async () => {
+      // The outer handler rethrows isMetaAuthError so the caller can prompt a re-auth. Falling
+      // back here would convert "your token is dead" into a quiet, plausible-looking answer.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      const authErr: any = new Error('Error validating access token');
+      authErr.isMetaAuthError = true;
+      (metaService.getDatasetEventStats as jest.Mock).mockRejectedValue(authErr);
+
+      await expect(
+        agentModeService.callMetaMarketingApi(
+          'user123', 'DATASET', 'GET_MATCH_QUALITY', '123456789',
+          undefined, undefined, undefined, { dataset_id: 'ds_100' }
+        )
+      ).rejects.toMatchObject({ isMetaAuthError: true });
+      expect(queryCapiKeyCoverageRows).not.toHaveBeenCalled();
+    });
+
     it('does NOT substitute when event_stats is merely unparseable — that is a read failure, not an empty result', async () => {
       // Failing the other way would present a parse failure as a measurement.
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);

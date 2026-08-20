@@ -52,9 +52,17 @@ function hasKey(obj: Record<string, any> | undefined, key: string): boolean {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+/**
+ * Returns true if the alert was actually delivered, false if it was
+ * suppressed by dedupe. Callers that only care about "did I fire and
+ * forget" can ignore the return value (existing behavior, unchanged);
+ * a caller that needs to know whether a specific call was the one that
+ * fired (e.g. reporting an accurate "was a digest sent" summary) should
+ * use it instead of assuming every call that didn't throw delivered.
+ */
 export async function sendAgentModeOncallAlert(
   params: AgentModeOncallAlertParams
-): Promise<void> {
+): Promise<boolean> {
   const { subject, message, sessionId, context, dedupeKey, dedupeWindowMs, now } = params;
 
   // Rate-limit/dedupe: when a dedupeKey is supplied, only the first alert per
@@ -63,7 +71,7 @@ export async function sendAgentModeOncallAlert(
   if (dedupeKey) {
     const windowMs = dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
     if (shouldSuppressAlert(dedupeKey, windowMs, now ?? Date.now())) {
-      return;
+      return false;
     }
   }
 
@@ -86,5 +94,18 @@ export async function sendAgentModeOncallAlert(
     baseContext['iShare Link'] = ishareLink || 'N/A';
   }
 
-  await emailService.sendOncallAlert(subject, message, baseContext);
+  try {
+    await emailService.sendOncallAlert(subject, message, baseContext);
+  } catch (error) {
+    // The dedupe window was reserved before this send was attempted (so a
+    // flood of near-simultaneous callers only tries once). If the send
+    // itself failed, nothing was actually delivered — release the
+    // reservation so the next call in the window can retry, instead of
+    // silently suppressing every alert on this key until the window expires.
+    if (dedupeKey) {
+      lastAlertAtByKey.delete(dedupeKey);
+    }
+    throw error;
+  }
+  return true;
 }
