@@ -40,7 +40,30 @@
  *     npx jest --testPathPattern=e2e/usage-runway --forceExit
  */
 
-import { DynamoDB } from 'aws-sdk';
+// `src/__mocks__/aws-sdk.ts` is a MANUAL MOCK, and `roots: ['<rootDir>/src']` makes Jest
+// apply it AUTOMATICALLY to every suite in this project — no `jest.mock('aws-sdk')` call
+// required. That is correct for the 240 unit suites and fatal here: an E2E suite whose
+// whole job is to seed real rows and read them back through a real API was writing into a
+// mock that returns `{}` for everything.
+//
+// This is not hypothetical. The first live run against staging passed two scenarios and
+// failed seven, and every one of those results was meaningless: `percentUsed` never moved
+// off the account's real 58% because no seed ever reached DynamoDB. The two passes were
+// accidents of the account's existing state, not evidence.
+//
+// `requireActual` is used rather than `jest.unmock` because it cannot be undone by hoisting
+// order or by another module re-registering the mock — this binding is the real SDK by
+// construction.
+// Keeps this file a MODULE. Replacing the `import` with `requireActual` removed the only
+// top-level import, and TypeScript then treats the file as a global script: its top-level
+// `const`s collide with `landing-page-happy-path.e2e.test.ts` (which is also script-scoped
+// and also declares `authToken`/`describeE2E`), and a top-level `AWS` binding shadows the
+// aws-sdk types' own global `AWS` namespace for every other file in the program. Both
+// showed up as errors in unrelated files, which is a long way from the cause.
+export {};
+
+const realAws = jest.requireActual('aws-sdk') as typeof import('aws-sdk');
+const { DynamoDB } = realAws;
 
 const RUN = process.env.RUN_E2E_TESTS === 'true';
 const BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:3001';
@@ -76,6 +99,25 @@ const RUN_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,
  * flag away from writing to the wrong place, and the ledger it would corrupt is
  * the same one ENG-1247 is already trying to reconcile.
  */
+/**
+ * Refuse to run against a MOCKED DynamoDB.
+ *
+ * The failure this prevents is silent and total: every seed succeeds, every read returns
+ * `{}`, and the suite reports on the account's pre-existing state while appearing to test
+ * the state it seeded. A suite that cannot write is not a suite that found nothing — it is
+ * a suite that measured nothing, and it must say so loudly rather than pass.
+ */
+function assertRealDynamoClient(): void {
+  const put = (ddb as unknown as { put?: { _isMockFunction?: boolean } }).put;
+  if (put && put._isMockFunction) {
+    throw new Error(
+      'Refusing to run: the DynamoDB client is Jest\'s manual mock from src/__mocks__/aws-sdk.ts, ' +
+        'so every seed would be discarded and every assertion would read the account\'s ' +
+        'pre-existing state instead. Obtain the client via jest.requireActual("aws-sdk").',
+    );
+  }
+}
+
 function assertNotProduction(): void {
   const looksProd =
     /api\.agentweb\.pro/i.test(BASE_URL) || PREFIX === '' || /^AW-/.test(USAGE_TABLE);
@@ -87,7 +129,34 @@ function assertNotProduction(): void {
   }
 }
 
-const ddb = new DynamoDB.DocumentClient({ region: REGION });
+/**
+ * Resolve credentials explicitly instead of trusting the SDK's default chain.
+ *
+ * `backend/.env` carries placeholder `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, and
+ * dotenv loads them into `process.env` before this file runs. The default chain reads
+ * ENVIRONMENT credentials first, so those placeholders shadow the working credentials in
+ * `~/.aws/credentials` and every call dies with `UnrecognizedClientException` — which
+ * reads like an IAM problem and is not one.
+ *
+ * The shared file is the source of truth for an operator-run suite; `E2E_AWS_*` is the
+ * escape hatch for a runner with no `~/.aws`.
+ */
+function e2eCredentials(): InstanceType<typeof realAws.Credentials> | undefined {
+  if (process.env.E2E_AWS_ACCESS_KEY_ID && process.env.E2E_AWS_SECRET_ACCESS_KEY) {
+    return new realAws.Credentials({
+      accessKeyId: process.env.E2E_AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.E2E_AWS_SECRET_ACCESS_KEY,
+      sessionToken: process.env.E2E_AWS_SESSION_TOKEN,
+    });
+  }
+  try {
+    return new realAws.SharedIniFileCredentials({ profile: process.env.AWS_PROFILE || 'default' });
+  } catch {
+    return undefined;
+  }
+}
+
+const ddb = new DynamoDB.DocumentClient({ region: REGION, credentials: e2eCredentials() });
 
 let authToken = '';
 let userId = '';
@@ -106,10 +175,62 @@ const appliedChangeIds: string[] = [];
 /** The test user's real usage, restored in afterAll. */
 let originalTokenUsage: unknown;
 let originalBonus: unknown;
+/**
+ * The account's real credit ledger.
+ *
+ * Captured because the COST ceiling is lifted by `llmUsageCredits`, not by
+ * `tokenAllowanceBonus` — see `seedCreditGrant`. The shared test account already carries a
+ * $200 admin grant, and overwriting it without restoring would silently change what every
+ * later reader of this account sees.
+ */
+let originalCredits: unknown;
+let hadCredits = false;
 /** Whether those attributes EXISTED. Absent is not the same as null or zero, and
  *  restoring the wrong one of the three leaves the account subtly rewritten. */
 let hadTokenUsage = false;
 let hadBonus = false;
+
+/** The account's live cost ceiling in USD, read rather than assumed. */
+async function readCostState(): Promise<{ used: number; allowance: number; allowed: boolean }> {
+  const { status, data } = await api('GET', '/api/subscription/usage');
+  if (status !== 200 || typeof data?.costAllowance !== 'number') {
+    throw new Error(`Could not read the cost ceiling (${status}): ${JSON.stringify(data)}`);
+  }
+  return { used: data.costUsed, allowance: data.costAllowance, allowed: data.allowed };
+}
+
+/**
+ * Lift the COST ceiling by writing a credit grant.
+ *
+ * `tokenAllowanceBonus` does NOT do this, which is what the first live run showed: the
+ * effective threshold is `hardCostThresholdMicroUsd + purchased + adminGranted` from
+ * `llmUsageCredits`, while `tokenAllowanceBonus` feeds the TOKEN allowance — null on a
+ * cost-enforced policy. Seeding the bonus and expecting admission to resume tested a lever
+ * that is not connected to the thing being measured.
+ */
+async function seedCreditGrant(amountMicroUsd: number): Promise<void> {
+  await ddb
+    .update({
+      TableName: USERS_TABLE,
+      Key: { email: TEST_EMAIL },
+      UpdateExpression: 'SET llmUsageCredits = :c',
+      ExpressionAttributeValues: {
+        ':c': {
+          month: currentMonth(),
+          version: 1,
+          grants: [],
+          grantIds: [],
+          reversals: [],
+          reversalIds: [],
+          totalPurchasedMicroUsd: 0,
+          totalPurchasedReversedMicroUsd: 0,
+          totalAdminGrantedMicroUsd: amountMicroUsd,
+          totalMigrationOffsetMicroUsd: 0,
+        },
+      },
+    })
+    .promise();
+}
 
 async function api(
   method: string,
@@ -262,6 +383,7 @@ const describeE2E = RUN ? describe : describe.skip;
 describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
   beforeAll(async () => {
     assertNotProduction();
+    assertRealDynamoClient();
 
     const login = await api('POST', '/api/auth/login', {
       email: TEST_EMAIL,
@@ -275,13 +397,29 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
       Buffer.from(authToken.split('.')[1], 'base64').toString('utf8'),
     ).userId;
 
+    // Also the credential/table preflight: a failure here means the suite cannot see the
+    // data plane at all, and every scenario below would otherwise report on the account's
+    // pre-existing state while appearing to test what it seeded.
     const existing = await ddb
       .get({ TableName: USERS_TABLE, Key: { email: TEST_EMAIL } })
-      .promise();
+      .promise()
+      .catch((error: Error) => {
+        throw new Error(
+          `Cannot read ${USERS_TABLE} (${error.message}). The suite seeds through the data ` +
+            `plane, so it must not run without it. Check AWS credentials — note that ` +
+            `backend/.env's placeholder AWS keys shadow ~/.aws/credentials unless ` +
+            `E2E_AWS_ACCESS_KEY_ID/E2E_AWS_SECRET_ACCESS_KEY are set.`,
+        );
+      });
+    if (!existing.Item) {
+      throw new Error(`${TEST_EMAIL} does not exist in ${USERS_TABLE}; nothing to seed against.`);
+    }
     originalTokenUsage = existing.Item?.tokenUsage;
     originalBonus = existing.Item?.tokenAllowanceBonus;
     hadTokenUsage = existing.Item ? 'tokenUsage' in existing.Item : false;
     hadBonus = existing.Item ? 'tokenAllowanceBonus' in existing.Item : false;
+    originalCredits = existing.Item?.llmUsageCredits;
+    hadCredits = existing.Item ? 'llmUsageCredits' in existing.Item : false;
   }, 60_000);
 
   afterEach(async () => {
@@ -342,6 +480,12 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     } else {
       removes.push('tokenAllowanceBonus');
     }
+    if (hadCredits) {
+      sets.push('llmUsageCredits = :c');
+      values[':c'] = originalCredits;
+    } else {
+      removes.push('llmUsageCredits');
+    }
     const expression = [
       sets.length ? `SET ${sets.join(', ')}` : '',
       removes.length ? `REMOVE ${removes.join(', ')}` : '',
@@ -396,8 +540,23 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
   it('SCENARIO 2 — projected early exhaustion: an exhaustion date, before reset', async () => {
     // The case a percentage alone cannot express: a modest percent used, burning
     // fast enough to run out before the cycle ends.
-    await seedUserSpend({ totalCost: 40 });
-    await seedSteadyBurn(6, 8_000_000);
+    // Derived from the LIVE ceiling, not from constants. The first live run failed here
+    // with onTrack=true because the numbers were written against an assumed $150 cap and an
+    // empty ledger; the real account had a $350 effective ceiling (policy + credits) and
+    // $118 of pre-existing spend, so a $48 burn was comfortably on track. The correct
+    // answer was the product's, and the test was wrong.
+    const ceiling = await readCostState();
+    const usedTarget = ceiling.allowance * 0.5;
+    await seedUserSpend({ totalCost: usedTarget });
+
+    // Burn hard enough that the remaining half cannot survive the cycle: three times the
+    // rate that would exactly last until reset. Seeded across the trailing-seven window so
+    // it dominates `max(cycleToDate, trailingSeven)` regardless of what the account already
+    // spent earlier in the month.
+    const runwayNow = await api('GET', '/api/subscription/usage-runway');
+    const daysLeft = Math.max(1, runwayNow.data?.runway?.daysUntilReset ?? 12);
+    const perDayUsd = ((ceiling.allowance - usedTarget) / daysLeft) * 3;
+    await seedSteadyBurn(7, Math.round(perDayUsd * 1_000_000));
 
     const { data } = await api('GET', '/api/subscription/usage-runway');
 
@@ -496,13 +655,28 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
   }, 60_000);
 
   it('SCENARIO 6 — top-up resume: verified credits lift the ceiling', async () => {
-    await seedUserSpend({ totalCost: 1_000_000 });
+    // Overshoot the ceiling by a KNOWN margin rather than by a huge constant. The first
+    // live run seeded $1,000,000 of spend and then expected a $500 top-up to resume
+    // admission — it cannot, and the failure said more about the arithmetic than the
+    // product.
+    const before = await readCostState();
+    const overshootUsd = before.allowance * 1.5;
+    await seedUserSpend({ totalCost: overshootUsd });
     const paused = await api('GET', '/api/subscription/usage');
     expect(paused.data.allowed).toBe(false);
 
-    // `tokenAllowanceBonus` IS the credit mechanism — no Stripe round-trip needed
-    // to prove the admission side of a top-up.
-    await seedUserSpend({ totalCost: 1_000_000, bonus: 500_000_000 });
+    // `llmUsageCredits` is the mechanism that lifts a COST ceiling —
+    // `effectiveHardThreshold = hardCostThreshold + purchased + adminGranted`. The token
+    // bonus this scenario used to seed is a different lever entirely, and is null on a
+    // cost-enforced policy, so no top-up could ever have shown up here.
+    // Sized against the SPEND, not against `before.allowance`. The ceiling read above
+    // already contains the account's existing $200 grant, and `seedCreditGrant` REPLACES
+    // the credit ledger rather than adding to it — so subtracting the old allowance while
+    // discarding the old grant under-funded the top-up and left the account paused. Since
+    // `effective = policyBase + granted` and `policyBase >= 0`, granting more than the
+    // whole seeded spend clears the ceiling whatever the base happens to be.
+    const grantMicroUsd = Math.ceil(overshootUsd * 1_000_000) + 50_000_000;
+    await seedCreditGrant(grantMicroUsd);
     const resumed = await api('GET', '/api/subscription/usage');
 
     expect(resumed.status).toBe(200);
@@ -510,8 +684,9 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     // next call is the bug this would be written to catch, so the admission
     // decision is the assertion — the numbers are corroboration.
     expect(resumed.data.allowed).toBe(true);
-    expect(resumed.data.bonus).toBeGreaterThan(0);
-    expect(resumed.data.effectiveAllowance).toBeGreaterThan(paused.data.effectiveAllowance ?? 0);
+    // Corroboration on the COST fields, which are the ones this policy enforces.
+    expect(resumed.data.costAllowance).toBeGreaterThan(paused.data.costAllowance);
+    expect(resumed.data.costAllowance).toBeGreaterThan(resumed.data.costUsed);
   }, 60_000);
 
   it('SCENARIO 7 — reset: a new cycle starts from zero', async () => {
@@ -529,6 +704,33 @@ describeE2E('ENG-1210 AC11 — usage runway, fake-user E2E', () => {
     // AC5: "no false-precision date". Under one complete day there is nothing to
     // extrapolate from, and guessing would be worse than saying so.
     await seedUserSpend({ totalCost: 5 });
+
+    // PRECONDITION, checked rather than assumed. "Insufficient history" is the one scenario
+    // that cannot be seeded INTO existence — it requires the absence of ledger rows, and no
+    // amount of writing produces an absence. The shared test account carries real spend
+    // across many days of the cycle, so on that account this scenario is unrunnable.
+    //
+    // Checked and failed loudly rather than skipped: a skip here would read as coverage of
+    // AC5's "no false-precision date", which is exactly the claim that would then be
+    // untrue. The remedy is an account whose ledger this suite owns, via E2E_TEST_EMAIL.
+    const cycleStart = `${currentMonth()}-01`;
+    const existingRows = await ddb
+      .query({
+        TableName: USAGE_TABLE,
+        KeyConditionExpression: 'userId = :u AND sk BETWEEN :s AND :e',
+        ExpressionAttributeValues: { ':u': userId, ':s': cycleStart, ':e': `${currentMonth()}-31~` },
+        Select: 'COUNT',
+      })
+      .promise();
+    if ((existingRows.Count || 0) > 0) {
+      throw new Error(
+        `SCENARIO 8 cannot run against ${TEST_EMAIL}: it has ${existingRows.Count} ledger ` +
+          `row(s) in the current cycle, so the forecast has history to work from and ` +
+          `"insufficient history" is unreachable. Point E2E_TEST_EMAIL at an account whose ` +
+          `ledger this suite owns. Failing rather than skipping — a skip would look like ` +
+          `AC5 was covered when it was not.`,
+      );
+    }
 
     const { status, data } = await api('GET', '/api/subscription/usage-runway');
 
