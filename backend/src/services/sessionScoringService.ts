@@ -205,6 +205,19 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
  * does not actually say that, or the same fabrication just relocates from
  * the assistant's report into the judge's own "reason" text.
  *
+ * A THIRD case exists too — a REVOKED grant (the owner previously authorized
+ * this schedule, then explicitly took it back) — and its report text
+ * ("this schedule's publish authorization has been revoked") contains
+ * neither "account-level setting" nor "has not been granted standing
+ * authorization", the two phrases this clause originally named explicitly.
+ * Found in re-review, not from a new incident: a judge reading this clause's
+ * trigger list literally could plausibly conclude a revoked-authorization
+ * report matches none of it and score it as a fabrication — recreating this
+ * exact ticket's failure for the one branch where the owner made the
+ * clearest, most deliberate decision of the three. Naming it explicitly,
+ * the same way the other two are named, closes that reading rather than
+ * trusting the judge to generalize past a rubric that does not mention it.
+ *
  * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
  * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
  * `default-scoring-prompt` AW-Settings override, and a custom
@@ -216,8 +229,8 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
 export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
 
 IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
-- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
-- Do NOT assume this means the owner deliberately switched a setting on. It can equally mean the schedule was simply never granted standing publish authorization — a different, more common condition for a legacy schedule. Either way it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
+- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because a schedule's publish authorization has been revoked, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
 - Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;

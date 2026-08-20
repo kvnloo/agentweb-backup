@@ -126,6 +126,25 @@ describe('SessionScoring - publish-approval withholding is not a fabrication (EN
     expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/never been granted|not.{0,20}deliberately|standing.{0,20}authorization/i);
   });
 
+  /**
+   * ENG-1245 (found in re-review, not filed as a ticket) — getScheduledSessionOverride
+   * gained a THIRD withheld branch ('revoked': the owner previously granted standing
+   * publish authorization and has since revoked it — see
+   * describePublishAuthorizationWithholdReason in schedulePublishAuthorization.ts) whose
+   * report text says "this schedule's publish authorization has been revoked" and does
+   * NOT contain the phrase "account-level setting" or "has not been granted standing
+   * authorization" — the two phrases this clause explicitly lists as recognized real
+   * reasons. A judge doing careful, literal reading of the clause's own trigger list
+   * could plausibly conclude a revoked-authorization report matches none of them and
+   * score it as a fabrication — recreating this exact ticket's failure for the one case
+   * where the owner made the clearest, most deliberate decision of all three branches.
+   * This is not a hypothetical judge behavior to guard against blindly — literal,
+   * narrow reading of a rubric is exactly what produced the original bug.
+   */
+  it('PUBLISH_APPROVAL_WITHHOLDING_CLAUSE explicitly recognizes a REVOKED authorization as real too, not just never-granted', () => {
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/revoked/i);
+  });
+
   it('scoreSession appends the clause to the system prompt sent to the LLM', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
 
