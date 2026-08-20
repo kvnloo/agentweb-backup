@@ -366,7 +366,46 @@ export async function checkUserConversionDivergence(
  * DynamoDB, the Meta SDK, or the email service — the same split `metaAttributionCoverage`
  * and `metaConversionRelay` both use.
  */
-export async function checkConversionDivergenceForUser(user: any): Promise<DivergenceResult> {
+/**
+ * Pick the alert transport: the caller's override, or the real oncall email.
+ *
+ * ⚠ EXTRACTED SO IT CAN BE TESTED AT ALL. Inline in the wrapper below, this choice was
+ * unreachable by every existing test — the cron suite `jest.mock`s this whole module, and the
+ * divergence suite exercises the INJECTABLE `checkUserConversionDivergence`, never the
+ * wrapper. A mutation that ignored the override therefore passed the entire suite, while dry
+ * runs would have silently sent real oncall alerts. Found by that surviving mutation.
+ *
+ * ⚠ Defaults to the REAL transport, never to a no-op: a caller that forgets the argument must
+ * keep production behaviour, not go quiet.
+ */
+export function resolveDivergenceAlertTransport(
+  override?: DivergenceDeps['alertTransport'],
+): DivergenceDeps['alertTransport'] {
+  return (
+    override ??
+    (async (subject, message, context) => {
+      const { emailService } = await import('./emailService');
+      await emailService.sendOncallAlert(subject, message, context);
+    })
+  );
+}
+
+export async function checkConversionDivergenceForUser(
+  user: any,
+  /**
+   * ENG-926 §F: let a caller substitute the alert transport.
+   *
+   * Everything else in the sweep routes alerts through an injected `AlertSink`, which is what
+   * makes a dry run side-effect-free. This check did not, so the cron had to SKIP it on a dry
+   * run — and the cost was not just a missing diagnostic. It meant the first time this
+   * detector ever ran against real relay data would be in production, unattended, sending an
+   * alert whose shape nobody had ever seen.
+   *
+   * ⚠ Defaults to the REAL oncall transport when omitted, so a caller that forgets this
+   * argument keeps today's production behaviour rather than silently going quiet.
+   */
+  alertTransport?: DivergenceDeps['alertTransport'],
+): Promise<DivergenceResult> {
   const [{ crmDb }, { metaService }, { getMetaAccountCredentials }] = await Promise.all([
     import('./db'),
     import('./metaService'),
@@ -386,9 +425,6 @@ export async function checkConversionDivergenceForUser(user: any): Promise<Diver
       getMetaAccountCredentials(owner, userId, accountId),
     countPixelEvents: (pixelId, accessToken, eventNames, window) =>
       countPixelRelayEvents(pixelId, accessToken, eventNames, window),
-    alertTransport: async (subject, message, context) => {
-      const { emailService } = await import('./emailService');
-      await emailService.sendOncallAlert(subject, message, context);
-    },
+    alertTransport: resolveDivergenceAlertTransport(alertTransport),
   });
 }

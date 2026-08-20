@@ -26,6 +26,7 @@ import {
   DIVERGENCE_MIN_SAMPLE,
   countPixelRelayEvents,
   countLoggedRelaysInWindow,
+  resolveDivergenceAlertTransport,
 } from '../services/metaConversionDivergence';
 
 describe('evaluateDivergence', () => {
@@ -393,3 +394,35 @@ describe('checkUserConversionDivergence — the comparison', () => {
     expect(alerts).toHaveLength(0);
   });
 });
+
+describe('resolveDivergenceAlertTransport — ENG-926 §F, the dry-run seam', () => {
+  /**
+   * ⚠ THIS EXISTS BECAUSE A MUTATION SURVIVED. Ignoring the override passed the ENTIRE suite:
+   * the cron tests `jest.mock` this whole module, and every other test here exercises the
+   * INJECTABLE `checkUserConversionDivergence`, never the wrapper that chooses the transport.
+   * The consequence of that gap is not academic — it is a dry run sending real oncall alerts,
+   * the exact footgun CodeRabbit caught in this codebase on #2469.
+   */
+
+  it('returns the caller\'s override EXACTLY, so a dry run captures instead of sending', () => {
+    const captured: any[] = [];
+    const override = async (subject: string, message: string, context?: Record<string, any>) => {
+      captured.push({ subject, message, context });
+    };
+
+    expect(resolveDivergenceAlertTransport(override)).toBe(override);
+  });
+
+  it('falls back to a REAL transport when omitted — never to a silent no-op', async () => {
+    // A caller that forgets the argument must keep production behaviour. Going quiet would be
+    // the worse failure: the detector would look healthy while alerting nobody.
+    const sendOncallAlert = jest.fn().mockResolvedValue(undefined);
+    jest.doMock('../services/emailService', () => ({ emailService: { sendOncallAlert } }));
+
+    const transport = resolveDivergenceAlertTransport();
+    expect(typeof transport).toBe('function');
+    await transport('subject', 'message', { userId: 'u1' });
+    expect(sendOncallAlert).toHaveBeenCalledWith('subject', 'message', { userId: 'u1' });
+  });
+});
+
