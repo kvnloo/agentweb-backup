@@ -173,9 +173,9 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
       },
       choices: [{ message: { content: 'ok' } }],
     });
-    (svc as any).llmModels['gpt-5-chat-2'].client = { chat: { completions: { create: azureCreate } } };
+    (svc as any).llmModels['gpt-5.5'].client = { chat: { completions: { create: azureCreate } } };
 
-    await svc.callLLM('gpt-5-chat-2', [{ role: 'user', content: 'hi' }], {
+    await svc.callLLM('gpt-5.5', [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', sessionId: 's1', feature: 'agent_task' },
     });
 
