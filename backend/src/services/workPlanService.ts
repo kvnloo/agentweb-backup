@@ -116,11 +116,10 @@ export class WorkPlanService {
   private validateSteps(steps: WorkPlanStep[] | undefined): void {
     if (!steps) return;
     steps.forEach((step, idx) => {
-      if (step.userInstructions === undefined || step.userInstructions === null) return;
-      if (typeof step.userInstructions !== 'string') {
+      if (step.userInstructions !== undefined && step.userInstructions !== null && typeof step.userInstructions !== 'string') {
         throw new Error(`step ${idx + 1}: userInstructions must be a string`);
       }
-      if (step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
+      if (typeof step.userInstructions === 'string' && step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
         throw new Error(
           `step ${idx + 1}: userInstructions exceeds ${USER_INSTRUCTIONS_MAX_LENGTH} characters (got ${step.userInstructions.length})`,
         );
