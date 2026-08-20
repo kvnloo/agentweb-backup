@@ -110,54 +110,76 @@ export function findUnconsumedCursors(
 ): UnconsumedCursor[] {
   if (!Array.isArray(ledger) || ledger.length === 0) return [];
 
-  const rowsPerTool = new Map<string, number>();
-  const emitted: { tool: string; cursor: string; index: number }[] = [];
+  /**
+   * One usable call: named, successful, with its rows, the cursor it consumed and
+   * the cursor it produced.
+   *
+   * `status` absent counts as success — the loop's own ledger omits it on the
+   * ordinary path — but any EXPLICIT status other than 'success' does not. A
+   * deferred or cancelled call never ran, so it can neither read a page nor
+   * consume one, and the emit and consume sides have to agree on that or a
+   * cancelled entry silently closes a page nobody fetched (CodeRabbit, #2493).
+   */
+  const ok = (e: CursorLedgerEntry | undefined) => !e?.status || e.status === 'success';
 
-  for (let i = 0; i < ledger.length; i++) {
-    const entry = ledger[i];
-    // A failed call read nothing, so it has nothing unread. Warning here would
-    // tell the user to resume a query that never ran.
-    if (entry?.status && entry.status !== 'success') continue;
-
+  const calls = ledger.map((entry, index) => {
+    if (!ok(entry)) return null;
     const tool = toolNameOf(entry);
-    if (!tool) continue; // unnameable: nothing a reader could resume
+    if (!tool) return null; // unnameable: nothing a reader could resume
+    return {
+      index,
+      tool,
+      rows: rowsFrom(entry?.result),
+      args: argValues(entry?.functionArgs),
+      out: cursorFrom(entry?.result),
+    };
+  });
 
-    rowsPerTool.set(tool, (rowsPerTool.get(tool) ?? 0) + rowsFrom(entry?.result));
-
-    const cursor = cursorFrom(entry?.result);
-    if (cursor) emitted.push({ tool, cursor, index: i });
+  /**
+   * Chains, not tools.
+   *
+   * Aggregating per TOOL was wrong: two unrelated searches on the same tool each
+   * leave a page unread, and collapsing them dropped one remainder outright while
+   * summing their rows into a chain length that never existed — 23 rows across a
+   * 20-row chain and a 3-row chain (CodeRabbit, #2493).
+   *
+   * A chain is a lineage: a call emits a cursor, the call that passes that exact
+   * cursor back continues it, and so on. Rows accumulate along the lineage, and the
+   * chain is outstanding when its final call emitted a cursor nobody took up.
+   */
+  const successorOf = new Map<number, number>(); // emitter index -> continuer index
+  const isContinuation = new Set<number>();
+  for (const call of calls) {
+    if (!call?.out) continue;
+    const next = calls.find(
+      (later) =>
+        later &&
+        later.index > call.index &&
+        later.tool === call.tool && // an unrelated tool holding the same string is a collision, not a read
+        later.args.has(call.out as string),
+    );
+    if (next) {
+      successorOf.set(call.index, next.index);
+      isContinuation.add(next.index);
+    }
   }
 
-  // Consumption is tracked by cursor VALUE, not by tool name.
-  //
-  // An earlier revision closed a tool's chain as soon as that tool returned a page
-  // with no cursor, on the reasoning that a consumed cursor always produces a
-  // further call whose result advances or closes the chain. That is true only when
-  // every call for a tool belongs to the SAME paging chain. It does not hold for an
-  // independent query: page 1 of list A leaves a cursor unread, the model then runs
-  // a fresh unrelated search with the same tool against list B, and list B's
-  // complete result closed list A's chain — silently reporting A as fully read when
-  // its page 2 was never fetched (CodeRabbit, #2493).
-  //
-  // Mutating the value matching away failed no test at the time, which I took as
-  // proof it was unreachable. It only proved the suite had no independent-call
-  // case. It has one now.
   const unconsumed: UnconsumedCursor[] = [];
-  const lastPerTool = new Map<string, UnconsumedCursor>();
-  for (const pending of emitted) {
-    const used = ledger
-      .slice(pending.index + 1)
-      .some((later) => later?.status !== 'error' && argValues(later?.functionArgs).has(pending.cursor));
-    if (used) continue;
-    // One entry per tool: paging three deep and stopping is one unread remainder,
-    // and the DEEPEST outstanding cursor is the one worth resuming from.
-    lastPerTool.set(pending.tool, {
-      tool: pending.tool,
-      cursor: pending.cursor,
-      returned: rowsPerTool.get(pending.tool) ?? 0,
-    });
+  for (const head of calls) {
+    if (!head || isContinuation.has(head.index)) continue; // only walk from a chain's start
+    let cur = head;
+    let rows = 0;
+    for (;;) {
+      rows += cur.rows;
+      const nextIndex = successorOf.get(cur.index);
+      if (nextIndex === undefined) break;
+      const next = calls[nextIndex];
+      if (!next) break;
+      cur = next;
+    }
+    // Outstanding only if the LAST call in the lineage handed back a cursor.
+    if (cur.out) unconsumed.push({ tool: cur.tool, cursor: cur.out, returned: rows });
   }
-  unconsumed.push(...lastPerTool.values());
   return unconsumed;
 }
 

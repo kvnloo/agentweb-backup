@@ -96,6 +96,53 @@ describe('findUnconsumedCursors', () => {
     expect(out[0].cursor).toBe('C1');
   });
 
+  it('two INDEPENDENT unread chains on one tool are both reported, with their own row counts', () => {
+    // Per-TOOL state was wrong (CodeRabbit, #2493). Two unrelated searches each
+    // leave a page unread; collapsing them to one entry drops a real remainder,
+    // and summing their rows invents a chain length that never existed — a 23-row
+    // chain when the chains are 20 and 3.
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('search_leads', { list_id: 'B' }, { leads: new Array(3), next_cursor: 'C2' }),
+    ];
+    const out = findUnconsumedCursors(ledger).sort((a, b) => a.cursor.localeCompare(b.cursor));
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ cursor: 'C1', returned: 20 });
+    expect(out[1]).toMatchObject({ cursor: 'C2', returned: 3 });
+  });
+
+  it('a continued chain still counts its whole length, and reports once', () => {
+    // The other side of the same rule: pages that genuinely belong to one chain do
+    // accumulate, and only the deepest cursor is outstanding.
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('search_leads', { list_id: 'A', cursor: 'C1' }, { leads: new Array(20), next_cursor: 'C2' }),
+    ];
+    const out = findUnconsumedCursors(ledger);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cursor: 'C2', returned: 40 });
+  });
+
+  it('a DIFFERENT tool passing the same value has not consumed the cursor', () => {
+    // Cursor strings are opaque and could collide across tools; consumption means
+    // "this tool fetched its own next page", not "that string appeared somewhere".
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('get_leads', { list_id: 'A', cursor: 'C1' }, { leads: new Array(5) }),
+    ];
+    expect(findUnconsumedCursors(ledger)).toHaveLength(1);
+  });
+
+  it('a CANCELLED later call has not consumed the cursor either', () => {
+    // The emit side only accepts `success`; the consume side must agree, or a
+    // deferred or cancelled entry silently closes a page that was never read.
+    const ledger = [
+      call('search_leads', { list_id: 'A' }, { leads: new Array(20), next_cursor: 'C1' }),
+      call('search_leads', { list_id: 'A', cursor: 'C1' }, {}, 'deferred'),
+    ];
+    expect(findUnconsumedCursors(ledger)).toHaveLength(1);
+  });
+
   it('a later call that FAILED while carrying the cursor has not consumed it', () => {
     // Attempting to read page 2 is not reading it. If the retry errored, the page
     // is still unread and the notice must still fire — otherwise a transient
