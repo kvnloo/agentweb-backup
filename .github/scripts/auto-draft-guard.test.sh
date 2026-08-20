@@ -162,6 +162,15 @@ assert_not_contains() {
   esac
 }
 
+assert_equals() {
+  local actual="$1" expected="$2" label="$3"
+  if [ "${actual}" = "${expected}" ]; then
+    pass_test "${label}"
+  else
+    fail_test "${label}" "expected: ${expected}   (got: ${actual})"
+  fi
+}
+
 # --- auto-draft-guard: only fires on the one push that matters (criterion 1/2) ---
 GUARD_IF="$(job_if auto-draft-guard)"
 if [ -z "${GUARD_IF}" ]; then
@@ -170,6 +179,10 @@ if [ -z "${GUARD_IF}" ]; then
 fi
 printf 'auto-draft-guard.test: auto-draft-guard\n'
 printf '  if: %s\n' "${GUARD_IF}"
+
+assert_equals "${GUARD_IF}" \
+  "github.event.action == 'synchronize' && github.event.pull_request.draft == false" \
+  "auto-draft-guard has the complete synchronize-and-ready expression"
 
 assert_contains "${GUARD_IF}" "github.event.action == 'synchronize'" \
   "only reacts to a new commit, never to opened/reopened/ready_for_review"
@@ -189,6 +202,9 @@ if [ -z "${GUARD_GROUP}" ]; then
   fail_test "auto-draft-guard has its own concurrency group" \
     "missing — without one, a rapid double-push could run the conversion twice concurrently"
 else
+  assert_equals "${GUARD_GROUP}" \
+    '${{ github.workflow }}-auto-draft-guard-${{ github.ref }}-${{ github.event.pull_request.draft }}' \
+    "auto-draft-guard has the complete per-PR/ref/draft concurrency group"
   assert_contains "${GUARD_GROUP}" '${{ github.ref }}' \
     "auto-draft-guard's group is scoped per-PR-ref, like every other job here"
   assert_contains "${GUARD_GROUP}" '${{ github.event.pull_request.draft }}' \
