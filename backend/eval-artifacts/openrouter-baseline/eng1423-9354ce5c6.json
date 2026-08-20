@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "revision": "eb5f56c10",
-  "generatedAt": "2026-08-20T21:38:41.324Z",
+  "revision": "9354ce5c6",
+  "generatedAt": "2026-08-20T22:43:39.506Z",
   "source": "executable synthetic fixtures + explicit logical model + OpenRouter generation detail",
   "artifacts": [
     {
@@ -22,12 +22,12 @@
         "cacheReadTokens": 0,
         "cacheWriteTokens": 0
       },
-      "recordedCostMicroUsd": 2,
-      "recordedCostUsd": 0.000002469,
+      "recordedCostMicroUsd": 7,
+      "recordedCostUsd": 0.0000068,
       "costSource": "provider_reported",
-      "latencyMs": 378,
-      "requestLatencyMs": 1405,
-      "providerName": "DigitalOcean",
+      "latencyMs": 1425,
+      "requestLatencyMs": 3295,
+      "providerName": "Phala",
       "finishReason": "stop",
       "output": "BASELINE_OK",
       "behavioralVerdict": "passed",
@@ -36,9 +36,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-interactive-chat-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:37:28.121Z",
-      "generationId": "gen-1787261846-4wLq8iJuAGUSAfYz1ypt",
-      "generationTimeMs": 800,
+      "observedAt": "2026-08-20T22:42:23.165Z",
+      "generationId": "gen-1787265740-hTs11fn1plARv0KOXUki",
+      "generationTimeMs": 2088,
       "nativeFinishReason": "stop"
     },
     {
@@ -62,8 +62,8 @@
       "recordedCostMicroUsd": 2,
       "recordedCostUsd": 0.000002469,
       "costSource": "provider_reported",
-      "latencyMs": 1616,
-      "requestLatencyMs": 2462,
+      "latencyMs": 710,
+      "requestLatencyMs": 2138,
       "providerName": "DigitalOcean",
       "finishReason": "stop",
       "output": "BASELINE_OK",
@@ -73,9 +73,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-scheduled-background-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:37:40.548Z",
-      "generationId": "gen-1787261858-9mEIQOnMZPeD1FdTI8Fm",
-      "generationTimeMs": 1749,
+      "observedAt": "2026-08-20T22:42:34.105Z",
+      "generationId": "gen-1787265752-lKgZdsnEfkdi9E483KlS",
+      "generationTimeMs": 1228,
       "nativeFinishReason": "stop"
     },
     {
@@ -99,8 +99,8 @@
       "recordedCostMicroUsd": 6,
       "recordedCostUsd": 0.000006176,
       "costSource": "provider_reported",
-      "latencyMs": 1314,
-      "requestLatencyMs": 2929,
+      "latencyMs": 601,
+      "requestLatencyMs": 2541,
       "providerName": "DigitalOcean",
       "finishReason": "stop",
       "output": "{\"status\":\"BASELINE_OK\",\"fixtureId\":\"eng1423-content-generation-v1\"}",
@@ -110,9 +110,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-content-generation-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:37:52.883Z",
-      "generationId": "gen-1787261870-LtBHplx1t0ywlNSxzPfB",
-      "generationTimeMs": 2277,
+      "observedAt": "2026-08-20T22:42:44.253Z",
+      "generationId": "gen-1787265762-uvCPVN82vc82aAYECvFl",
+      "generationTimeMs": 1498,
       "nativeFinishReason": "stop"
     },
     {
@@ -130,21 +130,21 @@
       "usage": {
         "inputTokens": 338,
         "outputTokens": 55,
-        "cacheReadTokens": 256,
+        "cacheReadTokens": 0,
         "cacheWriteTokens": 0
       },
-      "recordedCostMicroUsd": 22,
-      "recordedCostUsd": 0.000021888,
+      "recordedCostMicroUsd": 40,
+      "recordedCostUsd": 0.00004032,
       "costSource": "provider_reported",
-      "latencyMs": 372,
-      "requestLatencyMs": 1456,
+      "latencyMs": 1096,
+      "requestLatencyMs": 2245,
       "providerName": "DeepInfra",
       "finishReason": "tool_calls",
       "output": [
         {
           "type": "function",
           "index": 0,
-          "id": "chatcmpl-tool-be94f9dbfbf268c8",
+          "id": "chatcmpl-tool-96042c5d67993d69",
           "function": {
             "name": "baseline_echo",
             "arguments": "{\"fixtureId\": \"eng1423-mcp-api-v1\"}"
@@ -157,9 +157,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-mcp-api-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:38:02.479Z",
-      "generationId": "gen-1787261881-Pg3DqrSd8SNojS42rdtG",
-      "generationTimeMs": 625,
+      "observedAt": "2026-08-20T22:42:57.281Z",
+      "generationId": "gen-1787265775-MuNSlwEKl4WoA4Zcoi1v",
+      "generationTimeMs": 1403,
       "nativeFinishReason": "tool_calls"
     },
     {
@@ -183,15 +183,15 @@
       "recordedCostMicroUsd": 22,
       "recordedCostUsd": 0.000021528,
       "costSource": "provider_reported",
-      "latencyMs": 364,
-      "requestLatencyMs": 1115,
+      "latencyMs": 714,
+      "requestLatencyMs": 1886,
       "providerName": "DeepInfra",
       "finishReason": "tool_calls",
       "output": [
         {
           "type": "function",
           "index": 0,
-          "id": "chatcmpl-tool-a9bc48a55bd334b5",
+          "id": "chatcmpl-tool-95cd435cbcfab781",
           "function": {
             "name": "baseline_echo",
             "arguments": "{\"fixtureId\": \"eng1423-agent-engine-v1\"}"
@@ -204,9 +204,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-agent-engine-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:38:13.662Z",
-      "generationId": "gen-1787261892-nJbtyoT6JcafouJnZNH4",
-      "generationTimeMs": 556,
+      "observedAt": "2026-08-20T22:43:09.679Z",
+      "generationId": "gen-1787265788-I54SAqSzpxuuOmzoBfEd",
+      "generationTimeMs": 1125,
       "nativeFinishReason": "tool_calls"
     },
     {
@@ -230,15 +230,15 @@
       "recordedCostMicroUsd": 22,
       "recordedCostUsd": 0.000021528,
       "costSource": "provider_reported",
-      "latencyMs": 426,
-      "requestLatencyMs": 1167,
+      "latencyMs": 640,
+      "requestLatencyMs": 1716,
       "providerName": "DeepInfra",
       "finishReason": "tool_calls",
       "output": [
         {
           "type": "function",
           "index": 0,
-          "id": "chatcmpl-tool-b1b3596e48d4f437",
+          "id": "chatcmpl-tool-bb8320bce7faacca",
           "function": {
             "name": "baseline_echo",
             "arguments": "{\"fixtureId\": \"eng1423-coding-agent-v1\"}"
@@ -251,9 +251,9 @@
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-coding-agent-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:38:25.222Z",
-      "generationId": "gen-1787261904-tyXJhvp0YB82SyVUwUHo",
-      "generationTimeMs": 641,
+      "observedAt": "2026-08-20T22:43:18.546Z",
+      "generationId": "gen-1787265796-LSlon5fgIfYd0BirvRU6",
+      "generationTimeMs": 959,
       "nativeFinishReason": "tool_calls"
     },
     {
@@ -269,28 +269,28 @@
         "structuredOutput": true
       },
       "usage": {
-        "inputTokens": 42,
-        "outputTokens": 27,
+        "inputTokens": 65,
+        "outputTokens": 85,
         "cacheReadTokens": 0,
         "cacheWriteTokens": 0
       },
-      "recordedCostMicroUsd": 9,
-      "recordedCostUsd": 0.00000864,
+      "recordedCostMicroUsd": 33,
+      "recordedCostUsd": 0.0000329,
       "costSource": "provider_reported",
-      "latencyMs": 298,
-      "requestLatencyMs": 1230,
-      "providerName": "DeepInfra",
+      "latencyMs": 794,
+      "requestLatencyMs": 1952,
+      "providerName": "Novita",
       "finishReason": "stop",
-      "output": "{\"status\": \"BASELINE_OK\", \"fixtureId\": \"eng1423-nonstandard-consumer-v1\"}",
+      "output": "{\"status\":\"BASELINE_OK\",\"fixtureId\":\"eng1423-nonstandard-consumer-v1\"}",
       "behavioralVerdict": "passed",
       "failureSemantics": "Malformed JSON or missing/wrong typed fields fail closed; no silent text fallback is accepted.",
       "okareo": {
         "status": "executable_fixture_ready",
         "command": "NODE_ENV=production npx ts-node src/loops/scripts/runOpenRouterBaseline.ts --fixture eng1423-nonstandard-consumer-v1 --model openrouter/deepseek/deepseek-v4-flash --revision <sha> --out <artifact.json>"
       },
-      "observedAt": "2026-08-20T21:38:34.010Z",
-      "generationId": "gen-1787261912-o7TTjqLXfw8wdkPWUkhf",
-      "generationTimeMs": 429,
+      "observedAt": "2026-08-20T22:43:29.587Z",
+      "generationId": "gen-1787265807-Z5ksvfbvIjNLduhoOZak",
+      "generationTimeMs": 1485,
       "nativeFinishReason": "stop"
     }
   ]
