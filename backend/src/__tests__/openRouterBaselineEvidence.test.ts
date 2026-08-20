@@ -1,5 +1,5 @@
 import { normalizeOpenAIUsage } from '../utils/llmClients';
-import { parseArgs } from '../loops/scripts/runOpenRouterBaseline';
+import { parseArgs, resolveOutputPath } from '../loops/scripts/runOpenRouterBaseline';
 import {
   BASELINE_FIXTURES,
   applyOpenRouterGenerationDetail,
@@ -12,6 +12,21 @@ import {
 } from '../loops/eval/openRouterBaselineEvidence';
 
 describe('ENG-1423 executable baseline evidence', () => {
+  it('keeps relative artifact paths inside the current working directory', () => {
+    expect(resolveOutputPath('eval-artifacts/baseline.json', '/workspace/backend'))
+      .toBe('/workspace/backend/eval-artifacts/baseline.json');
+  });
+
+  it('rejects absolute artifact paths', () => {
+    expect(() => resolveOutputPath('/tmp/baseline.json', '/workspace/backend'))
+      .toThrow('--out must be a relative path');
+  });
+
+  it('rejects artifact paths that traverse above the current working directory', () => {
+    expect(() => resolveOutputPath('../baseline.json', '/workspace/backend'))
+      .toThrow('--out must stay inside');
+  });
+
   it('rejects a flag whose apparent value is another flag', () => {
     expect(() => parseArgs([
       '--revision', 'abcdef1', '--out', '--model', 'openrouter/example/model',

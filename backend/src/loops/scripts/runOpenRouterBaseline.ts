@@ -36,6 +36,16 @@ interface CliOptions {
   fixtureId?: string;
 }
 
+export function resolveOutputPath(out: string, cwd = process.cwd()): string {
+  if (path.isAbsolute(out)) throw new Error('--out must be a relative path inside the current working directory');
+  const outputPath = path.resolve(cwd, out);
+  const relative = path.relative(cwd, outputPath);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`)) {
+    throw new Error('--out must stay inside the current working directory');
+  }
+  return outputPath;
+}
+
 export function parseArgs(argv: readonly string[]): CliOptions {
   const value = (flag: string): string | undefined => {
     const index = argv.indexOf(flag);
@@ -141,7 +151,7 @@ async function main(): Promise<void> {
     artifacts,
     ...(failures.length > 0 ? { failures } : {}),
   };
-  const outputPath = path.resolve(options.out);
+  const outputPath = resolveOutputPath(options.out);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, `${JSON.stringify(output, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   process.stdout.write(`Wrote ${artifacts.length} observed baseline artifact(s) to ${outputPath}\n`);
