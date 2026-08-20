@@ -4479,6 +4479,24 @@ export async function POST(req: Request) {
     const fbp = (await cookies()).get("_fbp")?.value;
     const fbc = (await cookies()).get("_fbc")?.value;
 
+    // ENG-926 §B — the VISITOR's own IP and user agent, which exist only here.
+    // The browser posts directly to this route on the site's own domain, so these headers
+    // describe the person. By the time the request reaches our API it is this Vercel
+    // function making the call, and the backend can only ever see Vercel's egress — which
+    // is why it must be told rather than left to look. It validates before storing.
+    //
+    // ISOLATED IN ITS OWN try/catch ON PURPOSE. Everything below runs inside this route's
+    // blanket catch-and-return-500, so without this a header read that throws would not
+    // merely lose the identity fields - it would drop the LEAD. Identity is a match-quality
+    // bonus; the lead is the product. Never let the bonus cost the product.
+    let clientIp = "";
+    let clientUserAgent = "";
+    try {
+      const h = await headers();
+      clientIp = (h.get("x-forwarded-for") || "").split(",")[0].trim();
+      clientUserAgent = (h.get("user-agent") || "").trim();
+    } catch {}
+
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4491,6 +4509,8 @@ export async function POST(req: Request) {
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
         ...(fbc ? { fbc } : {}),
+        ...(clientIp ? { clientIp } : {}),
+        ...(clientUserAgent ? { clientUserAgent } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });

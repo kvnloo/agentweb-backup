@@ -285,6 +285,15 @@ function visitLandingPage(clickUrl: string, referrer = 'https://www.facebook.com
   return jar;
 }
 
+/**
+ * ENG-926 §B — a real visitor's address and browser, as the site's own capture route sees
+ * them. Deliberately NOT a datacenter address: the whole failure this closes is a lead
+ * recording the forwarder (`44.202.76.171` / `node`) for a submission from an iPhone.
+ */
+const VISITOR_IP = '45.253.245.23';
+const VISITOR_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
 interface ForwardCall {
   url: string;
   body: any;
@@ -298,6 +307,11 @@ interface ForwardCall {
 async function submitLeadForm(
   jar: CookieJar,
   form: Record<string, string>,
+  /** What the BROWSER sent to the site's own capture route — the visitor, not Vercel. */
+  visitorHeaders: Record<string, string> = {
+    'x-forwarded-for': VISITOR_IP,
+    'user-agent': VISITOR_UA,
+  },
 ): Promise<{ routeResponse: any; forwarded: ForwardCall }> {
   let forwarded: ForwardCall | undefined;
   const realFetch = globalThis.fetch;
@@ -321,6 +335,13 @@ async function submitLeadForm(
       cookies: async () => ({
         get: (name: string) => (jar[name] ? { name, value: jar[name] } : undefined),
       }),
+      // ENG-926 §B. This stub previously omitted `headers` entirely and every test still
+      // passed, because the only caller was resolvePagePath's REFERER fallback — which never
+      // runs here, since the middleware always stamps `aw_page`. An unexercised branch, not a
+      // covered one. The capture route now reads the visitor's IP/user agent from here.
+      headers: async () => ({
+        get: (name: string) => visitorHeaders[name.toLowerCase()] ?? null,
+      }),
     };
     const route = loadInjected(captureRouteSource, (m) => {
       if (m === 'next/server') return nextServer;
@@ -341,9 +362,10 @@ async function clickThroughToCrm(
   clickUrl: string,
   form: Record<string, string>,
   referrer?: string,
+  visitorHeaders?: Record<string, string>,
 ): Promise<{ lead: any; forwarded: ForwardCall; cookie: any }> {
   const jar = visitLandingPage(clickUrl, referrer);
-  const { forwarded } = await submitLeadForm(jar, form);
+  const { forwarded } = await submitLeadForm(jar, form, visitorHeaders);
   await new Promise((resolve) => setImmediate(resolve));
   const leadWrites = mockDynamoWrites.filter((w) => w.TableName === 'AW-Leads');
   return {
@@ -557,5 +579,87 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
 
     expect(lead.firstTouch.clickIds).toEqual({ gclid: 'Cj0KCQ_fake_gclid_456' });
     expect(lead.firstTouch.utm.source).toBe('google');
+  });
+
+  // ── ENG-926 §B: the visitor's own IP and user agent reach the CRM row ────────────
+  //
+  // Before this, a landing-page lead stored NEITHER. The capture route did not forward them
+  // and the backend guard correctly refused what it could see, because what it could see was
+  // Vercel. Both are named in ENG-926 §B as signals that materially improve Event Match
+  // Quality, and the whole chain is only assertable end to end — which is what this suite is.
+
+  it('stores the VISITOR\'s ip and user agent, not the forwarder\'s', async () => {
+    const { lead, forwarded } = await clickThroughToCrm(clickUrlFromMetaAd(LANDING_PAGE), {
+      email: 'identity@acme.io',
+    });
+
+    // Declared by the capture route, top-level.
+    expect(forwarded.body.clientIp).toBe(VISITOR_IP);
+    expect(forwarded.body.clientUserAgent).toBe(VISITOR_UA);
+
+    // Accepted by forward-lead and written to AW-Leads.
+    expect(lead.clientIp).toBe(VISITOR_IP);
+    expect(lead.clientUserAgent).toBe(VISITOR_UA);
+
+    // NOT swallowed into the free-form bag. Absent from HANDLED_TOP_LEVEL_KEYS they would
+    // land in customFields as junk while looking, from the row, like the feature worked.
+    expect(lead.customFields?.clientIp).toBeUndefined();
+    expect(lead.customFields?.clientUserAgent).toBeUndefined();
+  });
+
+  it('stores NOTHING when the declared address is a datacenter-side one', async () => {
+    // The original defect, now arriving through the new door: a forwarder that declares its
+    // own identity instead of the visitor's. A wrong IP is worse than no IP.
+    const { lead } = await clickThroughToCrm(
+      clickUrlFromMetaAd(LANDING_PAGE),
+      { email: 'forwarder-declared@acme.io' },
+      undefined,
+      { 'x-forwarded-for': '127.0.0.1', 'user-agent': 'node' },
+    );
+
+    expect(lead.clientIp).toBeUndefined();
+    expect(lead.clientUserAgent).toBeUndefined();
+  });
+
+  it('keeps a real browser agent even when the declared address is unusable', async () => {
+    // The agent is still true about the visitor and is a real match signal on its own.
+    const { lead } = await clickThroughToCrm(
+      clickUrlFromMetaAd(LANDING_PAGE),
+      { email: 'private-ip@acme.io' },
+      undefined,
+      { 'x-forwarded-for': '10.0.0.4', 'user-agent': VISITOR_UA },
+    );
+
+    expect(lead.clientIp).toBeUndefined();
+    expect(lead.clientUserAgent).toBe(VISITOR_UA);
+  });
+
+  it('takes the FIRST hop of a multi-hop x-forwarded-for', async () => {
+    // Vercel appends its own hops. The client is the leftmost entry; taking the last would
+    // store a proxy every time.
+    const { lead } = await clickThroughToCrm(
+      clickUrlFromMetaAd(LANDING_PAGE),
+      { email: 'multihop@acme.io' },
+      undefined,
+      { 'x-forwarded-for': `${VISITOR_IP}, 10.0.0.9, 172.31.0.31`, 'user-agent': VISITOR_UA },
+    );
+
+    expect(lead.clientIp).toBe(VISITOR_IP);
+  });
+
+  it('still records the LEAD when the header read is impossible', async () => {
+    // The capture route wraps the header read in its own try/catch precisely so a failure
+    // there cannot reach the route's blanket 500 handler and cost the submission. Identity
+    // is a bonus; the lead is the product.
+    const jar = visitLandingPage(clickUrlFromMetaAd(LANDING_PAGE));
+    const { forwarded } = await submitLeadForm(
+      jar,
+      { email: 'headers-throw@acme.io' },
+      new Proxy({}, { get() { throw new Error('headers() unavailable in this context'); } }) as any,
+    );
+
+    expect(forwarded.status).toBe(201);
+    expect(forwarded.body.clientIp).toBeUndefined();
+    expect(forwarded.body.clientUserAgent).toBeUndefined();
   });
 });

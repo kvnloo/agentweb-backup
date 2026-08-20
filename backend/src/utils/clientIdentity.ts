@@ -24,6 +24,8 @@
  * CORS-open and unauthenticated, so a body-supplied IP would be trivially spoofable.
  */
 
+import { isIP } from 'net';
+
 /**
  * Anchored patterns, not substring matches. A browser UA is a long string containing many
  * words; a loose `includes('java')` would swallow real traffic advertising JavaFX, and
@@ -88,5 +90,129 @@ export function resolveClientIdentity(
   // placeholder for a missing value, never something to persist as one.
   if (addr && addr.toLowerCase() !== 'unknown') out.clientIp = addr;
 
+  return out;
+}
+
+/**
+ * ENG-926 §B — accept the visitor's identity from the one caller that actually knows it.
+ *
+ * The guard above is right and stays: an IP resolved from the REQUEST belongs to whoever made
+ * the request, and for a landing-page lead that is Vercel. But refusing it left lander leads
+ * carrying NEITHER `client_ip_address` nor `client_user_agent`, both named in the card's §B as
+ * signals that materially improve Event Match Quality. Storing nothing was honest; it was still
+ * a gap.
+ *
+ * The visitor's real IP and user agent exist in exactly one place — the site's own Next.js
+ * capture route, which the browser posts to directly. So the forwarder declares them, and this
+ * is the narrow path that accepts a declaration.
+ *
+ * ⚠ THIS IS NOT "TRUST THE BODY". `forward-lead` is public, CORS-open and unauthenticated, so a
+ * declaration is accepted only when all three hold:
+ *
+ *   1. the CALLER is already recognised as a forwarding server. A direct browser caller can
+ *      never override its own identity, or any visitor could launder an arbitrary IP through a
+ *      public endpoint by simply claiming one.
+ *   2. the DECLARED user agent is itself a browser. A forwarder declaring `node` is describing
+ *      ITSELF — the original bug arriving through the new door — so the whole declaration is
+ *      refused rather than half-accepted.
+ *   3. the DECLARED IP is a syntactically valid PUBLIC address. Private, loopback, link-local,
+ *      CGNAT, multicast and reserved addresses cannot be a visitor's public IP and match nobody
+ *      at Meta, which is the same "a wrong IP is worse than no IP" rule applied to a declared
+ *      value instead of an observed one.
+ *
+ * ⚠ Stated plainly rather than implied: **this does not make the value trustworthy against a
+ * determined attacker.** Anyone can already POST an arbitrary lead here with a fake email and
+ * fake attribution, so declaring a fake IP alongside them is not a new capability, and
+ * `if_not_exists` in db.ts means an EXISTING lead's identity can never be overwritten. What the
+ * validation buys is correctness for real traffic: it stops a forwarder from mistakenly
+ * declaring its own datacenter identity, which is the precise failure the guard above exists for.
+ */
+export interface ForwardedClientIdentity {
+  clientIp?: unknown;
+  clientUserAgent?: unknown;
+}
+
+/** Reject every IPv4 range that cannot be a visitor's public address. */
+function isPublicIpv4(addr: string): boolean {
+  const parts = addr.split('.');
+  if (parts.length !== 4) return false;
+  const o = parts.map((p) => Number(p));
+  if (o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+
+  if (o[0] === 0) return false;                              // "this network"
+  if (o[0] === 10) return false;                             // private 10/8
+  if (o[0] === 127) return false;                            // loopback — what req.ip is today
+  if (o[0] === 169 && o[1] === 254) return false;            // link-local / cloud metadata
+  if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return false; // private 172.16/12 — the ALB range
+  if (o[0] === 192 && o[1] === 168) return false;            // private 192.168/16
+  if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return false; // CGNAT 100.64/10
+  if (o[0] >= 224) return false;                             // multicast, reserved, broadcast
+
+  // Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are deliberately NOT
+  // rejected: they are a spec nicety rather than a match hazard, and this repo's fixtures use
+  // 203.0.113.x throughout. Rejecting them would buy nothing and break every test that reads.
+  return true;
+}
+
+/** Reject the IPv6 ranges that cannot be a visitor's public address. */
+function isPublicIpv6(lower: string): boolean {
+  if (lower === '::' || lower === '::1') return false;       // unspecified / loopback
+  const head = lower.split(':')[0];
+  if (head.startsWith('fc') || head.startsWith('fd')) return false;  // unique-local fc00::/7
+  if (/^fe[89ab]/.test(head)) return false;                          // link-local fe80::/10
+  return true;
+}
+
+/**
+ * Is this a syntactically valid, publicly routable IP address?
+ *
+ * Uses Node's own `net.isIP` for the shape rather than a hand-rolled regex — an address is
+ * exactly the kind of grammar where a regex looks right and is subtly wrong, and this value
+ * is attacker-supplied.
+ */
+export function isPublicIpAddress(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const raw = value.trim();
+  if (!raw) return false;
+
+  const kind = isIP(raw);
+  if (kind === 4) return isPublicIpv4(raw);
+  if (kind !== 6) return false;
+
+  const lower = raw.toLowerCase();
+  // An IPv4-mapped address is IPv4 wearing a v6 costume — ::ffff:127.0.0.1 is loopback.
+  // Judge it by what it actually contains, not by the fact that it parses as v6.
+  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+  if (mapped) return isPublicIpv4(mapped[1]);
+
+  return isPublicIpv6(lower);
+}
+
+/**
+ * Resolve the visitor's identity, allowing a recognised forwarder to declare it.
+ *
+ * Falls back to {@link resolveClientIdentity} exactly when there is nothing to declare, so the
+ * observed-caller behaviour is unchanged and this is purely additive.
+ */
+export function resolveClientIdentityWithForwarded(
+  userAgent: unknown,
+  ip: unknown,
+  declared?: ForwardedClientIdentity,
+): ClientIdentity {
+  // A caller we can observe directly never gets to describe itself.
+  if (!isServerSideUserAgent(userAgent)) return resolveClientIdentity(userAgent, ip);
+
+  // The caller is a forwarder, so its own IP and agent are its own — already refused above.
+  // The only identity worth having is one it explicitly declares for the visitor.
+  const declaredUa =
+    typeof declared?.clientUserAgent === 'string' ? declared.clientUserAgent.trim() : '';
+  // Refuse the WHOLE declaration, not just the agent: if the forwarder is describing itself,
+  // its IP is its own too, and keeping that half is the bug this module exists to prevent.
+  if (!declaredUa || isServerSideUserAgent(declaredUa)) return {};
+
+  const out: ClientIdentity = { clientUserAgent: declaredUa };
+  const declaredIp = typeof declared?.clientIp === 'string' ? declared.clientIp.trim() : '';
+  // An unusable IP is simply absent. It NEVER falls back to the forwarder's own address.
+  if (isPublicIpAddress(declaredIp)) out.clientIp = declaredIp;
   return out;
 }
