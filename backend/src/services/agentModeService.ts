@@ -12841,9 +12841,15 @@ export class AgentModeService {
       // message no longer derives its total from it (see below), nothing the caller
       // asked for depends on it. Degrade the summary, not the tool.
       const [engagementCountResult, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId).catch(() => null),
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch((countError) => {
+          // Loud, not silent (CodeRabbit). The bare swallow kept the tool alive but
+          // left no trace, so a count query failing repeatedly would be invisible.
+          console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
+          return null;
+        }),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCountAvailable = engagementCountResult !== null;
       const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
@@ -12880,11 +12886,19 @@ export class AgentModeService {
       return {
         success: true,
         message: engagementMessage,
+        // ENG-1207 (CodeRabbit): explicit null, never undefined, plus a flag when
+        // the count is unavailable. An undefined field vanishes from the serialised
+        // payload, so the model cannot tell "this lead has no engagements" from "we
+        // could not count them" -- a milder form of the very ambiguity this change
+        // exists to remove. `?? null` also normalises a partial count object.
         engagementSummary: {
-          total: engagementCount.total,
-          last7Days: engagementCount.last7Days,
-          totalAllMessages: engagementCount.totalAllMessages
+          total: engagementCount.total ?? null,
+          last7Days: engagementCount.last7Days ?? null,
+          totalAllMessages: engagementCount.totalAllMessages ?? null
         },
+        // Only when it actually failed. Stamping it unconditionally would train the
+        // model to ignore it, which is how `has_more` came to be ignored.
+        ...(engagementCountAvailable ? {} : { engagementCountUnavailable: true }),
         engagements: limitedEngagements.map((eng: any) => ({
           eventId: eng.eventId,
           eventType: eng.eventType,

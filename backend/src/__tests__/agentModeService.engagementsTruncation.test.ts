@@ -219,6 +219,50 @@ describe('ENG-1207 — get_lead_engagements must not report a page as a total', 
     expect(result.message).toBe('Found 3 engagement(s) for Lovelace');
   });
 
+  it('a failed count query is reported as UNAVAILABLE, never as absent (CodeRabbit)', async () => {
+    // The subtle regression the swallow introduced. `undefined` fields vanish
+    // entirely from the JSON the model reads, so it cannot tell "this lead has no
+    // engagements" from "we could not count them" — a milder version of the exact
+    // ambiguity this PR exists to remove. Explicit null plus a flag says which.
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockRejectedValue(new Error('count query failed'));
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(143),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.success).toBe(true);
+    expect(result.engagementCountUnavailable).toBe(true);
+    // Present-and-null, not missing. `'total' in summary` is the assertion that
+    // matters — an undefined value would satisfy `toBeNull`-adjacent checks while
+    // still disappearing from the serialised payload.
+    expect('total' in result.engagementSummary).toBe(true);
+    expect(result.engagementSummary.total).toBeNull();
+    expect(result.engagementSummary.last7Days).toBeNull();
+    expect(result.engagementSummary.totalAllMessages).toBeNull();
+    // Loud, not silent — the same contract the rest of this file's best-effort
+    // catches follow.
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('a SUCCESSFUL count query carries no unavailable flag and real numbers', async () => {
+    // The control. Stamping the flag unconditionally would train the model to
+    // ignore it, which is how has_more got ignored in the first place.
+    (mockCrmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+      total: 143, last7Days: 4, totalAllMessages: 143,
+    });
+    (mockCrmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+      engagements: buildEngagements(143),
+    });
+
+    const result = await service.getLeadEngagements(listId, leadId, userId);
+
+    expect(result.engagementCountUnavailable).toBeUndefined();
+    expect(result.engagementSummary.total).toBe(143);
+  });
+
   it('ERROR PATH: a REJECTED count query must not take the whole tool down', async () => {
     // Distinct from the malformed-shape case above, and sharper: the count is
     // fetched in the same `Promise.all` as the engagements, so a rejection there
