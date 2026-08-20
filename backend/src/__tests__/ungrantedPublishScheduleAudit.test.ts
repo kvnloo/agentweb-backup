@@ -60,40 +60,31 @@ describe('scheduleSignalsPublishIntent', () => {
   });
 
   /**
-   * ENG-1245 — "post"/"posts" is the one ambiguous word in the pattern: it is
-   * both the verb (the actual instruction) and a common noun ("recent posts",
-   * "blog post", "the post"). A pure read-only/reporting schedule that happens
-   * to analyze or summarize existing posts would otherwise trip both this
-   * function and the customer-portal hint for having nothing to do with
-   * publishing. "publish"/"tweet"/"reply" don't get this treatment — they are
-   * effectively always verbs in a scheduling-prompt context.
+   * ENG-1245 — deliberately OVER-inclusive, unlike the customer-portal hint's
+   * identical-looking function of the same name (ScheduleFormPanel.tsx). The two
+   * diverge on purpose: this audit is the only thing left watching for a schedule
+   * silently stuck unauthorized — the judge-score signal that used to (accidentally)
+   * surface this bug class is now correctly suppressed for honest withholding, so
+   * nothing else catches a schedule that goes unwatched. A false negative here means
+   * a broken schedule stays invisible to EVERYTHING, indefinitely — worse than the
+   * UI hint's false negative, which just means one editor visit didn't warn the
+   * owner of a problem the audit would still catch on its own pass. A false positive
+   * here costs a reviewer one extra glance at an admin-reviewed list; a false
+   * positive in the UI hint is a recurring, per-visit "the app is wrong" moment that
+   * teaches distrust. So this function does NOT exclude "post(s)" used as a noun
+   * ("recent posts", "blog post") the way the UI hint does — a schedule phrased that
+   * way, with an uncovered synonym verb ("send it live", "share it"), would
+   * otherwise be missed by an audit whose whole job is not missing things.
    */
-  describe('does not false-positive on "post(s)" used as a noun', () => {
-    it.each([
-      'Analyze recent posts and their engagement',
-      'Summarize the latest blog post for the newsletter',
-      'Read the post and extract key quotes',
-      'Report on our social posts from last week',
-      'Which LinkedIn posts got the most reach this month?',
-    ])('%s', (text) => {
-      expect(scheduleSignalsPublishIntent({ startingMessage: text })).toBe(false);
-    });
+  it('matches "post(s)" even when noun-shaped, unlike the customer-portal hint — recall matters more here', () => {
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Analyze recent posts and their engagement' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Summarize the latest blog post for the newsletter' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Which LinkedIn posts got the most reach this month?' })).toBe(true);
   });
 
   it('still matches "post" used as a verb, including at the start of an instruction', () => {
     expect(scheduleSignalsPublishIntent({ startingMessage: 'Post directly to X. No approval needed.' })).toBe(true);
     expect(scheduleSignalsPublishIntent({ startingMessage: 'Draft the content, then post it to LinkedIn.' })).toBe(true);
-    expect(scheduleSignalsPublishIntent({ startingMessage: 'Please post this update immediately.' })).toBe(true);
-  });
-
-  it('still matches when a verb "post" appears alongside a noun-shaped "recent posts" mention', () => {
-    // An instruction can legitimately reference past posts (context) while also
-    // instructing a new one (the actual intent) — the noun mention must not mask it.
-    expect(
-      scheduleSignalsPublishIntent({
-        startingMessage: 'Check our recent posts for tone, then post a new update in the same style.',
-      })
-    ).toBe(true);
   });
 });
 
