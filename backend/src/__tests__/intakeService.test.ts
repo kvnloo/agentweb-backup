@@ -152,6 +152,17 @@ describe('fileUserIssue — bug, noResolvableReporter (ENG-939 AC4: unresolved t
     expect(r.canonicalUrl).toBe('lin');
   });
 
+  it('ENG-289 leak guard: trackerUrl is NEVER the internal canonical URL when there is no Featurebase ticket', async () => {
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'https://linear.app/emmabyaw/issue/ENG-9', id: 'uuid-9' });
+    const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true });
+    // trackerUrl is surfaced to the filing caller unconditionally (unlike canonicalUrl, which is
+    // admin-gated) — it must fall back to the public Featurebase board, never the Linear link.
+    expect(r.trackerUrl).toBe('https://agentweb.featurebase.app/');
+    expect(r.trackerUrl).not.toContain('linear.app');
+    expect(r.userUrl).toBeUndefined();
+    expect(r.canonicalUrl).toBe('https://linear.app/emmabyaw/issue/ENG-9');
+  });
+
   it('never writes a [reporter-ticket #N] marker -> the resolve bridge notifies nobody for it', async () => {
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'rui@agentweb.pro', noResolvableReporter: true, reportedByAdmin: 'rui@agentweb.pro' });

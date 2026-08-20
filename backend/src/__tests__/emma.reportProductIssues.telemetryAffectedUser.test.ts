@@ -118,23 +118,32 @@ describe('report_product_issues — telemetry-affected-user attribution (ENG-939
     expect(call.noResolvableReporter).toBeFalsy();
   });
 
-  it('run_id points at another user, but that user cannot be resolved -> files with noResolvableReporter, never defaults to the reviewer as the affected user', async () => {
+  it('run_id points at another user, but that user cannot be resolved -> files with noResolvableReporter, preserves the run session + surfacing reviewer, never defaults to the reviewer as the affected user', async () => {
     (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
       runs: [{ runId: 'run-3', sessionId: 'sess-ghost', userId: 'deleted-user-99', verdict: 'failed', toolCalls: 1, failedToolCalls: 1, outcomes: [] }],
       scannedEvents: 1,
       truncated: false,
     });
 
-    const result = await tool().execute({ issues: [issueWithRun('run-3')] }, { userId: REVIEWER.userId });
+    const result = await tool().execute({ issues: [issueWithRun('run-3')] }, { userId: REVIEWER.userId, sessionId: 'rui-review-session' });
 
     const call = lastFileCall();
     expect(call.noResolvableReporter).toBe(true);
+    // The analysed run's OWN session is preserved for eng traceability — never silently
+    // replaced by the reviewer's own chat session just because the owner didn't resolve.
+    expect(call.sessionId).toBe('sess-ghost');
+    // The surfacing reviewer is still recorded, even though the affected user isn't.
+    expect(call.reportedByAdmin).toBe('rui@agentweb.pro');
+    // notionContext must not silently present the REVIEWER as the affected user — that would
+    // make the auto-generated Linear description read as an ordinary self-report.
+    expect(call.notionContext['User Email']).not.toBe('rui@agentweb.pro');
+    expect(call.notionContext['Surfaced By']).toBe('rui@agentweb.pro');
     // Still files — report_product_issues does not fail the report over an unresolved affected user.
     expect(fileUserIssue).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(result)).not.toContain('"success":false');
   });
 
-  it('affected-user lookup throwing (DB error) degrades to noResolvableReporter, never crashes the report', async () => {
+  it('affected-user lookup throwing (DB error) degrades to noResolvableReporter, preserves the run session + surfacing reviewer, never crashes the report', async () => {
     (fetchAgentRunSummaries as jest.Mock).mockResolvedValue({
       runs: [{ runId: 'run-4', sessionId: 'sess-x', userId: 'some-other-user', verdict: 'failed', toolCalls: 1, failedToolCalls: 1, outcomes: [] }],
       scannedEvents: 1,
@@ -149,6 +158,9 @@ describe('report_product_issues — telemetry-affected-user attribution (ENG-939
 
     const call = lastFileCall();
     expect(call.noResolvableReporter).toBe(true);
+    expect(call.sessionId).toBe('sess-x');
+    expect(call.reportedByAdmin).toBe('rui@agentweb.pro');
+    expect(call.notionContext['User Email']).not.toBe('rui@agentweb.pro');
     expect(JSON.stringify(result)).not.toContain('"success":false');
   });
 });

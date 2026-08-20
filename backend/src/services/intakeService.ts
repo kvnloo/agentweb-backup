@@ -496,7 +496,11 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
 
   return {
     pageId: ticket ? String(ticket.number) : '',
-    trackerUrl: ticket?.url || canonicalUrl || FEATUREBASE_BOARD_URL,
+    // ENG-289 leak guard: `trackerUrl` is surfaced to the filing caller unconditionally (unlike
+    // `canonicalUrl`, which is gated on admin/delegated-admin). It must NEVER fall back to the
+    // internal Linear canonical link when no Featurebase ticket exists — that would hand a
+    // possibly-non-admin caller the internal eng URL through the un-gated field.
+    trackerUrl: ticket?.url || FEATUREBASE_BOARD_URL,
     userUrl: ticket?.url || undefined, // the reporter's OWN private card — none exists when skipReporter
     canonicalUrl: canonicalUrl || undefined,      // internal Linear canonical (ENG-289)
     deduped: grouped,

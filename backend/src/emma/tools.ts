@@ -7675,11 +7675,14 @@ emmaToolRegistry.register({
               issueContext['AgentRun ID'] = run.runId;
 
               if (run.userId && run.userId !== userId) {
+                // The run's session id is known regardless of whether the OWNER resolves — keep
+                // it so eng can still trace to the actual analysed session even on an unresolved
+                // lookup, instead of silently falling back to the caller's own chat session.
+                affectedSessionId = run.sessionId;
                 try {
                   const affected = await userDb.getUserById(run.userId);
                   if (affected?.email) {
                     affectedUser = { email: affected.email, displayName: affected.displayName, funnelStatus: affected.funnelStatus };
-                    affectedSessionId = run.sessionId;
                   } else {
                     affectedUserUnresolved = true;
                   }
@@ -7709,6 +7712,17 @@ emmaToolRegistry.register({
           } else {
             delete issueContext['User Status'];
           }
+        } else if (affectedUserUnresolved) {
+          // A KNOWN cross-user report whose owner didn't resolve — the context must not keep
+          // showing the CALLER as "User Name"/"User Email"/"User ID", or the auto-generated
+          // description reads as an ordinary self-report and silently contradicts the explicit
+          // "Affected user: unresolved" line `fileBugReport` writes for this case.
+          issueContext['User Name'] = 'unresolved (telemetry/satisfaction-report review)';
+          issueContext['User Email'] = 'unresolved';
+          delete issueContext['User ID'];
+          issueContext['Surfaced By'] = user.email;
+          if (affectedSessionId) issueContext['Session ID'] = affectedSessionId;
+          delete issueContext['User Status'];
         }
 
         if (isDelegatedAdmin && adminEmail) {
@@ -7733,7 +7747,10 @@ emmaToolRegistry.register({
             // their behalf" mechanism to record whoever surfaced it, distinct from who it affects.
             userEmail: affectedUser?.email ?? user.email,
             userName: affectedUser ? (affectedUser.displayName || affectedUser.email) : (user.displayName || user.email),
-            reportedByAdmin: affectedUser
+            // Preserve the surfacing actor whenever we KNOW this is a cross-user report — resolved
+            // or not — so an unresolved-affected-user filing still records who surfaced it, rather
+            // than silently losing that fact along with the affected user's identity.
+            reportedByAdmin: (affectedUser || affectedUserUnresolved)
               ? user.email
               : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
             sessionId: affectedSessionId ?? context?.sessionId,
