@@ -109,6 +109,23 @@ describe('SessionScoring - publish-approval withholding is not a fabrication (EN
     expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/not authoritative|even if/i);
   });
 
+  /**
+   * ENG-1245 (re-verified): the clause originally told the judge this restriction is
+   * always "an owner-configured account/schedule setting". That is only true for the
+   * literal "Require approval before publishing" toggle. Schedule
+   * 1d001fba-0fb7-4bcd-80f6-6041b244a442 ("Harsha Daily X Post (Autonomous)") has that
+   * toggle OFF and has posted nothing since 2026-08-13 because it was simply never
+   * granted standing publish authorization — a real, code-enforced restriction, but
+   * not one the owner deliberately switched on. The judge must not penalize either
+   * case, but it also must not itself assert a specific cause ("the owner turned this
+   * on") the transcript does not actually support — that just relocates the same
+   * fabrication into the judge's own "reason" text instead of the assistant's.
+   */
+  it('PUBLISH_APPROVAL_WITHHOLDING_CLAUSE does not assume the owner deliberately switched the setting on', () => {
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).not.toContain('owner-configured account/schedule setting');
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/never been granted|not.{0,20}deliberately|standing.{0,20}authorization/i);
+  });
+
   it('scoreSession appends the clause to the system prompt sent to the LLM', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
 

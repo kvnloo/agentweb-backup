@@ -5,6 +5,7 @@ import {
   isPublishCall,
   isPublishCapableTool,
   isPublishCallWithinAuthorizedScope,
+  describePublishAuthorizationWithholdReason,
   ACTION_SCOPED_PUBLISH_TOOLS,
 } from '../utils/schedulePublishAuthorization';
 import { emmaToolRegistry } from '../emma/registry';
@@ -492,5 +493,62 @@ describe('isPublishCallWithinAuthorizedScope (ENG-1045)', () => {
 
   it('is false on an empty grant', () => {
     expect(isPublishCallWithinAuthorizedScope('twitter_manage_post', { action: 'post_thread' }, [])).toBe(false);
+  });
+});
+
+/**
+ * ENG-1245 — session 0e5af215 (2026-08-15) and every daily run since, through
+ * today, told the owner "you turned ON Require approval before publishing,
+ * turn it OFF to unblock." Verified against the live schedule record
+ * (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)"):
+ * requirePublishApproval is FALSE. It has been posting nothing since
+ * 2026-08-13, the day after PR #2263 (ENG-827) deployed, because its
+ * requiredFunctionCalls (["twitter_outreach"]) names no publish tool, so the
+ * legacy opt-out in resolveSchedulePublishAuthorization finds no scope and
+ * falls to UNAUTHORIZED — a case resolveSchedulePublishAuthorization's own
+ * shape cannot distinguish from a genuine owner-set hold.
+ *
+ * This resolver supplies that missing distinction for the one thing that
+ * needs it: the owner-facing report, so it stops naming a setting that is not
+ * the actual blocker. Deliberately NOT folded into
+ * resolveSchedulePublishAuthorization's own return shape — that function is
+ * asserted with exact-object equality across every case above, and widening
+ * its shape would force each of those to also carry a reason it isn't
+ * testing.
+ */
+describe('describePublishAuthorizationWithholdReason (ENG-1245)', () => {
+  it('is undefined for a missing/unreadable schedule — no record means no known reason', () => {
+    expect(describePublishAuthorizationWithholdReason(null)).toBeUndefined();
+    expect(describePublishAuthorizationWithholdReason(undefined)).toBeUndefined();
+  });
+
+  it('is the genuine owner-set hold only when requirePublishApproval is literally true', () => {
+    expect(
+      describePublishAuthorizationWithholdReason({ requirePublishApproval: true })
+    ).toBe('require_publish_approval');
+  });
+
+  it('is "not_granted" for a legacy schedule that was simply never asked (Harsha\'s exact shape)', () => {
+    expect(
+      describePublishAuthorizationWithholdReason({
+        requirePublishApproval: false,
+        requiredFunctionCalls: ['twitter_outreach'],
+      })
+    ).toBe('not_granted');
+  });
+
+  it('is "not_granted" — never "require_publish_approval" — for an explicit revocation', () => {
+    // autopublishAuthorized: false is a real owner decision too, but it is not the
+    // "Require approval before publishing" toggle, so it must not be described as one.
+    expect(
+      describePublishAuthorizationWithholdReason({
+        requirePublishApproval: false,
+        autopublishAuthorized: false,
+      })
+    ).toBe('not_granted');
+  });
+
+  it('is "not_granted" when requirePublishApproval is simply absent, not just false', () => {
+    expect(describePublishAuthorizationWithholdReason({})).toBe('not_granted');
   });
 });
