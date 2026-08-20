@@ -238,6 +238,53 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(directive).toContain('best-effort');
   });
 
+  // ── ENG-996: deliver-and-annotate when a required conditional premise is stale ─
+  // Regression coverage for session 19ba99b9 (Scheduled: Google Ads connection
+  // watcher, AGW-58): the schedule required "if connected, remind the user the
+  // campaign is ready to build". The agent verified the connection, discovered
+  // the campaign was already live, and silently suppressed the entire required
+  // reminder — even after a nudge — reasoning that the premise was "stale". The
+  // directive must instead require delivering the mandated output and annotating
+  // it with a correction, never withholding it outright.
+  it('requires delivering a required conditional output even when its premise is stale, annotated with a correction', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('stale');
+    expect(lower).toContain('deliver');
+    expect(directive).toContain('DELIVER-AND-ANNOTATE');
+  });
+
+  it('treats "no longer needed" as a reason to annotate, never a license to withhold', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toMatch(/withholding is justified only when/);
+    expect(lower).toContain('factually false');
+    expect(lower).not.toMatch(/\bstale\b.{0,40}(withhold|omit|suppress)/);
+  });
+
+  // CodeRabbit flagged the "withholding is justified only when factually false"
+  // framing as a merge risk: read as a general rule (rather than scoped to the
+  // staleness case), it could appear to override the PUBLISH AUTHORIZATION
+  // contract or the DATA-MINIMIZATION guard on billing/Stripe fields elsewhere
+  // in this same directive — neither of which withholds for factual-falseness
+  // reasons. The rule must explicitly disclaim jurisdiction over those.
+  it('does not let the factually-false carve-out override publish authorization or data-minimization withholding', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toMatch(/governs only the staleness case/);
+    expect(lower).toContain('publish authorization');
+    expect(lower).toContain('data-minimization');
+  });
+
+  it('requires the correction to be an addition to the required output, not a replacement for it', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('addition to the required deliverable');
+    expect(lower).toContain('never a replacement');
+  });
+
+  it('does not let a nudge be satisfied by surface-level keywords while the substantive deliverable stays missing', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('nudge');
+    expect(lower).toMatch(/do not satisfy a nudge by re-adding a keyword/);
+  });
+
   // ── (6) Prescribed per-item call patterns are intent, not literal law ────────
   // Regression coverage for ENG-480 (sessions 54325528 / fa552592, "Daily User
   // Activity Report"): the scheduled prompt prescribed impossible per-session and
@@ -394,8 +441,36 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   it('names the exact publish tools the owner approved, and scopes to them', () => {
     const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
     expect(scoped).toContain('approved post_on_connected_account');
-    expect(scoped).toContain('covers ONLY post_on_connected_account');
+    expect(scoped).toContain('The authorization covers post_on_connected_account');
     expect(scoped).not.toContain('publish_landing_page_changes');
+  });
+
+  // ENG-1045 follow-up: a grant for post_on_connected_account alone used to leave the
+  // model believing twitter_manage_post was categorically off-limits, so it never
+  // attempted the thread route the completion checker's equivalence fix exists to
+  // credit — live-verified on preview 2026-08-17 (the model narrated "only
+  // pre-authorized to publish using post_on_connected_account" and silently
+  // collapsed a requested 2-tweet thread into one tweet).
+  it('tells the model the equivalent-outcome route is ALSO covered by the same grant', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+    expect(scoped).toContain('twitter_manage_post');
+    expect(scoped).toContain('post_thread only');
+    expect(scoped.toLowerCase()).toContain('do not silently shrink or merge');
+  });
+
+  // reply/quote_tweet/retweet are deliberately NOT part of the equivalence route
+  // (each responds to or reshares someone ELSE's content, not the schedule's own
+  // mandated content going out, ENG-1276 follow-up) — the directive must not
+  // blanket-authorize the whole tool.
+  it('does not blanket-name the equivalent tool as fully authorized — only its specific actions', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
+    expect(scoped).not.toContain('you MUST call post_on_connected_account / twitter_manage_post');
+  });
+
+  it('does NOT append the equivalence note for a grant with no known equivalent route', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['publish_landing_page_changes']);
+    expect(scoped).toContain('The authorization covers publish_landing_page_changes.');
+    expect(scoped).not.toContain('twitter_manage_post');
   });
 
   // Consent is tool-scoped, so authorization with no approved tool has unknown scope

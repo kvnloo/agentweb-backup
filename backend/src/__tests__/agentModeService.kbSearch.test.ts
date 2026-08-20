@@ -78,14 +78,48 @@ describe('AgentModeService.searchKnowledgeBase', () => {
     service = new AgentModeService();
   });
 
-  it('bounds the result count to max_results even when the source returns more', async () => {
+  it('bounds the result count to max_results, and does not call the page a total (ENG-1207)', async () => {
+    // Rewritten, not deleted, so the diff shows what changed. `totalResults: 3`
+    // when 8 matched was the defect this ticket is about, asserted as if it were
+    // correct: a field named "total" carrying a page count is more misleading than
+    // the prose, because a structured field reads as authoritative.
     mockSearchPlatformKnowledgeBase.mockResolvedValue(makeChunks(8));
 
     const res = await service.searchKnowledgeBase('real query', 3);
 
     expect(res.success).toBe(true);
     expect(res.results).toHaveLength(3);
-    expect(res.totalResults).toBe(3);
+    expect(res.returnedResults).toBe(3);
+    expect(res.hasMore).toBe(true);
+    expect(res).not.toHaveProperty('totalResults');
+    expect(res.message).not.toMatch(/^Found 3 knowledge base results/);
+    expect(res.message).toMatch(/max_results|more/i);
+  });
+
+  it('reads as a plain count when nothing was cut (ENG-1207)', async () => {
+    // The control. Over-qualifying a complete answer teaches the model to ignore
+    // the qualifier, which is how has_more came to be ignored in the first place.
+    mockSearchPlatformKnowledgeBase.mockResolvedValue(makeChunks(2));
+
+    const res = await service.searchKnowledgeBase('real query', 5);
+
+    expect(res.returnedResults).toBe(2);
+    expect(res.hasMore).toBe(false);
+    expect(res.message).toMatch(/Found 2 knowledge base results/);
+    expect(res.message).not.toMatch(/more|max_results/i);
+  });
+
+  it('BOUNDARY: exactly at the bound is not reported as cut (ENG-1207)', async () => {
+    // `slice` returns everything here, so a naive "did I slice?" check would warn
+    // about nothing. Whether MORE exists beyond it is unknowable — see the
+    // implementation note — and this asserts we do not guess in the safe direction
+    // either.
+    mockSearchPlatformKnowledgeBase.mockResolvedValue(makeChunks(3));
+
+    const res = await service.searchKnowledgeBase('real query', 3);
+
+    expect(res.results).toHaveLength(3);
+    expect(res.hasMore).toBe(false);
   });
 
   it('caps the effective max at 10 even if a larger max_results is requested', async () => {
@@ -101,7 +135,8 @@ describe('AgentModeService.searchKnowledgeBase', () => {
 
     expect(res.success).toBe(true);
     expect(res.results).toEqual([]);
-    expect(res.totalResults).toBe(0);
+    expect(res.returnedResults).toBe(0);
+    expect(res.hasMore).toBe(false);
     expect(mockSearchPlatformKnowledgeBase).not.toHaveBeenCalled();
   });
 

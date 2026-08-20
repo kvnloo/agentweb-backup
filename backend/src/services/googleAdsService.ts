@@ -4,6 +4,20 @@ import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  assertCountingType,
+  assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
+  describeGoogleAdsError,
+  parseTagSnippets,
+  diffConversionAction,
+  type ConversionActionDrift,
+  type ConversionTagPair,
+} from '../utils/googleAdsConversionActions';
+import {
+  summarizePartialFailure,
+  type ConversionUploadFailure,
+} from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -79,8 +93,22 @@ export class GoogleAdsService {
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
+      const described = describeGoogleAdsError(err);
+      if (described) err.message = described;
       throw err;
     }
   }
@@ -99,6 +127,11 @@ export class GoogleAdsService {
       pages++;
     } while (pageToken && pages < MAX_PAGES);
     return all;
+  }
+
+  /** Internal passthrough for endpoints that are not `:mutate` (e.g. conversionUploads). */
+  private async callApiPublic(method: 'GET' | 'POST', path: string, accessToken: string, body?: any, loginCustomerId?: string): Promise<any> {
+    return this.callApi(method, path, accessToken, body, loginCustomerId);
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
@@ -334,6 +367,266 @@ export class GoogleAdsService {
       explicitlyShared: r.campaignBudget.explicitlyShared,
       referenceCount: r.campaignBudget.referenceCount,
     }));
+  }
+
+  // ── Conversion actions (ENG-1322) ─────────────────────────────────────────
+  //
+  // CREATE / LIST / UPDATE only. REMOVE is deliberately not implemented (Harsha,
+  // ENG-1329): removing a conversion action severs historical attribution in the
+  // customer's account, and it is the one operation whose damage we cannot undo
+  // from our side. Pausing via UPDATE covers what an operator actually needs.
+
+  /** The fields a conversion action's tag and reporting behaviour actually hinge on. */
+  private conversionActionSelect(): string {
+    return 'SELECT conversion_action.resource_name, conversion_action.id, conversion_action.name, '
+      + 'conversion_action.status, conversion_action.type, conversion_action.category, '
+      + 'conversion_action.counting_type, conversion_action.primary_for_goal, '
+      + 'conversion_action.include_in_conversions_metric, '
+      + 'conversion_action.click_through_lookback_window_days, conversion_action.tag_snippets '
+      + 'FROM conversion_action';
+  }
+
+  private mapConversionAction(row: any): any {
+    const ca = row.conversionAction || {};
+    return {
+      resourceName: ca.resourceName,
+      id: ca.id,
+      name: ca.name,
+      status: ca.status,
+      type: ca.type,
+      category: ca.category,
+      countingType: ca.countingType,
+      primaryForGoal: ca.primaryForGoal,
+      includeInConversionsMetric: ca.includeInConversionsMetric,
+      clickThroughLookbackWindowDays: ca.clickThroughLookbackWindowDays,
+      tagSnippets: ca.tagSnippets,
+      // The pair the page actually needs. A resource name cannot be installed.
+      tag: parseTagSnippets(ca.tagSnippets),
+    };
+  }
+
+  async listConversionActions(userId: string, customerId: string): Promise<any[]> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken, this.conversionActionSelect(), loginCustomerId);
+    return results.map((r: any) => this.mapConversionAction(r));
+  }
+
+  private async getConversionActionByResourceName(
+    customerId: string, accessToken: string, resourceName: string, loginCustomerId?: string,
+  ): Promise<any | null> {
+    const escaped = resourceName.replace(/'/g, "\\'");
+    const rows = await this.search(
+      customerId, accessToken,
+      `${this.conversionActionSelect()} WHERE conversion_action.resource_name = '${escaped}'`,
+      loginCustomerId,
+    );
+    return rows.length > 0 ? this.mapConversionAction(rows[0]) : null;
+  }
+
+  /**
+   * Create a conversion action and hand back the tag pair, not just a resource name.
+   *
+   * Two things this deliberately does NOT do. It does not default `countingType` —
+   * that field fails silently and picking for the customer is how reported
+   * conversions quietly inflate. And it does not trust the create: the action is
+   * read back and diffed field by field, because `createAdGroup`/`createAd` already
+   * prove a create can return success while storing something else (ENG-1293).
+   */
+  async createConversionAction(userId: string, customerId: string, params: {
+    name: string;
+    category: string;
+    countingType: string;
+    status?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; tag: ConversionTagPair | null; stored: any; drift: ConversionActionDrift[] }> {
+    if (!params?.name || !params.name.trim()) {
+      throw new Error('name is required to create a conversion action.');
+    }
+    if (!params?.category || !params.category.trim()) {
+      throw new Error(
+        'category is required and is never inferred — it decides how Google reports and optimises '
+        + 'this action (for example SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD).',
+      );
+    }
+    const countingType = assertCountingType(params.countingType);
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const create: any = {
+      name: params.name,
+      type: 'WEBPAGE',
+      category: params.category,
+      countingType,
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
+    };
+    if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      create.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    const data = await this.mutate(customerId, accessToken, 'conversionActions', [{ create }], loginCustomerId);
+    const resourceName = data.results[0].resourceName;
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    const requested: Record<string, unknown> = {
+      name: params.name, category: params.category, countingType, status: create.status,
+    };
+    if (params.primaryForGoal !== undefined) requested.primaryForGoal = params.primaryForGoal;
+    // Every field we SEND has to be a field we CHECK, or drift on it is invisible.
+    // A silently-widened attribution window misattributes conversions for weeks.
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    return {
+      resourceName,
+      tag: stored?.tag ?? null,
+      stored,
+      drift: diffConversionAction(requested, stored || {}),
+    };
+  }
+
+  /**
+   * Amend an existing conversion action. Only the fields supplied are sent, so an
+   * omitted field is left alone rather than reset — and `countingType`, when given,
+   * still goes through the same no-inference check as on create.
+   */
+  async updateConversionAction(userId: string, customerId: string, resourceName: string, params: {
+    name?: string;
+    status?: string;
+    category?: string;
+    countingType?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; stored: any; drift: ConversionActionDrift[] }> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION UPDATE.');
+
+    const update: any = { resourceName };
+    const updateMask: string[] = [];
+    const requested: Record<string, unknown> = {};
+
+    if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      // status=REMOVED reaches the same end as the REMOVE operation, and REMOVE carries the
+      // confirmation gate. Route it there rather than letting UPDATE be an unconfirmed
+      // back door to the same irreversible change.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'To stop a conversion action recording, use CONVERSION_ACTION REMOVE with '
+          + 'confirm_conversion_action_removal=true rather than UPDATE status=REMOVED — the '
+          + 'change is permanent and cannot be re-enabled, so it goes through the confirmation '
+          + 'step. Conversions already recorded stay in your reports either way.',
+        );
+      }
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
+    if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
+    if (params.countingType !== undefined) {
+      const countingType = assertCountingType(params.countingType);
+      update.countingType = countingType; updateMask.push('counting_type'); requested.countingType = countingType;
+    }
+    if (params.primaryForGoal !== undefined) {
+      update.primaryForGoal = params.primaryForGoal; updateMask.push('primary_for_goal'); requested.primaryForGoal = params.primaryForGoal;
+    }
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      update.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+      updateMask.push('click_through_lookback_window_days');
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    if (updateMask.length === 0) {
+      throw new Error('CONVERSION_ACTION UPDATE requires at least one field to change.');
+    }
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions',
+      [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
+  }
+
+  /**
+   * Retire a conversion action. Google models this as a soft state, not a delete: the
+   * action stops recording, and conversions it already recorded stay in reporting — the
+   * same way a REMOVED campaign still returns its historical metrics.
+   *
+   * Scope note: ENG-1329 deferred this, on the stated basis that removal "severs historical
+   * attribution". The end-to-end run showed that premise is only half right — it cannot be
+   * undone, but nothing already attributed is lost — and that HIDDEN, the alternative every
+   * earlier message recommended, cannot be set through the API at all. That left no working
+   * retire path, which is the "if REMOVE is needed later" case that decision anticipated.
+   *
+   * The caller-facing confirmation lives in the handler, not here, so this stays a plain
+   * service method like removeBudget/removeCampaign.
+   */
+  async removeConversionAction(userId: string, customerId: string, resourceName: string): Promise<void> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+  }
+
+  /**
+   * The account's own IANA time zone, read from Google rather than assumed.
+   *
+   * Offline conversion timestamps are interpreted in the ACCOUNT's zone. Defaulting to
+   * UTC would shift every conversion by the account's real offset — for the INR account
+   * this work was verified against, 5.5 hours — and the only symptom is conversions
+   * attributed to the wrong day, which reads as a reporting oddity rather than a bug.
+   */
+  async getAccountTimeZone(userId: string, customerId: string): Promise<string> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId, accessToken,
+      'SELECT customer.time_zone FROM customer LIMIT 1',
+      loginCustomerId,
+    );
+    const tz = rows?.[0]?.customer?.timeZone;
+    if (!tz) throw new Error('Could not read the account time zone, so a conversion timestamp cannot be placed correctly.');
+    return tz;
+  }
+
+  /**
+   * Upload offline conversions keyed on gclid (ENG-1325).
+   *
+   * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
+   * past its lookback window should upload forty-nine, not zero — an all-or-nothing batch
+   * turns one stale row into a silent gap across the whole run. The caller gets the
+   * per-row failures back so "uploaded" never quietly means "some of them".
+   *
+   * `validateOnly` exists for the same reason the drift read-back does: this runs from a
+   * background sweep with nobody watching, so being able to rehearse a batch before
+   * committing it is the difference between a caught mistake and a discovered one.
+   */
+  async uploadClickConversions(
+    userId: string,
+    customerId: string,
+    conversions: Record<string, unknown>[],
+    opts?: { validateOnly?: boolean },
+  ): Promise<{ uploaded: number; failures: ConversionUploadFailure[]; raw: any }> {
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      throw new Error('At least one conversion is required for an offline conversion upload.');
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const raw = await this.callApiPublic(
+      'POST',
+      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      accessToken,
+      { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
+      loginCustomerId,
+    );
+    const failures = summarizePartialFailure(raw);
+    // Counted from what Google accepted, not from what we sent — those differ exactly
+    // when partial failure fires, which is the case this reporting exists for.
+    return { uploaded: Math.max(0, conversions.length - failures.length), failures, raw };
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────

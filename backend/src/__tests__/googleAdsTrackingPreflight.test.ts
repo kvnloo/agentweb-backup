@@ -193,3 +193,112 @@ describe('googleAdsTrackingPreflight — preflightTrackingGate', () => {
     expect(fetchHtml).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-1358 — a GTM container is not proof an Ads conversion tag is in it', () => {
+  // Found on a live campaign, not hypothesised. During the ENG-1182 run, Step 5 audited
+  // the only ENABLED campaign's destination and found GTM-NFWK798Z with NO AW- id
+  // anywhere in the served HTML. The gate passed it. The campaign's goal was
+  // SUBMIT_LEAD_FORM, biddable — bidding toward an event that page could not report.
+  //
+  // A container is a PLACE where tags may live, not evidence any particular tag is in
+  // it, and its contents are not readable over HTTP. So this is WARN, never BLOCK:
+  // plenty of legitimate setups do fire the Ads conversion from inside GTM, and blocking
+  // them would be the mirror-image error — training people to set override_tracking_check,
+  // which is worse than the problem it solves.
+  const page = (body: string) => `<html><head>${body}</head><body>hi</body></html>`;
+  const withAw = page('<script src="https://www.googletagmanager.com/gtag/js?id=AW-18192751758"></script>');
+  const withGtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const withGa4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+  const withNothing = page('<title>nothing here</title>');
+  const gate = (html: string) => preflightTrackingGate(['https://x.test/'], { fetchHtml: async () => html });
+
+  it('AC1: a page carrying AW- still passes unchanged', async () => {
+    const out = await gate(withAw);
+    expect(out.ok).toBe(true);
+    expect(out.blockedUrls).toEqual([]);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('AC2: GTM-only does NOT block — a launch is still permitted', async () => {
+    const out = await gate(withGtmOnly);
+    expect(out.ok).toBe(true);
+    expect(out.blockedUrls).toEqual([]);
+  });
+
+  it('AC2: GTM-only produces a warning rather than a clean pass', async () => {
+    const out = await gate(withGtmOnly);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings![0].url).toBe('https://x.test/');
+  });
+
+  it('AC2: the warning names the specific unverifiable thing', async () => {
+    // Not "tracking may be incomplete" — that is unactionable. It has to say that the
+    // container may or may not contain an Ads conversion tag and that we cannot see in.
+    const out = await gate(withGtmOnly);
+    expect(out.message).toMatch(/GTM-NFWK798Z/);
+    expect(out.message).toMatch(/cannot (see inside|be read)/i);
+  });
+
+  it('AC4: the warning states how to resolve it', async () => {
+    // A warning with no route to resolution is one people learn to ignore.
+    const out = await gate(withGtmOnly);
+    expect(out.message).toMatch(/GTM Preview|beacon/i);
+  });
+
+  it('AC2: GA4-only warns for the same reason', async () => {
+    const out = await gate(withGa4Only);
+    expect(out.ok).toBe(true);
+    expect(out.warnings).toHaveLength(1);
+  });
+
+  it('AC3: a page with none of the three still BLOCKS', async () => {
+    const out = await gate(withNothing);
+    expect(out.ok).toBe(false);
+    expect(out.blockedUrls).toHaveLength(1);
+  });
+
+  it('a page with BOTH GTM and AW passes clean — the AW is what matters', async () => {
+    const out = await gate(page(
+      '<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>'
+      + '<script src="https://www.googletagmanager.com/gtag/js?id=AW-18192751758"></script>',
+    ));
+    expect(out.ok).toBe(true);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('an unverifiable fetch still blocks, and is not downgraded to a warning', async () => {
+    // Blocked-by-default must survive this change: a page we could not read is not a
+    // page we may assume is tagged.
+    const out = await preflightTrackingGate(['https://x.test/'], {
+      fetchHtml: async () => { throw new Error('timeout'); },
+    });
+    expect(out.ok).toBe(false);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('warns per URL, so a mixed set names only the containers', async () => {
+    const out = await preflightTrackingGate(
+      ['https://tagged.test/', 'https://container.test/'],
+      { fetchHtml: async (u) => (u.includes('tagged') ? withAw : withGtmOnly) },
+    );
+    expect(out.ok).toBe(true);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings![0].url).toBe('https://container.test/');
+  });
+});
+
+describe('fetch-failure fallbacks (pre-existing branches, closed while here)', () => {
+  it('falls back to a generic reason when the error carries no message', async () => {
+    const out = await preflightTrackingGate(['https://x.test/'], {
+      fetchHtml: async () => { throw {}; },
+    });
+    expect(out.ok).toBe(false);
+    expect(out.message).toMatch(/Could not fetch URL|unknown error/);
+  });
+
+  it('tolerates a null url list rather than throwing', async () => {
+    const out = await preflightTrackingGate(null as any, {});
+    expect(out.ok).toBe(true);
+    expect(out.results).toEqual([]);
+  });
+});

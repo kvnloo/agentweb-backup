@@ -3313,6 +3313,25 @@ const writeShedRunResults = async (
   }
 };
 
+/**
+ * ENG-1363: in `expect`, "the attribute is still UNSET" — matching BOTH spellings
+ * production uses for an unset schedule model.
+ *
+ * `undefined` already means "still absent" and keeps that strict meaning, because
+ * consent attributes (ENG-827 `autopublishAuthorized`) depend on absence being
+ * absence. But a schedule that inherits the platform default is stored two ways:
+ * the attribute is missing on 12 active schedules and holds `""` on 48. Asserting
+ * `attribute_not_exists` against the second group is false the moment it is
+ * written, so every model switch on the majority of active schedules failed its
+ * condition and surfaced as a permanent 409.
+ *
+ * This is deliberately NOT a relaxation of the guard. It still binds the write to
+ * the state the caller decided from — it just spells that state the way the data
+ * actually spells it. A row holding a real model still fails the condition, which
+ * is what stops a stale "unset" decision overwriting somebody else's pin.
+ */
+export const EXPECT_UNSET = Symbol.for("agentweb.schedule.expectUnset");
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3556,6 +3575,15 @@ export const scheduleDb = {
         expressionAttributeNames[`#${alias}`] = key;
         if (value === undefined) {
           conditionExpressions.push(`attribute_not_exists(#${alias})`);
+          return;
+        }
+        // ENG-1363: "still unset" is absent OR empty. One clause, so the whole
+        // condition stays a single conjunction and the write stays atomic.
+        if (value === EXPECT_UNSET) {
+          conditionExpressions.push(
+            `(attribute_not_exists(#${alias}) OR #${alias} = :${alias})`,
+          );
+          expressionAttributeValues[`:${alias}`] = '';
           return;
         }
         conditionExpressions.push(`#${alias} = :${alias}`);

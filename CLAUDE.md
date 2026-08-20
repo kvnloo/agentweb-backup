@@ -11,16 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - AI agents own qualifying engineering work through merge. Merge only from a
   branch current with `main`, after the full relevant local suite, regression
   coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, a passing Greptile verdict, attribution, rollback evidence, and
-  acceptance-contract completeness all pass.
-- Greptile verdict policy (changed 2026-08-18, Harsha's explicit direction —
-  see `.github/scripts/greptile-verdict-policy.sh`): a genuine below-bar
-  review (`refused`) still hard-fails the merge gate, unchanged. Greptile
-  never answering for this head at all (`unavailable` — e.g. the org-wide
-  usage cap) now passes the `Require Greptile Review` job, with a loud
-  warning annotation, rather than blocking forever. This is not "Greptile is
-  retired" — a genuine bad review is still a hard stop; only its total
-  unavailability stopped being fatal.
+  check, attribution, rollback evidence, and acceptance-contract completeness
+  all pass.
+- Greptile is retired (ENG-1371, 2026-08-19). It is no longer a merge
+  criterion, the `Require Greptile Review` job and its scripts are deleted, and
+  `greptile.json` is gone. Do not wait for a Greptile verdict and do not
+  reintroduce a reviewer job in front of the test suites — ENG-1039 measured
+  that coupling skipping the backend suite 303 times, and `merge-evidence.sh`
+  now uses `Detect changed projects` as its draft discriminator. CodeRabbit
+  still comments on every PR and remains advisory only: it has never been a
+  required check and reports `pass` regardless of its own rate-limit state, so
+  read its findings, but nothing mechanical is gating on it.
 - Establish "every relevant GitHub check" with
   `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
   (exit 0), never with `gh pr checks` alone. `gh pr checks` answers "did anything
@@ -28,6 +29,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   cannot schedule a run at all, and on a stale draft-time run in which every job
   skipped. Exit 3 is `NO_EVIDENCE`: nothing ever executed against this head,
   which is not the same as passing and never satisfies the gate (ENG-757).
+  Note the exit codes: 0 PASS, 1 FAIL, 2 PENDING, 3 NO_EVIDENCE, 4 ERROR. Only
+  0 is a merge.
 - Database/data-plane work requires Harsha before merge: migrations or persistent
   schema/table/index/key/model changes; backfills, bulk mutations, deletes, or
   production data repair; persistence provisioning/retention/backup/access
