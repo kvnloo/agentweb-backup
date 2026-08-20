@@ -199,3 +199,211 @@ describe('AgentModeService.searchLeads — cursor pagination', () => {
     );
   });
 });
+
+/**
+ * ENG-1207 — a truncated page must not be phrased as a complete count.
+ *
+ * `searchLeads` defaults to `limit || 20` and reported `Found 20 matching lead(s)`
+ * whether or not more existed. `has_more`/`next_cursor` were present in the
+ * payload, but the human-readable `message` is what a model anchors on, and it
+ * asserted a total. In prod session d5898ffd a filter matching 98 of 107 leads
+ * reported "Found 20", the model re-issued the same unpaged query six times,
+ * concluded there were 20, wrote 17, and told the user the job was complete.
+ *
+ * NOTE: the scan stops at the limit, so the true total is NOT known here and
+ * must not be invented — the message may only say the page is partial.
+ */
+describe('AgentModeService.searchLeads — truncated-page messaging (ENG-1207)', () => {
+  let service: AgentModeService;
+  const userId = 'user-1';
+  const listId = 'list-1';
+  const mockList = { listId, userId, name: 'Test List' };
+
+  const buildLeads = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      leadId: `lead-${String(count - i).padStart(4, '0')}`,
+      listId,
+      email: `user${i}@example.com`,
+      firstName: `First${i}`,
+      lastName: `Last${i}`,
+      company: `Co${i}`,
+      title: 'Engineer',
+      customFields: {},
+    }));
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+  });
+
+  it('does not phrase a truncated page as a total', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.searchLeads(listId, [{ field: 'email', operator: 'is_not_empty' }], userId, 20);
+
+    expect(result.has_more).toBe(true);
+    expect(result.message).not.toMatch(/^Found 20 matching lead\(s\)$/);
+  });
+
+  it('says the page is partial and names the way to continue', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.searchLeads(listId, [{ field: 'email', operator: 'is_not_empty' }], userId, 20);
+
+    expect(result.message).toMatch(/first 20/i);
+    expect(result.message).toMatch(/more/i);
+    expect(result.message).toMatch(/next_cursor/);
+  });
+
+  it('does NOT invent a total it never scanned', async () => {
+    // Only 20 of 50 were ever examined; any "of N" claim would be fabricated.
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.searchLeads(listId, [{ field: 'email', operator: 'is_not_empty' }], userId, 20);
+
+    expect(result.message).not.toMatch(/of \d+/i);
+  });
+
+  it('still reports an exhaustive result as a plain total', async () => {
+    // 5 matches, no lastEvaluatedKey -> the scan completed, so 5 IS the total.
+    const leads = buildLeads(5);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: undefined } as any);
+
+    const result = await service.searchLeads(listId, [{ field: 'email', operator: 'is_not_empty' }], userId, 20);
+
+    expect(result.has_more).toBe(false);
+    expect(result.message).toBe('Found 5 matching lead(s)');
+  });
+
+  it('keeps matchCount as the page length regardless of wording', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.searchLeads(listId, [{ field: 'email', operator: 'is_not_empty' }], userId, 20);
+
+    expect(result.matchCount).toBe(20);
+    expect(result.leads).toHaveLength(20);
+  });
+});
+
+/**
+ * ENG-1207 AC2 — "same treatment for `get_leads` and any other cursor-paged agent
+ * tool with a count in its message."
+ *
+ * `getLeads` received the identical fix as `searchLeads` but shipped with no test
+ * of its own, so the AC was met by inspection rather than by evidence. That is the
+ * weaker half of the same defect: the production incident was a MODEL reading
+ * "Found 20 lead(s)" as a complete count and stopping, and `get_leads` is the tool
+ * it reaches for first. A regression in this wording is invisible to types, to
+ * the compiler, and to every other test in the suite.
+ */
+describe('AgentModeService.getLeads — truncated-page messaging (ENG-1207 AC2)', () => {
+  let service: AgentModeService;
+  const userId = 'user-1';
+  const listId = 'list-1';
+  const mockList = { listId, userId, name: 'Test List' };
+
+  const buildLeads = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      leadId: `lead-${String(count - i).padStart(4, '0')}`,
+      listId,
+      email: `user${i}@example.com`,
+      firstName: `First${i}`,
+      lastName: `Last${i}`,
+      company: `Co${i}`,
+      title: 'Engineer',
+      customFields: {},
+    }));
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    (mockCrmDb.canOrgMemberAccessList as jest.Mock).mockResolvedValue(true);
+    mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+  });
+
+  it('does not phrase a truncated page as a total', async () => {
+    // The exact production failure, in the tool the model reaches for first.
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.has_more).toBe(true);
+    expect(result.message).not.toMatch(/^Found 20 lead\(s\)$/);
+  });
+
+  it('says the page is partial and names the way to continue', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.message).toMatch(/first 20/i);
+    expect(result.message).toMatch(/more/i);
+    expect(result.message).toMatch(/next_cursor/);
+  });
+
+  it('does NOT invent a total it never scanned', async () => {
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.message).not.toMatch(/of \d+/i);
+  });
+
+  it('still reports an exhaustive result as a plain total', async () => {
+    // No cursor back means the listing completed, so the count IS the total and
+    // must keep reading as one — over-hedging a complete answer is its own defect.
+    const leads = buildLeads(5);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: undefined } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(result.has_more).toBe(false);
+    expect(result.message).toBe('Found 5 lead(s)');
+  });
+
+  it('hands back a usable cursor with the truncated page', async () => {
+    // The wording tells the model to pass next_cursor; that only helps if one is
+    // actually returned.
+    const leads = buildLeads(50);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: leads,
+      lastEvaluatedKey: { listId, leadId: leads[leads.length - 1].leadId },
+    } as any);
+
+    const result = await service.getLeads(listId, userId, { limit: 20 });
+
+    expect(typeof result.next_cursor).toBe('string');
+    expect(result.next_cursor.length).toBeGreaterThan(0);
+    expect(result.leads).toHaveLength(20);
+  });
+});

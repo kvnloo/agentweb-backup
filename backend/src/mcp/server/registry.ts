@@ -34,6 +34,23 @@ export interface McpToolHandler {
    * first contact with the product.
    */
   requiresUserAccount?: boolean;
+  /**
+   * ENG-1276 follow-up — declares that EVERY call to this tool, for ANY
+   * arguments, has no external side effect (nothing published, sent, or
+   * written to a customer's live account/CRM — pure read/compute/research).
+   * Consulted by the scheduled-run conditional-skip veto
+   * (`isReadOnlyToolName` in agentModeController.ts) so a schedule's "check
+   * something first" step doesn't get misclassified as a write just because
+   * its name doesn't lead with get/read/list/... — the exact bug that broke
+   * perform_data_analysis (ENG-1276).
+   *
+   * Leave unset (defaults to write) for any tool that bundles a write action
+   * under SOME arguments — e.g. twitter_manage_post (post_thread writes,
+   * get_tweet_metrics doesn't) or call_google_ads_api (LIST reads, CREATE/
+   * UPDATE write). A whole-tool boolean cannot express "read-only for THESE
+   * arguments only"; only set this when no possible call writes anything.
+   */
+  readOnly?: boolean;
 }
 
 export { isAnonymousUserId } from '../anonymousToolAccess';

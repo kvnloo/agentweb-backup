@@ -216,4 +216,76 @@ describe('AgentModeService.linkedinOutreach get-profile — connection overlay (
     expect(res.data.first_name).toBe('Sri');
     expect(res.data.is_relationship).toBe(false);
   });
+
+  describe('an anonymized profile must not borrow a stranger\'s connection state', () => {
+    // LinkedIn anonymizes out-of-network profiles with `public_identifier` set to the
+    // literal string "undefined", and Unipile builds `public_profile_url` from that
+    // same value. Both were used to derive the key passed to
+    // getConnectionByProfileUrlAndAccount — a GSI lookup returning Items[0]. So EVERY
+    // anonymized profile queried the same `/in/undefined` key, and the connection-sync
+    // cron writes rows under exactly that key, which means the overlay could hand the
+    // agent an unrelated person's is_relationship / connected_at and drive the
+    // invite-vs-message decision off it.
+    const anonymized = {
+      first_name: 'LinkedIn',
+      last_name: 'Member',
+      public_identifier: 'undefined',
+      public_profile_url: 'https://www.linkedin.com/in/undefined',
+    };
+
+    it('never queries the connection cache with the fabricated URL', async () => {
+      stubProfile(anonymized);
+
+      await service.linkedinOutreach(userId, {
+        action: 'get-profile', account_id: accountId, provider_id: 'ACoAAA123',
+      });
+
+      for (const call of mockGetConnection.mock.calls) {
+        expect(String(call[0])).not.toContain('/in/undefined');
+      }
+    });
+
+    it('does not report a connection borrowed from that shared key', async () => {
+      // A row really does sit under the fabricated key — written by the sync cron for
+      // some other anonymized profile. If the lookup runs, this stranger's state
+      // surfaces as the user's own.
+      stubProfile(anonymized);
+      mockGetConnection.mockResolvedValue({ publicId: 'someone-else', connectedAt: 1780960142000 });
+
+      const res: any = await service.linkedinOutreach(userId, {
+        action: 'get-profile', account_id: accountId, provider_id: 'ACoAAA123',
+      });
+
+      expect(res.success).toBe(true);
+      expect(res.data.connected_at).toBeUndefined();
+      expect(res.data.is_relationship).toBe(false);
+    });
+
+    it('does not hand back the sentinel the fabricated URL is built from', async () => {
+      // Dropping public_profile_url alone left `public_identifier: "undefined"` on the
+      // payload, which is the exact slug needed to rebuild the dead link.
+      stubProfile(anonymized);
+
+      const res: any = await service.linkedinOutreach(userId, {
+        action: 'get-profile', account_id: accountId, provider_id: 'ACoAAA123',
+      });
+
+      expect(res.data.anonymized).toBe(true);
+      expect(res.data.public_identifier).toBeUndefined();
+      expect(JSON.stringify(res.data)).not.toContain('/in/undefined');
+    });
+
+    it('still overlays connection state for a REAL profile', async () => {
+      // Guards the fix from over-reaching: the ENG-440 overlay must still work.
+      stubProfile({ first_name: 'Sri', public_identifier: 'sri-real', public_profile_url: 'https://www.linkedin.com/in/sri-real' });
+      mockGetConnection.mockResolvedValue({ publicId: 'sri-real', connectedAt: 1780960142000 });
+
+      const res: any = await service.linkedinOutreach(userId, {
+        action: 'get-profile', account_id: accountId, provider_id: 'ACoAAA999',
+      });
+
+      expect(res.data.is_relationship).toBe(true);
+      expect(res.data.connected_at).toBe(1780960142000);
+    });
+  });
 });

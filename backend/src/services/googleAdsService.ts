@@ -4,6 +4,16 @@ import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
+import {
+  assertCountingType,
+  assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
+  describeGoogleAdsError,
+  parseTagSnippets,
+  diffConversionAction,
+  type ConversionActionDrift,
+  type ConversionTagPair,
+} from '../utils/googleAdsConversionActions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -79,8 +89,22 @@ export class GoogleAdsService {
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
+      const described = describeGoogleAdsError(err);
+      if (described) err.message = described;
       throw err;
     }
   }
@@ -334,6 +358,191 @@ export class GoogleAdsService {
       explicitlyShared: r.campaignBudget.explicitlyShared,
       referenceCount: r.campaignBudget.referenceCount,
     }));
+  }
+
+  // ── Conversion actions (ENG-1322) ─────────────────────────────────────────
+  //
+  // CREATE / LIST / UPDATE only. REMOVE is deliberately not implemented (Harsha,
+  // ENG-1329): removing a conversion action severs historical attribution in the
+  // customer's account, and it is the one operation whose damage we cannot undo
+  // from our side. Pausing via UPDATE covers what an operator actually needs.
+
+  /** The fields a conversion action's tag and reporting behaviour actually hinge on. */
+  private conversionActionSelect(): string {
+    return 'SELECT conversion_action.resource_name, conversion_action.id, conversion_action.name, '
+      + 'conversion_action.status, conversion_action.type, conversion_action.category, '
+      + 'conversion_action.counting_type, conversion_action.primary_for_goal, '
+      + 'conversion_action.include_in_conversions_metric, '
+      + 'conversion_action.click_through_lookback_window_days, conversion_action.tag_snippets '
+      + 'FROM conversion_action';
+  }
+
+  private mapConversionAction(row: any): any {
+    const ca = row.conversionAction || {};
+    return {
+      resourceName: ca.resourceName,
+      id: ca.id,
+      name: ca.name,
+      status: ca.status,
+      type: ca.type,
+      category: ca.category,
+      countingType: ca.countingType,
+      primaryForGoal: ca.primaryForGoal,
+      includeInConversionsMetric: ca.includeInConversionsMetric,
+      clickThroughLookbackWindowDays: ca.clickThroughLookbackWindowDays,
+      tagSnippets: ca.tagSnippets,
+      // The pair the page actually needs. A resource name cannot be installed.
+      tag: parseTagSnippets(ca.tagSnippets),
+    };
+  }
+
+  async listConversionActions(userId: string, customerId: string): Promise<any[]> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken, this.conversionActionSelect(), loginCustomerId);
+    return results.map((r: any) => this.mapConversionAction(r));
+  }
+
+  private async getConversionActionByResourceName(
+    customerId: string, accessToken: string, resourceName: string, loginCustomerId?: string,
+  ): Promise<any | null> {
+    const escaped = resourceName.replace(/'/g, "\\'");
+    const rows = await this.search(
+      customerId, accessToken,
+      `${this.conversionActionSelect()} WHERE conversion_action.resource_name = '${escaped}'`,
+      loginCustomerId,
+    );
+    return rows.length > 0 ? this.mapConversionAction(rows[0]) : null;
+  }
+
+  /**
+   * Create a conversion action and hand back the tag pair, not just a resource name.
+   *
+   * Two things this deliberately does NOT do. It does not default `countingType` —
+   * that field fails silently and picking for the customer is how reported
+   * conversions quietly inflate. And it does not trust the create: the action is
+   * read back and diffed field by field, because `createAdGroup`/`createAd` already
+   * prove a create can return success while storing something else (ENG-1293).
+   */
+  async createConversionAction(userId: string, customerId: string, params: {
+    name: string;
+    category: string;
+    countingType: string;
+    status?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; tag: ConversionTagPair | null; stored: any; drift: ConversionActionDrift[] }> {
+    if (!params?.name || !params.name.trim()) {
+      throw new Error('name is required to create a conversion action.');
+    }
+    if (!params?.category || !params.category.trim()) {
+      throw new Error(
+        'category is required and is never inferred — it decides how Google reports and optimises '
+        + 'this action (for example SUBMIT_LEAD_FORM, PURCHASE, SIGNUP, DOWNLOAD).',
+      );
+    }
+    const countingType = assertCountingType(params.countingType);
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const create: any = {
+      name: params.name,
+      type: 'WEBPAGE',
+      category: params.category,
+      countingType,
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
+    };
+    if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      create.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    const data = await this.mutate(customerId, accessToken, 'conversionActions', [{ create }], loginCustomerId);
+    const resourceName = data.results[0].resourceName;
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    const requested: Record<string, unknown> = {
+      name: params.name, category: params.category, countingType, status: create.status,
+    };
+    if (params.primaryForGoal !== undefined) requested.primaryForGoal = params.primaryForGoal;
+    // Every field we SEND has to be a field we CHECK, or drift on it is invisible.
+    // A silently-widened attribution window misattributes conversions for weeks.
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    return {
+      resourceName,
+      tag: stored?.tag ?? null,
+      stored,
+      drift: diffConversionAction(requested, stored || {}),
+    };
+  }
+
+  /**
+   * Amend an existing conversion action. Only the fields supplied are sent, so an
+   * omitted field is left alone rather than reset — and `countingType`, when given,
+   * still goes through the same no-inference check as on create.
+   */
+  async updateConversionAction(userId: string, customerId: string, resourceName: string, params: {
+    name?: string;
+    status?: string;
+    category?: string;
+    countingType?: string;
+    primaryForGoal?: boolean;
+    clickThroughLookbackWindowDays?: number;
+  }): Promise<{ resourceName: string; stored: any; drift: ConversionActionDrift[] }> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION UPDATE.');
+
+    const update: any = { resourceName };
+    const updateMask: string[] = [];
+    const requested: Record<string, unknown> = {};
+
+    if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      // REMOVE is refused as an operation (ENG-1329: it severs historical attribution and
+      // cannot be undone). status=REMOVED does exactly the same thing by another route, so
+      // allowing it here would refuse the front door and leave the window open.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'Setting status=REMOVED retires the conversion action permanently and severs its '
+          + 'historical attribution — the same irreversible outcome as REMOVE, which this tool '
+          + 'deliberately does not support. Use status=HIDDEN to stop it counting toward goals '
+          + 'while keeping its history.',
+        );
+      }
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
+    if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
+    if (params.countingType !== undefined) {
+      const countingType = assertCountingType(params.countingType);
+      update.countingType = countingType; updateMask.push('counting_type'); requested.countingType = countingType;
+    }
+    if (params.primaryForGoal !== undefined) {
+      update.primaryForGoal = params.primaryForGoal; updateMask.push('primary_for_goal'); requested.primaryForGoal = params.primaryForGoal;
+    }
+    if (params.clickThroughLookbackWindowDays !== undefined) {
+      update.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+      updateMask.push('click_through_lookback_window_days');
+      requested.clickThroughLookbackWindowDays = params.clickThroughLookbackWindowDays;
+    }
+
+    if (updateMask.length === 0) {
+      throw new Error('CONVERSION_ACTION UPDATE requires at least one field to change.');
+    }
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions',
+      [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+
+    const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
+    return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────
@@ -755,6 +964,7 @@ export class GoogleAdsService {
     name: string;
     campaignResourceName: string;
     type: 'SEARCH_STANDARD' | 'DISPLAY_STANDARD';
+    status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
   }): Promise<{ resourceName: string }> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
@@ -762,7 +972,7 @@ export class GoogleAdsService {
       create: {
         name: params.name,
         campaign: params.campaignResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         type: params.type,
         ...(params.cpcBidMicros !== undefined && { cpcBidMicros: String(params.cpcBidMicros) }),
       },
@@ -1120,6 +1330,7 @@ export class GoogleAdsService {
     headlines: string[];
     descriptions: string[];
     finalUrl: string;
+    status?: 'ENABLED' | 'PAUSED';
     imageAssetResourceNames?: string[];
     /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
     finalUrlSuffix?: string;
@@ -1166,7 +1377,7 @@ export class GoogleAdsService {
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
         adGroup: params.adGroupResourceName,
-        status: 'ENABLED',
+        status: params.status ?? 'ENABLED',
         ad: {
           ...adContent,
           finalUrls: [params.finalUrl],

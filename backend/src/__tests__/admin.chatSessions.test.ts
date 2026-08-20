@@ -338,6 +338,201 @@ describe("Admin chat sessions endpoint", () => {
       expect(res.body.sessions[0].satisfactionScore).toEqual(newScore);
     });
 
+    // ENG-1332: report an honest scoring denominator instead of making the
+    // caller infer one from sessions.length.
+    it("returns scoringCoverage reflecting requested-range, already-scored, and newly-scored counts", async () => {
+      const inRangeUnscored = {
+        ...makeSession("in-range-unscored"),
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T08:00:00.000Z",
+      };
+      const inRangeAlreadyScored = {
+        ...makeSession("in-range-scored"),
+        createdAt: "2026-08-17T20:00:00.000Z",
+        updatedAt: "2026-08-17T20:00:00.000Z",
+        satisfactionScore: {
+          score: 4,
+          reason: "Good",
+          evaluatedAt: "2026-03-01T00:00:00.000Z",
+          evaluatedMessageIndex: 2,
+          dimensions: { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 },
+        },
+      };
+      const outOfRangeHistorical = {
+        ...makeSession("historical"),
+        createdAt: "2026-02-21T10:30:00.000Z",
+        updatedAt: "2026-08-18T13:00:00.000Z",
+      };
+
+      const sessions = [inRangeUnscored, inRangeAlreadyScored, outOfRangeHistorical];
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
+      mockScoreSessionIfNeeded.mockImplementation(async (session: any) =>
+        session.sessionId === "in-range-unscored" ? newScore : null
+      );
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+        .expect(200);
+
+      expect(res.body.scoringCoverage).toEqual({
+        requestedRangeCount: 2,
+        totalFetched: 3,
+        alreadyScored: 1,
+        newlyScored: 1,
+        unscored: 0,
+        timedOut: false,
+        requestedRangeMayBeIncomplete: false,
+      });
+    });
+
+    it("omits scoringCoverage when sync is not set", async () => {
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(res.body.scoringCoverage).toBeUndefined();
+    });
+
+    // ENG-1332 (Greptile): a historical session merely touched (not created) in
+    // the requested window is fetched by the primary updatedAt-index query and
+    // can get scored, but it is NOT part of the requested-range population.
+    // alreadyScored/newlyScored must stay scoped to requestedRangeCount's
+    // population or the reported scored total can exceed its own denominator.
+    it("excludes an out-of-range historical session from alreadyScored/newlyScored even when it gets scored", async () => {
+      const inRangeUnscored = {
+        ...makeSession("in-range-unscored"),
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T08:00:00.000Z",
+      };
+      const outOfRangeHistorical = {
+        ...makeSession("historical"),
+        createdAt: "2026-02-21T10:30:00.000Z",
+        updatedAt: "2026-08-18T13:00:00.000Z",
+      };
+
+      const sessions = [inRangeUnscored, outOfRangeHistorical];
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const newScore = { score: 5, reason: "great", evaluatedAt: "2026-08-18T14:01:00.000Z", evaluatedMessageIndex: 2 };
+      // Both sessions get freshly scored by this backfill run.
+      mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+        .expect(200);
+
+      // requestedRangeCount counts only the in-range session; newlyScored must
+      // match that same population even though the historical session was also
+      // scored by this run — otherwise newlyScored (2) would exceed
+      // requestedRangeCount (1).
+      expect(res.body.scoringCoverage).toEqual({
+        requestedRangeCount: 1,
+        totalFetched: 2,
+        alreadyScored: 0,
+        newlyScored: 1,
+        unscored: 0,
+        timedOut: false,
+        requestedRangeMayBeIncomplete: false,
+      });
+    });
+
+    // ENG-1332 (Greptile): backfill.skipped is a raw count over the FULL
+    // fetched set (in-range + historical), the same population mismatch
+    // alreadyScored/newlyScored had. `unscored` must report only how many
+    // REQUESTED-WINDOW sessions remain unscored, not the historical ones.
+    it("scopes unscored to in-range sessions, excluding out-of-range history", async () => {
+      const originalBudgetMs = process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS;
+      // "0.5" (not "0"): envInt's `raw > 0` validation rejects a literal 0 and
+      // falls back to the 4-minute default, which this test's near-instant
+      // mocked scorer would sail through undetected. "0.5" passes that check
+      // but floors to an actual 0ms budget, deterministically skipping every
+      // session before the first is dispatched (no timing flakiness).
+      process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS = "0.5";
+
+      try {
+        const inRangeUnscoredA = {
+          ...makeSession("in-range-a"),
+          createdAt: "2026-08-18T08:00:00.000Z",
+          updatedAt: "2026-08-18T08:00:00.000Z",
+        };
+        const inRangeUnscoredB = {
+          ...makeSession("in-range-b"),
+          createdAt: "2026-08-18T09:00:00.000Z",
+          updatedAt: "2026-08-18T09:00:00.000Z",
+        };
+        const outOfRangeHistorical = {
+          ...makeSession("historical"),
+          createdAt: "2026-02-21T10:30:00.000Z",
+          updatedAt: "2026-08-18T13:00:00.000Z",
+        };
+
+        const sessions = [inRangeUnscoredA, inRangeUnscoredB, outOfRangeHistorical];
+        mockChatbotDb.getRecentSessionsPage.mockResolvedValue({ sessions: sessions as any, lastEvaluatedKey: undefined });
+        mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+          sessions.find((s) => s.sessionId === id) as any
+        );
+        mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+        const res = await request(app)
+          .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+          .expect(200);
+
+        // The zero budget skips all 3 fetched sessions (backfill.skipped === 3),
+        // but only 2 of them are in the requested window — unscored must
+        // report 2, not 3.
+        expect(res.body.scoringCoverage).toEqual({
+          requestedRangeCount: 2,
+          totalFetched: 3,
+          alreadyScored: 0,
+          newlyScored: 0,
+          unscored: 2,
+          timedOut: true,
+          requestedRangeMayBeIncomplete: false,
+        });
+      } finally {
+        if (originalBudgetMs === undefined) {
+          delete process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS;
+        } else {
+          process.env.CHAT_HISTORY_SYNC_SCORE_BUDGET_MS = originalBudgetMs;
+        }
+      }
+    });
+
+    // ENG-1332 (Greptile): getRecentSessionsPage's gap query can hit its page
+    // cap and silently stop before reaching a qualifying late-touched session
+    // — this asserts that signal propagates all the way to the route's
+    // response instead of being swallowed.
+    it("surfaces requestedRangeMayBeIncomplete when the gap query was truncated", async () => {
+      const inRangeUnscored = {
+        ...makeSession("in-range-unscored"),
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T08:00:00.000Z",
+      };
+
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [inRangeUnscored] as any,
+        lastEvaluatedKey: undefined,
+        gapQueryTruncated: true,
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(inRangeUnscored as any);
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+      mockScoreSessionIfNeeded.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true&startTime=2026-08-17T14:00:00Z&endTime=2026-08-18T14:00:00Z")
+        .expect(200);
+
+      expect(res.body.scoringCoverage.requestedRangeMayBeIncomplete).toBe(true);
+    });
+
   });
 
   describe("sessionId search", () => {

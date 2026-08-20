@@ -2,6 +2,7 @@ import {
   resolveSchedulePublishAuthorization,
   narrowPublishAuthorization,
   isPublishCall,
+  isPublishCallWithinAuthorizedScope,
   SchedulePublishAuthorization,
 } from './schedulePublishAuthorization';
 import { extractScheduleId } from './schedulePublishApproval';
@@ -286,8 +287,12 @@ export async function refuseUnauthorizedScheduledPublish(
 
   // Gate on the boolean AND the approved scope. Consent is recorded against the publish
   // tools the owner could see when they gave it, so a run can be authorized for one tool
-  // while reaching for another they never approved — that call is refused.
-  if (!authorization.authorized || !authorization.tools.includes(toolName)) {
+  // while reaching for another they never approved — that call is refused. ENG-1045: the
+  // scope check also credits a call that ACHIEVES an approved tool's mandated outcome
+  // via an equivalent route (e.g. a thread through twitter_manage_post satisfying a
+  // post_on_connected_account grant) — without it this gate refused the exact call the
+  // completion checker's equivalence route exists to credit, before that logic ever ran.
+  if (!authorization.authorized || !isPublishCallWithinAuthorizedScope(toolName, args, authorization.tools)) {
     return refuse(
       toolName,
       authorization.tools.length > 0
