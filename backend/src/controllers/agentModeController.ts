@@ -8440,7 +8440,8 @@ export const agentModeController = {
           // reflect the real answered option (highlight + "Answered") instead of a bare
           // "View only". Everything here is already visible in the transcript's card, so
           // it leaks nothing new; the share stays read-only via the card's readOnly path.
-          pendingUserQuestion: session.pendingUserQuestion
+          pendingUserQuestion: session.pendingUserQuestion,
+          pendingWorkPlanInput: session.pendingWorkPlanInput
         }
       });
 
@@ -8487,7 +8488,8 @@ export const agentModeController = {
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
-      const { userMessage, llmModel, attachments = [] } = req.body;
+      const { userMessage, llmModel, attachments = [], workPlanInputAnswer } = req.body;
+      let effectiveUserMessage = userMessage;
 
       if (!userMessage) {
         return res.status(400).json({ error: 'User message is required' });
@@ -8534,6 +8536,32 @@ export const agentModeController = {
       }
 
       try {
+
+      if (workPlanInputAnswer) {
+        try {
+          const pendingWorkPlanInput = session.pendingWorkPlanInput;
+          if (!pendingWorkPlanInput) {
+            return res.status(409).json({ error: 'These details are no longer awaiting a response.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          const answered = resolveWorkPlanInputAnswer(
+            pendingWorkPlanInput,
+            workPlanInputAnswer.values,
+            new Date().toISOString(),
+          );
+          const persisted = await chatbotDb.updateSessionWorkPlanInputRequest(session.sessionId, answered, {
+            requireStillAwaiting: workPlanInputAnswer.requestId,
+          });
+          if (!persisted) {
+            return res.status(409).json({ error: 'These details were already submitted.', code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          effectiveUserMessage = `${effectiveUserMessage}\n\n[Structured work plan details: ${JSON.stringify(answered.answer?.values ?? {})}]`;
+        } catch (err) {
+          if (err instanceof WorkPlanInputRequestError || err instanceof TypeError) {
+            return res.status(409).json({ error: err.message, code: 'WORK_PLAN_INPUT_INVALID' });
+          }
+          throw err;
+        }
+      }
 
       // ENG-705: this route is registered before `router.use(authenticateToken)`,
       // so the caller is anonymous — but the spend is not. Gate on the share
@@ -8600,7 +8628,7 @@ export const agentModeController = {
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
-          userMessage,
+          effectiveUserMessage,
           session.userId,
           modelToUse,
           attachments,
@@ -11409,6 +11437,7 @@ export const agentModeController = {
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
         workPlan: session.workPlan,
+        pendingWorkPlanInput: session.pendingWorkPlanInput,
         llmModel: modelToUse,
         isConversable: true
       });

@@ -232,6 +232,48 @@ describe('AgentModeController - ishare Model Selection', () => {
         })
       );
     });
+
+    it('should expose a pending work-plan input request to interactive plan clients', async () => {
+      const pendingWorkPlanInput = {
+        requestId: 'request-1',
+        stepCount: 1,
+        title: 'Connect your event',
+        prompt: 'Add the guest-list URL and registration window.',
+        fields: [
+          { id: 'guestListUrl', label: 'Guest-list URL', type: 'url', required: true },
+        ],
+        status: 'awaiting',
+        createdAt: new Date().toISOString(),
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSessionWithModel,
+        pendingWorkPlanInput: pendingWorkPlanInput as any,
+      });
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        on: jest.fn(),
+      } as unknown as Request;
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.getSharedConversation(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          session: expect.objectContaining({
+            pendingWorkPlanInput: expect.objectContaining({
+              requestId: 'request-1',
+              title: 'Connect your event',
+              fields: [expect.objectContaining({ id: 'guestListUrl', type: 'url' })],
+            }),
+          }),
+        }),
+      );
+    });
   });
 
   describe('generateSharedResponse', () => {
