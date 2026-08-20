@@ -3362,8 +3362,13 @@ export class AgentModeService {
       humanPaced = false
     } = options || {};
 
+    // `openrouter/` is our internal routing namespace. OpenRouter's API only
+    // accepts the upstream provider/model suffix (for example `z-ai/glm-5.2`).
+    const upstreamModel = model.startsWith('openrouter/')
+      ? model.slice('openrouter/'.length)
+      : model;
     const params: any = {
-      model: model,
+      model: upstreamModel,
       messages: messages,
       response_format: response_format || { type: "text" },
     };
