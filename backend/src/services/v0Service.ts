@@ -7,6 +7,7 @@ import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig }
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
 import { injectPixelIntoLayoutFiles, injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
+import { injectGoogleAdsIntoLayoutFiles, injectGoogleAdsIntoLayout, verifyGoogleAdsInjection } from "../utils/googleAdsInjection";
 import { metaService } from "./metaService";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
@@ -502,6 +503,40 @@ export interface GeneratedLandingPage {
    */
   metaTrackingInstalled?: boolean;
   /**
+   * The site's Google Ads conversion id — the `AW-…` half of a conversion action's
+   * `send_to`. Site-level (root record only), mirroring `gtmContainerId` and
+   * `metaPixelId`. This is what goes in the base gtag snippet in the layout.
+   */
+  googleAdsConversionId?: string;
+  /**
+   * The half of `send_to` AFTER the slash, which identifies WHICH conversion action
+   * fires. Stored separately from the id because the label is per-conversion-action,
+   * not per-account: one `AW-` id serves both "lead form" and "book demo", with a
+   * different label each. Modelled as a single value for v1; a site needing several
+   * wants a list, and that is a deliberate later change (ENG-1328).
+   */
+  googleAdsConversionLabel?: string;
+  /**
+   * Which connected Google Ads customer the id/label were resolved from — the exact
+   * analogue of `metaAdAccountId`, and needed for the same reason: the offline
+   * conversion import (ENG-1325) is Google's server-side leg and must know which
+   * customer to upload to and mint a fresh token for. Without this it would have to
+   * re-resolve or guess.
+   */
+  googleAdsCustomerId?: string;
+  /**
+   * Whether the Google Ads base tag was injected into the generated layout at push
+   * time. Mirrors `trackingInstalled` / `metaTrackingInstalled`'s "fail loud, never
+   * silently skip" contract.
+   *
+   * This one carries more weight than its two siblings. A failed Meta injection
+   * degrades to "server-side only", because the CAPI leg still fires from the capture
+   * route. Google Ads has no server-side leg until ENG-1325, so `false` here means the
+   * lander shipped with NO Google measurement at all — which is precisely what RULE 7.5
+   * exists to refuse a launch over.
+   */
+  googleAdsTrackingInstalled?: boolean;
+  /**
    * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
    * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
@@ -789,6 +824,16 @@ export function buildBrandEnrichedPrompt(
    * net" pattern as metaPixelId (see bridgeOutVerified/validateBridgeOutRedirect).
    */
   bridgeOutUrl?: string,
+  /**
+   * The site's Google Ads conversion action, when one is configured. Both halves are
+   * required together — an id with no label fires a conversion that matches no
+   * conversion action, which reports as "fired" while attributing nothing (ENG-1328).
+   *
+   * Unlike metaPixelId this needs NO validation-retry safety net: v0 does not author the
+   * conversion call, it only passes two values into the platform-owned helper. That is
+   * the whole reason the helper takes a parameter rather than asking v0 for a gtag call.
+   */
+  googleAds?: { conversionId: string; conversionLabel: string },
 ): string {
   const parts: string[] = [];
 
@@ -850,18 +895,23 @@ export function buildBrandEnrichedPrompt(
     );
   }
 
-  if (leadListId && (metaPixelId || bridgeOutUrl)) {
+  // Both halves or neither: a conversion id without its label fires an event that
+  // matches no conversion action — reported as fired, attributing nothing.
+  const googleAdsArg = googleAds?.conversionId && googleAds?.conversionLabel ? googleAds : undefined;
+
+  if (leadListId && (metaPixelId || bridgeOutUrl || googleAdsArg)) {
     parts.push(
       `\n\nLEAD TRACKING — IMPORTANT ARCHITECTURE:\n` +
       `1. In the lead capture form component, generate a shared event id ONCE per submit: const eventId = crypto.randomUUID();\n` +
       `2. Include that same value as an "eventId" field in the JSON body of the fetch('/api/capture', ...) call.\n` +
       `3. On a SUCCESSFUL submission response, call: await fireLeadTracking({ email, eventId, ` +
         `${metaPixelId ? `pixelId: ${JSON.stringify(metaPixelId)}, ` : ""}` +
+        `${googleAdsArg ? `googleAds: { conversionId: ${JSON.stringify(googleAdsArg.conversionId)}, conversionLabel: ${JSON.stringify(googleAdsArg.conversionLabel)} }, ` : ""}` +
         `${bridgeOutUrl ? `bridgeOutUrl: ${JSON.stringify(bridgeOutUrl)}` : ""} });\n` +
       `   Import it via: import { fireLeadTracking } from "@/lib/agentweb-track";\n` +
-      `4. Do NOT hand-author your own fbq('track', ...) call or window.location.href redirect — ` +
-        `fireLeadTracking already does both correctly (including the required flush delay before any redirect). Only call fireLeadTracking; do not duplicate its logic.\n` +
-      `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout.`
+      `4. Do NOT hand-author your own fbq('track', ...) call, gtag('event', ...) call, or window.location.href redirect — ` +
+        `fireLeadTracking already does all of them correctly, in the right order, with the required flush and conversion callback before any redirect. Only call fireLeadTracking; do not duplicate its logic.\n` +
+      `5. Do NOT call fbq('init', ...) or gtag('config', ...) yourself — the platform already injects both base snippets in the root layout.`
     );
   }
 
@@ -1053,6 +1103,22 @@ export interface GenerateLandingPageOptions {
    * site-wide and written onto its root record, so later pages inherit it.
    */
   metaPixelOverride?: { pixelId: string; accountId: string };
+  /**
+   * ENG-1328: the site's Google Ads conversion action, when one is already known at
+   * generation time. Drives AC1 — the base gtag ships in app/layout.tsx on the FIRST
+   * commit, so a lander is measurable from its first deploy rather than after a
+   * follow-up call to the manual endpoint.
+   *
+   * Both halves are required together; an id without its label fires a conversion that
+   * matches no conversion action. `customerId` is carried for the offline import
+   * (ENG-1325), which needs to know which account to upload against.
+   *
+   * On the sub-page path this is NOT read: a conversion is site-wide by construction
+   * (shared root layout), so a sub-page inherits the site's pair rather than taking one
+   * per request — the same rule as metaPixelOverride, minus the fill-a-gap case, since
+   * the manual endpoint already covers a site that has none.
+   */
+  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string };
 }
 
 /**
@@ -1124,6 +1190,7 @@ export async function generateLandingPage(
   const mode = opts?.mode ?? "unified";
   const bridgeOutUrl = opts?.bridgeOutUrl;
   const metaPixelOverride = opts?.metaPixelOverride;
+  const googleAds = opts?.googleAds;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1147,7 +1214,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
       );
     }
 
@@ -1167,7 +1234,7 @@ export async function generateLandingPage(
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl, metaPixelOverride, googleAds
     );
   }
 
@@ -1213,7 +1280,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl, metaPixelOverride, googleAds);
 }
 
 /**
@@ -1308,7 +1375,8 @@ async function generateFirstPage(
   existingId?: string,
   originatingSessionId?: string,
   bridgeOutUrl?: string,
-  metaPixelOverride?: { pixelId: string; accountId: string }
+  metaPixelOverride?: { pixelId: string; accountId: string },
+  googleAds?: { conversionId: string; conversionLabel: string; customerId?: string }
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1350,7 +1418,9 @@ async function generateFirstPage(
     }
   }
 
-  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl);
+  // Both halves or neither — see GenerateLandingPageOptions.googleAds.
+  const googleAdsConfig = googleAds?.conversionId && googleAds?.conversionLabel ? googleAds : undefined;
+  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl, googleAdsConfig);
 
   const record: GeneratedLandingPage = {
     id,
@@ -1372,6 +1442,13 @@ async function generateFirstPage(
   if (originatingSessionId) record.originatingSessionId = originatingSessionId;
   if (metaPixelId) { record.metaPixelId = metaPixelId; record.metaAdAccountId = metaAdAccountId; }
   if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
+  // Set BEFORE the push: createGitHubRepoAndPush reads record.googleAdsConversionId to
+  // inject the base tag into the initial commit (AC1 — measurable from the first deploy).
+  if (googleAdsConfig) {
+    record.googleAdsConversionId = googleAdsConfig.conversionId;
+    record.googleAdsConversionLabel = googleAdsConfig.conversionLabel;
+    if (googleAdsConfig.customerId) record.googleAdsCustomerId = googleAdsConfig.customerId;
+  }
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1684,6 +1761,15 @@ async function addPageToExistingRepo(
   const effectiveMetaAccountId = inheritedPixelId
     ? existingPage.metaAdAccountId
     : (applyingPixelOverride ? metaPixelOverride!.accountId : undefined);
+  /*
+   * A Google Ads conversion is site-wide for the same reason a pixel is: the base tag
+   * lives in the shared root layout. So a sub-page inherits the site's pair — there is no
+   * per-page override, and both halves are required together (an id without its label
+   * fires an event matching no conversion action). ENG-1328.
+   */
+  const subPageGoogleAds = existingPage.googleAdsConversionId && existingPage.googleAdsConversionLabel
+    ? { conversionId: existingPage.googleAdsConversionId, conversionLabel: existingPage.googleAdsConversionLabel }
+    : undefined;
   if (applyingPixelOverride) {
     console.log(
       `[V0 SERVICE] Site ${existingPage.siteId ?? existingPage.id} has no Meta pixel — applying the ` +
@@ -1726,6 +1812,13 @@ async function addPageToExistingRepo(
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
   if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
+  // A Google Ads conversion is site-wide by construction — the base tag lives in the shared
+  // layout — so a sub-page inherits the site's config rather than resolving its own. Carried
+  // onto the record so RULE 7.5 and the offline import (ENG-1325) can read it from ANY page
+  // of the site without walking back to the root (ENG-1328).
+  if (existingPage.googleAdsConversionId) record.googleAdsConversionId = existingPage.googleAdsConversionId;
+  if (existingPage.googleAdsConversionLabel) record.googleAdsConversionLabel = existingPage.googleAdsConversionLabel;
+  if (existingPage.googleAdsCustomerId) record.googleAdsCustomerId = existingPage.googleAdsCustomerId;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1745,7 +1838,7 @@ async function addPageToExistingRepo(
     // untouched, from the first page's push) — but the Lead-event prompt instruction is still
     // needed here since each page has its OWN form component. Just read whatever the site's
     // root already resolved, no fresh Meta API call.
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, effectivePixelId, bridgeOutUrl);
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, effectivePixelId, bridgeOutUrl, subPageGoogleAds);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -2002,13 +2095,14 @@ async function addPageToExistingRepo(
     // fire-and-forget — a stale LIST_BY_PATH only breaks a lead SUBMIT, not the BUILD), this
     // page's own form imports `@/lib/agentweb-track` (per the updated buildBrandEnrichedPrompt
     // instruction) ONLY when that instruction was actually included — same gate
-    // buildBrandEnrichedPrompt itself uses (leadListId && (metaPixelId || bridgeOutUrl)). When
+    // buildBrandEnrichedPrompt itself uses (leadListId && (metaPixelId || bridgeOutUrl ||
+    // googleAds)). When
     // it applies, the import is a genuine build-time dependency: a repo created before this
     // file existed (or one whose deferred sync hasn't landed yet) fails this page's Vercel
     // build OUTRIGHT with "Module not found" if the file isn't in THIS commit — live-repro'd
     // exactly this by adding a page to a pre-existing test-env repo. Must ride in the SAME
     // commit whose build status this function actually checks, not a later async sync.
-    if (leadListId && (effectivePixelId || bridgeOutUrl)) {
+    if (leadListId && (effectivePixelId || bridgeOutUrl || subPageGoogleAds)) {
       filesToCommit.push({ path: "lib/agentweb-track.ts", content: Buffer.from(buildTrackingHelper()) });
     }
 
@@ -2115,6 +2209,87 @@ async function addPageToExistingRepo(
       }
     }
 
+    /*
+     * ENG-1328 AC2 — the same gap as the pixel install above, for Google Ads, and the one
+     * that actually bit us. remapFilesForSubPage drops app/layout.tsx from a sub-page's file
+     * set, so nothing else in this path installs a base tag. During ENG-1182 a generated
+     * sub-page received a perfectly correct conversion call and fired NOTHING, because
+     * `window.gtag` was never defined. Unblocking one test lander took a hand-written PR
+     * from a fork.
+     *
+     * The guard is broader than the pixel's deliberately. Meta only installs while APPLYING
+     * an override, because a site that already had a pixel got the snippet at generation
+     * time. A Google Ads id, by contrast, is routinely set AFTER generation — by the manual
+     * endpoint, or when a conversion action is created (ENG-1322) — and every sub-page then
+     * inherits a layout that carries nothing. So: install whenever the site has an id and
+     * the layout does not already verify. injectGoogleAdsIntoLayout is idempotent, and
+     * verify gates the write, so a repeat is a no-op rather than a duplicate.
+     *
+     * Best-effort, with one exception, exactly as above: a layout we cannot read must not
+     * fail the page build, but DRIFT is refused outright (AC5). Note that "best-effort" is
+     * weaker consolation here than for Meta — a failed pixel install still leaves the CAPI
+     * leg working, whereas Google Ads has no server-side leg until ENG-1325, so a skip here
+     * means no measurement at all. It is recorded on the record rather than shrugged off.
+     */
+    let googleAdsInstallAbandoned = false;
+    // Set true by whichever branch leaves the layout genuinely carrying the tag — either we
+    // just injected it, or it was already there. Inferring this from filesToCommit instead
+    // would report "unmeasured" for the already-present case, which is the common one.
+    let googleAdsTagPresent = false;
+    const subPageGoogleAdsId = existingPage.googleAdsConversionId;
+    if (subPageGoogleAdsId) {
+      try {
+        const currentLayout = await readRepoFile(repoFullName, "app/layout.tsx", ghHeaders);
+        if (!currentLayout) {
+          console.warn(`[V0 SERVICE] No app/layout.tsx in ${repoFullName} — skipping base Google Ads tag install`);
+        } else if (verifyGoogleAdsInjection(currentLayout, subPageGoogleAdsId)) {
+          googleAdsTagPresent = true;
+          console.log(`[V0 SERVICE] Base Google Ads tag ${subPageGoogleAdsId} already present in ${repoFullName}'s layout`);
+        } else if (repairs.some((r) => r.path === "app/layout.tsx")
+          || filesToCommit.some((f) => f.path === "app/layout.tsx")) {
+          // Another writer already owns this path in this commit — two entries for one path
+          // would be ambiguous. The pixel install above can also claim it.
+          console.warn(`[V0 SERVICE] Skipping base Google Ads tag install: app/layout.tsx is already being written this commit`);
+        } else if (/\{\/\* Google Ads Tag \*\/\}/.test(currentLayout)) {
+          /*
+           * The repo already carries a DIFFERENT AW- id than the one we are about to install.
+           * injectGoogleAdsIntoLayout always strips the existing block before inserting, so
+           * proceeding would silently repoint a LIVE site's conversions at another account.
+           * Refuse and say so: a missing install is visible and recoverable, a swapped
+           * conversion id corrupts someone's attribution quietly (ENG-910's lesson).
+           */
+          googleAdsInstallAbandoned = true;
+          console.error(
+            `[V0 SERVICE] Base Google Ads tag install ABORTED for ${repoFullName}: layout.tsx already has a ` +
+            `different Google Ads block. Not replacing it — the site record and the repo disagree, which needs ` +
+            `a human. Requested conversion id: ${subPageGoogleAdsId}.`,
+          );
+        } else {
+          const updatedLayout = injectGoogleAdsIntoLayout(currentLayout, subPageGoogleAdsId);
+          if (verifyGoogleAdsInjection(updatedLayout, subPageGoogleAdsId)) {
+            googleAdsTagPresent = true;
+            filesToCommit.push({ path: "app/layout.tsx", content: Buffer.from(updatedLayout) });
+            console.log(`[V0 SERVICE] Installing base Google Ads tag ${subPageGoogleAdsId} into ${repoFullName}'s layout`);
+          } else {
+            console.warn(
+              `[V0 SERVICE] Base Google Ads tag install skipped for ${repoFullName}: layout.tsx has no <head>/<body> anchor`,
+            );
+          }
+        }
+      } catch (layoutErr: any) {
+        console.warn(`[V0 SERVICE] Base Google Ads tag install failed for ${repoFullName} (continuing): ${layoutErr?.message}`);
+      }
+
+      /*
+       * Persist what actually happened, rather than inferring it later from the code.
+       * `false` here is the ENG-1182 condition verbatim: the site has a conversion id, so a
+       * conversion call will fire, but no base tag reached the layout — `window.gtag` will be
+       * undefined and the call goes nowhere. There is no server-side leg to fall back on until
+       * ENG-1325, so this flag is the ONLY signal that a page shipped unmeasured, and RULE 7.5
+       * needs it to refuse the launch.
+       */
+    }
+
     const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
       repoFullName,
       ghHeaders,
@@ -2123,6 +2298,32 @@ async function addPageToExistingRepo(
         ? `Add new page: ${name} (/${slug}) + repair ${repairs.length} broken import(s)`
         : `Add new page: ${name} (/${slug})`
     );
+
+    /*
+     * Recorded only now the commit has actually landed. Writing it before the push meant
+     * a throwing commit left the record claiming the base tag was installed while the
+     * layout never received it — which is precisely the ENG-1182 condition this flag
+     * exists to detect, produced by the detector itself. The Meta leg already persists
+     * after its push for the same reason.
+     *
+     * `false` here is not bookkeeping: there is no server-side leg until ENG-1325, so it
+     * means the page shipped with no Google measurement at all, and RULE 7.5 needs it to
+     * refuse the launch.
+     */
+    if (subPageGoogleAdsId) {
+      const googleAdsTagLive = googleAdsTagPresent && !googleAdsInstallAbandoned;
+      record.googleAdsTrackingInstalled = googleAdsTagLive;
+      try {
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET googleAdsTrackingInstalled = :g, updatedAt = :u",
+          ExpressionAttributeValues: { ":g": googleAdsTagLive, ":u": new Date().toISOString() },
+        }).promise();
+      } catch (persistErr: any) {
+        console.warn(`[V0 SERVICE] Could not persist googleAdsTrackingInstalled for /${slug}: ${persistErr?.message}`);
+      }
+    }
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
 
@@ -3004,7 +3205,7 @@ export async function deployLandingPage(
       }
     }
 
-    const { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected } = await createGitHubRepoAndPush(
+    const { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected, googleAdsInjected } = await createGitHubRepoAndPush(
       repoName,
       zipBuffer,
       record.name,
@@ -3012,11 +3213,13 @@ export async function deployLandingPage(
       record.gtmContainerId,
       metaPixelId,
       metaAdAccountId,
+      record.googleAdsConversionId,
     );
     // Reflect the tracking signals on the in-memory record so every downstream return
     // (deployed or build-failed) carries them consistently with what we persisted.
     record.trackingInstalled = gtmInjected;
     record.metaTrackingInstalled = pixelInjected;
+    record.googleAdsTrackingInstalled = googleAdsInjected;
     record.metaPixelId = metaPixelId;
     record.metaAdAccountId = metaAdAccountId;
     if (pixelLeadEventVerified !== undefined) record.pixelLeadEventVerified = pixelLeadEventVerified;
@@ -3031,7 +3234,8 @@ export async function deployLandingPage(
         Key: { id },
         UpdateExpression:
           "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, " +
-          "metaTrackingInstalled = :metaTrackingInstalled, updatedAt = :updatedAt" +
+          "metaTrackingInstalled = :metaTrackingInstalled, " +
+          "googleAdsTrackingInstalled = :googleAdsTrackingInstalled, updatedAt = :updatedAt" +
           (metaPixelId ? ", metaPixelId = :metaPixelId, metaAdAccountId = :metaAdAccountId" : "") +
           (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : "") +
           (bridgeOutVerified !== undefined ? ", bridgeOutVerified = :bridgeOutVerified" : ""),
@@ -3041,6 +3245,7 @@ export async function deployLandingPage(
           ":repoUrl": githubRepoUrl,
           ":trackingInstalled": gtmInjected,
           ":metaTrackingInstalled": pixelInjected,
+          ":googleAdsTrackingInstalled": googleAdsInjected,
           ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
           ...(bridgeOutVerified !== undefined ? { ":bridgeOutVerified": bridgeOutVerified } : {}),
           ":updatedAt": new Date().toISOString(),
@@ -3949,16 +4154,20 @@ function isV0TrackingHelper(p: string): boolean {
  * than a single baked id.
  */
 export function buildTrackingHelper(): string {
-  return `// Generated by AgentWeb — DO NOT hand-author fbq()/redirect logic in your form
-// component. Call fireLeadTracking(...) instead; it is guaranteed to fire the Meta Pixel
-// Lead event (if a pixelId is configured) and perform the bridge-out redirect (if a
-// bridgeOutUrl is configured), in the correct order, with the correct 800ms flush.
+  return `// Generated by AgentWeb — DO NOT hand-author fbq()/gtag()/redirect logic in your
+// form component. Call fireLeadTracking(...) instead; it is guaranteed to fire the Meta
+// Pixel Lead event (if a pixelId is configured), the Google Ads conversion (if googleAds is
+// configured), and the bridge-out redirect (if a bridgeOutUrl is configured), in the correct
+// order, with the correct flush.
 export async function fireLeadTracking(opts: {
   email: string;
   /** The SAME eventId you generated and sent in the /api/capture POST body — required so
-   *  Meta's server-side CAPI event can be deduplicated against this client-side Pixel event. */
+   *  Meta's server-side CAPI event can be deduplicated against this client-side Pixel event,
+   *  and reused as Google's transaction_id so an offline import cannot double-count it. */
   eventId?: string;
   pixelId?: string;
+  /** The site's Google Ads conversion action, both halves of its send_to. */
+  googleAds?: { conversionId: string; conversionLabel: string };
   bridgeOutUrl?: string;
 }): Promise<void> {
   if (opts.pixelId) {
@@ -3969,6 +4178,40 @@ export async function fireLeadTracking(opts: {
     }
     // Give the tracking beacon time to flush before any redirect below.
     await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+
+  // eventId is REQUIRED for the Google leg, unlike Meta's. It is the offline import's
+  // dedup key (ENG-1325 uploads it as order_id), so firing without it would record a
+  // browser conversion that nothing can be matched against — and the same lead uploaded
+  // later would count twice. Skipping the conversion is the lesser failure: one missing
+  // conversion is visible in reporting, a double-counted one silently inflates it and
+  // misdirects smart bidding.
+  if (opts.googleAds && opts.googleAds.conversionId && opts.googleAds.conversionLabel && opts.eventId) {
+    // @ts-ignore — gtag is injected globally by the platform-owned base tag in layout.tsx
+    if (typeof window !== "undefined" && typeof window.gtag === "function") {
+      // Wait for Google's own event_callback rather than a blind sleep: the bridge-out
+      // redirect below tears down this page, and a conversion still in flight is simply
+      // lost. The timeout is a floor, not the happy path — if gtag never calls back (ad
+      // blocker, offline) we must still redirect rather than strand the visitor.
+      await new Promise(function (resolve) {
+        var settled = false;
+        function done() { if (!settled) { settled = true; resolve(undefined); } }
+        var timer = setTimeout(done, 1000);
+        // @ts-ignore
+        window.gtag('event', 'conversion', {
+          send_to: opts.googleAds.conversionId + '/' + opts.googleAds.conversionLabel,
+          // Same id as Meta's dedup key and as the offline import's order_id, so a lead
+          // uploaded later cannot be counted twice against this same click.
+          transaction_id: opts.eventId,
+          event_callback: function () { clearTimeout(timer); done(); },
+        });
+      });
+    }
+    // No else: a missing window.gtag means the base tag never installed. That is recorded
+    // server-side as googleAdsTrackingInstalled=false; silently sleeping here would only
+    // delay the redirect without recording anything.
+  } else if (opts.googleAds && !opts.eventId) {
+    console.warn('fireLeadTracking: googleAds configured but no eventId — skipping the conversion rather than sending one that cannot be deduplicated.');
   }
 
   if (opts.bridgeOutUrl) {
@@ -4236,6 +4479,31 @@ export async function POST(req: Request) {
     const fbp = (await cookies()).get("_fbp")?.value;
     const fbc = (await cookies()).get("_fbc")?.value;
 
+    // ENG-926 §B — the VISITOR's own IP and user agent, which exist only here.
+    // The browser posts directly to this route on the site's own domain, so these headers
+    // describe the person. By the time the request reaches our API it is this Vercel
+    // function making the call, and the backend can only ever see Vercel's egress — which
+    // is why it must be told rather than left to look. It validates before storing.
+    //
+    // ISOLATED IN ITS OWN try/catch ON PURPOSE. Everything below runs inside this route's
+    // blanket catch-and-return-500, so without this a header read that throws would not
+    // merely lose the identity fields - it would drop the LEAD. Identity is a match-quality
+    // bonus; the lead is the product. Never let the bonus cost the product.
+    let visitorIp = "";
+    let visitorUserAgent = "";
+    try {
+      const h = await headers();
+      // x-vercel-forwarded-for FIRST. Vercel's docs: x-forwarded-for is overwritten by
+      // Vercel and external IPs are not forwarded, "to prevent IP spoofing" - so it cannot
+      // be forged by a visitor. But the same docs note x-forwarded-for "could be overwritten
+      // if you are using a proxy on top of Vercel", which a customer on a custom domain
+      // plausibly has. x-vercel-forwarded-for stays Vercel's own determination either way.
+      visitorIp = (h.get("x-vercel-forwarded-for") || h.get("x-forwarded-for") || "")
+        .split(",")[0]
+        .trim();
+      visitorUserAgent = (h.get("user-agent") || "").trim();
+    } catch {}
+
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4248,6 +4516,8 @@ export async function POST(req: Request) {
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
         ...(fbc ? { fbc } : {}),
+        ...(visitorIp ? { visitorIp } : {}),
+        ...(visitorUserAgent ? { visitorUserAgent } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
@@ -4324,7 +4594,13 @@ async function createGitHubRepoAndPush(
    *  generated capture route (as a public identifier, not a secret) so `forward-lead` can look
    *  up a fresh access token for the CAPI send. */
   metaAdAccountId?: string,
-): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean }> {
+  /**
+   * The site's Google Ads conversion id (`AW-…`). When set, the base gtag snippet is
+   * injected into the root layout before the initial commit, mirroring GTM and Meta.
+   * When absent, NOTHING is injected — no fallback tag on a customer page.
+   */
+  googleAdsConversionId?: string,
+): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean; googleAdsInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -4494,6 +4770,21 @@ async function createGitHubRepoAndPush(
       : `[V0 SERVICE] No Meta Pixel configured for this site — pushing WITHOUT Meta conversion tracking`,
   );
 
+  // Auto-inject the site's Google Ads base tag into the root layout BEFORE the initial
+  // commit, mirroring GTM and Meta above. Absent a conversion id, nothing is injected and
+  // the caller records a "no Google Ads tracking installed" signal.
+  //
+  // Unlike the two above, a false here is not a partial degrade. Meta keeps working
+  // server-side via CAPI when its layout install fails; Google Ads has no server-side leg
+  // until ENG-1325, so this flag going false means no Google measurement at all — the exact
+  // condition RULE 7.5 refuses a launch over (ENG-1328).
+  const googleAdsInjected = injectGoogleAdsIntoLayoutFiles(finalFiles, googleAdsConversionId);
+  console.log(
+    googleAdsInjected
+      ? `[V0 SERVICE] Injected Google Ads tag ${googleAdsConversionId} into app/layout.tsx`
+      : `[V0 SERVICE] No Google Ads conversion id configured for this site — pushing WITHOUT Google Ads conversion tracking`,
+  );
+
   // Push files to the repo using the Git Trees API (single commit for all files)
   // Step A: Get the default branch SHA
   const refRes = await axios.get<any>(
@@ -4552,7 +4843,7 @@ async function createGitHubRepoAndPush(
 
   console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
-  return { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected };
+  return { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected, googleAdsInjected };
 }
 
 /**
@@ -5773,6 +6064,77 @@ export async function updateLandingPageTrackingInstalled(
 }
 
 /**
+ * Persist (or clear) the site's Google Ads conversion config on a page record.
+ *
+ * Mirrors updateLandingPageGtm / updateLandingPageMetaPixel. All three Google Ads
+ * identity fields move together on purpose: an id without its label fires a conversion
+ * that matches no conversion action, and a label without the customer id leaves the
+ * offline import (ENG-1325) unable to find the account to upload to. Clearing removes
+ * all three rather than leaving a half-configured record behind.
+ */
+export async function updateLandingPageGoogleAds(
+  id: string,
+  userId: string,
+  conversionId: string,
+  conversionLabel?: string,
+  customerId?: string,
+): Promise<void> {
+  const record = await getLandingPage(id, userId);
+  if (!record) throw new Error("Landing page not found");
+
+  if (conversionId) {
+    const sets = ["googleAdsConversionId = :cid", "updatedAt = :now"];
+    const values: Record<string, any> = { ":cid": conversionId, ":now": new Date().toISOString() };
+    const removes: string[] = [];
+    if (conversionLabel) { sets.push("googleAdsConversionLabel = :lbl"); values[":lbl"] = conversionLabel; }
+    else removes.push("googleAdsConversionLabel");
+    if (customerId) { sets.push("googleAdsCustomerId = :cust"); values[":cust"] = customerId; }
+    else removes.push("googleAdsCustomerId");
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeValues: values,
+      })
+      .promise();
+  } else {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "REMOVE googleAdsConversionId, googleAdsConversionLabel, googleAdsCustomerId SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  }
+}
+
+/**
+ * Update the `googleAdsTrackingInstalled` signal on a single page record. Split out for
+ * the same reason as updateLandingPageTrackingInstalled: the base tag lives in the SHARED
+ * root layout, so installing it changes the answer for every page on the site, not just
+ * the one the request named.
+ */
+export async function updateLandingPageGoogleAdsInstalled(
+  id: string,
+  googleAdsTrackingInstalled: boolean,
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET googleAdsTrackingInstalled = :g, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":g": googleAdsTrackingInstalled,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
  * Mirrors updateLandingPageGtm for the Meta pixel manual-override path.
  */
 export async function updateLandingPageMetaPixel(
@@ -6337,6 +6699,70 @@ export async function syncMiddlewareAndTrackingHelper(
  * @param listByPath page path -> lead list id, for EVERY page of the site (the capture
  *   route is repo-level while the lead list is per-page). May be empty.
  */
+/**
+ * Which page paths does a DEPLOYED capture route claim, that our own map does not?
+ *
+ * ⚠ THE FAILURE THIS EXISTS FOR IS LIVE AND KNOWN. Every.io's root path "/" is HAND-ADDED to
+ * its deployed LIST_BY_PATH: the AW-LandingPages record that owned "/" was archived while the
+ * frontend stayed live, so the entry exists in the repo and in no database. Regenerating the
+ * file from the DB drops it, and the site's root form starts answering 422 "no lead list
+ * configured" to real visitors on a live managed client.
+ *
+ * That has always been true of any regeneration. It stayed asleep only because the
+ * idempotence check above usually found the file already up to date and made no commit — so
+ * ANY change to buildCaptureRoute wakes it, for this repo and any other hand-edited one, and
+ * nothing anywhere tracks which repos have been hand-edited.
+ *
+ * ⚠ THE ANSWER IS TO PRESERVE THEM, NOT TO REFUSE THE WRITE. Refusing was tried and is
+ * WRONG: a frozen capture route never registers a NEW sub-page either, so that page's form
+ * answers 422 — the identical breakage, arriving by the other door. It also fires on any
+ * ordinarily-archived page, which is normal rather than exceptional. Carrying the entry
+ * forward keeps the live form working AND lets the file keep being updated.
+ *
+ * What survives is the mapping, not the page: a path the DB no longer claims keeps filing
+ * into the list it already had. If that list is itself gone the form 422s exactly as it
+ * would have anyway, so preserving can only ever be neutral-or-better for a live visitor.
+ *
+ * Three outcomes:
+ *
+ *  - `{}`   nothing to preserve. No file yet, or a PRE-ENG-308 route with no LIST_BY_PATH
+ *           at all (a hardcoded list id — PMPS's shape). Overwriting those is exactly what
+ *           ENG-310 exists to do, so this must NOT block them or the UTM-repair path for
+ *           every old customer repo stops working.
+ *  - `null` it HAS a LIST_BY_PATH and we could not read it. A map we cannot read is a map we
+ *           cannot preserve, and that is the ONE case where the caller leaves the file alone.
+ *  - `{…}`  entries the deployed file serves that our map does not, to be carried forward.
+ */
+export function findOrphanedCaptureEntries(
+  existingCaptureRoute: string | null,
+  listByPath: Record<string, string>,
+): Record<string, string> | null {
+  if (!existingCaptureRoute) return {};
+  // No map at all — a pre-ENG-308 route. Nothing here to preserve, so overwriting is safe
+  // and is the point. Distinguished from "has a map we cannot read" below.
+  if (!existingCaptureRoute.includes("LIST_BY_PATH")) return {};
+  // Both layouts must parse. buildCaptureRoute pretty-prints across lines, but a deployed
+  // file may be single-line — from an older builder or a hand-edit — and a regex that only
+  // matched the pretty form read those as unreadable and froze the site. Values are plain
+  // strings, so stopping at the first `};` is unambiguous.
+  const match = /const LIST_BY_PATH: Record<string, string> = (\{[\s\S]*?\})\s*;/.exec(
+    existingCaptureRoute,
+  );
+  if (!match) return null;
+  let deployed: Record<string, unknown>;
+  try {
+    deployed = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (!deployed || typeof deployed !== "object" || Array.isArray(deployed)) return null;
+  const orphans: Record<string, string> = {};
+  for (const [path, listId] of Object.entries(deployed)) {
+    if (!(path in listByPath) && typeof listId === "string" && listId) orphans[path] = listId;
+  }
+  return orphans;
+}
+
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   /**
@@ -6367,7 +6793,6 @@ export async function syncLeadCaptureFilesToRepo(
       // Fresh every attempt — see the buildListByPath doc comment above for why.
       const listByPath = await buildListByPath();
       const middlewareContent = buildLandingPageMiddleware();
-      const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
       const trackingHelperContent = buildTrackingHelper();
 
       const [existingMiddleware, existingCaptureRoute, existingDomainMap, existingTrackingHelper] = await Promise.all([
@@ -6381,10 +6806,53 @@ export async function syncLeadCaptureFilesToRepo(
       // subdomain map — clobbering it with {} would break the customer's routing.
       const needsDomainMap = existingDomainMap === null;
 
+      // ⚠ CARRY FORWARD ANY PATH THE DEPLOYED FILE SERVES THAT OUR MAP DOES NOT.
+      // Every.io's root "/" is hand-added to its deployed LIST_BY_PATH: the record that
+      // owned "/" was archived while the frontend stayed live, so the mapping exists in the
+      // repo and in no database. Rebuilding purely from the DB deletes it and the root form
+      // answers 422 to real visitors on a live managed client. Ordinary archived pages have
+      // the same shape, so this is the common case rather than an exotic one.
+      // Our map WINS on any path both sides claim — the DB is authoritative for pages it
+      // knows about; this only ever ADDS back ones it does not.
+      const orphans = findOrphanedCaptureEntries(existingCaptureRoute, listByPath);
+      if (orphans && Object.keys(orphans).length) {
+        console.warn(
+          `[V0 SERVICE] ${repoFullName}: preserving ${Object.keys(orphans).length} capture ` +
+            `path(s) the database does not claim — ${Object.entries(orphans)
+              .map(([p, l]) => `${p} -> ${l}`)
+              .join(", ")}. Deployed and serving; rebuilding without them would 422 a live form.`
+        );
+      }
+      const effectiveListByPath = { ...(orphans ?? {}), ...listByPath };
+      const captureRouteContent = buildCaptureRoute(
+        effectiveListByPath,
+        undefined,
+        pixelId,
+        metaAccountId,
+      );
+
+      // The ONE case we still refuse: a LIST_BY_PATH that exists and cannot be parsed. We
+      // cannot preserve what we cannot read, so the file is left exactly as deployed while
+      // everything else still syncs. Rare by construction — both layouts parse.
+      const captureRouteUnreadable = orphans === null;
+      if (captureRouteUnreadable) {
+        console.warn(
+          `[V0 SERVICE] ⚠ ${repoFullName}: deployed capture route has a LIST_BY_PATH that ` +
+            `could not be parsed — NOT rewriting app/api/capture/route.ts, because doing so ` +
+            `would drop mappings we were unable to read.`
+        );
+      }
+
+      // An unreadable capture route is never "out of date" for our purposes — we are not
+      // going to write it — so it must not force a commit on its own either, or that repo
+      // takes a pointless middleware-only commit and live redeploy on every single sync.
+      const captureRouteUpToDate =
+        existingCaptureRoute === captureRouteContent || captureRouteUnreadable;
+
       if (
         !needsDomainMap &&
         existingMiddleware === middlewareContent &&
-        existingCaptureRoute === captureRouteContent &&
+        captureRouteUpToDate &&
         existingTrackingHelper === trackingHelperContent
       ) {
         console.log(
@@ -6393,9 +6861,22 @@ export async function syncLeadCaptureFilesToRepo(
         return { committed: false, reason: "up-to-date" };
       }
 
+      // ⚠ FAIL CLOSED ON A HAND-EDITED CAPTURE ROUTE. If the deployed file claims a page path
+      // our map does not, rewriting it DELETES a mapping that is serving real visitors right
+      // now — see findOrphanedCapturePaths. We cannot tell a deliberate hand-edit from a page
+      // legitimately removed from the DB, and the two want opposite handling, so this refuses
+      // to guess: middleware and the tracking helper still sync (neither carries the map),
+      // and the capture route is left exactly as deployed.
+      //
+      // A LOG LINE WOULD NOT BE ENOUGH. This repo has already learned that "log only" means
+      // invisible, and the thing being protected is a live customer's lead form. The skip is
+      // reported back to the caller so it can surface, and the durable fix is to make the DB
+      // agree with reality (un-archive the record) rather than to widen this.
       const filesToCommit: Array<{ path: string; content: string }> = [
         { path: "middleware.ts", content: middlewareContent },
-        { path: "app/api/capture/route.ts", content: captureRouteContent },
+        ...(captureRouteUnreadable
+          ? []
+          : [{ path: "app/api/capture/route.ts", content: captureRouteContent }]),
         { path: "lib/agentweb-track.ts", content: trackingHelperContent },
       ];
       if (needsDomainMap) {
@@ -6417,7 +6898,7 @@ export async function syncLeadCaptureFilesToRepo(
           1,
         );
 
-        const wired = Object.entries(listByPath);
+        const wired = Object.entries(effectiveListByPath);
         console.log(
           `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
             .map((f) => f.path)

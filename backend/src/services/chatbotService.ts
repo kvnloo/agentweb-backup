@@ -151,6 +151,7 @@ export interface ChatMessage {
     imageFilename?: string;             // Filename when kind === 'image-generated'
     imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
+    mediaBudgetDeferred?: boolean;      // ENG-1239: set on the tool-role deferral marker AND on the whole-turn-timeout partial-delivery message that reports it, so an unresolved media-batch pause is detectable from the tail of session history alone
   };
 }
 
@@ -582,8 +583,15 @@ export interface GoogleAdsMeasurementCheckRecord {
   customerId: string;
   campaignResourceName: string;
   action: string;
-  /** Overall outcome of the gate for this launch attempt. */
-  outcome: 'passed' | 'blocked' | 'overridden';
+  /**
+   * Overall outcome of the gate for this launch attempt.
+   *
+   * `passed_with_warning` (ENG-1358) is deliberately distinct from `passed`: the launch
+   * was permitted, but the page carried only a GTM container or a GA4 property and no
+   * Google Ads conversion tag. Collapsing the two would make the audit trail claim the
+   * conversion path was verified when all we verified was that some Google tag exists.
+   */
+  outcome: 'passed' | 'passed_with_warning' | 'blocked' | 'overridden';
   /** Per-URL check results (url + status + detected mechanisms). */
   urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
   checkedAt: string;
@@ -2552,11 +2560,21 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-1332: guarded by default against clobbering an admin override. The
+   * caller (scoreSessionIfNeeded) already skips adminOverride rows using the
+   * session it read, but that read happens once before scoring — a concurrent
+   * admin override written in between is a TOCTOU race the in-process check
+   * can't catch. Pass `allowOverride: true` only for an explicit human
+   * override write (the admin PUT route), which must be allowed to replace
+   * anything, including a prior override.
+   */
   async updateSessionSatisfactionScore(
     sessionId: string,
-    satisfactionScore: ChatSession["satisfactionScore"]
-  ): Promise<ChatSession> {
-    const params = {
+    satisfactionScore: ChatSession["satisfactionScore"],
+    options?: { allowOverride?: boolean }
+  ): Promise<ChatSession | null> {
+    const params: AWS.DynamoDB.DocumentClient.UpdateItemInput = {
       TableName: this.tableName,
       Key: {
         sessionId,
@@ -2568,10 +2586,18 @@ export class ChatbotDB {
       ReturnValues: "ALL_NEW",
     };
 
+    if (!options?.allowOverride) {
+      params.ConditionExpression = "attribute_not_exists(satisfactionScore.adminOverride)";
+    }
+
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      // Lost the race: an admin override landed on this row after it was read
+      // for scoring, so there is nothing to persist. Not an error — the row
+      // still holds the human's score.
+      if (!options?.allowOverride && this.isConditionalCheckFailure(error)) return null;
       console.error("Error updating session satisfaction score:", error);
       throw error;
     }
@@ -3632,7 +3658,15 @@ export class ChatbotDB {
     limit: number,
     lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key,
     timeRange?: { startTime: string; endTime: string }
-  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+  ): Promise<{
+    sessions: ChatSession[];
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key;
+    // ENG-1332 (Greptile): the gap query's page cap can stop before reaching a
+    // qualifying late-touched session, silently understating the requested
+    // range. This says so, rather than leaving the caller to trust an
+    // unqualified count.
+    gapQueryTruncated?: boolean;
+  }> {
     const expressionValues: Record<string, any> = {
       ":adminListPartition": "all",
     };
@@ -3670,9 +3704,114 @@ export class ChatbotDB {
           currentKey = result.LastEvaluatedKey;
         } while (currentKey);
 
+        // ENG-1332 follow-up: the query above is keyed on updatedAt, so a session
+        // created inside the window but last touched AFTER timeRange.endTime (e.g.
+        // its final message landed a few seconds past the window boundary, or this
+        // window is being re-queried well after it closed) is invisible to it even
+        // though it belongs in the requested range. Close that gap with a second
+        // query over [endTime, now] — only sessions genuinely created in range are
+        // kept from it, so it can't pull in unrelated later activity. DynamoDB
+        // KeyConditionExpression allows only one condition per key, so BETWEEN
+        // (inclusive both ends) is the only compound-range operator available;
+        // BETWEEN is inclusive on both ends, so a session with updatedAt exactly
+        // at endTime legitimately matches both this query and the primary one —
+        // dedupe by sessionId against what the primary query already returned
+        // (comparing the updatedAt strings directly is not reliable: DynamoDB
+        // always stores full-millisecond ISO timestamps, but a caller-supplied
+        // endTime without milliseconds, e.g. "...T14:00:00Z", would never
+        // string-equal the stored value even though they name the same instant).
+        // Skipped entirely when endTime is already at/after "now" (the common
+        // daily-report case, where nothing can have updatedAt in the future), so
+        // this adds no cost to the case the fix already handles.
+        //
+        // [endTime, now] is unbounded in principle (a stale/old window re-queried
+        // much later can span months of unrelated activity), so this loop stops
+        // once enough in-range sessions have been found to fill `limit` — the
+        // final slice below never returns more than `limit` in-range sessions
+        // anyway, so scanning further pages can't change the response, only add
+        // cost.
+        //
+        // The `inRangeCount < limit` stop condition alone isn't enough: a
+        // sparse stale range (few or no sessions actually created in it) can
+        // never reach `limit` no matter how many pages are scanned, so it would
+        // still walk every page through "now" one at a time. A hard page cap
+        // bounds that case too — past this many pages, further scanning trades
+        // an unbounded amount of latency for a small chance of catching one
+        // more late-touched session, so this stops and logs instead.
+        const nowIso = new Date().toISOString();
+        let gapQueryTruncated = false;
+        if (timeRange.endTime < nowIso) {
+          const primarySessionIds = new Set(accumulated.map((s) => s.sessionId));
+          let inRangeCount = accumulated.filter(
+            (s) => s.createdAt && s.createdAt >= timeRange.startTime && s.createdAt <= timeRange.endTime
+          ).length;
+          const lateExpressionValues: Record<string, any> = {
+            ":adminListPartition": "all",
+            ":end": timeRange.endTime,
+            ":now": nowIso,
+          };
+          const lateKeyCondition =
+            "adminListPartition = :adminListPartition AND updatedAt BETWEEN :end AND :now";
+          const MAX_GAP_QUERY_PAGES = 20;
+          let lateKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+          let pageCount = 0;
+          do {
+            const lateParams: AWS.DynamoDB.DocumentClient.QueryInput = {
+              TableName: this.tableName,
+              IndexName: "AdminUpdatedAtIndex",
+              KeyConditionExpression: lateKeyCondition,
+              ExpressionAttributeValues: lateExpressionValues,
+              ScanIndexForward: false,
+            };
+            if (lateKey) {
+              lateParams.ExclusiveStartKey = lateKey;
+            }
+
+            const lateResult = await dynamodb.query(lateParams).promise();
+            pageCount++;
+            for (const session of (lateResult.Items as ChatSession[]) || []) {
+              if (primarySessionIds.has(session.sessionId)) continue; // already covered by the primary query
+              const createdAt = session.createdAt;
+              if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+                accumulated.push(session);
+                inRangeCount++;
+              }
+            }
+            lateKey = lateResult.LastEvaluatedKey;
+          } while (lateKey && inRangeCount < limit && pageCount < MAX_GAP_QUERY_PAGES);
+
+          if (lateKey && pageCount >= MAX_GAP_QUERY_PAGES) {
+            gapQueryTruncated = true;
+            console.warn(
+              `[chatbotService] getRecentSessionsPage: gap query hit its ${MAX_GAP_QUERY_PAGES}-page cap scanning [${timeRange.endTime}, ${nowIso}] for a sparse range — some late-touched in-range sessions past this point may be missing from this page`
+            );
+          }
+        }
+
+        // ENG-1332: the query above orders by updatedAt, not createdAt — a
+        // historical session touched (but not created) during this window sorts
+        // by that touch, and can outrank a session genuinely created in the
+        // window if the touch is more recent. Re-prioritize before truncating:
+        // sessions actually created within the requested range come first
+        // (newest first), so the `limit` slice and any budget-bound consumer
+        // (e.g. the sync scoring backfill) exhaust in-range coverage before
+        // spending anything on out-of-range history.
+        const inRange: ChatSession[] = [];
+        const outOfRange: ChatSession[] = [];
+        for (const session of accumulated) {
+          const createdAt = session.createdAt;
+          if (createdAt && createdAt >= timeRange.startTime && createdAt <= timeRange.endTime) {
+            inRange.push(session);
+          } else {
+            outOfRange.push(session);
+          }
+        }
+        inRange.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
         return {
-          sessions: accumulated.slice(0, limit),
+          sessions: [...inRange, ...outOfRange].slice(0, limit),
           lastEvaluatedKey: undefined,
+          gapQueryTruncated,
         };
       } catch (error) {
         console.error("Error getting chat sessions by time range:", error);

@@ -41,6 +41,35 @@ function citeForSlack(response: any): string {
 
 const router = express.Router();
 
+// ENG-1263: known-internal Slack user IDs, checked independently of email resolution.
+// getSlackUserEmail() returns null on several paths that do NOT mean "external author" — rate
+// limiting, a missing users:read.email scope, or (most relevant for customer channels, which are
+// Slack-Connect/externally-shared) a cross-workspace profile users.info can't resolve an email
+// for. Gating solely on a resolved @agentweb.pro email means any of those failures silently falls
+// through as "external", which is how Harsha's own outbound weekly reports got classified as
+// inbound client questions on 2026-08-16. A positive ID allowlist doesn't depend on email
+// resolution succeeding at all. Comma-separated env override; defaults to Harsha's Slack ID
+// (reference-ids.md).
+const INTERNAL_SLACK_USER_IDS = new Set(
+  (process.env.AGENTWEB_INTERNAL_SLACK_USER_IDS || 'U08TM4QFQ1L')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
+// Shared by every path that gates on "is this our own team talking, not the customer" — the
+// initial top-level message check and the monitored triggered-thread reply check both need the
+// same two-signal predicate (CodeRabbit flagged the latter still being email-only on PR #2508:
+// an allowlisted internal user replying in a monitored thread with an unresolved email fell
+// through the same fail-open gap this row exists to close). Email comparison is
+// case-insensitive — Slack profile emails aren't guaranteed lowercase.
+function isInternalSlackAuthor(slackUserId: string, senderEmail: string | null): boolean {
+  return (
+    INTERNAL_SLACK_USER_IDS.has(slackUserId) ||
+    (!!senderEmail && senderEmail.toLowerCase().endsWith('@agentweb.pro'))
+  );
+}
+
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -146,11 +175,24 @@ async function handleSlackTriggeredSession(params: {
 
     if (!rawMessage) return;
 
-    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
+    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments.
+    // Two independent signals, either one is sufficient: a resolved @agentweb.pro email, or a known
+    // internal Slack user ID (checked first — it doesn't depend on email resolution succeeding).
     const senderEmail = await getSlackUserEmail(slackUserId);
-    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
-      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
+
+    if (isInternalSlackAuthor(slackUserId, senderEmail)) {
+      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${slackUserId}${senderEmail ? `, ${senderEmail}` : ''})`);
       return;
+    }
+
+    if (!senderEmail) {
+      // Author identity could not be resolved (rate limit, missing users:read.email scope, or a
+      // cross-workspace profile in a Slack-Connect channel) and the ID isn't on the known-internal
+      // list. Do NOT fail closed here — treating "unresolvable" as "internal" would silently drop
+      // genuine customer questions with no signal, which is strictly worse than the noise this row
+      // is fixing. Fall through to triage as before, but log distinguishably from both the internal
+      // skip above and the normal triage-continues path so a repeat is diagnosable from logs.
+      console.log(`📨 [slack-triggered] could not resolve author identity for Slack user ${slackUserId} — proceeding as external (unresolved)`);
     }
 
     // Look up user by slackChannel field (with cache)
@@ -787,10 +829,39 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
             }
 
+            // ENG-1292: no channel binding — fall back to the mentioning Slack
+            // user's own verified identity instead of failing outright. Only
+            // an exact match on Slack's verified profile email resolves a
+            // user (never a fuzzy/partial match), so a Slack user with no
+            // matching AgentWeb account can never resolve to someone else's
+            // account (no cross-tenant leak). Deliberately NOT cached as a
+            // channel mapping: an internal channel can have several different
+            // AgentWeb users mention Emma, and caching the first one would
+            // silently misroute everyone else who mentions Emma there.
+            let requesterEmail: string | null = null;
             if (!user) {
+              requesterEmail = await getSlackUserEmail(slackUserId);
+              if (requesterEmail) {
+                const identityUser = await userDb.getUserByEmail(requesterEmail);
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                  user = identityUser;
+                  console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
+                }
+              }
+            }
+
+            if (!user) {
+              const remedy = 'An AgentWeb admin or the account owner can link it by posting ' +
+                '`@Emma for user <their-agentweb-email> link this channel` in this channel.';
+              const text = requesterEmail
+                ? `❌ Sorry, this channel isn't linked to an AgentWeb account, and there's no AgentWeb user with the email ${requesterEmail}. ${remedy}`
+                : `❌ Sorry, this channel isn't linked to an AgentWeb account, and I couldn't verify a Slack email for you to match one. ${remedy}`;
               await slackClient.chat.postMessage({
                 channel,
-                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+                text,
                 thread_ts: ts
               });
               return;
@@ -913,10 +984,12 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             if (isTriggered) {
               // Monitored (email-only) session — continue it and send email, do NOT post to Slack
               if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
+                // Skip replies from AgentWeb team members — no suggest needed for our own team's
+                // comments. Same two-signal predicate as the top-level message guard (ENG-1263):
+                // a known-internal ID doesn't depend on email resolution succeeding.
                 const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
+                if (isInternalSlackAuthor(slackUserId, replySenderEmail)) {
+                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${slackUserId}${replySenderEmail ? `, ${replySenderEmail}` : ''})`);
                   return;
                 }
 

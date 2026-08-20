@@ -303,6 +303,12 @@ router.delete('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.d
 // Get test history for a scheduled chat
 router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeController.getScheduledChatTestHistory));
 
+// GET /api/agent-mode/scheduled-chats/:scheduleId/storage-diagnostics
+// ENG-1071: read-only byte-usage breakdown (current prompt / prompt revisions / run
+// results) against DynamoDB's per-item limit, plus a corrective action when the
+// schedule is under storage pressure. Never returns field content, never writes.
+router.get('/scheduled-chats/:scheduleId/storage-diagnostics', asyncHandler(agentModeController.getScheduledChatStorageDiagnostics));
+
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
 // Send test notification email for a specific test history record
 router.post('/scheduled-chats/:scheduleId/test-history/:runId/send-email', asyncHandler(agentModeController.sendScheduledChatTestEmail));

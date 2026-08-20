@@ -24,6 +24,14 @@ export interface TimeoutContinuationMessage {
     // own work and must never be counted as salvageable output.
     isErrorMessage?: boolean;
     isDiagnosticMessage?: boolean;
+    // ENG-1239: set on the tool-role message toolDispatch persists the instant it
+    // defers a generate_image/video call for the per-turn media budget (see
+    // hasPersistedMediaBudgetDeferral below).
+    mediaBudgetDeferred?: boolean;
+    // ENG-1239: an assistant message's own settled toolCalls ledger, checked by
+    // hasUnresolvedMediaDeferral for the "soft" deferral shape (see
+    // hasDeferredMediaBudgetToolCall).
+    toolCalls?: DeferredToolCallLike[];
   } | null;
   timestamp?: string;
   role?: string;
@@ -139,6 +147,121 @@ export function collectTurnWorkSince(
     if (text) narrationCount += 1;
   }
   return { narrationCount, toolNames };
+}
+
+/**
+ * ENG-1239: toolDispatch's per-turn media-budget deferral (toolDispatch.ts, `makeDeferred`)
+ * stops short of the whole-turn hard cap and asks the user to reply "continue" — it never
+ * throws, so the interactive route sees a normal 200 response, not a timeout. This detects
+ * that specific deferral on a settled turn's toolCalls ledger so the caller can resume the
+ * batch itself instead of waiting on the user to notice and retype "continue".
+ *
+ * Scoped to `reason === 'media_generation_time_budget'` specifically — the same 'deferred'
+ * status also covers ENG-822's handler-supplied refusals (e.g. an anonymous-account-scoped
+ * decline), which carry their own reason and must NOT be auto-retried the same way.
+ */
+export interface DeferredToolCallLike {
+  result?: { deferred?: boolean; reason?: string; [key: string]: unknown } | null;
+}
+
+export function hasDeferredMediaBudgetToolCall(
+  toolCalls: DeferredToolCallLike[] | undefined | null,
+): boolean {
+  if (!Array.isArray(toolCalls)) return false;
+  return toolCalls.some(
+    (tc) => tc?.result?.deferred === true && tc.result?.reason === 'media_generation_time_budget',
+  );
+}
+
+/**
+ * ENG-1239: the whole-turn hard-timeout catch branch (agentModeController.ts) never gets
+ * a settled `response` — `withGenerationTimeout` rejected, so there is no `toolCalls`
+ * ledger for hasDeferredMediaBudgetToolCall to inspect. This reads the same "a media call
+ * was deferred" signal off the PERSISTED session history instead: toolDispatch writes a
+ * tool-role message with `metadata.mediaBudgetDeferred: true` the instant it defers a
+ * call (before the turn can go on to time out), so it survives even when the turn's own
+ * final response never arrives. Confirmed against the real production incident (session
+ * 822c1ed4, 2026-08-14T18:20:51.907Z): the deferral marker persisted, then the whole-turn
+ * cap fired ~21s later — this is exactly the marker that scenario left behind.
+ *
+ * Scoped to `sinceMs` (the turn's own start) so an EARLIER turn's already-resolved
+ * deferral is never mistaken for this turn's.
+ */
+export function hasPersistedMediaBudgetDeferral(
+  messages: TimeoutContinuationMessage[] | undefined | null,
+  sinceMs: number,
+): boolean {
+  if (!Array.isArray(messages)) return false;
+  return messages.some((message) => {
+    if (!message?.metadata?.mediaBudgetDeferred) return false;
+    const rawTs = message.timestamp || message.metadata.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    return Number.isFinite(ts) && ts >= sinceMs;
+  });
+}
+
+/**
+ * ENG-1239: durability backstop for the in-process auto-continuation chain. Firing the
+ * continuation only right after the deferred turn means a process death in between (a
+ * deploy, a crash) loses it silently with no record it was ever attempted. This lets ANY
+ * later touch of the session (getSession, on the next page load) detect the same
+ * condition from session history alone — no new persistence — and re-fire the resume.
+ *
+ * Deliberately looks ONLY at the LAST message (cheap enough to call from a
+ * frequently-polled endpoint) and requires it to be one of FOUR shapes an unresolved
+ * media pause actually leaves behind:
+ *  - the whole-turn-timeout partial-delivery notice, tagged `mediaBudgetDeferred: true`
+ *    (added alongside `kind: 'generation-timeout-continuation'` specifically for this —
+ *    the generic non-media salvage variant shares the same `kind` but is NOT tagged, so
+ *    it correctly returns false here)
+ *  - the model's own successful reply whose toolCalls ledger still shows a deferred call
+ *  - the RAW tool-role deferral marker toolDispatch persists the instant it defers
+ *    (CodeRabbit, PR #2479): incremental checkpointing can persist this marker BEFORE
+ *    the model's own follow-up narration is ever composed, so a process death in exactly
+ *    that window leaves it as the tail — a shape neither of the two assistant-authored
+ *    checks above matches. Safe to key off `mediaBudgetDeferred` alone here: toolDispatch
+ *    only ever sets that flag for a genuine media-budget pause — a handler-supplied
+ *    deferral (e.g. ENG-822's anonymous-account-scoped refusal) is deliberately left
+ *    untagged, so it can never be mistaken for a resumable timing pause.
+ *  - OUR OWN synthetic auto-continuation directive (role: 'user', kind:
+ *    'auto-continuation') dangling with no reply — a process death can kill the
+ *    continuation's own turn AFTER it persists that directive but BEFORE it replies,
+ *    which none of the shapes above matches (verified live: killing the backend right
+ *    after the directive saved left getSession blind to it until this branch was added).
+ *    Scoped to the `auto-continuation` kind specifically — a REAL customer message
+ *    dangling with no reply is a different, unrelated problem and must never be mistaken
+ *    for a media pause.
+ * Anything else — including the round-cap exhaustion notice (`kind:
+ * 'auto-continuation-exhausted'`) superseding an earlier pause — returns false, so this
+ * can never retry forever once the bounded round cap has already given up once.
+ *
+ * ENG-1239 (rework): `sinceMs` bounds how OLD a matching pause may be before this stops
+ * treating it as resumable — getSession is a passive READ endpoint, so without this, a
+ * customer merely reopening a session they abandoned days ago would silently trigger a
+ * fresh billed generation attempt they never asked for. Optional (defaults to no bound)
+ * so every existing caller keeps its exact prior behavior — including tolerating a
+ * message with no timestamp at all — and only a caller that explicitly wants staleness
+ * bounding (getSession) opts in. Once opted in, a matching message with NO usable
+ * timestamp fails closed (treated as stale) rather than being trusted indefinitely.
+ */
+export function hasUnresolvedMediaDeferral(
+  messages: TimeoutContinuationMessage[] | undefined | null,
+  sinceMs: number = 0,
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  if (!last) return false;
+  const isUnresolvedShape = last.role === 'user'
+    ? last.metadata?.kind === 'auto-continuation'
+    : last.role === 'tool'
+      ? last.metadata?.mediaBudgetDeferred === true
+      : last.role === 'assistant'
+        && (last.metadata?.mediaBudgetDeferred === true || hasDeferredMediaBudgetToolCall(last.metadata?.toolCalls));
+  if (!isUnresolvedShape) return false;
+  if (sinceMs <= 0) return true;
+  const rawTs = last.timestamp || last.metadata?.timestamp;
+  const ts = rawTs ? Date.parse(rawTs) : NaN;
+  return Number.isFinite(ts) && ts >= sinceMs;
 }
 
 /** Cap the tool list so a 40-step run doesn't produce an unreadable wall of names. */

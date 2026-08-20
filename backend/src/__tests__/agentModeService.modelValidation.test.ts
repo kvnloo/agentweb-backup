@@ -49,6 +49,22 @@ describe('AgentModeService - Generation model validation (ENG-46)', () => {
     expect(result.fellBack).toBe(false);
   });
 
+  // 2026-08-19: gpt-5-chat-2 and gpt-5.2-chat were removed from the registry
+  // during the Rui-owned Azure resource migration (gpt-5-chat-2 dropped from
+  // Azure's deployable catalog entirely; gpt-5.2-chat's Azure inference cutoff
+  // already passed). A paused schedule/session/setting still holding either id
+  // must resolve forward to gpt-5.5, not throw or silently fall back to the
+  // generic default.
+  it.each(['gpt-5-chat-2', 'gpt-5.2-chat'])(
+    'normalizes the retired %s to gpt-5.5 instead of falling back',
+    (retiredId) => {
+      const result = agentModeService.resolveGenerationModel(retiredId);
+      expect(result.model).toBe('gpt-5.5');
+      expect(result.fellBack).toBe(false);
+      expect(result.requestedModel).toBe(retiredId);
+    }
+  );
+
   it('falls back to the default model for a removed/invalid id instead of throwing', async () => {
     // 'gpt-5.1' was removed from the allow-list — the smoke-test config still pins it.
     const result = agentModeService.resolveGenerationModel('gpt-5.1');

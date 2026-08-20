@@ -26,6 +26,7 @@ import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secur
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance, resolveBillingUserId } from "../services/tokenUsageService";
 import { grantMonthlyLlmUsageCredit } from "../services/llmUsageCreditService";
 import { getRevenueMetrics } from "../services/revenueService";
+import { detectMrrCollectionGaps } from "../services/mrrCollectionGapService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
@@ -3239,11 +3240,11 @@ router.get("/chat-sessions", async (req, res) => {
       }
     }
 
-    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
-      limit,
-      lastEvaluatedKey,
-      timeRange
-    );
+    const {
+      sessions,
+      lastEvaluatedKey: nextKey,
+      gapQueryTruncated,
+    } = await chatbotDb.getRecentSessionsPage(limit, lastEvaluatedKey, timeRange);
 
     // Load messages from the messages table for each session
     const sessionsWithMessages = await Promise.all(
@@ -3259,6 +3260,32 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    // ENG-1332: coverage metadata travels with the response so a caller (e.g.
+    // the Daily Satisfaction Score Report) can state its own denominator
+    // honestly instead of inferring one from sessions.length.
+    let scoringCoverage:
+      | {
+          requestedRangeCount: number;
+          totalFetched: number;
+          alreadyScored: number;
+          newlyScored: number;
+          // ENG-1332 (Greptile): named `unscored`, not `skippedForBudget` — an
+          // in-range session lands here whenever it has no persisted score
+          // after this run, whether that's because the scoring budget ran out
+          // (see `timedOut`), the scorer threw, it intentionally returned no
+          // score, or it lost the conditional-write race to an admin override.
+          // The old name implied budget was always the cause; it usually
+          // isn't distinguishable from here, so the name no longer claims it.
+          unscored: number;
+          timedOut: boolean;
+          // True when the gap query (see getRecentSessionsPage) hit its page
+          // cap before exhausting [endTime, now] — some late-touched in-range
+          // sessions may exist beyond where it stopped, so requestedRangeCount
+          // may understate the true population for this window.
+          requestedRangeMayBeIncomplete: boolean;
+        }
+      | undefined;
+
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3270,6 +3297,26 @@ router.get("/chat-sessions", async (req, res) => {
       } catch (error) {
         console.error("Error loading scoring judges for sync mode:", error);
       }
+
+      // ENG-1332 (Greptile): alreadyScored/newlyScored must be counted over the
+      // same population as requestedRangeCount, or a time-range sync that also
+      // fetched historical sessions (touched, not created, in the window) can
+      // report a scored total that exceeds its own denominator. Scope both to
+      // sessions actually created in the requested range.
+      const inRangeSessions = timeRange
+        ? sessionsWithMessages.filter(
+            (session: any) =>
+              session.createdAt &&
+              session.createdAt >= timeRange.startTime &&
+              session.createdAt <= timeRange.endTime
+          )
+        : sessionsWithMessages;
+      const requestedRangeCount = inRangeSessions.length;
+      const alreadyScoredIds = new Set(
+        inRangeSessions
+          .filter((session: any) => session.satisfactionScore?.evaluatedAt)
+          .map((session: any) => session.sessionId)
+      );
 
       // ENG-291: score with bounded concurrency under a wall-clock budget and
       // apply the results in-memory. This returns before the tool timeout even on
@@ -3286,6 +3333,33 @@ router.get("/chat-sessions", async (req, res) => {
           `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
         );
       }
+
+      const newlyScored = inRangeSessions.filter(
+        (session: any) =>
+          session.satisfactionScore?.evaluatedAt && !alreadyScoredIds.has(session.sessionId)
+      ).length;
+
+      // ENG-1332 (Greptile): backfill.skipped counts across the FULL fetched
+      // set (in-range + historical), the same population mismatch as
+      // alreadyScored/newlyScored above. What the report actually needs — "how
+      // many requested-window sessions remain unscored" — is fully derivable
+      // from the counts already scoped to inRangeSessions: every in-range
+      // session is accounted for by exactly one of alreadyScored (had a score
+      // already), newlyScored (scored this run), or neither — so the
+      // remainder is the honest, correctly-scoped count. It is NOT purely a
+      // budget count (see the `unscored` field comment above), which is why
+      // it's paired with `timedOut` rather than named after budget alone.
+      const unscored = requestedRangeCount - alreadyScoredIds.size - newlyScored;
+
+      scoringCoverage = {
+        requestedRangeCount,
+        totalFetched: sessionsWithMessages.length,
+        alreadyScored: alreadyScoredIds.size,
+        newlyScored,
+        unscored,
+        timedOut: backfill.timedOut,
+        requestedRangeMayBeIncomplete: gapQueryTruncated === true,
+      };
     }
 
     const nextCursor = nextKey
@@ -3299,7 +3373,11 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringCoverage ? { scoringCoverage } : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
@@ -5482,7 +5560,7 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
       adminOverride: true as const,
     };
 
-    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore);
+    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore, { allowOverride: true });
 
     res.json({ satisfactionScore });
   } catch (error: any) {
@@ -5612,6 +5690,16 @@ router.get("/revenue-metrics", async (req, res) => {
   } catch (error: any) {
     console.error("Error fetching revenue metrics:", error.message);
     res.status(500).json({ message: "Failed to fetch revenue metrics" });
+  }
+});
+
+router.get("/revenue-collection-gaps", async (req, res) => {
+  try {
+    const flags = await detectMrrCollectionGaps();
+    res.json({ flags, count: flags.length });
+  } catch (error: any) {
+    console.error("Error detecting MRR collection gaps:", error.message);
+    res.status(500).json({ message: "Failed to detect MRR collection gaps" });
   }
 });
 

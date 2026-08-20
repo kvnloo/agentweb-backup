@@ -32,9 +32,10 @@ import {
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
+import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
@@ -77,6 +78,7 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
+  costScoreFromPrice,
   cacheWriteCost,
   CacheWriteByTtl,
   imageGenerationCostUsd,
@@ -824,7 +826,12 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
-  /** Usage/cost tier for the model picker UI, ordered most- to least-expensive. Unset defaults to 'medium'. */
+  /**
+   * Usage/cost tier for the model picker UI. Only used as a fallback when
+   * getModelPrice() has no entry for this model — otherwise the picker's
+   * tier grouping is derived live from the computed cost score (see
+   * TIER_COST_SCORE_BANDS). Unset defaults to 'medium'.
+   */
   tier?: ModelTier;
   /** Short, user-facing one-line description shown next to the model name in the picker. */
   description?: string;
@@ -832,10 +839,126 @@ interface LLMModelConfig {
   name?: string;
   /** Underlying lab, for picking the right provider icon in the picker. Unset defaults to 'other'. */
   provider?: ModelProvider;
+  /**
+   * True for a superseded version of a model family still kept selectable for
+   * session/schedule continuity (see LEGACY_MODEL_ALIASES and resolveGenerationModel —
+   * this flag only affects picker visibility grouping, never generation). The picker
+   * UI tucks these behind a "Show more" row instead of hiding them from new selection
+   * entirely (that's what adminOnly is for).
+   *
+   * Hand-set here for models superseded for reasons other than pure
+   * dominance (e.g. a straight version retirement). getSupportedModelsWithMetadata
+   * ALSO computes legacy live for any model that a same-`family` model
+   * strictly dominates (see deriveDominanceLegacyIds) — this field and that
+   * computation combine with OR, never override each other.
+   */
+  legacy?: boolean;
+  /**
+   * Groups models that are genuinely the same product line across
+   * generations (e.g. every "GPT-5.x balanced chat" deployment, or every
+   * Claude Opus release) for automatic same-family dominance detection.
+   * Deliberately narrow and hand-assigned — NOT "same provider": Claude
+   * Opus and Claude Sonnet, or Gemini Pro and Gemini Flash, are different
+   * product tiers serving different jobs, not generations of the same
+   * model, so they must never share a family or a stronger sibling tier
+   * would wrongly hide a still-useful different-tier model. Omitted
+   * (no family) means this model is never auto-dominated.
+   */
+  family?: string;
+  /**
+   * Benchmark-derived quality score, 0-100, higher = stronger. Omitted
+   * entirely when there is insufficient benchmark evidence for this model —
+   * never estimated or invented. Does NOT get lowered merely because a
+   * model is `legacy`; legacy affects picker visibility grouping only, not
+   * how good the model actually is.
+   */
+  qualityScore?: number;
+  /** Methodology/source note for qualityScore — benchmark name, source
+   *  version, and evaluation date (e.g. "Artificial Analysis Intelligence
+   *  Index, snapshot 2026-08-19"). Surfaced in the picker's quality tooltip. */
+  qualityScoreSource?: string;
+  // No costScore/costScoreSource field here (unlike qualityScore) — cost is
+  // fully derivable from MODEL_PRICING (see getSupportedModelsWithMetadata),
+  // so it is computed live rather than duplicated as a second hand-typed
+  // number that can drift from what we actually bill.
 }
 
 /** Usage/cost tiers surfaced in the model picker, ordered most- to least-expensive. */
 export type ModelTier = 'ultra_premium' | 'pro' | 'medium' | 'cheap' | 'ultra_cheap';
+
+/**
+ * Cost-score band boundaries backing the picker's tier buckets (Harsha's
+ * exact thresholds, revised 2026-08-19 after reviewing the live numbers) —
+ * inclusive lower bound, ordered highest band first. costScore is 0-100 and
+ * higher = more expensive (see costScoreFromPrice), so a model's tier is
+ * simply whichever band its own cost score falls in. Tier IDs (ultra_premium/
+ * ultra_cheap) are unchanged from earlier — only the numeric boundaries and
+ * the frontend's DISPLAY labels moved ("Flagship"/"Very Cheap", see
+ * modelTiers.ts TIER_LABELS); no backend API contract change.
+ */
+export const TIER_COST_SCORE_BANDS: ReadonlyArray<{ tier: ModelTier; minCostScore: number }> = [
+  { tier: 'ultra_premium', minCostScore: 71 },
+  { tier: 'pro', minCostScore: 64 },
+  { tier: 'medium', minCostScore: 51 },
+  { tier: 'cheap', minCostScore: 31 },
+  { tier: 'ultra_cheap', minCostScore: 0 },
+];
+
+/** Derives a model's picker tier bucket from its cost score. */
+export function tierFromCostScore(costScore: number): ModelTier {
+  const band = TIER_COST_SCORE_BANDS.find((b) => costScore >= b.minCostScore);
+  // TIER_COST_SCORE_BANDS' last band has minCostScore: 0, which matches any
+  // costScore >= 0 — so `band` is only undefined for a negative/NaN input.
+  return band?.tier ?? 'ultra_cheap';
+}
+
+/** Cheapest-to-most-expensive numeric rank of each tier, for dominance comparison. */
+const TIER_RANK: Record<ModelTier, number> = {
+  ultra_cheap: 0,
+  cheap: 1,
+  medium: 2,
+  pro: 3,
+  ultra_premium: 4,
+};
+
+export interface DominanceCandidate {
+  id: string;
+  /** LLMModelConfig.family — omitted candidates are never auto-dominated. */
+  family?: string;
+  tier: ModelTier;
+  qualityScore?: number;
+  /** The model's OWN static legacy flag (not the final computed one) — only
+   *  a candidate that was not already legacy can dominate another. */
+  legacy: boolean;
+}
+
+/**
+ * Ids that should be treated as legacy because a same-`family`, originally
+ * non-legacy sibling is at least as cheap (same-or-lower cost tier band) AND
+ * at least as good (same-or-higher quality score), strictly so in at least
+ * one dimension — e.g. GPT-5.6 Luna (ultra_cheap, quality 52) strictly beats
+ * GPT-5.4 Nano (ultra_cheap, quality 40): same band, higher quality, so Nano
+ * is dominated. Comparison is scoped to `family`, never "same provider" —
+ * Claude Opus and Claude Sonnet are different product tiers, not
+ * generations of one model, so a stronger Opus must never hide Sonnet.
+ */
+export function deriveDominanceLegacyIds(candidates: DominanceCandidate[]): Set<string> {
+  const dominated = new Set<string>();
+  for (const a of candidates) {
+    if (!a.family || typeof a.qualityScore !== 'number') continue;
+    const beatenBySibling = candidates.some((b) => {
+      if (b.id === a.id || b.family !== a.family || b.legacy || typeof b.qualityScore !== 'number') {
+        return false;
+      }
+      const cheaperOrEqual = TIER_RANK[b.tier] <= TIER_RANK[a.tier];
+      const betterOrEqualQuality = b.qualityScore >= a.qualityScore!;
+      const strictlyBetter = TIER_RANK[b.tier] < TIER_RANK[a.tier] || b.qualityScore > a.qualityScore!;
+      return cheaperOrEqual && betterOrEqualQuality && strictlyBetter;
+    });
+    if (beatenBySibling) dominated.add(a.id);
+  }
+  return dominated;
+}
 
 /** Underlying lab a model is from, for picking the right provider icon in the picker. */
 export type ModelProvider =
@@ -848,6 +971,14 @@ export interface SupportedModelInfo {
   tier: ModelTier;
   description: string;
   provider: ModelProvider;
+  /** True for a superseded version the picker should tuck behind "Show more". Omitted (not `false`) for a current/primary model. */
+  legacy?: true;
+  /** 0-100, higher = stronger. Omitted when there's no benchmark evidence — never a guess. */
+  qualityScore?: number;
+  qualityScoreSource?: string;
+  /** 0-100, higher = more expensive. Omitted when pricing isn't available. */
+  costScore?: number;
+  costScoreSource?: string;
 }
 
 // Type for LLM call options
@@ -907,12 +1038,18 @@ const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'b
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
 // Legacy model ids persisted by sessions/schedules created before a model was
-// renamed. Maps the old id to its current registry key so old sessions keep
-// working instead of throwing "Invalid model". Opus 4.8 was renamed from the
-// bare Vertex id "claude-opus-4-8" to the Bedrock id "anthropic.claude-opus-4-8"
-// in commit c86c8ec1.
+// renamed or fully retired. Maps the old id to its current registry key so old
+// sessions/schedules keep working instead of throwing "Invalid model". Opus 4.8
+// was renamed from the bare Vertex id "claude-opus-4-8" to the Bedrock id
+// "anthropic.claude-opus-4-8" in commit c86c8ec1. gpt-5-chat-2 and gpt-5.2-chat
+// were removed from the registry 2026-08-19 (Azure deployment retired/deprecated
+// during the migration off the Rui-owned Azure resource — see the registry
+// comment above the gpt-5.4 entry) and redirected to gpt-5.5, the current
+// non-legacy top of the same gpt5-chat family.
 const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
+  'gpt-5-chat-2': 'gpt-5.5',
+  'gpt-5.2-chat': 'gpt-5.5',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -1026,7 +1163,12 @@ export class AgentModeService {
   // `agent_mode_default_model` setting when one is configured (getDefaultModel).
   // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
   // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
+  // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
+  // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
+  // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
+  // direct rate — not a multi-provider OpenRouter blend), and it dominates
+  // every other model in the `gemini-flash` family band for band.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1797,8 +1939,18 @@ export class AgentModeService {
     try {
       const setting = await settingsService.getSetting('agent_mode_backup_model');
       const configured = setting?.settingValue?.trim();
-      if (configured && this.llmModels[configured] && configured !== primaryModel) {
-        return configured;
+      if (configured) {
+        // Same legacy-alias resolution as resolveConfiguredModel/normalizeModelId
+        // uses (ENG-806) — a stored backup id that's since been retired (e.g. a
+        // superseded gpt-5.x version) must still resolve to its current
+        // replacement, not silently return null and disable failover. Normalize
+        // primaryModel too so a retired id used as BOTH primary and configured
+        // backup still collapses to "same model, skip" instead of appearing to
+        // be a distinct backup once only one side is resolved forward.
+        const normalized = this.normalizeModelId(configured);
+        if (this.llmModels[normalized] && normalized !== this.normalizeModelId(primaryModel)) {
+          return normalized;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Error getting backup model setting:', error);
@@ -2854,11 +3006,20 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { name: 'GPT-5 Chat 2', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.2-chat': { name: 'GPT-5.2 Chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
-    'gpt-5.4': { name: 'GPT-5.4', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
-    'gpt-5.5': { name: 'GPT-5.5', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
+    // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
+    // the Rui-owned Azure resource (ai-ruiwangwarm...) onto agentweb-openrouter-byok:
+    // gpt-5-chat-2 is no longer in Azure's deployable model catalog at all;
+    // gpt-5.2-chat's Azure inference cutoff was 2026-06-29 (fully deprecated,
+    // no working deployment possible on any resource). Both were already
+    // legacy:true and the two lowest-quality entries in the gpt5-chat family.
+    // Safe to remove ONLY because LEGACY_MODEL_ALIASES now redirects both ids
+    // to gpt-5.5 (see below) — a paused schedule/session still holding the old
+    // id resolves forward instead of throwing "Invalid model". Do not delete a
+    // registry entry without an alias first; that was exactly the caution the
+    // prior version of this comment existed to enforce.
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -2867,10 +3028,29 @@ export class AgentModeService {
     // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
     // Its price entry is intentionally left in place — a rate for a removed model is
     // harmless, a missing rate for a live one is not.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true },
+    // 2026-08-19: Harsha — "the preview gemini models should be moved to
+    // legacy asap." Static legacy: true (not dominance-derived — "preview"
+    // status isn't something a cost/quality comparison would ever catch on
+    // its own; this is a policy call that preview builds shouldn't be a
+    // default-visible pick regardless of how they benchmark).
+    // resolveGenerationModel/resolveFallbackModel are untouched — an
+    // existing session or schedule pinned to either id is unaffected.
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
+    // live against three independent sources (ai.google.dev/deepmind.google/
+    // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
+    // Flash-Lite exists. Google shipped 3.6 Flash first, then 3.7 Flash on top
+    // of it — 3.6 is deliberately skipped (never added to this registry) since
+    // 3.7 supersedes it outright. `family: 'gemini-flash'` (shared with 3.5
+    // Flash, NOT 3.1 Flash Lite — Lite is a distinct "lightest/fastest"
+    // positioning, same reasoning as gpt5-chat vs gpt5-nano) lets the
+    // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
+    // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
+    // Flash is now correctly auto-flagged legacy.
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -2892,11 +3072,14 @@ export class AgentModeService {
     //   (see LLMModelConfig.supportsVision above) requires empirical verification
     //   against the real describe_image path, which none of these have had yet.
     //   Metadata-only vision support is not the bar this flag uses elsewhere.
-    // - adminOnly: true on every new entry below (not this starter one, which was
-    //   already smoke-tested live) — unproven-in-our-stack, gated until verified,
-    //   matching the existing convention for other non-default/experimental models
-    //   (e.g. anthropic.claude-opus-4-6-v1 above).
-    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true },
+    // - adminOnly: OMITTED for every OpenRouter entry below (2026-08-19: was
+    //   `true` on each, gated as unproven-in-our-stack — Harsha: "i'm fine to
+    //   include open source / open router stuff for all users not just
+    //   isadmin". Client construction is the same lazy-loaded OpenRouter path
+    //   already used successfully by gpt-4o-mini above.) This does NOT apply
+    //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
+    //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
+    'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -2918,31 +3101,68 @@ export class AgentModeService {
     // Net result: Meta/Llama has ZERO entrants after this cleanup. OpenRouter's
     // catalog has no meta-llama/llama-5* listed as of this snapshot (checked
     // live) — this is a real, currently-unfillable gap, not an oversight.
-    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, adminOnly: true },
-    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, adminOnly: true },
+    'openrouter/x-ai/grok-4.6': { name: 'Grok 4.6', provider: 'xai', tier: 'pro', description: 'Near-Opus quality, fastest of the top tier', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/deepseek/deepseek-v4-pro': { name: 'DeepSeek V4 Pro', provider: 'deepseek', tier: 'medium', description: 'Strong coding performance at low cost', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: qualityScore corrected 52 -> 40. The 52 belonged to a
+    // DIFFERENT, newer snapshot ("DeepSeek V4 Flash 0731, Max Effort") —
+    // this registry id resolves on OpenRouter to "DeepSeek V4 Flash 0423",
+    // whose real AA Intelligence Index score is 40 (confirmed live against
+    // AA's own page + independent coverage). Not a stale-number issue like
+    // the Kimi K3 pricing catch — the wrong model's score was attached to
+    // the model we actually invoke. Pricing is unaffected: our MODEL_PRICING
+    // entry ($0.068/$0.168) already matches the real 0423 snapshot.
+    'openrouter/deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash', provider: 'deepseek', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "DeepSeek V4 Flash 0423" page (the snapshot this OpenRouter id actually resolves to), snapshot 2026-08-19' },
+    'openrouter/qwen/qwen3.8-max': { name: 'Qwen3.8 Max', provider: 'qwen', tier: 'pro', description: 'Alibaba\'s flagship model', client: null, supportsTemperature: true, qualityScore: 58, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/mistralai/mistral-small-2603': { name: 'Mistral Small', provider: 'mistral', tier: 'cheap', description: 'Fast and inexpensive', client: null, supportsTemperature: true, qualityScore: 20, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k3': { name: 'Kimi K3', provider: 'moonshot', tier: 'ultra_premium', description: 'Frontier-scale reasoning, near the top of the field', client: null, supportsTemperature: true, qualityScore: 60, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/moonshotai/kimi-k2.7-code': { name: 'Kimi K2.7 Code', provider: 'moonshot', tier: 'medium', description: 'Coding-focused, efficient', client: null, supportsTemperature: true, qualityScore: 43, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-5.2': { name: 'GLM 5.2', provider: 'zai', tier: 'medium', description: 'Capable open-weight model, strong value', client: null, supportsTemperature: true, qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/z-ai/glm-4.7-flash': { name: 'GLM 4.7 Flash', provider: 'zai', tier: 'ultra_cheap', description: 'Maximum efficiency for high-volume work', client: null, supportsTemperature: true, qualityScore: 23, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // 2026-08-19: OpenAI's GPT-5.6 three-tier family (Sol/Terra/Luna, launched
+    // 2026-07-09), added via OpenRouter — live-confirmed slugs and pricing at
+    // openrouter.ai/openai/gpt-5.6-{sol,terra,luna}. adminOnly per the
+    // existing convention for unverified-in-our-stack OpenRouter entries.
+    // Sol: AA Coding Agent Index leader (80) but behind Opus 5 on 9/12
+    // tracked benchmarks including SWE-bench Pro and ARC-AGI-3 — pro tier,
+    // not ultra_premium. Terra: GPT-5.5-competitive quality at ~half cost —
+    // replaces gpt-5.5 as the default GPT-5.x picker row. Luna: cheap/fast,
+    // ~24 benchmark points per API dollar at launch pricing — ultra_cheap.
+    // 2026-08-19: NOT in the 'gpt5-chat' family (unlike Terra/5.5/5.4/etc) —
+    // its own description marks it as a distinct specialized/premium
+    // positioning ("Frontier coding and agentic work"), not a generation of
+    // the "Balanced general-purpose model" line the rest of that family
+    // shares verbatim in their description text. Lumping it in wrongly
+    // flagged GPT-5.6 Terra as legacy: Sol's OpenRouter price is currently
+    // on a promotional discount that happens to land it in the same cost
+    // band as Terra, so same-family dominance concluded Terra was
+    // redundant — a coincidence of a volatile promo price, not a real
+    // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
+    // a family with Kimi K2.7-Code (a coding-specialized sibling).
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true },
-    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true },
+    // 2026-08-19: all four below are `legacy` (picker-grouping only, see
+    // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
+    // referenced by live TaskSchedules/ChatSessions (opus-4-8 and sonnet-4-6
+    // have active schedules touching them the same day this was written), so
+    // NOT deleted and NOT adminOnly — customers can still select them via
+    // "Show more", they're just no longer the default row per tier.
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { name: 'Claude Sonnet 4.5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 37, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-4-6': { name: 'Claude Sonnet 4.6', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Previous-generation Sonnet', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-opus-4-6-v1': { name: 'Claude Opus 4.6', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: true, adminOnly: true, supportsVision: true, legacy: true , qualityScore: 45, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
-    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-4-8': { name: 'Claude Opus 4.8', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'Previous-generation Opus', client: null, supportsTemperature: false, supportsVision: true, legacy: true , qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
     // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
     // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
     // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
     // deprecated for this model") — verified against live Bedrock, not assumed.
-    'anthropic.claude-opus-5': { name: 'Claude Opus 5', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true },
-    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-opus-5': { name: 'Claude Opus 5', family: 'claude-opus', provider: 'anthropic', tier: 'pro', description: 'For complex tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 63, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'anthropic.claude-sonnet-5': { name: 'Claude Sonnet 5', family: 'claude-sonnet', provider: 'anthropic', tier: 'medium', description: 'Most efficient for everyday tasks', client: null, supportsTemperature: false, supportsVision: true , qualityScore: 55, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // Haiku 4.5 still accepts temperature (also live-verified).
-    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true },
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { name: 'Claude Haiku 4.5', provider: 'anthropic', tier: 'cheap', description: 'Fastest for quick answers', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 30, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2961,21 +3181,58 @@ export class AgentModeService {
    * selectable through the HTTP generate picker (see callLLM's isLive guard).
    * Untiered entries default to 'medium' with a generic description rather than being
    * dropped, so a newly-added model is never silently invisible in the picker.
+   *
+   * costScore is computed live from MODEL_PRICING (via getModelPrice +
+   * costScoreFromPrice) rather than read off the config — see the
+   * LLMModelConfig comment for why. tier is then derived from that same
+   * costScore via tierFromCostScore, so the picker's section headers always
+   * agree with the cost meter it's grouping by. Only when a model has no
+   * MODEL_PRICING entry (so costScore can't be computed) does tier fall back
+   * to the config's static field, and costScore/costScoreSource are omitted.
    */
   async getSupportedModelsWithMetadata(isAdmin: boolean = false): Promise<SupportedModelInfo[]> {
     const ids = await this.getSupportedModels(isAdmin);
-    return ids
-      .filter(id => !this.llmModels[id]?.isLive)
-      .map(id => {
-        const config = this.llmModels[id];
-        return {
-          id,
-          name: config?.name ?? id,
-          tier: config?.tier ?? 'medium',
-          description: config?.description ?? 'General-purpose model',
-          provider: config?.provider ?? 'other',
-        };
-      });
+    const visibleIds = ids.filter(id => !this.llmModels[id]?.isLive);
+
+    const enriched = visibleIds.map(id => {
+      const config = this.llmModels[id];
+      const price = getModelPrice(id);
+      const costScore = price ? costScoreFromPrice(price) : undefined;
+      return {
+        id,
+        name: config?.name ?? id,
+        tier: typeof costScore === 'number' ? tierFromCostScore(costScore) : (config?.tier ?? 'medium'),
+        description: config?.description ?? 'General-purpose model',
+        provider: config?.provider ?? 'other',
+        family: config?.family,
+        staticLegacy: config?.legacy === true,
+        qualityScore: config?.qualityScore,
+        qualityScoreSource: config?.qualityScoreSource,
+        costScore,
+      };
+    });
+
+    const dominatedIds = deriveDominanceLegacyIds(
+      enriched.map(e => ({ id: e.id, family: e.family, tier: e.tier, qualityScore: e.qualityScore, legacy: e.staticLegacy })),
+    );
+
+    return enriched.map(e => ({
+      id: e.id,
+      name: e.name,
+      tier: e.tier,
+      description: e.description,
+      provider: e.provider,
+      ...(e.staticLegacy || dominatedIds.has(e.id) ? { legacy: true as const } : {}),
+      ...(typeof e.qualityScore === 'number' ? { qualityScore: e.qualityScore } : {}),
+      ...(e.qualityScoreSource ? { qualityScoreSource: e.qualityScoreSource } : {}),
+      ...(typeof e.costScore === 'number'
+        ? {
+            costScore: e.costScore,
+            costScoreSource:
+              'AgentWeb blended rate (75% input / 25% output), computed live from the real per-token billing price table (llmPricing.ts MODEL_PRICING) — never a separately hand-typed number',
+          }
+        : {}),
+    }));
   }
 
   async getReportsModelOptions(isAdmin: boolean = false): Promise<string[]> {
@@ -3988,7 +4245,12 @@ export class AgentModeService {
       // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
       // iterations of this turn, so the dispatcher can suppress an identical re-request in a
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
-      const mediaCallKeysThisRun = new Map<string, string>();
+      // ENG-1239: seeded from RECENT persisted history (not just started empty) — this run
+      // may itself be a media auto-continuation of a batch that was deferred moments ago in
+      // a DIFFERENT (already-ended) turn, which this same-turn-only map would otherwise
+      // have no record of at all. Bounded to the last hour so an old, unrelated,
+      // coincidentally-identical request is never mistaken for a duplicate.
+      const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
 
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
@@ -5092,6 +5354,52 @@ export class AgentModeService {
         }
       }
 
+      // ENG-1207 AC3: a run must not finish silently on an unread page.
+      //
+      // Same shape as the two reconcilers above and placed alongside them
+      // deliberately: deterministic, always-on, append-only, patched into the last
+      // assistant message so the persisted transcript matches what the user sees.
+      // It never rewrites the model's text and never claims success — it only adds
+      // the fact that some of the data was not looked at.
+      //
+      // NOT folded into the finalize guard, which is the established
+      // claimed-vs-executed seam: that guard is seen only when AGENT_FINALIZE_GUARD
+      // and AGENT_RUNTIME_SPINE_ENABLED are both on, and both are off in production.
+      // An acceptance criterion that cannot run is the defect it is meant to fix.
+      // The detection lives in a PURE module so the guard can absorb it unchanged
+      // the day those flags flip.
+      //
+      // Why this exists at all when AC1/AC2 already fixed the wording: during
+      // ENG-1200 the response ALREADY carried `has_more: true` and a cursor, and the
+      // model re-ran the identical unpaged query six times, then wrote 17 of 107
+      // records and reported the job complete. A clearer message makes noticing
+      // possible; it does not make it certain.
+      //
+      // Kill switch, not a gate: set AGENT_UNCONSUMED_CURSOR_NOTICE=false to disable.
+      // Absent means ON, so this cannot quietly become inert the way the guard did.
+      if (content && !wasCancelled && !mockMode
+          && process.env.AGENT_UNCONSUMED_CURSOR_NOTICE !== 'false') {
+        try {
+          // Same predicate the finalize ledger uses, so the two cannot disagree
+          // about which calls actually executed.
+          const reconciled = reconcileUnconsumedCursors(content, toolCalls, toolCallNeverExecuted);
+          if (reconciled !== content) {
+            content = reconciled;
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                break;
+              }
+            }
+          }
+        } catch (cursorError) {
+          // Advisory. A bug here must never block delivery of a reply the user is
+          // waiting on — the failure mode this prevents is a silent overclaim, which
+          // is strictly less bad than losing the message.
+          console.warn('AgentMode: unconsumed-cursor notice failed', cursorError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -5888,6 +6196,7 @@ export class AgentModeService {
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables',
+    'get_scheduled_chat_storage_diagnostics', // ENG-1071: byte-usage breakdown when a save fails/is at risk
 
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
@@ -6883,6 +7192,48 @@ export class AgentModeService {
         ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
       };
     }
+
+    // ENG-1207: pagination markers survive minimization, for EVERY tool.
+    //
+    // The default branch returned {}, which is right for storage and wrong for the
+    // one consumer that reads this ledger to decide whether a run finished on an
+    // unread page (`reconcileUnconsumedCursors`, at the finalize seam). With the
+    // cursor stripped it saw {} for every call and never fired — the feature was
+    // inert in production while its unit tests passed, because those tests built
+    // ledger entries by hand with un-minimized results and so never crossed this
+    // function. Found by live verification, not by the suite.
+    //
+    // Deliberately GENERIC rather than a list of tool names: a tool that paginates
+    // is describable by its response, and a future one must not have to be
+    // remembered here to be covered.
+    //
+    // Proportionate to the purpose of this function — a cursor string and a boolean,
+    // never the rows. The heavy payload is still dropped.
+    const paginationMarkers: Record<string, unknown> = {};
+    if (result && typeof result === 'object') {
+      for (const key of ['next_cursor', 'nextCursor', 'has_more', 'hasMore']) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === 'string' ? value.trim() : typeof value === 'boolean') {
+          paginationMarkers[key] = value;
+        }
+      }
+      // The COUNT survives too, as a number — the rows themselves do not.
+      //
+      // Without it the notice said "search_leads returned 0 row(s) and more remain
+      // unread" on a call that returned 20, because the row array it counted had
+      // already been stripped here. Found in production; the unit test asserted
+      // only "no undefined/NaN", so zero passed.
+      //
+      // Zero is worse than silence in that sentence: it reads as "this found
+      // nothing", the opposite of what happened.
+      if (Object.keys(paginationMarkers).length > 0) {
+        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+          const value = (result as Record<string, unknown>)[key];
+          if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
+        }
+      }
+    }
+    if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
 
     // For other tools, return empty object to minimize storage
     return {};
@@ -12835,22 +13186,70 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      const [engagementCount, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId),
+      // ENG-1207: the count is fetched alongside the engagements, so a rejection
+      // there rejected BOTH -- taking down a tool whose actual payload was sitting
+      // in the other promise. It is a summary field, not the answer, and since the
+      // message no longer derives its total from it (see below), nothing the caller
+      // asked for depends on it. Degrade the summary, not the tool.
+      const [engagementCountResult, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch((countError) => {
+          // Loud, not silent (CodeRabbit). The bare swallow kept the tool alive but
+          // left no trace, so a count query failing repeatedly would be invisible.
+          console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
+          return null;
+        }),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCountAvailable = engagementCountResult !== null;
+      const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
 
+      // ENG-1207: never report a truncated page as a total. `searchLeads` and
+      // `getLeads` were corrected in #2407; this tool kept saying "Found 20
+      // engagement(s)" for a lead with 143, and a model reads that as "there are
+      // 20" and stops -- the same misread that wrote 17 of 107 records and called
+      // the job done.
+      //
+      // The total is `engagements.length`, NOT `engagementCount.total`, and the
+      // distinction matters. `engagements` is the exact population being sliced,
+      // and it is complete: both of its sources paginate fully (the email-events
+      // query loops on LastEvaluatedKey and returns everything; the rest is a lead
+      // attribute). `engagementCount` is a SEPARATE query that may count a
+      // different population, which would make "20 of 143" inconsistent with the
+      // 20 rows actually returned beside it -- and it can fail independently,
+      // leaving a total that has to be omitted or invented.
+      //
+      // Counting the array we truncated keeps the two numbers describing the same
+      // thing by construction, and removes the failure mode entirely.
+      const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      // A lead with neither name collapses the label to '', leaving
+      // "... engagement(s) for  — raise limit": a double space and a dangling
+      // preposition in a sentence a model parses. Trimming the whole message does
+      // not help, because the gap is in the middle. Drop the clause instead.
+      const forLead = leadLabel ? ` for ${leadLabel}` : '';
+      const truncated = engagements.length > limitedEngagements.length;
+      const engagementMessage = truncated
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s)${forLead} — raise limit to see more.`
+        : `Found ${limitedEngagements.length} engagement(s)${forLead}`;
+
       return {
         success: true,
-        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        message: engagementMessage,
+        // ENG-1207 (CodeRabbit): explicit null, never undefined, plus a flag when
+        // the count is unavailable. An undefined field vanishes from the serialised
+        // payload, so the model cannot tell "this lead has no engagements" from "we
+        // could not count them" -- a milder form of the very ambiguity this change
+        // exists to remove. `?? null` also normalises a partial count object.
         engagementSummary: {
-          total: engagementCount.total,
-          last7Days: engagementCount.last7Days,
-          totalAllMessages: engagementCount.totalAllMessages
+          total: engagementCount.total ?? null,
+          last7Days: engagementCount.last7Days ?? null,
+          totalAllMessages: engagementCount.totalAllMessages ?? null
         },
+        // Only when it actually failed. Stamping it unconditionally would train the
+        // model to ignore it, which is how `has_more` came to be ignored.
+        ...(engagementCountAvailable ? {} : { engagementCountUnavailable: true }),
         engagements: limitedEngagements.map((eng: any) => ({
           eventId: eng.eventId,
           eventType: eng.eventType,
@@ -16794,13 +17193,95 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
-          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+
+          // Meta declines to answer this in TWO different ways, and the first version of this
+          // fix only handled one of them. It returns an empty `event_stats` on some pixels, and
+          // on others the call THROWS — observed on a real production pixel, where the throw
+          // escaped before the fallback could run and the tool answered nothing at all, which
+          // is the exact defect it was written to remove.
+          //
+          // ⚠ An AUTH error is deliberately NOT caught here. A dead token is a fact the caller
+          // must see so it can prompt a re-authorisation; converting it into send-side coverage
+          // would turn "your credentials are gone" into a quiet, plausible-looking answer —
+          // the could-not-ask/received-nothing conflation this module exists to prevent.
+          let stats: any = {};
+          let statsError: string | undefined;
+          try {
+            stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          } catch (statsErr: any) {
+            if (statsErr?.isMetaAuthError) throw statsErr;
+            statsError = statsErr?.message || 'Meta returned an error for event_stats';
+            console.warn(
+              `[AgentMode] GET_MATCH_QUALITY: Meta errored on event_stats for dataset ${datasetId}: ${statsError}`,
+            );
+          }
+
+          // Meta's `event_stats` is the only EMQ surface that exists, and on live busy
+          // pixels it comes back EMPTY — probed on two pixels, two tokens, two Business
+          // Managers. Returning that verbatim answered `{}` to every customer who asked
+          // Emma for match quality, while the docs advertise "EMQ scores per event type".
+          //
+          // The Meta call is deliberately KEPT: if Meta ever starts serving this, the real
+          // number wins and nothing below runs. Only when it is empty do we answer with the
+          // half we can actually measure — what WE sent (ENG-926 §F).
+          const { isEmptyEventStats, computeCapiKeyCoverage } = await import('./metaCapiKeyCoverage');
+
+          // Only a SUCCESSFUL, non-empty read is Meta's own answer. If it errored we never
+          // saw one, so `statsError` short-circuits ahead of the emptiness test.
+          if (!statsError && !isEmptyEventStats(stats.event_stats)) {
+            return {
+              success: true,
+              message: `Event match quality for dataset ${stats.name || datasetId}`,
+              dataset_id: stats.id,
+              dataset_name: stats.name,
+              event_stats: stats.event_stats
+            };
+          }
+
+          const { queryCapiKeyCoverageRows } = await import('./metaCapiKeyCoverageDb');
+          const sendSide = await computeCapiKeyCoverage([String(datasetId)], 30, {
+            queryRows: (pixelId, oldestDate) => queryCapiKeyCoverageRows(pixelId, oldestDate),
+          });
+
+          // ⚠ A Meta ERROR stays an ERROR. An existing test caught the first version of this
+          // turning "Dataset not found" into `success: true` — which would have answered a
+          // question about a dataset that does not exist, with coverage for it. The caller
+          // still gets the send-side numbers, but the verdict reports what actually happened.
+          if (statsError) {
+            return {
+              success: false,
+              message:
+                `${statsError} — Meta could not serve Event Match Quality for dataset ` +
+                `${datasetId}. Send-side identity coverage is included below: it is what WE ` +
+                `attached to the conversions we sent, NOT Meta's match-quality score, and Meta ` +
+                `does not expose that number through any API.`,
+              dataset_id: datasetId,
+              meta_event_match_quality_available: false,
+              meta_event_stats_status: 'error',
+              meta_event_stats_error: statsError,
+              send_side_identity_coverage: sendSide
+            };
+          }
+
           return {
             success: true,
-            message: `Event match quality for dataset ${stats.name || datasetId}`,
-            dataset_id: stats.id,
+            // Worded so it can never be relayed as Meta's own score. The distinction is the
+            // whole point: this says what identity we ATTACHED, not what Meta MATCHED.
+            message:
+              `Meta reports no Event Match Quality for dataset ${stats.name || datasetId} — ` +
+              `its event_stats field is empty, which is what it returns for live pixels. ` +
+              `Reporting our own send-side identity coverage instead: of the conversions we ` +
+              `sent to this dataset in the last 30 days, the share that carried each identity ` +
+              `parameter. This is NOT Meta's match-quality score and should not be described ` +
+              `as one — Meta does not expose that number through any API.`,
+            dataset_id: stats.id || datasetId,
             dataset_name: stats.name,
-            event_stats: stats.event_stats
+            event_stats: stats.event_stats,
+            meta_event_match_quality_available: false,
+            // 'error' and 'empty' are DIFFERENT facts and are reported as such — collapsing
+            // them would let a Meta outage read as "Meta has no data for you".
+            meta_event_stats_status: 'empty',
+            send_side_identity_coverage: sendSide
           };
         }
         default:
@@ -21539,7 +22020,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: 'No search query provided.',
           query: query || '',
           results: [],
-          totalResults: 0,
+          returnedResults: 0,
+          hasMore: false,
         };
       }
 
@@ -21680,7 +22162,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           message: `No knowledge base results found for "${query}"`,
           query,
           results: [],
-          totalResults: 0
+          returnedResults: 0,
+          hasMore: false
         };
       }
 
@@ -21689,12 +22172,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // list can be several times larger than requested — cap it to avoid context bloat.
       const boundedResults = results.slice(0, limitedMaxResults);
 
+      // ENG-1207: never present a page as a total. `totalResults` was the worst
+      // instance of this in the file — a structured field NAMED "total" carrying a
+      // page count reads as authoritative in a way prose does not, so a model has
+      // no reason to doubt it. Renamed to `returnedResults`, which is what it
+      // always actually held, plus an explicit `hasMore`.
+      //
+      // Unlike `get_lead_engagements`, no honest total is available here and none
+      // is invented. Each source (Vertex, Drive, ClickUp docs/tasks) is collected
+      // up to `limitedMaxResults` INDEPENDENTLY before merging, so `results.length`
+      // is a floor rather than a count of what matched — a source that returned
+      // exactly its own cap may well have had more. `hasMore` therefore reports
+      // only what is certain: that the merge itself was cut. It can be false while
+      // more exists upstream, which is why the message says "raise max_results"
+      // rather than promising a specific remainder.
+      const hasMore = results.length > boundedResults.length;
       return {
         success: true,
-        message: `Found ${boundedResults.length} knowledge base results for "${query}"`,
+        message: hasMore
+          ? `Showing the first ${boundedResults.length} knowledge base results for "${query}" — raise max_results to see more.`
+          : `Found ${boundedResults.length} knowledge base results for "${query}"`,
         query,
         results: boundedResults,
-        totalResults: boundedResults.length
+        returnedResults: boundedResults.length,
+        hasMore
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -22758,8 +23259,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Create as a standalone doc at workspace root
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      // Create as a standalone doc at workspace root, then attach the content as its
+      // first page. ClickUp's doc-create endpoint has no `content` param — content
+      // must be added via a separate page-create call, mirroring the parentDocId branch above.
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name);
+      try {
+        await createClickUpPageInDoc(clickUpToken, workspaceId, doc.id, name, content);
+      } catch (pageError) {
+        // The doc itself already exists in ClickUp at this point. Reporting a hard
+        // failure would risk the caller retrying and creating a second, duplicate
+        // empty doc — report partial success with the doc id instead.
+        console.error('AgentMode: Created ClickUp doc but failed to add its content page:', pageError);
+        return {
+          success: true,
+          message: `Created ClickUp document "${name}" in workspace "${workspace.name}", but failed to save its content: ${pageError instanceof Error ? pageError.message : 'Unknown error'}. Retry by calling write_clickup_doc with parent_doc_id="${doc.id}" to add the content as a page.`,
+          docId: doc.id,
+        };
+      }
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
@@ -31732,19 +32248,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      // Check if the account exists first
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const allAccounts = await getAccountsByUserId(userId);
-      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
-      if (!matchingAccount) {
+      // ENG-1385: existence must be org-shared-aware (resolveAccessibleAccount),
+      // not a plain per-caller lookup — a company page list_connected_accounts
+      // reports as active can be owned by a teammate and shared with the org.
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
+      // getPostsForUser does its own internal account lookup — it must be handed
+      // the account's real owner, not the caller, or it re-derives nothing for a
+      // teammate-owned account. Also matches every adapter call below needing the
+      // owner's id for token lookup/refresh, same as loadConnectedAccountMetrics.
       const { getPostsForUser } = await import('./socialPostsService');
-      const result = await getPostsForUser(userId, {
+      const result = await getPostsForUser(ownerUserId, {
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
@@ -31781,8 +32302,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // connected and healthy), so this must NOT render as a tool "failure" in
       // the UI. The message leads with what AgentWeb DOES (positive, ownership
       // framing) so the model doesn't present this as a weakness/"limitation".
-      const accountType = (matchingAccount.config as any)?.account_type;
-      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+      const accountType = (account.config as any)?.account_type;
+      if (result.posts.length === 0 && account.platform === 'linkedin' && accountType === 'personal') {
         return {
           success: true,
           organicReadUnsupported: true,
@@ -34243,7 +34764,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     action: string,
     override: boolean,
     sessionId?: string,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
@@ -34265,7 +34786,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     newFinalUrls: Array<string | undefined>,
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     if (campaignStatus !== 'ENABLED') return { proceed: true };
     const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
     if (urls.length === 0) return { proceed: true };
@@ -34284,15 +34805,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     override: boolean,
     sessionId: string | undefined,
     finalUrls: string[],
-  ): Promise<{ proceed: boolean; blockResult?: any }> {
+  ): Promise<{ proceed: boolean; blockResult?: any; warning?: string }> {
     const gate = await preflightTrackingGate(finalUrls);
     const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
     if (gate.ok) {
+      /*
+       * ENG-1358: measurable, but nothing on the page proves an Ads conversion can be
+       * recorded — only a GTM container or a GA4 property. Recorded under its own outcome
+       * so the run history distinguishes "verified" from "we could not tell", and
+       * returned so the caller surfaces it instead of the gate quietly swallowing it.
+       *
+       * A warning that is computed and discarded is the same as no warning at all, which
+       * is exactly how the AC1 wiring gap survived 111 green tests.
+       */
+      const warned = (gate.warnings?.length ?? 0) > 0;
       await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
-        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+        customerId, campaignResourceName, action,
+        outcome: warned ? 'passed_with_warning' : 'passed',
+        urlResults, checkedAt: new Date().toISOString(),
       });
-      return { proceed: true };
+      return warned ? { proceed: true, warning: gate.message } : { proceed: true };
     }
 
     if (override) {
@@ -34319,7 +34852,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY' | 'CONVERSION_ACTION' | 'OFFLINE_CONVERSION';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -34365,8 +34898,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
           const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
           if (!gate.proceed) return gate.blockResult;
+          const resumeTrackingWarning = gate.warning;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
-          return { success: true, message: 'Campaign resumed' };
+          // Relayed, not swallowed: the launch is permitted, but the operator has to be
+          // told the page proves only that SOME Google tag is present (ENG-1358).
+          return { success: true, message: 'Campaign resumed', ...(resumeTrackingWarning ? { trackingWarning: resumeTrackingWarning } : {}) };
         }
         if (action === 'REMOVE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for REMOVE action' };
@@ -34403,10 +34939,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          let trackingWarning: string | undefined;
           // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
           if (args.status === 'ENABLED') {
             const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
             if (!gate.proceed) return gate.blockResult;
+            trackingWarning = gate.warning;
           }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
@@ -34419,7 +34957,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrlSuffix: args.final_url_suffix,
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
-          return { success: true, message: 'Campaign updated' };
+          // Same relay as RESUME: permitted, but the operator is told what could not be
+          // verified rather than reading a bare success (ENG-1358).
+          return { success: true, message: 'Campaign updated', ...(trackingWarning ? { trackingWarning } : {}) };
         }
         if (action === 'ADD_PROXIMITY') {
           if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
@@ -34443,6 +34983,146 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
           await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
           return { success: true, message: 'Campaign criterion removed' };
+        }
+      }
+
+      // CONVERSION_ACTION (ENG-1322). CREATE / LIST / UPDATE only — REMOVE is
+      // deliberately absent (Harsha, ENG-1329): it severs historical attribution in
+      // the customer's account and is the one operation we cannot undo from our
+      // side. Pausing via UPDATE covers what an operator actually needs.
+      if (entity_type === 'OFFLINE_CONVERSION') {
+        if (action !== 'UPLOAD') {
+          return { success: false, error: `OFFLINE_CONVERSION supports UPLOAD only, not ${action}.` };
+        }
+        if (!args.gclid || !args.conversion_action_resource_name || !args.conversion_at) {
+          return {
+            success: false,
+            error: 'gclid, conversion_action_resource_name and conversion_at are all required. '
+              + 'conversion_at is when the conversion HAPPENED (ISO 8601), not when you noticed it — '
+              + 'Google attributes it to that moment.',
+          };
+        }
+        const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
+        /*
+         * The account's own time zone, read from Google rather than assumed. Google
+         * interprets the timestamp in it, so guessing UTC would silently shift every
+         * conversion by the account's real offset — and the only symptom is conversions
+         * landing on the wrong day, which nobody reads as a bug.
+         */
+        const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
+        let conversion: Record<string, unknown>;
+        try {
+          conversion = buildClickConversion({
+            gclid: args.gclid,
+            conversionActionResourceName: args.conversion_action_resource_name,
+            conversionAt: new Date(args.conversion_at),
+            timeZone: tz,
+            value: args.conversion_value,
+            currencyCode: args.currency_code,
+            orderId: args.order_id,
+          });
+        } catch (err: any) {
+          // Refused locally, before the network. An upload runs from a background sweep
+          // with nobody watching, so a rejected batch surfaces days later as "conversions
+          // never appeared".
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+        const out = await googleAdsService.uploadClickConversions(
+          userId, customer_id, [conversion], { validateOnly: args.validate_only === true },
+        );
+        return {
+          success: out.failures.length === 0,
+          validateOnly: args.validate_only === true,
+          uploaded: out.uploaded,
+          failures: out.failures,
+          conversion,
+          ...(out.failures.length > 0
+            ? { error: out.failures.map((f) => `row ${f.index}: ${f.errorCode ?? ''} ${f.message}`.trim()).join('; ') }
+            : {}),
+        };
+      }
+
+      if (entity_type === 'CONVERSION_ACTION') {
+        if (action === 'LIST') {
+          const conversionActions = await googleAdsService.listConversionActions(userId, customer_id);
+          return { success: true, conversionActions };
+        }
+        if (action === 'CREATE') {
+          // counting_type is NOT defaulted here — the service refuses an absent one
+          // with a message naming both options and what choosing wrong costs.
+          const created = await googleAdsService.createConversionAction(userId, customer_id, {
+            name: args.name,
+            category: args.category,
+            countingType: args.counting_type,
+            status: args.status,
+            primaryForGoal: args.primary_for_goal,
+            clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+          });
+          return {
+            success: true,
+            conversionActionResourceName: created.resourceName,
+            // The pair the page actually needs — a resource name cannot be installed.
+            tag: created.tag,
+            tagUnavailable: created.tag
+              ? undefined
+              : 'Google has not generated tag snippets for this action yet. Re-run CONVERSION_ACTION LIST shortly to read the AW-<id>/<label> pair.',
+            stored: created.stored,
+            drift: created.drift,
+            driftWarning: created.drift.length > 0
+              ? `Google stored ${created.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'UPDATE') {
+          const updated = await googleAdsService.updateConversionAction(
+            userId, customer_id, args.conversion_action_resource_name, {
+              name: args.name,
+              status: args.status,
+              category: args.category,
+              countingType: args.counting_type,
+              primaryForGoal: args.primary_for_goal,
+              clickThroughLookbackWindowDays: args.click_through_lookback_window_days,
+            });
+          return {
+            success: true,
+            conversionActionResourceName: updated.resourceName,
+            stored: updated.stored,
+            drift: updated.drift,
+            driftWarning: updated.drift.length > 0
+              ? `Google stored ${updated.drift.length} field(s) differently from what was requested — see drift.`
+              : undefined,
+          };
+        }
+        if (action === 'REMOVE') {
+          if (!args.conversion_action_resource_name) {
+            return { success: false, error: 'conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.' };
+          }
+          /*
+           * Permanent and not re-enableable, so it goes through an explicit confirmation —
+           * the follow-up shape ENG-1329 anticipated ("if REMOVE is needed later, it's a
+           * small additive follow-up with its own explicit confirmation step").
+           *
+           * The message states what removal ACTUALLY does. The previous wording said it
+           * "severs historical attribution", which is not true and would talk someone out
+           * of a safe operation: Google models this as a soft state — the action stops
+           * recording, and conversions already recorded stay in reporting, exactly as a
+           * REMOVED campaign still returns its historical metrics.
+           */
+          if (args.confirm_conversion_action_removal !== true) {
+            return {
+              success: false,
+              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
+                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
+                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
+                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+            };
+          }
+          await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
+          return {
+            success: true,
+            message: `Conversion action removed. It has stopped recording and cannot be re-enabled; `
+              + `conversions it already recorded remain in reporting.`,
+          };
         }
       }
 
