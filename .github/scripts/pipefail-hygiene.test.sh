@@ -2,6 +2,9 @@
 #
 # ENG-1412: no script may pipe into a reader that exits early.
 #
+# Kept byte-identical in agentweb and agentweb-customer-portal, which share
+# eb-deploy.sh. Change it in one repo and copy it to the other.
+#
 #   bash .github/scripts/pipefail-hygiene.test.sh
 #
 # Why this is a test and not a review habit
@@ -61,6 +64,45 @@ fail() {
 
 # A reader that stops before its input does. `grep -q` in any flag order
 # (-q, -qF, -Fxq, -qiE ...), and `head` in any form.
+# A pipeline is not a line. Shell continues one across a newline after a
+# trailing `\` and — with no backslash at all — after a trailing `|`:
+#
+#     printf '%s' "${content}" |
+#       grep -qF "${needle}"
+#
+# Matching physical lines misses that form completely (raised by CodeRabbit on
+# #2530/#1061). Checked both continuation styles rather than assuming: the
+# backslash form was already caught, because its second line begins with
+# `| grep -qF` and matches on its own. The pipe-at-end-of-line form was not.
+#
+# So join continuations into logical lines first, keeping the line number of
+# where each STARTS so a failure still points somewhere useful. Comments are
+# never joined: `#` ends at the newline, and gluing one to the line below would
+# invent a pipeline that does not exist.
+logical_lines() {
+  awk '
+    {
+      line = $0
+      sub(/[[:space:]]+$/, "", line)
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed ~ /^#/) {
+        if (buf != "") { print start ":" buf; buf = "" }
+        print NR ":" line
+        next
+      }
+      if (buf == "") start = NR
+      cont = (line ~ /\\$/) || (line ~ /\|$/)
+      sub(/\\$/, "", line)
+      buf = (buf == "" ? line : buf " " line)
+      if (cont) next
+      print start ":" buf
+      buf = ""
+    }
+    END { if (buf != "") print start ":" buf }
+  ' "$1"
+}
+
 # Validated against 12 real lines from this directory, matching and
 # non-matching alike. Note `-[a-zA-Z]*q[a-zA-Z]*`: the q is not necessarily the
 # LAST flag letter — `-qF`, `-qiE` and `-Fxq` all appear in this repo, and an
@@ -79,9 +121,10 @@ for script in "${SCRIPT_DIR}"/*.sh; do
 
   # Strip comment-only lines so prose describing the bug does not trip it, and
   # allow an explicit `|| true` as a documented tolerance.
-  offenders="$(grep -nE "${EARLY_EXIT_READER}" "${script}" \
+  offenders="$(logical_lines "${script}" \
     | grep -vE '^[0-9]+:[[:space:]]*#' \
     | grep -vE '\|\|[[:space:]]*true[[:space:]]*\)?[[:space:]]*$' \
+    | grep -E "${EARLY_EXIT_READER}" \
     || true)"
 
   if [ -z "${offenders}" ]; then
@@ -105,16 +148,22 @@ set -euo pipefail
 if printf '%s' "${content}" | grep -qF "${needle}"; then :; fi
 if printf '%s\n' "${x}" | grep -Fxq "${y}"; then :; fi
 v="$(printf '%s\n' "${x}" | head -n 1)"
+printf '%s' "${content}" \
+  | grep -qiE "${needle}"
+printf '%s' "${content}" |
+  grep -qF "${needle}"
 PROBE
-n_flagged="$(grep -cE "${EARLY_EXIT_READER}" "${probe}" || true)"
-if [ "${n_flagged}" = "3" ]; then
+n_flagged="$(logical_lines "${probe}" | grep -cE "${EARLY_EXIT_READER}" || true)"
+if [ "${n_flagged}" = "5" ]; then
   pass "the rule actually detects the shape it exists to ban"
 else
-  fail "the detector flagged ${n_flagged} of 3 known-bad lines." \
+  fail "the detector flagged ${n_flagged} of 5 known-bad pipelines." \
        "The probe carries -qF, -Fxq and 'head -n 1' precisely because an" \
        "earlier expression anchored the q at the end of the flag group and" \
        "matched none of them, reporting every file clean. A detector that" \
-       "cannot fail is the same thing as no detector."
+       "cannot fail is the same thing as no detector. The last two are" \
+       "split across lines — one by backslash, one by a trailing pipe — and" \
+       "the second escaped the detector entirely before normalisation."
 fi
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
