@@ -7,6 +7,7 @@ import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
   assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
   describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
@@ -454,7 +455,7 @@ export class GoogleAdsService {
       // and treating it as "omitted" would silently create an ENABLED action off a request
       // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
       // and inconsistent with updateConversionAction, which validates every defined status.
-      status: params.status === undefined ? 'ENABLED' : assertConversionActionStatus(params.status),
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
@@ -505,6 +506,17 @@ export class GoogleAdsService {
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
     if (params.status !== undefined) {
       const status = assertConversionActionStatus(params.status);
+      // status=REMOVED reaches the same end as the REMOVE operation, and REMOVE carries the
+      // confirmation gate. Route it there rather than letting UPDATE be an unconfirmed
+      // back door to the same irreversible change.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'To stop a conversion action recording, use CONVERSION_ACTION REMOVE with '
+          + 'confirm_conversion_action_removal=true rather than UPDATE status=REMOVED — the '
+          + 'change is permanent and cannot be re-enabled, so it goes through the confirmation '
+          + 'step. Conversions already recorded stay in your reports either way.',
+        );
+      }
       update.status = status; updateMask.push('status'); requested.status = status;
     }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
@@ -531,6 +543,26 @@ export class GoogleAdsService {
 
     const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
     return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
+  }
+
+  /**
+   * Retire a conversion action. Google models this as a soft state, not a delete: the
+   * action stops recording, and conversions it already recorded stay in reporting — the
+   * same way a REMOVED campaign still returns its historical metrics.
+   *
+   * Scope note: ENG-1329 deferred this, on the stated basis that removal "severs historical
+   * attribution". The end-to-end run showed that premise is only half right — it cannot be
+   * undone, but nothing already attributed is lost — and that HIDDEN, the alternative every
+   * earlier message recommended, cannot be set through the API at all. That left no working
+   * retire path, which is the "if REMOVE is needed later" case that decision anticipated.
+   *
+   * The caller-facing confirmation lives in the handler, not here, so this stays a plain
+   * service method like removeBudget/removeCampaign.
+   */
+  async removeConversionAction(userId: string, customerId: string, resourceName: string): Promise<void> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────

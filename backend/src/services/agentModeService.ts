@@ -17050,13 +17050,95 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
         case 'GET_MATCH_QUALITY': {
           const datasetId = params.dataset_id;
-          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+
+          // Meta declines to answer this in TWO different ways, and the first version of this
+          // fix only handled one of them. It returns an empty `event_stats` on some pixels, and
+          // on others the call THROWS — observed on a real production pixel, where the throw
+          // escaped before the fallback could run and the tool answered nothing at all, which
+          // is the exact defect it was written to remove.
+          //
+          // ⚠ An AUTH error is deliberately NOT caught here. A dead token is a fact the caller
+          // must see so it can prompt a re-authorisation; converting it into send-side coverage
+          // would turn "your credentials are gone" into a quiet, plausible-looking answer —
+          // the could-not-ask/received-nothing conflation this module exists to prevent.
+          let stats: any = {};
+          let statsError: string | undefined;
+          try {
+            stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          } catch (statsErr: any) {
+            if (statsErr?.isMetaAuthError) throw statsErr;
+            statsError = statsErr?.message || 'Meta returned an error for event_stats';
+            console.warn(
+              `[AgentMode] GET_MATCH_QUALITY: Meta errored on event_stats for dataset ${datasetId}: ${statsError}`,
+            );
+          }
+
+          // Meta's `event_stats` is the only EMQ surface that exists, and on live busy
+          // pixels it comes back EMPTY — probed on two pixels, two tokens, two Business
+          // Managers. Returning that verbatim answered `{}` to every customer who asked
+          // Emma for match quality, while the docs advertise "EMQ scores per event type".
+          //
+          // The Meta call is deliberately KEPT: if Meta ever starts serving this, the real
+          // number wins and nothing below runs. Only when it is empty do we answer with the
+          // half we can actually measure — what WE sent (ENG-926 §F).
+          const { isEmptyEventStats, computeCapiKeyCoverage } = await import('./metaCapiKeyCoverage');
+
+          // Only a SUCCESSFUL, non-empty read is Meta's own answer. If it errored we never
+          // saw one, so `statsError` short-circuits ahead of the emptiness test.
+          if (!statsError && !isEmptyEventStats(stats.event_stats)) {
+            return {
+              success: true,
+              message: `Event match quality for dataset ${stats.name || datasetId}`,
+              dataset_id: stats.id,
+              dataset_name: stats.name,
+              event_stats: stats.event_stats
+            };
+          }
+
+          const { queryCapiKeyCoverageRows } = await import('./metaCapiKeyCoverageDb');
+          const sendSide = await computeCapiKeyCoverage([String(datasetId)], 30, {
+            queryRows: (pixelId, oldestDate) => queryCapiKeyCoverageRows(pixelId, oldestDate),
+          });
+
+          // ⚠ A Meta ERROR stays an ERROR. An existing test caught the first version of this
+          // turning "Dataset not found" into `success: true` — which would have answered a
+          // question about a dataset that does not exist, with coverage for it. The caller
+          // still gets the send-side numbers, but the verdict reports what actually happened.
+          if (statsError) {
+            return {
+              success: false,
+              message:
+                `${statsError} — Meta could not serve Event Match Quality for dataset ` +
+                `${datasetId}. Send-side identity coverage is included below: it is what WE ` +
+                `attached to the conversions we sent, NOT Meta's match-quality score, and Meta ` +
+                `does not expose that number through any API.`,
+              dataset_id: datasetId,
+              meta_event_match_quality_available: false,
+              meta_event_stats_status: 'error',
+              meta_event_stats_error: statsError,
+              send_side_identity_coverage: sendSide
+            };
+          }
+
           return {
             success: true,
-            message: `Event match quality for dataset ${stats.name || datasetId}`,
-            dataset_id: stats.id,
+            // Worded so it can never be relayed as Meta's own score. The distinction is the
+            // whole point: this says what identity we ATTACHED, not what Meta MATCHED.
+            message:
+              `Meta reports no Event Match Quality for dataset ${stats.name || datasetId} — ` +
+              `its event_stats field is empty, which is what it returns for live pixels. ` +
+              `Reporting our own send-side identity coverage instead: of the conversions we ` +
+              `sent to this dataset in the last 30 days, the share that carried each identity ` +
+              `parameter. This is NOT Meta's match-quality score and should not be described ` +
+              `as one — Meta does not expose that number through any API.`,
+            dataset_id: stats.id || datasetId,
             dataset_name: stats.name,
-            event_stats: stats.event_stats
+            event_stats: stats.event_stats,
+            meta_event_match_quality_available: false,
+            // 'error' and 'empty' are DIFFERENT facts and are reported as such — collapsing
+            // them would let a Meta outage read as "Meta has no data for you".
+            meta_event_stats_status: 'empty',
+            send_side_identity_coverage: sendSide
           };
         }
         default:
@@ -23014,8 +23096,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Create as a standalone doc at workspace root
-      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+      // Create as a standalone doc at workspace root, then attach the content as its
+      // first page. ClickUp's doc-create endpoint has no `content` param — content
+      // must be added via a separate page-create call, mirroring the parentDocId branch above.
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name);
+      try {
+        await createClickUpPageInDoc(clickUpToken, workspaceId, doc.id, name, content);
+      } catch (pageError) {
+        // The doc itself already exists in ClickUp at this point. Reporting a hard
+        // failure would risk the caller retrying and creating a second, duplicate
+        // empty doc — report partial success with the doc id instead.
+        console.error('AgentMode: Created ClickUp doc but failed to add its content page:', pageError);
+        return {
+          success: true,
+          message: `Created ClickUp document "${name}" in workspace "${workspace.name}", but failed to save its content: ${pageError instanceof Error ? pageError.message : 'Unknown error'}. Retry by calling write_clickup_doc with parent_doc_id="${doc.id}" to add the content as a page.`,
+          docId: doc.id,
+        };
+      }
       return {
         success: true,
         message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
@@ -34758,11 +34855,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
         if (action === 'REMOVE') {
+          if (!args.conversion_action_resource_name) {
+            return { success: false, error: 'conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.' };
+          }
+          /*
+           * Permanent and not re-enableable, so it goes through an explicit confirmation —
+           * the follow-up shape ENG-1329 anticipated ("if REMOVE is needed later, it's a
+           * small additive follow-up with its own explicit confirmation step").
+           *
+           * The message states what removal ACTUALLY does. The previous wording said it
+           * "severs historical attribution", which is not true and would talk someone out
+           * of a safe operation: Google models this as a soft state — the action stops
+           * recording, and conversions already recorded stay in reporting, exactly as a
+           * REMOVED campaign still returns its historical metrics.
+           */
+          if (args.confirm_conversion_action_removal !== true) {
+            return {
+              success: false,
+              error: 'CONVERSION_ACTION REMOVE stops this conversion action recording, permanently — '
+                + 'it cannot be re-enabled afterwards, and any campaign bidding toward it as a goal '
+                + 'will stop counting it. Conversions already recorded stay in your reports. Confirm '
+                + 'with the user, then retry with confirm_conversion_action_removal=true.',
+            };
+          }
+          await googleAdsService.removeConversionAction(userId, customer_id, args.conversion_action_resource_name);
           return {
-            success: false,
-            error: 'CONVERSION_ACTION REMOVE is not supported. Removing a conversion action severs '
-              + 'historical attribution in the account and cannot be undone. To stop an action from '
-              + 'recording, use CONVERSION_ACTION UPDATE with status=PAUSED instead.',
+            success: true,
+            message: `Conversion action removed. It has stopped recording and cannot be re-enabled; `
+              + `conversions it already recorded remain in reporting.`,
           };
         }
       }

@@ -39,6 +39,9 @@ export function isWorkerShutdownError(error: unknown): boolean {
   if (message === 'Worker shutdown') return true;
   // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
   if (message.startsWith('Worker process exited with code')) return true;
+  // Dispatch raced a graceful-shutdown drain window (deploy/restart) — same
+  // deploy-timing class as the two patterns above (ENG-1166).
+  if (message === 'Worker is draining — no new requests accepted') return true;
   return false;
 }
 
