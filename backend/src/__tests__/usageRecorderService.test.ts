@@ -351,12 +351,12 @@ describe('usageRecorderService', () => {
 
   describe('computeCostMicroUsd', () => {
     it('computes token cost in integer microdollars', () => {
-      // gpt-5-chat-2: in $1.25/M, out $10/M — was $2.5/M in ("ported from
-      // estimateCost", stale); corrected 2026-08-19 against OpenAI's own
-      // pricing docs for the model this deployment alias actually routes to
-      // (gpt-5-chat-latest). See llmPricing.ts MODEL_PRICING.
-      expect(computeCostMicroUsd('gpt-5-chat-2', 1_000_000, 100_000)).toBe(
-        1_250_000 + 1_000_000
+      // gpt-5.5: in $5/M, out $30/M. See llmPricing.ts MODEL_PRICING.
+      // (Was pinned on gpt-5-chat-2 — removed from the registry 2026-08-19
+      // along with its pricing entry, as part of migrating off the Rui-owned
+      // Azure resource; see agentModeService.ts's LEGACY_MODEL_ALIASES comment.)
+      expect(computeCostMicroUsd('gpt-5.5', 1_000_000, 100_000)).toBe(
+        5_000_000 + 3_000_000
       );
     });
 
