@@ -24,11 +24,17 @@
  * before the fix. DO NOT "simplify" it to match the new implementation — its
  * entire purpose is to be an independent oracle of the prior behavior.
  *
- * ONE deliberate divergence has been folded into the oracle since: ENG-940's
- * follow-up changed which results the tool-content preserve window protects
- * (the N most recent AT-RISK results, not the N most recent results outright).
- * That is an intended behavior change, not drift, so the oracle encodes it too —
- * it is marked at the point of use. Everything else must still match byte for
+ * TWO deliberate divergences have been folded into the oracle since:
+ *  - ENG-940's follow-up changed which results the tool-content preserve window
+ *    protects (the N most recent AT-RISK results, not the N most recent results
+ *    outright).
+ *  - ENG-1310 changed the compressed-preview TEXT itself: the placeholder now
+ *    explicitly tells the model the preview is not a verified source and names
+ *    the recovery path (re-read via read_tool_response/search_tool_response, or
+ *    re-run the source tool), instead of a bare "[Tool: name — preview...]" that
+ *    silently disappeared a few turns later with nothing pointing back at it.
+ * Both are intended behavior changes, not drift, so the oracle encodes them too —
+ * each is marked at the point of use. Everything else must still match byte for
  * byte, and the performance and splice/reorder guarantees are unaffected.
  */
 
@@ -95,8 +101,16 @@ function goldenTrim(
     if (msg.role === 'tool' && !atRiskPreserveSet.has(idx) && typeof msg.content === 'string') {
       const limit = REF_LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
       if (msg.content.length > limit) {
+        // ENG-1310 divergence: none of buildSyntheticSession's fixtures carry a
+        // "[Full response stored at S3 key: …]" header, so the S3-ref branch of the
+        // real function is never exercised here — this mirrors production's
+        // no-ref path exactly (see agentModeService.ts's trimToolMessagesForContext).
         const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-        return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+        const recoveryHint = `re-run ${msg.name} if you need the full result`;
+        return {
+          ...msg,
+          content: `[Tool: ${msg.name} — compressed for context; this preview is NOT a verified source — do not restate any number or figure from it, or from your own earlier reply, as confirmed; ${recoveryHint}. preview: ${preview}...]`,
+        };
       }
     }
     if (msg.role === 'assistant' && oldAssistantIndices.has(idx) && msg.tool_calls?.length) {

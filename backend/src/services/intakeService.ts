@@ -582,20 +582,17 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     addIssueComment,
     createInternalLinearIssue,
     escalateIssue,
-    raiseIssueTriage,
   } = await import('./linearService');
   const executionRoute = p.executionRoute ?? 'human-triage';
   const route =
     executionRoute === 'autofix'
       ? {
           labels: ['Bug', 'autofix'],
-          removeLabels: ['Needs PM'],
           assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
           stateName: 'Todo',
         }
       : {
           labels: ['Bug', 'Needs PM'],
-          removeLabels: ['autofix'],
           assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6', // Harsha
           stateName: 'Todo',
         };
@@ -651,18 +648,12 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
         console.warn('[intake] auto alert escalation failed:', e instanceof Error ? e.message : e);
       }
     }
-    if (routeLabels.length > 0) {
-      // Routing metadata is part of successful intake, not best-effort
-      // decoration. Propagate failures so the producer retries instead of
-      // silently leaving the canonical in the wrong execution queue.
-      await raiseIssueTriage(match.issueId, {
-        addLabelNames: routeLabels,
-        removeLabelNames: route.removeLabels,
-        assigneeId: route.assigneeId,
-        ...(priority ? { priority } : {}),
-        settleStateName: route.stateName,
-      });
-    }
+    // ENG-1285: a recurrence must NOT re-apply the first-file route (labels, assignee, state).
+    // That route is only correct at file time — once a canonical exists, PM/human triage owns its
+    // labels/assignee/state, and every re-fire of a recurring alert (this rail fires hourly) was
+    // silently reverting that routing decision by re-adding "Needs PM" et al. on every occurrence
+    // comment. Priority escalation on a strictly more severe re-fire is still allowed above
+    // (escalateIssue is raise-only and a distinct, intentional ENG-358 behavior); routing is not.
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
   const body = [

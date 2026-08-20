@@ -433,8 +433,15 @@ function pixelIds(mechanisms: string[]): string[] {
   return mechanisms.map(m => m.replace(/^PIXEL:/, ''));
 }
 
+/**
+ * The guarded fetcher this gate uses when a caller injects nothing.
+ *
+ * EXPORTED so §G's per-run URL cache can wrap THIS rather than substitute its own — the
+ * redirect follower and `assertPublicHostname` SSRF guard must stay in the path. A cache that
+ * called `axios` directly would be a quiet way to lose both.
+ */
 /* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
-async function defaultFetchHtml(url: string): Promise<string> {
+export async function defaultFetchHtml(url: string): Promise<string> {
   const MAX_HTML_BYTES = 5 * 1024 * 1024;
   return fetchHtmlFollowingRedirects(url, {
     get: (u: string) =>

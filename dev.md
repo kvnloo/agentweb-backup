@@ -1,3 +1,195 @@
+## ENG-1371: deleting a retired gate is easy; the things quietly leaning on it are not (2026-08-19)
+
+Greptile was dropped as a vendor. Its app had already stopped posting — the `Greptile Review`
+check-run is absent on every PR opened after 2026-08-19 ~10:00Z — but all of its code was still on
+`main`, so every run still paid for a 600s poll that could no longer succeed. This removed the
+`greptile-review` job, seven scripts and `greptile.json`. Findings, because almost none of the work
+was the deletion:
+
+- **The gate's failure mode had already inverted, and the error message lied.** `greptile-gate.sh`
+  returns `unavailable` (exit 75, which passes under ENG-1277's policy) only when no verdict exists
+  for **any** commit on the PR. If a stale pre-cutoff review existed, `greptile_alive` was set and
+  the timeout was classified `refused` (exit 1) instead, printing *"Greptile reviewed this head and
+  it did not clear the bar — a real finding, still blocking."* Greptile had not reviewed that head
+  at all. In one captured run the stale review it was ignoring was **5/5**. The `greptile_alive`
+  guard was correct when written and was silently invalidated by ENG-1282 setting
+  `triggerOnUpdates: false` — after that, every PR with one review and one later push hit the false
+  branch. **Two changes that are each individually correct can compose into a lie.**
+- **5 of the 6 open PRs failing `merge-evidence.sh` were failing on this and nothing else**
+  (#2485, #2481, #2399, #2376, #2417). The queue was blocked by a vendor we no longer used.
+- **`merge-evidence.sh` was leaning on the deleted job in a way nothing would have caught.** It used
+  `Require Greptile Review` as its draft discriminator, matched by exact name and **fail-closed on
+  absence** — so a plain `git rm` of the job would have turned every PR into NO_EVIDENCE, disabling
+  the merge gate CLAUDE.md mandates. The replacement was verified before the switch rather than
+  after: both discriminators were run against all 18 open PRs and returned **identical verdicts on
+  18/18**. `MERGE_EVIDENCE_DRAFT_JOB` already existed as an override, so that A/B needed no code
+  change at all — a seam built for renames paid for itself two months later.
+- **`detect-changes` is a strictly better discriminator than the job it replaced.** `greptile-review`
+  needed `always() &&` in front of its draft check because it declared
+  `needs: [detect-changes, backend-tests-a, backend-tests-b]`, and GitHub implicitly ANDs an `if:`
+  with `success()` when the expression names no status-check function — so a path-filtered skip
+  upstream could propagate into the discriminator. `detect-changes` is the root of the graph with no
+  `needs:` at all, so the bare draft check is exactly right. The invariant now asserts **both** the
+  `if:` and the absence of `needs:`.
+- **An invariant that greps for a vendor name goes vacuous the moment the vendor leaves.**
+  `merge-evidence.test.sh` asserted that backend-tests-a/b did not reference `greptile` in their
+  `needs`/`if`. With the job deleted that check could never fail again while appearing to pass —
+  the exact shape of a control that has quietly stopped working. It now asserts the positive
+  property instead: those jobs declare `needs: [detect-changes]` and nothing else, so a reviewer,
+  lint gate or approval job added in front of the suite fails in the PR that adds it.
+- **Renaming fixtures across a suite is not a `sed`.** The regression fixtures modelled two distinct
+  jobs — the discriminator and an ordinary second job that happened to be `Detect changed projects`.
+  A blanket rename collapsed both into one name and produced fixtures with the same job appearing
+  twice with contradictory conclusions; 7 tests went red for reasons unrelated to the change. The
+  ordinary job had to be moved out of the way first, then the discriminator promoted into the freed
+  name. The suite caught all of it, which is the point of it existing.
+- **dev.md already knew.** The ENG-754 entry recorded, on 2026-07-29, that *"`Require Greptile
+  Review` was not actually a required status check — branch protection on `main` required only
+  `Detect changed projects`."* That stayed true for three weeks while `tests.yml` asserted the
+  opposite in three separate comments and ENG-1320 based a vendor decision on it. **A fact recorded
+  once in a log does not propagate to the comments that contradict it.** Branch protection is now
+  being fixed under ENG-1373; the comments here were corrected with this change.
+- **Ride-alongs taken because the files were already open:** `dependabot-integrity-check.test.sh`
+  (20 assertions guarding the one genuinely security-relevant required check) existed but no job
+  ran it; the CLI `--testPathIgnorePatterns` *replaces* rather than extends `jest.config.js`,
+  silently re-including the opt-in twins suites; five jobs had no `timeout-minutes`, inheriting
+  GitHub's 360-minute default; and `eb-config-conflict`'s existing 5-minute ceiling turned out to
+  sit BELOW its own `fetch-depth: 0` checkout cost — it was killed at 4m59s on this very PR, having
+  survived only because the job is path-gated and had run 6 times in 197 runs without drawing the
+  tail. Auditing "jobs with no timeout" and not "jobs whose timeout is wrong" missed it.
+- **The one ride-along that had to be reverted, and why it is the most useful finding here.** Job
+  B's ignore list used `/__tests__/agentMode` while job A selects on `agentMode`, so 23 files ran
+  in BOTH backend jobs on every PR. Making the two lists exact complements looks like free money.
+  It is not: coverage is collected ONLY from `src/utils/**` and ONLY by job B, so **which tests run
+  in job B is what the coverage number measures**. Two of those 23 are
+  `src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`, whose targets sit
+  inside the coverage scope — and every other test touching those two modules is also
+  `agentMode`-named, so excluding the 23 sent both modules to zero. CI went red: branches
+  95.2% -> 93.99%, statements 98.35% -> 97.55%. Reverted, with the measurement recorded in
+  `tests.yml` so the next person does not rediscover it. **A test-selection change in a repo with a
+  coverage gate is a coverage change, whatever it looks like.** Deduplicating the split needs the
+  `collectCoverageFrom` scope decided first — ENG-1376.
+- **Both of my own errors were caught by CI, not by review or by me.** The coverage drop and the
+  timeout kill were each invisible to local suites (391 assertions, all green) because neither is
+  expressible as a script test — one needs the real Jest run, the other needs a real runner and a
+  real clone. The 5-minute timeout in particular had been latent for months. Local suites prove the
+  logic; only the real run prices it.
+
+## ENG-1309: fixing a "prompt bloat causes verbosity" regression without adding to the pile (2026-08-18)
+
+Fix for ENG-1306 (two customers, four sessions, quantified 2x completion-token growth since the
+Opus 5 default switch). Human-written behavioral contract (drafted by Fable from Ed Mongiovi's and
+Vince Magaline's own words, confirmed by Harsha on ENG-1305): yes/no questions get a yes/no first
+line; an explicit stated length is honored within ~20% on the first attempt; factual/config
+questions stay under ~150 words by default; the verified/unverified distinction becomes a compact
+per-claim tag, not two separate lists. Findings, because the shape generalizes:
+
+- **The contract itself said not to do the obvious thing.** ENG-1305's audit named the last two
+  "fix this failure mode" prompt additions (ENG-829, ENG-1187) as contributors to the very
+  regression being fixed here — each one grew the reply by adding a rule that had to be obeyed on
+  every turn. Bolting a third CRITICAL block on top of the same pile would be the identical move
+  that produced ENG-1306. So this PR's one new section (`## Answer Directness & Length`) is
+  offset by removing two already-proven-ineffective instructions it makes redundant: a generic
+  "keep responses concise but informative" bullet (dead weight — the customer complaints are
+  direct proof it was never followed) and a 7-line "Important formatting rules" numbered list that
+  had three separate rules all restating "minimal spacing" and a fourth restating "concise."
+  Net result: **+961 chars / +163 words** on the 66,893-char (now 67,854) `AGENT_MODE_SYSTEM_PROMPT`
+  constant — a real, disclosed increase (+1.4%), not zero, but roughly an order of magnitude
+  smaller than treating this as "just add another block" would have produced, and the new section
+  constrains *output shape* rather than adding another thing to check before answering — a
+  different failure mode than the additive pattern ENG-1305 flagged.
+
+- **Two instructions asking for opposite formats is worse than either alone.** The ENG-829 bullet
+  literally said "keep the two lists visibly separate" — the exact anti-pattern criterion 3 of this
+  ticket's own contract asks to fix. Adding a new "use a compact tag, never two lists" rule
+  *alongside* the old "keep two lists separate" rule would have left the model with two live,
+  contradictory formatting instructions for the same claim-labeling behavior — genuinely
+  underdetermined, and a worse outcome than not fixing it. The old bullet was edited in place
+  (same file, same PR) rather than left for a future cleanup; `agentModeSystemPrompt.answerDirectness.test.ts`
+  asserts the old phrase is gone, not just that the new one exists, specifically to catch a
+  reviewer or future edit reintroducing it as an "addition."
+
+- **The thinking-budget/model-config lever was deliberately not used here**, despite
+  `AGENT_MODE_MAX_OUTPUT_TOKENS` (`agentModeService.ts:197`, raised 12,384→32,000 on ENG-403,
+  07-21) and Bedrock's `ConverseCommand` having no thinking-budget cap (`agentModeService.ts` Claude
+  path, ~L2248) both being named as root-cause contributors in ENG-1305's audit, and Harsha's own
+  decision comment naming "length/thinking-budget config where available" as a preferred lever
+  over prompt prose. Reasons for staying prompt-only in *this* PR: (1) `AGENT_MODE_MAX_OUTPUT_TOKENS`
+  is a single global ceiling shared by every AgentMode feature, including ones that legitimately
+  need long output (GTM plans, audit reports, blog articles) — lowering it to fix short-answer
+  verbosity risks truncating unrelated legitimate long-form generation; a targeted fix needs a
+  per-request-shape cap, not a global one, which is a bigger design than this ticket's contract
+  asks for. (2) Adding a Bedrock `thinking` budget is a live-behavior change across every Opus 5
+  call in the product, not just the four named replay fixtures, and needs its own scoped
+  investigation/testing — Harsha's ENG-1305 decision comment frames ENG-1309 itself as "the fix"
+  (the harness contract), not as the vehicle for that separate lever. Flagging both here so a
+  follow-up isn't accidentally treated as novel: if the harness-only contract proves insufficient
+  once ENG-1314 unblocks real replay evidence, the next lever is a per-request output-length hint
+  derived from the new contract's own thresholds (e.g. cap `max_tokens` lower when no explicit
+  depth was requested), not a global constant change.
+
+- **The real behavioral evidence (replay against the four named production sessions) is
+  infrastructure-blocked, not skipped.** `loops/eval/agentModeReplayFixtures.ts` (ENG-1312,
+  already merged) is the deterministic char/word-threshold harness this contract's own criterion 4
+  calls for ("measured in characters/tokens, not judge score") — it already cites this ticket's
+  exact thresholds (`ENG-1309 criterion 1/2/3`) in `thresholdSource`, and already proves the
+  mechanism catches a regression using a synthetic `'x'.repeat(10524)` payload standing in for the
+  real "today 10,524 chars" figure from criterion 2. It runs on synthetic placeholder content
+  because the real transcript content is a data-exposure decision (ENG-1314), not a code decision —
+  see that module's own doc comment. This PR's tests therefore characterize the only surface a unit
+  test actually owns: that the system prompt *states* the contract in terms an LLM can follow
+  (same idiom `agentModeSystemPrompt.followExplicitDirection.test.ts` established for ENG-1311) —
+  pinned RED (absent) before this change, GREEN (present) after. `agentModeReplayFixtures.test.ts`
+  was re-run unchanged and stays green; this PR doesn't touch that module.
+
+## ENG-1312: the satisfaction judge's blind spot, and a real fixture is a data-exposure decision, not a code one (2026-08-17)
+
+Two customers both reported the judge rewarding exactly the behavior they
+were complaining about — a 20-page reply to a 2-page ask scored 4/5 with
+5/5/5 dimensions, and pushback against a direct instruction scored 5 for
+"excellent reasoning." Findings, because the shape generalizes:
+
+- **The judge only had 3 dimensions and none of them measured length,
+  instruction-following, or unnecessary caution.** `goalCompletion`/
+  `dataAccuracy`/`outputQuality` can all be genuinely high on a reply that is
+  simultaneously a regression — verbosity and permission-asking are
+  orthogonal to correctness. Added `concision`, `instructionCompliance`
+  (both 0-5), and `unnecessaryPermissionRequest` (boolean), plus a rubric
+  rule that pushback against a non-spend/non-publish instruction can't score
+  `outputQuality: 5` — see `VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE` in
+  `sessionScoringService.ts`.
+
+- **New rubric text must be APPENDED, never baked into the hardcoded
+  default.** Production carries a live `default-scoring-prompt` AW-Settings
+  override, and a custom `ScoringJudge.systemPrompt` is entirely
+  user-authored. Editing only `DEFAULT_SCORING_SYSTEM_PROMPT`'s literal text
+  would leave whatever prompt is *actually configured* blind to the new
+  dimensions — the same masking failure (ENG-392) that let this regression
+  hide for two weeks in the first place. Same pattern `NO_TASK_JUDGMENT_CLAUSE`
+  already uses; extended, not reinvented.
+
+- **"Replay fixtures with hard thresholds" sounds MOCKABLE and is, right up
+  until the fixture needs real content.** All five session IDs named in this
+  issue's own acceptance criteria (kept out of this file — see the Linear
+  issue text, not git) are real, existing production `AW-ChatSessions` rows —
+  verified read-only. The mechanism (`loops/eval/agentModeReplayFixtures.ts`)
+  is fully built and tested, but populating it with the REAL transcripts
+  means copying a real customer's verbatim conversation content into
+  permanently-committed, CI-gating git history, readable by every future
+  clone and by Argusoft's external contractors forever. That's a
+  data-exposure call under `autonomous-execution-and-merge.md`'s
+  database/data-plane gate ("a change that can... expose... existing stored
+  data"), not a code call — filed as ENG-1314 (blocks ENG-1312) with three
+  concrete options + a recommendation rather than decided unilaterally. The
+  lesson: "no live third party" and "no data-plane change" are necessary but
+  not sufficient for MOCKABLE — check whether the fixture DATA ITSELF is a
+  live customer's content before assuming the classification holds.
+  Separately (CodeRabbit, PR #2443): the real session IDs, customer/org
+  names, and quoted request text don't need to wait on that decision either
+  — they aren't the transcript content ENG-1314 is scoping, so
+  `agentModeReplayFixtures.ts`'s fixtures use neutral synthetic `id`/`label`
+  values instead, independent of how ENG-1314 resolves.
+
 ## ENG-973: the quota gate was one layer above what MCP actually calls (2026-08-08)
 
 `/api/emma/*` is 59 routes (now 60 counting a PATCH the source-level regex sweep missed) and none

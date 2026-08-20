@@ -42,6 +42,42 @@ beforeEach(() => {
   checkConversionDivergenceForUser.mockResolvedValue({ status: 'skipped' });
 });
 
+describe('metaTrackingMonitorCron — duplicate ad accounts (ENG-1326)', () => {
+  it('passes ONE shared set to every user, so an account is swept once per run', async () => {
+    // 21 production connection rows resolve to 15 distinct ad accounts. Without a set shared
+    // across users, each duplicate is a full second sweep and every counter double-counts.
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }, { userId: 'u3' }]);
+
+    await runMetaTrackingMonitor();
+
+    const sets = monitorUserTracking.mock.calls.map((c: any[]) => c[1]?.sweptAccountIds);
+    expect(sets).toHaveLength(3);
+    expect(sets[0]).toBeInstanceOf(Set);
+    // The SAME object, not three fresh ones — a per-user set would dedupe nothing.
+    expect(sets[1]).toBe(sets[0]);
+    expect(sets[2]).toBe(sets[0]);
+  });
+
+  it('aggregates the skipped-duplicate counter', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);
+    monitorUserTracking
+      .mockResolvedValueOnce(summary({ duplicateAccountsSkipped: 0 }))
+      .mockResolvedValueOnce(summary({ duplicateAccountsSkipped: 2 }));
+
+    const result = await runMetaTrackingMonitor();
+
+    expect(result.duplicateAccountsSkipped).toBe(2);
+  });
+
+  it('treats a summary without the field as 0, not NaN', async () => {
+    getAllUsers.mockResolvedValue([{ userId: 'u1' }]);
+    monitorUserTracking.mockResolvedValue(summary());
+    const result = await runMetaTrackingMonitor();
+    expect(result.duplicateAccountsSkipped).toBe(0);
+    expect(Number.isNaN(result.duplicateAccountsSkipped)).toBe(false);
+  });
+});
+
 describe('metaTrackingMonitorCron — §G destination counters', () => {
   it('aggregates destination counters across users', async () => {
     getAllUsers.mockResolvedValue([{ userId: 'u1' }, { userId: 'u2' }]);

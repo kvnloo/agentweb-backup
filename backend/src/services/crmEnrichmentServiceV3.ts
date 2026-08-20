@@ -1006,6 +1006,7 @@ export async function runEnrichment(
   const previewSamples: NonNullable<RunEnrichmentResult['preview']> = [];
   let processed = 0;
   let identityResolutionFailed = 0;
+  const skippedLeadIds: string[] = [];
   let apolloFailed = 0;
   let llmOrParseFailed = 0;
   let updateFailed = 0;
@@ -1085,6 +1086,7 @@ export async function runEnrichment(
       switch (outcome.failureCategory) {
         case 'identityResolution':
           identityResolutionFailed += 1;
+          if (skippedLeadIds.length <= 5000) skippedLeadIds.push(lead.leadId);
           continue;
         case 'llmOrParse':
           llmOrParseFailed += 1;
@@ -1209,9 +1211,11 @@ export async function runEnrichment(
     result.preview = previewSamples;
   }
 
-  const totalFailed =
-    identityResolutionFailed + llmOrParseFailed + updateFailed;
-  console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} durationMs=${result.durationMs}`);
+  // Identity misses are an expected, explainable outcome, not hard failures.
+  // Keep their diagnostic counter in failureBreakdown while exposing only
+  // provider/LLM/update failures through the legacy failedCount contract.
+  const totalFailed = llmOrParseFailed + updateFailed;
+  console.log(`[v3] runEnrichment DONE runId=${runId} processed=${processed} failed=${totalFailed} skipped=${identityResolutionFailed} durationMs=${result.durationMs}`);
   emitToRooms(completeEvent, {
     runId,
     listId: input.listId,
@@ -1225,7 +1229,7 @@ export async function runEnrichment(
 
   const attemptedLeadIds = leads.map((l: LeadRecord) => l.leadId);
 
-  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0)) {
+  if (input.mode !== 'preview' && (processed > 0 || totalFailed > 0 || identityResolutionFailed > 0)) {
     crmDb.createEnrichmentJobMeta({
       jobId: runId,
       listId: input.listId,
@@ -1236,11 +1240,15 @@ export async function runEnrichment(
       expiresAt: jobExpiresAt,
       processedCount: processed,
       failedCount: totalFailed,
-      skippedCount: 0,
+      skippedCount: identityResolutionFailed,
       ...(attemptedLeadIds.length <= 5000
         ? { attemptedLeadIds }
         : { leadsDeduplicationUnavailable: true }),
+      ...(skippedLeadIds.length <= 5000
+        ? { skippedLeadIds }
+        : { skippedDeduplicationUnavailable: true }),
       failureBreakdown: {
+        identityResolutionFailed,
         searchWebFailed: 0,
         linkedinFailed: apolloFailed,
         llmOrParseFailed,

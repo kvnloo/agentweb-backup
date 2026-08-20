@@ -2823,6 +2823,53 @@ export class MetaService {
         return { success: false, error: message, usage };
       }
 
+      // The ONLY record of what identity actually left this process, and the reason it exists
+      // is specific: Meta's `/stats?aggregation=match_keys` does NOT report `fbc` or `fbp`.
+      // Verified 2026-08-18 across three production pixels carrying real paid traffic and ~15
+      // distinct event types — zero occurrences of either, including on a lander proven to set
+      // both cookies. So an absent `fbc` there is NOT evidence it was never sent, and ENG-926's
+      // AC2 was once judged failed on exactly that inference (§50, corrected in §55).
+      //
+      // Until someone has Business Manager access, this line is the only send-side proof
+      // available — §42 recorded the gap as "nothing logs it".
+      //
+      // KEY NAMES ONLY, never values: every entry here is PII (`em`/`ph`/`fn`/`ln` hashes,
+      // `client_ip_address`, `client_user_agent`) or a click identifier (`fbc`/`fbp`).
+      const sentKeys = Object.keys(userData).sort();
+
+      console.log(
+        `[MetaService] CAPI ${event.eventName || 'Lead'} accepted — pixel ${pixelId} ` +
+        `event_id=${event.eventId} user_data keys: ` +
+        `${sentKeys.join(',') || '(none)'}`,
+      );
+
+      // ENG-926 §F — persist what that log line says, so send-side identity coverage is a
+      // TREND rather than a grep. The card asks to track Event Match Quality over time and
+      // Meta sells no such API, so the half we own is: of the conversions we actually sent,
+      // what fraction carried each key. `fn`/`ln` were hashed wrong for 24 days and nothing
+      // could see it, because the only symptom is a number quietly lower than it should be.
+      //
+      // ⚠ Awaited, and wrapped so it can NEVER throw. Meta has already ACCEPTED this
+      // conversion by the time we get here — it cannot be recalled — so a storage fault must
+      // not turn a delivered conversion into a reported failure, nor provoke a relay retry of
+      // an event Meta already counted. Awaited rather than fire-and-forget because a floating
+      // promise outliving the Jest environment is exactly the ENG-1286 shape, and a DynamoDB
+      // update is ~10ms against a CAPI round trip of hundreds.
+      try {
+        const [{ recordCapiKeySend }, { addCapiKeyCounters }] = await Promise.all([
+          import('./metaCapiKeyCoverage'),
+          import('./metaCapiKeyCoverageDb'),
+        ]);
+        await recordCapiKeySend(
+          { pixelId, eventName: event.eventName, keys: sentKeys, nowMs: Date.now() },
+          { addCounters: addCapiKeyCounters },
+        );
+      } catch (coverageError: any) {
+        console.warn(
+          `[MetaService] CAPI key coverage not recorded for pixel ${pixelId}: ${coverageError?.message}`,
+        );
+      }
+
       return { success: true, fbtraceId: data.fbtrace_id, usage };
     } catch (error: any) {
       console.error(`[MetaService] sendCapiLeadEvent threw for pixel ${pixelId}: ${error?.message}`);

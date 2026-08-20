@@ -189,7 +189,7 @@ mcpToolRegistry.register({
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
         llm_model: { type: 'string', description: 'LLM model to use (optional)' },
-        backup_model: { type: 'string', description: 'Backup model to use if the preferred model is restricted by optimized usage (optional). The server remains authoritative.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 no threshold below the hard usage cap restricts or rewrites a model, so this is never consulted. The server remains authoritative on model eligibility and on the hard cap.' },
         media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
@@ -303,7 +303,7 @@ mcpToolRegistry.register({
   name: 'emma_list_models',
   definition: {
     name: 'emma_list_models',
-    description: 'List the Emma models currently selectable for this account, plus the eligible scheduled-chat backup models. The result is cost-policy aware: after optimized usage begins it omits restricted premium models, and when usage is paused canGenerate is false.',
+    description: 'List the Emma models currently selectable for this account. Every entitled model stays selectable right up to the hard usage cap; only a paused account returns an empty list with canGenerate false. scheduleBackupModels is a legacy field and no longer restricts anything.',
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
@@ -522,7 +522,7 @@ mcpToolRegistry.register({
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
         llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
-        backup_model: { type: 'string', description: 'Backup model for scheduled runs if the preferred model becomes unavailable or is restricted by optimized usage (create/update). If omitted, the server assigns the admin-configured optimized default and marks it for user confirmation.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 a scheduled run always uses its own preferred model below the hard usage cap, so this is never consulted. Omitting it changes nothing.' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
         revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
@@ -814,7 +814,7 @@ mcpToolRegistry.register({
         variable_values: { type: 'object', description: 'Variable values for the template placeholders' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
         llm_model: { type: 'string', description: 'Override LLM model' },
-        backup_model: { type: 'string', description: 'Backup model if the preferred model is restricted at run time. If omitted, the server assigns the admin-configured optimized default and marks it for confirmation.' },
+        backup_model: { type: 'string', description: 'Legacy field, retained for compatibility. Since ENG-1211 the preferred model is not restricted at run time below the hard usage cap, so this is never consulted.' },
       },
       required: ['template_id']
     }
@@ -2437,6 +2437,8 @@ mcpToolRegistry.register({
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
 - attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+- modelLine: the exact per-session model line to print — use this verbatim, do not compose your own from llmModel/attributedModels. Already in "picker: X · ran: Y" form when the picker disagrees with what ran, INCLUDING when the picker is one of several models that ran (a multi-model run is never "agreement" — it is never equal to the single-value picker, so the picker's involvement doesn't collapse it); collapses to a single model name only when exactly one model ran and it is the picker, or when there is nothing to contrast (selection-only). When attributionBasis is 'partial-transcript' it carries its own "(partial — N of M assistant turns unlabelled)" suffix, so it is safe to print as-is without separately checking attributionBasis. Null only when attributedModels is null.
+- modelMix (top-level, sibling of sessions): the model-mix / share-of-sessions section, precomputed from attributedModels — { sessionsWithModelData, partialAttributionSessions, truncated, byModel: [{model, sessions, share}] }, byModel sorted by sessions descending, share a 0-1 fraction of sessionsWithModelData. Use this directly for any "share of sessions per model" or model-mix reporting; do not recompute it from llmModel or you will hide a fleet-wide default-model switch behind stale picker values. partialAttributionSessions counts how many of sessionsWithModelData were only partially labelled (qualify the shares as approximate when this is > 0). truncated (also returned top-level, sibling of sessions) is true when more sessions exist in the requested range beyond the limit parameter — when true, do not present modelMix, or sessions, as covering the full range; say so, or re-run with a higher limit. Null when no session in range has any resolvable attribution.
 
 The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
@@ -2524,8 +2526,12 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // no recorded spend still means the transcript is only partially labelled, and
       // keying that off cost alone let a partial set read as authoritative.
       let unlabelledAssistantTurns = 0;
+      // Greptile P1 (ENG-1313): the denominator for unlabelledAssistantTurns, so
+      // "partial" can be quantified (N of M) rather than just flagged.
+      let assistantTurnCount = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        assistantTurnCount++;
         const turnCost = msg?.usage?.estimated_cost || 0;
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
@@ -2564,6 +2570,51 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         };
       }
 
+      const attributedModels: string[] | null = generationModels.size > 0
+        ? [...generationModels]
+        : (session.llmModel ? [session.llmModel] : null);
+      const attributionBasis: 'transcript' | 'partial-transcript' | 'selection-only' | null =
+        generationModels.size > 0
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
+          : (session.llmModel ? 'selection-only' : null);
+      // ENG-1313: the Daily Satisfaction Score Report named the picker
+      // (llmModel) instead of the model that ran even after ENG-892 exposed
+      // attributedModels — building the report's per-session line was still a
+      // judgement call the reporting agent had to make correctly every time,
+      // and it silently reverted to the field named `llmModel` on sight. Same
+      // fix pattern as ENG-892: pre-compute the exact display line so there is
+      // no choice left to make. Only names the picker when it disagrees with
+      // what ran — agreement (or selection-only, where there is nothing to
+      // contrast) collapses to a single value.
+      //
+      // Greptile P1 (ENG-1313 review): a partial-transcript session's
+      // attributedModels only lists the turns that DID record a model, so
+      // printing it bare (as "the" model line) presents an incomplete list as
+      // complete — a model used only by an unlabelled turn goes unnamed with
+      // no signal that anything is missing. Append an explicit "(partial — N
+      // of M assistant turns unlabelled)" qualifier whenever attributionBasis
+      // is 'partial-transcript', so modelLine can still be printed verbatim
+      // without silently overstating its own completeness.
+      const partialQualifier = attributionBasis === 'partial-transcript'
+        ? ` (partial — ${unlabelledAssistantTurns} of ${assistantTurnCount} assistant turns unlabelled)`
+        : '';
+      // CodeRabbit (ENG-1313 review): "agreement" must mean the picker is the
+      // WHOLE story — exactly one model ran and it is the picker — not merely
+      // that the picker is somewhere among several models that ran. The old
+      // `!includes()` check treated a picker-plus-backup run (picker ran, and
+      // so did another model) as agreement, dropping the "picker:" label even
+      // though a second model's involvement is exactly the kind of fact this
+      // field exists to surface. Per acceptance criterion 1 (ENG-1313):
+      // "when picker ≠ generation it shows both" — a multi-model
+      // `attributedModels` is never equal to the single-value picker, so it
+      // must take the "picker: X · ran: Y" form regardless of whether the
+      // picker happens to be one of the models that ran.
+      const modelLine: string | null = attributedModels
+        ? (session.llmModel && (attributedModels.length !== 1 || attributedModels[0] !== session.llmModel)
+            ? `picker: ${session.llmModel} · ran: ${attributedModels.join(', ')}${partialQualifier}`
+            : `${attributedModels.join(', ')}${partialQualifier}`)
+        : null;
+
       return {
         sessionId: session.sessionId,
         userId: session.userId,
@@ -2580,12 +2631,11 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         // sight; a stored account memory still instructs grouping cost by it.
         // Emitting the answer (plus how trustworthy it is) removes that judgement
         // call rather than relying on the agent to make it correctly.
-        attributedModels: generationModels.size > 0
-          ? [...generationModels]
-          : (session.llmModel ? [session.llmModel] : null),
-        attributionBasis: generationModels.size > 0
-          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
-          : (session.llmModel ? 'selection-only' : null),
+        attributedModels,
+        attributionBasis,
+        // ENG-1313: the exact string the per-session report line should use
+        // verbatim — see the modelLine computation above.
+        modelLine,
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
         cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
@@ -2622,11 +2672,59 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       };
     });
 
+    // Greptile P1 (ENG-1313 review): the admin route paginates with a cursor
+    // (`nextCursor`, non-null when more sessions exist beyond `limit`), but
+    // this tool previously dropped it entirely — so a limit-truncated result
+    // was returned with no signal that it was incomplete. Any range-wide
+    // aggregate computed only over the returned page (modelMix below, but
+    // this also applies to `count`/`sessions`) needs that signal surfaced,
+    // not silently presented as covering the full requested range.
+    const truncated = (data as any)?.nextCursor != null;
+
+    // ENG-1313 acceptance criterion 3: the model-mix section must be computed
+    // from attributedModels (transcript-derived where available), never from
+    // llmModel — otherwise a fleet-wide default-model switch stays invisible
+    // because every session still shows its old picker selection. Counted per
+    // session (not per turn), against attributedModels only, so this can never
+    // be pulled toward llmModel by accident.
+    const modelMixCounts: Record<string, number> = {};
+    let sessionsWithModelData = 0;
+    // Greptile P1 (ENG-1313 review): sessions with only partial transcript
+    // attribution are still counted (their known models are real), but the
+    // count of how many are partial travels with the aggregate so a consumer
+    // can qualify the shares rather than presenting them as exact.
+    let partialAttributionSessions = 0;
+    for (const s of formattedSessions) {
+      if (!s.attributedModels) continue;
+      sessionsWithModelData++;
+      if (s.attributionBasis === 'partial-transcript') partialAttributionSessions++;
+      for (const m of s.attributedModels as string[]) {
+        modelMixCounts[m] = (modelMixCounts[m] || 0) + 1;
+      }
+    }
+    const modelMix = sessionsWithModelData > 0
+      ? {
+          sessionsWithModelData,
+          partialAttributionSessions,
+          truncated,
+          byModel: Object.entries(modelMixCounts)
+            .map(([model, sessions]) => ({ model, sessions, share: sessions / sessionsWithModelData }))
+            .sort((a, b) => b.sessions - a.sessions || a.model.localeCompare(b.model)),
+        }
+      : null;
+
     return jsonResult({
       sessions: formattedSessions,
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      truncated,
+      modelMix,
+      // ENG-1332: requested-range/scored/skipped counts for sync=true calls, so
+      // a report can state its own coverage/denominator honestly instead of
+      // inferring one from sessions.length. Null when sync=false — no scoring
+      // pass ran, so there is nothing to report coverage on.
+      scoringCoverage: (data as any)?.scoringCoverage ?? null,
     });
   }
 });
