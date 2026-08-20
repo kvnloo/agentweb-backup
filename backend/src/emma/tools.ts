@@ -7641,6 +7641,15 @@ emmaToolRegistry.register({
         // the server pulls the telemetry it already has. Best-effort — a
         // failed lookup must never block the report.
         let description: string = issue.description;
+        // ENG-939: the analysed run may belong to a DIFFERENT user than whoever is filing this
+        // report (an internal reviewer surfacing a telemetry/satisfaction-report pattern from a
+        // customer's session). When it does, THAT user — not the reviewer — is the affected
+        // reporter, or the ENG-170 "your bug shipped" notification addresses the wrong person.
+        // `affectedUser` resolved -> attach them as the reporter; `affectedUserUnresolved` (a
+        // known mismatch we couldn't resolve) -> file without defaulting to the reviewer (AC4).
+        let affectedUser: { email: string; displayName?: string; funnelStatus?: string | null } | undefined;
+        let affectedSessionId: string | undefined;
+        let affectedUserUnresolved = false;
         if (typeof issue.run_id === 'string' && issue.run_id.trim()) {
           try {
             const { fetchAgentRunSummaries } = await import('../services/agentRunInspectorService');
@@ -7664,9 +7673,41 @@ emmaToolRegistry.register({
                 ...(failures.length > 0 ? ['- failed tool calls:', ...failures] : []),
               ].join('\n');
               issueContext['AgentRun ID'] = run.runId;
+
+              if (run.userId && run.userId !== userId) {
+                try {
+                  const affected = await userDb.getUserById(run.userId);
+                  if (affected?.email) {
+                    affectedUser = { email: affected.email, displayName: affected.displayName, funnelStatus: affected.funnelStatus };
+                    affectedSessionId = run.sessionId;
+                  } else {
+                    affectedUserUnresolved = true;
+                  }
+                } catch (e) {
+                  console.warn('[report_product_issues] affected-user resolution failed (filing without a reporter):', e instanceof Error ? e.message : e);
+                  affectedUserUnresolved = true;
+                }
+              }
             }
           } catch (e) {
             console.warn('[report_product_issues] run dossier enrichment failed (report still filed):', e instanceof Error ? e.message : e);
+          }
+        }
+
+        // Realign the eng-facing context to the affected user, never overwriting who surfaced it.
+        let issueFunnelStatusLabel = funnelStatusLabel;
+        let issueFunnelStatusTags = funnelStatusTags;
+        if (affectedUser) {
+          issueFunnelStatusLabel = getUserFunnelStatusLabel(affectedUser.funnelStatus);
+          issueFunnelStatusTags = getUserFunnelStatusIssueTags(affectedUser.funnelStatus);
+          issueContext['User Name'] = affectedUser.displayName || affectedUser.email;
+          issueContext['User Email'] = affectedUser.email;
+          issueContext['Surfaced By'] = user.email;
+          if (affectedSessionId) issueContext['Session ID'] = affectedSessionId;
+          if (issueFunnelStatusLabel) {
+            issueContext['User Status'] = issueFunnelStatusLabel;
+          } else {
+            delete issueContext['User Status'];
           }
         }
 
@@ -7687,22 +7728,30 @@ emmaToolRegistry.register({
             type: itemType,
             title: issue.title,
             description,
-            userEmail: user.email,
-            userName: user.displayName || user.email,
-            reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
-            sessionId: context?.sessionId,
+            // ENG-939: the affected user (from the analysed run), not the caller, is the
+            // reporter when the two differ. `reportedByAdmin` reuses the existing "acted on
+            // their behalf" mechanism to record whoever surfaced it, distinct from who it affects.
+            userEmail: affectedUser?.email ?? user.email,
+            userName: affectedUser ? (affectedUser.displayName || affectedUser.email) : (user.displayName || user.email),
+            reportedByAdmin: affectedUser
+              ? user.email
+              : (isDelegatedAdmin && adminEmail ? adminEmail : undefined),
+            sessionId: affectedSessionId ?? context?.sessionId,
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
             // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
-            funnelStatus: user.funnelStatus,
+            funnelStatus: affectedUser ? affectedUser.funnelStatus : user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
             notionTags: [
               context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
-              ...funnelStatusTags,
+              ...issueFunnelStatusTags,
             ],
             notionContext: issueContext,
+            // ENG-939 AC4: a run_id KNOWN to belong to a different user whose account we could
+            // not resolve — never default the reporter slot to the surfacing caller.
+            noResolvableReporter: affectedUserUnresolved || undefined,
           }),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)

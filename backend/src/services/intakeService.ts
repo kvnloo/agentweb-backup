@@ -187,6 +187,17 @@ export interface FileUserIssueParams {
    * upgrades the tier and a stated Low never downgrades it.
    */
   priority?: string;
+  /**
+   * ENG-939 AC4: true when this report is KNOWN to be about a different user's session (a
+   * telemetry/satisfaction-report review) but that user could not be resolved to an account.
+   * Bug canonicals only (`fileBugReport`): skips minting a personal Featurebase card for
+   * `userEmail` and skips the `[reporter-ticket #N]` marker the resolve bridge notifies on — the
+   * canonical still files/dedupes normally, but nobody is credited or notified as the affected
+   * reporter. `userEmail` must still be supplied (used only as an eng-visible "surfaced by" note,
+   * never for a customer-facing card) so the surfacing reviewer is never silently defaulted into
+   * the reporter slot the way ENG-939 found. No-op for feature requests.
+   */
+  noResolvableReporter?: boolean;
 }
 
 // Reporter-stated priority text -> Linear enum (1=Urgent, 2=High, 3=Medium, 4=Low). Unknown or
@@ -300,41 +311,51 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const stated = p.priority ? LINEAR_PRIORITY[p.priority.toLowerCase()] : undefined;
   const priority = stated ? Math.min(bugPriorityForFunnel(p.funnelStatus), stated) : bugPriorityForFunnel(p.funnelStatus);
 
-  // 0. ENG-529 AC5 / ENG-598 option A — destination-side idempotency.
-  //    The in-process replay guard (`utils/reportIntake.fileReportOnce`) is bounded and evicts
-  //    settled entries under aggregate pressure, so it CANNOT be the durable guarantee: once an
-  //    entry is evicted — or the process restarts, or a second instance serves the retry — the
-  //    reporter's retry re-runs this filer and mints a second card. That is how one report became
-  //    reporter tickets #169, #170 and #171 on 2026-07-26.
-  //
-  //    The durable check therefore lives here, at the destination. A hit means THIS reporter has
-  //    already filed THIS exact report: return their existing card rather than creating another,
-  //    and skip canonical creation so one bug never splits across two eng tickets.
-  if (p.reportFingerprint) {
-    const existing = await findTicketByMarker(p.reportFingerprint);
-    if (existing) {
-      return {
-        pageId: existing.id,
-        trackerUrl: existing.url,
-        userUrl: existing.url,
-        deduped: true,
-        tracker: 'Featurebase',
-      };
-    }
-  }
+  // ENG-939 AC4: a telemetry-surfaced report whose affected user could NOT be resolved still
+  // files (eng needs the ticket) but must never default to crediting whoever surfaced it as the
+  // affected reporter — that is precisely the bug ENG-939 fixes. No personal Featurebase card is
+  // minted for `p.userEmail` and no [reporter-ticket #N] marker is written below, so the ENG-170
+  // resolve bridge notifies nobody for this filing instead of pinging the surfacing reviewer.
+  const skipReporter = p.noResolvableReporter === true;
 
-  // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
-  //    The fingerprint marker is appended as an HTML comment: it rides in the same `content` text
-  //    the `q` search indexes, and Featurebase renders the card as markdown so the reporter never
-  //    sees it.
-  const ticket = await createTicket({
-    title: p.title,
-    content: p.reportFingerprint
-      ? `${p.description}\n\n<!-- report-fingerprint: ${p.reportFingerprint} -->`
-      : p.description,
-    authorEmail: p.userEmail,
-    authorName: p.userName,
-  });
+  let ticket: { number: number; url: string } | null = null;
+  if (!skipReporter) {
+    // 0. ENG-529 AC5 / ENG-598 option A — destination-side idempotency.
+    //    The in-process replay guard (`utils/reportIntake.fileReportOnce`) is bounded and evicts
+    //    settled entries under aggregate pressure, so it CANNOT be the durable guarantee: once an
+    //    entry is evicted — or the process restarts, or a second instance serves the retry — the
+    //    reporter's retry re-runs this filer and mints a second card. That is how one report became
+    //    reporter tickets #169, #170 and #171 on 2026-07-26.
+    //
+    //    The durable check therefore lives here, at the destination. A hit means THIS reporter has
+    //    already filed THIS exact report: return their existing card rather than creating another,
+    //    and skip canonical creation so one bug never splits across two eng tickets.
+    if (p.reportFingerprint) {
+      const existing = await findTicketByMarker(p.reportFingerprint);
+      if (existing) {
+        return {
+          pageId: existing.id,
+          trackerUrl: existing.url,
+          userUrl: existing.url,
+          deduped: true,
+          tracker: 'Featurebase',
+        };
+      }
+    }
+
+    // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
+    //    The fingerprint marker is appended as an HTML comment: it rides in the same `content` text
+    //    the `q` search indexes, and Featurebase renders the card as markdown so the reporter never
+    //    sees it.
+    ticket = await createTicket({
+      title: p.title,
+      content: p.reportFingerprint
+        ? `${p.description}\n\n<!-- report-fingerprint: ${p.reportFingerprint} -->`
+        : p.description,
+      authorEmail: p.userEmail,
+      authorName: p.userName,
+    });
+  }
 
   // 2. Find or create the ONE canonical Linear ticket for this bug (dedup groups reporters).
   const cans = await listOpenBugCanonicals(MAX_CANDIDATES);
@@ -413,7 +434,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       console.warn('[intake] bug canonical reopen triage upgrade failed:', e instanceof Error ? e.message : e);
     }
   } else {
-    const filedBy = p.reportedByAdmin
+    const filedBy = skipReporter
+      ? `surfaced via telemetry/satisfaction-report review${p.reportedByAdmin ? ` by ${p.reportedByAdmin}` : ''} — affected user could not be resolved automatically`
+      : p.reportedByAdmin
       ? `via ${p.reportedByAdmin} acting on their behalf (delegated session)`
       : 'self-reported';
     const li = await createInternalLinearIssue({
@@ -424,7 +447,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         '---',
         'Customer-reported bug. Each affected user has their own private Featurebase ticket; resolving THIS issue notifies them all (see the [reporter-ticket #N] comments).',
         '',
-        `Affected user: ${reporterLabel(p)} (${filedBy})`,
+        skipReporter ? `Affected user: unresolved (${filedBy})` : `Affected user: ${reporterLabel(p)} (${filedBy})`,
         ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
         ...contextLines(p.notionContext),
       ].join('\n'),
@@ -445,7 +468,10 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
 
   // 3. Record this reporter on the canonical (best-effort). `[reporter-ticket #N]` is the contract
   //    the resolve-bridge parses to notify each card; eng also sees the affected user + session.
-  if (canonicalUuid) {
+  //    ENG-939 AC4: when there's no personal ticket to key a marker on (skipReporter), write a
+  //    plain visibility note instead — it deliberately does NOT match the [reporter-ticket #N]
+  //    pattern, so the resolve bridge notifies nobody for this filing.
+  if (canonicalUuid && ticket) {
     const note = [
       ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `[reporter-ticket #${ticket.number} ${p.userEmail}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
@@ -457,12 +483,21 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       ...contextLines(p.notionContext),
     ].join('\n');
     try { await addIssueComment(canonicalUuid, note); } catch (e) { console.warn('[intake] bug canonical comment failed:', e instanceof Error ? e.message : e); }
+  } else if (canonicalUuid && skipReporter) {
+    const note = [
+      ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
+      `Surfaced via telemetry/satisfaction-report review${p.reportedByAdmin ? ` by ${p.reportedByAdmin}` : ''} — affected user could not be resolved automatically; no reporter-ticket attached (nobody notified on resolve).`,
+      ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
+      ...(grouped ? ['', 'Report:', p.description] : []),
+      ...contextLines(p.notionContext),
+    ].join('\n');
+    try { await addIssueComment(canonicalUuid, note); } catch (e) { console.warn('[intake] bug canonical unattributed comment failed:', e instanceof Error ? e.message : e); }
   }
 
   return {
-    pageId: String(ticket.number),
-    trackerUrl: ticket.url || FEATUREBASE_BOARD_URL,
-    userUrl: ticket.url || FEATUREBASE_BOARD_URL, // the reporter's OWN private card
+    pageId: ticket ? String(ticket.number) : '',
+    trackerUrl: ticket?.url || canonicalUrl || FEATUREBASE_BOARD_URL,
+    userUrl: ticket?.url || undefined, // the reporter's OWN private card — none exists when skipReporter
     canonicalUrl: canonicalUrl || undefined,      // internal Linear canonical (ENG-289)
     deduped: grouped,
 
@@ -747,6 +782,17 @@ function pickEmmaResolutionMessage(comments: Array<{ body: string; createdAt: st
   return best ? best.text : null;
 }
 
+/**
+ * ENG-939 AC3: `@agentweb.pro` addresses are staff, not customers. A [reporter-ticket #N] entry
+ * can point at an internal account (a telemetry-attached affected user who turns out to be
+ * internal staff, or — today's actual bug — an internal reviewer wrongly attached as the
+ * reporter) and must never receive the customer-channel Slack ping or resolution email.
+ */
+const INTERNAL_EMAIL_DOMAIN_RE = /@agentweb\.pro$/i;
+function isInternalEmail(email: string): boolean {
+  return INTERNAL_EMAIL_DOMAIN_RE.test(email.trim());
+}
+
 export async function notifyCanonicalResolved(
   canonicalIssueId: string,
   issueTitle = 'the issue you reported',
@@ -789,6 +835,17 @@ export async function notifyCanonicalResolved(
     `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`;
   const acted: number[] = [];
   for (const [num, email] of reporters) {
+    if (isInternalEmail(email)) {
+      // ENG-939 AC3: no customer-channel Slack ping or resolution email for an internal reporter
+      // — but still flip the ticket status so Featurebase stays tidy for whoever is tracking it.
+      try {
+        await patchTicketStatus(num, completedId);
+        acted.push(num);
+      } catch (e) {
+        console.warn(`[resolve-bridge] status flip for internal reporter #${num} failed:`, e instanceof Error ? e.message : e);
+      }
+      continue;
+    }
     // Slack ping in the reporter's own channel — ADDITIVE to the email, independent of it.
     // notifyReporterShipped never throws by contract; guarded anyway so a bug there can
     // never block the email or the card flip.
