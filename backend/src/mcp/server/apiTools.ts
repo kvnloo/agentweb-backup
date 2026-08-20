@@ -703,9 +703,9 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'diagnose_scheduled_chat_storage',
+  name: 'get_scheduled_chat_storage_diagnostics',
   definition: {
-    name: 'diagnose_scheduled_chat_storage',
+    name: 'get_scheduled_chat_storage_diagnostics',
     description: 'Diagnose why a scheduled chat is failing to save with a size-related error, or check whether one is at risk of it. DynamoDB caps a schedule at 400KB; this returns a byte-usage breakdown (current prompt, saved prompt-edit history, saved run history) against that limit and, when the schedule is under storage pressure, the one corrective action the user can take. Returns byte counts only — never the schedule\'s actual prompt or run content.',
     inputSchema: {
       type: 'object',

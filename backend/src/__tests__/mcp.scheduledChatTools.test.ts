@@ -49,7 +49,7 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(names).toContain('test_scheduled_chat');
       expect(names).toContain('get_scheduled_chat_test_history');
       expect(names).toContain('submit_scheduled_chat_variables');
-      expect(names).toContain('diagnose_scheduled_chat_storage');
+      expect(names).toContain('get_scheduled_chat_storage_diagnostics');
     });
 
     it('exposes an explicit backup model for scheduled chat create/update', () => {
@@ -563,7 +563,7 @@ describe('Scheduled Chat MCP Tools', () => {
     });
   });
 
-  describe('diagnose_scheduled_chat_storage', () => {
+  describe('get_scheduled_chat_storage_diagnostics', () => {
     it('should call GET /api/agent-mode/scheduled-chats/:id/storage-diagnostics', async () => {
       mockMcpFetch.mockResolvedValue({
         totalBytes: 435200,
@@ -575,7 +575,7 @@ describe('Scheduled Chat MCP Tools', () => {
         correctiveAction: 'Shorten the starting message.',
       });
 
-      const result = await mcpToolRegistry.execute('diagnose_scheduled_chat_storage', {
+      const result = await mcpToolRegistry.execute('get_scheduled_chat_storage_diagnostics', {
         schedule_id: 'sc-1',
       }, context);
 
@@ -584,19 +584,27 @@ describe('Scheduled Chat MCP Tools', () => {
         path: '/api/agent-mode/scheduled-chats/sc-1/storage-diagnostics',
         context: { userId: 'user-123', agentUserId: 'user-123' },
       });
-      expect(result.content[0].text).toContain('promptRevisions');
-      expect(result.content[0].text).toContain('approachingLimit');
+      // Assert the actual returned VALUES, not just that the keys are present —
+      // a formatter that dropped or mangled a value would still pass a
+      // keys-only check.
+      const text = result.content[0].text;
+      expect(text).toContain('435200');
+      expect(text).toContain('409600');
+      expect(text).toContain('389120');
+      expect(text).toContain('promptRevisions');
+      expect(text).toContain('true'); // approachingLimit: true
+      expect(text).toContain('Shorten the starting message.');
     });
 
     it('should propagate HTTP errors from mcpFetch', async () => {
       mockMcpFetch.mockRejectedValue(new Error('API error (404): Scheduled chat not found'));
       await expect(
-        mcpToolRegistry.execute('diagnose_scheduled_chat_storage', { schedule_id: 'missing' }, context)
+        mcpToolRegistry.execute('get_scheduled_chat_storage_diagnostics', { schedule_id: 'missing' }, context)
       ).rejects.toThrow('API error (404)');
     });
 
     it('requires schedule_id in its input schema', () => {
-      const definition: any = mcpToolRegistry.getTool('diagnose_scheduled_chat_storage')?.definition;
+      const definition: any = mcpToolRegistry.getTool('get_scheduled_chat_storage_diagnostics')?.definition;
       expect(definition.inputSchema.required).toContain('schedule_id');
     });
   });

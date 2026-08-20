@@ -7106,7 +7106,7 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
-  'diagnose_scheduled_chat_storage',
+  'get_scheduled_chat_storage_diagnostics',
   // Schedule Template tools
   'list_schedule_templates',
   'manage_schedule_template',
