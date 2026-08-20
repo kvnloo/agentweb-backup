@@ -1003,6 +1003,41 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
   return match ? match[1] : null;
 }
 
+/**
+ * ENG-1301: given a raw provider `usage` object off an OpenAI-shape LLM
+ * response, returns the correctly EXCLUSIVE prompt-token count and the real
+ * cache-read count. Every client this file routes through answers in OpenAI
+ * shape (Azure OpenAI directly, Bedrock/Gemini/Vertex via their own wrappers),
+ * but they disagree on convention:
+ *   - Bedrock's Converse wrapper (agentModeService's own construction) and
+ *     Gemini's native wrapper (geminiNativeClient) already report an EXCLUSIVE
+ *     prompt_tokens alongside an explicit cache_read_input_tokens counter.
+ *   - A raw Azure OpenAI response reports an INCLUSIVE prompt_tokens
+ *     (Google/OpenAI's own convention — cached tokens are a subset, not
+ *     additive) with the cache count nested under
+ *     prompt_tokens_details.cached_tokens instead. Left unsubtracted, this
+ *     both drops Azure's real cache reads from the ledger (cache_read_input_tokens
+ *     is never present on a raw Azure response) AND bills the cached portion
+ *     twice wherever a caller does pick it up via this fallback.
+ * Math.max(0, ...) guards a cached_tokens count reported >= prompt_tokens.
+ */
+export function extractExclusivePromptTokens(usage: any): {
+  promptTokens: number;
+  cacheReadTokens: number;
+} {
+  const totalPromptTokens = usage?.prompt_tokens || 0;
+  const nativeCacheReadTokens = usage?.prompt_tokens_details?.cached_tokens;
+  if (nativeCacheReadTokens != null) {
+    return {
+      promptTokens: Math.max(0, totalPromptTokens - nativeCacheReadTokens),
+      cacheReadTokens: nativeCacheReadTokens,
+    };
+  }
+  return {
+    promptTokens: totalPromptTokens,
+    cacheReadTokens: usage?.cache_read_input_tokens || 0,
+  };
+}
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -3209,6 +3244,9 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
+            // ENG-1301: prompt_tokens/cache_read_input_tokens need provider-aware
+            // extraction — see extractExclusivePromptTokens for why.
+            const { promptTokens, cacheReadTokens } = extractExclusivePromptTokens(usage);
             // ENG-200: meter the main agent turn — record shadow burn AND charge
             // the per-user cost cap when a real user is attributable (org members
             // resolve to the owner). Cost (incl. cache tokens) is computed once
@@ -3228,9 +3266,9 @@ export class AgentModeService {
               // the "retries defeat charge dedup" Greptile P1 for the highest-
               // volume metering site in the codebase.
               eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: usage.prompt_tokens || 0,
+              inputTokens: promptTokens,
               outputTokens: usage.completion_tokens || 0,
-              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
+              cacheReadTokens,
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
@@ -4526,18 +4564,22 @@ export class AgentModeService {
         // Attach token usage from the LLM response to the message
         const responseUsage = response.usage;
         if (responseUsage) {
+          // ENG-1301: prompt_tokens/cache_read_input_tokens need provider-aware
+          // extraction — see extractExclusivePromptTokens for why.
+          const { promptTokens, cacheReadTokens } = extractExclusivePromptTokens(responseUsage);
+          const cacheWriteTokens = responseUsage.cache_creation_input_tokens || 0;
           responseMessage.usage = {
-            prompt_tokens: responseUsage.prompt_tokens || 0,
+            prompt_tokens: promptTokens,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
-            cache_read_input_tokens: responseUsage.cache_read_input_tokens || 0,
-            cache_creation_input_tokens: responseUsage.cache_creation_input_tokens || 0,
+            cache_read_input_tokens: cacheReadTokens,
+            cache_creation_input_tokens: cacheWriteTokens,
             estimated_cost: this.estimateCost(
               llmModel,
-              responseUsage.prompt_tokens || 0,
+              promptTokens,
               responseUsage.completion_tokens || 0,
-              responseUsage.cache_read_input_tokens || 0,
-              responseUsage.cache_creation_input_tokens || 0,
+              cacheReadTokens,
+              cacheWriteTokens,
               responseUsage.cache_creation_by_ttl,
             ),
           };

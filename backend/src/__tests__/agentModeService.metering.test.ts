@@ -43,7 +43,7 @@ jest.mock('../services/tokenUsageService', () => ({
   incrementUserTokenUsage: jest.fn().mockResolvedValue(undefined),
 }));
 
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, extractExclusivePromptTokens } from '../services/agentModeService';
 import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
 import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { chatbotDb } from '../services/chatbotService';
@@ -65,6 +65,53 @@ const fakeResponse = {
 };
 
 const MODEL = 'anthropic.claude-sonnet-4-6';
+
+describe('extractExclusivePromptTokens (ENG-1301)', () => {
+  it('rejects missing/undefined usage without throwing', () => {
+    expect(extractExclusivePromptTokens(undefined)).toEqual({ promptTokens: 0, cacheReadTokens: 0 });
+    expect(extractExclusivePromptTokens(null)).toEqual({ promptTokens: 0, cacheReadTokens: 0 });
+  });
+
+  it('defensively floors promptTokens at 0 when cached_tokens is reported greater than prompt_tokens', () => {
+    expect(
+      extractExclusivePromptTokens({
+        prompt_tokens: 100,
+        prompt_tokens_details: { cached_tokens: 150 },
+      })
+    ).toEqual({ promptTokens: 0, cacheReadTokens: 150 });
+  });
+
+  it('does NOT subtract when the only cache signal is the Anthropic-style fallback field (Bedrock/Gemini wrapper shape)', () => {
+    // Regression guard: agentModeService's own Bedrock wrapper and
+    // geminiNativeClient both already report an EXCLUSIVE prompt_tokens
+    // alongside cache_read_input_tokens — subtracting again would
+    // double-discount their cache reads.
+    expect(
+      extractExclusivePromptTokens({
+        prompt_tokens: 300,
+        cache_read_input_tokens: 250,
+      })
+    ).toEqual({ promptTokens: 300, cacheReadTokens: 250 });
+  });
+
+  it('success: partially-cached native Azure/OpenAI response reports the non-cached remainder', () => {
+    expect(
+      extractExclusivePromptTokens({
+        prompt_tokens: 500,
+        prompt_tokens_details: { cached_tokens: 200 },
+      })
+    ).toEqual({ promptTokens: 300, cacheReadTokens: 200 });
+  });
+
+  it('fully-cached native Azure/OpenAI response floors promptTokens at 0', () => {
+    expect(
+      extractExclusivePromptTokens({
+        prompt_tokens: 100,
+        prompt_tokens_details: { cached_tokens: 100 },
+      })
+    ).toEqual({ promptTokens: 0, cacheReadTokens: 100 });
+  });
+});
 
 describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
   let svc: AgentModeService;
@@ -109,6 +156,36 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     });
     expect(mockMeterUser).toHaveBeenCalledWith(
       expect.objectContaining({ userId: undefined, feature: 'agent_task' })
+    );
+  });
+
+  // ENG-1301: a raw Azure OpenAI response never carries cache_read_input_tokens
+  // (that's Anthropic's field name) — it reports cache reads under
+  // prompt_tokens_details.cached_tokens instead, with prompt_tokens INCLUSIVE
+  // of that count. Left unfixed, the per-user cap enforcement above both drops
+  // Azure's real cache reads AND bills the cached portion at full price.
+  it('excludes cached tokens from inputTokens for a native Azure/OpenAI response, on the actual cap-enforcement call', async () => {
+    const azureCreate = jest.fn().mockResolvedValue({
+      usage: {
+        prompt_tokens: 500,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 200 },
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels['gpt-5-chat-2'].client = { chat: { completions: { create: azureCreate } } };
+
+    await svc.callLLM('gpt-5-chat-2', [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', sessionId: 's1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'azure-openai',
+        inputTokens: 300, // 500 - 200, not the raw inclusive 500
+        outputTokens: 20,
+        cacheReadTokens: 200, // captured, not silently dropped to 0
+      })
     );
   });
 
