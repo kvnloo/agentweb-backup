@@ -223,6 +223,49 @@ describe('isPublicIpAddress', () => {
     expect(isPublicIpAddress('100::1')).toBe(false);        // discard-only
   });
 
+  it('rejects EVERY spelling of IPv4-mapped loopback — CodeRabbit #2513, shipped defect', () => {
+    // These are all THE SAME address. Text-matching only the compressed dotted form let the
+    // other two through as "valid global IPv6", so a declared client_ip_address of loopback
+    // would have been accepted and forwarded to Meta.
+    expect(isPublicIpAddress('::ffff:127.0.0.1')).toBe(false);
+    expect(isPublicIpAddress('::ffff:7f00:1')).toBe(false);
+    expect(isPublicIpAddress('0:0:0:0:0:ffff:7f00:1')).toBe(false);
+    expect(isPublicIpAddress('0000:0000:0000:0000:0000:ffff:7f00:0001')).toBe(false);
+  });
+
+  it('requires GLOBAL UNICAST 2000::/3 — an allowlist, not a deny list', () => {
+    // The original deny-listed a handful of ranges, so anything nobody thought of defaulted
+    // to ACCEPTED. 4000::1 is reserved and sailed through.
+    expect(isPublicIpAddress('4000::1')).toBe(false);
+    expect(isPublicIpAddress('8000::1')).toBe(false);
+    expect(isPublicIpAddress('::ffff:0:7f00:1')).toBe(false);
+    // ...while real global unicast still passes.
+    expect(isPublicIpAddress('2606:4700:4700::1111')).toBe(true);
+    expect(isPublicIpAddress('2001:4860:4860::8888')).toBe(true);
+    expect(isPublicIpAddress('3ffe::1')).toBe(true);
+  });
+
+  it('parses every valid spelling of the SAME global address identically', () => {
+    // The risk that matters here is the opposite of the loopback one: a parser that chokes on
+    // a legitimate spelling would silently DROP a real visitor's IP. All of these are the same
+    // Cloudflare resolver address.
+    for (const spelling of [
+      '2606:4700:4700::1111',
+      '2606:4700:4700:0:0:0:0:1111',
+      '2606:4700:4700:0000:0000:0000:0000:1111',
+    ]) {
+      expect(isPublicIpAddress(spelling)).toBe(true);
+    }
+    // ...and a mapped IPv4 written with a trailing dotted quad still resolves to its v4.
+    expect(isPublicIpAddress('::ffff:45.253.245.23')).toBe(true);
+  });
+
+  it('rejects malformed IPv6 rather than accepting it', () => {
+    expect(isPublicIpAddress('2001::db8::1')).toBe(false);   // two :: runs
+    expect(isPublicIpAddress('2001:zzzz::1')).toBe(false);   // non-hex
+    expect(isPublicIpAddress('2001:db8:1:2:3:4:5:6:7')).toBe(false); // nine groups
+  });
+
   it('decodes the HEX IPv4-mapped spelling, not just the dotted one', () => {
     // ::ffff:7f00:1 and ::ffff:127.0.0.1 are the SAME loopback address. Understanding only
     // the dotted form let the hex one through as a valid global IPv6.

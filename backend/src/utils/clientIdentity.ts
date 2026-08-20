@@ -173,31 +173,76 @@ function isPublicIpv4(addr: string): boolean {
 }
 
 /**
- * Decode every IPv4-mapped IPv6 spelling to its dotted IPv4, or null if it is not one.
+ * Expand any valid IPv6 spelling into its eight 16-bit hextets, or null if it is not one.
  *
- * ⚠ BOTH TAILS ARE REAL. `::ffff:127.0.0.1` and `::ffff:7f00:1` are the SAME loopback
- * address, and a check that only understood the dotted spelling let the hex one through as
- * "a valid global IPv6". Found by review, not by the tests that existed.
+ * ⚠ TEXT MATCHING ON IPv6 IS NOT SUFFICIENT, and the first version of this file got it wrong.
+ * `::ffff:127.0.0.1`, `::ffff:7f00:1` and `0:0:0:0:0:ffff:7f00:1` are all THE SAME loopback
+ * address. A regex that recognised only the compressed dotted spelling let the other two
+ * through as "valid global IPv6" — so a declared `client_ip_address` of loopback would have
+ * been accepted and sent to Meta. Found by CodeRabbit on #2513, after it had already shipped.
+ *
+ * Handles `::` compression and a trailing dotted-quad, which is the only form where an IPv6
+ * address legitimately contains IPv4 notation.
  */
-function mappedIpv4(lower: string): string | null {
-  const dotted = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
-  if (dotted) return dotted[1];
-  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
-  if (!hex) return null;
-  const hi = parseInt(hex[1], 16);
-  const lo = parseInt(hex[2], 16);
-  return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+function ipv6Hextets(lower: string): number[] | null {
+  const addr = lower.split('%')[0]; // drop any zone id
+  let text = addr;
+
+  // A trailing dotted quad occupies the last TWO hextets. Convert it so the rest of the
+  // parser only ever deals with hex groups.
+  const dotted = /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(text);
+  if (dotted) {
+    const o = dotted[1].split('.').map(Number);
+    if (o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    text =
+      text.slice(0, dotted.index) +
+      (((o[0] << 8) | o[1]) >>> 0).toString(16) +
+      ':' +
+      (((o[2] << 8) | o[3]) >>> 0).toString(16);
+  }
+
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':').filter((g) => g !== '') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':').filter((g) => g !== '') : [];
+
+  let groups: string[];
+  if (halves.length === 1) {
+    groups = left;
+  } else {
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groups = [...left, ...Array(missing).fill('0'), ...right];
+  }
+  if (groups.length !== 8) return null;
+
+  const out = groups.map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN));
+  return out.some((n) => Number.isNaN(n)) ? null : out;
 }
 
-/** Reject the IPv6 ranges that cannot be a visitor's public address. */
-function isPublicIpv6(lower: string): boolean {
-  if (lower === '::' || lower === '::1') return false;       // unspecified / loopback
-  const head = lower.split(':')[0];
-  if (head.startsWith('fc') || head.startsWith('fd')) return false;  // unique-local fc00::/7
-  if (/^fe[89ab]/.test(head)) return false;                          // link-local fe80::/10
-  if (head.startsWith('ff')) return false;                           // multicast ff00::/8
-  if (head === '100') return false;                                  // discard-only 100::/64
-  if (head === '2001' && /^0?db8$/.test(lower.split(':')[1] ?? '')) return false; // doc 2001:db8::/32
+/**
+ * Is this IPv6 address publicly routable?
+ *
+ * ⚠ AN ALLOWLIST (`2000::/3`, global unicast), NOT A DENY LIST. The original deny-listed
+ * fc00::/7, fe80::/10, multicast and a few others — which meant every range nobody had thought
+ * of defaulted to ACCEPTED. `4000::1` is reserved and sailed through. Requiring global unicast
+ * inverts that: anything unrecognised is rejected, which is the correct direction for a value
+ * we persist write-once and send to Meta as a match signal.
+ *
+ * Global unicast still contains one range worth excluding: 2001:db8::/32, documentation.
+ */
+function isPublicIpv6(hextets: number[]): boolean {
+  // IPv4-mapped in ANY spelling — judge what it actually contains.
+  if (
+    hextets[0] === 0 && hextets[1] === 0 && hextets[2] === 0 &&
+    hextets[3] === 0 && hextets[4] === 0 && hextets[5] === 0xffff
+  ) {
+    const v4 = `${(hextets[6] >> 8) & 255}.${hextets[6] & 255}.${(hextets[7] >> 8) & 255}.${hextets[7] & 255}`;
+    return isPublicIpv4(v4);
+  }
+
+  if (hextets[0] < 0x2000 || hextets[0] > 0x3fff) return false; // not global unicast
+  if (hextets[0] === 0x2001 && hextets[1] === 0x0db8) return false; // documentation
   return true;
 }
 
@@ -217,13 +262,9 @@ export function isPublicIpAddress(value: unknown): boolean {
   if (kind === 4) return isPublicIpv4(raw);
   if (kind !== 6) return false;
 
-  const lower = raw.toLowerCase();
-  // An IPv4-mapped address is IPv4 wearing a v6 costume — ::ffff:127.0.0.1 is loopback, and
-  // so is ::ffff:7f00:1. Judge it by what it CONTAINS, not by the fact that it parses as v6.
-  const mapped = mappedIpv4(lower);
-  if (mapped) return isPublicIpv4(mapped);
-
-  return isPublicIpv6(lower);
+  const hextets = ipv6Hextets(raw.toLowerCase());
+  if (!hextets) return false;
+  return isPublicIpv6(hextets);
 }
 
 /**
