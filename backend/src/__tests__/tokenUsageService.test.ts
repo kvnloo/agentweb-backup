@@ -28,6 +28,12 @@ jest.mock("../services/subscriptionService", () => ({
   getSubscriptionTypeConfig: jest.fn(),
 }));
 
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: {
+    getUserSessions: jest.fn(),
+  },
+}));
+
 // Explicit mock (rather than relying on the shared aws-sdk auto-mock's
 // always-succeeding `put`) so isNewCharge can be driven to false for the
 // "don't strand an unapplied event" regression test below.
@@ -42,8 +48,10 @@ import {
   getSubscriptionTypeConfig,
 } from "../services/subscriptionService";
 import { recordLlmChargeEvent } from "../services/llmChargeAuditDb";
+import { chatbotDb } from "../services/chatbotService";
 
 const mockGetUserById = userDb.getUserById as jest.Mock;
+const mockGetUserSessions = chatbotDb.getUserSessions as jest.Mock;
 const mockGetUserByIdConsistent = (userDb as any).getUserByIdConsistent as jest.Mock;
 const mockUpdateUser = userDb.updateUser as jest.Mock;
 const mockIncrementTokenUsageForMonth = userDb.incrementTokenUsageForMonth as jest.Mock;
@@ -272,26 +280,46 @@ describe("checkTokenUsage", () => {
   });
 });
 
-describe("checkTokenUsage - anonymous session owner (ENG-1163)", () => {
-  it("does not throw for an anon_ userId with no AW-Users row", async () => {
+describe("checkTokenUsage - anonymous session owner (ENG-1163 / ENG-705)", () => {
+  it("does not throw for an anon_ userId with no AW-Users row and no prior sessions", async () => {
     mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
 
     await expect(checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049")).resolves.not.toThrow();
   });
 
-  it("allows an anon_ userId unconditionally, with no allowance to exhaust", async () => {
+  it("allows an anon_ userId under the fixed anonymous cost cap, with cost enforcement on", async () => {
     mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: 0.45 }],
+    });
 
     const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
 
     expect(result.allowed).toBe(true);
-    expect(result.warning).toBe(false);
     expect(result.effectiveAllowance).toBeNull();
     expect(result.percentUsed).toBe(0);
+    expect(result.costEnforced).toBe(true);
+    expect(result.costUsed).toBe(0.45);
+    expect(result.costAllowance).toBeGreaterThan(0);
+  });
+
+  it("blocks an anon_ userId once their summed session cost reaches the fixed cap — no unlimited free generation on a public share link", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: 1.2 }, { totalCost: 0.9 }],
+    });
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(true);
+    expect(result.costUsed).toBe(2.1);
   });
 
   it("never queries user/subscription records for an anon_ userId (short-circuits before any lookup)", async () => {
     mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
 
     await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
 
@@ -299,19 +327,28 @@ describe("checkTokenUsage - anonymous session owner (ENG-1163)", () => {
     expect(mockGetUserSubscriptionType).not.toHaveBeenCalled();
   });
 
-  it("treats a missing/empty userId as anonymous too (fail-closed), not as a real-user lookup", async () => {
+  it("fails closed (blocked) when the anon session-cost lookup itself errors, rather than defaulting to unlimited", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(true);
+  });
+
+  it("does NOT treat a missing/empty userId as anonymous — falls through and throws, so a data-integrity bug is never silently granted an allowance", async () => {
     mockGetUserById.mockResolvedValue(undefined);
 
-    const result = await checkTokenUsage("");
-
-    expect(result.allowed).toBe(true);
-    expect(mockGetUserById).not.toHaveBeenCalled();
+    await expect(checkTokenUsage("")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
   });
 
   it("still throws for a real (non-anonymous) userId with no AW-Users row — data-integrity errors must not be swallowed", async () => {
     mockGetUserById.mockResolvedValue(undefined);
 
     await expect(checkTokenUsage("1746747115266")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
   });
 });
 
