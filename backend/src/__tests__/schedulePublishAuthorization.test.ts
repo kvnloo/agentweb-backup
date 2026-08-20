@@ -578,4 +578,27 @@ describe('describePublishAuthorizationWithholdReason (ENG-1245)', () => {
       })
     ).toBe('not_granted');
   });
+
+  /**
+   * CodeRabbit (PR #2517) — real bug, caught before it was reachable in
+   * production. A schedule with a USABLE explicit grant
+   * (autopublishAuthorized: true + a valid approved tool) is authorized per
+   * resolveSchedulePublishAuthorization, but this classifier fell through
+   * every branch to the 'not_granted' default anyway — reporting a
+   * nonexistent withholding reason for a schedule that is not withheld at
+   * all. Every current call site (agentModeService.ts,
+   * ungrantedPublishScheduleAudit.ts) already guards with
+   * `if (resolveSchedulePublishAuthorization(schedule).authorized) ...`
+   * before calling this, so the bug was not reachable today — but the
+   * function is exported, and its own contract ("WHY a schedule resolves to
+   * unauthorized") is violated for any caller that trusts it directly.
+   */
+  it('is undefined for a schedule that IS authorized — this function only explains withholding, never asserts it', () => {
+    expect(
+      describePublishAuthorizationWithholdReason({
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      })
+    ).toBeUndefined();
+  });
 });

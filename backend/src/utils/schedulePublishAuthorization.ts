@@ -270,6 +270,12 @@ export function describePublishAuthorizationWithholdReason(
   schedule: SchedulePublishAuthorizationInput | null | undefined
 ): PublishAuthorizationWithholdReason | undefined {
   if (!schedule) return undefined;
+  // CodeRabbit: this function only explains WHY a schedule is withheld — it must
+  // never assert a withholding reason for a schedule that resolveSchedulePublishAuthorization
+  // says is actually authorized (e.g. a usable explicit grant). Every current
+  // caller already guards on `.authorized` before reaching here, but the
+  // function's own contract has to hold for any caller that doesn't.
+  if (resolveSchedulePublishAuthorization(schedule).authorized) return undefined;
   if (schedule.requirePublishApproval === true) return 'require_publish_approval';
   if (schedule.autopublishAuthorized === false) return 'revoked';
   return 'not_granted';
