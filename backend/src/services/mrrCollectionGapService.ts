@@ -84,8 +84,17 @@ async function fetchLiveSubscriptions(): Promise<Stripe.Subscription[]> {
   return subs.filter(s => LIVE_STATUSES.has(s.status));
 }
 
-function hasPaymentMethodOnFile(customer: Stripe.Customer): boolean {
-  return Boolean(customer.invoice_settings?.default_payment_method || customer.default_source);
+function hasPaymentMethodOnFile(sub: Stripe.Subscription, customer: Stripe.Customer): boolean {
+  // Subscription-level defaults override the customer-level defaults for that
+  // subscription's invoices, so check them first (stripe-node: Subscription
+  // .default_payment_method / .default_source take precedence over the
+  // customer's invoice_settings.default_payment_method / default_source).
+  return Boolean(
+    sub.default_payment_method ||
+      sub.default_source ||
+      customer.invoice_settings?.default_payment_method ||
+      customer.default_source
+  );
 }
 
 async function hasEverSuccessfullyPaid(customerId: string): Promise<boolean> {
@@ -116,6 +125,12 @@ export async function detectMrrCollectionGaps(
     const customer = sub.customer as Stripe.Customer;
     if (!customer || typeof customer === 'string' || customer.deleted) continue;
 
+    // A trial has no charge due yet, so an absent payment method or zero
+    // successful charges is expected, not a collection gap. Only a
+    // trial billing below its configured contracted price (e.g. a paid
+    // trial) is a real gap, so trials still fall through to that check.
+    const inPreChargeTrial = sub.status === 'trialing' && !hasPaymentMethodOnFile(sub, customer);
+
     const contractedAmount = getMonthlyAmount(sub);
     const customerEmail = customer.email ?? null;
     const customerLabel = customerEmail ?? customer.id;
@@ -125,7 +140,7 @@ export async function detectMrrCollectionGaps(
       subscriptionId: sub.id,
     };
 
-    if (!hasPaymentMethodOnFile(customer)) {
+    if (!inPreChargeTrial && !hasPaymentMethodOnFile(sub, customer)) {
       flags.push({
         ...base,
         reason: 'no_payment_method',
@@ -136,7 +151,7 @@ export async function detectMrrCollectionGaps(
       continue; // implies zero successful charges too — one flag, not two
     }
 
-    if (!(await hasEverSuccessfullyPaid(customer.id))) {
+    if (!inPreChargeTrial && !(await hasEverSuccessfullyPaid(customer.id))) {
       flags.push({
         ...base,
         reason: 'zero_successful_charges',

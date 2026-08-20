@@ -162,7 +162,7 @@ describe('detectMrrCollectionGaps', () => {
     expect(flags).toHaveLength(0);
   });
 
-  it('does not flag no_payment_method or zero_successful_charges for a canceled or trialing-with-no-charge-due subscription', async () => {
+  it('does not flag no_payment_method or zero_successful_charges for a canceled subscription (not a live status)', async () => {
     const customer = makeCustomer({ id: 'cus_canceled', default_source: null });
     mockSubscriptionPage([
       makeSubscription({ id: 'sub_6', customer, status: 'canceled' }),
@@ -172,6 +172,38 @@ describe('detectMrrCollectionGaps', () => {
 
     expect(flags).toHaveLength(0);
     expect(mockStripe.invoices.list).not.toHaveBeenCalled();
+  });
+
+  it('does not flag no_payment_method or zero_successful_charges for a trialing subscription with no charge due yet', async () => {
+    const customer = makeCustomer({ id: 'cus_trial', default_source: null });
+    mockSubscriptionPage([
+      makeSubscription({ id: 'sub_trial', customer, status: 'trialing' }),
+    ]);
+
+    const flags = await detectMrrCollectionGaps();
+
+    expect(flags).toHaveLength(0);
+    expect(mockStripe.invoices.list).not.toHaveBeenCalled();
+  });
+
+  it('does not treat a subscription-level default payment method as no_payment_method even when the customer has no default', async () => {
+    const customer = makeCustomer({
+      id: 'cus_sub_level_pm',
+      default_source: null,
+      invoice_settings: { default_payment_method: null } as any,
+    });
+    mockSubscriptionPage([
+      makeSubscription({
+        id: 'sub_with_own_pm',
+        customer,
+        default_payment_method: 'pm_on_subscription',
+      } as any),
+    ]);
+    mockStripe.invoices.list.mockResolvedValueOnce({ data: [{ id: 'in_sub_pm', status: 'paid' }] });
+
+    const flags = await detectMrrCollectionGaps();
+
+    expect(flags).toHaveLength(0);
   });
 
   it('reproduces the three named real-book leaks as a fixture-driven regression (Story With AI, Corgi, PMPS)', async () => {
