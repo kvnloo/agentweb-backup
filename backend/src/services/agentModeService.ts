@@ -6144,6 +6144,7 @@ export class AgentModeService {
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables',
+    'diagnose_scheduled_chat_storage', // ENG-1071: byte-usage breakdown when a save fails/is at risk
 
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
