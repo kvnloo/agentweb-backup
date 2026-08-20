@@ -128,6 +128,14 @@ logical_lines() {
 # hazards, and a detector that misses them gives false assurance. Raised by
 # CodeRabbit on #1061. `[^|;&]*` keeps the search inside one command so a later
 # command on the same logical line cannot lend it a `-q`.
+# What is deliberately NOT here: `grep -s`. In GNU grep that is
+# `--no-messages`, which suppresses error output and reads its input to EOF —
+# it does not exit early and is not a hazard. The similar spelling to
+# `--silent` makes that easy to get wrong in either direction, so both are
+# pinned by fixtures: `| grep -s x` must stay clean, while `| grep -sq x` must
+# be flagged, because the combined form still carries the q. Raised as a
+# question by CodeRabbit on #2530; the behaviour was already correct, and the
+# fixtures are what stop a later edit from quietly changing it.
 EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep[[:space:]]+([^|;&]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--(quiet|silent))([[:space:]]|;|$)|head([[:space:]]|$))'
 
 # Normalise into a FILE and prove it worked, so a broken scanner cannot present
@@ -234,6 +242,7 @@ printf '%s' "${content}" |
 if printf '%s' "${content}" | grep -e "${needle}" -q; then :; fi
 if printf '%s' "${content}" | grep --quiet "${needle}"; then :; fi
 if printf '%s' "${content}" | grep --silent "${needle}"; then :; fi
+if printf '%s' "${content}" | grep -sq "${needle}"; then :; fi
 PROBE
 # `|| n=0` would reintroduce exactly the masking removed from the scan above:
 # `grep -c` exits 1 for "no matches", so the fallback cannot tell that from a
@@ -245,10 +254,10 @@ if probe_norm="$(normalise "${probe}")"; then
 else
   n_flagged='normalisation-failed'
 fi
-if [ "${n_flagged}" = "8" ]; then
+if [ "${n_flagged}" = "9" ]; then
   pass "the rule actually detects the shape it exists to ban"
 else
-  fail "the detector flagged ${n_flagged} of 8 known-bad pipelines." \
+  fail "the detector flagged ${n_flagged} of 9 known-bad pipelines." \
        "The probe carries -qF, -Fxq and 'head -n 1' precisely because an" \
        "earlier expression anchored the q at the end of the flag group and" \
        "matched none of them, reporting every file clean. A detector that" \
@@ -274,6 +283,7 @@ check_a || check_b || grep -q "${pattern}" <<<"${subject}"
 some_cmd || head -n 1 <<<"${subject}"
 run_something ||
   grep -qF "${needle}" <<<"${content}"
+producer | grep -s "${needle}"
 CLEAN
 if clean_norm="$(normalise "${clean_probe}")"; then
   false_hits="$(filter_and_match "${clean_norm}")"; rc=$?
