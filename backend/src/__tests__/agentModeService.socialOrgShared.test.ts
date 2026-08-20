@@ -35,6 +35,7 @@ import { AgentModeService } from '../services/agentModeService';
 import {
   getAccountsWithOwnerIncludingOrgShared,
   getAccountByIdConsistent,
+  getAccountsByUserId,
 } from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
 
@@ -44,6 +45,10 @@ const mockAccessible = getAccountsWithOwnerIncludingOrgShared as jest.MockedFunc
 const mockConsistent = getAccountByIdConsistent as jest.MockedFunction<
   typeof getAccountByIdConsistent
 >;
+// getPostsForUser (socialPostsService, real/unmocked here) re-fetches accounts itself via
+// this — separate from mockAccessible, which only gates loadConnectedAccountPosts's own
+// existence check via resolveAccessibleAccount.
+const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
 const mockSocial = socialPlatformService as jest.Mocked<typeof socialPlatformService>;
 
 const CALLER = 'caller-user-1';
@@ -75,6 +80,8 @@ describe('AgentModeService — org-shared accounts on social read paths (ENG-943
     getAccountMetrics: jest.fn(),
     getPostAnalytics: jest.fn(),
     createReaction: jest.fn(),
+    listPosts: jest.fn(),
+    getPostMetrics: jest.fn(),
   };
 
   beforeEach(() => {
@@ -210,6 +217,42 @@ describe('AgentModeService — org-shared accounts on social read paths (ENG-943
       expect(result.success).toBe(false);
       expect(result.message).toBe('Account not found or access denied');
       expect(adapter.getPostAnalytics).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-1385: loadConnectedAccountPosts was the one sibling ENG-943 missed — it
+  // resolved existence via a plain per-caller lookup, so a company page listed by
+  // list_connected_accounts (org-shared-aware) came back "Account not found or
+  // access denied" from list_connected_account_posts. Unlike the other siblings
+  // above, this one calls through to the real (unmocked) getPostsForUser in
+  // socialPostsService, which does its OWN internal account re-fetch via
+  // getAccountsByUserId — so the owner id has to reach that second lookup too,
+  // not just the first existence check.
+  describe('loadConnectedAccountPosts', () => {
+    it('loads a teammate’s org-shared account posts as its OWNER', async () => {
+      mockGetAccountsByUserId.mockImplementation(async (uid: string) =>
+        uid === OWNER ? [sharedLinkedIn] as any : []
+      );
+      adapter.listPosts.mockResolvedValue([
+        { id: 'urn:li:share:1', commentary: 'A post', author: sharedLinkedIn.account_id },
+      ]);
+
+      const result = await service.loadConnectedAccountPosts(CALLER, sharedLinkedIn.account_id, {});
+
+      expect(result.success).toBe(true);
+      expect(adapter.listPosts).toHaveBeenCalledWith(
+        sharedLinkedIn,
+        expect.anything(),
+        OWNER
+      );
+    });
+
+    it('rejects an account the caller cannot reach', async () => {
+      const result = await service.loadConnectedAccountPosts(CALLER, 'urn:li:organization:nope', {});
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
+      expect(adapter.listPosts).not.toHaveBeenCalled();
     });
   });
 });
