@@ -85,6 +85,16 @@ describe('evaluateBudgetVariance', () => {
   it('exposes the default threshold constant used when none is passed', () => {
     expect(DEFAULT_BUDGET_VARIANCE_THRESHOLD_PCT).toBeGreaterThan(0);
   });
+
+  it('does not flag malformed (NaN) budget inputs — reports a data gap instead of a false positive', () => {
+    const result = evaluateBudgetVariance({ configuredCapCents: NaN, actualSpendCents: 500_00 });
+    expect(result.flagged).toBe(false);
+    expect(result.reason).toMatch(/not finite/i);
+
+    const result2 = evaluateBudgetVariance({ configuredCapCents: 1000_00, actualSpendCents: NaN });
+    expect(result2.flagged).toBe(false);
+    expect(result2.reason).toMatch(/not finite/i);
+  });
 });
 
 describe('evaluateAdConnectivity', () => {
@@ -126,6 +136,13 @@ describe('evaluateAdConnectivity', () => {
     ]);
     expect(result.flagged).toBe(false);
   });
+
+  it('accepts an explicit evaluation time so the same inputs give the same result deterministically', () => {
+    const fixedNow = 1_700_000_000_000;
+    const token = { platform: 'meta', config: { token_expires_at: fixedNow + 1000 } } as any;
+    expect(evaluateAdConnectivity([token], fixedNow).flagged).toBe(false);
+    expect(evaluateAdConnectivity([token], fixedNow + 2000).flagged).toBe(true);
+  });
 });
 
 describe('evaluateAccountHealth (composition, no false positives)', () => {
@@ -151,6 +168,7 @@ describe('evaluateAccountHealth (composition, no false positives)', () => {
     });
     expect(result.flagged).toBe(true);
     expect(result.flags.map((f) => f.check)).toEqual(['pixel']);
+    expect(result.flags[0].reason).toMatch(/destination.*no pixel/i);
   });
 
   it('flags exactly the failing check when only the budget check fails (Haven reconstruction)', () => {

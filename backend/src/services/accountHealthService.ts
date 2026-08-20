@@ -88,6 +88,13 @@ export const DEFAULT_BUDGET_VARIANCE_THRESHOLD_PCT = 10;
  */
 export function evaluateBudgetVariance(input: BudgetVarianceInput): HealthFlag {
   const thresholdPct = input.thresholdPct ?? DEFAULT_BUDGET_VARIANCE_THRESHOLD_PCT;
+  if (
+    !Number.isFinite(input.configuredCapCents) ||
+    !Number.isFinite(input.actualSpendCents) ||
+    !Number.isFinite(thresholdPct)
+  ) {
+    return { flagged: false, reason: 'budget inputs are not finite numbers — cannot evaluate variance' };
+  }
   if (input.configuredCapCents <= 0) {
     return { flagged: false, reason: 'no cap configured for this account' };
   }
@@ -116,12 +123,12 @@ export interface ConnectivityAccountInput {
  * Generalizes `renewalIntegrationHealthCron.hasHealthyAdIntegration` to run for every
  * account on every sweep rather than only inside the pre-renewal lookahead window.
  */
-export function evaluateAdConnectivity(accounts: ConnectivityAccountInput[]): HealthFlag {
+export function evaluateAdConnectivity(accounts: ConnectivityAccountInput[], nowMs: number = Date.now()): HealthFlag {
   const adAccounts = accounts.filter((acc) => acc && AD_HEALTH_PLATFORMS.has(acc.platform));
   if (adAccounts.length === 0) {
     return { flagged: true, reason: 'no ad-platform account connected' };
   }
-  const now = Date.now();
+  const now = nowMs;
   const hasValid = adAccounts.some(
     (acc) => acc.config && typeof acc.config.token_expires_at === 'number' && acc.config.token_expires_at > now,
   );
@@ -152,7 +159,7 @@ export interface AccountHealthInput {
  * (e.g. disconnected AND overspent) is visible as more than one entry, not collapsed
  * into a single undifferentiated alert.
  */
-export function evaluateAccountHealth(input: AccountHealthInput): AccountHealthResult {
+export function evaluateAccountHealth(input: AccountHealthInput, nowMs: number = Date.now()): AccountHealthResult {
   const flags: Array<{ check: AccountHealthCheck; reason?: string }> = [];
 
   const pixel = evaluatePixelHealth(input.pixel);
@@ -161,7 +168,7 @@ export function evaluateAccountHealth(input: AccountHealthInput): AccountHealthR
   const budget = evaluateBudgetVariance(input.budget);
   if (budget.flagged) flags.push({ check: 'budget', reason: budget.reason });
 
-  const connectivity = evaluateAdConnectivity(input.connectedAccounts);
+  const connectivity = evaluateAdConnectivity(input.connectedAccounts, nowMs);
   if (connectivity.flagged) flags.push({ check: 'connectivity', reason: connectivity.reason });
 
   return { userId: input.userId, flagged: flags.length > 0, flags };
