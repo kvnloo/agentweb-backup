@@ -351,9 +351,12 @@ describe('usageRecorderService', () => {
 
   describe('computeCostMicroUsd', () => {
     it('computes token cost in integer microdollars', () => {
-      // gpt-5-chat-2: in $2.5/M, out $10/M
-      expect(computeCostMicroUsd('gpt-5-chat-2', 1_000_000, 100_000)).toBe(
-        2_500_000 + 1_000_000
+      // gpt-5.5: in $5/M, out $30/M. See llmPricing.ts MODEL_PRICING.
+      // (Was pinned on gpt-5-chat-2 — removed from the registry 2026-08-19
+      // along with its pricing entry, as part of migrating off the Rui-owned
+      // Azure resource; see agentModeService.ts's LEGACY_MODEL_ALIASES comment.)
+      expect(computeCostMicroUsd('gpt-5.5', 1_000_000, 100_000)).toBe(
+        5_000_000 + 3_000_000
       );
     });
 

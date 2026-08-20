@@ -6,11 +6,18 @@ import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, ut
 import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 import {
   assertCountingType,
+  assertConversionActionStatus,
+  assertCreatableConversionActionStatus,
+  describeGoogleAdsError,
   parseTagSnippets,
   diffConversionAction,
   type ConversionActionDrift,
   type ConversionTagPair,
 } from '../utils/googleAdsConversionActions';
+import {
+  summarizePartialFailure,
+  type ConversionUploadFailure,
+} from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -86,8 +93,22 @@ export class GoogleAdsService {
       }
       return response.data;
     } catch (err: any) {
+      // Log ONLY the response body — never the error object at large, which carries the
+      // full request config including its headers. The body is the part with diagnostic
+      // value; the rest is noise at best.
       const detail = err?.response?.data;
       console.error('[GoogleAds] callApi error:', JSON.stringify(detail, null, 2));
+      // Google's body names the exact field or error code; axios's own message is only
+      // "Request failed with status code 400", so that detail reached the log and nowhere
+      // else. Enrich the message in place and rethrow the SAME error.
+      //
+      // Deliberately NOT a new Error wrapping this one. Callers read Google Ads error
+      // codes straight off `err.response.data.error.details[0].errors[]` — agentModeService
+      // builds its errorType/errorCode for CAMPAIGN_CRITERION from exactly that — so
+      // replacing the object silently degrades every Google Ads failure to a generic
+      // message. Caught by googleAdsService.test.ts asserting the original is rethrown.
+      const described = describeGoogleAdsError(err);
+      if (described) err.message = described;
       throw err;
     }
   }
@@ -106,6 +127,11 @@ export class GoogleAdsService {
       pages++;
     } while (pageToken && pages < MAX_PAGES);
     return all;
+  }
+
+  /** Internal passthrough for endpoints that are not `:mutate` (e.g. conversionUploads). */
+  private async callApiPublic(method: 'GET' | 'POST', path: string, accessToken: string, body?: any, loginCustomerId?: string): Promise<any> {
+    return this.callApi(method, path, accessToken, body, loginCustomerId);
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
@@ -431,7 +457,14 @@ export class GoogleAdsService {
       type: 'WEBPAGE',
       category: params.category,
       countingType,
-      status: params.status || 'ENABLED',
+      // Validated, not passed through: ConversionActionStatus has no PAUSED, and an
+      // unvalidated value returns an opaque 400 (ENG-1329 e2e).
+      //
+      // Keyed on `undefined`, not falsiness. `status: ''` is a supplied-but-invalid value,
+      // and treating it as "omitted" would silently create an ENABLED action off a request
+      // the caller got wrong — the same silent-substitution the PAUSED fix exists to stop,
+      // and inconsistent with updateConversionAction, which validates every defined status.
+      status: params.status === undefined ? 'ENABLED' : assertCreatableConversionActionStatus(params.status),
     };
     if (params.primaryForGoal !== undefined) create.primaryForGoal = params.primaryForGoal;
     if (params.clickThroughLookbackWindowDays !== undefined) {
@@ -480,7 +513,21 @@ export class GoogleAdsService {
     const requested: Record<string, unknown> = {};
 
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
-    if (params.status !== undefined) { update.status = params.status; updateMask.push('status'); requested.status = params.status; }
+    if (params.status !== undefined) {
+      const status = assertConversionActionStatus(params.status);
+      // status=REMOVED reaches the same end as the REMOVE operation, and REMOVE carries the
+      // confirmation gate. Route it there rather than letting UPDATE be an unconfirmed
+      // back door to the same irreversible change.
+      if (status === 'REMOVED') {
+        throw new Error(
+          'To stop a conversion action recording, use CONVERSION_ACTION REMOVE with '
+          + 'confirm_conversion_action_removal=true rather than UPDATE status=REMOVED — the '
+          + 'change is permanent and cannot be re-enabled, so it goes through the confirmation '
+          + 'step. Conversions already recorded stay in your reports either way.',
+        );
+      }
+      update.status = status; updateMask.push('status'); requested.status = status;
+    }
     if (params.category !== undefined) { update.category = params.category; updateMask.push('category'); requested.category = params.category; }
     if (params.countingType !== undefined) {
       const countingType = assertCountingType(params.countingType);
@@ -505,6 +552,61 @@ export class GoogleAdsService {
 
     const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
     return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
+  }
+
+  /**
+   * Retire a conversion action. Google models this as a soft state, not a delete: the
+   * action stops recording, and conversions it already recorded stay in reporting — the
+   * same way a REMOVED campaign still returns its historical metrics.
+   *
+   * Scope note: ENG-1329 deferred this, on the stated basis that removal "severs historical
+   * attribution". The end-to-end run showed that premise is only half right — it cannot be
+   * undone, but nothing already attributed is lost — and that HIDDEN, the alternative every
+   * earlier message recommended, cannot be set through the API at all. That left no working
+   * retire path, which is the "if REMOVE is needed later" case that decision anticipated.
+   *
+   * The caller-facing confirmation lives in the handler, not here, so this stays a plain
+   * service method like removeBudget/removeCampaign.
+   */
+  async removeConversionAction(userId: string, customerId: string, resourceName: string): Promise<void> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+  }
+
+  /**
+   * Upload offline conversions keyed on gclid (ENG-1325).
+   *
+   * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
+   * past its lookback window should upload forty-nine, not zero — an all-or-nothing batch
+   * turns one stale row into a silent gap across the whole run. The caller gets the
+   * per-row failures back so "uploaded" never quietly means "some of them".
+   *
+   * `validateOnly` exists for the same reason the drift read-back does: this runs from a
+   * background sweep with nobody watching, so being able to rehearse a batch before
+   * committing it is the difference between a caught mistake and a discovered one.
+   */
+  async uploadClickConversions(
+    userId: string,
+    customerId: string,
+    conversions: Record<string, unknown>[],
+    opts?: { validateOnly?: boolean },
+  ): Promise<{ uploaded: number; failures: ConversionUploadFailure[]; raw: any }> {
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      throw new Error('At least one conversion is required for an offline conversion upload.');
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const raw = await this.callApiPublic(
+      'POST',
+      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      accessToken,
+      { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
+      loginCustomerId,
+    );
+    const failures = summarizePartialFailure(raw);
+    // Counted from what Google accepted, not from what we sent — those differ exactly
+    // when partial failure fires, which is the case this reporting exists for.
+    return { uploaded: Math.max(0, conversions.length - failures.length), failures, raw };
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────
