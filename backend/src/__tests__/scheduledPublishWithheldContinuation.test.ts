@@ -31,6 +31,11 @@ import {
 } from '../controllers/agentModeController';
 
 const MARKER = 'PUBLISH WITHHELD: this schedule requires approval before publishing.';
+// ENG-1245: the never-granted branch's own terminal marker — same infra role as
+// MARKER (ends the run, suppresses the confirmation-halt classifier), but it must
+// never assert the "Require approval before publishing" toggle is why the run was
+// withheld when that specific setting isn't actually what happened.
+const MARKER_NOT_GRANTED = 'PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.';
 
 describe('scheduledRunWithheldPublish (ENG-803)', () => {
   it('recognises the marker the withheld branch mandates', () => {
@@ -50,6 +55,20 @@ describe('scheduledRunWithheldPublish (ENG-803)', () => {
     expect(scheduledRunWithheldPublish(undefined)).toBe(false);
     expect(scheduledRunWithheldPublish(null as any)).toBe(false);
   });
+
+  // ENG-1245: the never-granted branch's report must not be forced to say "requires
+  // approval before publishing" when the owner never touched that setting — so its
+  // own marker sentence has to be recognised too, not just the genuine-hold one.
+  it('also recognises the never-granted branch\'s own accurate marker', () => {
+    expect(scheduledRunWithheldPublish(`Drafts saved.\n\n${MARKER_NOT_GRANTED}`)).toBe(true);
+  });
+
+  it('does not cross-match the never-granted marker\'s wording as the genuine-hold one, or vice versa', () => {
+    // Each marker is its own complete sentence — neither is a substring of the other,
+    // so this is really pinning that both are matched independently, not confused.
+    expect(scheduledRunWithheldPublish(MARKER)).toBe(true);
+    expect(scheduledRunWithheldPublish(MARKER_NOT_GRANTED)).toBe(true);
+  });
 });
 
 describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)', () => {
@@ -66,6 +85,12 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
   it('returns null once a genuinely WITHHELD run emits the marker — the run is complete', () => {
     expect(
       classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER}` }, false)
+    ).toBeNull();
+  });
+
+  it('returns null on the never-granted branch\'s own marker too (ENG-1245) — same exemption, different accurate wording', () => {
+    expect(
+      classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER_NOT_GRANTED}` }, false)
     ).toBeNull();
   });
 

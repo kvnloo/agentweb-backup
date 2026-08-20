@@ -290,11 +290,16 @@ describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', 
     expect(neverGranted).toMatch(/Require approval before publishing.*(is already off|not what|will not change|does not (govern|change))/i);
   });
 
-  it('the never-granted branch still ends on the SAME terminal marker string as the genuine-hold branch', () => {
-    // Load-bearing: PUBLISH_WITHHELD_MARKER in agentModeController.ts matches this
-    // exact string. Changing it here would silently break the nudge-loop guard for
-    // every never-granted schedule.
-    expect(neverGranted).toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+  it('the never-granted branch ends on its OWN accurate terminal marker, not the genuine-hold one', () => {
+    // ENG-1245: originally these had to stay byte-identical because
+    // PUBLISH_WITHHELD_MARKER in agentModeController.ts only matched one string.
+    // That regex now matches both variants (see scheduledPublishWithheldContinuation
+    // .test.ts), so the marker can finally say the true reason instead of always
+    // blaming "requires approval before publishing" on a schedule where that
+    // specific setting was never touched.
+    expect(neverGranted).toContain('PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.');
+    expect(neverGranted).not.toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+    expect(genuineHold).toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
   });
 
   it('the never-granted branch keeps every unconditional rule the genuine-hold branch has', () => {
