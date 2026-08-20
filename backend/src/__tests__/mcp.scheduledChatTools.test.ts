@@ -42,13 +42,14 @@ describe('Scheduled Chat MCP Tools', () => {
   // ─── FAIL tests: invalid inputs, boundary conditions, error paths ────
 
   describe('registration', () => {
-    it('should register all 5 scheduled chat tools', () => {
+    it('should register all 6 scheduled chat tools', () => {
       const names = mcpToolRegistry.getToolNames();
       expect(names).toContain('list_scheduled_chats');
       expect(names).toContain('manage_scheduled_chat');
       expect(names).toContain('test_scheduled_chat');
       expect(names).toContain('get_scheduled_chat_test_history');
       expect(names).toContain('submit_scheduled_chat_variables');
+      expect(names).toContain('diagnose_scheduled_chat_storage');
     });
 
     it('exposes an explicit backup model for scheduled chat create/update', () => {
@@ -559,6 +560,44 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(text.toLowerCase()).toContain('poll');
       // Must instruct the model not to report an empty result as a finished run
       expect(text.toLowerCase()).toContain('do not');
+    });
+  });
+
+  describe('diagnose_scheduled_chat_storage', () => {
+    it('should call GET /api/agent-mode/scheduled-chats/:id/storage-diagnostics', async () => {
+      mockMcpFetch.mockResolvedValue({
+        totalBytes: 435200,
+        limitBytes: 409600,
+        budgetBytes: 389120,
+        fields: { currentPrompt: 35840, promptRevisions: 340000, runResults: 58000, other: 1360 },
+        dominantField: 'promptRevisions',
+        approachingLimit: true,
+        correctiveAction: 'Shorten the starting message.',
+      });
+
+      const result = await mcpToolRegistry.execute('diagnose_scheduled_chat_storage', {
+        schedule_id: 'sc-1',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'GET',
+        path: '/api/agent-mode/scheduled-chats/sc-1/storage-diagnostics',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      });
+      expect(result.content[0].text).toContain('promptRevisions');
+      expect(result.content[0].text).toContain('approachingLimit');
+    });
+
+    it('should propagate HTTP errors from mcpFetch', async () => {
+      mockMcpFetch.mockRejectedValue(new Error('API error (404): Scheduled chat not found'));
+      await expect(
+        mcpToolRegistry.execute('diagnose_scheduled_chat_storage', { schedule_id: 'missing' }, context)
+      ).rejects.toThrow('API error (404)');
+    });
+
+    it('requires schedule_id in its input schema', () => {
+      const definition: any = mcpToolRegistry.getTool('diagnose_scheduled_chat_storage')?.definition;
+      expect(definition.inputSchema.required).toContain('schedule_id');
     });
   });
 
