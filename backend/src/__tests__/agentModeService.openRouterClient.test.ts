@@ -153,6 +153,37 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect((client as any)._config?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
+  it('sends every registered OpenRouter model to the upstream API without the internal prefix', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    const models = (service as any).llmModels;
+    const openRouterModels = Object.keys(models).filter((modelId) => modelId.startsWith('openrouter/'));
+
+    expect(openRouterModels.length).toBeGreaterThan(0);
+
+    for (const modelId of openRouterModels) {
+      create.mockClear();
+      models[modelId].client = { chat: { completions: { create } } };
+
+      await service.callLLM(modelId, [{ role: 'user', content: 'Hello' }]);
+
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({
+        model: modelId.slice('openrouter/'.length),
+      }));
+    }
+  });
+
+  it('keeps non-OpenRouter model IDs unchanged in provider requests', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    const models = (service as any).llmModels;
+    models['gpt-5.4'].client = { chat: { completions: { create } } };
+
+    await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }));
+  });
+
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as
   // unproven-in-our-stack). Harsha: "i'm fine to include open source /
   // open router stuff for all users not just isadmin" — removed from all
