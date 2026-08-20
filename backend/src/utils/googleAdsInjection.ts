@@ -51,6 +51,35 @@ const CONVERSION_ID = /^AW-[0-9]{6,}$/;
  * verifyGoogleAdsInjection check then naturally reports this as a failed injection
  * (fail loud), same as any other layout shape the insertion cannot handle.
  */
+/**
+ * Find Google Ads ids present in the layout OUTSIDE our own delimited block.
+ *
+ * The drift guard used to look only for `{/* Google Ads Tag *\/}` — our own handiwork —
+ * which meant a tag we did not install was invisible. Proven against the real ENG-1182
+ * lander, whose gtag was hand-written under a different comment: installing the same id
+ * produced two loaders, and installing a DIFFERENT id put two distinct AW ids on one
+ * page. That is the ENG-910 double-count this guard exists to prevent, walked straight
+ * past because it only ever recognised its own work.
+ *
+ * Matches the same shape RULE 7.5's detector looks for, so "a tag the gate would see" and
+ * "a tag we consider present" cannot disagree.
+ */
+function foreignGoogleAdsIds(content: string): string[] {
+  const withoutOurs = content.replace(
+    /\{\/\* Google Ads Tag \*\/\}[\s\S]*?\{\/\* End Google Ads Tag \*\/\}/g,
+    '',
+  );
+  // Scoped to <script> elements, not the whole file. An id in prose is not a tag — v0
+  // writes marketing copy, and a page whose body happens to quote a gtag URL must not
+  // read as tracked, or RULE 7.5 would pass a page that fires nothing. Conversely a
+  // hand-written loader or config call inside a script IS a live tag, whoever wrote it.
+  const ids = new Set<string>();
+  for (const script of withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []) {
+    for (const id of script.match(/\bAW-[0-9]{6,}\b/gi) || []) ids.add(id.toUpperCase());
+  }
+  return [...ids];
+}
+
 export function injectGoogleAdsIntoLayout(currentContent: string, conversionId: string): string {
   if (currentContent.length > MAX_LAYOUT_SIZE_BYTES) return currentContent;
 
@@ -64,6 +93,27 @@ export function injectGoogleAdsIntoLayout(currentContent: string, conversionId: 
       + 'not a valid AW-<digits> value. Layout left untouched.',
     );
     return currentContent;
+  }
+
+  // A tag someone else put here — hand-written, or installed by another tool — is still a
+  // tag, and we cannot safely rewrite markup we did not author.
+  if (conversionId !== '') {
+    const foreign = foreignGoogleAdsIds(currentContent);
+    if (foreign.length > 0) {
+      if (foreign.length === 1 && foreign[0] === conversionId.toUpperCase()) {
+        // Already carrying exactly the id we were asked to install. The page IS
+        // measurable, so leave it alone and let verify report it as installed —
+        // refusing would mark a tracked page untracked and have RULE 7.5 block a
+        // launch that is perfectly fine.
+        return currentContent;
+      }
+      console.error(
+        `[GOOGLE ADS INJECTION] ABORTED for conversion id ${conversionId}: the layout already `
+        + `carries Google Ads tag(s) ${foreign.join(', ')} that we did not install. Adding ours `
+        + 'would fire two different conversion ids from one page (ENG-910). Layout left untouched.',
+      );
+      return currentContent;
+    }
   }
 
   const adsSnippet =
@@ -132,6 +182,13 @@ export function verifyGoogleAdsInjection(content: string, conversionId: string):
   // Without this, a hostile id whose payload happened to appear inside an existing block
   // could read as installed.
   if (!CONVERSION_ID.test(conversionId)) return false;
+
+  // A hand-written tag carrying this exact id counts as installed: the question this
+  // answers is "will a conversion fire against this id", not "did we write it".
+  if (blocks.length === 0) {
+    const foreign = foreignGoogleAdsIds(content);
+    return foreign.length === 1 && foreign[0] === conversionId.toUpperCase();
+  }
 
   return (
     blocks.length === 1 &&
