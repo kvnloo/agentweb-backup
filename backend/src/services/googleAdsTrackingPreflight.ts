@@ -248,19 +248,35 @@ function buildBlockMessage(blocked: UrlTrackingResult[]): string {
  */
 function buildWarnMessage(results: UrlTrackingResult[], warnings: UrlTrackingWarning[]): string {
   const lines = warnings.map((w) => `  • ${w.url} — found ${w.mechanisms.join(', ')}, but no Google Ads conversion tag (AW-…)`);
+  // Only mention GTM when GTM is actually what we found. Telling someone with a GA4-only
+  // page to "open GTM Preview on the container" sends them looking for a container that
+  // does not exist — and advice that does not match what the operator can see is how a
+  // warning gets written off as noise.
+  const anyGtm = warnings.some((w) => w.mechanisms.some((m) => m.startsWith('GTM:')));
+  const why = anyGtm
+    ? 'A GTM container is a place where tags may live, not evidence that an Ads conversion tag '
+      + 'is inside it — and a container\'s contents cannot be read over HTTP. If the conversion '
+      + 'fires from inside GTM this is fine; if it does not, the campaign will bid toward a '
+      + 'conversion the page can never report.'
+    : 'A GA4 property measures analytics, not Google Ads conversions — they are separate '
+      + 'systems, and a page can report to GA4 while recording nothing against your Ads '
+      + 'conversion action. If the conversion is imported from GA4 this is fine; if it is not, '
+      + 'the campaign will bid toward a conversion the page can never report.';
+  const how = anyGtm
+    ? 'To settle it: submit the form on that page and confirm a request to '
+      + 'googleadservices.com/pagead/conversion/… carrying your conversion label, or open GTM '
+      + 'Preview on the container and check an Ads conversion tag fires.'
+    : 'To settle it: submit the form on that page and confirm a request to '
+      + 'googleadservices.com/pagead/conversion/… carrying your conversion label, or check that '
+      + 'the GA4 conversion is imported into Google Ads as a conversion action.';
   return [
     'Pre-flight tracking check passed with a warning. These URLs are measurable, but nothing ' +
       'on them proves a Google Ads conversion can be recorded:',
     ...lines,
     '',
-    'A GTM container is a place where tags may live, not evidence that an Ads conversion tag ' +
-      'is inside it — and a container\'s contents cannot be read over HTTP. If the conversion ' +
-      'fires from inside GTM this is fine; if it does not, the campaign will bid toward a ' +
-      'conversion the page can never report.',
+    why,
     '',
-    'To settle it: submit the form on that page and confirm a request to ' +
-      'googleadservices.com/pagead/conversion/… carrying your conversion label, or open GTM ' +
-      'Preview on the container and check an Ads conversion tag fires.',
+    how,
   ].join('\n');
 }
 

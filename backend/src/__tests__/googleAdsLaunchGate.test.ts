@@ -293,3 +293,41 @@ describe('ENG-1358 — a GTM-only page warns, and the warning must ESCAPE the ga
     expect(result.trackingWarning).toContain('GTM-NFWK798Z');
   });
 });
+
+describe('ENG-1358 — every launch route relays the warning, not just RESUME/UPDATE (CodeRabbit, #2516)', () => {
+  // CodeRabbit caught this, and it is the exact failure the fix's own comment names:
+  // "a warning that is computed and discarded is the same as no warning at all". Adding a
+  // creative to an already-ENABLED campaign is a launch by another route, and both of
+  // those call sites read gate.proceed while ignoring gate.warning.
+  const warnedGate = {
+    ok: true,
+    results: [{ url: 'https://acme.com/compare', status: 'measured', mechanisms: ['GTM:GTM-NFWK798Z'], checkedFor: [] }],
+    blockedUrls: [],
+    warnings: [{ url: 'https://acme.com/compare', mechanisms: ['GTM:GTM-NFWK798Z'] }],
+    message: 'Pre-flight tracking check passed with a warning. …GTM-NFWK798Z… no Google Ads conversion tag (AW-…)',
+  };
+
+  it('AD CREATE on an ENABLED campaign relays the warning', async () => {
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    (googleAdsService.getAdGroupParentCampaign as jest.Mock)?.mockResolvedValue?.({
+      campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED',
+    });
+    const result: any = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE',
+      ad_group_resource_name: 'customers/1234567890/adGroups/1', type: 'SEARCH',
+      headlines: ['a', 'b', 'c'], descriptions: ['d', 'e'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+    if (result.success) expect(result.trackingWarning).toContain('GTM-NFWK798Z');
+  });
+
+  it('the two creative routes read gate.warning at all', () => {
+    // Guards the wiring itself: if a future edit drops the capture, this fails even when
+    // the mock-heavy handler test above cannot reach its success path.
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '../services/agentModeService.ts'), 'utf8');
+    const captures = src.match(/creativeTrackingWarning = gate\.warning;/g) || [];
+    expect(captures).toHaveLength(2);
+    const relays = src.match(/trackingWarning: creativeTrackingWarning/g) || [];
+    expect(relays).toHaveLength(2);
+  });
+});

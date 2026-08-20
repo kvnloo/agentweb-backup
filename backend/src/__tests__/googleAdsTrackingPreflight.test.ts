@@ -302,3 +302,37 @@ describe('fetch-failure fallbacks (pre-existing branches, closed while here)', (
     expect(out.results).toEqual([]);
   });
 });
+
+describe('the warning must describe what was actually found (CodeRabbit, #2516)', () => {
+  // Telling someone with a GA4-only page to "open GTM Preview on the container" sends
+  // them looking for a container that does not exist. Advice that does not match what the
+  // operator can see is how a warning gets written off as noise.
+  const page = (b: string) => `<html><head>${b}</head><body>x</body></html>`;
+  const gtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const ga4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+  const gate = (html: string) => preflightTrackingGate(['https://x.test/'], { fetchHtml: async () => html });
+
+  it('a GA4-only page is not described as having a GTM container', async () => {
+    const out = await gate(ga4Only);
+    expect(out.message).not.toMatch(/GTM container/);
+    expect(out.message).not.toMatch(/GTM Preview/);
+  });
+
+  it('a GA4-only page is told the GA4-specific thing to check', async () => {
+    const out = await gate(ga4Only);
+    expect(out.message).toMatch(/GA4 property measures analytics/);
+    expect(out.message).toMatch(/imported into Google Ads/);
+  });
+
+  it('a GTM page still gets the GTM advice', async () => {
+    const out = await gate(gtmOnly);
+    expect(out.message).toMatch(/GTM Preview/);
+    expect(out.message).toMatch(/place where tags may live/);
+  });
+
+  it('both messages still name the beacon check, which works either way', async () => {
+    for (const html of [gtmOnly, ga4Only]) {
+      expect((await gate(html)).message).toMatch(/googleadservices\.com/);
+    }
+  });
+});
