@@ -118,6 +118,9 @@ import {
   scheduledRunSignalsConditionalSkip,
   reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
+import { callSatisfiesRequirement, countCallsSatisfyingRequirement } from '../utils/requiredCallSatisfaction';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -272,6 +275,543 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ['The post failed to publish.', 'auth failed.', 'I could not access LinkedIn.'].forEach((tail) =>
       expect(scheduledRunSignalsConditionalSkip(`Non-publishing day, skipped. ${tail}`, { now: THURSDAY, toolCalls: [], instruction })).toBe(false)
     );
+  });
+
+  it('fires on the REAL 2026-08-16 prod regression: perform_data_analysis used to check the weekday (ENG-1276, session 17834849…)', () => {
+    // The LUCAS prompt's FIRST instruction is "check today's actual weekday" — the
+    // agent complied by calling perform_data_analysis to compute the weekday via
+    // Python, THEN reported the clean skip with zero write calls. perform_data_analysis
+    // is a pure compute/read tool (runs code on caller-supplied data, no external
+    // side effects) but its name doesn't lead with any READ_ONLY_TOOL verb
+    // (get/read/list/fetch/search/describe/analyze/…), so the fail-safe allowlist
+    // misclassified it as a WRITE call, tripped the non-required-write veto (step 3),
+    // and the run was pressed with "Make sure to generate_image (1 more time needed),
+    // post_on_connected_account (1 more time needed)" despite a correct, documented
+    // skip.
+    const SUNDAY_1616 = new Date('2026-08-16T13:26:36Z');
+    expect(SUNDAY_1616.getUTCDay()).toBe(0);
+    const instruction =
+      'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+      'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped." Only proceed on Monday, Wednesday, or Friday.';
+    const realSkip =
+      '<strong>LUCAS: non-publishing day, skipped.</strong>\n\n' +
+      '<p>Weekday check ran first, as instructed:</p>\n' +
+      '<ul>\n' +
+      '<li><strong>Date:</strong> 2026-08-16</li>\n' +
+      '<li><strong>Weekday:</strong> Sunday (verified via date computation this session, not assumed)</li>\n' +
+      '<li><strong>Publishing days:</strong> Monday / Wednesday / Friday only</li>\n' +
+      '</ul>\n\n' +
+      '<p><strong>Actions taken this run: none.</strong> No post drafted, no image generated, nothing published to any of the four destinations.</p>';
+    expect(scheduledRunSignalsConditionalSkip(realSkip, {
+      now: SUNDAY_1616,
+      instruction,
+      toolCalls: [{ name: 'perform_data_analysis' }],
+    })).toBe(true);
+  });
+
+  describe('registry-declared readOnly tools (ENG-1276 follow-up)', () => {
+    const SUNDAY = new Date('2026-08-02T12:00:00Z');
+    const skipContent = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+
+    // emmaToolRegistry is a process-wide singleton — a fake tool registered by
+    // one test leaks into every test that runs after it in this file (no public
+    // unregister API), which would otherwise break the drift guard's exact-set
+    // assertion below the moment test order changes it runs after these.
+    afterEach(() => {
+      (emmaToolRegistry as any).tools?.delete('fake_registry_readonly_tool');
+      (emmaToolRegistry as any).tools?.delete('fake_registry_write_tool');
+    });
+
+    it('treats a tool the registry declares readOnly:true as read, not write', () => {
+      emmaToolRegistry.register({
+        name: 'fake_registry_readonly_tool',
+        definition: { name: 'fake_registry_readonly_tool', description: 'test', inputSchema: { type: 'object', properties: {} } },
+        execute: async () => ({}),
+        readOnly: true,
+      });
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'fake_registry_readonly_tool' }],
+      })).toBe(true);
+    });
+
+    it('still treats a registered tool with readOnly unset (or false) as a write', () => {
+      emmaToolRegistry.register({
+        name: 'fake_registry_write_tool',
+        definition: { name: 'fake_registry_write_tool', description: 'test', inputSchema: { type: 'object', properties: {} } },
+        execute: async () => ({}),
+      });
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'fake_registry_write_tool' }],
+      })).toBe(false);
+    });
+
+    it('still treats an UNREGISTERED tool name as a write (fail-safe default unchanged)', () => {
+      expect(scheduledRunSignalsConditionalSkip(skipContent, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'totally_unknown_tool_xyz' }],
+      })).toBe(false);
+    });
+
+    // Pins the PRODUCTION configuration itself — verified read-only by reading
+    // each tool's actual execute() implementation (not just its name/description,
+    // since ENG-1276 is precisely about those lying): perform_deep_research only
+    // calls Gemini Deep Research + uploads to internal S3 (no external publish);
+    // call_google_ads_reporting_api and call_linkedin_ads_insights_api only fetch
+    // analytics, with no write-capable action in their schemas at all — unlike
+    // their write-bundling siblings call_google_ads_api/call_linkedin_marketing_api,
+    // which correctly stay unflagged.
+    it('the real tool registry flags the confirmed side-effect-free analogs of perform_data_analysis', () => {
+      const readOnlyNames = ['perform_deep_research', 'call_google_ads_reporting_api', 'call_linkedin_ads_insights_api'];
+      for (const name of readOnlyNames) {
+        expect([name, emmaToolRegistry.getTool(name)?.readOnly]).toEqual([name, true]);
+        expect([name, scheduledRunSignalsConditionalSkip(skipContent, { now: SUNDAY, toolCalls: [{ name }] })]).toEqual([name, true]);
+      }
+    });
+
+    it('does NOT flag the write-bundling siblings of the read-only analytics tools', () => {
+      const writeNames = ['call_google_ads_api', 'call_linkedin_marketing_api', 'call_hubspot_api'];
+      for (const name of writeNames) {
+        expect([name, emmaToolRegistry.getTool(name)?.readOnly]).toEqual([name, undefined]);
+        expect([name, scheduledRunSignalsConditionalSkip(skipContent, { now: SUNDAY, toolCalls: [{ name }] })]).toEqual([name, false]);
+      }
+    });
+
+    // DRIFT GUARD — readOnly:true is a manual, point-in-time judgment call, made
+    // by reading each tool's actual execute() implementation (see the comments
+    // beside each registration in emma/tools.ts). Nothing else re-checks that
+    // judgment as the tool evolves: if a future edit adds a write-capable action
+    // to one of these three tools, the flag goes stale SILENTLY and creates a
+    // new false-skip bug — the exact same category that caused ENG-1276 in the
+    // first place, just relocated from a tool NAME to a tool FLAG. This walks
+    // every enum in each readOnly tool's inputSchema (that's how every write
+    // action in this codebase's tools is expressed — CREATE/UPDATE/DELETE/POST/
+    // etc., see call_google_ads_api, call_hubspot_api, twitter_manage_post) and
+    // fails loudly if one ever appears. It also pins the exact readOnly SET, so
+    // adding or removing a flag is a deliberate, reviewed edit to this test —
+    // not an incidental side effect of an unrelated change.
+    it('drift guard: no readOnly-flagged tool schema exposes a write-shaped action value', () => {
+      // \w* trails EVERY verb, not just the ones with a known compound today
+      // (SEND_TEST, ADD_ASSET, CREATE_INLINE, ...) — a bare trailing \b would
+      // miss a FUTURE compound like PUBLISH_RESULTS, since \w includes the
+      // underscore and there is no boundary between PUBLISH and _RESULTS.
+      // Widened on independent review (ENG-1276 follow-up): the original list
+      // was drawn from verbs already observed in THIS registry's write tools,
+      // which is exactly the reactive-allowlist trap this whole drift guard
+      // exists to avoid for the readOnly flag itself. Added plausible future
+      // write verbs that hadn't appeared yet — CANCEL/APPROVE/REJECT/SCHEDULE/
+      // SUBSCRIBE/FOLLOW/BLOCK/ARCHIVE/ASSIGN/TAG/SHARE/GRANT/REVOKE/TRANSFER/
+      // MERGE — none of which collide with any current readOnly tool's actual
+      // enum values (verified by running this test after widening).
+      const WRITE_SHAPED_VALUE = /\b(?:CREATE|UPDATE|DELETE|REMOVE|POST|PUBLISH|SEND|UPLOAD|ADD|ATTACH|REPOST|COMMENT|REACT|LIKE|UNLIKE|RETWEET|UNRETWEET|PAUSE|RESUME|ENABLE|DISABLE|WRITE|SET|MODIFY|EDIT|RETAG_UTM|CANCEL|APPROVE|REJECT|SCHEDULE|SUBSCRIBE|FOLLOW|UNFOLLOW|BLOCK|UNBLOCK|ARCHIVE|UNARCHIVE|ASSIGN|UNASSIGN|TAG|UNTAG|SHARE|GRANT|REVOKE|TRANSFER|MERGE)\w*/i;
+
+      function collectEnumValues(schema: any, out: string[] = []): string[] {
+        if (!schema || typeof schema !== 'object') return out;
+        if (Array.isArray(schema.enum)) out.push(...schema.enum);
+        for (const value of Object.values(schema)) {
+          if (value && typeof value === 'object') collectEnumValues(value, out);
+        }
+        return out;
+      }
+
+      const readOnlyTools = emmaToolRegistry.getAllTools().filter((t) => t.readOnly === true);
+      expect(readOnlyTools.map((t) => t.name).sort()).toEqual([
+        'call_google_ads_reporting_api',
+        'call_linkedin_ads_insights_api',
+        'perform_deep_research',
+      ]);
+      for (const tool of readOnlyTools) {
+        const enumValues = collectEnumValues(tool.definition?.inputSchema);
+        const suspicious = enumValues.filter((v) => typeof v === 'string' && WRITE_SHAPED_VALUE.test(v));
+        expect([tool.name, suspicious]).toEqual([tool.name, []]);
+      }
+    });
+  });
+
+  // ENG-1276 follow-up #3 — a full audit of the tool-substitution class of bug,
+  // not just the one instance (twitter_manage_post/post_on_connected_account)
+  // that had already broken production. Every tool whose description tells the
+  // model to use, or prefer, a DIFFERENT registered tool is a candidate for the
+  // same bug: a schedule's requiredFunctionCalls names one, the model
+  // legitimately uses the other, and the requirement never gets credited.
+  //
+  // This is a PINNED, REVIEWED catalog, not a live "is this safe" classifier —
+  // classifying "is tool B really a substitute for tool A" requires reading
+  // each pair's actual execute() implementation (name/description text lies,
+  // that is the whole premise of ENG-1276), which is a human judgment call each
+  // time. What this test buys: the judgment only has to happen ONCE per pair,
+  // and it happens LOUDLY — a NEW pair appearing (a new tool registered, or an
+  // existing description edited to add a redirect) fails this test and forces
+  // the same review before it can ship silently.
+  //
+  // Disposition of every pair found as of this audit:
+  //   - twitter_manage_post -> post_on_connected_account: REAL bug (three
+  //     production schedules, 10+ Linear duplicates 2026-08-03..08-12). FIXED
+  //     — aliased (post_thread action only).
+  //   - email -> send_email_from_sender, send_email_from_sender -> email: same
+  //     shape, verified via both execute() paths (email's send action is a real
+  //     write through resolveEmailAccount(..., 'send'); send_email_from_sender
+  //     has no action param, every call sends). No production incident yet, but
+  //     the mechanism is identical and verified, so FIXED proactively —
+  //     aliased bidirectionally.
+  //   - create_work_plan -> modify_work_plan: INVESTIGATED, NOT a valid alias.
+  //     modifyWorkPlan requires a PRE-EXISTING work plan and returns
+  //     `{success: false}` with no plan — it can never substitute for
+  //     create_work_plan, so aliasing it would credit a call that (if it ever
+  //     happens with no plan) represents a FAILURE to do what was needed.
+  //   - call_meta_ads_insights_api <-> get_meta_ads_metrics: both READ-ONLY
+  //     reporting tools that redirect to each other by query shape (custom GAQL
+  //     vs quick dashboard). Real analog in SHAPE, but not in STAKES — even a
+  //     false negative here nudges toward a redundant read, not an off-cadence
+  //     publish. Not aliased; logged here so it isn't silently missed.
+  //   - delete_leads_by_filter -> delete_leads (+ -> search_leads): a real
+  //     destructive action, but delete_leads_by_filter carries its OWN
+  //     confirm-gated two-phase workflow (preview, then confirm=true) — a
+  //     different shape than a simple action-flag alias, and unlike email/
+  //     twitter there is no evidence any schedule requires delete_leads.
+  //     Deprioritized, not aliased; logged so it isn't silently missed either.
+  //   - ask_crm <-> get_leads/search_leads: ask_crm is a free-form NL query tool
+  //     that redirects to get_leads/search_leads "for single-list browsing" —
+  //     different QUERY SHAPES over the same data, not an account-state-driven
+  //     substitute. All three already classify as read-only by name (ask_/get_/
+  //     search_ all match READ_ONLY_TOOL), so even a miss here can only nudge
+  //     toward a redundant read, never a false-skip or a missed publish.
+  //   - describe_image/describe_video <-> read_file_content, get_deployment_status
+  //     -> coding_agent, remove_image_background -> generate_image/
+  //     update_html_file, and every other pair (compose_video<->generate_video,
+  //     create_blog_article<->create_html_file, create_html_file<->
+  //     create_html_template, create_html_file->generate_landing_page,
+  //     create_image_task_from_prompt->generate_image, create_revision->
+  //     generate_image/update_html_file, perform_deep_research->
+  //     create_blog_article, remove_c2pa_from_image->remove_image_background,
+  //     update_book_content->generate_book_content): routes between DIFFERENT
+  //     deliverable types/content types/scopes, not a same-outcome substitute
+  //     for the SAME requirement — aliasing any of these would credit a call
+  //     that did not produce what was required. create_image_task_from_prompt
+  //     and create_revision are also [DEPRECATED], further lowering their
+  //     real-world likelihood.
+  it('redirect audit: pins every "use/prefer tool X instead" cross-reference between two registered tools (ENG-1276 follow-up #3)', () => {
+    const allTools = emmaToolRegistry.getAllTools();
+    const allNames = allTools.map((t) => t.name);
+    const pairs = new Set<string>();
+    for (const tool of allTools) {
+      const desc = tool.definition?.description ?? '';
+      for (const otherName of allNames) {
+        if (otherName === tool.name) continue;
+        const mentionsRedirect = new RegExp(
+          `\\b${otherName}\\b[^.]{0,40}\\b(?:instead|prefer)\\b|\\b(?:instead|prefer)\\b[^.]{0,40}\\b${otherName}\\b`,
+          'i'
+        );
+        if (mentionsRedirect.test(desc)) pairs.add(`${tool.name} -> ${otherName}`);
+      }
+    }
+    expect([...pairs].sort()).toEqual(
+      [
+        'ask_crm -> get_leads',
+        'ask_crm -> search_leads',
+        'call_meta_ads_insights_api -> get_meta_ads_metrics',
+        'compose_video -> generate_video',
+        'create_blog_article -> create_html_file',
+        'create_html_file -> create_blog_article',
+        'create_html_file -> create_html_template',
+        'create_html_file -> generate_landing_page',
+        'create_html_template -> create_html_file',
+        'create_image_task_from_prompt -> generate_image',
+        'create_revision -> generate_image',
+        'create_revision -> update_html_file',
+        'create_work_plan -> modify_work_plan',
+        'delete_leads_by_filter -> delete_leads',
+        'delete_leads_by_filter -> search_leads',
+        'describe_image -> read_file_content',
+        'describe_video -> read_file_content',
+        'email -> send_email_from_sender',
+        'generate_video -> compose_video',
+        'get_deployment_status -> coding_agent',
+        'get_meta_ads_metrics -> call_meta_ads_insights_api',
+        'perform_deep_research -> create_blog_article',
+        'read_file_content -> describe_image',
+        'read_file_content -> describe_video',
+        'remove_c2pa_from_image -> remove_image_background',
+        'remove_image_background -> generate_image',
+        'remove_image_background -> update_html_file',
+        'search_leads -> ask_crm',
+        'send_email_from_sender -> email',
+        'twitter_manage_post -> post_on_connected_account',
+        'update_book_content -> generate_book_content',
+      ].sort()
+    );
+  });
+
+  it('fires on the REAL 2026-08-15 prod regression: a NEGATED "failure" mention read as hard failure evidence (ENG-1276 follow-up, session 7f95530d…)', () => {
+    // The day BEFORE the perform_data_analysis regression above, the SAME schedule
+    // hit the SAME 20-attempt nudge trap through a completely different mechanism:
+    // this run made ZERO tool calls at all (the model reasoned the weekday in
+    // prose, never touching perform_data_analysis or anything else), so the
+    // write-call veto (step 3) was never in play. The skip explanation instead
+    // said "Posts published: 0 (by design, not by failure)" — HARD_FAILURE_PATTERNS
+    // (step 2a) matches the bare word "failure" ANYWHERE in the turn with no
+    // negation awareness, so this benign sentence EXPLICITLY DENYING a failure
+    // tripped the veto exactly like a real one would.
+    const SATURDAY_0815 = new Date('2026-08-15T13:26:57.527Z');
+    expect(SATURDAY_0815.getUTCDay()).toBe(6);
+    const instruction =
+      'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+      'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped." Only proceed on Monday, Wednesday, or Friday.';
+    const realSkip =
+      'LUCAS: non-publishing day, skipped.\n\n' +
+      '<p><strong>Weekday check:</strong> Today is <strong>Saturday, 15 August 2026</strong>. This schedule only publishes Monday, Wednesday, and Friday — so nothing was created and nothing was published.</p>\n\n' +
+      '<ul>\n' +
+      '<li>Posts published: <strong>0</strong> (by design, not by failure)</li>\n' +
+      '<li>Images generated: <strong>0</strong></li>\n' +
+      '<li>Tool calls made: <strong>none</strong> — no brand/market reads, no research, no publish attempts</li>\n' +
+      '</ul>';
+    expect(scheduledRunSignalsConditionalSkip(realSkip, {
+      now: SATURDAY_0815,
+      instruction,
+      toolCalls: [],
+    })).toBe(true);
+  });
+
+  it('NEGATION AUDIT: a denied failure/error is waived; a genuine one nearby still vetoes', () => {
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // A denied failure/error is the OPPOSITE of hard failure evidence.
+    [
+      'Non-publishing day, skipped. Posts published: 0 (by design, not by failure).',
+      'Non-publishing day, skipped. This was not a failure — the cadence simply excludes today.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Nothing was published, without any failure on our end.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // A genuine failure elsewhere in the SAME turn must still veto — neutralizing
+    // one denied mention must not blind the check to a real one nearby.
+    [
+      'Non-publishing day, skipped. Not a failure of the schedule, but image generation failed.',
+      'Non-publishing day, skipped. No failure here, though the LinkedIn API timed out.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
+  it('NEGATION AUDIT #2: the negation-to-failure span tolerates intervening words, but stays clause-bounded (ENG-1276 follow-up)', () => {
+    // The original NEGATED_FAILURE_MENTION only caught the negation word landing
+    // DIRECTLY on the failure noun (an optional article/"by" in between, nothing
+    // more) — "not by failure" but not "not a SINGLE failure" or "no REAL error".
+    // Real English negation isn't that rigid, so this generalizes to a tempered
+    // greedy token: the negation cue, then ANY text that doesn't cross a clause
+    // boundary (a contrastive conjunction, or a sentence/semicolon break), then
+    // the failure word. The bug class this closes is the SAME one that broke
+    // "not by failure" (session 7f95530d) — just a different specific wording
+    // that hadn't happened to occur yet.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // Phrasings the OLD adjacency-only regex missed — negation and failure word
+    // share a clause, just with more words between them than a bare article/"by".
+    [
+      'Non-publishing day, skipped. Not a single failure occurred today.',
+      'Non-publishing day, skipped. There was never any failure to report.',
+      'Non-publishing day, skipped. No real error happened on our end.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // Widening the span must stay fail-CLOSED: a negation cue must NOT reach
+    // across a real clause break (a semicolon, or a contrastive conjunction like
+    // "but"/"though") to neutralize an UNRELATED, genuine failure that follows it.
+    [
+      'Non-publishing day, skipped. No post today; auth failed.',
+      'Non-publishing day, skipped. This was not a great day, but the LinkedIn post failed to publish.',
+      'Non-publishing day, skipped. Not without effort, but the post failed to publish.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
+  it('NEGATION AUDIT #3: an interjection "No," must not bridge a comma-joined run-on to a genuine failure (ENG-1276 follow-up)', () => {
+    // Found on a fresh adversarial re-audit of #2's own widening, NOT from a
+    // production incident: "No," introducing an independent clause is
+    // grammatically an INTERJECTION ("the answer is no"), not a negator of
+    // whatever follows it — but the unbounded tempered-greedy-token from #2 had
+    // no way to tell that apart from "No" used as a direct negator, so a
+    // comma-joined run-on with no "but"/semicolon/period in between could bridge
+    // all the way to a genuinely UNRELATED failure and wrongly neutralize it.
+    // None of the LEGITIMATE cases in #1/#2 have a comma directly after the cue,
+    // so rejecting that shape costs nothing real. Also bounds the maximum span
+    // as a second, independent backstop against an unforeseen long bridge.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. No, unfortunately, today\'s run failed for unknown reasons.',
+      'Non-publishing day, skipped. No, the deployment failed, we should investigate.',
+      'Non-publishing day, skipped. No, it did not work — the post failed.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // The fix must not regress any of the genuine "No <word> failure/error"
+    // negators from #1/#2 — none of them have a comma right after the cue.
+    [
+      'Non-publishing day, skipped. No real error happened on our end.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
+  it('NEGATION AUDIT #4: the comma exclusion from #3 must be scoped to "no" only, not "not"/"never"/"without" (independent review finding)', () => {
+    // An independent fresh-eyes review (not a production incident) reproduced a
+    // real gap in #3's fix: `(?!\s*,)` was applied to ALL FOUR cue words, but
+    // the interjection problem it fixes is specific to a bare "No," opening an
+    // INDEPENDENT clause ("the answer is no; separately, X happened"). "Not,"/
+    // "Never,"/"Without," followed by a comma are still fronted negations with
+    // a parenthetical aside in between — the negation continues to apply across
+    // the comma to whatever follows ("Without, admittedly, any failure
+    // occurring..." still means "there was no failure"). Scoping the exclusion
+    // to "no" alone fixes this without reopening #3's original gap (verified:
+    // "No, unfortunately, ... failed" still isn't neutralized).
+    //
+    // NOT fixed here, and deliberately so: the review also found that a LONG
+    // parenthetical after "never"/"not" ("Never, in this case, did we see a
+    // failure" — 28 characters to the failure word) still doesn't get
+    // neutralized, because it exceeds the 20-char span cap from #3. That cap is
+    // independently load-bearing for a MORE realistic and MORE dangerous case —
+    // "Not entirely sure why the deployment failed today" is a genuine failure
+    // report (the hedge is about the CAUSE, not a denial that it happened), and
+    // widening the cap to accommodate an elaborate courtroom-style parenthetical
+    // would reopen that gap in the direction that matters more (a real failure
+    // silently waived, not an unusual phrasing still causing a retry). See the
+    // cap's own test coverage below.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // Short parentheticals after not/never/without now correctly waive.
+    [
+      'Non-publishing day, skipped. Without, admittedly, any failure occurring, the run completed cleanly.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // "No," stays excluded — #3's original fix must not regress.
+    [
+      'Non-publishing day, skipped. No, unfortunately, today\'s run failed for unknown reasons.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // The length cap is a DELIBERATE trade-off, not an oversight: it still
+    // blocks a long parenthetical after not/never (the elaborate cases the
+    // review constructed), AND — the case that actually justifies keeping the
+    // cap — a genuine failure hedged with "not entirely sure why" is NOT
+    // wrongly waived.
+    [
+      'Non-publishing day, skipped. Never, in this case, did we see a failure.',
+      'Non-publishing day, skipped. Not entirely sure why the deployment failed today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
+  it('NEGATION AUDIT #5: a double negation ("not true that there was no failure") must not silently waive a real failure', () => {
+    // The independent review that found audit #4 also found this: "It is not
+    // true that there was no failure today" re-asserts a REAL failure, but
+    // NEGATED_FAILURE_MENTION only sees the INNER "no failure" — it has no
+    // concept of the OUTER "not true that" flipping the meaning back. This is
+    // the dangerous direction (a genuine failure silently waived as a clean
+    // skip), so unlike audit #4's elaborate-but-safe cases, this one is worth
+    // closing even though the phrasing is unnatural for a scheduled-run status
+    // line — there's no evidence it has happened, but the failure mode if it
+    // did would be worse than an extra retry.
+    //
+    // Properly PARSING the double negation would need real negation-depth
+    // tracking — a much bigger, riskier change bolted onto an already-layered
+    // regex. Instead this FAILS CLOSED: a sentence that itself negates a TRUTH
+    // CLAIM ("it is not true that...", "that's false...", "it is false
+    // that...") is INELIGIBLE for the neutralization entirely — skip it, so
+    // any failure word inside that sentence stays intact and still vetoes via
+    // the normal HARD_FAILURE_PATTERNS check. Safe because it doesn't need to
+    // understand the sentence, only recognize the shape and decline to be
+    // clever about it.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. It is not true that there was no failure today.',
+      "Non-publishing day, skipped. That's false — there was no failure today.",
+      'Non-publishing day, skipped. It is false that no failure occurred.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // Must not regress any legitimate single-negation case from audits #1-#4 —
+    // none of them contain a truth-negating construction, so the guard never
+    // engages for them.
+    [
+      'Non-publishing day, skipped. Not by failure.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Without, admittedly, any failure occurring, the run completed cleanly.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // The guard's own "not" must be REQUIRED, not optional — self-caught on a
+    // fresh re-audit before shipping. An earlier version of the pattern used
+    // (?:not\s+)? (optional), so a plain, non-negated "it is true that there
+    // was no failure" ALSO matched the meta-negation shape and wrongly
+    // suppressed neutralization for a legitimate, single-negation denial —
+    // over-cautious (still vetoes when it could safely waive), the safe
+    // direction, but still a real behavior change from what audits #1-#4 in
+    // the same file establish as correct.
+    [
+      'Non-publishing day, skipped. It is true that there was no failure today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+  });
+
+  it('NEGATION AUDIT #6: an uncertainty hedge ("not sure it failed") must not be read as a denial of failure', () => {
+    // Independent CodeRabbit review finding (ENG-1276): "not sure it failed" or
+    // "not certain there was an error" express UNCERTAINTY about whether a
+    // failure happened — fundamentally different from "not by failure" (a
+    // confident DENIAL). The tempered-greedy-token had no way to tell them
+    // apart: "not" immediately followed by "sure"/"certain" still reached the
+    // failure word within the 20-char span and got wrongly neutralized, which
+    // could accept a cadence response with NO tool calls as a clean skip even
+    // though the actual outcome is unresolved — the dangerous direction (an
+    // unknown/possibly-failed run reported as a successful skip). The one
+    // adversarial case already covered ("Not entirely sure why the deployment
+    // failed today") only happened to be blocked by the 20-char span cap
+    // (coincidence of word count, not an actual understanding of uncertainty
+    // vs. denial) — a shorter phrasing like "not sure it failed" slips through
+    // the cap and needs its own guard.
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    [
+      'Non-publishing day, skipped. Not sure it failed or not, will check next run.',
+      'Non-publishing day, skipped. Not certain there was an error, but flagging it.',
+      'Non-publishing day, skipped. Never sure if it failed given the ambiguous response.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+
+    // Must not regress any legitimate single-negation case from audits #1-#5 —
+    // none of them have "sure"/"certain"/"confident"/"convinced"/"clear"
+    // immediately after the cue.
+    [
+      'Non-publishing day, skipped. Not by failure.',
+      'Non-publishing day, skipped. No failure occurred; nothing was attempted.',
+      'Non-publishing day, skipped. Not a single failure occurred today.',
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
   });
 
   it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
@@ -459,7 +999,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
 
     // Read/context tool calls do not make it a non-skip.
     for (const readTool of ['read_brand_guidelines', 'read_market_strategy', 'you_search_web',
-      'get_leads', 'describe_image', 'analyze_crm_data', 'ask_crm', 'audit_ad_utm_coverage', 'account_summary']) {
+      'get_leads', 'describe_image', 'analyze_crm_data', 'ask_crm', 'audit_ad_utm_coverage', 'account_summary',
+      'perform_data_analysis']) {
       expect(scheduledRunSignalsConditionalSkip(skipProse, {
         now: sunday, instruction: instr, toolCalls: [{ name: readTool }],
       })).toBe(true);
@@ -569,6 +1110,52 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     // Schedule timezone Asia/Tokyo → Monday (a publish day) → rejected.
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF, timezone: 'Asia/Tokyo' })).toBe(false);
   });
+
+  it('recognizes PLURAL weekday names in the cadence, not just singular (live-verification follow-up, ENG-1276)', () => {
+    // A production live-verification run for ENG-1276 used "This schedule only
+    // publishes on Wednesdays" — the WEEKDAY_TOKEN regex only matched singular day
+    // names, so the cadence clause parsed to zero days, publishDays stayed empty,
+    // and the run fell through to the (unrelated) negated-conditional skip clause,
+    // which named Wednesday for the WRONG reason and rejected the skip on Tuesday.
+    // Net effect: the run hit the full 20-attempt retry press this ticket exists to
+    // prevent, on live phrasing an owner would naturally write.
+    const sunday = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
+    const monday = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+    const tuesday = new Date('2026-08-04T12:00:00Z'); // getUTCDay() === 2
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
+    // Weekday-agnostic content (names no day itself) so it stays valid across every
+    // `now` used below without tripping the separate model-asserted-weekday cross-
+    // check in step (4), which is orthogonal to what this test targets.
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+
+    // Positive cadence, multi-day, written with plural day names.
+    const publishOnlyPluralMWF = 'This schedule only publishes on Mondays, Wednesdays, and Fridays.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: publishOnlyPluralMWF })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: publishOnlyPluralMWF })).toBe(false);
+
+    // Skip-day list written with plural day names.
+    const skipListPlural = 'If today is a Saturday or a Sunday, publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: skipListPlural })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: skipListPlural })).toBe(false);
+
+    // The exact live-verification shape: a single plural publish day, plus a
+    // negated-conditional skip clause that ALSO names that same weekday (for the
+    // opposite reason). The positive publish-day cadence must win.
+    const singlePluralPublishDay =
+      'This test schedule only publishes on Wednesdays. If today is NOT Wednesday: create and publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: tuesday, instruction: singlePluralPublishDay })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: singlePluralPublishDay })).toBe(false);
+  });
+
+  it('recognizes a plural weekday RANGE ("Mondays through Fridays") in the cadence', () => {
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3, inside the range
+    const saturday = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6, outside the range
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+    for (const instr of ['Publish only on Mondays through Fridays.', 'Publish only on Mondays to Fridays.']) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: instr })).toBe(false);
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: instr })).toBe(true);
+    }
+  });
 });
 
 describe('reconstructPriorToolCalls (ENG-844)', () => {
@@ -595,6 +1182,137 @@ describe('reconstructPriorToolCalls (ENG-844)', () => {
   it('drops nameless calls and tolerates non-array input', () => {
     expect(reconstructPriorToolCalls(undefined as any)).toEqual([]);
     expect(reconstructPriorToolCalls([{ metadata: { toolCalls: [{}, { name: 'get_leads' }] } }])).toEqual([{ name: 'get_leads' }]);
+  });
+
+  // ENG-1045: the publish-outcome check reads arguments.action, so the reconstruction
+  // must carry the arguments through — otherwise a resumed run that already published
+  // a thread falls back into the "post_on_connected_account (1 more time needed)" loop.
+  it('carries the action argument from the executed ledger', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread', tweets: ['a', 'b'] } },
+    ]);
+  });
+
+  it('parses the JSON-string arguments of a request-list fallback', () => {
+    const messages = [{ tool_calls: [{ function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' } },
+    ]);
+  });
+
+  it('omits unparseable arguments but keeps the entry and its error', () => {
+    const messages = [{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: '{not json', error: 'boom' }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'twitter_manage_post', error: 'boom' }]);
+  });
+
+  it('lets a resumed post_thread entry satisfy a post_on_connected_account requirement', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: { success: true } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(true);
+
+    // A resumed thread that FAILED still leaves the publish owed.
+    const [failed] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'rate limited' }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', failed)).toBe(false);
+  });
+
+  // ENG-1045: the real persisted shape — the executed ledger is CUMULATIVE and lands
+  // on the message that CLOSES the turn, while each intermediate assistant message
+  // keeps its own request-only tool_calls. Verified against prod session 555bb0a4,
+  // where 26 real calls reconstructed as 52 entries. Because these entries seed the
+  // required-call counts, the doubling let ONE real publish satisfy a minCount of 2.
+  it('counts a call once when the request list and the closing turn ledger both carry it', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'you_search_web', arguments: '{"q":"x"}' } }] },
+      { tool_calls: [{ id: 'call_2', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      {
+        metadata: {
+          toolCalls: [
+            { id: 'call_1', name: 'you_search_web', arguments: { q: 'x' }, result: {} },
+            { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          ],
+        },
+      },
+    ];
+
+    const entries = reconstructPriorToolCalls(messages);
+    expect(entries).toHaveLength(2);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', entries)).toBe(1);
+  });
+
+  it('upgrades a request-list entry to the ledger entry so a later-recorded failure still vetoes', () => {
+    const messages = [
+      { tool_calls: [{ id: 'call_1', function: { name: 'twitter_manage_post', arguments: '{"action":"post_thread"}' } }] },
+      { metadata: { toolCalls: [{ id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' }] } },
+    ];
+
+    // One entry, and it is the one carrying the error — so the publish stays owed.
+    expect(reconstructPriorToolCalls(messages)).toEqual([
+      { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, error: 'X API 401' },
+    ]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', reconstructPriorToolCalls(messages))).toBe(0);
+  });
+
+  it('never collapses distinct calls, and keeps un-identified entries separate', () => {
+    // Two genuine publishes with distinct ids must both count.
+    const distinct = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { id: 'call_1', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { id: 'call_2', name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(countCallsSatisfyingRequirement('post_on_connected_account', distinct)).toBe(2);
+
+    // No id means unknown identity, which is not evidence of sameness — keep both.
+    const noIds = reconstructPriorToolCalls([{
+      metadata: {
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+          { name: 'twitter_manage_post', arguments: { action: 'post_thread' }, result: {} },
+        ],
+      },
+    }]);
+    expect(noIds).toHaveLength(2);
+  });
+
+  // ENG-947/ENG-1045: a preflight rejection commonly comes back as
+  // `result.success: false` with NO top-level `error` at all (e.g. publish_blog_article's
+  // result extraction only sets `error` when the tool itself supplied one). callSatisfiesRequirement's
+  // exact-name-match branch now calls toolCallSucceeded for every publish requirement, which reads
+  // `result.success`, so dropping `result` on reconstruction would silently credit an abandoned
+  // portion's failed publish as a success on resume.
+  it('carries the result through so a resumed publish that failed WITHOUT a top-level error still vetoes', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: false, message: 'Multiple twitter accounts connected' } }] },
+    }]);
+    expect(entry).toEqual({
+      name: 'post_on_connected_account',
+      result: { success: false, message: 'Multiple twitter accounts connected' },
+    });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
+
+    // Control: the same shape but result.success: true — must be credited.
+    const [succeeded] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', result: { success: true, tweetId: '1' } }] },
+    }]);
+    expect(callSatisfiesRequirement('post_on_connected_account', succeeded)).toBe(true);
+  });
+
+  it('carries duplicateOf through so a resumed suppressed same-turn duplicate is not credited', () => {
+    const [entry] = reconstructPriorToolCalls([{
+      metadata: { toolCalls: [{ name: 'post_on_connected_account', duplicateOf: 'call_1' }] },
+    }]);
+    expect(entry).toEqual({ name: 'post_on_connected_account', duplicateOf: 'call_1' });
+    expect(callSatisfiesRequirement('post_on_connected_account', entry)).toBe(false);
   });
 });
 

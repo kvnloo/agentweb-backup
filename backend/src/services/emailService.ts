@@ -8,6 +8,7 @@ import { userDb } from './db';
 import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
+import { LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON } from '../utils/scheduleRunBlockedReason';
 
 // ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
@@ -1049,6 +1050,263 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
     }
   },
 
+  /**
+   * Tell an owner their LinkedIn (Unipile) session died and only they can revive it
+   * (ENG-1197).
+   *
+   * Deliberately names what is blocked rather than just "reconnect": the failure is
+   * invisible from the product's surface, because discovery keeps working off a
+   * shared account (ENG-1198) while every send, withdraw and even the read of the
+   * pending queue is dead. An owner told only "reconnect your account" has no way to
+   * tell whether that mattered.
+   */
+  async sendLinkedInAccountDisconnectedEmail(
+    toEmails: string | string[],
+    opts: {
+      accountName: string;
+      /**
+       * When we DETECTED the dead session — not when LinkedIn ended it, which we have
+       * no way to know. On a first-ever detection this is stamped "now", so for an
+       * account that has been dead for weeks it is the moment we noticed and nothing
+       * more. The copy says exactly that. Omit it entirely when even that is unknown;
+       * the sentence drops rather than inventing a time.
+       */
+      disconnectedAt?: string;
+      isReminder: boolean;
+      daysDisconnected: number;
+      /**
+       * Set when a schedule was paused after repeated skips. Changes the remedy:
+       * reconnecting is no longer sufficient on its own, because a paused schedule
+       * does not resume by itself — which is the opposite of what the ordinary skip
+       * copy promises, and the reason this cannot reuse the generic run-failed email.
+       */
+      pausedScheduleName?: string;
+      /**
+       * How many scheduled RUNS were skipped before the pause — a different unit from
+       * `daysDisconnected`, and the one the pause copy actually means. Conflating them
+       * mis-stated the elapsed time by whatever the schedule's cadence happened to be.
+       */
+      skippedRunCount?: number;
+    }
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(opts.accountName);
+      // Rendered in UTC and labelled as such. Without an explicit `timeZone` this took
+      // the SERVER's zone — meaningless to a customer base spread across the world, and
+      // actively misleading once labelled, since the label would name our zone as
+      // though it were theirs. UTC is the one zone that is unambiguous to everyone.
+      const whenParsed = opts.disconnectedAt ? new Date(opts.disconnectedAt) : null;
+      const when = whenParsed && !Number.isNaN(whenParsed.getTime())
+        ? whenParsed.toLocaleString('en-US', {
+            year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+            timeZone: 'UTC', timeZoneName: 'short',
+          })
+        : null;
+      const safeSchedule = opts.pausedScheduleName ? this.escapeHtml(opts.pausedScheduleName) : '';
+      const headline = opts.pausedScheduleName
+        ? 'A schedule was paused — LinkedIn Outreach still disconnected'
+        : opts.isReminder
+          ? `Still disconnected ${opts.daysDisconnected} day${opts.daysDisconnected === 1 ? '' : 's'} after we detected it`
+          : 'Your LinkedIn Outreach account disconnected';
+      // /settings/:tab — the tab slug is `accounts` (labelled "Connected Accounts"
+      // in the sidebar). `/settings/connected-accounts` is not a real tab, so it
+      // would have sent every recipient of this alert to a dead page. Canonical
+      // source: customer-portal src/config/portalRoutes.ts.
+      const settingsUrl = `${customerFrontendUrl}/settings/accounts`;
+      // A paused schedule needs BOTH actions, and saying only "reconnect" would
+      // leave it stopped indefinitely.
+      // NOT `?? opts.daysDisconnected`: that fallback re-created the units bug it was
+      // added to remove, silently, for any caller that sets `pausedScheduleName`
+      // without a run count.
+      const skippedRuns = opts.skippedRunCount;
+      const pausedAfter = typeof skippedRuns === 'number'
+        ? ` after ${skippedRuns} skipped run${skippedRuns === 1 ? '' : 's'}`
+        : '';
+      const resumeHtml = opts.pausedScheduleName
+        ? `<p style="line-height: 1.6;"><strong>"${safeSchedule}"</strong>
+             has been paused${pausedAfter}.
+             Reconnecting is not enough on its own — once the account is back, switch the schedule
+             back on from your schedules page.</p>`
+        : `<p style="line-height: 1.6;">
+             Any scheduled outreach that needs this account is being skipped rather than run, so nothing is
+             being sent from a broken session. It resumes on its own once you reconnect &mdash; there is
+             nothing to switch back on.</p>`;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>🔌 ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="error-section">
+                <h3>LinkedIn Outreach is paused until you reconnect</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  LinkedIn has ended the session for <strong>${safeName}</strong>${when ? ` &mdash; we detected this on <strong>${when}</strong>` : ''}.
+                  Reconnecting takes about a minute and only you can do it &mdash; it needs your LinkedIn login.
+                </p>
+              </div>
+              <p style="line-height: 1.6;"><strong>What has stopped:</strong></p>
+              <ul style="line-height: 1.6;">
+                <li>Sending connection invitations and messages</li>
+                <li>Withdrawing old pending invitations</li>
+                <li>Reading how many invitations are still pending</li>
+              </ul>
+              ${resumeHtml}
+            </div>
+            <div class="footer">
+              <a class="button" href="${settingsUrl}">Reconnect LinkedIn Outreach</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">
+                If reconnecting does not work, remove the connection and add it again as a new connection.
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${opts.accountName}
+
+LinkedIn has ended the session for "${opts.accountName}"${when ? ` - we detected this on ${when}` : ''}. Reconnecting takes about a minute and only you can do it - it needs your LinkedIn login.
+
+What has stopped:
+- Sending connection invitations and messages
+- Withdrawing old pending invitations
+- Reading how many invitations are still pending
+
+${opts.pausedScheduleName
+  ? `"${opts.pausedScheduleName}" has been paused${pausedAfter}. Reconnecting is not enough on its own - once the account is back, switch the schedule back on from your schedules page.`
+  : 'Any scheduled outreach that needs this account is being skipped rather than run, so nothing is being sent from a broken session. It resumes on its own once you reconnect.'}
+
+---
+Reconnect LinkedIn Outreach: ${settingsUrl}
+If reconnecting does not work, remove the connection and add it again as a new connection.`;
+
+      const subject = opts.pausedScheduleName
+        ? `⏸️ Schedule paused: "${opts.pausedScheduleName}" needs ${opts.accountName} reconnected`
+        : opts.isReminder
+          ? `🔌 Still disconnected: ${opts.accountName} (LinkedIn Outreach paused)`
+          : `🔌 Reconnect needed: ${opts.accountName} (LinkedIn Outreach paused)`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`LinkedIn disconnect email sent to: ${emailList.join(', ')} (reminder=${opts.isReminder})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending LinkedIn disconnect email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the sync cron.
+    }
+  },
+
+  /**
+   * ENG-1131 follow-up: tell the schedule owner the MOMENT their prospecting
+   * schedule's LinkedIn sourcing capability changes state, rather than only
+   * reporting it passively via the schedule-card badge / per-run emails the
+   * next time they happen to check. Called on the EDGE (see
+   * didSourcingBlockStateChange in agentModeController.ts) — once when a run
+   * first comes back blocked, once when a later run recovers — never on every
+   * run of a multi-day outage.
+   */
+  async sendScheduleSourcingBlockTransitionEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    isNowBlocked: boolean,
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const safeName = this.escapeHtml(scheduleName);
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+
+      const headline = isNowBlocked
+        ? 'LinkedIn search is currently unavailable for this schedule'
+        : 'LinkedIn search is working again for this schedule';
+      const bodyHtml = isNowBlocked
+        ? `Your scheduled prospecting chat <strong>"${safeName}"</strong> could not source any prospects on its most recent ` +
+          `run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. ` +
+          `This is <strong>not</strong> "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is ` +
+          `account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; ` +
+          `we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to <strong>"${safeName}"</strong>, ` +
+          `and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+      const bodyText = isNowBlocked
+        ? `Your scheduled prospecting chat "${scheduleName}" could not source any prospects on its most recent run (${currentDate}) because LinkedIn people search is currently unavailable for the connected account. This is NOT "nobody matched your filters" — the outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. No action is needed on your end; we'll email you again once search is back and this schedule resumes sourcing normally.`
+        : `Good news — LinkedIn people search is working again for the account connected to "${scheduleName}", and its most recent run (${currentDate}) sourced prospects normally. No action was needed on your end.`;
+
+      const headerColor = isNowBlocked ? '#ffc107' : '#28a745';
+      const icon = isNowBlocked ? '⚠️' : '✅';
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: ${headerColor}; color: ${isNowBlocked ? '#664d03' : 'white'}; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .info-section { background-color: ${isNowBlocked ? '#fff3cd' : '#e8f5e8'}; border-left: 4px solid ${headerColor}; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>${icon} ${headline}</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="info-section">
+                <p style="margin: 0; line-height: 1.6;">${bodyHtml}</p>
+              </div>
+            </div>
+            <div class="footer">
+              <a class="button" href="${customerFrontendUrl}/agent-mode?tab=scheduled">Review your schedules</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">This is an automated email from your scheduled chat.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `${headline}: ${scheduleName}
+
+${bodyText}
+
+---
+Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
+
+      const subject = isNowBlocked
+        ? `⚠️ LinkedIn search unavailable: ${scheduleName}`
+        : `✅ LinkedIn search is back: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Sourcing-block transition email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId}, isNowBlocked=${isNowBlocked})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending sourcing-block transition email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the scheduled chat flow.
+    }
+  },
+
   async sendScheduledChatTokenLimitEmail(
     toEmails: string | string[],
     scheduleName: string,
@@ -1363,6 +1621,11 @@ Schedule ID: ${scheduleId}
       sessionId: string;
       attempt: number;
       createdAt: string;
+      // ENG-1131: set when the run "succeeded" (produced a report) but its only
+      // sourcing path was blocked — e.g. the LinkedIn people-search outage. Left
+      // separate from `passed` on purpose (see agentModeController.ts), so this
+      // email must read it explicitly instead of trusting `passed` alone.
+      blockedBy?: string;
     },
     scheduleId: string,
     summary?: string
@@ -1370,6 +1633,11 @@ Schedule ID: ${scheduleId}
     try {
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      // CodeRabbit (PR #2383): escape before interpolating into the HTML body —
+      // a schedule name containing markup otherwise renders unescaped in the
+      // recipient's email client. sendScheduleSourcingBlockTransitionEmail
+      // already does this; this brings the sibling function in line with it.
+      const safeScheduleName = this.escapeHtml(scheduleName);
 
       // ENG-351: resolve {{cite:N}} markers to inline sources so recipients can trace each figure.
       // 'markdown' → the HTML body (marked()) renders clickable source links; the plain-text body
@@ -1388,8 +1656,49 @@ Schedule ID: ${scheduleId}
         // Fall back to regular agent-mode URL if share creation fails
       }
 
-      const statusColor = result.passed ? '#28a745' : '#dc3545';
-      const statusIcon = result.passed ? '✅' : '❌';
+      // ENG-1131: a blocked-sourcing run reads neither as a plain success nor a
+      // failure — `passed` stays `true` (the run itself completed; see
+      // agentModeController.ts for why), but the card/email must not say
+      // "successfully executed" when the reason it produced nothing was an
+      // upstream outage, not a real empty result.
+      //
+      // ENG-1131 follow-up: a run can be BOTH blocked AND have failed to meet
+      // its OTHER requirements — a schedule whose only sourcing path is search
+      // can't satisfy requiredFunctionCalls when that path is down
+      // (allRequirementsMet in agentModeController.ts depends on
+      // allFunctionCallsMet). Failure must take icon/color precedence over the
+      // blocked state: an owner must never read a run that failed as a
+      // reassuring "outage, self-heals, nothing to worry about" notice with no
+      // mention it also failed. The outage explanation is instead ALWAYS
+      // appended as its own note when isBlockedRun, independent of pass/fail —
+      // additive context, never a replacement for the failure signal.
+      const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+      const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+      const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+      const statusBg = !result.passed ? '#ffeaea' : (isBlockedRun ? '#fff3cd' : '#e8f5e8');
+      // Each of the 4 (passed x blocked) combinations gets its own headline —
+      // NOT derived from `passed` alone, or the original "don't say
+      // 'successfully executed' for a blocked run" fix (the whole point of
+      // this email surfacing at all) regresses right back for the passed +
+      // blocked case.
+      const primaryMessage = !result.passed && isBlockedRun
+        ? 'did not meet all criteria on this run. LinkedIn people search was also unavailable for the connected account during the run — see the note below.'
+        : !result.passed
+        ? 'executed but did not meet all criteria and results are ready.'
+        : isBlockedRun
+        ? 'ran, but LinkedIn people search was unavailable for the connected account, so no prospects could be sourced — see the note below.'
+        : 'has been successfully executed and results are ready.';
+      const outageNoteHtml = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is ' +
+          'account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically ' +
+          'once search returns for the account.'
+        : '';
+      const outageNoteText = isBlockedRun
+        ? 'LinkedIn people search was unavailable for the connected account on this run, so no prospects could be sourced — ' +
+          'this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: ' +
+          'your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.'
+        : '';
 
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric',
@@ -1432,18 +1741,24 @@ Schedule ID: ${scheduleId}
           <div class="container">
             <div class="header">
               <h1>${statusIcon} Scheduled Chat Results</h1>
-              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeScheduleName}</p>
             </div>
-            
+
             <div class="content">
-              <div class="section" style="background-color: ${result.passed ? '#e8f5e8' : '#ffeaea'}; border-left: 4px solid ${result.passed ? '#28a745' : '#dc3545'}; margin: 20px 0;">
+              <div class="section" style="background-color: ${statusBg}; border-left: 4px solid ${statusColor}; margin: 20px 0;">
                 <p style="margin: 0; font-size: 16px; line-height: 1.5;">
-                  Your scheduled chat <strong>"${scheduleName}"</strong> has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready. 
-                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong> 
+                  Your scheduled chat <strong>"${safeScheduleName}"</strong> ${primaryMessage}
+                  It ran for <strong>${Math.round(result.executionTime / 1000)} seconds</strong>
                   and completed at <strong>${currentDate}</strong>.
                 </p>
               </div>
-              
+
+              ${isBlockedRun ? `
+              <div class="section" style="background-color: #fff3cd; border-left: 4px solid #ffc107; margin: 20px 0;">
+                <p style="margin: 0; font-size: 14px; line-height: 1.5;">${outageNoteHtml}</p>
+              </div>
+              ` : ''}
+
               ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
               <div class="section">
                 <h3>🔧 Function Call Details</h3>
@@ -1492,8 +1807,11 @@ Schedule ID: ${scheduleId}
       const text = `
 Scheduled Chat Results: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" has been ${result.passed ? 'successfully executed' : 'executed but did not meet all criteria'} and results are ready.
+Your scheduled chat "${scheduleName}" ${primaryMessage}
 It ran for ${Math.round(result.executionTime / 1000)} seconds and completed at ${currentDate}.
+${isBlockedRun ? `
+${outageNoteText}
+` : ''}
 
 ${result.functionCallDetails && Object.keys(result.functionCallDetails).length > 0 ? `
 Function Call Details:
@@ -1782,8 +2100,22 @@ Sent via AgentWeb: ${customerFrontendUrl}
 
       // Generate results HTML
       const resultsHtml = todaysResults.map((result, index) => {
-        const statusIcon = result.passed ? '✅' : '❌';
-        const statusColor = result.passed ? '#28a745' : '#dc3545';
+        // ENG-1131: a blocked-sourcing run (LinkedIn search outage) still has
+        // `passed: true` — see agentModeController.ts — so it must be read off
+        // `blockedBy` explicitly rather than rendered as a plain PASSED run.
+        //
+        // ENG-1131 follow-up: a run can be BOTH blocked AND failed to meet its
+        // other requirements (a schedule whose only sourcing path is search
+        // can't satisfy requiredFunctionCalls when that path is down). FAILED
+        // must take badge precedence over BLOCKED — the outage note below is
+        // always shown when isBlockedRun regardless of pass/fail, so no
+        // information is lost either way.
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        const statusIcon = !result.passed ? '❌' : (isBlockedRun ? '⚠️' : '✅');
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
+        const statusColor = !result.passed ? '#dc3545' : (isBlockedRun ? '#ffc107' : '#28a745');
+        const statusTextColor = !result.passed ? 'white' : (isBlockedRun ? '#664d03' : 'white');
+        const itemBg = !result.passed ? '#fff8f8' : (isBlockedRun ? '#fffbea' : '#f8fff8');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
@@ -1791,11 +2123,11 @@ Sent via AgentWeb: ${customerFrontendUrl}
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : '#';
 
         return `
-          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${result.passed ? '#f8fff8' : '#fff8f8'};">
+          <div class="result-item" style="border: 1px solid #e9ecef; border-radius: 8px; padding: 15px; margin: 10px 0; background-color: ${itemBg};">
             <div class="result-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
               <div class="result-info">
-                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: white;">
-                  ${statusIcon} ${result.passed ? 'PASSED' : 'FAILED'}
+                <span class="status-badge" style="display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background-color: ${statusColor}; color: ${statusTextColor};">
+                  ${statusIcon} ${statusLabel}
                 </span>
                 <span style="margin-left: 15px; color: #6c757d; font-size: 14px;">Run ${index + 1} at ${runTime}</span>
               </div>
@@ -1805,6 +2137,14 @@ Sent via AgentWeb: ${customerFrontendUrl}
               </div>
             </div>
             <div class="result-content">
+              ${isBlockedRun ? `
+                <div style="background-color: #fff3cd; border: 1px solid #ffe69c; color: #664d03; padding: 10px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; line-height: 1.4;">
+                  LinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced —
+                  this is <strong>not</strong> "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is
+                  account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically
+                  once search returns for the account.
+                </div>
+              ` : ''}
               <div class="response-preview" style="background-color: #f8f9fa; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; line-height: 1.4; max-height: 100px; overflow: hidden; position: relative;">
                 ${this.escapeHtml(result.actualResponse.length > 200 ? result.actualResponse.substring(0, 200) + '...' : result.actualResponse)}
               </div>
@@ -1907,13 +2247,16 @@ ${dateLabel}:
 
 Individual Run Results:
 ${todaysResults.map((result, index) => {
+        const isBlockedRun = result.blockedBy === LINKEDIN_SEARCH_OUTAGE_BLOCK_REASON;
+        // FAILED takes precedence over BLOCKED — see the HTML branch above for why.
+        const statusLabel = !result.passed ? 'FAILED' : (isBlockedRun ? 'BLOCKED' : 'PASSED');
         const runTime = new Date(result.createdAt).toLocaleTimeString('en-US', {
           hour: '2-digit',
           minute: '2-digit'
         });
         const sessionUrl = result.sessionId ? sessionUrls[result.sessionId] : 'N/A';
         return `
-Run ${index + 1} at ${runTime} - ${result.passed ? 'PASSED' : 'FAILED'}
+Run ${index + 1} at ${runTime} - ${statusLabel}${isBlockedRun ? '\nLinkedIn people search was unavailable for the connected account on this run, so no prospects were sourced — this is NOT "nobody matched your filters". The outage is upstream at LinkedIn/Unipile and is account-scoped: your account is not broken and reconnecting will not help. Sourcing resumes automatically once search returns for the account.' : ''}
 Response: ${result.actualResponse.substring(0, 100)}${result.actualResponse.length > 100 ? '...' : ''}
 View Conversation: ${sessionUrl}
 `;

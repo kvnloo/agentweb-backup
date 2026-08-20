@@ -43,8 +43,8 @@
 #
 # This gate's own PR hit it (agentweb#2231, captured verbatim in the tests):
 # pushed, flipped ready 13s later, `cancel-in-progress` killed run 4936 while
-# run 4937 carried the real result. Both suites came back, so `Require Greptile
-# Review` appeared twice — success from 4937, skipped from 4936 — the
+# run 4937 carried the real result. Both suites came back, so the discriminator
+# job appeared twice — success from 4937, skipped from 4936 — the
 # discriminator read the superseded `skipped`, and the gate returned NO_EVIDENCE
 # for a fully green PR. A gate that rejects legitimate PRs gets switched off
 # within a week, so that false negative is as disqualifying as a false positive.
@@ -60,8 +60,20 @@
 # `.github/workflows/tests.yml` gates the backend jobs on
 # `backend == 'true' && draft == false`, collapsing both reasons into one
 # `if`, so both render identically as `conclusion: skipped`. One job
-# disambiguates them: `Require Greptile Review` is gated on `draft == false`
+# disambiguates them: `Detect changed projects` is gated on `draft == false`
 # ALONE, with no path filter. Therefore:
+#
+# ENG-1371: this used to be `Require Greptile Review`, which had the same
+# shape — draft-gated, never path-filtered. When Greptile was dropped as a
+# vendor that job was deleted, and because the discriminator is matched by
+# exact name and FAILS CLOSED on absence, leaving the old default would have
+# turned every PR into NO_EVIDENCE. `Detect changed projects` was verified as
+# an exact substitute before the switch: both discriminators were run against
+# all 18 open agentweb PRs and returned identical verdicts on 18/18.
+#
+# Whatever this points at must be gated on the draft flag and NOTHING else. A
+# job with a path filter would report `skipped` on a perfectly real run, which
+# this gate would then read as a draft-time run and reject.
 #
 #   discriminator skipped  -> this was a draft-time run; every draft-gated
 #                             job skipped for that reason. Not evidence.
@@ -74,8 +86,11 @@
 #
 # Why an executed discriminator is no longer enough on its own (ENG-915)
 # ----------------------------------------------------------------------
-# The backend test jobs are now gated on `greptile-review` as well, so their
-# `skipped` carries a third possible meaning: the Greptile gate did not pass.
+# ENG-915 additionally gated the backend test jobs on the reviewer check, so
+# their `skipped` carried a third possible meaning: the gate did not pass.
+# ENG-1039 removed that coupling and ENG-1371 deleted the gate, but the rule
+# below is KEPT — it never depended on that gate existing, and it is what makes
+# a path-filter skip provable rather than inferred.
 # That defeats every attempt to infer the reason from the payload. Suite ids
 # do not separate the cases either — `re-run failed jobs` appends the new
 # results to the SAME suite, so a re-run in which only the gate turned green
@@ -88,8 +103,8 @@
 # `success` at this head. Anything else — skipped, absent, cancelled — is
 # NO_EVIDENCE. The diff is read from `pulls/{n}/files`, which is the same
 # input `dorny/paths-filter` decides on, and the path list below mirrors the
-# `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: the
-# Greptile gate may reorder work, it must not reduce merge evidence.
+# `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: a
+# gate may reorder work, but it must not reduce merge evidence.
 #
 # Why a CLI and not a CI job
 # --------------------------
@@ -104,7 +119,9 @@
 #
 # Exit codes (each is separately actionable for a calling agent):
 #   0  PASS         a real run executed against this head and nothing failed
-#   1  FAIL         a check actually ran and failed/was cancelled
+#   1  FAIL         a check actually ran and returned a negative verdict.
+#                   NOT a cancellation outside the evidence set — that is an
+#                   absent verdict, not a negative one (ENG-1381)
 #   2  PENDING      still in flight, or GitHub is still computing mergeability
 #   3  NO_EVIDENCE  nothing has ever executed against this head — the ENG-757
 #                   class. Distinct from FAIL because the remedy differs:
@@ -116,7 +133,7 @@
 #   PR_NUMBER                   pull request number
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
-#                               (default "Require Greptile Review")
+#                               (default "Detect changed projects")
 #   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
 #                               `success` when the diff touches the backend
 #                               paths (ENG-915)
@@ -125,7 +142,7 @@ set -uo pipefail
 
 REPO="${REPO:?REPO must be set}"
 PR_NUMBER="${PR_NUMBER:?PR_NUMBER must be set}"
-DRAFT_JOB="${MERGE_EVIDENCE_DRAFT_JOB:-Require Greptile Review}"
+DRAFT_JOB="${MERGE_EVIDENCE_DRAFT_JOB:-Detect changed projects}"
 
 # Mirrors the `backend` filter in .github/workflows/tests.yml, including the two
 # CI-path entries that filter counts as backend changes (ENG-743). A prefix here
@@ -470,27 +487,84 @@ fi
 #
 # The first version had `bad` as a fixed list and simply ignored anything not in
 # it, so a `neutral` check sitting beside one success produced PASS with the
-# neutral silently dropped (caught by Greptile on this PR). That is the exact
+# neutral silently dropped (caught in review on this PR). That is the exact
 # defect this script exists to eliminate: a conclusion the control cannot
 # account for, omitted, yielding a green.
 #
 # Adding "neutral" to the list would fix that one value and leave the shape
 # intact for the next conclusion GitHub introduces. Instead anything outside the
 # known sets is counted, named, and blocks. Unknown is not benign.
-classified="$(printf '%s' "${runs_json}" | jq -r '
-    def bad: ["failure","neutral","cancelled","timed_out","action_required","stale"];
-    def known: bad + ["success","skipped"];
+#
+# ENG-1381: `cancelled` is deliberately NOT in `bad`, and this is the one
+# entry whose absence is a decision rather than an oversight.
+#
+# A failure is a negative verdict. A cancellation is the ABSENCE of a verdict —
+# the job was killed before it could produce one. Those are different facts, and
+# this script already knows it: the supersession rule in section 2 ignores
+# cancelled runs on exactly that reasoning ("it produced no verdict of its own,
+# so nothing is thrown away by ignoring it"). Counting the same conclusion as a
+# failure here contradicted that.
+#
+# The cost of the contradiction was measured, not theorised. `Backend deploy to
+# staging` holds a single GLOBAL concurrency lane; a newer waiting request
+# evicts the older, so with several backend PRs open almost none of them obtains
+# a completed deploy. 37% of staging-deploy executions were cancelled over the
+# 20h sampled for ENG-1381. Every one of those PRs got FAIL from the gate that
+# CLAUDE.md and AGENTS.md name as the merge criterion — including agentweb#2491,
+# where the override had to be taken on the PR that keeps this script working.
+# The header calls that disqualifying: "a gate that rejects legitimate PRs gets
+# switched off within a week".
+#
+# What stops this from being a loosening is that the gate never relied on `bad`
+# to catch a missing measurement in the first place. It demands a POSITIVE
+# `success` from the jobs whose evidence it requires, and does so by name:
+# section 5 for the discriminator (a cancelled one is caught explicitly below)
+# and section 7 for MERGE_EVIDENCE_BACKEND_JOBS, which already reports a
+# cancelled backend job as NO_EVIDENCE and was simply never reached while
+# `n_bad` exited first. Section 6's `n_success -eq 0` backstops a wholly
+# cancelled run. A cancellation outside that set is what it says it is: no
+# verdict, from a job no verdict was required of.
+#
+# Known limitation, stated rather than discovered later: a job killed by its own
+# `timeout-minutes` also reports `cancelled`, not `timed_out` (verified on #2491
+# — "EB resource/instance config conflict" died at 4m59s against a 5-minute
+# ceiling). Eviction and self-timeout are not distinguishable from any
+# structured API field, only from a log annotation. So a self-timeout outside
+# the evidence set no longer blocks either. That is accepted deliberately, and
+# paid for by naming every tolerated cancellation in the PASS output below — a
+# silent tolerance is how a gate stops working without anyone noticing.
+classified="$(printf '%s' "${runs_json}" | jq -r \
+    --arg draft "${DRAFT_JOB}" --arg backend "${BACKEND_JOBS}" '
+    def bad: ["failure","neutral","timed_out","action_required","stale"];
+    # The jobs this gate can require a positive success from, so a cancelled
+    # ATTEMPT of one is described accurately rather than lumped in with the
+    # cancellations nothing was ever required from.
+    #
+    # Membership is tested with `index`, never `inside`/`contains`: for strings
+    # those match on SUBSTRING, so a job named "Backend tests" would be counted
+    # as a member because "Backend tests (agentMode)" contains it. Every other
+    # set membership in this script is exact so that a rename fails closed
+    # rather than being absorbed by a partial match, and this is no different.
+    def evset: [$draft] + ($backend | split("\n") | map(select(length > 0)));
+    def known: bad + ["success","skipped","cancelled"];
     def done_: select(.status == "completed");
     def unknown_: done_ | select(.conclusion as $c | known | index($c) | not);
     [ ([ .check_runs[] | select(.status != "completed") ] | length),
       ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) ] | length),
       ([ .check_runs[] | select(.conclusion == "success") ] | length),
       ([ .check_runs[] | unknown_ ] | length),
+      ([ .check_runs[] | done_ | select(.conclusion == "cancelled") ] | length),
       ([ .check_runs[] | select(.status != "completed") | .name ] | join(", ")),
       ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
       ([ .check_runs[] | select(.conclusion == "skipped") | .name ] | join(", ")),
       ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", ")),
-      ([ .check_runs[] | unknown_ | "\(.name) (\(.conclusion // "null"))" ] | join(", "))
+      ([ .check_runs[] | unknown_ | "\(.name) (\(.conclusion // "null"))" ] | join(", ")),
+      ([ .check_runs[] | done_ | select(.conclusion == "cancelled")
+         | select(.name as $n | evset | index($n) == null)
+         | "\(.name) (\(.conclusion))" ] | join(", ")),
+      ([ .check_runs[] | done_ | select(.conclusion == "cancelled")
+         | select(.name as $n | evset | index($n) != null)
+         | "\(.name) (\(.conclusion))" ] | join(", "))
     ] | map(tostring) | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
 
@@ -499,8 +573,9 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${classified}" ]; then
   hard_fail "unparseable check-runs payload while classifying job conclusions at ${head_sha}"
 fi
 
-IFS="${SEP}" read -r n_pending n_bad n_success n_unknown \
-  pending_names bad_names skipped_names success_names unknown_names <<<"${classified}"
+IFS="${SEP}" read -r n_pending n_bad n_success n_unknown n_cancelled \
+  pending_names bad_names skipped_names success_names unknown_names \
+  cancelled_outside cancelled_inset <<<"${classified}"
 
 # ---------------------------------------------------------------------------
 # 5. Was this a draft-time run?
@@ -557,6 +632,22 @@ if [ "${discriminator}" = "skipped" ]; then
   exit 3
 fi
 
+# ENG-1381 AC3. Cancellation is tolerated below for jobs no evidence was
+# required from — but the discriminator is not one of those. It is the job every
+# other conclusion is interpreted against: without it a draft-time run cannot be
+# told from a real one, which is the whole ENG-757 shape. Absent gets its own
+# verdict above for the same reason; cancelled is the same absence arriving by a
+# different route, so it fails closed identically rather than falling through to
+# the tolerant path.
+if [ "${discriminator}" = "cancelled" ]; then
+  if [ "${n_pending}" -gt 0 ]; then
+    verdict 'PENDING' "'${DRAFT_JOB}' was cancelled at head ${head_sha}, but a run is executing now (${pending_names}). Re-run once it settles."
+    exit 2
+  fi
+  verdict 'NO_EVIDENCE' "the draft discriminator '${DRAFT_JOB}' was CANCELLED at head ${head_sha}, so it produced no verdict. Without it a draft-time run cannot be told apart from a real one, and every other conclusion here is uninterpretable. This gate fails closed rather than guess. Re-run the workflow at this head."
+  exit 3
+fi
+
 # ---------------------------------------------------------------------------
 # 6. Ordinary reporting, now that the run is known to be real
 # ---------------------------------------------------------------------------
@@ -594,7 +685,7 @@ fi
 # Reached only once the run is known real and nothing failed or is pending, so
 # this converts exactly one verdict: a PASS that would have been read off a
 # `skipped` backend suite. See the header for why the skip's reason cannot be
-# inferred from the payload now that those jobs are Greptile-gated.
+# inferred from the payload.
 
 # Endpoint first, flags after: every other call in this script passes the
 # endpoint as the first argument, and the test mock dispatches on it.
@@ -653,7 +744,7 @@ if [ -n "${touches_backend}" ]; then
     # "Did it ever pass at this head", not "is the newest entry a pass".
     #
     # Without this, re-running the workflow at a head whose suite had already
-    # gone green reports NO_EVIDENCE the moment the re-run's Greptile gate
+    # gone green reports NO_EVIDENCE the moment the re-run's discriminator
     # comes back below 5/5: the tests skip, the skip is newer than the success,
     # and a real green run at this exact SHA is discarded. That verdict is
     # wrong on the facts — the suite did execute against this code — and it is
@@ -665,6 +756,15 @@ if [ -n "${touches_backend}" ]; then
     # failing re-run is visible) and exits before reaching this line. So this
     # can only ever rescue a success that a SKIP superseded — never mask a
     # failure with an earlier pass.
+    #
+    # ENG-1381 narrowed that precondition: a `cancelled` job no longer exits at
+    # `n_bad`, so this line is now also reachable with one present. The rescue
+    # stays sound for the same reason it always did — the head SHA is immutable,
+    # so a suite that went green tested exactly this code and a later
+    # cancellation cannot un-test it. What it must not do is treat a cancelled
+    # backend job that NEVER passed as evidence, and it does not: `job_state`
+    # falls through to the newest conclusion, which is `cancelled`, which is not
+    # `success`, so it lands in `missing` and returns NO_EVIDENCE below.
     job_state="$(printf '%s' "${runs_after_supersession}" | jq -r --arg job "${job}" '
         [ .check_runs[] | select(.name == $job) ] as $rows
         | if ($rows | length) == 0 then "ABSENT"
@@ -682,7 +782,7 @@ if [ -n "${touches_backend}" ]; then
   done <<<"${BACKEND_JOBS}"
 
   if [ -n "${missing}" ]; then
-    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. Those jobs are gated on '${DRAFT_JOB}' as well as the path filter (ENG-915), so a skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Re-run the workflow at this head once the Greptile gate passes. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. A skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Push or re-run the workflow at this head. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
     exit 3
   fi
 fi
@@ -711,9 +811,13 @@ fi
 # Scope, stated honestly: this proves FILE-LEVEL independence, not semantic
 # independence. Two PRs can break each other while editing different files. That
 # is a real gap — but it is a gap `strict` does not close either, because
-# `strict` only forces the branch to be current, and the two REQUIRED contexts
-# here (`Detect changed projects`, `Require Greptile Review`) do not run the test
-# suite at all. So this is strictly more evidence than the repo has today, not
+# `strict` only forces the branch to be current, and the sole REQUIRED context
+# here (`Detect changed projects`) does not run the test suite at all — it is a
+# ~25s paths-filter job at the HEAD of the graph, so it reports green long
+# before the suites it gates even finish. (Until ENG-1371 the required set also
+# named `Require Greptile Review`, which at least sat behind backend-tests-a/b;
+# that job is gone, so the required set now proves strictly less than it did.
+# ENG-1373 is the fix.) So this is strictly more evidence than the repo has today, not
 # less. Turning `strict` off is a separate, human decision (ENG-1003); this block
 # is what makes that decision safe to take rather than a silent loss of a gate.
 
@@ -813,6 +917,32 @@ fi
 # explicit rather than inferred.
 verdict 'PASS' "${n_success} job(s) executed successfully against head ${head_sha}: ${success_names}"
 if [ -n "${skipped_names}" ]; then
-  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, and any Greptile-gated job it covers carries a success): ${skipped_names}"
+  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, and every job it covers carries a success): ${skipped_names}"
+fi
+
+# ENG-1381 AC2, and the condition on which tolerating a cancellation is
+# defensible at all. These jobs produced NO verdict, and this PASS is a
+# statement about the jobs that did — never about these. Printed on the pass
+# path specifically, because a cancellation that blocks announces itself and one
+# that does not is invisible unless it is said out loud. If a name here starts
+# recurring, that is a signal about the job, not noise to filter: it is how the
+# global backend-staging-deploy lane (ENG-1003) stayed latent long enough to
+# force the override on #2491.
+#
+# Split in two, after CodeRabbit caught the single-line version asserting
+# something false on #2523. Section 7 accepts a required job on "did it EVER
+# pass at this head", so a job with a cancelled attempt AND a success reaches
+# this point legitimately — and calling it "outside the evidence set", as the
+# first version did, misdescribes the one thing this line exists to state
+# accurately. The verdict was right; only the explanation was wrong, which is
+# the more dangerous half to get wrong in a control people read to decide
+# whether to trust a green.
+if [ "${n_cancelled}" -gt 0 ]; then
+  if [ -n "${cancelled_outside}" ]; then
+    log "cancelled, NOT blocking — no verdict was produced and none was required from these: ${cancelled_outside}"
+  fi
+  if [ -n "${cancelled_inset}" ]; then
+    log "cancelled ATTEMPT(s) of job(s) INSIDE the evidence set ('${DRAFT_JOB}' + MERGE_EVIDENCE_BACKEND_JOBS). The requirement on each is separately accounted for above — either a success at this head, or a path filter that made it inapplicable — so this is a spent attempt, not a tolerated gap: ${cancelled_inset}"
+  fi
 fi
 exit 0

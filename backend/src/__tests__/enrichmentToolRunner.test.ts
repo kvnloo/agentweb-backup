@@ -300,6 +300,32 @@ describe('pickPreviewLeadIds', () => {
     expect(ids).toEqual(['b', 'c']);
   });
 
+  it('skips placeholder/test-domain rows when real leads are available (ENG-968)', async () => {
+    // A list ~40% seeded with test rows must still preview against real leads —
+    // sampling the junk rows makes the whole list look unenrichable.
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+      items: [
+        { leadId: 'junk1', email: 'queue-verify@example.com', linkedin: '' },
+        { leadId: 'junk2', email: 'test2@company.com', linkedin: '' },
+        { leadId: 'real1', email: 'jane@acme.com', linkedin: '' },
+        { leadId: 'real2', email: '', linkedin: 'https://linkedin.com/in/real2' },
+      ],
+    });
+    const ids = await pickPreviewLeadIds('list-1', undefined);
+    expect(ids).toEqual(['real1', 'real2']);
+  });
+
+  it('falls back to the pool when every lead is a placeholder row (ENG-968)', async () => {
+    (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+      items: [
+        { leadId: 'junk1', email: 'queue-verify@example.com', linkedin: '' },
+        { leadId: 'junk2', email: 'test2@company.com', linkedin: '' },
+      ],
+    });
+    const ids = await pickPreviewLeadIds('list-1', undefined);
+    expect(ids).toEqual(['junk1', 'junk2']);
+  });
+
   it('falls back to the first leads when fewer than 2 have identity data', async () => {
     (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
       items: [{ leadId: 'a', email: '', linkedin: '' }, { leadId: 'b', email: '', linkedin: '' }],

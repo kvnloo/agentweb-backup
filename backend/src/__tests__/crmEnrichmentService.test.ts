@@ -1058,6 +1058,55 @@ describe('CrmEnrichmentService', () => {
     });
   });
 
+  describe('isPlaceholderDomain', () => {
+    it('identifies RFC 2606 / 6761 reserved domains and TLDs', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.org')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mail.example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.test')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.invalid')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.localhost')).toBe(true);
+    });
+
+    it('identifies canonical filler domains typed into test rows', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('company.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourcompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mycompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourdomain.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('test.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agenttest.com')).toBe(true);
+    });
+
+    it('is case- and trailing-dot-insensitive', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('  Example.COM. ')).toBe(true);
+    });
+
+    it('does not flag real company domains', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agentweb.pro')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('testflight.apple.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('examplecorp.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('')).toBe(false);
+    });
+
+    it('makes placeholder domains non-business everywhere (ENG-968)', () => {
+      // Folded into the personal/institutional guards so no firmographic path
+      // (Apollo org match, web-search templates, V3 identity) ever treats a
+      // reserved domain as the lead's employer.
+      expect(CrmEnrichmentService.isPersonalDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('queue-verify@example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('test2@company.com')).toBe(true);
+    });
+
+    it('drops the {{emailDomain}} token for placeholder-domain leads', () => {
+      const query = CrmEnrichmentService.applySearchTemplate(
+        '{{emailDomain}} company overview',
+        { leadId: 'l1', email: 'test2@company.com' } as any,
+      );
+      expect(query).toBe('company overview');
+    });
+  });
+
   describe('isPersonalEmailDomain', () => {
     it('identifies common personal providers', () => {
       expect(CrmEnrichmentService.isPersonalEmailDomain('user@gmail.com')).toBe(true);
@@ -1759,6 +1808,87 @@ describe('CrmEnrichmentService template fallback chain', () => {
     });
 
     expect(mockAgentModeService.youSearchWeb).toHaveBeenCalledWith('Epsilon Ltd funding crunchbase', 5);
+  });
+});
+
+describe('CrmEnrichmentService cross-provider timeout fallback', () => {
+  const input = {
+    leadContext: { company: 'Acme Corp' },
+    webContext: 'Acme Corp source context',
+    linkedinContext: '',
+    spec: {
+      userId: 'user-fallback',
+      instruction: 'Find company size',
+      outputFields: ['company_size'],
+    },
+    lead: { leadId: 'lead-fallback' },
+    enrichConfig: {
+      enrichmentModel: 'gpt-5-chat-2',
+      dataExtractionModel: 'gpt-5-chat-2',
+    },
+  } as any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  afterEach(() => {
+    mockAgentModeService.getClientForModel.mockResolvedValue({
+      chat: { completions: { create: mockGeminiCreate } },
+    } as any);
+  });
+
+  it('uses the fallback model client after a primary timeout', async () => {
+    const primaryCreate = jest.fn().mockRejectedValue(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }));
+    const fallbackCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    const fallbackClient = { chat: { completions: { create: fallbackCreate } } };
+    mockAgentModeService.getClientForModel
+      .mockResolvedValueOnce(primaryClient as any)
+      .mockResolvedValueOnce(fallbackClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(primaryCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate).toHaveBeenCalledTimes(1);
+    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
+  });
+
+  it('does not resolve the fallback client when the primary succeeds', async () => {
+    const primaryCreate = jest.fn().mockResolvedValue(geminiResponse({ company_size: '51-200' }));
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    const result = await (new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    );
+
+    expect(result.fields.company_size).toBe('51-200');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(1);
+    expect(primaryCreate.mock.calls[0][0].model).toBe('gpt-5-chat-2');
+  });
+
+  it('keeps non-timeout provider errors on the primary path', async () => {
+    const providerError = new Error('provider rejected request');
+    const primaryCreate = jest.fn().mockRejectedValue(providerError);
+    const primaryClient = { chat: { completions: { create: primaryCreate } } };
+    mockAgentModeService.getClientForModel.mockResolvedValue(primaryClient as any);
+
+    await expect((new CrmEnrichmentService() as any).extractFieldsViaLLM(
+      input.leadContext, input.webContext, input.linkedinContext,
+      input.spec, input.lead, input.enrichConfig,
+    )).rejects.toThrow('provider rejected request');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenCalledTimes(2);
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(1, 'gpt-5-chat-2');
+    expect(mockAgentModeService.getClientForModel).toHaveBeenNthCalledWith(2, 'gpt-5-chat-2');
   });
 });
 

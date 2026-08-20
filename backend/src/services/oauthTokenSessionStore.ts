@@ -154,8 +154,24 @@ export async function storeTokenSession(
  * Retrieve and burn a session. Returns null if it is unknown, expired, or does not match a
  * live session id for this user+provider.
  *
- * Only the matching session is consumed — concurrent popups for the same provider do not
- * invalidate each other. Expired siblings are pruned on the way through.
+ * ENG-965 — what "one-time use" actually guarantees here: the persisted removal is
+ * CONDITIONED on the exact row this call read (optimistic concurrency via
+ * `settingsService.*IfValueMatches`), and token material is returned ONLY when that
+ * conditional write actually applied. Concretely:
+ *   - Write applies  → the removal provably happened; tokens are returned.
+ *   - Conditional-check failure (another request changed the row first) → this read was
+ *     stale, so the match cannot be trusted; returns null rather than risk handing out
+ *     tokens for an already-superseded session.
+ *   - Any other store failure → the write never applied, so the row is provably unchanged
+ *     from what was read (nothing was silently consumed); this rethrows so the caller
+ *     produces a deliberate error instead of pretending the session was used.
+ * A session can only ever be replayed by presenting its id again before this call
+ * completes successfully for it — never after, and never merely because a later
+ * persistence attempt happened to fail.
+ *
+ * Only the matching session is removed — concurrent popups for the same provider do not
+ * invalidate each other. Expired siblings are pruned on the way through, atomically with
+ * the same write.
  */
 export async function retrieveTokenSession(
   sessionId: string,
@@ -165,16 +181,57 @@ export async function retrieveTokenSession(
   if (!sessionId) return null;
 
   const now = Date.now();
-  const row = await readRow(userId, provider);
-  if (row.sessions.length === 0) return null;
+  const key = settingName(userId, provider);
+  const setting = await settingsService.getSetting(key);
+  if (!setting?.settingValue) return null;
 
-  const match = row.sessions.find(
+  let sessions: StoredSession[];
+  try {
+    const parsed = JSON.parse(setting.settingValue) as SessionRow;
+    sessions = Array.isArray(parsed?.sessions) ? parsed.sessions : [];
+  } catch {
+    return null;
+  }
+  if (sessions.length === 0) return null;
+
+  const match = sessions.find(
     (s) => s.sessionId && live(s, now) && secretsMatch(s.sessionId, sessionId),
   );
 
-  // One-time use: remove the matched session, and prune expired siblings while we're here.
-  row.sessions = row.sessions.filter((s) => live(s, now) && s !== match);
-  await writeRow(row);
+  // Remove the matched session, and prune expired siblings while we're here — conditioned
+  // on the exact raw value we just read, so this write can only apply if nothing else has
+  // touched the row since (see doc comment above).
+  const remaining = sessions.filter((s) => live(s, now) && s !== match);
+
+  // Nothing to consume and nothing to prune (e.g. an unknown/wrong sessionId against a row
+  // of otherwise-live siblings): skip the write entirely. Rewriting the row here would only
+  // change its `updatedAt`, but that still changes the raw `settingValue` this write is
+  // conditioned on — which would invalidate a concurrent LEGITIMATE consume's own read and
+  // make it lose its conditional race for no reason. A no-op stays a no-op.
+  if (!match && remaining.length === sessions.length) {
+    return null;
+  }
+
+  try {
+    if (remaining.length === 0) {
+      await settingsService.deleteSettingIfValueMatches(key, setting.settingValue);
+    } else {
+      const furthestExpiry = Math.max(...remaining.map((s) => s.expires));
+      await settingsService.setSettingIfValueMatches(
+        key,
+        JSON.stringify({ userId, provider, sessions: remaining }),
+        setting.settingValue,
+        `Transient ${provider} OAuth token session`,
+        'system',
+        Math.floor(furthestExpiry / 1000),
+      );
+    }
+  } catch (err: any) {
+    if (err?.code === 'ConditionalCheckFailedException') {
+      return null;
+    }
+    throw err;
+  }
 
   if (!match) {
     return null;

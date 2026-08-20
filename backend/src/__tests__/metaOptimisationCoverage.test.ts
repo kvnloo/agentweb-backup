@@ -790,3 +790,146 @@ describe('newestSpendingDay', () => {
     expect(newestSpendingDay(null)).toBeUndefined();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// §G day-1 detection — alert on the FIRST spending day of a resumed/new ad set.
+//
+// Today a resumed known-broken ad set costs ~4 days of spend before the streak reaches
+// OPTIMISATION_ABSENCE_DAYS. The storage-free fix INVERTS Tier 1's own first P1: account-wide
+// PRESENCE masks a dead pixel (a busy sibling vouches for it), but account-wide ABSENCE
+// cannot be masked — if a family produced zero conversions across the WHOLE account for the
+// window, no pixel produced it.
+// ─────────────────────────────────────────────────────────────────────────────────────
+describe('day-1 detection for an ad set with no history of its own', () => {
+  const adSet = (over: any = {}) => ({
+    id: 'as_new', name: 'Resumed — Complete Registration', effective_status: 'ACTIVE',
+    promoted_object: { pixel_id: 'px_1', custom_event_type: 'COMPLETE_REGISTRATION' },
+    ...over,
+  });
+  /** Account history: spent every day, never once produced the family. */
+  const accountDaysAbsent = (n = 10) =>
+    Array.from({ length: n }, (_, i) => ({
+      date: `2026-08-${String(i + 1).padStart(2, '0')}`, spend: 100, families: ['lead'],
+    }));
+  /** The ad set's own history: it has spent exactly once. */
+  const ownFirstDay = [{ date: '2026-08-10', spend: 40, families: [] as string[] }];
+  const livePixel = { px_1: ['PageView', 'Lead'] };
+
+  it('ALERTS on the first spending day when the family is absent account-wide', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: ownFirstDay }, undefined, accountDaysAbsent(),
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0]).toMatchObject({
+      adSetId: 'as_new', insightsFamily: 'complete_registration', day1: true,
+    });
+  });
+
+  it('does NOT alert when the account HAS produced the family — presence is exculpatory', () => {
+    // The whole basis of the inversion. If the account ever produced it, the pixel's 24h
+    // silence is a low-volume window, not proof of absence.
+    const days = accountDaysAbsent();
+    days[3].families = ['lead', 'complete_registration'];
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: ownFirstDay }, undefined, days,
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('does NOT alert when the pixel shows no PageView — a silent pixel proves nothing', () => {
+    // Without PageView the pixel may simply be idle or unreadable, and "could not ask" is
+    // never "received nothing".
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], { px_1: ['Lead'] }, { as_new: ownFirstDay }, undefined, accountDaysAbsent(),
+    );
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('does NOT alert when the account barely has history — too little opportunity to conclude', () => {
+    // A brand-new account on its own first days has no basis for an absence claim; alerting
+    // there would fire on every account that has not converted YET.
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: ownFirstDay }, undefined, accountDaysAbsent(2),
+    );
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('does NOT alert when the ad set never delivered — ACTIVE is configuration, not spend', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: [] }, undefined, accountDaysAbsent(),
+    );
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('leaves a PAUSED ad set dormant — day-1 must not bypass the alert/log decision', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet({ effective_status: 'PAUSED' })], livePixel, { as_new: ownFirstDay },
+      undefined, accountDaysAbsent(),
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.dormant).toHaveLength(1);
+  });
+
+  it('is INERT when no account history is supplied — the existing callers keep their behaviour', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: ownFirstDay },
+    );
+    expect(v.alerting).toEqual([]);
+    expect(v.unconfirmed).toHaveLength(1);
+  });
+
+  it('still prefers the ordinary streak once the ad set has its own history', () => {
+    // Day-1 is a floor, not a replacement: a real 3-day streak alerts WITHOUT day1 set.
+    const own = [
+      { date: '2026-08-08', spend: 40, families: [] as string[] },
+      { date: '2026-08-09', spend: 40, families: [] as string[] },
+      { date: '2026-08-10', spend: 40, families: [] as string[] },
+      { date: '2026-08-11', spend: 40, families: [] as string[] },
+    ];
+    const v = evaluateAccountOptimisationCoverage(
+      [adSet()], livePixel, { as_new: own }, undefined, accountDaysAbsent(),
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0].consecutiveAbsentSpendingDays).toBe(3);
+    expect((v.alerting[0] as any).day1).toBeUndefined();
+  });
+});
+
+describe('day-1 detection respects delivery recency', () => {
+  it('does NOT alert when the only own spending day is stale — no spend left to stop', () => {
+    // CodeRabbit, PR #2499. The first version checked that the ad set had spent, never that
+    // it was spending NOW, so an ad set that spent once weeks ago would page someone about
+    // money nobody is spending. The streak branch has always guarded this.
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_new', name: 'Long stopped', effective_status: 'ACTIVE',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'COMPLETE_REGISTRATION' },
+      }],
+      { px_1: ['PageView', 'Lead'] },
+      { as_new: [{ date: '2026-07-20', spend: 40, families: [] as string[] }] },
+      '2026-08-15',
+      Array.from({ length: 10 }, (_, i) => ({
+        date: `2026-08-${String(i + 1).padStart(2, '0')}`, spend: 100, families: ['lead'],
+      })),
+    );
+    expect(v.alerting).toEqual([]);
+  });
+
+  it('DOES alert when the first spending day is recent', () => {
+    const v = evaluateAccountOptimisationCoverage(
+      [{
+        id: 'as_new', name: 'Just resumed', effective_status: 'ACTIVE',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'COMPLETE_REGISTRATION' },
+      }],
+      { px_1: ['PageView', 'Lead'] },
+      { as_new: [{ date: '2026-08-15', spend: 40, families: [] as string[] }] },
+      '2026-08-15',
+      Array.from({ length: 10 }, (_, i) => ({
+        date: `2026-08-${String(i + 1).padStart(2, '0')}`, spend: 100, families: ['lead'],
+      })),
+    );
+    expect(v.alerting).toHaveLength(1);
+    expect(v.alerting[0]).toMatchObject({ day1: true });
+  });
+});

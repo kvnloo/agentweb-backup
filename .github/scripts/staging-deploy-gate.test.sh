@@ -305,8 +305,28 @@ assert_contains "${DEPLOY_IF}" "needs.backend-tests-a.result == 'success'" \
   "agentMode suite must have PASSED, not merely not-failed"
 assert_contains "${DEPLOY_IF}" "needs.backend-tests-b.result == 'success'" \
   "non-agentMode + coverage suite must have PASSED"
-assert_contains "${DEPLOY_IF}" "needs.greptile-review.result == 'success'" \
-  "Greptile gate must have PASSED (ENG-754)"
+
+# ENG-1371: the `needs.greptile-review.result == 'success'` clause was dropped
+# with the job when Greptile was retired as a vendor.
+#
+# The first attempt at replacing it was `assert_not_contains "greptile"`, which
+# is PERMANENTLY VACUOUS — the job is deleted, so the string can never come
+# back, and the check can never fail. That is the exact anti-pattern this same
+# change removes from merge-evidence.test.sh, and it would have traded a live
+# gate assertion for decoration.
+#
+# What ENG-754 actually bought is the SHAPE, and the shape outlives the vendor:
+# every upstream clause reads `result == 'success'`, never "did not fail". That
+# is what stops a skipped or cancelled upstream from being read as a pass — the
+# ENG-757 false green, in the one job that can reach AWS. Assert it directly, so
+# a future clause written as `!= 'failure'` fails here.
+for _upstream in backend-tests-a backend-tests-b; do
+  assert_contains "${DEPLOY_IF}" "needs.${_upstream}.result == 'success'" \
+    "${_upstream} is gated on a positive success, not on the absence of failure"
+done
+assert_not_contains "${DEPLOY_IF}" "!= 'failure'" \
+  "no upstream is gated on 'did not fail' — skipped and cancelled are not passes" \
+  "a skipped or cancelled upstream satisfies != 'failure', which is the ENG-757 false green"
 
 # --- The ENG-991 guard. ------------------------------------------------------
 assert_contains "${DEPLOY_IF}" "github.event.pull_request.user.login != 'dependabot[bot]'" \
@@ -321,15 +341,15 @@ assert_not_contains "${DEPLOY_IF}" "github.actor" \
   "github.actor is the triggering actor and changes when a human touches a Dependabot branch"
 
 # --- Containment: the guard belongs on the deploy job and nowhere else. ------
-# Dependabot PRs must still run the full backend suite and the Greptile gate.
+# Dependabot PRs must still run the full backend suite.
 # They change .github/workflows/tests.yml, which the `backend` filter counts as
 # a backend change precisely so the CI path gates its own changes (ENG-743);
 # skipping the tests for Dependabot would make that self-gating vacuous and let
 # an action bump land having exercised nothing.
-for job in backend-tests-a backend-tests-b greptile-review; do
+for job in backend-tests-a backend-tests-b; do
   assert_not_contains "$(job_if "${job}")" "dependabot" \
     "${job} still runs for Dependabot PRs" \
-    "Dependabot bumps must be tested and reviewed like any other PR"
+    "Dependabot bumps must be tested like any other PR"
 done
 
 # --- ENG-1041: the deploy decision and the test decision are separate. -------

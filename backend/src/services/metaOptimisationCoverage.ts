@@ -23,6 +23,9 @@
  * Tier 2 (see §39). Do not let this module's existence imply that coverage.
  */
 
+import { META_GRAPH_TIMEOUT_MS } from '../utils/metaApiFetch';
+
+
 /**
  * Meta's `promoted_object.custom_event_type` values mapped to the standard event NAME the
  * pixel actually reports. The two vocabularies differ (`COMPLETE_REGISTRATION` vs
@@ -84,6 +87,82 @@ export const INSIGHTS_FAMILY_BY_OPTIMISATION: Readonly<Record<string, string>> =
 export const IGNORED_OPTIMISATIONS = new Set(['OTHER']);
 
 /**
+ * What a promoted object is actually optimising for, resolved ONCE for every caller.
+ *
+ * There are three call sites and they used to each re-read `custom_event_type` and re-apply
+ * their own rules, which is how they drifted apart: one applied IGNORED_OPTIMISATIONS and the
+ * other did not. Fixing one member of a group and not its neighbours is the defect §48 records
+ * four times, so the rule lives in one place and the callers ask.
+ *
+ * The case that matters: `custom_event_type: 'OTHER'` means "a custom conversion", NOT an
+ * unknown event, and Meta hands us its name in `custom_event_str` in the SAME object we
+ * already fetch. Dropping those cost real coverage — measured 2026-08-18, Tier 1 could judge
+ * only 5 of the 13 delivering conversion-optimised ad sets fleet-wide, and all 8 it could not
+ * see belonged to the single biggest-spending account.
+ */
+export type OptimisationEventResolution =
+  | { kind: 'none' }
+  | { kind: 'ignored'; key: string }
+  | { kind: 'unrecognised'; key: string }
+  | { kind: 'resolved'; key: string; expectedEventName: string; custom: boolean };
+
+export function resolveOptimisationEvent(
+  promoted: OptimisationAdSet['promoted_object'],
+): OptimisationEventResolution {
+  const raw = promoted?.custom_event_type;
+  // Reach, traffic and engagement goals promote nothing — there is no event to compare.
+  if (typeof raw !== 'string' || !raw.trim()) return { kind: 'none' };
+
+  const key = raw.trim().toUpperCase();
+
+  if (key === 'OTHER') {
+    const custom = promoted?.custom_event_str;
+    if (typeof custom === 'string' && custom.trim()) {
+      // A custom conversion's pixel event name IS the string itself — no translation, unlike
+      // the standard taxonomy where `COMPLETE_REGISTRATION` reports as `CompleteRegistration`.
+      const name = custom.trim();
+      return { kind: 'resolved', key: name, expectedEventName: name, custom: true };
+    }
+    // OTHER with no name attached. Ignored rather than reported unrecognised: it is a real,
+    // valid configuration, and surfacing it would print the same word in every sweep forever.
+    return { kind: 'ignored', key };
+  }
+
+  if (IGNORED_OPTIMISATIONS.has(key)) return { kind: 'ignored', key };
+
+  const expected = META_EVENT_BY_OPTIMISATION[key];
+  // Meta adds optimisation types over time. An untranslatable one is REPORTED, never asserted
+  // as a mismatch — claiming a pixel is missing an event we cannot name is the confidently
+  // wrong diagnosis §F's alert-enrichment rounds were spent removing.
+  if (!expected) return { kind: 'unrecognised', key };
+
+  return { kind: 'resolved', key, expectedEventName: expected, custom: false };
+}
+
+/**
+ * Did this pixel report this event?
+ *
+ * Percent-decoded as well as compared raw, because `/stats` returns BOTH forms for a custom
+ * event whose name contains spaces or symbols — one production pixel reports
+ * `Hubspot Form Completed $25k+` and `Hubspot%20Form%20Completed%20%2425k%2B` side by side.
+ *
+ * Deliberately CASE-SENSITIVE. `Lead` and `lead` are different events and one production pixel
+ * receives both; folding them would let a healthy event vouch for a dead one.
+ */
+export function pixelReceivedEvent(received: Set<string>, expected: string): boolean {
+  if (received.has(expected)) return true;
+  for (const got of received) {
+    if (got === expected) return true;
+    try {
+      if (decodeURIComponent(got) === expected) return true;
+    } catch {
+      // A malformed percent sequence is not a match; it is also not an error worth throwing.
+    }
+  }
+  return false;
+}
+
+/**
  * Consecutive SPENDING days with no attributed conversion of the family before a pixel
  * silence is treated as real. Same number and same reasoning as
  * `BLACKOUT_CONSECUTIVE_DAYS`, and it is not arbitrary: Haven's own healthy baseline
@@ -132,6 +211,47 @@ function daysBetween(from: string, to: string): number | null {
 }
 
 /** The most recent day the ad set actually spent, or undefined if it never did. */
+/**
+ * §G day-1 detection — how much account history must exist before ABSENCE means anything.
+ *
+ * Resuming a known-broken ad set costs ~4 days of spend before the ordinary streak reaches
+ * OPTIMISATION_ABSENCE_DAYS, because the streak needs spending days the ad set has not had
+ * yet. This floor closes that gap without storing anything.
+ *
+ * The reasoning INVERTS this module's own first P1. Account-wide PRESENCE is worthless as
+ * evidence — a busy sibling pixel's conversions land in the account's family list and vouch
+ * for a dead pixel. Account-wide ABSENCE cannot be masked that way: if a family produced
+ * ZERO conversions across the entire account while it was spending, then no pixel produced
+ * it, and a brand-new ad set optimising for it is bidding at something that does not arrive.
+ *
+ * The floor exists because "the account never produced it" is only meaningful once the
+ * account has had a real chance to. Without it, every genuinely new account would alert on
+ * its first days for not having converted YET — the noise failure §F paid for twice.
+ */
+export const DAY1_MIN_ACCOUNT_SPENDING_DAYS = 7;
+
+/** Spending days in a window. Zero-spend days are not opportunity, so they do not count. */
+export function countSpendingDays(days: OptimisationSpendingDay[] | null | undefined): number {
+  return (Array.isArray(days) ? days : []).filter((d) => Number(d?.spend) > 0).length;
+}
+
+/**
+ * Did this family EVER arrive across the window, on any day, at any spend?
+ *
+ * Deliberately not restricted to spending days: a conversion on a zero-spend day still
+ * proves the event can arrive, and this function's only job is to find an exculpating fact.
+ */
+export function familyEverPresent(
+  days: OptimisationSpendingDay[] | null | undefined,
+  family: string,
+): boolean {
+  return (Array.isArray(days) ? days : []).some((d) =>
+    (Array.isArray(d?.families) ? d.families : []).some(
+      (f) => typeof f === 'string' && f.trim().toLowerCase() === family,
+    ),
+  );
+}
+
 export function newestSpendingDay(
   days: OptimisationSpendingDay[] | null | undefined,
 ): string | undefined {
@@ -150,7 +270,14 @@ export interface OptimisationAdSet {
   name?: string;
   effective_status?: string;
   optimization_goal?: string;
-  promoted_object?: { custom_event_type?: string; pixel_id?: string } | null;
+  promoted_object?: {
+    custom_event_type?: string;
+    pixel_id?: string;
+    /** Present when `custom_event_type` is OTHER: the custom conversion's own event
+     *  name, reported by the pixel verbatim. Meta returns it in the same object. */
+    custom_event_str?: string;
+    custom_conversion_id?: string;
+  } | null;
 }
 
 export interface OptimisationMismatch {
@@ -206,29 +333,23 @@ export function evaluateOptimisationCoverage(
   const unrecognised = new Set<string>();
 
   for (const row of rows) {
-    const raw = row?.promoted_object?.custom_event_type;
-    // No promoted event at all (reach, traffic, engagement goals) — nothing to compare.
-    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const resolved = resolveOptimisationEvent(row?.promoted_object);
+    if (resolved.kind === 'none' || resolved.kind === 'ignored') continue;
 
-    const key = raw.trim().toUpperCase();
-    const expected = META_EVENT_BY_OPTIMISATION[key];
     const delivering = DELIVERING_STATUSES.has(String(row?.effective_status ?? '').toUpperCase());
 
-    if (!expected) {
-      // Meta adds optimisation types over time. An untranslatable one is reported, never
-      // asserted as a mismatch — claiming a pixel is missing an event we cannot name is
-      // exactly the confidently-wrong diagnosis §F's alert-enrichment rounds warned about.
-      if (delivering) unrecognised.add(key);
+    if (resolved.kind === 'unrecognised') {
+      if (delivering) unrecognised.add(resolved.key);
       continue;
     }
 
-    if (received.has(expected)) continue;
+    if (pixelReceivedEvent(received, resolved.expectedEventName)) continue;
 
     const hit: OptimisationMismatch = {
       adSetId: row?.id,
       adSetName: row?.name,
-      optimisationEvent: key,
-      expectedEventName: expected,
+      optimisationEvent: resolved.key,
+      expectedEventName: resolved.expectedEventName,
       pixelId: row?.promoted_object?.pixel_id,
     };
     (delivering ? mismatches : dormant).push(hit);
@@ -291,10 +412,30 @@ export function countTrailingAbsentSpendingDays(
   return streak;
 }
 
+/**
+ * Has this ad set stopped delivering long enough that there is no spend left to stop?
+ *
+ * Extracted so the streak branch and day-1 share one definition — they answer the same
+ * question and drifted apart once already.
+ */
+export function isStaleDelivery(
+  ownDays: OptimisationSpendingDay[] | null | undefined,
+  asOf?: string,
+): boolean {
+  if (!asOf) return false;
+  const last = newestSpendingDay(ownDays);
+  if (!last) return false;
+  const staleBy = daysBetween(last, asOf);
+  return staleBy !== null && staleBy > OPTIMISATION_RECENCY_DAYS;
+}
+
 /** A mismatch the spending history CONFIRMS: the money-losing case, and the only one that alerts. */
 export interface ConfirmedOptimisationMismatch extends OptimisationMismatch {
   insightsFamily: string;
   consecutiveAbsentSpendingDays: number;
+  /** Raised by day-1 detection rather than by a completed absence streak. Set so an alert
+   *  can say WHY it fired on so little of the ad set's own history. */
+  day1?: true;
 }
 
 export type AccountOptimisationVerdict = {
@@ -363,6 +504,9 @@ export function evaluateAccountOptimisationCoverage(
   receivedEventsByPixel: Record<string, Iterable<string>> | null | undefined,
   spendingDaysByAdSet: Record<string, OptimisationSpendingDay[]> | null | undefined,
   asOf?: string,
+  /** The ACCOUNT's own per-day history, used only by day-1 detection. Omitted by existing
+   *  callers, which keeps their behaviour byte-identical. */
+  accountSpendingDays?: OptimisationSpendingDay[] | null,
 ): AccountOptimisationVerdict {
   const verdict: AccountOptimisationVerdict = {
     alerting: [], unconfirmed: [], unconfirmable: [], dormant: [], staleDelivery: [],
@@ -391,18 +535,18 @@ export function evaluateAccountOptimisationCoverage(
   };
 
   for (const row of rows) {
-    const raw = row?.promoted_object?.custom_event_type;
-    if (typeof raw !== 'string' || !raw.trim()) continue; // reach/traffic goals promote nothing
-
-    const key = raw.trim().toUpperCase();
-    if (IGNORED_OPTIMISATIONS.has(key)) continue;
+    const resolved = resolveOptimisationEvent(row?.promoted_object);
+    if (resolved.kind === 'none' || resolved.kind === 'ignored') continue;
 
     const delivering = DELIVERING_STATUSES.has(String(row?.effective_status ?? '').toUpperCase());
-    const expected = META_EVENT_BY_OPTIMISATION[key];
-    if (!expected) {
-      if (delivering) unrecognised.add(key);
+
+    if (resolved.kind === 'unrecognised') {
+      if (delivering) unrecognised.add(resolved.key);
       continue;
     }
+
+    const key = resolved.key;
+    const expected = resolved.expectedEventName;
 
     const hit: OptimisationMismatch = {
       adSetId: row?.id,
@@ -427,7 +571,11 @@ export function evaluateAccountOptimisationCoverage(
       continue;
     }
 
-    if (received.has(expected)) continue; // arriving — no claim to make
+    // pixelReceivedEvent, NOT received.has: /stats returns a custom event under BOTH its
+    // decoded and percent-encoded names, and a raw Set lookup sees only one of them. This
+    // evaluator was left on the raw check when the helper was introduced for its sibling —
+    // the same fix-one-of-a-pair defect §48 records, in the commit that cited §48.
+    if (pixelReceivedEvent(received, expected)) continue; // arriving — no claim to make
 
     // Paused: real, but costs nothing until someone resumes it. Never alerted, by decision.
     if (!delivering) {
@@ -450,13 +598,39 @@ export function evaluateAccountOptimisationCoverage(
       const confirmed = { ...hit, insightsFamily: family, consecutiveAbsentSpendingDays: absent };
       // ACTIVE describes configuration, not spend. Only an ad set that was still delivering
       // recently can be described as paying for anything right now.
-      const lastSpend = asOf ? newestSpendingDay(ownDays) : undefined;
-      const staleBy = asOf && lastSpend ? daysBetween(lastSpend, asOf) : null;
-      if (staleBy !== null && staleBy > OPTIMISATION_RECENCY_DAYS) {
+      if (isStaleDelivery(ownDays, asOf)) {
         verdict.staleDelivery.push(confirmed);
       } else {
         verdict.alerting.push(confirmed);
       }
+    } else if (
+      // ── day-1 detection ───────────────────────────────────────────────────────────
+      // Every condition is a way for the claim to be WRONG, so all must fail to hold.
+      delivering &&
+      // The ad set delivered at all — ACTIVE is configuration, not spend.
+      countSpendingDays(ownDays) >= 1 &&
+      // ...but has too little history of its own for the ordinary streak to have run.
+      absent < OPTIMISATION_ABSENCE_DAYS &&
+      // The account had a real chance to produce this family, and never did. PRESENCE would
+      // be exculpatory here; only total absence supports the claim.
+      countSpendingDays(accountSpendingDays) >= DAY1_MIN_ACCOUNT_SPENDING_DAYS &&
+      !familyEverPresent(accountSpendingDays, family) &&
+      // The pixel is demonstrably ALIVE. Without traffic of its own, its silence about this
+      // event is "could not ask", never "did not arrive".
+      pixelReceivedEvent(received, 'PageView') &&
+      // ...and it is delivering NOW. Spending once three weeks ago and stopping is not money
+      // at risk, and paging about it says an ad set is paying for something when it is
+      // paying for nothing — the same "ACTIVE is configuration, not spend" error this module
+      // already paid for once. The streak branch guards this with newestSpendingDay(); the
+      // first version of day-1 did not, and CodeRabbit caught the gap.
+      !isStaleDelivery(ownDays, asOf)
+    ) {
+      verdict.alerting.push({
+        ...hit,
+        insightsFamily: family,
+        consecutiveAbsentSpendingDays: absent,
+        day1: true,
+      });
     } else {
       // Either this ad set converted the family recently — so the pixel's 24h silence is far
       // more likely to be a low-volume window than a fault — or it did not deliver at all.
@@ -522,7 +696,12 @@ export async function fetchOptimisationInputs(
   const fetchImpl = deps?.fetchImpl ?? fetch;
   const apiVersion = process.env.META_API_VERSION || 'v25.0';
   const params = new URLSearchParams({
-    fields: 'id,name,effective_status,promoted_object{custom_event_type,pixel_id}',
+    // `custom_event_str` is the load-bearing addition: without it Meta returns
+    // `custom_event_type: 'OTHER'` with no name, every custom-conversion ad set is
+    // unjudgeable, and the check goes quiet on most of what is actually delivering.
+    fields:
+      'id,name,effective_status,' +
+      'promoted_object{custom_event_type,custom_event_str,custom_conversion_id,pixel_id}',
     limit: '200',
   });
 
@@ -533,7 +712,7 @@ export async function fetchOptimisationInputs(
 
   try {
     for (let page = 0; page < MAX_ADSET_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) {
         return {
@@ -559,8 +738,11 @@ export async function fetchOptimisationInputs(
   const referenced: string[] = [];
   for (const row of adSets) {
     const pixelId = row?.promoted_object?.pixel_id;
-    const event = row?.promoted_object?.custom_event_type;
-    if (typeof pixelId === 'string' && pixelId.trim() && typeof event === 'string' && event.trim()) {
+    // Resolved rather than merely present, so a pixel referenced ONLY by ad sets we cannot
+    // judge does not cost a Graph call — and, more importantly, so a pixel referenced only by
+    // custom-conversion ad sets DOES get one. Before this it was skipped entirely.
+    const resolved = resolveOptimisationEvent(row?.promoted_object);
+    if (typeof pixelId === 'string' && pixelId.trim() && resolved.kind === 'resolved') {
       if (!referenced.includes(pixelId)) referenced.push(pixelId);
     }
   }
@@ -576,7 +758,7 @@ export async function fetchOptimisationInputs(
       const statsUrl =
         `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(pixelId)}/stats` +
         `?aggregation=event&access_token=${encodeURIComponent(accessToken)}`;
-      const response = await fetchImpl(statsUrl);
+      const response = await fetchImpl(statsUrl, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) continue; // omitted → inconclusive, never "nothing arrives"
 
@@ -637,7 +819,7 @@ async function fetchAdSetSpendingDays(
     // only the first page would silently drop delivery evidence and turn real alerts into
     // silence — the same pagination trap #2420 hit moving account level to campaign.
     for (let page = 0; page < MAX_INSIGHT_PAGES && url; page++) {
-      const response = await fetchImpl(url);
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(META_GRAPH_TIMEOUT_MS) });
       const body: any = await response.json();
       if (!response.ok || body?.error) return {};
 

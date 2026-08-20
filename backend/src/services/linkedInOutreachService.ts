@@ -5,6 +5,41 @@ import { userDb } from './db';
 // NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
 // Twitter/X support is suspended — see dev.md for details.
 
+/**
+ * Does this error prove the LinkedIn session is gone, as opposed to merely failing?
+ *
+ * The distinction is the whole point. A timeout, a 5xx or a transport blip says
+ * nothing about session validity, and treating one as a disconnection suppresses a
+ * healthy account behind a false reconnect prompt (ENG-281). Only Unipile's explicit
+ * disconnect code, a 401, or an AUTH_ERROR classification are proof.
+ *
+ * Exported so every caller that persists or blocks on this verdict — the session
+ * probe, the sync cron's health recorder — shares one definition. Two copies of a
+ * safety predicate is one copy too many.
+ */
+export function isProvenDisconnectError(error: any): boolean {
+  // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
+  // `structuredError`. Read both so classification can't depend on which layer threw.
+  const structured = error?.structuredError;
+  const code = structured?.code || error?.body?.code || error?.code || '';
+  const status = structured?.status || error?.body?.status || error?.status;
+  const classification =
+    structured?.classification || error?.body?.classification || error?.classification;
+  // 403 is deliberately NOT proof. `handleError` classifies 401 AND 403 as
+  // AUTH_ERROR, but a 403 is a permission/plan/endpoint restriction — the session
+  // is alive, we are just not allowed to do that thing. This predicate used to feed
+  // a 10-minute in-memory cache where a wrong verdict expired harmlessly; it now
+  // persists `needs_reconnect`, withholds scheduled runs, and emails a paying
+  // customer that their account is broken. That is not a mistake worth making on a
+  // 403.
+  if (Number(status) === 403 && code !== 'errors/disconnected_account') return false;
+  return (
+    code === 'errors/disconnected_account' ||
+    classification === 'AUTH_ERROR' ||
+    Number(status) === 401
+  );
+}
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call
@@ -26,6 +61,23 @@ export class LinkedInOutreachService {
   // another. Note: the per-recipient "Should delay new invitation" rejection does
   // NOT arm this breaker — that one is specific to a single recipient.
   private invitationCooldownUntil: Map<string, number> = new Map();
+
+  /**
+   * True while this account is inside the ENG-126 account-level invitation cooldown.
+   *
+   * Exposed so callers can tell "this send will not reach LinkedIn" BEFORE paying a
+   * pacing slot for it. The breaker below short-circuits the network call entirely,
+   * so a paced caller would otherwise sleep the full gap and consume one of the
+   * account's hourly writes for zero LinkedIn traffic — for up to an hour, on every
+   * queued invite.
+   */
+  isUnderInvitationCooldown(accountId: string): boolean {
+    const until = this.invitationCooldownUntil.get(accountId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.invitationCooldownUntil.delete(accountId);
+    return false;
+  }
   private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
   // Per-account people-search capability verdict (ENG-975). See
   // probeSearchCapability below for why this exists; cached per account so a
@@ -374,21 +426,12 @@ export class LinkedInOutreachService {
         state = 'connected';
       }
     } catch (error: any) {
-      // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
-      // `structuredError`. Read both so the classification cannot depend on which
-      // layer threw.
+      // Only a proven-dead signal may say "disconnected"; everything else is
+      // indeterminate and the caller decides. See isProvenDisconnectError.
+      state = isProvenDisconnectError(error) ? 'disconnected' : 'unknown';
       const structured = error?.structuredError;
       const code = structured?.code || error?.body?.code || error?.code || '';
       const status = structured?.status || error?.body?.status || error?.status;
-      const classification = structured?.classification || error?.body?.classification || error?.classification;
-      // Only these mean "the LinkedIn session is gone". A timeout or transport
-      // failure proves nothing about the session, so it must not be reported as
-      // a disconnection to a caller that would block on it.
-      const definitivelyDisconnected =
-        code === 'errors/disconnected_account' ||
-        classification === 'AUTH_ERROR' ||
-        Number(status) === 401;
-      state = definitivelyDisconnected ? 'disconnected' : 'unknown';
       this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''}) → ${state}`);
     }
     this.connectedStatusCache.set(accountId, { state, timestamp: Date.now() });

@@ -108,8 +108,12 @@ async function fetchAllSubscriptions(): Promise<Stripe.Subscription[]> {
  * Get the monthly amount for a subscription in cents.
  * Converts yearly prices to monthly equivalent.
  * Accounts for active coupons/discounts — a 100% off coupon = $0 effective MRR.
+ *
+ * Exported for mrrCollectionGapService, which needs the same post-discount
+ * "actually billed" figure to compare against a subscription's configured
+ * contracted price.
  */
-function getMonthlyAmount(sub: Stripe.Subscription): number {
+export function getMonthlyAmount(sub: Stripe.Subscription): number {
   const item = sub.items.data[0];
   if (!item?.price) return 0;
 

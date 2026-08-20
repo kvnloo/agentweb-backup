@@ -676,6 +676,16 @@ createTestAccount().then(async () => {
       // or simply empty) is completely normal, not an error.
       try {
         const { pollAndProcessOnce } = await import('./services/asyncJobQueue');
+        // Verify the binding BEFORE scheduling the timer. The import is captured
+        // once, and calling an undefined binding throws SYNCHRONOUSLY inside the
+        // interval callback — past this try/catch and past the `.catch()` below,
+        // which only sees rejected promises. That error then surfaces 30s later
+        // against whichever unrelated suite happens to be running, which is how
+        // `settings.replaySessions` and `securityHeaders` failed on a PR that
+        // touches neither. Failing here instead keeps it to one init-time log.
+        if (typeof pollAndProcessOnce !== 'function') {
+          throw new Error('asyncJobQueue.pollAndProcessOnce is unavailable — poller not started');
+        }
         const QUEUE_POLL_INTERVAL_MS = 30 * 1000;
         setInterval(() => {
           if (!isCronEnabled()) return;
@@ -828,6 +838,30 @@ createTestAccount().then(async () => {
         console.log('[renewalIntegrationHealthCron] Initialized — running daily');
       } catch (error) {
         console.error('[renewalIntegrationHealthCron] Failed to initialize:', error);
+      }
+
+      // Skill Review Queue Digest (ENG-932) — runs daily.
+      // "Submit for Review" fires no notification at all (ENG-149 correctly
+      // killed the old per-submission oncall page as noise, but that left the
+      // queue with no reader). This alerts once a skill has sat in
+      // pending_review past the stale window, deduped to at most one message
+      // per day regardless of queue size — submitting a single skill still
+      // pages nobody.
+      try {
+        const { runSkillReviewQueueDigest } = await import('./cron/skillReviewQueueDigestCron');
+        const SKILL_REVIEW_DIGEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        if (isCronEnabled()) {
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error on first run:', e));
+        }
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('skillReviewQueueDigestCron', runSkillReviewQueueDigest())
+            .catch(e => console.error('[skillReviewQueueDigestCron] Error:', e));
+        }, SKILL_REVIEW_DIGEST_INTERVAL_MS);
+        console.log('[skillReviewQueueDigestCron] Initialized — running daily');
+      } catch (error) {
+        console.error('[skillReviewQueueDigestCron] Failed to initialize:', error);
       }
 
       // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15

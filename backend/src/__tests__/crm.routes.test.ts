@@ -877,7 +877,7 @@ describe('CRM Routes', () => {
       r.route?.path === '/lists/:listId/leads/match-icps' && r.route?.methods?.post
     );
 
-    it('should use gpt-5.2-chat for ICP matching', async () => {
+    it('should use gpt-5.4 for ICP matching (gpt-5.2-chat is Azure-deprecated since 2026-06-29)', async () => {
       const mockList = {
         listId: 'list1',
         name: 'Test List',
@@ -933,7 +933,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
 
-      expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
+      expect(createLLMService).toHaveBeenCalledWith('gpt-5.4', 1);
       expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
         icpMatch: {
           isMatch: true,
