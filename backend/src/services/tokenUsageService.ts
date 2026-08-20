@@ -8,7 +8,6 @@ import { evaluateLlmUsageMode, type LlmUsageMode, type LlmUsagePolicy,
 import { applyLlmUsageCredits, getLlmUsageCreditAdjustment } from './llmUsageCreditService';
 import { randomUUID } from 'crypto';
 import { recordLlmChargeEvent, LLM_CHARGE_EVENTS_TABLE } from './llmChargeAuditDb';
-import { isAnonymousUserId } from '../mcp/anonymousToolAccess';
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -99,6 +98,29 @@ function computePercentUsed(used: number, allowance: number | null): number {
 }
 
 /**
+ * Fixed, conservative dollar cap for an anonymous (`anon_`-owned) session.
+ * There is no subscription tier to size this from — an anon owner has no
+ * AW-Users row — so this exists purely to bound worst-case spend on the
+ * publicly reachable ishare/generate path (ENG-705, ENG-1163). Observed
+ * cost to run the full two-step Founder_Linkedin_Sales_Readiness_Eval plan
+ * is ~$0.45; this caps at roughly 4x that.
+ */
+export const ANONYMOUS_SESSION_COST_CAP_USD = 2;
+
+/**
+ * Sums `totalCost` across every AW-ChatSessions row owned by an anonymous
+ * `anon_<uuid>` id (via the existing UserIdIndex GSI). Lazy-imported —
+ * chatbotService pulls in agentModeService, and a static import here would
+ * drag that graph into every suite that mocks this module (same reasoning
+ * as the tokenUsageService lazy-import in agentModeService).
+ */
+async function getAnonymousSessionCostUsedUsd(userId: string): Promise<number> {
+  const { chatbotDb } = await import('./chatbotService');
+  const { sessions } = await chatbotDb.getUserSessions(userId);
+  return sessions.reduce((sum, session) => sum + (session.totalCost || 0), 0);
+}
+
+/**
  * Get a user's current month token usage, performing lazy reset if month changed.
  */
 export async function getUserTokenUsage(
@@ -168,22 +190,38 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   // getUserTokenUsage then throws "User not found", which generateSharedResponse
   // does not catch specially: the visitor's very first reply on an anonymous
   // work-plan session came back as a raw error instead of the agent's response.
-  // There is no owner to gate spend against here, so let it through uncapped
-  // rather than crash the turn.
-  if (isAnonymousUserId(userId)) {
+  // There is no owner to gate spend against by subscription here, but that does
+  // NOT mean uncapped: createSessionWithPlan activates interactive sharing on
+  // every one of these sessions, and generateSharedResponse's ishare/generate
+  // route is the ENG-705 gate meant to bound an anonymous visitor's spend — the
+  // only rate limiter on that public route. A strict `anon_` prefix check (not
+  // the broader isAnonymousUserId, which also swallowed empty/non-string ids
+  // into this same free pass) plus a fixed conservative cost cap keeps that
+  // invariant intact instead of trading a crash for unlimited free generation.
+  if (typeof userId === 'string' && userId.startsWith('anon_')) {
+    let costUsed: number;
+    try {
+      costUsed = await getAnonymousSessionCostUsedUsd(userId);
+    } catch (err) {
+      // Fail closed: if we can't verify how much this anon owner has already
+      // spent, do not hand out an unlimited allowance — treat as at-cap.
+      console.error(`[tokenUsageService] Failed to resolve anon session cost for ${userId}:`, err);
+      costUsed = ANONYMOUS_SESSION_COST_CAP_USD;
+    }
+    const costPercentUsed = computePercentUsed(costUsed, ANONYMOUS_SESSION_COST_CAP_USD);
     return {
-      allowed: true,
-      warning: false,
+      allowed: costUsed < ANONYMOUS_SESSION_COST_CAP_USD,
+      warning: costUsed < ANONYMOUS_SESSION_COST_CAP_USD && costPercentUsed >= 80,
       used: 0,
       allowance: null,
       bonus: 0,
       effectiveAllowance: null,
       percentUsed: 0,
       month: getCurrentMonth(),
-      costUsed: 0,
-      costAllowance: null,
-      costPercentUsed: 0,
-      costEnforced: false,
+      costUsed,
+      costAllowance: ANONYMOUS_SESSION_COST_CAP_USD,
+      costPercentUsed,
+      costEnforced: true,
       alertThresholds: resolveAlertThresholds(null),
     };
   }
