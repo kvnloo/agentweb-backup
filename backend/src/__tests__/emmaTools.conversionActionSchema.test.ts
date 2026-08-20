@@ -128,3 +128,45 @@ describe('the matrix describes the corrected status model (ENG-1329 e2e)', () =>
     expect(text).toMatch(/CONVERSION_ACTION REMOVE with confirm_conversion_action_removal=true/);
   });
 });
+
+describe('ENG-1325 — OFFLINE_CONVERSION is reachable through the tool (not just implemented)', () => {
+  // uploadClickConversions shipped to main with ZERO callers and no tool exposure — the
+  // same shape as ENG-1328's AC1 gap, where a capability existed at every layer except
+  // the one that could invoke it, behind 43 green tests that all sat below the gap.
+  const tool: any = emmaToolRegistry.getTool('call_google_ads_api');
+  const props = () => tool.definition.inputSchema.properties;
+  const text = `${tool.definition?.description ?? ''}`;
+
+  it('offers OFFLINE_CONVERSION as an entity type', () => {
+    expect(props().entity_type.enum).toContain('OFFLINE_CONVERSION');
+  });
+
+  it('exposes every argument the handler requires', () => {
+    for (const p of ['gclid', 'conversion_at', 'conversion_action_resource_name']) {
+      expect(props()[p]).toBeDefined();
+    }
+  });
+
+  it('exposes validate_only, so a batch can be rehearsed without writing', () => {
+    expect(props().validate_only).toBeDefined();
+    expect(props().validate_only.type).toBe('boolean');
+  });
+
+  it('exposes value and currency together', () => {
+    expect(props().conversion_value).toBeDefined();
+    expect(props().currency_code).toBeDefined();
+  });
+
+  it('tells the model conversion_at is when it HAPPENED, not when it was noticed', () => {
+    expect(text).toMatch(/when the conversion HAPPENED/);
+  });
+
+  it('tells the model order_id is the browser eventId, and why', () => {
+    expect(text).toMatch(/SAME eventId the browser sent as transaction_id/);
+    expect(text).toMatch(/counting twice/);
+  });
+
+  it('warns that a value without a currency misstates revenue', () => {
+    expect(text).toMatch(/REQUIRES a currency_code/);
+  });
+});
