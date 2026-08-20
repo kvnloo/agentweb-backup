@@ -32,7 +32,7 @@ import {
   promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
-import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset, seedMediaCallKeysFromHistory } from './agentMode/core/toolDispatch';
 import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { reconcileUnconsumedCursors } from './agentMode/core/unconsumedCursor';
@@ -4245,7 +4245,12 @@ export class AgentModeService {
       // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
       // iterations of this turn, so the dispatcher can suppress an identical re-request in a
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
-      const mediaCallKeysThisRun = new Map<string, string>();
+      // ENG-1239: seeded from RECENT persisted history (not just started empty) — this run
+      // may itself be a media auto-continuation of a batch that was deferred moments ago in
+      // a DIFFERENT (already-ended) turn, which this same-turn-only map would otherwise
+      // have no record of at all. Bounded to the last hour so an old, unrelated,
+      // coincidentally-identical request is never mistaken for a duplicate.
+      const mediaCallKeysThisRun = seedMediaCallKeysFromHistory(sessionHistory as any, Date.now() - 60 * 60 * 1000);
 
       // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
       // A broad research turn can stay far under `maxIterations` and still burn the whole
