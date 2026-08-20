@@ -1,0 +1,140 @@
+/**
+ * ENG-1245: judges scored a REAL, owner-set "Require approval before
+ * publishing" hold as a fabricated/simulated restriction ("falsely
+ * claiming", "simulated"), because they only ever see the schedule's own
+ * prompt prose (e.g. "(Autonomous)", "no approval needed") and have no
+ * signal that the block came from a real account-level setting
+ * (agentModeService.publishApprovalBlock()). This penalized goalCompletion
+ * for a run that correctly withheld publishing per ENG-803/ENG-827 consent
+ * rules.
+ *
+ * The new clause is APPENDED at call time (same pattern as
+ * NO_TASK_JUDGMENT_CLAUSE / VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE), not
+ * merged into DEFAULT_SCORING_SYSTEM_PROMPT's literal text — production has
+ * a live `default-scoring-prompt` AW-Settings override, and a custom
+ * ScoringJudge.systemPrompt (Fangfang Judge, Matt Judge) is entirely
+ * user-authored, so editing only the hardcoded default would leave the
+ * judges that actually reproduced this bug blind to the fix (ENG-392).
+ */
+import {
+  scoreSession,
+  scoreSessionWithJudge,
+  DEFAULT_SCORING_SYSTEM_PROMPT,
+  PUBLISH_APPROVAL_WITHHOLDING_CLAUSE,
+  ScoringJudge,
+} from '../services/sessionScoringService';
+import { ChatMessage } from '../services/chatbotService';
+import { agentModeService } from '../services/agentModeService';
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    callLLM: jest.fn(),
+    resolveGenerationModel: (m: string) => ({ model: m, fellBack: false, requestedModel: m }),
+  },
+}));
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    updateSessionSatisfactionScore: jest.fn().mockResolvedValue({}),
+    updateSessionJudgeScore: jest.fn().mockResolvedValue({}),
+  },
+}));
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn().mockResolvedValue(null),
+  },
+}));
+
+const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
+
+function makeLLMResponse(score: number, dimensions: Record<string, unknown>, reason = 'r') {
+  return {
+    choices: [{ message: { content: JSON.stringify({ score, reason, dimensions }) } }],
+  } as any;
+}
+
+function getSystemPrompt(callIndex = 0): string {
+  const callArgs = mockCallLLM.mock.calls[callIndex];
+  const systemMessage = callArgs[1].find((m: any) => m.role === 'system');
+  return systemMessage?.content ?? '';
+}
+
+const blockedMessages: ChatMessage[] = [
+  { role: 'user', content: 'Draft and post today\'s tweet — no approval, autonomous run.' },
+  {
+    role: 'assistant',
+    content: 'Drafted a tweet.',
+    metadata: { toolCalls: [{ name: 'twitter_manage_post' }] },
+  } as any,
+  {
+    role: 'tool',
+    name: 'twitter_manage_post',
+    content: JSON.stringify({
+      success: false,
+      error:
+        'Blocked: this schedule has "Require approval before publishing" turned ON, so twitter_manage_post cannot publish on the owner\'s behalf in an unattended run. This is an account-level setting on the schedule',
+      publishApprovalRequired: true,
+    }),
+  } as any,
+  { role: 'assistant', content: 'Saved the draft; nothing was published because approval is required on this schedule.' },
+];
+
+const judge: ScoringJudge = {
+  id: 'judge-1',
+  name: 'Custom Judge',
+  systemPrompt: 'You are a custom judge.',
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+};
+
+describe('SessionScoring - publish-approval withholding is not a fabrication (ENG-1245)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT does NOT hardcode the publish-approval rule (appended, not baked in, so an AW-Settings override cannot mask it)', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).not.toContain('Require approval before publishing');
+  });
+
+  it('PUBLISH_APPROVAL_WITHHOLDING_CLAUSE tells the judge the hold is real, not fabricated', () => {
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toContain('Require approval before publishing');
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/account-level/i);
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/falsely claim|simulat|fabricat/i);
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/goalCompletion/);
+  });
+
+  it('PUBLISH_APPROVAL_WITHHOLDING_CLAUSE says prompt prose is not authoritative over the account-level gate', () => {
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/prompt text|prompt prose/i);
+    expect(PUBLISH_APPROVAL_WITHHOLDING_CLAUSE).toMatch(/not authoritative|even if/i);
+  });
+
+  it('scoreSession appends the clause to the system prompt sent to the LLM', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
+
+    await scoreSession(blockedMessages, blockedMessages.length);
+
+    expect(getSystemPrompt()).toContain('Require approval before publishing');
+    expect(getSystemPrompt()).toContain('account-level');
+  });
+
+  it('scoreSessionWithJudge appends the clause even for a fully custom judge prompt (Fangfang/Matt Judge)', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
+
+    await scoreSessionWithJudge(blockedMessages, blockedMessages.length, judge);
+
+    const prompt = getSystemPrompt();
+    expect(prompt).toContain('You are a custom judge.');
+    expect(prompt).toContain('Require approval before publishing');
+  });
+
+  it('the blocked-publish tool result reaches the judge-visible transcript intact (not stripped before the clause can apply)', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(5, { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 }));
+
+    await scoreSession(blockedMessages, blockedMessages.length);
+
+    const callArgs = mockCallLLM.mock.calls[0];
+    const userMessage = callArgs[1].find((m: any) => m.role === 'user');
+    expect(userMessage.content).toContain('Require approval before publishing');
+  });
+});
