@@ -94,6 +94,9 @@ describe('llmClients normalizers', () => {
 
   it('prefers the OpenAI cached_tokens field when both shapes are present', () => {
     // A genuine OpenAI response must not be reinterpreted through the fallback.
+    // ENG-1301: prompt_tokens_details presence also means prompt_tokens is the
+    // Google/OpenAI-style INCLUSIVE total, so the 40 cached tokens must come out
+    // of inputTokens too — not just get reported alongside it.
     expect(
       normalizeOpenAIUsage({
         prompt_tokens: 100,
@@ -101,7 +104,7 @@ describe('llmClients normalizers', () => {
         prompt_tokens_details: { cached_tokens: 40 },
         cache_read_input_tokens: 4000,
       })
-    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 });
+    ).toEqual({ inputTokens: 60, outputTokens: 25, cacheReadTokens: 40 });
   });
 
   it('carries Anthropic cache writes and their TTL split when reported', () => {
@@ -139,6 +142,9 @@ describe('llmClients normalizers', () => {
   });
 
   it('normalizes OpenAI chat usage including cached prompt tokens', () => {
+    // ENG-1301: OpenAI/Azure's own prompt_tokens is inclusive of cached_tokens
+    // (same convention as Gemini's promptTokenCount) — exclude it here so
+    // downstream cost math doesn't bill the cached portion twice.
     expect(
       normalizeOpenAIUsage({
         prompt_tokens: 100,
@@ -146,7 +152,52 @@ describe('llmClients normalizers', () => {
         prompt_tokens_details: { cached_tokens: 40 },
         completion_tokens_details: { reasoning_tokens: 5 },
       })
-    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 40 });
+    ).toEqual({ inputTokens: 60, outputTokens: 25, cacheReadTokens: 40 });
+  });
+
+  describe('inputTokens excludes native OpenAI/Azure cached tokens (ENG-1301)', () => {
+    it('fully-cached prompt: inputTokens floors at 0, cacheReadTokens still reports the full count', () => {
+      expect(
+        normalizeOpenAIUsage({
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          prompt_tokens_details: { cached_tokens: 100 },
+        })
+      ).toEqual({ inputTokens: 0, outputTokens: 10, cacheReadTokens: 100 });
+    });
+
+    it('defensively floors at 0 when cached_tokens is reported greater than prompt_tokens', () => {
+      expect(
+        normalizeOpenAIUsage({
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          prompt_tokens_details: { cached_tokens: 150 },
+        })
+      ).toEqual({ inputTokens: 0, outputTokens: 10, cacheReadTokens: 150 });
+    });
+
+    it('does NOT subtract when the Anthropic-style fallback field is the only cache signal (Bedrock-via-OpenAI-shape)', () => {
+      // Regression guard: Bedrock's Converse wrapper answers in OpenAI shape but
+      // its prompt_tokens is ALREADY exclusive of cache (Bedrock's own
+      // convention) — subtracting again here would double-discount it.
+      expect(
+        normalizeOpenAIUsage({
+          prompt_tokens: 300,
+          completion_tokens: 10,
+          cache_read_input_tokens: 250,
+        })
+      ).toEqual({ inputTokens: 300, outputTokens: 10, cacheReadTokens: 250 });
+    });
+
+    it('partially-cached prompt: inputTokens reports the non-cached remainder', () => {
+      expect(
+        normalizeOpenAIUsage({
+          prompt_tokens: 500,
+          completion_tokens: 50,
+          prompt_tokens_details: { cached_tokens: 200 },
+        })
+      ).toEqual({ inputTokens: 300, outputTokens: 50, cacheReadTokens: 200 });
+    });
   });
 
   it('normalizes Bedrock converse usage including cache fields', () => {
@@ -332,7 +383,7 @@ describe('normalizeUsageFromResponse (shape detection)', () => {
       normalizeUsageFromResponse({
         usage: { prompt_tokens: 100, completion_tokens: 25, prompt_tokens_details: { cached_tokens: 10 } },
       })
-    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 10 });
+    ).toEqual({ inputTokens: 90, outputTokens: 25, cacheReadTokens: 10 });
   });
 
   it('detects the OpenAI embeddings shape (prompt_tokens, no completion)', () => {
