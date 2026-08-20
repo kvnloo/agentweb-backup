@@ -50,7 +50,12 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 // repeatedly, per editor visit, to a live user — see its own comment), which is
 // why it excludes noun usage and this does not. Do not "fix" this to match the UI
 // hint again without re-deriving that asymmetry.
-const PUBLISH_INTENT_PATTERN = /\b(posts?|publish(es|ing|ed)?|tweets?|repl(y|ies|ied))\b/i;
+// CodeRabbit: also covers retweet/repost/comment/quote_tweet — the exact
+// publishing actions ACTION_SCOPED_PUBLISH_TOOLS declares for
+// twitter_manage_post and linkedin_manage_post (schedulePublishAuthorization.ts)
+// — and the "posting" gerund, which the bare "posts?" form missed entirely.
+const PUBLISH_INTENT_PATTERN =
+  /\b(post(?:s|ing)?|publish(?:es|ing|ed)?|tweet(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|retweet(?:s|ed|ing)?|repost(?:s|ed|ing)?|comment(?:s|ed|ing)?|quote[_ -]?tweet(?:s|ed|ing)?)\b/i;
 
 interface AuditableSchedule extends SchedulePublishAuthorizationInput {
   scheduleId: string;

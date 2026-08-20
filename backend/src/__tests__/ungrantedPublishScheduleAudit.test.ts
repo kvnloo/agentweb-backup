@@ -86,6 +86,27 @@ describe('scheduleSignalsPublishIntent', () => {
     expect(scheduleSignalsPublishIntent({ startingMessage: 'Post directly to X. No approval needed.' })).toBe(true);
     expect(scheduleSignalsPublishIntent({ startingMessage: 'Draft the content, then post it to LinkedIn.' })).toBe(true);
   });
+
+  /**
+   * CodeRabbit (PR #2517) — real recall gap in the deliberately over-inclusive
+   * audit pattern. It missed the "posting" gerund entirely (only post/posts
+   * were covered), and missed retweet/repost/comment/quote_tweet — the exact
+   * publishing actions ACTION_SCOPED_PUBLISH_TOOLS declares for
+   * twitter_manage_post and linkedin_manage_post. A schedule whose prompt says
+   * "retweet trending posts in his lane" or "repost interesting articles" is
+   * exactly the ENG-1245 bug class (never granted standing authorization,
+   * signals real publish intent) and the audit was silently skipping it before
+   * authorization was ever checked. This is audit-only, matching its
+   * recall-over-precision philosophy — NOT applied to the customer-portal
+   * hint, which intentionally stays precise.
+   */
+  it('matches "posting" (gerund) and action-scoped publish verbs: retweet, repost, comment, quote_tweet', () => {
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Posting a market update every morning' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Retweet trending posts in his lane' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Repost interesting articles from the team' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Comment on his mentions with a quick take' })).toBe(true);
+    expect(scheduleSignalsPublishIntent({ startingMessage: 'Quote tweet the most relevant industry news' })).toBe(true);
+  });
 });
 
 describe('findUngrantedPublishingSchedules (ENG-1245)', () => {
