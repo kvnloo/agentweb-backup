@@ -180,16 +180,30 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
 
 /**
- * ENG-1245: judges scored a REAL, owner-set "Require approval before
- * publishing" hold on a schedule as a fabricated/simulated restriction
- * ("falsely claiming", "simulated"), because the only text they ever see is
- * the schedule's own prompt prose (e.g. "(Autonomous)", "no approval
- * needed") plus the truncated tool-error string from
- * `agentModeService.publishApprovalBlock()`. ENG-803/ENG-827 already made
- * the resolved `autopublishAuthorized` flag (not prompt prose) the single
- * authoritative consent signal for whether a run is ALLOWED to publish —
- * this clause makes the judge honor that same authority when SCORING a run
- * that correctly withheld.
+ * ENG-1245: judges scored a REAL "Require approval before publishing" hold
+ * on a schedule as a fabricated/simulated restriction ("falsely claiming",
+ * "simulated"), because the only text they ever see is the schedule's own
+ * prompt prose (e.g. "(Autonomous)", "no approval needed") plus the tool
+ * error / final report text describing the block. This clause stops the
+ * judge from scoring a correctly-withheld publish as an assistant fabrication.
+ *
+ * RE-VERIFIED, NOT JUST RE-FILED: the clause originally also told the judge
+ * this is always "an owner-configured account/schedule setting". Pulling the
+ * live schedule record for the exact session that motivated this ticket
+ * (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)")
+ * showed `requirePublishApproval: false` — the owner never turned that
+ * setting on. It had posted nothing since 2026-08-13 (the day after
+ * PR #2263/ENG-827 deployed) because it was simply never granted standing
+ * publish authorization, a distinct and far more common condition for a
+ * legacy schedule than a deliberate owner hold (see
+ * describePublishAuthorizationWithholdReason in schedulePublishAuthorization.ts,
+ * and the parallel accuracy fix in getScheduledSessionOverride /
+ * publishApprovalBlock, which stopped telling the owner to toggle a setting
+ * that was already off). Both cases are real, both are account-level, and
+ * the assistant is not fabricating either one — but the judge must not
+ * itself assert "the owner deliberately turned this on" when the transcript
+ * does not actually say that, or the same fabrication just relocates from
+ * the assistant's report into the judge's own "reason" text.
  *
  * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
  * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
@@ -202,7 +216,8 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
 export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
 
 IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
-- If the conversation transcript contains a tool result reporting that a publish tool was blocked because "Require approval before publishing" is turned on, or because "this is an account-level setting on the schedule", that restriction is REAL. It is an owner-configured account/schedule setting, not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- Do NOT assume this means the owner deliberately switched a setting on. It can equally mean the schedule was simply never granted standing publish authorization — a different, more common condition for a legacy schedule. Either way it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
 - Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
