@@ -22,6 +22,23 @@ const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
 // during a test run (e.g. a dedicated sandbox API with no meaningful side effects).
 export const ALLOWED_HOSTNAMES = new Set<string>();
 
+// ENG-1210 AC11: the usage-runway E2E suite is the case the paragraph above
+// anticipated -- a run that is SUPPOSED to reach a real host, because reaching it is
+// the whole measurement. It is opened dynamically rather than by a static entry so the
+// guard stays fully armed for every ordinary run: `RUN_E2E_TESTS` is unset in CI and in
+// local `npm test` (jest also ignores `__tests__/e2e/` outright), so this set is empty
+// exactly when it needs to be. Only the single host named by `E2E_BASE_URL` is opened,
+// never a wildcard -- and the suite itself independently refuses to run against a
+// production-looking target, so this cannot become a back door to prod.
+if (process.env.RUN_E2E_TESTS === 'true' && process.env.E2E_BASE_URL) {
+  try {
+    ALLOWED_HOSTNAMES.add(new URL(process.env.E2E_BASE_URL).hostname);
+  } catch {
+    // An unparseable E2E_BASE_URL opens nothing; the suite fails on its own login step
+    // with a clearer message than anything this guard could produce.
+  }
+}
+
 export class RealNetworkEgressError extends Error {
   constructor(url: string, testName: string) {
     super(
