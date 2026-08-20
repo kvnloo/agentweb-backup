@@ -20,7 +20,13 @@
  * lead captured before this guard is permanently wrong rather than merely stale.
  */
 
-import { resolveClientIdentity, isServerSideUserAgent } from '../clientIdentity';
+import {
+  resolveClientIdentity,
+  isServerSideUserAgent,
+  isPublicIpAddress,
+  resolveClientIdentityWithForwarded,
+  ACCEPT_DECLARED_CLIENT_IDENTITY,
+} from '../clientIdentity';
 
 describe('isServerSideUserAgent', () => {
   it('recognises the agent actually observed in production', () => {
@@ -116,5 +122,224 @@ describe('resolveClientIdentity', () => {
 
   it('returns an empty object rather than undefined so callers can always spread it', () => {
     expect(resolveClientIdentity(undefined, undefined)).toEqual({});
+  });
+});
+
+/**
+ * ENG-926 §B — landing-page leads had NO client identity at all, and that is the gap this
+ * closes.
+ *
+ * The guard above is correct and stays: a value resolved from the REQUEST is the forwarder's,
+ * not the visitor's, so it is dropped. But dropping it left lander leads storing neither
+ * `client_ip_address` nor `client_user_agent` — both named explicitly in the card's §B as
+ * signals that "materially improve Event Match Quality".
+ *
+ * The visitor's real IP and user agent are known in exactly one place: the site's own Next.js
+ * capture route, which the browser DOES post to directly. So the forwarder must declare them,
+ * and this is the narrow, guarded path that accepts a declaration.
+ *
+ * ⚠ WHY THIS IS NOT SIMPLY "TRUST THE BODY". `forward-lead` is public, CORS-open and
+ * unauthenticated. A declaration is therefore accepted ONLY when:
+ *
+ *   1. the CALLER is already recognised as a forwarding server — a real browser can never
+ *      override its own identity, or any visitor could launder an arbitrary IP through us;
+ *   2. the DECLARED user agent is itself a browser — if a forwarder declares `node`, it is
+ *      describing itself, which is the original bug wearing a different hat;
+ *   3. the DECLARED IP is a syntactically valid PUBLIC address — a private, loopback,
+ *      link-local or CGNAT address cannot be a visitor's public IP and matches nobody at Meta.
+ *
+ * Stated plainly rather than implied: this does NOT make the value trustworthy against a
+ * determined attacker. Anyone can already POST an arbitrary lead to this route with a fake
+ * email and fake attribution, so faking an IP alongside them is not a new capability. What the
+ * validation buys is CORRECTNESS FOR REAL TRAFFIC — it stops a forwarder from mistakenly
+ * declaring its own datacenter identity, which is the exact failure the guard above exists for.
+ */
+
+describe('isPublicIpAddress', () => {
+  it('accepts ordinary public IPv4', () => {
+    for (const ip of ['45.253.245.23', '34.105.84.37', '8.8.8.8', '13.107.42.14']) {
+      expect(isPublicIpAddress(ip)).toBe(true);
+    }
+  });
+
+  it('accepts ordinary public IPv6', () => {
+    for (const ip of ['2606:4700:4700::1111', '2001:4860:4860::8888']) {
+      expect(isPublicIpAddress(ip)).toBe(true);
+    }
+  });
+
+  it('rejects private, loopback, link-local and CGNAT IPv4', () => {
+    // None of these can be a visitor's public address. Storing one is the same class of
+    // error as storing the forwarder: a match signal that matches nobody.
+    for (const ip of [
+      '10.0.0.1', '10.255.255.254',
+      '172.16.0.1', '172.31.0.31', '172.31.18.3',   // the two real ALB addresses from ENG-493
+      '192.168.1.1',
+      '127.0.0.1',                                   // what req.ip actually is today (ENG-493)
+      '169.254.169.254',                             // link-local / cloud metadata
+      '100.64.0.1',                                  // CGNAT
+      '0.0.0.0', '255.255.255.255', '224.0.0.1',
+    ]) {
+      expect(isPublicIpAddress(ip)).toBe(false);
+    }
+  });
+
+  it('rejects private, loopback and link-local IPv6', () => {
+    for (const ip of ['::1', '::', 'fc00::1', 'fd12:3456::1', 'fe80::1']) {
+      expect(isPublicIpAddress(ip)).toBe(false);
+    }
+  });
+
+  it('judges an IPv4-mapped IPv6 address by its embedded IPv4', () => {
+    // ::ffff:127.0.0.1 is loopback wearing a v6 costume. Judging the string shape alone
+    // would let it through as "a valid v6 address".
+    expect(isPublicIpAddress('::ffff:127.0.0.1')).toBe(false);
+    expect(isPublicIpAddress('::ffff:10.0.0.1')).toBe(false);
+    expect(isPublicIpAddress('::ffff:45.253.245.23')).toBe(true);
+  });
+
+  it('rejects anything that is not an address at all', () => {
+    for (const v of ['', '   ', 'unknown', 'not-an-ip', '45.253.245', '45.253.245.23.8',
+                     '999.0.0.1', '45.253.245.23:443', undefined, null, 12345, {}]) {
+      expect(isPublicIpAddress(v as any)).toBe(false);
+    }
+  });
+
+  it('tolerates surrounding whitespace on an otherwise valid address', () => {
+    expect(isPublicIpAddress('  45.253.245.23  ')).toBe(true);
+  });
+
+  it('rejects the special-use ranges a first pass missed — all found by review', () => {
+    // Each of these passed the original validator. Kept as named regressions rather than
+    // folded into the list above, because the reason each is non-public differs.
+    expect(isPublicIpAddress('198.18.0.1')).toBe(false);    // benchmarking 198.18/15
+    expect(isPublicIpAddress('198.19.255.1')).toBe(false);  // ...its upper half
+    expect(isPublicIpAddress('192.0.0.1')).toBe(false);     // IETF protocol assignments
+    expect(isPublicIpAddress('192.0.2.5')).toBe(false);     // TEST-NET-1
+    expect(isPublicIpAddress('198.51.100.5')).toBe(false);  // TEST-NET-2
+    expect(isPublicIpAddress('203.0.113.7')).toBe(false);   // TEST-NET-3
+    expect(isPublicIpAddress('ff02::1')).toBe(false);       // IPv6 multicast
+    expect(isPublicIpAddress('2001:db8::1')).toBe(false);   // IPv6 documentation
+    expect(isPublicIpAddress('100::1')).toBe(false);        // discard-only
+  });
+
+  it('decodes the HEX IPv4-mapped spelling, not just the dotted one', () => {
+    // ::ffff:7f00:1 and ::ffff:127.0.0.1 are the SAME loopback address. Understanding only
+    // the dotted form let the hex one through as a valid global IPv6.
+    expect(isPublicIpAddress('::ffff:7f00:1')).toBe(false);        // 127.0.0.1
+    expect(isPublicIpAddress('::ffff:a00:1')).toBe(false);         // 10.0.0.1
+    expect(isPublicIpAddress('::ffff:2dfd:f517')).toBe(true);      // 45.253.245.23
+  });
+});
+
+
+describe('resolveClientIdentityWithForwarded', () => {
+  const BROWSER =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+  const VERCEL_EGRESS = '44.202.76.171';
+  const VISITOR_IP = '45.253.245.23';
+
+  it('accepts a declaration from a recognised forwarder — the case this exists for', () => {
+    // The generated capture route runs on Vercel, reads the BROWSER's own x-forwarded-for
+    // and user-agent, and declares them. This is the whole point of the change.
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+        clientIp: VISITOR_IP,
+        clientUserAgent: BROWSER,
+      }),
+    ).toEqual({ clientIp: VISITOR_IP, clientUserAgent: BROWSER });
+  });
+
+  it('IGNORES a declaration when a real browser posted directly', () => {
+    // Otherwise any visitor could launder an arbitrary IP through a public endpoint by
+    // declaring one. A direct caller's identity is observed, never self-reported.
+    expect(
+      resolveClientIdentityWithForwarded(BROWSER, VISITOR_IP, {
+        clientIp: '34.105.84.37',
+        clientUserAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0 Safari/537.36',
+      }),
+    ).toEqual({ clientIp: VISITOR_IP, clientUserAgent: BROWSER });
+  });
+
+  it('rejects the whole declaration when the DECLARED agent is itself server-side', () => {
+    // A forwarder declaring `node` is describing itself. Accepting the IP alongside it
+    // would re-create the original bug through the new door.
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+        clientIp: VISITOR_IP,
+        clientUserAgent: 'node',
+      }),
+    ).toEqual({});
+  });
+
+  it('rejects the whole declaration when no agent is declared', () => {
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, { clientIp: VISITOR_IP }),
+    ).toEqual({});
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, { clientIp: VISITOR_IP, clientUserAgent: '  ' }),
+    ).toEqual({});
+  });
+
+  it('keeps a declared browser agent but DROPS a non-public declared IP', () => {
+    // The agent is still true information about the visitor and is a real match signal.
+    // The IP is not usable, so it is simply absent rather than wrong.
+    const got = resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+      clientIp: '127.0.0.1',
+      clientUserAgent: BROWSER,
+    });
+    expect(got).toEqual({ clientUserAgent: BROWSER });
+  });
+
+  it('never falls back to the forwarder\'s own IP when the declared one is rejected', () => {
+    // The failure this whole module exists to prevent.
+    const got = resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+      clientIp: 'not-an-ip',
+      clientUserAgent: BROWSER,
+    });
+    expect(got.clientIp).toBeUndefined();
+  });
+
+  it('behaves exactly like resolveClientIdentity when nothing is declared', () => {
+    expect(resolveClientIdentityWithForwarded('node', VERCEL_EGRESS)).toEqual({});
+    expect(resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {})).toEqual({});
+    expect(resolveClientIdentityWithForwarded(BROWSER, VISITOR_IP)).toEqual({
+      clientIp: VISITOR_IP,
+      clientUserAgent: BROWSER,
+    });
+  });
+
+  it('ignores non-string declared values rather than throwing', () => {
+    // The body is attacker-controlled JSON; any type can arrive.
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+        clientIp: { evil: true } as any,
+        clientUserAgent: 12345 as any,
+      }),
+    ).toEqual({});
+  });
+
+  it('trims what it accepts from a declaration', () => {
+    expect(
+      resolveClientIdentityWithForwarded('node', VERCEL_EGRESS, {
+        clientIp: `  ${VISITOR_IP}  `,
+        clientUserAgent: `  ${BROWSER}  `,
+      }),
+    ).toEqual({ clientIp: VISITOR_IP, clientUserAgent: BROWSER });
+  });
+});
+
+describe('ACCEPT_DECLARED_CLIENT_IDENTITY', () => {
+  // ⚠ A TRIPWIRE, not a behavioural test — say which it is. The constant's OFF path returns
+  // `{}` for a forwarding caller, which is byte-for-byte the pre-existing behaviour the
+  // "drops BOTH when the caller is a forwarding server" cases above already pin. What this
+  // asserts is that the switch still EXISTS and is still ON, so flipping it can only happen
+  // deliberately and shows up in a diff rather than drifting.
+  //
+  // It exists because accepting a declaration widens the population whose IP we store to
+  // every landing-page lead, while §B's consent field is unbuilt and blocked on a business
+  // decision about which customers and which regions. That decision is not engineering's.
+  it('is present and ON, so disabling it is a one-line, visible change', () => {
+    expect(ACCEPT_DECLARED_CLIENT_IDENTITY).toBe(true);
   });
 });
