@@ -34,10 +34,15 @@ async function main() {
 
   console.log(`\nUNGRANTED PUBLISHING SCHEDULES (${findings.length}) — never granted standing publish authorization:`);
   for (const f of sorted) {
+    // A schedule that HAS published before must never read as "never published" —
+    // even when the day count itself is unavailable (missing/unparseable timestamp
+    // on that run).
     const staleness =
-      f.daysSinceLastPublish === undefined
-        ? 'never published in the available history'
-        : `last published ${f.daysSinceLastPublish} day(s) ago`;
+      f.daysSinceLastPublish !== undefined
+        ? `last published ${f.daysSinceLastPublish} day(s) ago`
+        : f.everPublished
+        ? 'published before, but that run\'s timestamp is unavailable'
+        : 'never published in the available history';
     console.log(`  ${f.scheduleId}  ${f.userId}  ${f.scheduleName}  —  ${staleness}`);
   }
   console.log('\nNothing was written. Confirm with each owner, then grant via:');

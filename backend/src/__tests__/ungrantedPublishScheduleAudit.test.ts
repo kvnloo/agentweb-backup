@@ -157,7 +157,49 @@ describe('findUngrantedPublishingSchedules (ENG-1245)', () => {
     );
 
     expect(findings[0].daysSinceLastPublish).toBeUndefined();
+    expect(findings[0].everPublished).toBe(false);
     expect(findings[0].lastRunAt).toBe('2026-08-20T08:19:00.000Z');
+  });
+
+  /**
+   * CodeRabbit (PR #2517) — real ambiguity, caught before it shipped.
+   * daysSinceLastPublish returning undefined was documented to mean ONLY "no
+   * run in the available history ever called a publish-capable tool" — but a
+   * publish-capable call whose OWN run has a missing OR malformed createdAt
+   * also produced undefined, silently conflating "never published" with
+   * "published, but we don't know when" into the same value. The CLI then
+   * reported the latter as "never published in the available history", which
+   * is false and could mislead an admin triaging a list of these — a
+   * schedule that has proven it CAN publish reads identically to one that
+   * never has.
+   */
+  it.each([
+    ['a missing createdAt', undefined],
+    ['a malformed createdAt', 'not-a-real-date'],
+  ])('distinguishes "never published" from "published, but %s" via everPublished', (_label, createdAt) => {
+    const findings = findUngrantedPublishingSchedules(
+      [schedule({ runResults: [{ createdAt, actualFunctionCalls: ['post_on_connected_account'] }] })],
+      NOW,
+    );
+
+    // A publish call WAS found — this must not read the same as "never published",
+    // even though the day count is unavailable either way.
+    expect(findings[0].daysSinceLastPublish).toBeUndefined();
+    expect(findings[0].everPublished).toBe(true);
+  });
+
+  it('reports a real days count (and everPublished true) for a valid publish timestamp', () => {
+    const findings = findUngrantedPublishingSchedules(
+      [
+        schedule({
+          runResults: [{ createdAt: '2026-08-05T08:19:00.000Z', actualFunctionCalls: ['post_on_connected_account'] }],
+        }),
+      ],
+      NOW,
+    );
+
+    expect(findings[0].everPublished).toBe(true);
+    expect(findings[0].daysSinceLastPublish).toBe(15);
   });
 
   it('computes daysSinceLastPublish from the most recent run that DID call a publish tool', () => {

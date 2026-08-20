@@ -66,8 +66,17 @@ export interface UngrantedPublishingScheduleFinding {
   scheduleId: string;
   scheduleName: string;
   userId: string;
-  /** undefined when no run in the available history ever called a publish-capable tool. */
+  /**
+   * undefined whenever it cannot be computed — either no run in the available
+   * history ever called a publish-capable tool, OR one did but that run's
+   * `createdAt` was missing or unparseable. Check `everPublished` to tell those
+   * two apart: a schedule that has proven it CAN publish must not read the same
+   * as one that never has.
+   */
   daysSinceLastPublish: number | undefined;
+  /** True when some run in the available history called a publish-capable tool,
+   * regardless of whether that run's timestamp was usable. */
+  everPublished: boolean;
   lastRunAt: string | undefined;
 }
 
@@ -105,10 +114,12 @@ export function findUngrantedPublishingSchedules(
     if (describePublishAuthorizationWithholdReason(schedule) !== 'not_granted') continue;
 
     const runResults = Array.isArray(schedule.runResults) ? schedule.runResults : [];
+    let everPublished = false;
     let lastPublishAt: string | undefined;
     for (let i = runResults.length - 1; i >= 0; i--) {
       const calls = Array.isArray(runResults[i]?.actualFunctionCalls) ? (runResults[i]!.actualFunctionCalls as unknown[]) : [];
       if (calls.some((c) => typeof c === 'string' && isPublishCapableTool(c))) {
+        everPublished = true;
         lastPublishAt = runResults[i]?.createdAt;
         break;
       }
@@ -119,6 +130,7 @@ export function findUngrantedPublishingSchedules(
       scheduleName: schedule.scheduleName || schedule.name || '(unnamed)',
       userId: schedule.userId,
       daysSinceLastPublish: daysBetween(lastPublishAt, now),
+      everPublished,
       lastRunAt: runResults[runResults.length - 1]?.createdAt,
     });
   }
