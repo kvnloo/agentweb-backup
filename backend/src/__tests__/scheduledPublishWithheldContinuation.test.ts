@@ -36,6 +36,9 @@ const MARKER = 'PUBLISH WITHHELD: this schedule requires approval before publish
 // never assert the "Require approval before publishing" toggle is why the run was
 // withheld when that specific setting isn't actually what happened.
 const MARKER_NOT_GRANTED = 'PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.';
+// ENG-1245: the revoked branch's own marker — a real owner decision, distinct from
+// both the genuine-hold toggle and "never asked".
+const MARKER_REVOKED = "PUBLISH WITHHELD: this schedule's publish authorization has been revoked.";
 
 describe('scheduledRunWithheldPublish (ENG-803)', () => {
   it('recognises the marker the withheld branch mandates', () => {
@@ -63,11 +66,16 @@ describe('scheduledRunWithheldPublish (ENG-803)', () => {
     expect(scheduledRunWithheldPublish(`Drafts saved.\n\n${MARKER_NOT_GRANTED}`)).toBe(true);
   });
 
-  it('does not cross-match the never-granted marker\'s wording as the genuine-hold one, or vice versa', () => {
-    // Each marker is its own complete sentence — neither is a substring of the other,
-    // so this is really pinning that both are matched independently, not confused.
+  it('also recognises the revoked branch\'s own accurate marker', () => {
+    expect(scheduledRunWithheldPublish(`Drafts saved.\n\n${MARKER_REVOKED}`)).toBe(true);
+  });
+
+  it('does not cross-match any marker\'s wording as another\'s, or vice versa', () => {
+    // Each marker is its own complete sentence — none is a substring of another,
+    // so this is really pinning that all three are matched independently, not confused.
     expect(scheduledRunWithheldPublish(MARKER)).toBe(true);
     expect(scheduledRunWithheldPublish(MARKER_NOT_GRANTED)).toBe(true);
+    expect(scheduledRunWithheldPublish(MARKER_REVOKED)).toBe(true);
   });
 });
 
@@ -91,6 +99,12 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
   it('returns null on the never-granted branch\'s own marker too (ENG-1245) — same exemption, different accurate wording', () => {
     expect(
       classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER_NOT_GRANTED}` }, false)
+    ).toBeNull();
+  });
+
+  it('returns null on the revoked branch\'s own marker too (ENG-1245) — same exemption, different accurate wording', () => {
+    expect(
+      classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER_REVOKED}` }, false)
     ).toBeNull();
   });
 

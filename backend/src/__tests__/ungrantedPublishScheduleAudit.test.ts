@@ -118,6 +118,14 @@ describe('findUngrantedPublishingSchedules (ENG-1245)', () => {
     expect(findings).toEqual([]);
   });
 
+  it('does NOT flag an explicitly REVOKED grant either — also a real, intentional owner decision, not a bug', () => {
+    const findings = findUngrantedPublishingSchedules(
+      [schedule({ autopublishAuthorized: false })],
+      NOW,
+    );
+    expect(findings).toEqual([]);
+  });
+
   it('does NOT flag an inactive schedule', () => {
     const findings = findUngrantedPublishingSchedules([schedule({ status: 'inactive' })], NOW);
     expect(findings).toEqual([]);

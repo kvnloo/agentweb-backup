@@ -16,7 +16,7 @@
  */
 import { AgentModeService } from '../services/agentModeService';
 
-function block(toolName: string, reason: 'require_publish_approval' | 'not_granted' | 'unverifiable') {
+function block(toolName: string, reason: 'require_publish_approval' | 'revoked' | 'not_granted' | 'unverifiable') {
   return (AgentModeService as any).publishApprovalBlock(toolName, reason);
 }
 
@@ -45,14 +45,31 @@ describe('AgentModeService.publishApprovalBlock — accurate withhold reason (EN
     expect(result.error).toContain('post_on_connected_account');
   });
 
-  it('unverifiable stays unchanged — a read failure is a distinct, third reason', () => {
+  it('revoked: does NOT claim the owner turned on "Require approval before publishing", nor confuse it with never-granted', () => {
+    const result = block('post_on_connected_account', 'revoked');
+    expect(result.success).toBe(false);
+    expect(result.publishApprovalRequired).toBe(true);
+    expect(result.error).not.toContain('this schedule has "Require approval before publishing" turned ON');
+    expect(result.error).not.toContain('tell the owner they can turn "Require approval before publishing" OFF');
+    // A revocation is a real decision, not silence — must not reuse "has not been
+    // granted" wording, which implies nobody ever considered it.
+    expect(result.error).not.toMatch(/not been granted standing/i);
+  });
+
+  it('revoked: accurately says authorization was revoked', () => {
+    const result = block('post_on_connected_account', 'revoked');
+    expect(result.error).toMatch(/revoked/i);
+    expect(result.error).toContain('post_on_connected_account');
+  });
+
+  it('unverifiable stays unchanged — a read failure is a distinct, fourth reason', () => {
     const result = block('post_on_connected_account', 'unverifiable');
     expect(result.error).toContain('could not be verified');
     expect(result.error).not.toContain('tell the owner they can turn "Require approval before publishing" OFF');
   });
 
   it('every branch still names the tool and states this is an account-level setting, not a platform gate', () => {
-    for (const reason of ['require_publish_approval', 'not_granted', 'unverifiable'] as const) {
+    for (const reason of ['require_publish_approval', 'revoked', 'not_granted', 'unverifiable'] as const) {
       const result = block('post_on_connected_account', reason);
       expect(result.error).toContain('post_on_connected_account');
       expect(result.error).toContain('account-level setting');

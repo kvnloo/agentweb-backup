@@ -263,6 +263,7 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
 describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', () => {
   const genuineHold = getScheduledSessionOverride('scheduled', false, 'require_publish_approval');
   const neverGranted = getScheduledSessionOverride('scheduled', false, 'not_granted');
+  const revoked = getScheduledSessionOverride('scheduled', false, 'revoked');
   const omittedReason = getScheduledSessionOverride('scheduled', false);
 
   it('omitting the reason behaves identically to the explicit genuine-hold branch (backward compatible default)', () => {
@@ -300,6 +301,43 @@ describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', 
     expect(neverGranted).toContain('PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.');
     expect(neverGranted).not.toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
     expect(genuineHold).toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+  });
+
+  /**
+   * ENG-1245 — 'revoked' is its own reason, not folded into 'not_granted'. An
+   * owner who previously authorized a schedule and then explicitly revoked it
+   * made a real decision; describing that as "has not been granted" implies
+   * nobody ever considered it, which understates what actually happened. It
+   * still must not be confused with the "Require approval before publishing"
+   * toggle — that's a different, unrelated setting.
+   */
+  describe('the revoked branch (ENG-1245)', () => {
+    it('does not claim the owner turned on "Require approval before publishing"', () => {
+      expect(revoked).not.toContain('The owner has turned ON "Require approval before publishing"');
+      expect(revoked).not.toContain('turn OFF "Require approval before publishing" in this schedule\'s settings, and the next run will post');
+    });
+
+    it('does not reuse the never-granted branch\'s "has not been granted" wording — a revocation is a real decision, not silence', () => {
+      expect(revoked).not.toContain('has not been granted standing');
+    });
+
+    it('accurately says authorization was revoked', () => {
+      expect(revoked).toMatch(/revoked/i);
+    });
+
+    it('ends on its own distinct terminal marker', () => {
+      expect(revoked).toContain('PUBLISH WITHHELD: this schedule\'s publish authorization has been revoked.');
+      expect(revoked).not.toContain('PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.');
+      expect(revoked).not.toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+    });
+
+    it('keeps every unconditional rule the other branches have', () => {
+      for (const text of ['THIS BLOCK IS reason (1) above', 'Do NOT call any tool that publishes externally',
+        'twitter_manage_post', 'COMPLETE terminal state', 'It is not unfinished work', 'State it ONCE and stop',
+        'Do NOT ask the owner a question', 'do NOT phrase the ending as waiting on their confirmation']) {
+        expect(revoked).toContain(text);
+      }
+    });
   });
 
   it('the never-granted branch keeps every unconditional rule the genuine-hold branch has', () => {

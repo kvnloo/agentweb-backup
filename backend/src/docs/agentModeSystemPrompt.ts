@@ -680,6 +680,30 @@ export function getScheduledSessionOverride(
   if (sessionType !== 'scheduled') return '';
   // Only an unattended run carries a resolved decision; see the tri-state note above.
   const unattended = publishAuthorized !== undefined;
+  // ENG-1245: three withheld reasons, not two. 'revoked' (autopublishAuthorized ===
+  // false) is a real owner decision, distinct from 'not_granted' (never asked, or a
+  // grant with no usable scope) — describing a revocation as "has not been granted"
+  // understates a real choice the owner made. Both are still distinct from the
+  // literal "Require approval before publishing" toggle. Undefined/omitted defaults
+  // to the genuine-hold text, matching every pre-ENG-1245 caller's behavior.
+  const withheldCauseBullet =
+    withholdReason === 'not_granted'
+      ? `- This schedule has not been granted standing authorization to publish unattended. This is NOT the "Require approval before publishing" setting — that setting is already OFF on this schedule, so telling the owner to turn it off again will not change anything and is not what is holding this run back.`
+      : withholdReason === 'revoked'
+      ? `- The owner previously authorized this schedule to publish unattended and has since revoked that authorization. This is NOT the "Require approval before publishing" setting — that is a different, unrelated toggle — and the prompt cannot override a revoked authorization either way.`
+      : `- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.`;
+  const withheldReasonPhrase =
+    withholdReason === 'not_granted'
+      ? 'this schedule has not been granted standing publish authorization'
+      : withholdReason === 'revoked'
+      ? "this schedule's publish authorization has been revoked"
+      : 'this schedule requires approval before publishing';
+  const withheldQuoteBullet =
+    withholdReason === 'not_granted'
+      ? `- Quote THIS block as the reason, and describe it accurately: this schedule is missing a one-time standing publish-authorization grant, NOT a setting the owner can flip themselves today. Do NOT tell the owner to turn OFF "Require approval before publishing" — it is already off and doing nothing here. Do NOT point them at "Full autonomy" either — it does not affect publishing. Instead tell them plainly that this schedule needs a standing publish authorization grant, and that they can flag it via report_product_issues if they expected this schedule to already be posting.`
+      : withholdReason === 'revoked'
+      ? `- Quote THIS block as the reason, and describe it accurately: the owner previously granted this schedule standing publish authorization and has since revoked it. This is NOT the "Require approval before publishing" setting — do not tell the owner to toggle that. Tell them plainly that publishing was revoked for this schedule, and that they (or an admin) would need to re-authorize it for a future run to publish.`
+      : `- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.`;
   return `\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.
 
 NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
@@ -702,15 +726,11 @@ PUBLISH AUTHORIZATION — this schedule publishes without approval (CRITICAL):
   : `
 
 PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRITICAL):
-${withholdReason === 'not_granted'
-  ? `- This schedule has not been granted standing authorization to publish unattended. This is NOT the "Require approval before publishing" setting — that setting is already OFF on this schedule, so telling the owner to turn it off again will not change anything and is not what is holding this run back.`
-  : `- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.`}
-- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted${withholdReason === 'not_granted' ? ' because this schedule has not been granted standing publish authorization' : ' because this schedule requires approval before publishing'}.
-${withholdReason === 'not_granted'
-  ? `- Quote THIS block as the reason, and describe it accurately: this schedule is missing a one-time standing publish-authorization grant, NOT a setting the owner can flip themselves today. Do NOT tell the owner to turn OFF "Require approval before publishing" — it is already off and doing nothing here. Do NOT point them at "Full autonomy" either — it does not affect publishing. Instead tell them plainly that this schedule needs a standing publish authorization grant, and that they can flag it via report_product_issues if they expected this schedule to already be posting.`
-  : `- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.`}
+${withheldCauseBullet}
+- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because ${withheldReasonPhrase}.
+${withheldQuoteBullet}
 - Drafted-and-awaiting-approval is the correct, COMPLETE terminal state for this run. It is not unfinished work. State it ONCE and stop — do not re-attempt or re-explain the withheld publish across turns.
-- End your final report with EXACTLY this sentence on its own line, so the run is recorded as deliberately withheld rather than as a halt waiting for an answer: "PUBLISH WITHHELD: this schedule ${withholdReason === 'not_granted' ? 'has not been granted standing publish authorization' : 'requires approval before publishing'}." Do NOT ask the owner a question, and do NOT phrase the ending as waiting on their confirmation — there is no one to answer, and the drafts are already saved for them.`}`}`;
+- End your final report with EXACTLY this sentence on its own line, so the run is recorded as deliberately withheld rather than as a halt waiting for an answer: "PUBLISH WITHHELD: ${withheldReasonPhrase}." Do NOT ask the owner a question, and do NOT phrase the ending as waiting on their confirmation — there is no one to answer, and the drafts are already saved for them.`}`}`;
 }
 
 // Directive injected for scheduled / automated unattended runs.

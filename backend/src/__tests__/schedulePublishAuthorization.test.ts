@@ -537,18 +537,45 @@ describe('describePublishAuthorizationWithholdReason (ENG-1245)', () => {
     ).toBe('not_granted');
   });
 
-  it('is "not_granted" — never "require_publish_approval" — for an explicit revocation', () => {
-    // autopublishAuthorized: false is a real owner decision too, but it is not the
-    // "Require approval before publishing" toggle, so it must not be described as one.
+  it('is "revoked" — never "require_publish_approval" or "not_granted" — for an explicit revocation', () => {
+    // autopublishAuthorized: false is a real owner decision too, and a DIFFERENT one
+    // from "never asked" — collapsing them lost the distinction between "nobody
+    // decided" and "someone said no", which is worth reporting accurately. It is
+    // still not the "Require approval before publishing" toggle, so it must not be
+    // described as that either.
     expect(
       describePublishAuthorizationWithholdReason({
         requirePublishApproval: false,
         autopublishAuthorized: false,
       })
-    ).toBe('not_granted');
+    ).toBe('revoked');
+  });
+
+  it('requirePublishApproval still outranks an explicit revocation', () => {
+    // The owner's explicit hold is the highest-precedence signal in
+    // resolveSchedulePublishAuthorization itself; the reason classifier must agree.
+    expect(
+      describePublishAuthorizationWithholdReason({
+        requirePublishApproval: true,
+        autopublishAuthorized: false,
+      })
+    ).toBe('require_publish_approval');
   });
 
   it('is "not_granted" when requirePublishApproval is simply absent, not just false', () => {
     expect(describePublishAuthorizationWithholdReason({})).toBe('not_granted');
+  });
+
+  it('is "not_granted" — not "revoked" — for a grant with no approved tool scope (never actually usable)', () => {
+    // autopublishAuthorized: true with an empty/invalid tool list resolves unauthorized
+    // in resolveSchedulePublishAuthorization too — there is no active grant right now,
+    // and unlike an explicit false this was never a deliberate "no".
+    expect(
+      describePublishAuthorizationWithholdReason({
+        requirePublishApproval: false,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: [],
+      })
+    ).toBe('not_granted');
   });
 });

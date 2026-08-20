@@ -252,19 +252,27 @@ export function resolveSchedulePublishAuthorization(
  * which only ever offers "Require approval before publishing".
  *
  * Only the literal `requirePublishApproval === true` case is that specific,
- * named toggle. Every other unauthorized case (never asked, explicit
- * `autopublishAuthorized: false` revocation, a grant with no approved scope)
- * collapses to `'not_granted'` — from the owner's perspective none of those is
- * "Require approval before publishing" being on, so none should be described
- * that way.
+ * named toggle. Two other unauthorized cases are worth telling apart too — not
+ * everything collapses to "never asked":
+ *
+ *  - `'revoked'` — `autopublishAuthorized === false`, an explicit owner decision,
+ *    just not the "Require approval before publishing" toggle. Reporting this as
+ *    "not been granted" (implying nobody ever considered it) would understate a
+ *    real choice the owner made.
+ *  - `'not_granted'` — everything else: truly never asked, or a grant with no
+ *    approved tool scope (consent given but nothing usable — there is no active
+ *    grant right now, and unlike an explicit `false` this was never a deliberate
+ *    "no").
  */
-export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'not_granted';
+export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'revoked' | 'not_granted';
 
 export function describePublishAuthorizationWithholdReason(
   schedule: SchedulePublishAuthorizationInput | null | undefined
 ): PublishAuthorizationWithholdReason | undefined {
   if (!schedule) return undefined;
-  return schedule.requirePublishApproval === true ? 'require_publish_approval' : 'not_granted';
+  if (schedule.requirePublishApproval === true) return 'require_publish_approval';
+  if (schedule.autopublishAuthorized === false) return 'revoked';
+  return 'not_granted';
 }
 
 /**

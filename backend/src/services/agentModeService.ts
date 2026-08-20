@@ -8308,12 +8308,16 @@ export class AgentModeService {
     const detail =
       reason === 'require_publish_approval'
         ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : reason === 'revoked'
+        ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
         : reason === 'not_granted'
         ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
     const unblockInstruction =
       reason === 'require_publish_approval'
         ? `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`
+        : reason === 'revoked'
+        ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
         : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
