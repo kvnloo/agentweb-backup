@@ -238,6 +238,53 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(directive).toContain('best-effort');
   });
 
+  // ── ENG-996: deliver-and-annotate when a required conditional premise is stale ─
+  // Regression coverage for session 19ba99b9 (Scheduled: Google Ads connection
+  // watcher, AGW-58): the schedule required "if connected, remind the user the
+  // campaign is ready to build". The agent verified the connection, discovered
+  // the campaign was already live, and silently suppressed the entire required
+  // reminder — even after a nudge — reasoning that the premise was "stale". The
+  // directive must instead require delivering the mandated output and annotating
+  // it with a correction, never withholding it outright.
+  it('requires delivering a required conditional output even when its premise is stale, annotated with a correction', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('stale');
+    expect(lower).toContain('deliver');
+    expect(directive).toContain('DELIVER-AND-ANNOTATE');
+  });
+
+  it('treats "no longer needed" as a reason to annotate, never a license to withhold', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toMatch(/withholding is justified only when/);
+    expect(lower).toContain('factually false');
+    expect(lower).not.toMatch(/\bstale\b.{0,40}(withhold|omit|suppress)/);
+  });
+
+  // CodeRabbit flagged the "withholding is justified only when factually false"
+  // framing as a merge risk: read as a general rule (rather than scoped to the
+  // staleness case), it could appear to override the PUBLISH AUTHORIZATION
+  // contract or the DATA-MINIMIZATION guard on billing/Stripe fields elsewhere
+  // in this same directive — neither of which withholds for factual-falseness
+  // reasons. The rule must explicitly disclaim jurisdiction over those.
+  it('does not let the factually-false carve-out override publish authorization or data-minimization withholding', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toMatch(/governs only the staleness case/);
+    expect(lower).toContain('publish authorization');
+    expect(lower).toContain('data-minimization');
+  });
+
+  it('requires the correction to be an addition to the required output, not a replacement for it', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('addition to the required deliverable');
+    expect(lower).toContain('never a replacement');
+  });
+
+  it('does not let a nudge be satisfied by surface-level keywords while the substantive deliverable stays missing', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('nudge');
+    expect(lower).toMatch(/do not satisfy a nudge by re-adding a keyword/);
+  });
+
   // ── (6) Prescribed per-item call patterns are intent, not literal law ────────
   // Regression coverage for ENG-480 (sessions 54325528 / fa552592, "Daily User
   // Activity Report"): the scheduled prompt prescribed impossible per-session and
