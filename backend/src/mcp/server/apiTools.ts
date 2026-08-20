@@ -702,6 +702,27 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'get_scheduled_chat_storage_diagnostics',
+  definition: {
+    name: 'get_scheduled_chat_storage_diagnostics',
+    description: 'Diagnose why a scheduled chat is failing to save with a size-related error, or check whether one is at risk of it. DynamoDB caps a schedule at 400KB; this returns a byte-usage breakdown (current prompt, saved prompt-edit history, saved run history) against that limit and, when the schedule is under storage pressure, the one corrective action the user can take. Returns byte counts only — never the schedule\'s actual prompt or run content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'The scheduled chat ID to diagnose' }
+      },
+      required: ['schedule_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/storage-diagnostics`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Schedule Templates ─────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
