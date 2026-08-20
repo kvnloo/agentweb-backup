@@ -116,7 +116,43 @@ logical_lines() {
 # ` grep -qF`, so an unanchored expression flags it and CI blocks a compliant
 # script. Raised by CodeRabbit on #2530/#1061; the false positive predated the
 # logical-line joining below, which merely made it reachable in more places.
-EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q[a-zA-Z]*|head)([[:space:]]|$)'
+#
+# The quiet flag is found ANYWHERE in grep's argument list, not just in the last
+# option token. `grep -q -F x` was already caught, but `grep -e "${n}" -q` and
+# `grep --quiet` were not: the first puts a non-option word before the flag, the
+# second is a long option. Both still exit on the first match, so both are
+# hazards, and a detector that misses them gives false assurance. Raised by
+# CodeRabbit on #1061. `[^|;&]*` keeps the search inside one command so a later
+# command on the same logical line cannot lend it a `-q`.
+EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep[[:space:]]+([^|;&]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--quiet)([[:space:]]|;|$)|head([[:space:]]|$))'
+
+# Normalise into a FILE and prove it worked, so a broken scanner cannot present
+# as a clean result. Echoes the path; non-zero if anything went wrong.
+normalise() {
+  local script="$1" out
+  out="$(mktemp)" || return 1
+  if ! logical_lines "${script}" >"${out}"; then rm -f "${out}"; return 1; fi
+  # A non-empty script must normalise to something. Silent truncation is the
+  # failure mode that would otherwise look identical to "no violations".
+  if [ -s "${script}" ] && [ ! -s "${out}" ]; then rm -f "${out}"; return 1; fi
+  printf '%s' "${out}"
+}
+
+# Drop comments and explicitly-tolerated pipelines, then match. Each step reads
+# a file and its status is checked on its own: 1 means "nothing left", which is
+# ordinary, and anything above 1 is a real error that must not pass for clean.
+filter_and_match() {
+  local norm="$1" a b rc
+  a="$(mktemp)"; b="$(mktemp)"
+  grep -vE '^[0-9]+:[[:space:]]*#' "${norm}" >"${a}"; rc=$?
+  if [ "${rc}" -gt 1 ]; then rm -f "${a}" "${b}"; return "${rc}"; fi
+  grep -vE '\|\|[[:space:]]*true[[:space:]]*\)?[[:space:]]*$' "${a}" >"${b}"; rc=$?
+  if [ "${rc}" -gt 1 ]; then rm -f "${a}" "${b}"; return "${rc}"; fi
+  grep -E "${EARLY_EXIT_READER}" "${b}"; rc=$?
+  rm -f "${a}" "${b}"
+  if [ "${rc}" -gt 1 ]; then return "${rc}"; fi
+  return 0
+}
 
 shopt -s nullglob
 for script in "${SCRIPT_DIR}"/*.sh; do
@@ -128,11 +164,33 @@ for script in "${SCRIPT_DIR}"/*.sh; do
 
   # Strip comment-only lines so prose describing the bug does not trip it, and
   # allow an explicit `|| true` as a documented tolerance.
-  offenders="$(logical_lines "${script}" \
-    | grep -vE '^[0-9]+:[[:space:]]*#' \
-    | grep -vE '\|\|[[:space:]]*true[[:space:]]*\)?[[:space:]]*$' \
-    | grep -E "${EARLY_EXIT_READER}" \
-    || true)"
+  #
+  # Done through files, one status at a time, rather than as a pipeline ending
+  # in `|| true`. That form was the previous version here, and CodeRabbit was
+  # right to call it out: `|| true` covers the WHOLE pipeline, and `grep` exits
+  # 1 for "no matches", so an awk that failed outright produced empty output,
+  # an empty offenders list, and a cheerful `ok` for a file that was never
+  # actually read. A hygiene check that reports clean when its own scanner
+  # broke is the exact defect this file exists to stop — one masked status
+  # standing in for a verdict.
+  #
+  # pipefail alone would not have saved it either: it yields the RIGHTMOST
+  # non-zero status, so a genuine error (2) upstream is hidden behind a normal
+  # "no matches" (1) downstream. Hence a file and an explicit check per step,
+  # with >1 treated as an error and 1 as the ordinary empty result.
+  if ! scan_ok="$(normalise "${script}")"; then
+    fail "${base}: could not normalise for scanning." \
+         "The detector never examined this file. Reporting it clean would be" \
+         "the same masked-status defect this suite exists to prevent."
+    continue
+  fi
+  offenders="$(filter_and_match "${scan_ok}")"
+  rc=$?
+  rm -f "${scan_ok}"
+  if [ "${rc}" -gt 1 ]; then
+    fail "${base}: the scan itself errored (exit ${rc}), so nothing was verified."
+    continue
+  fi
 
   if [ -z "${offenders}" ]; then
     pass "${base}: no pipeline feeds an early-exiting reader"
@@ -159,18 +217,27 @@ printf '%s' "${content}" \
   | grep -qiE "${needle}"
 printf '%s' "${content}" |
   grep -qF "${needle}"
+if printf '%s' "${content}" | grep -e "${needle}" -q; then :; fi
+if printf '%s' "${content}" | grep --quiet "${needle}"; then :; fi
 PROBE
-n_flagged="$(logical_lines "${probe}" | grep -cE "${EARLY_EXIT_READER}" || true)"
-if [ "${n_flagged}" = "5" ]; then
+if probe_norm="$(normalise "${probe}")"; then
+  n_flagged="$(grep -cE "${EARLY_EXIT_READER}" "${probe_norm}")" || n_flagged=0
+  rm -f "${probe_norm}"
+else
+  n_flagged='normalisation-failed'
+fi
+if [ "${n_flagged}" = "7" ]; then
   pass "the rule actually detects the shape it exists to ban"
 else
-  fail "the detector flagged ${n_flagged} of 5 known-bad pipelines." \
+  fail "the detector flagged ${n_flagged} of 7 known-bad pipelines." \
        "The probe carries -qF, -Fxq and 'head -n 1' precisely because an" \
        "earlier expression anchored the q at the end of the flag group and" \
        "matched none of them, reporting every file clean. A detector that" \
        "cannot fail is the same thing as no detector. The last two are" \
        "split across lines — one by backslash, one by a trailing pipe — and" \
-       "the second escaped the detector entirely before normalisation."
+       "the second escaped the detector entirely before normalisation." \
+       "The last two are 'grep -e X -q' and 'grep --quiet': the quiet flag" \
+       "is not always the final option token, and both still exit early."
 fi
 
 # A detector that over-reports is not "safe by default" — it makes the check
@@ -188,9 +255,12 @@ some_cmd || head -n 1 <<<"${subject}"
 run_something ||
   grep -qF "${needle}" <<<"${content}"
 CLEAN
-n_false="$(logical_lines "${clean_probe}" \
-  | grep -vE '^[0-9]+:[[:space:]]*#' \
-  | grep -cE "${EARLY_EXIT_READER}" || true)"
+if clean_norm="$(normalise "${clean_probe}")"; then
+  n_false="$(grep -vE '^[0-9]+:[[:space:]]*#' "${clean_norm}" | grep -cE "${EARLY_EXIT_READER}")" || n_false=0
+  rm -f "${clean_norm}"
+else
+  n_false='normalisation-failed'
+fi
 if [ "${n_false}" = "0" ]; then
   pass "the rule does not fire on OR-lists or here-strings"
 else
