@@ -385,10 +385,37 @@ run_check "$(cd "${SCRIPT_DIR}/../.." && pwd)" \
 check 'ENG-836: the live repo timeout.config alone is not a conflict' 0 ''
 
 # ENG-1412: every shell script must avoid the pipefail/SIGPIPE shape that made
-# the mixed-class fixture report a false green.  A structural assertion is
-# deterministic even though the original timing race is not.
+# the mixed-class fixture report a false green. A structural assertion is
+# deterministic even though the original timing race is not. Keep the
+# detector broad enough to cover continued lines, combined short options, and
+# the long quiet option.
+PIPE_GREP_PATTERN='printf(?:[^\n]|\\\n)*\|\s*grep\s+(?:-[^\s]*q[^\s]*|--quiet(?:\s|$))'
+PIPE_GREP_FIXTURES="${WORKDIR}/pipe-grep-fixtures"
+mkdir -p "${PIPE_GREP_FIXTURES}"
+cat >"${PIPE_GREP_FIXTURES}/combined-short.sh" <<'EOF'
+printf '%s' "value" | grep -Fq "value"
+EOF
+cat >"${PIPE_GREP_FIXTURES}/long-option.sh" <<'EOF'
+printf '%s' "value" | grep --quiet "value"
+EOF
+cat >"${PIPE_GREP_FIXTURES}/continued.sh" <<'EOF'
+printf '%s' "value" \
+  | grep -qF "value"
+EOF
+PIPE_GREP_FIXTURE_MATCHES="$(rg -n -U "${PIPE_GREP_PATTERN}" "${PIPE_GREP_FIXTURES}" --glob '*.sh' || true)"
 TESTS_RUN=$(( TESTS_RUN + 1 ))
-PIPE_GREP_MATCHES="$(rg -n -U 'printf[^\n]*\|\s*grep\s+-q' "${SCRIPT_DIR}" --glob '*.sh' || true)"
+if [ "$(rg -l -U "${PIPE_GREP_PATTERN}" "${PIPE_GREP_FIXTURES}" --glob '*.sh' | wc -l)" -eq 3 ]; then
+  printf '  ok   %s\n' 'ENG-1412: detector catches combined, long, and continued printf-to-grep forms'
+else
+  printf '  FAIL %s\n       detector output:\n%s\n' \
+    'ENG-1412: detector catches combined, long, and continued printf-to-grep forms' \
+    "${PIPE_GREP_FIXTURE_MATCHES}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
+
+PIPE_GREP_MATCHES="$(rg -n -U "${PIPE_GREP_PATTERN}" "${SCRIPT_DIR}" \
+  --glob '*.sh' --glob '!eb-config-conflict.test.sh' || true)"
+TESTS_RUN=$(( TESTS_RUN + 1 ))
 if [ -z "${PIPE_GREP_MATCHES}" ]; then
   printf '  ok   %s\n' 'ENG-1412: no CI shell script pipes printf into grep -q under pipefail'
 else
