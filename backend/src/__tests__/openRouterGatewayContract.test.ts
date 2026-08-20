@@ -9,6 +9,7 @@ describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', (
     ['openrouter/openai/gpt-4o-mini', 'openai/gpt-4o-mini'],
     ['openrouter/z-ai/glm-5.2', 'z-ai/glm-5.2'],
     ['openai/gpt-4o-mini', 'openai/gpt-4o-mini'],
+    ['gpt-5.4', 'gpt-5.4'],
   ])('normalizes %s to the valid upstream id %s', (logicalModelId, upstreamModelId) => {
     expect(normalizeOpenRouterModelId(logicalModelId)).toBe(upstreamModelId);
   });
@@ -23,10 +24,8 @@ describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', (
     expect(() => normalizeOpenRouterModelId(modelId)).toThrow(GatewayContractError);
   });
 
-  it('does not silently select a fallback when the logical id is unknown', () => {
-    expect(() => normalizeOpenRouterModelId('not-a-model')).toThrow(
-      'must be an OpenRouter upstream id',
-    );
+  it('does not change non-OpenRouter logical IDs before their migration slice', () => {
+    expect(normalizeOpenRouterModelId('not-a-model')).toBe('not-a-model');
   });
 
   it('keeps task attribution, event id, and capability payload in the gateway request contract', () => {

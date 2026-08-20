@@ -26,6 +26,35 @@ const FORBIDDEN_PATTERNS: Array<{ name: string; re: RegExp }> = [
 ];
 
 /**
+ * Importing a text/chat provider SDK is the architectural boundary. Checking
+ * the import source (rather than `new Foo`) closes alias, factory, require and
+ * dynamic-import bypasses before they reach production.
+ */
+const DIRECT_TEXT_PROVIDER_SDKS = [
+  'openai',
+  '@google/genai',
+  '@google/generative-ai',
+  '@aws-sdk/client-bedrock-runtime',
+  '@azure/openai',
+  '@anthropic-ai/sdk',
+  '@langchain/openai',
+  '@langchain/aws',
+  '@langchain/google-genai',
+  '@langchain/anthropic',
+] as const;
+
+function findDirectProviderSdkImports(content: string): string[] {
+  return DIRECT_TEXT_PROVIDER_SDKS.filter((packageName) => {
+    const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // ES import/export-from, CommonJS require, and dynamic import. `\\s*`
+    // intentionally permits multiline formatting and arbitrary aliases.
+    return new RegExp(
+      `(?:\\b(?:import|export)\\s+(?:type\\s+)?[\\s\\S]*?\\bfrom\\s*|\\brequire\\s*\\(|\\bimport\\s*\\()\\s*['\"]${escaped}['\"]`,
+    ).test(content);
+  });
+}
+
+/**
  * Finds both literal SDK construction and the common import-alias bypass.
  * This is intentionally source-level rather than a lint rule: it runs in the
  * existing Jest gate and covers TypeScript's default and named import forms.
@@ -61,8 +90,8 @@ function findForbiddenSdkConstruction(content: string): string[] {
  *
  * - utils/llmClients.ts — the metered factory itself (the ONLY long-term home)
  * - utils/llmService.ts — metered internally via usageRecorderService
- * - everything else — legacy call sites seeded at guard creation (2026-06-12);
- *   the migration phase removes them one by one.
+ * - temporary migration inventory entries name their owning slice and are not
+ *   capability exceptions. They must shrink, never grow, as ENG-1415/1416 land.
  */
 const ALLOWLIST = new Set<string>([
   'utils/llmClients.ts',
@@ -79,7 +108,21 @@ const ALLOWLIST = new Set<string>([
   // not per-token — token metering does not apply. Video/image cost is tracked
   // separately (incrementUserTokenUsage cost-only path in agentModeService).
   'services/videoGeneration.ts',
+  // Transitional, inventory-owned direct text routes; not permanent exceptions.
+  'services/chatbotService.ts',
+  'services/codingAgentService.ts',
+  'loops/instances/ai-eval-funnel/rcaEnricher.ts',
 ]);
+
+function assertNoForbiddenProviderImports(file: string, content: string): void {
+  const imports = findDirectProviderSdkImports(content);
+  if (imports.length > 0 && !ALLOWLIST.has(file)) {
+    throw new Error(
+      `Direct provider SDK import in ${file}: ${imports.join(', ')}. ` +
+      'Route text/chat/tool calls through the approved OpenRouter gateway, or add a documented capability exception with owner, evidence, review date, removal condition, and affected call sites.',
+    );
+  }
+}
 
 function listSourceFiles(dir: string, acc: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -101,31 +144,15 @@ function listSourceFiles(dir: string, acc: string[] = []): string[] {
 }
 
 describe('SDK construction guard', () => {
-  it('no direct LLM SDK construction outside llmClients.ts + the seeded allowlist', () => {
-    const violations: string[] = [];
-
+  it('no direct text/chat provider SDK import exists outside the gateway, approved exceptions, or inventory-owned migration entries', () => {
     for (const file of listSourceFiles(SRC_ROOT)) {
       const rel = path.relative(SRC_ROOT, file).split(path.sep).join('/');
       const content = fs.readFileSync(file, 'utf8');
-      const constructions = findForbiddenSdkConstruction(content);
-      if (constructions.length > 0 && !ALLOWLIST.has(rel)) {
-        violations.push(`${rel} contains ${constructions.map((name) => `"${name}"`).join(', ')}`);
-      }
-    }
-
-    if (violations.length > 0) {
-      throw new Error(
-        'Direct LLM SDK construction found outside the metered factory.\n' +
-          'Use getOpenAIClient/getAzureClient/getBedrockClient/getGeminiClient ' +
-          'from src/utils/llmClients.ts instead (so usage is metered), or — only if this is ' +
-          'genuinely not an inference client — add the file to the allowlist in ' +
-          'src/__tests__/sdkConstructionGuard.test.ts with a justification.\n\nViolations:\n' +
-          violations.map((v) => `  - ${v}`).join('\n')
-      );
+      assertNoForbiddenProviderImports(rel, content);
     }
   });
 
-  it('allowlist entries still exist and still construct clients (prunes stale entries)', () => {
+  it('allowlist entries still exist and still import a direct provider SDK (prunes stale entries)', () => {
     const stale: string[] = [];
     for (const rel of ALLOWLIST) {
       const full = path.join(SRC_ROOT, rel);
@@ -134,9 +161,8 @@ describe('SDK construction guard', () => {
         continue;
       }
       const content = fs.readFileSync(full, 'utf8');
-      const stillConstructs = FORBIDDEN_PATTERNS.some(({ re }) => re.test(content));
-      if (!stillConstructs) {
-        stale.push(`${rel} (no longer constructs an SDK client — remove from allowlist)`);
+      if (findDirectProviderSdkImports(content).length === 0) {
+        stale.push(`${rel} (no longer imports a direct provider SDK — remove from allowlist)`);
       }
     }
     expect(stale).toEqual([]);
@@ -145,15 +171,18 @@ describe('SDK construction guard', () => {
 
 describe('SDK construction guard alias resistance (ENG-1414)', () => {
   it.each([
-    ["import Client from 'openai';\nnew Client({ apiKey: 'x' });"],
-    ["import { GoogleGenAI as Client } from '@google/genai';\nnew Client({ apiKey: 'x' });"],
-    ["import { BedrockRuntimeClient as Client } from '@aws-sdk/client-bedrock-runtime';\nnew Client({});"],
-  ])('detects a forbidden SDK import alias', (source) => {
-    expect(findForbiddenSdkConstruction(source)).not.toEqual([]);
+    ["import Client from 'openai';\nmakeClient(Client);"],
+    ["import * as Google from '@google/genai';\nGoogle.makeClient();"],
+    ["const sdk = require('@aws-sdk/client-bedrock-runtime');\nmakeClient(sdk);"],
+    ["const sdk = await import(\n  '@azure/openai'\n);\nmakeClient(sdk);"],
+  ])('rejects a deliberately introduced forbidden provider import regardless of construction spelling', (source) => {
+    expect(() => assertNoForbiddenProviderImports('services/newConsumer.ts', source)).toThrow(/Direct provider SDK import/);
   });
 
-  it('does not flag a type-only SDK import without construction', () => {
-    expect(findForbiddenSdkConstruction("import type OpenAI from 'openai';")).toEqual([]);
+  it('passes the approved gateway and documented non-text exceptions', () => {
+    expect(() => assertNoForbiddenProviderImports('utils/llmClients.ts', "import OpenAI from 'openai';")).not.toThrow();
+    expect(() => assertNoForbiddenProviderImports('services/liveVoiceService.ts', "import { GoogleGenAI } from '@google/genai';")).not.toThrow();
+    expect(() => assertNoForbiddenProviderImports('services/videoGeneration.ts', "const sdk = require('@google/genai');")).not.toThrow();
   });
 });
 

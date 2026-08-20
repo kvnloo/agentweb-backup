@@ -39,6 +39,7 @@ jest.mock('openai', () => jest.fn().mockImplementation((config: any) => ({ _conf
 
 import { AgentModeService } from '../services/agentModeService';
 import { getSecret } from '../utils/secretsManager';
+import { normalizeOpenRouterModelId } from '../utils/openRouterGatewayContract';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const MockOpenAI = require('openai') as jest.Mock;
 const mockGetSecret = getSecret as jest.Mock;
@@ -170,6 +171,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         model: modelId.slice('openrouter/'.length),
       }));
+      expect(normalizeOpenRouterModelId(modelId)).toBe(modelId.slice('openrouter/'.length));
     }
   });
 

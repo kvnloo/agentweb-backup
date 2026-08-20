@@ -103,6 +103,7 @@ import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { normalizeOpenRouterModelId } from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -3362,11 +3363,10 @@ export class AgentModeService {
       humanPaced = false
     } = options || {};
 
-    // `openrouter/` is our internal routing namespace. OpenRouter's API only
-    // accepts the upstream provider/model suffix (for example `z-ai/glm-5.2`).
-    const upstreamModel = model.startsWith('openrouter/')
-      ? model.slice('openrouter/'.length)
-      : model;
+    // The gateway boundary strips AgentWeb's internal OpenRouter namespace and
+    // validates its provider/model wire id. Non-OpenRouter routes retain their
+    // current semantics until their own migration slice.
+    const upstreamModel = normalizeOpenRouterModelId(model);
     const params: any = {
       model: upstreamModel,
       messages: messages,

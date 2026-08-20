@@ -53,15 +53,27 @@ export interface GatewayResponse<T> {
   usage: GatewayUsage;
 }
 
-/** Convert AgentWeb's logical ID to OpenRouter's validated upstream wire ID. */
+/**
+ * Convert AgentWeb's OpenRouter logical ID to a validated upstream wire ID.
+ *
+ * This boundary deliberately leaves non-OpenRouter logical IDs untouched. Those
+ * routes have not migrated yet, and changing their semantics here would create a
+ * hidden dual migration rather than a focused OpenRouter boundary.
+ */
 export function normalizeOpenRouterModelId(logicalModelId: string): string {
-  if (typeof logicalModelId !== 'string' || logicalModelId.trim() !== logicalModelId) {
+  if (
+    typeof logicalModelId !== 'string' ||
+    logicalModelId.length === 0 ||
+    logicalModelId.trim() !== logicalModelId
+  ) {
     throw new GatewayContractError('OpenRouter model id must be a non-empty trimmed string');
   }
 
-  const upstreamModelId = logicalModelId.startsWith('openrouter/')
-    ? logicalModelId.slice('openrouter/'.length)
-    : logicalModelId;
+  if (!logicalModelId.startsWith('openrouter/')) {
+    return logicalModelId;
+  }
+
+  const upstreamModelId = logicalModelId.slice('openrouter/'.length);
 
   if (!UPSTREAM_MODEL_ID.test(upstreamModelId)) {
     throw new GatewayContractError(
