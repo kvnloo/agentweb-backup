@@ -4479,6 +4479,31 @@ export async function POST(req: Request) {
     const fbp = (await cookies()).get("_fbp")?.value;
     const fbc = (await cookies()).get("_fbc")?.value;
 
+    // ENG-926 §B — the VISITOR's own IP and user agent, which exist only here.
+    // The browser posts directly to this route on the site's own domain, so these headers
+    // describe the person. By the time the request reaches our API it is this Vercel
+    // function making the call, and the backend can only ever see Vercel's egress — which
+    // is why it must be told rather than left to look. It validates before storing.
+    //
+    // ISOLATED IN ITS OWN try/catch ON PURPOSE. Everything below runs inside this route's
+    // blanket catch-and-return-500, so without this a header read that throws would not
+    // merely lose the identity fields - it would drop the LEAD. Identity is a match-quality
+    // bonus; the lead is the product. Never let the bonus cost the product.
+    let visitorIp = "";
+    let visitorUserAgent = "";
+    try {
+      const h = await headers();
+      // x-vercel-forwarded-for FIRST. Vercel's docs: x-forwarded-for is overwritten by
+      // Vercel and external IPs are not forwarded, "to prevent IP spoofing" - so it cannot
+      // be forged by a visitor. But the same docs note x-forwarded-for "could be overwritten
+      // if you are using a proxy on top of Vercel", which a customer on a custom domain
+      // plausibly has. x-vercel-forwarded-for stays Vercel's own determination either way.
+      visitorIp = (h.get("x-vercel-forwarded-for") || h.get("x-forwarded-for") || "")
+        .split(",")[0]
+        .trim();
+      visitorUserAgent = (h.get("user-agent") || "").trim();
+    } catch {}
+
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4491,6 +4516,8 @@ export async function POST(req: Request) {
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
         ...(fbc ? { fbc } : {}),
+        ...(visitorIp ? { visitorIp } : {}),
+        ...(visitorUserAgent ? { visitorUserAgent } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
@@ -6672,6 +6699,70 @@ export async function syncMiddlewareAndTrackingHelper(
  * @param listByPath page path -> lead list id, for EVERY page of the site (the capture
  *   route is repo-level while the lead list is per-page). May be empty.
  */
+/**
+ * Which page paths does a DEPLOYED capture route claim, that our own map does not?
+ *
+ * ⚠ THE FAILURE THIS EXISTS FOR IS LIVE AND KNOWN. Every.io's root path "/" is HAND-ADDED to
+ * its deployed LIST_BY_PATH: the AW-LandingPages record that owned "/" was archived while the
+ * frontend stayed live, so the entry exists in the repo and in no database. Regenerating the
+ * file from the DB drops it, and the site's root form starts answering 422 "no lead list
+ * configured" to real visitors on a live managed client.
+ *
+ * That has always been true of any regeneration. It stayed asleep only because the
+ * idempotence check above usually found the file already up to date and made no commit — so
+ * ANY change to buildCaptureRoute wakes it, for this repo and any other hand-edited one, and
+ * nothing anywhere tracks which repos have been hand-edited.
+ *
+ * ⚠ THE ANSWER IS TO PRESERVE THEM, NOT TO REFUSE THE WRITE. Refusing was tried and is
+ * WRONG: a frozen capture route never registers a NEW sub-page either, so that page's form
+ * answers 422 — the identical breakage, arriving by the other door. It also fires on any
+ * ordinarily-archived page, which is normal rather than exceptional. Carrying the entry
+ * forward keeps the live form working AND lets the file keep being updated.
+ *
+ * What survives is the mapping, not the page: a path the DB no longer claims keeps filing
+ * into the list it already had. If that list is itself gone the form 422s exactly as it
+ * would have anyway, so preserving can only ever be neutral-or-better for a live visitor.
+ *
+ * Three outcomes:
+ *
+ *  - `{}`   nothing to preserve. No file yet, or a PRE-ENG-308 route with no LIST_BY_PATH
+ *           at all (a hardcoded list id — PMPS's shape). Overwriting those is exactly what
+ *           ENG-310 exists to do, so this must NOT block them or the UTM-repair path for
+ *           every old customer repo stops working.
+ *  - `null` it HAS a LIST_BY_PATH and we could not read it. A map we cannot read is a map we
+ *           cannot preserve, and that is the ONE case where the caller leaves the file alone.
+ *  - `{…}`  entries the deployed file serves that our map does not, to be carried forward.
+ */
+export function findOrphanedCaptureEntries(
+  existingCaptureRoute: string | null,
+  listByPath: Record<string, string>,
+): Record<string, string> | null {
+  if (!existingCaptureRoute) return {};
+  // No map at all — a pre-ENG-308 route. Nothing here to preserve, so overwriting is safe
+  // and is the point. Distinguished from "has a map we cannot read" below.
+  if (!existingCaptureRoute.includes("LIST_BY_PATH")) return {};
+  // Both layouts must parse. buildCaptureRoute pretty-prints across lines, but a deployed
+  // file may be single-line — from an older builder or a hand-edit — and a regex that only
+  // matched the pretty form read those as unreadable and froze the site. Values are plain
+  // strings, so stopping at the first `};` is unambiguous.
+  const match = /const LIST_BY_PATH: Record<string, string> = (\{[\s\S]*?\})\s*;/.exec(
+    existingCaptureRoute,
+  );
+  if (!match) return null;
+  let deployed: Record<string, unknown>;
+  try {
+    deployed = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+  if (!deployed || typeof deployed !== "object" || Array.isArray(deployed)) return null;
+  const orphans: Record<string, string> = {};
+  for (const [path, listId] of Object.entries(deployed)) {
+    if (!(path in listByPath) && typeof listId === "string" && listId) orphans[path] = listId;
+  }
+  return orphans;
+}
+
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   /**
@@ -6702,7 +6793,6 @@ export async function syncLeadCaptureFilesToRepo(
       // Fresh every attempt — see the buildListByPath doc comment above for why.
       const listByPath = await buildListByPath();
       const middlewareContent = buildLandingPageMiddleware();
-      const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
       const trackingHelperContent = buildTrackingHelper();
 
       const [existingMiddleware, existingCaptureRoute, existingDomainMap, existingTrackingHelper] = await Promise.all([
@@ -6716,10 +6806,53 @@ export async function syncLeadCaptureFilesToRepo(
       // subdomain map — clobbering it with {} would break the customer's routing.
       const needsDomainMap = existingDomainMap === null;
 
+      // ⚠ CARRY FORWARD ANY PATH THE DEPLOYED FILE SERVES THAT OUR MAP DOES NOT.
+      // Every.io's root "/" is hand-added to its deployed LIST_BY_PATH: the record that
+      // owned "/" was archived while the frontend stayed live, so the mapping exists in the
+      // repo and in no database. Rebuilding purely from the DB deletes it and the root form
+      // answers 422 to real visitors on a live managed client. Ordinary archived pages have
+      // the same shape, so this is the common case rather than an exotic one.
+      // Our map WINS on any path both sides claim — the DB is authoritative for pages it
+      // knows about; this only ever ADDS back ones it does not.
+      const orphans = findOrphanedCaptureEntries(existingCaptureRoute, listByPath);
+      if (orphans && Object.keys(orphans).length) {
+        console.warn(
+          `[V0 SERVICE] ${repoFullName}: preserving ${Object.keys(orphans).length} capture ` +
+            `path(s) the database does not claim — ${Object.entries(orphans)
+              .map(([p, l]) => `${p} -> ${l}`)
+              .join(", ")}. Deployed and serving; rebuilding without them would 422 a live form.`
+        );
+      }
+      const effectiveListByPath = { ...(orphans ?? {}), ...listByPath };
+      const captureRouteContent = buildCaptureRoute(
+        effectiveListByPath,
+        undefined,
+        pixelId,
+        metaAccountId,
+      );
+
+      // The ONE case we still refuse: a LIST_BY_PATH that exists and cannot be parsed. We
+      // cannot preserve what we cannot read, so the file is left exactly as deployed while
+      // everything else still syncs. Rare by construction — both layouts parse.
+      const captureRouteUnreadable = orphans === null;
+      if (captureRouteUnreadable) {
+        console.warn(
+          `[V0 SERVICE] ⚠ ${repoFullName}: deployed capture route has a LIST_BY_PATH that ` +
+            `could not be parsed — NOT rewriting app/api/capture/route.ts, because doing so ` +
+            `would drop mappings we were unable to read.`
+        );
+      }
+
+      // An unreadable capture route is never "out of date" for our purposes — we are not
+      // going to write it — so it must not force a commit on its own either, or that repo
+      // takes a pointless middleware-only commit and live redeploy on every single sync.
+      const captureRouteUpToDate =
+        existingCaptureRoute === captureRouteContent || captureRouteUnreadable;
+
       if (
         !needsDomainMap &&
         existingMiddleware === middlewareContent &&
-        existingCaptureRoute === captureRouteContent &&
+        captureRouteUpToDate &&
         existingTrackingHelper === trackingHelperContent
       ) {
         console.log(
@@ -6728,9 +6861,22 @@ export async function syncLeadCaptureFilesToRepo(
         return { committed: false, reason: "up-to-date" };
       }
 
+      // ⚠ FAIL CLOSED ON A HAND-EDITED CAPTURE ROUTE. If the deployed file claims a page path
+      // our map does not, rewriting it DELETES a mapping that is serving real visitors right
+      // now — see findOrphanedCapturePaths. We cannot tell a deliberate hand-edit from a page
+      // legitimately removed from the DB, and the two want opposite handling, so this refuses
+      // to guess: middleware and the tracking helper still sync (neither carries the map),
+      // and the capture route is left exactly as deployed.
+      //
+      // A LOG LINE WOULD NOT BE ENOUGH. This repo has already learned that "log only" means
+      // invisible, and the thing being protected is a live customer's lead form. The skip is
+      // reported back to the caller so it can surface, and the durable fix is to make the DB
+      // agree with reality (un-archive the record) rather than to widen this.
       const filesToCommit: Array<{ path: string; content: string }> = [
         { path: "middleware.ts", content: middlewareContent },
-        { path: "app/api/capture/route.ts", content: captureRouteContent },
+        ...(captureRouteUnreadable
+          ? []
+          : [{ path: "app/api/capture/route.ts", content: captureRouteContent }]),
         { path: "lib/agentweb-track.ts", content: trackingHelperContent },
       ];
       if (needsDomainMap) {
@@ -6752,7 +6898,7 @@ export async function syncLeadCaptureFilesToRepo(
           1,
         );
 
-        const wired = Object.entries(listByPath);
+        const wired = Object.entries(effectiveListByPath);
         console.log(
           `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
             .map((f) => f.path)
