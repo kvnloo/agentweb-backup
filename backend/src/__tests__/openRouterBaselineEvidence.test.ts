@@ -1,6 +1,7 @@
 import { normalizeOpenAIUsage } from '../utils/llmClients';
 import {
   BASELINE_FIXTURES,
+  applyOpenRouterGenerationDetail,
   observeBaselineFixture,
   pollOpenRouterGenerationDetail,
   validateBaselineArtifact,
@@ -85,6 +86,31 @@ describe('ENG-1423 executable baseline evidence', () => {
       id: 'gen-1', promptTokens: 87, completionTokens: 4, cachedTokens: 0,
       totalCostUsd: 0.000006517, latencyMs: 504, providerName: 'OpenAI',
     }));
+  });
+
+  it('preserves response-observed cache writes when generation detail omits them', () => {
+    const artifact = {
+      incumbentLogicalModel: 'openrouter/openai/gpt-4o-mini',
+      usage: { inputTokens: 11, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4 },
+    } as BaselineArtifact;
+
+    expect(applyOpenRouterGenerationDetail(artifact, {
+      id: 'gen-cache-write',
+      model: 'openai/gpt-4o-mini',
+      providerName: 'OpenAI',
+      latencyMs: 10,
+      generationTimeMs: 12,
+      promptTokens: 12,
+      completionTokens: 3,
+      cachedTokens: 5,
+      totalCostUsd: 0.000001,
+      finishReason: 'stop',
+    }).usage).toEqual({
+      inputTokens: 12,
+      outputTokens: 3,
+      cacheReadTokens: 5,
+      cacheWriteTokens: 4,
+    });
   });
 
   it('retries an initially unindexed 404 and then succeeds', async () => {

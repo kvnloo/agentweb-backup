@@ -244,10 +244,10 @@ export function applyOpenRouterGenerationDetail(
       inputTokens: detail.promptTokens,
       outputTokens: detail.completionTokens,
       cacheReadTokens: detail.cachedTokens,
-      // OpenRouter generation detail currently exposes native cached tokens,
-      // not a separate cache-write counter. Preserve the observed zero rather
-      // than infer one from prompt totals.
-      cacheWriteTokens: 0,
+      // Generation detail exposes cache reads but no separate cache-write
+      // counter. Keep the response-level observation instead of replacing a
+      // real cache-write value with a fabricated zero.
+      cacheWriteTokens: artifact.usage.cacheWriteTokens,
     },
     recordedCostMicroUsd: Math.round(detail.totalCostUsd * 1_000_000),
     recordedCostUsd: detail.totalCostUsd,
