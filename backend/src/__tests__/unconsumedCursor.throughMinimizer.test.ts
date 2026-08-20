@@ -114,11 +114,20 @@ describe('reconciler over a MINIMIZED ledger — the live failure', () => {
     expect(reconcileUnconsumedCursors('Done.', toolCalls)).toBe('Done.');
   });
 
-  it('counts rows the minimizer removed without inventing them', () => {
-    // `leads` is gone after minimization, so the row count cannot come from there.
-    // Reporting a fabricated number would be worse than reporting none.
+  it('reports the REAL row count, not zero, after minimization', () => {
+    // Found in production, not here. The first version of this test asserted only
+    // "no undefined/NaN", so `0` sailed through — and prod produced exactly that:
+    //
+    //   "search_leads returned 0 row(s) and more remain unread"
+    //
+    // ...on a call that returned 20. `leads` is stripped by the minimizer, so the
+    // count has to survive alongside the cursor or it cannot be stated truthfully.
+    // Saying 0 is worse than saying nothing: it reads as "this found nothing",
+    // which is the opposite of what happened.
     const toolCalls = [ledgerEntry('search_leads', { list_id: 'l1' }, searchLeadsPage)];
     const out = reconcileUnconsumedCursors('Summarised.', toolCalls);
     expect(out).not.toMatch(/undefined|NaN/);
+    expect(out).not.toMatch(/returned 0 row/);
+    expect(out).toContain('20 row(s)');
   });
 });
