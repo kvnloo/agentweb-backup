@@ -119,6 +119,59 @@ export function mediaGenProducedAsset(toolName: string, result: any): boolean {
   return true;
 }
 
+/** Minimal shape of a persisted assistant message this reads — deliberately loose so it
+ * doesn't need to import the full ChatMessage type from chatbotService. */
+interface HistoryMessageLike {
+  role?: string;
+  timestamp?: string;
+  metadata?: {
+    timestamp?: string;
+    toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown; result?: any; error?: string }>;
+  } | null;
+}
+
+/**
+ * ENG-1239: `priorMediaCallKeys` (see executePreparedTools above) only ever contains what
+ * the CALLER threads in — every fresh turn starts it as `new Map()`
+ * (agentModeService.ts), so a media auto-continuation (a brand-new turn, not a later
+ * iteration of the SAME turn) got no code-level dedupe protection at all against the
+ * model re-emitting an already-completed generate_image call — only the LLM-prompt
+ * "already generated" awareness block, which relies on the model actually obeying it.
+ *
+ * This reconstructs the identical key shape (`name:stableStringify(args)` →
+ * tool_call_id) from PERSISTED session history instead, so a continuation turn can seed
+ * the dispatcher's dedupe map with what already actually happened — the dispatcher then
+ * refuses a genuine duplicate outright, the same hard guarantee same-turn iterations
+ * already get. Only counts a call that actually produced an asset (matches
+ * `mediaGenProducedAsset` / `countsAsAsset` above: no error, not deferred, not a
+ * confirmation-gate pause) — a failed or deferred call must stay retryable, not be
+ * mistaken for a duplicate. Bounded to `sinceMs` so an old, unrelated, coincidentally-
+ * identical request from a much earlier session/turn is never treated as a duplicate.
+ */
+export function seedMediaCallKeysFromHistory(
+  messages: HistoryMessageLike[] | undefined | null,
+  sinceMs: number,
+): Map<string, string> {
+  const seeded = new Map<string, string>();
+  if (!Array.isArray(messages)) return seeded;
+  for (const message of messages) {
+    if (!message || message.role !== 'assistant') continue;
+    const toolCalls = message.metadata?.toolCalls;
+    if (!Array.isArray(toolCalls)) continue;
+    const rawTs = message.timestamp || message.metadata?.timestamp;
+    const ts = rawTs ? Date.parse(rawTs) : NaN;
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    for (const tc of toolCalls) {
+      if (!tc?.name || !MEDIA_GEN_TOOLS.has(tc.name)) continue;
+      if (tc.error || !tc.result || tc.result.deferred === true || tc.result.success === false) continue;
+      if (!mediaGenProducedAsset(tc.name, tc.result)) continue;
+      const key = `${tc.name}:${stableStringify(tc.arguments)}`;
+      if (!seeded.has(key)) seeded.set(key, tc.id || '');
+    }
+  }
+  return seeded;
+}
+
 /** A tool-result outcome from the gateway, normalized into the loop's union shape. */
 export interface ToolExecOutcome {
   status: 'success' | 'error';
@@ -1107,7 +1160,15 @@ export async function executePreparedTools(
         role: 'tool',
         name: toolCall.function.name,
         content: deferContent,
-        metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+        // CodeRabbit (PR #2479): mediaBudgetDeferred must mean exactly what it says — a
+        // genuine per-turn media time-budget pause — not any deferral. A handler-supplied
+        // deferral (ENG-822's anonymous-account-scoped refusal, or any future one) carries
+        // its own unrelated reason and is a deliberate, permanent policy decision, never
+        // meant to be auto-retried. Durability checks (hasPersistedMediaBudgetDeferral,
+        // hasUnresolvedMediaDeferral) key off exactly this flag to decide whether to
+        // auto-resume, so tagging it unconditionally would have made those checks retry a
+        // policy refusal as if it were a timing issue.
+        metadata: { timestamp: new Date().toISOString(), ...(handlerDeferral ? {} : { mediaBudgetDeferred: true }) },
       });
     } else {
       const { toolCall, functionArgs, error, duration } = toolResult;

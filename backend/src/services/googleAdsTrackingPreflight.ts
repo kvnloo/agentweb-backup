@@ -39,8 +39,22 @@ export interface PreflightGateResult {
   results: UrlTrackingResult[];
   /** URLs that are 'unmeasured' or 'unverifiable' — i.e. the reason a launch is blocked. */
   blockedUrls: UrlTrackingResult[];
+  /**
+   * URLs that ARE measurable but carry no Google Ads conversion tag — only a GTM
+   * container or a GA4 property. Not blocked: plenty of legitimate setups fire the Ads
+   * conversion from inside GTM, and blocking those would be the mirror image of today's
+   * false pass. But not a clean pass either, because a container is a PLACE tags may
+   * live, not evidence any particular tag is in it (ENG-1358).
+   */
+  warnings?: UrlTrackingWarning[];
   /** Human-readable explanation naming each blocked URL, what was checked, and how to fix it. */
   message: string;
+}
+
+export interface UrlTrackingWarning {
+  url: string;
+  /** The container / property ids we DID see, e.g. ['GTM:GTM-NFWK798Z']. */
+  mechanisms: string[];
 }
 
 export interface PreflightDeps {
@@ -164,6 +178,21 @@ async function defaultFetchHtml(url: string): Promise<string> {
 }
 
 /**
+ * Does this URL carry a Google Ads conversion tag specifically, as opposed to *some*
+ * Google measurement?
+ *
+ * The distinction the gate was missing. `detectTrackingSnippets` answers "is anything
+ * Google-ish here", which is the right question for GA4 or GTM and the wrong one for a
+ * Google Ads launch: bidding optimises toward a conversion the page must be able to
+ * report, and only an `AW-` tag reports one.
+ *
+ * Kept pure and separate so the rule is provable without a fetch boundary.
+ */
+export function hasAdsConversionTag(mechanisms: string[]): boolean {
+  return (mechanisms || []).some((m) => m.startsWith('AW:'));
+}
+
+/**
  * Fetch one final URL and classify its measurement status. A fetch failure
  * (timeout, 4xx/5xx, DNS, SSRF-blocked) is NEVER treated as measured — it
  * surfaces as 'unverifiable' and follows the blocked-by-default path.
@@ -210,6 +239,31 @@ function buildBlockMessage(blocked: UrlTrackingResult[]): string {
   ].join('\n');
 }
 
+/**
+ * The WARN wording, and it is the part that decides whether this is useful or noise.
+ *
+ * It must name the specific unverifiable thing rather than say "tracking may be
+ * incomplete" — an operator cannot act on that. And it must give the two ways to settle
+ * it, because a warning with no route to resolution is one people learn to scroll past.
+ */
+function buildWarnMessage(results: UrlTrackingResult[], warnings: UrlTrackingWarning[]): string {
+  const lines = warnings.map((w) => `  • ${w.url} — found ${w.mechanisms.join(', ')}, but no Google Ads conversion tag (AW-…)`);
+  return [
+    'Pre-flight tracking check passed with a warning. These URLs are measurable, but nothing ' +
+      'on them proves a Google Ads conversion can be recorded:',
+    ...lines,
+    '',
+    'A GTM container is a place where tags may live, not evidence that an Ads conversion tag ' +
+      'is inside it — and a container\'s contents cannot be read over HTTP. If the conversion ' +
+      'fires from inside GTM this is fine; if it does not, the campaign will bid toward a ' +
+      'conversion the page can never report.',
+    '',
+    'To settle it: submit the form on that page and confirm a request to ' +
+      'googleadservices.com/pagead/conversion/… carrying your conversion label, or open GTM ' +
+      'Preview on the container and check an Ads conversion tag fires.',
+  ].join('\n');
+}
+
 function buildPassMessage(results: UrlTrackingResult[]): string {
   if (results.length === 0) {
     return 'Pre-flight tracking check: no final URLs to verify.';
@@ -234,10 +288,28 @@ export async function preflightTrackingGate(urls: string[], deps: PreflightDeps 
   const blockedUrls = results.filter((r) => r.status !== 'measured');
   const ok = blockedUrls.length === 0;
 
+  /*
+   * ENG-1358. Measurable, but with no AW- tag — only a container or a GA4 property.
+   *
+   * Found on a live campaign: the account's one ENABLED campaign pointed at a page
+   * carrying GTM-NFWK798Z and no AW- id anywhere, with a biddable SUBMIT_LEAD_FORM goal.
+   * The gate passed it. It was one bid change from spending into a funnel that could not
+   * report a single conversion.
+   *
+   * Only computed for URLs that are otherwise fine: an unverifiable or unmeasured URL is
+   * already blocked, and adding a warning on top would bury the harder finding.
+   */
+  const warnings: UrlTrackingWarning[] = results
+    .filter((r) => r.status === 'measured' && !hasAdsConversionTag(r.mechanisms))
+    .map((r) => ({ url: r.url, mechanisms: r.mechanisms }));
+
   return {
     ok,
     results,
     blockedUrls,
-    message: ok ? buildPassMessage(results) : buildBlockMessage(blockedUrls),
+    ...(warnings.length > 0 ? { warnings } : {}),
+    message: ok
+      ? (warnings.length > 0 ? buildWarnMessage(results, warnings) : buildPassMessage(results))
+      : buildBlockMessage(blockedUrls),
   };
 }

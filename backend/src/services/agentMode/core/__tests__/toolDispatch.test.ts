@@ -16,6 +16,7 @@ import {
 import {
   executePreparedTools,
   stableStringify,
+  seedMediaCallKeysFromHistory,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
@@ -589,6 +590,34 @@ describe('executePreparedTools', () => {
       const forwarded = recordToolTelemetry.mock.calls[0][0];
       expect(forwarded).toHaveLength(1);
       expect(forwarded[0]).toMatchObject({ status: 'deferred', toolCall: expect.objectContaining({ id: 'a' }) });
+    });
+
+    // CodeRabbit (PR #2479): the persisted tool-role message's `mediaBudgetDeferred: true`
+    // was set unconditionally for EVERY deferral, including a handler-supplied one (ENG-822's
+    // anonymous-account-scoped refusal) that carries its own unrelated reason. Durability
+    // checks (hasPersistedMediaBudgetDeferral, hasUnresolvedMediaDeferral) key off exactly
+    // this flag to decide "should I auto-resume this" — so an ENG-822 refusal (a deliberate,
+    // permanent policy block, never meant to be retried) would have been indistinguishable
+    // from a genuine time-budget pause and incorrectly auto-retried.
+    it('does NOT tag the persisted marker mediaBudgetDeferred for a handler-supplied (non-time-budget) deferral', async () => {
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => ({
+          status: 'success',
+          result: { deferred: true, reason: 'anonymous_account_scoped', message: 'Sign in to use this feature.' },
+          durationMs: 1,
+          policyDecision: i.policyDecision,
+        }),
+      });
+      const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"x"}')], ports, {});
+      await executePreparedTools(input);
+
+      expect(input.toolCallsLedger[0].result).toEqual({
+        deferred: true,
+        reason: 'anonymous_account_scoped',
+        message: 'Sign in to use this feature.',
+      });
+      expect(input.messages[0]).toMatchObject({ tool_call_id: 'a', role: 'tool', content: 'Sign in to use this feature.' });
+      expect(input.messages[0].metadata?.mediaBudgetDeferred).not.toBe(true);
     });
 
     it('a deferred call that did not run does not count as a produced asset', async () => {
@@ -1221,5 +1250,96 @@ describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () =
     });
     const result = await executePreparedTools(input);
     expect(result.producedMediaCallKeys.size).toBe(0); // failure not recorded → retryable
+  });
+});
+
+describe('seedMediaCallKeysFromHistory (ENG-1239)', () => {
+  // The in-run dedupe map above (priorMediaCallKeys) only ever starts non-empty when the
+  // CALLER threads a prior iteration's keys into it — it always starts empty at the top of
+  // a fresh turn (agentModeService.ts: `new Map()`), so a media auto-continuation (a brand
+  // new turn) got NO code-level dedupe protection against the model re-emitting an
+  // already-done generate_image call — only the LLM-prompt "already generated" awareness
+  // block, which the model can ignore. This reconstructs the SAME key shape
+  // (`name:stableStringify(args)`) from persisted history so a continuation turn seeds the
+  // dispatcher's dedupe map with what already actually happened, hardening it beyond the
+  // prompt-only guard.
+  const successMsg = (name: string, args: string, iso: string) => ({
+    role: 'assistant',
+    timestamp: iso,
+    metadata: { toolCalls: [{ id: 'x', name, arguments: JSON.parse(args), result: { success: true, imageUrl: 'https://s3/img.png' } }] },
+  });
+
+  it('returns an empty map for non-array input', () => {
+    expect(seedMediaCallKeysFromHistory(undefined, 0).size).toBe(0);
+    expect(seedMediaCallKeysFromHistory(null, 0).size).toBe(0);
+  });
+
+  it('seeds a key for a successful generate_image call at/after sinceMs', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', '2026-08-14T18:20:51.906Z')];
+    const seeded = seedMediaCallKeysFromHistory(msgs, sinceMs);
+    expect(seeded.get(`generate_image:${stableStringify({ prompt: 'sun' })}`)).toBe('x');
+  });
+
+  it('ignores a call from BEFORE sinceMs (an unrelated, much earlier session/turn)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', '2026-08-01T00:00:00Z')];
+    expect(seedMediaCallKeysFromHistory(msgs, sinceMs).size).toBe(0);
+  });
+
+  // CodeRabbit (PR #2479): the boundary comparison is `ts >= sinceMs` (inclusive) — pin
+  // the exact-equal case explicitly, not just a call safely after the bound.
+  it('seeds a call whose timestamp is exactly sinceMs (inclusive boundary)', () => {
+    const sinceMs = Date.parse('2026-08-14T18:00:00Z');
+    const msgs = [successMsg('generate_image', '{"prompt":"sun"}', new Date(sinceMs).toISOString())];
+    const seeded = seedMediaCallKeysFromHistory(msgs, sinceMs);
+    expect(seeded.get(`generate_image:${stableStringify({ prompt: 'sun' })}`)).toBe('x');
+  });
+
+  it('does NOT seed a deferred call (nothing was actually produced)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, result: { deferred: true, reason: 'media_generation_time_budget' } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('does NOT seed a FAILED call (it must stay retryable, not be treated as a duplicate)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, error: 'provider timeout' }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('does NOT seed a confirmation-gate pause (awaitingUserConfirmation, no asset produced)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'generate_image', arguments: { prompt: 'sun' }, result: { success: true, awaitingUserConfirmation: true } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('ignores a non-media tool call entirely (e.g. send_email)', () => {
+    const msgs = [{
+      role: 'assistant',
+      timestamp: '2026-08-14T18:20:51.906Z',
+      metadata: { toolCalls: [{ id: 'x', name: 'send_email', arguments: { to: 'a@b.com' }, result: { success: true } }] },
+    }];
+    expect(seedMediaCallKeysFromHistory(msgs, 0).size).toBe(0);
+  });
+
+  it('ignores malformed entries and non-assistant messages', () => {
+    const msgs = [
+      null,
+      undefined,
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', metadata: {} },
+      { role: 'assistant', metadata: { toolCalls: [null, {}] } },
+    ];
+    expect(seedMediaCallKeysFromHistory(msgs as any, 0).size).toBe(0);
   });
 });

@@ -165,6 +165,20 @@ describe('findUnconsumedCursors', () => {
     expect(out[0].cursor).toBe('C1');
   });
 
+  it.each([-1, 1.5, NaN, Infinity])(
+    'INVALID INPUT: a rowCount of %s is ignored in favour of the real rows',
+    (bad) => {
+      // The preserved count is trusted over the array, so a malformed one would be
+      // printed verbatim — "returned 1.5 row(s)" (CodeRabbit, #2520).
+      const ledger = [
+        call('search_leads', {}, { leads: new Array(7), next_cursor: 'C1', rowCount: bad }),
+      ];
+      const out = findUnconsumedCursors(ledger);
+      expect(out).toHaveLength(1);
+      expect(out[0].returned).toBe(7);
+    },
+  );
+
   it('INVALID INPUT: an entry with no tool name is skipped, not reported as "a tool"', () => {
     // A notice naming "a tool" cannot be acted on — the user has nothing to resume
     // (CodeRabbit, #2493). An unnameable entry is malformed input, and the file's

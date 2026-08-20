@@ -575,6 +575,26 @@ export class GoogleAdsService {
   }
 
   /**
+   * The account's own IANA time zone, read from Google rather than assumed.
+   *
+   * Offline conversion timestamps are interpreted in the ACCOUNT's zone. Defaulting to
+   * UTC would shift every conversion by the account's real offset — for the INR account
+   * this work was verified against, 5.5 hours — and the only symptom is conversions
+   * attributed to the wrong day, which reads as a reporting oddity rather than a bug.
+   */
+  async getAccountTimeZone(userId: string, customerId: string): Promise<string> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId, accessToken,
+      'SELECT customer.time_zone FROM customer LIMIT 1',
+      loginCustomerId,
+    );
+    const tz = rows?.[0]?.customer?.timeZone;
+    if (!tz) throw new Error('Could not read the account time zone, so a conversion timestamp cannot be placed correctly.');
+    return tz;
+  }
+
+  /**
    * Upload offline conversions keyed on gclid (ENG-1325).
    *
    * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
