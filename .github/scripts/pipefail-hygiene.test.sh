@@ -120,11 +120,15 @@ logical_lines() {
 # The quiet flag is found ANYWHERE in grep's argument list, not just in the last
 # option token. `grep -q -F x` was already caught, but `grep -e "${n}" -q` and
 # `grep --quiet` were not: the first puts a non-option word before the flag, the
-# second is a long option. Both still exit on the first match, so both are
+# second is a long option. `--silent` is the same flag again under a third
+# spelling — `grep --help` lists `-q, --quiet, --silent` as one option, and it
+# was confirmed here to produce a 141 through a pipeline, which is the only
+# local reproduction of the race this whole ticket is about. All still exit on
+# the first match, so all are
 # hazards, and a detector that misses them gives false assurance. Raised by
 # CodeRabbit on #1061. `[^|;&]*` keeps the search inside one command so a later
 # command on the same logical line cannot lend it a `-q`.
-EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep[[:space:]]+([^|;&]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--quiet)([[:space:]]|;|$)|head([[:space:]]|$))'
+EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep[[:space:]]+([^|;&]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--(quiet|silent))([[:space:]]|;|$)|head([[:space:]]|$))'
 
 # Normalise into a FILE and prove it worked, so a broken scanner cannot present
 # as a clean result. Echoes the path; non-zero if anything went wrong.
@@ -152,6 +156,16 @@ filter_and_match() {
   rm -f "${a}" "${b}"
   if [ "${rc}" -gt 1 ]; then return "${rc}"; fi
   return 0
+}
+
+# Count matches in an already-normalised file. `grep -c` prints 0 and exits 1
+# when there are none, which is ordinary; anything above 1 is a real error and
+# must not be reported as a count.
+count_hits() {
+  local f="$1" n rc
+  n="$(grep -cE "${EARLY_EXIT_READER}" "${f}")"; rc=$?
+  if [ "${rc}" -gt 1 ]; then return 2; fi
+  printf '%s' "${n}"
 }
 
 shopt -s nullglob
@@ -219,17 +233,22 @@ printf '%s' "${content}" |
   grep -qF "${needle}"
 if printf '%s' "${content}" | grep -e "${needle}" -q; then :; fi
 if printf '%s' "${content}" | grep --quiet "${needle}"; then :; fi
+if printf '%s' "${content}" | grep --silent "${needle}"; then :; fi
 PROBE
+# `|| n=0` would reintroduce exactly the masking removed from the scan above:
+# `grep -c` exits 1 for "no matches", so the fallback cannot tell that from a
+# grep that errored, and a broken self-check reports the detector healthy.
+# count_hits distinguishes them.
 if probe_norm="$(normalise "${probe}")"; then
-  n_flagged="$(grep -cE "${EARLY_EXIT_READER}" "${probe_norm}")" || n_flagged=0
+  n_flagged="$(count_hits "${probe_norm}")" || n_flagged='scan-errored'
   rm -f "${probe_norm}"
 else
   n_flagged='normalisation-failed'
 fi
-if [ "${n_flagged}" = "7" ]; then
+if [ "${n_flagged}" = "8" ]; then
   pass "the rule actually detects the shape it exists to ban"
 else
-  fail "the detector flagged ${n_flagged} of 7 known-bad pipelines." \
+  fail "the detector flagged ${n_flagged} of 8 known-bad pipelines." \
        "The probe carries -qF, -Fxq and 'head -n 1' precisely because an" \
        "earlier expression anchored the q at the end of the flag group and" \
        "matched none of them, reporting every file clean. A detector that" \
@@ -237,7 +256,8 @@ else
        "split across lines — one by backslash, one by a trailing pipe — and" \
        "the second escaped the detector entirely before normalisation." \
        "The last two are 'grep -e X -q' and 'grep --quiet': the quiet flag" \
-       "is not always the final option token, and both still exit early."
+       "is not always the final option token, and --quiet/--silent are the" \
+       "same flag spelled long. All of them still exit on first match."
 fi
 
 # A detector that over-reports is not "safe by default" — it makes the check
@@ -256,8 +276,15 @@ run_something ||
   grep -qF "${needle}" <<<"${content}"
 CLEAN
 if clean_norm="$(normalise "${clean_probe}")"; then
-  n_false="$(grep -vE '^[0-9]+:[[:space:]]*#' "${clean_norm}" | grep -cE "${EARLY_EXIT_READER}")" || n_false=0
+  false_hits="$(filter_and_match "${clean_norm}")"; rc=$?
   rm -f "${clean_norm}"
+  if [ "${rc}" -gt 1 ]; then
+    n_false='scan-errored'
+  elif [ -z "${false_hits}" ]; then
+    n_false=0
+  else
+    n_false="$(printf '%s\n' "${false_hits}" | wc -l | tr -d ' ')"
+  fi
 else
   n_false='normalisation-failed'
 fi
