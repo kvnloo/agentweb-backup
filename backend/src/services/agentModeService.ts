@@ -34999,11 +34999,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
         /*
-         * The account's own time zone, read from Google rather than assumed. Google
-         * interprets the timestamp in it, so guessing UTC would silently shift every
-         * conversion by the account's real offset — and the only symptom is conversions
-         * landing on the wrong day, which nobody reads as a bug.
+         * Validate BEFORE resolving the time zone. getAccountTimeZone is a live Google
+         * call, so doing it first meant a future-dated timestamp or a value with no
+         * currency — both refusable locally — still cost a network round trip before
+         * being rejected. On a background sweep that is a request per bad row.
+         *
+         * The zone is only needed to FORMAT a conversion we have already accepted, so a
+         * throwaway placeholder validates everything else first. UTC is safe here purely
+         * because the result is discarded; the real formatting below uses the account's
+         * own zone, and getting that wrong would shift every conversion by the real
+         * offset with no symptom beyond conversions landing on the wrong day.
          */
+        const validateOnlyArgs = {
+          gclid: args.gclid,
+          conversionActionResourceName: args.conversion_action_resource_name,
+          conversionAt: new Date(args.conversion_at),
+          value: args.conversion_value,
+          currencyCode: args.currency_code,
+          orderId: args.order_id,
+        };
+        try {
+          buildClickConversion({ ...validateOnlyArgs, timeZone: 'UTC' });
+        } catch (err: any) {
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+
         const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
         let conversion: Record<string, unknown>;
         try {

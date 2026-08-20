@@ -18,7 +18,9 @@ import { AgentModeService } from '../services/agentModeService';
 import { googleAdsService } from '../services/googleAdsService';
 
 const ACTION = 'customers/2883029950/conversionActions/7724987234';
-const PAST = '2026-06-15T07:04:05.000Z';
+// Fixed and permanently historical. A fixture dated relative to "now" starts failing
+// the moment the clock passes it — the same brittleness this suite already fixed once.
+const PAST = '2020-06-15T07:04:05.000Z';
 let service: AgentModeService;
 
 const call = (args: any) => service.handleCallGoogleAdsApi('u1', {
@@ -68,6 +70,9 @@ describe('OFFLINE_CONVERSION — refusals before any network call', () => {
     expect(out.success).toBe(false);
     expect(out.error).toMatch(/future/i);
     expect(googleAdsService.uploadClickConversions).not.toHaveBeenCalled();
+    // And no Google call AT ALL: getAccountTimeZone is live, so validating after it
+    // would cost a round trip per bad row on a background sweep.
+    expect(googleAdsService.getAccountTimeZone).not.toHaveBeenCalled();
   });
 
   it('refuses a value with no currency, which would misstate revenue', async () => {
@@ -76,6 +81,7 @@ describe('OFFLINE_CONVERSION — refusals before any network call', () => {
     });
     expect(out.success).toBe(false);
     expect(out.error).toMatch(/currency/i);
+    expect(googleAdsService.getAccountTimeZone).not.toHaveBeenCalled();
   });
 });
 
@@ -86,14 +92,14 @@ describe('OFFLINE_CONVERSION — the upload itself', () => {
     await call(ok);
     expect(googleAdsService.getAccountTimeZone).toHaveBeenCalledWith('u1', '2883029950');
     const [, , conversions] = (googleAdsService.uploadClickConversions as jest.Mock).mock.calls[0];
-    expect(conversions[0].conversionDateTime).toBe('2026-06-15 12:34:05+05:30');
+    expect(conversions[0].conversionDateTime).toBe('2020-06-15 12:34:05+05:30');
   });
 
   it('honours an explicit time_zone override without calling Google for it', async () => {
     await call({ ...ok, time_zone: 'UTC' });
     expect(googleAdsService.getAccountTimeZone).not.toHaveBeenCalled();
     const [, , conversions] = (googleAdsService.uploadClickConversions as jest.Mock).mock.calls[0];
-    expect(conversions[0].conversionDateTime).toBe('2026-06-15 07:04:05+00:00');
+    expect(conversions[0].conversionDateTime).toBe('2020-06-15 07:04:05+00:00');
   });
 
   it('passes order_id through so the browser conversion cannot double-count', async () => {

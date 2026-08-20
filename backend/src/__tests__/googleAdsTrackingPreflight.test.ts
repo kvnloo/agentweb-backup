@@ -336,3 +336,39 @@ describe('the warning must describe what was actually found (CodeRabbit, #2516)'
     }
   });
 });
+
+describe('mixed GTM and GA4 sets get the right advice each (CodeRabbit, #2522)', () => {
+  // anyGtm picked ONE message for the whole array, so a set containing a GTM URL and a
+  // GA4-only URL told the GA4 one to open GTM Preview. Same class as the bug it replaced.
+  const page = (b: string) => `<html><head>${b}</head><body>x</body></html>`;
+  const gtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const ga4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+
+  const mixed = () => preflightTrackingGate(
+    ['https://gtm.test/', 'https://ga4.test/'],
+    { fetchHtml: async (u) => (u.includes('gtm') ? gtmOnly : ga4Only) },
+  );
+
+  it('warns on both URLs', async () => {
+    expect((await mixed()).warnings).toHaveLength(2);
+  });
+
+  it('the GA4 line does not mention GTM Preview', async () => {
+    const out = await mixed();
+    const ga4Line = out.message.split('\n').find((l) => l.includes('https://ga4.test/'))!;
+    expect(ga4Line).not.toMatch(/GTM Preview/);
+    expect(ga4Line).toMatch(/imported into Google Ads/);
+  });
+
+  it('the GTM line does mention GTM Preview', async () => {
+    const out = await mixed();
+    const gtmLine = out.message.split('\n').find((l) => l.includes('https://gtm.test/'))!;
+    expect(gtmLine).toMatch(/GTM Preview/);
+  });
+
+  it('both explanations appear when both mechanisms are present', async () => {
+    const out = await mixed();
+    expect(out.message).toMatch(/place where tags may live/);
+    expect(out.message).toMatch(/GA4 property measures analytics/);
+  });
+});

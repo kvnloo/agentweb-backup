@@ -177,7 +177,10 @@ export class GoogleAdsService {
         client_secret: secrets.clientSecret,
         refresh_token: refreshToken,
         grant_type: 'refresh_token',
-      }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+      }).toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
+      });
       const { access_token, expires_in } = response.data as { access_token: string; expires_in: number };
       await updateAccountTokens(userId, 'google_ads', {
         access_token,
@@ -236,6 +239,7 @@ export class GoogleAdsService {
   async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
+      timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'developer-token': secrets.developerToken,
@@ -1023,6 +1027,7 @@ export class GoogleAdsService {
     let response;
     try {
       response = await axios.post(`${GOOGLE_ADS_API_BASE}/geoTargetConstants:suggest`, { locale, locationNames: { names: [query] } }, {
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'developer-token': secrets.developerToken,
