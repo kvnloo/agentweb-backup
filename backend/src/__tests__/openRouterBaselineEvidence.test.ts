@@ -1,7 +1,9 @@
 import { normalizeOpenAIUsage } from '../utils/llmClients';
+import { parseArgs } from '../loops/scripts/runOpenRouterBaseline';
 import {
   BASELINE_FIXTURES,
   applyOpenRouterGenerationDetail,
+  buildBaselineRequest,
   observeBaselineFixture,
   pollOpenRouterGenerationDetail,
   validateBaselineArtifact,
@@ -10,6 +12,11 @@ import {
 } from '../loops/eval/openRouterBaselineEvidence';
 
 describe('ENG-1423 executable baseline evidence', () => {
+  it('rejects a flag whose apparent value is another flag', () => {
+    expect(() => parseArgs([
+      '--revision', 'abcdef1', '--out', '--model', 'openrouter/example/model',
+    ])).toThrow('--out is required');
+  });
   it('covers every Slice B/C task class with a stable executable fixture', () => {
     const expected: BaselineTaskClass[] = [
       'interactive_chat',
@@ -68,9 +75,41 @@ describe('ENG-1423 executable baseline evidence', () => {
     ]));
   });
 
+  it('reports each missing OpenRouter field only once', () => {
+    const incomplete = {
+      incumbentLogicalModel: 'openrouter/example/model',
+      requirements: {},
+      usage: {},
+    } as unknown as BaselineArtifact;
+
+    const errors = validateBaselineArtifact(incomplete);
+    expect(errors.filter((error) => error === 'providerName is required')).toHaveLength(1);
+    expect(errors.filter((error) => error === 'finishReason is required')).toHaveLength(1);
+  });
+
   it('keeps the existing OpenAI-compatible usage normalization as a passing control', () => {
     expect(normalizeOpenAIUsage({ prompt_tokens: 8, completion_tokens: 2 }))
       .toEqual({ inputTokens: 8, outputTokens: 2, cacheReadTokens: 0 });
+  });
+
+  it('gives structured JSON fixtures more completion headroom than exact-text fixtures', () => {
+    const exact = BASELINE_FIXTURES.find((fixture) => fixture.outputKind === 'exact_text')!;
+    const structured = BASELINE_FIXTURES.find((fixture) => fixture.outputKind === 'structured_json')!;
+
+    expect(buildBaselineRequest(structured, 'openrouter/example/model').max_completion_tokens)
+      .toBeGreaterThan(buildBaselineRequest(exact, 'openrouter/example/model').max_completion_tokens as number);
+  });
+
+  it('fails closed when provider cost is absent and the logical model is unpriced', async () => {
+    await expect(observeBaselineFixture(
+      'eng1423-interactive-chat-v1',
+      'openrouter/unpriced/model',
+      async () => ({
+        id: 'gen-unpriced',
+        choices: [{ message: { content: 'BASELINE_OK' } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2 },
+      }),
+    )).rejects.toThrow('has no authoritative price');
   });
 
   it('correlates a successful OpenRouter generation-detail record', async () => {
@@ -135,6 +174,14 @@ describe('ENG-1423 executable baseline evidence', () => {
       async () => ({ status: 404, body: { error: 'not found' } }),
       { maxAttempts: 2, delayMs: 0 },
     )).rejects.toThrow('not indexed after 2 attempts');
+  });
+
+  it('fails loudly on a non-404 generation lookup response', async () => {
+    await expect(pollOpenRouterGenerationDetail(
+      'gen-500',
+      async () => ({ status: 500, body: null }),
+      { maxAttempts: 1 },
+    )).rejects.toThrow('HTTP 500');
   });
 
   it('rejects malformed or incomplete generation metrics', async () => {

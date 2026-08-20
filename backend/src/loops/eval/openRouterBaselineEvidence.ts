@@ -9,6 +9,7 @@
  */
 import { normalizeUsageFromResponse } from '../../utils/llmClients';
 import { computeCostMicroUsd } from '../../services/usageRecorderService';
+import { getModelPrice } from '../../utils/llmPricing';
 
 export type BaselineTaskClass =
   | 'interactive_chat'
@@ -224,7 +225,7 @@ export function buildBaselineRequest(fixture: BaselineFixture, logicalModel: str
   return {
     model: logicalModel.startsWith('openrouter/') ? logicalModel.slice('openrouter/'.length) : logicalModel,
     messages: fixture.messages,
-    max_completion_tokens: 96,
+    max_completion_tokens: fixture.outputKind === 'structured_json' ? 256 : 96,
     ...(fixture.tools ? { tools: fixture.tools, tool_choice: fixture.toolChoice } : {}),
     ...(fixture.responseFormat ? { response_format: fixture.responseFormat } : {}),
   };
@@ -325,6 +326,12 @@ export async function observeBaselineFixture(
   };
   const providerCost = response?.usage?.cost;
   const hasProviderCost = typeof providerCost === 'number' && Number.isFinite(providerCost) && providerCost >= 0;
+  if (!hasProviderCost && getModelPrice(model) === null) {
+    throw new Error(`Fixture ${fixtureId} model ${model} has no authoritative price`);
+  }
+  const fallbackCostMicroUsd = hasProviderCost
+    ? 0
+    : computeCostMicroUsd(model, usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens);
   const output = outputFromResponse(response);
   const behaviorError = validateBehavior(fixture, output);
   if (behaviorError) throw new Error(`Fixture ${fixtureId}: ${behaviorError}`);
@@ -342,10 +349,10 @@ export async function observeBaselineFixture(
     usage,
     recordedCostMicroUsd: hasProviderCost
       ? Math.round(providerCost * 1_000_000)
-      : computeCostMicroUsd(model, usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens),
+      : fallbackCostMicroUsd,
     recordedCostUsd: hasProviderCost
       ? providerCost
-      : computeCostMicroUsd(model, usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens) / 1_000_000,
+      : fallbackCostMicroUsd / 1_000_000,
     costSource: hasProviderCost ? 'provider_reported' : 'authoritative_price_book',
     latencyMs,
     requestLatencyMs: latencyMs,
@@ -404,8 +411,6 @@ export function validateBaselineArtifact(
     options.requireOpenRouterGenerationDetail !== false
   ) {
     if (!artifact.generationId) errors.push('generationId is required for OpenRouter fixtures');
-    if (!artifact.providerName) errors.push('providerName is required for OpenRouter fixtures');
-    if (!artifact.finishReason) errors.push('finishReason is required for OpenRouter fixtures');
     if (!Number.isFinite(artifact.generationTimeMs) || (artifact.generationTimeMs ?? -1) < 0) {
       errors.push('generationTimeMs is required for OpenRouter fixtures');
     }

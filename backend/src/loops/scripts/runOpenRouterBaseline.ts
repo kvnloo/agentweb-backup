@@ -36,10 +36,12 @@ interface CliOptions {
   fixtureId?: string;
 }
 
-function parseArgs(argv: readonly string[]): CliOptions {
+export function parseArgs(argv: readonly string[]): CliOptions {
   const value = (flag: string): string | undefined => {
     const index = argv.indexOf(flag);
-    return index >= 0 ? argv[index + 1] : undefined;
+    if (index < 0) return undefined;
+    const next = argv[index + 1];
+    return next && !next.startsWith('--') ? next : undefined;
   };
   const revision = value('--revision');
   const out = value('--out');
@@ -118,9 +120,17 @@ async function main(): Promise<void> {
   const fetchDetail = openRouterGenerationFetcher(apiKey);
 
   const artifacts: BaselineArtifact[] = [];
+  const failures: Array<{ fixtureId: string; error: string }> = [];
   for (const fixture of fixtures) {
     // Serial by design: bounded spend, deterministic attribution, low RAM.
-    artifacts.push(await executeFixture(fixture, options.model, client, fetchDetail));
+    try {
+      artifacts.push(await executeFixture(fixture, options.model, client, fetchDetail));
+    } catch (error) {
+      failures.push({
+        fixtureId: fixture.fixtureId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   const output = {
@@ -129,11 +139,15 @@ async function main(): Promise<void> {
     generatedAt: new Date().toISOString(),
     source: 'executable synthetic fixtures + explicit logical model + OpenRouter generation detail',
     artifacts,
+    ...(failures.length > 0 ? { failures } : {}),
   };
   const outputPath = path.resolve(options.out);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, `${JSON.stringify(output, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   process.stdout.write(`Wrote ${artifacts.length} observed baseline artifact(s) to ${outputPath}\n`);
+  if (failures.length > 0) {
+    throw new Error(`${failures.length} fixture(s) failed; see ${outputPath}`);
+  }
 }
 
 if (require.main === module) {
