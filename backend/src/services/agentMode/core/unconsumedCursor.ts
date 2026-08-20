@@ -90,6 +90,12 @@ function cursorFrom(result: unknown): string | null {
 
 function rowsFrom(result: unknown): number {
   if (!result || typeof result !== 'object') return 0;
+  // `rowCount` is what the ledger minimizer preserves in place of the rows. Checked
+  // FIRST because by the time this runs in the real loop the arrays below are gone
+  // — they are only present when a caller passes an un-minimized result, which is
+  // what every unit test did before production disagreed with them.
+  const preserved = (result as Record<string, unknown>).rowCount;
+  if (typeof preserved === 'number' && Number.isFinite(preserved)) return preserved;
   for (const key of ROW_KEYS) {
     const value = (result as Record<string, unknown>)[key];
     if (Array.isArray(value)) return value.length;

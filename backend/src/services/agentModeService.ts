@@ -7212,6 +7212,21 @@ export class AgentModeService {
           paginationMarkers[key] = value;
         }
       }
+      // The COUNT survives too, as a number — the rows themselves do not.
+      //
+      // Without it the notice said "search_leads returned 0 row(s) and more remain
+      // unread" on a call that returned 20, because the row array it counted had
+      // already been stripped here. Found in production; the unit test asserted
+      // only "no undefined/NaN", so zero passed.
+      //
+      // Zero is worse than silence in that sentence: it reads as "this found
+      // nothing", the opposite of what happened.
+      if (Object.keys(paginationMarkers).length > 0) {
+        for (const key of ['leads', 'engagements', 'results', 'items', 'rows']) {
+          const value = (result as Record<string, unknown>)[key];
+          if (Array.isArray(value)) { paginationMarkers.rowCount = value.length; break; }
+        }
+      }
     }
     if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
 
