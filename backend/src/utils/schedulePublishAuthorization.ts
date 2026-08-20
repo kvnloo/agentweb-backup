@@ -234,6 +234,40 @@ export function resolveSchedulePublishAuthorization(
 }
 
 /**
+ * ENG-1245 — WHY a schedule resolves to unauthorized, for accurate owner-facing
+ * reporting only. Deliberately NOT part of `SchedulePublishAuthorization`'s own
+ * shape (asserted with exact-object equality across every case above) — this is
+ * read solely by the prompt-construction call site that decides which withheld
+ * explanation to show the owner.
+ *
+ * Session 0e5af215 (2026-08-15) and every daily run since — through today —
+ * told the owner "you turned ON Require approval before publishing, turn it
+ * OFF to unblock." The live schedule record has `requirePublishApproval:
+ * false`. The real reason: this schedule was never granted standing
+ * autopublish authorization, and its `requiredFunctionCalls` names no publish
+ * tool, so the legacy opt-out above finds no scope and falls to UNAUTHORIZED.
+ * Telling the owner to flip a switch that is already off fixes nothing and
+ * hides a real regression (ENG-1245) — it also happens to point at "Publish
+ * without my review" wording that does not exist anywhere in the schedule UI,
+ * which only ever offers "Require approval before publishing".
+ *
+ * Only the literal `requirePublishApproval === true` case is that specific,
+ * named toggle. Every other unauthorized case (never asked, explicit
+ * `autopublishAuthorized: false` revocation, a grant with no approved scope)
+ * collapses to `'not_granted'` — from the owner's perspective none of those is
+ * "Require approval before publishing" being on, so none should be described
+ * that way.
+ */
+export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'not_granted';
+
+export function describePublishAuthorizationWithholdReason(
+  schedule: SchedulePublishAuthorizationInput | null | undefined
+): PublishAuthorizationWithholdReason | undefined {
+  if (!schedule) return undefined;
+  return schedule.requirePublishApproval === true ? 'require_publish_approval' : 'not_granted';
+}
+
+/**
  * Narrow a schedule's required-function list to what this run is actually allowed
  * to be nudged for.
  *
