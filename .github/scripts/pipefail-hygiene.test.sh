@@ -109,7 +109,14 @@ logical_lines() {
 # earlier version of this expression anchored q at the end and therefore matched
 # none of them. It reported 16 clean files while every one of them was dirty.
 # That is why the self-check at the bottom exists.
-EARLY_EXIT_READER='\|[[:space:]]*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q[a-zA-Z]*|head)([[:space:]]|$)'
+#
+# The leading `(^|[^|])` matters as much as the rest: without it, `||` matches.
+# `validate || grep -qF x <<<"$y"` is an OR-list, not a pipeline — grep reads a
+# here-string and nothing can break — but the second `|` of `||` is followed by
+# ` grep -qF`, so an unanchored expression flags it and CI blocks a compliant
+# script. Raised by CodeRabbit on #2530/#1061; the false positive predated the
+# logical-line joining below, which merely made it reachable in more places.
+EARLY_EXIT_READER='(^|[^|])\|[[:space:]]*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q[a-zA-Z]*|head)([[:space:]]|$)'
 
 shopt -s nullglob
 for script in "${SCRIPT_DIR}"/*.sh; do
@@ -164,6 +171,35 @@ else
        "cannot fail is the same thing as no detector. The last two are" \
        "split across lines — one by backslash, one by a trailing pipe — and" \
        "the second escaped the detector entirely before normalisation."
+fi
+
+# A detector that over-reports is not "safe by default" — it makes the check
+# something people switch off, which is how the gate stops working. These are
+# all SAFE and must not be flagged: an OR-list is not a pipeline, and a
+# here-string has no pipe to break.
+clean_probe="$(mktemp)"
+trap 'rm -f "${probe}" "${clean_probe}"' EXIT
+cat >"${clean_probe}" <<'CLEAN'
+set -euo pipefail
+if grep -qF "${needle}" <<<"${content}"; then :; fi
+validate_thing || grep -qF "${needle}" <<<"${content}"
+check_a || check_b || grep -q "${pattern}" <<<"${subject}"
+some_cmd || head -n 1 <<<"${subject}"
+run_something ||
+  grep -qF "${needle}" <<<"${content}"
+CLEAN
+n_false="$(logical_lines "${clean_probe}" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' \
+  | grep -cE "${EARLY_EXIT_READER}" || true)"
+if [ "${n_false}" = "0" ]; then
+  pass "the rule does not fire on OR-lists or here-strings"
+else
+  fail "the detector flagged ${n_false} SAFE construct(s)." \
+       "An OR-list continues across a newline after '||' just as a pipeline" \
+       "does after '|', and its second '|' is followed by the reader name —" \
+       "so an unanchored expression reads 'a || grep -q x <<<\$y' as a pipe" \
+       "into grep. It is not one. Over-reporting turns this check into" \
+       "something a future PR deletes rather than satisfies."
 fi
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
