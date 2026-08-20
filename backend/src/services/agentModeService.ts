@@ -32086,19 +32086,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      // Check if the account exists first
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const allAccounts = await getAccountsByUserId(userId);
-      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
-      if (!matchingAccount) {
+      // ENG-1385: existence must be org-shared-aware (resolveAccessibleAccount),
+      // not a plain per-caller lookup — a company page list_connected_accounts
+      // reports as active can be owned by a teammate and shared with the org.
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
+      // getPostsForUser does its own internal account lookup — it must be handed
+      // the account's real owner, not the caller, or it re-derives nothing for a
+      // teammate-owned account. Also matches every adapter call below needing the
+      // owner's id for token lookup/refresh, same as loadConnectedAccountMetrics.
       const { getPostsForUser } = await import('./socialPostsService');
-      const result = await getPostsForUser(userId, {
+      const result = await getPostsForUser(ownerUserId, {
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
@@ -32135,8 +32140,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // connected and healthy), so this must NOT render as a tool "failure" in
       // the UI. The message leads with what AgentWeb DOES (positive, ownership
       // framing) so the model doesn't present this as a weakness/"limitation".
-      const accountType = (matchingAccount.config as any)?.account_type;
-      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+      const accountType = (account.config as any)?.account_type;
+      if (result.posts.length === 0 && account.platform === 'linkedin' && accountType === 'personal') {
         return {
           success: true,
           organicReadUnsupported: true,
