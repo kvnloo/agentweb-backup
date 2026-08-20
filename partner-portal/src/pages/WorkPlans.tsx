@@ -61,6 +61,11 @@ interface WorkPlanStep {
   /** Media assets this step must actually produce before it can be marked
    *  completed. Enforced at run time by the session work plan's asset gate. */
   expectedAssetCount?: number;
+  inputRequest?: {
+    title: string;
+    prompt: string;
+    fields: Array<{ id: string; label: string; type: 'text' | 'url' | 'number' | 'boolean'; required?: boolean }>;
+  };
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -456,7 +461,7 @@ export default function WorkPlans() {
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
   };
 
-  const updateStep = (index: number, field: string, value: string | string[] | number | undefined) => {
+  const updateStep = (index: number, field: string, value: string | string[] | number | boolean | WorkPlanStep['inputRequest'] | undefined) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
@@ -844,6 +849,29 @@ export default function WorkPlans() {
                       }}
                       sx={{ mb: 0.5 }}
                     />
+                    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1, mb: 1 }}>
+                      <FormControlLabel
+                        control={<Switch checked={Boolean(step.inputRequest)} onChange={(e) => updateStep(i, 'inputRequest', e.target.checked ? {
+                          title: step.title || `Details for step ${i + 1}`,
+                          prompt: 'Share the details Emma needs to continue.',
+                          fields: [{ id: 'details', label: 'Details', type: 'text', required: true }],
+                        } : undefined)} />}
+                        label="Collect details from the customer before this step"
+                      />
+                      {step.inputRequest && (
+                        <Stack spacing={1} sx={{ mt: 1 }}>
+                          <TextField label="Card title" value={step.inputRequest.title} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, title: e.target.value })} size="small" fullWidth />
+                          <TextField label="What should we ask?" value={step.inputRequest.prompt} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, prompt: e.target.value })} size="small" fullWidth helperText="This appears in the chat card, not as a wall of instructions." />
+                          <TextField label="Answer label" value={step.inputRequest.fields[0]?.label || ''} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [{ ...step.inputRequest!.fields[0], id: 'details', label: e.target.value, type: step.inputRequest!.fields[0]?.type || 'text', required: true }] })} size="small" fullWidth />
+                          <FormControl size="small" fullWidth>
+                            <InputLabel>Answer type</InputLabel>
+                            <Select label="Answer type" value={step.inputRequest.fields[0]?.type || 'text'} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [{ ...step.inputRequest!.fields[0], id: 'details', label: step.inputRequest!.fields[0]?.label || 'Details', type: e.target.value as 'text' | 'url' | 'number' | 'boolean', required: true }] })}>
+                              <MenuItem value="text">Short text</MenuItem><MenuItem value="url">Link (URL)</MenuItem><MenuItem value="number">Number</MenuItem><MenuItem value="boolean">Yes / no</MenuItem>
+                            </Select>
+                          </FormControl>
+                        </Stack>
+                      )}
+                    </Box>
                     <Box component="details" sx={{ mb: 1 }}>
                       <Box component="summary" sx={{ cursor: "pointer", color: "text.secondary", fontSize: "0.8rem", mb: 1 }}>
                         Advanced agent instructions
