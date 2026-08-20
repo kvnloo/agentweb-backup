@@ -34,6 +34,7 @@ import { computeCostMicroUsd } from './usageRecorderService';
 import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
+import { WorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -226,6 +227,11 @@ export interface ChatSession {
   // write gate (checkQuestionGate) still find an earlier human answer even
   // after Emma has moved on to asking something else in the same session.
   answeredQuestions?: Record<string, PendingUserQuestion>;
+  // One channel-neutral information request emitted by the current work-plan
+  // step. It is intentionally separate from pendingUserQuestion because it
+  // carries typed values rather than an option selection; the write guard
+  // still makes the two mutually exclusive while either is awaiting.
+  pendingWorkPlanInput?: WorkPlanInputRequest;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -3109,6 +3115,68 @@ export class ChatbotDB {
         return null;
       }
       console.error("Error updating session AskUserQuestion:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Persist the typed information a work-plan step is waiting for. The same
+   * request is rendered as a chat card in the portal or as MCP elicitation;
+   * persisting the channel-neutral form lets a reconnect resume safely.
+   *
+   * There is one human-input interruption at a time across both structured
+   * interaction types. A second request must wait instead of racing to steal
+   * the user's answer slot.
+   */
+  async updateSessionWorkPlanInputRequest(
+    sessionId: string,
+    pendingWorkPlanInput: WorkPlanInputRequest | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    const guard = opts?.failIfAwaitingExists === true && pendingWorkPlanInput !== null;
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+
+    const params: any = pendingWorkPlanInput
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'SET pendingWorkPlanInput = :pendingWorkPlanInput, adminListPartition = :adminListPartition',
+          ExpressionAttributeValues: {
+            ':pendingWorkPlanInput': pendingWorkPlanInput,
+            ':adminListPartition': 'all',
+          },
+          ReturnValues: 'ALL_NEW',
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: 'REMOVE pendingWorkPlanInput',
+          ReturnValues: 'ALL_NEW',
+        };
+
+    if (guard) {
+      params.ConditionExpression = '(attribute_not_exists(pendingWorkPlanInput) OR pendingWorkPlanInput.#inputStatus <> :awaitingStatus) AND (attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#questionStatus <> :awaitingStatus)';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status', '#questionStatus': 'status' };
+      params.ExpressionAttributeValues[':awaitingStatus'] = 'awaiting';
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression = 'pendingWorkPlanInput.requestId = :requestId AND pendingWorkPlanInput.#inputStatus = :awaitingStatus';
+      params.ExpressionAttributeNames = { '#inputStatus': 'status' };
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ':requestId': requireStillAwaiting,
+        ':awaitingStatus': 'awaiting',
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      if ((guard || requireStillAwaiting) && (error as any)?.code === 'ConditionalCheckFailedException') {
+        return null;
+      }
+      console.error('Error updating session work-plan input request:', error);
       throw error;
     }
   }
