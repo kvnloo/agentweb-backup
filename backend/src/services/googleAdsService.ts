@@ -14,6 +14,10 @@ import {
   type ConversionActionDrift,
   type ConversionTagPair,
 } from '../utils/googleAdsConversionActions';
+import {
+  summarizePartialFailure,
+  type ConversionUploadFailure,
+} from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -123,6 +127,11 @@ export class GoogleAdsService {
       pages++;
     } while (pageToken && pages < MAX_PAGES);
     return all;
+  }
+
+  /** Internal passthrough for endpoints that are not `:mutate` (e.g. conversionUploads). */
+  private async callApiPublic(method: 'GET' | 'POST', path: string, accessToken: string, body?: any, loginCustomerId?: string): Promise<any> {
+    return this.callApi(method, path, accessToken, body, loginCustomerId);
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
@@ -563,6 +572,61 @@ export class GoogleAdsService {
     if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+  }
+
+  /**
+   * The account's own IANA time zone, read from Google rather than assumed.
+   *
+   * Offline conversion timestamps are interpreted in the ACCOUNT's zone. Defaulting to
+   * UTC would shift every conversion by the account's real offset — for the INR account
+   * this work was verified against, 5.5 hours — and the only symptom is conversions
+   * attributed to the wrong day, which reads as a reporting oddity rather than a bug.
+   */
+  async getAccountTimeZone(userId: string, customerId: string): Promise<string> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId, accessToken,
+      'SELECT customer.time_zone FROM customer LIMIT 1',
+      loginCustomerId,
+    );
+    const tz = rows?.[0]?.customer?.timeZone;
+    if (!tz) throw new Error('Could not read the account time zone, so a conversion timestamp cannot be placed correctly.');
+    return tz;
+  }
+
+  /**
+   * Upload offline conversions keyed on gclid (ENG-1325).
+   *
+   * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
+   * past its lookback window should upload forty-nine, not zero — an all-or-nothing batch
+   * turns one stale row into a silent gap across the whole run. The caller gets the
+   * per-row failures back so "uploaded" never quietly means "some of them".
+   *
+   * `validateOnly` exists for the same reason the drift read-back does: this runs from a
+   * background sweep with nobody watching, so being able to rehearse a batch before
+   * committing it is the difference between a caught mistake and a discovered one.
+   */
+  async uploadClickConversions(
+    userId: string,
+    customerId: string,
+    conversions: Record<string, unknown>[],
+    opts?: { validateOnly?: boolean },
+  ): Promise<{ uploaded: number; failures: ConversionUploadFailure[]; raw: any }> {
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      throw new Error('At least one conversion is required for an offline conversion upload.');
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const raw = await this.callApiPublic(
+      'POST',
+      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      accessToken,
+      { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
+      loginCustomerId,
+    );
+    const failures = summarizePartialFailure(raw);
+    // Counted from what Google accepted, not from what we sent — those differ exactly
+    // when partial failure fires, which is the case this reporting exists for.
+    return { uploaded: Math.max(0, conversions.length - failures.length), failures, raw };
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────
