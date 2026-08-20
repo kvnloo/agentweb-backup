@@ -164,4 +164,23 @@ describe('register controller — CompleteRegistration CAPI (ENG-1402)', () => {
 
     expect(res.status).toBe(201);
   });
+
+  it('does not fail registration when the CAPI send resolves success:false', async () => {
+    process.env.AGENTWEB_META_PIXEL_ID = 'pixel-123';
+    process.env.AGENTWEB_META_CAPI_ACCESS_TOKEN = 'token-abc';
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockSendCapiLeadEvent.mockResolvedValueOnce({ success: false, error: 'invalid_token' });
+
+    const app = makeApp();
+    const res = await request(app)
+      .post('/register')
+      .send({ email: 'new@user.com', password: 'ValidPass123!' });
+    await flush();
+
+    expect(res.status).toBe(201);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('CompleteRegistration CAPI send failed: invalid_token')
+    );
+    errorSpy.mockRestore();
+  });
 });

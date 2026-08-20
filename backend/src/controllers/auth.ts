@@ -35,11 +35,16 @@ async function sendCompleteRegistrationCapiEvent(eventId: string, email: string)
     return;
   }
   try {
-    await metaService.sendCapiLeadEvent(pixelId, accessToken, {
+    const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
       eventId,
       email,
       eventName: "CompleteRegistration",
     });
+    if (!result.success) {
+      console.error(
+        `[auth.register] CompleteRegistration CAPI send failed: ${result.error}`
+      );
+    }
   } catch (err) {
     console.error("[auth.register] CompleteRegistration CAPI send threw:", err);
   }
