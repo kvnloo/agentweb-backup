@@ -80,6 +80,7 @@ import {
   MAX_ATOMIC_RUN_RESULT_REMOVALS,
   SCHEDULE_ITEM_BUDGET_BYTES,
   estimateDynamoItemBytes,
+  getScheduleStorageDiagnostics,
   isDynamoItemSizeError,
   trimListToItemBudget,
 } from '../utils/dynamoItemBudget';
@@ -10886,6 +10887,33 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get test history error:', error);
       res.status(500).json({ error: 'Failed to get test history' });
+    }
+  },
+
+  // ENG-1071: read-only storage-pressure diagnosis. AGW-241 / ENG-1048 established
+  // that a schedule's item can silently drift toward DynamoDB's 400KB ceiling and
+  // fail every subsequent write with an opaque error, and that root-causing it
+  // required direct CloudWatch + DynamoDB access. This surfaces the same byte
+  // breakdown (current prompt / prompt revisions / run results) that diagnosis used,
+  // through the authenticated API, so Emma or the portal can explain it without an
+  // operator. Read-only: no field is trimmed, pruned, or written here — that stays
+  // ENG-1048's job on the update path above.
+  async getScheduledChatStorageDiagnostics(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+
+      // Verify schedule exists and belongs to user (same ownership check as every
+      // other scheduled-chat endpoint — this never accepts an operator override).
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      res.json(getScheduleStorageDiagnostics(schedule));
+    } catch (error) {
+      console.error('AgentMode: Get scheduled chat storage diagnostics error:', error);
+      res.status(500).json({ error: 'Failed to get scheduled chat storage diagnostics' });
     }
   },
 

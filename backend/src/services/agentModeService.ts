@@ -6149,6 +6149,7 @@ export class AgentModeService {
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables',
+    'get_scheduled_chat_storage_diagnostics', // ENG-1071: byte-usage breakdown when a save fails/is at risk
 
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
@@ -13096,22 +13097,70 @@ export class AgentModeService {
         return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
       }
 
-      const [engagementCount, engagementsResult] = await Promise.all([
-        crmDb.getLeadEngagementCount(listId, leadId, userId),
+      // ENG-1207: the count is fetched alongside the engagements, so a rejection
+      // there rejected BOTH -- taking down a tool whose actual payload was sitting
+      // in the other promise. It is a summary field, not the answer, and since the
+      // message no longer derives its total from it (see below), nothing the caller
+      // asked for depends on it. Degrade the summary, not the tool.
+      const [engagementCountResult, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId).catch((countError) => {
+          // Loud, not silent (CodeRabbit). The bare swallow kept the tool alive but
+          // left no trace, so a count query failing repeatedly would be invisible.
+          console.error('AgentMode getLeadEngagements: engagement count unavailable', countError);
+          return null;
+        }),
         crmDb.getLeadEngagements(listId, leadId, userId)
       ]);
+      const engagementCountAvailable = engagementCountResult !== null;
+      const engagementCount: any = engagementCountResult || {};
       const engagements = engagementsResult.engagements || [];
 
       const limitedEngagements = engagements.slice(0, effectiveLimit);
 
+      // ENG-1207: never report a truncated page as a total. `searchLeads` and
+      // `getLeads` were corrected in #2407; this tool kept saying "Found 20
+      // engagement(s)" for a lead with 143, and a model reads that as "there are
+      // 20" and stops -- the same misread that wrote 17 of 107 records and called
+      // the job done.
+      //
+      // The total is `engagements.length`, NOT `engagementCount.total`, and the
+      // distinction matters. `engagements` is the exact population being sliced,
+      // and it is complete: both of its sources paginate fully (the email-events
+      // query loops on LastEvaluatedKey and returns everything; the rest is a lead
+      // attribute). `engagementCount` is a SEPARATE query that may count a
+      // different population, which would make "20 of 143" inconsistent with the
+      // 20 rows actually returned beside it -- and it can fail independently,
+      // leaving a total that has to be omitted or invented.
+      //
+      // Counting the array we truncated keeps the two numbers describing the same
+      // thing by construction, and removes the failure mode entirely.
+      const leadLabel = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+      // A lead with neither name collapses the label to '', leaving
+      // "... engagement(s) for  — raise limit": a double space and a dangling
+      // preposition in a sentence a model parses. Trimming the whole message does
+      // not help, because the gap is in the middle. Drop the clause instead.
+      const forLead = leadLabel ? ` for ${leadLabel}` : '';
+      const truncated = engagements.length > limitedEngagements.length;
+      const engagementMessage = truncated
+        ? `Showing the first ${limitedEngagements.length} of ${engagements.length} engagement(s)${forLead} — raise limit to see more.`
+        : `Found ${limitedEngagements.length} engagement(s)${forLead}`;
+
       return {
         success: true,
-        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        message: engagementMessage,
+        // ENG-1207 (CodeRabbit): explicit null, never undefined, plus a flag when
+        // the count is unavailable. An undefined field vanishes from the serialised
+        // payload, so the model cannot tell "this lead has no engagements" from "we
+        // could not count them" -- a milder form of the very ambiguity this change
+        // exists to remove. `?? null` also normalises a partial count object.
         engagementSummary: {
-          total: engagementCount.total,
-          last7Days: engagementCount.last7Days,
-          totalAllMessages: engagementCount.totalAllMessages
+          total: engagementCount.total ?? null,
+          last7Days: engagementCount.last7Days ?? null,
+          totalAllMessages: engagementCount.totalAllMessages ?? null
         },
+        // Only when it actually failed. Stamping it unconditionally would train the
+        // model to ignore it, which is how `has_more` came to be ignored.
+        ...(engagementCountAvailable ? {} : { engagementCountUnavailable: true }),
         engagements: limitedEngagements.map((eng: any) => ({
           eventId: eng.eventId,
           eventType: eng.eventType,
@@ -32090,19 +32139,24 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      // Check if the account exists first
-      const { getAccountsByUserId } = await import('./connectedAccountsDb');
-      const allAccounts = await getAccountsByUserId(userId);
-      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
-      if (!matchingAccount) {
+      // ENG-1385: existence must be org-shared-aware (resolveAccessibleAccount),
+      // not a plain per-caller lookup — a company page list_connected_accounts
+      // reports as active can be owned by a teammate and shared with the org.
+      const resolved = await this.resolveAccessibleAccount(userId, accountId);
+      if (!resolved) {
         return {
           success: false,
           message: 'Account not found or access denied'
         };
       }
+      const { account, ownerUserId } = resolved;
 
+      // getPostsForUser does its own internal account lookup — it must be handed
+      // the account's real owner, not the caller, or it re-derives nothing for a
+      // teammate-owned account. Also matches every adapter call below needing the
+      // owner's id for token lookup/refresh, same as loadConnectedAccountMetrics.
       const { getPostsForUser } = await import('./socialPostsService');
-      const result = await getPostsForUser(userId, {
+      const result = await getPostsForUser(ownerUserId, {
         accountId,
         limit: options.limit || 10,
         includeMetrics: options.include_metrics !== false,
@@ -32139,8 +32193,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // connected and healthy), so this must NOT render as a tool "failure" in
       // the UI. The message leads with what AgentWeb DOES (positive, ownership
       // framing) so the model doesn't present this as a weakness/"limitation".
-      const accountType = (matchingAccount.config as any)?.account_type;
-      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+      const accountType = (account.config as any)?.account_type;
+      if (result.posts.length === 0 && account.platform === 'linkedin' && accountType === 'personal') {
         return {
           success: true,
           organicReadUnsupported: true,
