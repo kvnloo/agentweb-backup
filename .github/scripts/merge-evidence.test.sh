@@ -527,6 +527,64 @@ changed_files "${d}" 'backend/src/index.ts'
 run_gate "${d}"
 check 'ENG-1381: a run cancelled after the discriminator cannot pass a backend PR' 3 'VERDICT: NO_EVIDENCE'
 
+# ENG-1381, raised by CodeRabbit on #2523 and confirmed as a real defect before
+# being acted on.
+#
+# Section 7 accepts a required backend job on "did it EVER pass at this head",
+# so a job with a cancelled attempt in one suite and a success in another
+# passes — correctly, because the head SHA is immutable and a green suite at it
+# tested exactly this code. But that job then ALSO appears in the cancelled
+# list, and the first version of the PASS line claimed every name in that list
+# was "outside the evidence set". For this job that is simply false.
+#
+# The verdict was right and only the explanation was wrong, which is exactly
+# the failure this line exists to prevent: AC2 makes the gate trustworthy by
+# saying out loud what it tolerated, and a message that misdescribes what it
+# tolerated is worse than no message at all.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled","check_suite":{"id":10}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":5,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"cancelled","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a required job with a cancelled attempt AND a success still PASSes' 0 'VERDICT: PASS'
+
+# The cancelled ATTEMPT of a required job is reported as separately accounted
+# for — never as something no evidence was required from.
+run_gate "${d}"
+check 'ENG-1381: a required job cancelled-attempt is not called outside the evidence set' 0 'not a tolerated gap: Backend tests (agentMode) (cancelled)'
+
+# ...while a genuinely unrelated cancellation in the SAME payload is still
+# named as outside it. Both lines have to be able to appear at once, which is
+# why this is one fixture rather than two.
+run_gate "${d}"
+check 'ENG-1381: an unrelated cancellation is still named as outside the evidence set' 0 'none was required from these: Backend deploy to staging (after tests pass) (cancelled)'
+
+# Evidence-set membership is EXACT. Written after the first implementation used
+# jq's `inside`, which for strings matches on substring — so a job named
+# "Backend tests" was classified as a member of the set purely because
+# "Backend tests (agentMode)" contains it. Everywhere else in the gate a name
+# is matched exactly so a rename fails closed instead of being absorbed by a
+# partial match; this asserts the cancelled split obeys the same rule.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests","status":"completed","conclusion":"cancelled","check_suite":{"id":20}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a name that is only a SUBSTRING of a required job is outside the set' 0 'none was required from these: Backend tests (cancelled)'
+
+
+
 # A ready flip and a synchronize event can race and schedule two workflow runs
 # for the same head. GitHub's commit check-runs endpoint returns both suites,
 # newest first. The older run is then cancelled by workflow concurrency while

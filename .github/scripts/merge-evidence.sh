@@ -533,8 +533,19 @@ fi
 # the evidence set no longer blocks either. That is accepted deliberately, and
 # paid for by naming every tolerated cancellation in the PASS output below — a
 # silent tolerance is how a gate stops working without anyone noticing.
-classified="$(printf '%s' "${runs_json}" | jq -r '
+classified="$(printf '%s' "${runs_json}" | jq -r \
+    --arg draft "${DRAFT_JOB}" --arg backend "${BACKEND_JOBS}" '
     def bad: ["failure","neutral","timed_out","action_required","stale"];
+    # The jobs this gate can require a positive success from, so a cancelled
+    # ATTEMPT of one is described accurately rather than lumped in with the
+    # cancellations nothing was ever required from.
+    #
+    # Membership is tested with `index`, never `inside`/`contains`: for strings
+    # those match on SUBSTRING, so a job named "Backend tests" would be counted
+    # as a member because "Backend tests (agentMode)" contains it. Every other
+    # set membership in this script is exact so that a rename fails closed
+    # rather than being absorbed by a partial match, and this is no different.
+    def evset: [$draft] + ($backend | split("\n") | map(select(length > 0)));
     def known: bad + ["success","skipped","cancelled"];
     def done_: select(.status == "completed");
     def unknown_: done_ | select(.conclusion as $c | known | index($c) | not);
@@ -549,6 +560,10 @@ classified="$(printf '%s' "${runs_json}" | jq -r '
       ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", ")),
       ([ .check_runs[] | unknown_ | "\(.name) (\(.conclusion // "null"))" ] | join(", ")),
       ([ .check_runs[] | done_ | select(.conclusion == "cancelled")
+         | select(.name as $n | evset | index($n) == null)
+         | "\(.name) (\(.conclusion))" ] | join(", ")),
+      ([ .check_runs[] | done_ | select(.conclusion == "cancelled")
+         | select(.name as $n | evset | index($n) != null)
          | "\(.name) (\(.conclusion))" ] | join(", "))
     ] | map(tostring) | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
@@ -560,7 +575,7 @@ fi
 
 IFS="${SEP}" read -r n_pending n_bad n_success n_unknown n_cancelled \
   pending_names bad_names skipped_names success_names unknown_names \
-  cancelled_names <<<"${classified}"
+  cancelled_outside cancelled_inset <<<"${classified}"
 
 # ---------------------------------------------------------------------------
 # 5. Was this a draft-time run?
@@ -913,7 +928,21 @@ fi
 # recurring, that is a signal about the job, not noise to filter: it is how the
 # global backend-staging-deploy lane (ENG-1003) stayed latent long enough to
 # force the override on #2491.
+#
+# Split in two, after CodeRabbit caught the single-line version asserting
+# something false on #2523. Section 7 accepts a required job on "did it EVER
+# pass at this head", so a job with a cancelled attempt AND a success reaches
+# this point legitimately — and calling it "outside the evidence set", as the
+# first version did, misdescribes the one thing this line exists to state
+# accurately. The verdict was right; only the explanation was wrong, which is
+# the more dangerous half to get wrong in a control people read to decide
+# whether to trust a green.
 if [ "${n_cancelled}" -gt 0 ]; then
-  log "cancelled, NOT blocking — no verdict was produced and none was required from these (ENG-1381); they are outside the evidence set ('${DRAFT_JOB}' + MERGE_EVIDENCE_BACKEND_JOBS), each of which is separately required to carry a success above: ${cancelled_names}"
+  if [ -n "${cancelled_outside}" ]; then
+    log "cancelled, NOT blocking — no verdict was produced and none was required from these: ${cancelled_outside}"
+  fi
+  if [ -n "${cancelled_inset}" ]; then
+    log "cancelled ATTEMPT(s) of job(s) INSIDE the evidence set ('${DRAFT_JOB}' + MERGE_EVIDENCE_BACKEND_JOBS). The requirement on each is separately accounted for above — either a success at this head, or a path filter that made it inapplicable — so this is a spent attempt, not a tolerated gap: ${cancelled_inset}"
+  fi
 fi
 exit 0
