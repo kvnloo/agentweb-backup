@@ -95,7 +95,10 @@ export function evaluateBudgetVariance(input: BudgetVarianceInput): HealthFlag {
   ) {
     return { flagged: false, reason: 'budget inputs are not finite numbers — cannot evaluate variance' };
   }
-  if (input.configuredCapCents <= 0) {
+  if (input.configuredCapCents < 0 || input.actualSpendCents < 0 || thresholdPct < 0) {
+    return { flagged: false, reason: 'budget inputs contain a negative value — cannot evaluate variance' };
+  }
+  if (input.configuredCapCents === 0) {
     return { flagged: false, reason: 'no cap configured for this account' };
   }
   const overagePct = ((input.actualSpendCents - input.configuredCapCents) / input.configuredCapCents) * 100;

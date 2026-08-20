@@ -94,6 +94,34 @@ describe('evaluateBudgetVariance', () => {
     const result2 = evaluateBudgetVariance({ configuredCapCents: 1000_00, actualSpendCents: NaN });
     expect(result2.flagged).toBe(false);
     expect(result2.reason).toMatch(/not finite/i);
+
+    const result3 = evaluateBudgetVariance({
+      configuredCapCents: 1000_00,
+      actualSpendCents: 500_00,
+      thresholdPct: Infinity,
+    });
+    expect(result3.flagged).toBe(false);
+    expect(result3.reason).toMatch(/not finite/i);
+  });
+
+  it('does not flag negative budget inputs — reports a data gap instead of a false positive', () => {
+    const negativeCap = evaluateBudgetVariance({ configuredCapCents: -100_00, actualSpendCents: 500_00 });
+    expect(negativeCap.flagged).toBe(false);
+    expect(negativeCap.reason).toMatch(/negative/i);
+
+    const negativeSpend = evaluateBudgetVariance({ configuredCapCents: 1000_00, actualSpendCents: -1 });
+    expect(negativeSpend.flagged).toBe(false);
+    expect(negativeSpend.reason).toMatch(/negative/i);
+
+    // Spend exactly at the cap (0% over) must not be flagged by a negative threshold's
+    // inverted comparison (0 > -1 is true).
+    const negativeThreshold = evaluateBudgetVariance({
+      configuredCapCents: 1000_00,
+      actualSpendCents: 1000_00,
+      thresholdPct: -1,
+    });
+    expect(negativeThreshold.flagged).toBe(false);
+    expect(negativeThreshold.reason).toMatch(/negative/i);
   });
 });
 
