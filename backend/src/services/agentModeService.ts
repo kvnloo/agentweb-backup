@@ -7188,6 +7188,33 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1207: pagination markers survive minimization, for EVERY tool.
+    //
+    // The default branch returned {}, which is right for storage and wrong for the
+    // one consumer that reads this ledger to decide whether a run finished on an
+    // unread page (`reconcileUnconsumedCursors`, at the finalize seam). With the
+    // cursor stripped it saw {} for every call and never fired — the feature was
+    // inert in production while its unit tests passed, because those tests built
+    // ledger entries by hand with un-minimized results and so never crossed this
+    // function. Found by live verification, not by the suite.
+    //
+    // Deliberately GENERIC rather than a list of tool names: a tool that paginates
+    // is describable by its response, and a future one must not have to be
+    // remembered here to be covered.
+    //
+    // Proportionate to the purpose of this function — a cursor string and a boolean,
+    // never the rows. The heavy payload is still dropped.
+    const paginationMarkers: Record<string, unknown> = {};
+    if (result && typeof result === 'object') {
+      for (const key of ['next_cursor', 'nextCursor', 'has_more', 'hasMore']) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === 'string' ? value.trim() : typeof value === 'boolean') {
+          paginationMarkers[key] = value;
+        }
+      }
+    }
+    if (Object.keys(paginationMarkers).length > 0) return paginationMarkers;
+
     // For other tools, return empty object to minimize storage
     return {};
   }
