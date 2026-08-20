@@ -787,10 +787,39 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
             }
 
+            // ENG-1292: no channel binding — fall back to the mentioning Slack
+            // user's own verified identity instead of failing outright. Only
+            // an exact match on Slack's verified profile email resolves a
+            // user (never a fuzzy/partial match), so a Slack user with no
+            // matching AgentWeb account can never resolve to someone else's
+            // account (no cross-tenant leak). Deliberately NOT cached as a
+            // channel mapping: an internal channel can have several different
+            // AgentWeb users mention Emma, and caching the first one would
+            // silently misroute everyone else who mentions Emma there.
+            let requesterEmail: string | null = null;
             if (!user) {
+              requesterEmail = await getSlackUserEmail(slackUserId);
+              if (requesterEmail) {
+                const identityUser = await userDb.getUserByEmail(requesterEmail);
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                  user = identityUser;
+                  console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
+                }
+              }
+            }
+
+            if (!user) {
+              const remedy = 'An AgentWeb admin or the account owner can link it by posting ' +
+                '`@Emma for user <their-agentweb-email> link this channel` in this channel.';
+              const text = requesterEmail
+                ? `❌ Sorry, this channel isn't linked to an AgentWeb account, and there's no AgentWeb user with the email ${requesterEmail}. ${remedy}`
+                : `❌ Sorry, this channel isn't linked to an AgentWeb account, and I couldn't verify a Slack email for you to match one. ${remedy}`;
               await slackClient.chat.postMessage({
                 channel,
-                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+                text,
                 thread_ts: ts
               });
               return;

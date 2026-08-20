@@ -462,9 +462,115 @@ export async function clearDisconnectFlag(viewerUserId: string, accountId: strin
     // Resuming unconditionally is safe because the resume itself is narrow — paused
     // AND `pausedReason: 'linkedin_disconnected'` AND pinning this account — and
     // idempotent, so a call for an account that was never disconnected does nothing.
+    //
+    // Repoint first (ENG-1366): a reconnect mints a brand-new account_id — the old
+    // one is never reused — so any schedule that hardcoded the old id would still
+    // fail to match `account.accountId` below unless its text is corrected first.
+    await repointStaleAccountReferences(ownerUserId, account.accountId);
     await resumeSchedulesPausedForAccount(ownerUserId, account.accountId);
   } catch (error) {
     console.error(`${TAG} Failed to clear disconnect flag for ${accountId}:`, error);
+  }
+}
+
+/**
+ * Rewrite any other schedule of this user's that hardcodes a now-stale Unipile
+ * account_id, so it points at the account that just reconnected (ENG-1366).
+ *
+ * `createAccount` matches on `platform === 'unipile' && account_id === input.account_id`
+ * to decide update-vs-append (`connectedAccountsDb.ts`) — a genuinely new id from a
+ * reconnect always misses that match, so the new row is appended and the old,
+ * now-dead row is left in place. Nothing else in the backend ever rewrites a
+ * schedule's `startingMessage` (confirmed by searching every call site), so a
+ * schedule that hardcoded the old id stays orphaned forever otherwise: the
+ * account-gate blocks the run before the model is invoked, and even
+ * `resumeSchedulesPausedForAccount` can't find it, because both match on literal
+ * substrings of `startingMessage` and the text still names an id nobody uses
+ * anymore.
+ *
+ * Scoped to `ownerUserId`'s own schedules only, never cross-user. Literal
+ * substring replace, same technique as a manual fix, so surrounding prompt text
+ * is preserved exactly and every occurrence (a prompt can repeat the id several
+ * times) is caught in one pass. Fails open like its sibling above — a repoint
+ * failure must never break the reconnect response, since the account itself is
+ * already saved by the time this runs.
+ *
+ * Two safety properties a blind text rewrite needs that a hand-written one gets
+ * for free:
+ *
+ * 1. The rewrite has no understanding of context — if a prompt ever narrated an
+ *    old account ("we tried X, it failed") rather than directing live use of it,
+ *    the swap could read strangely afterward. Detecting that distinction
+ *    reliably isn't practical without semantic understanding, and a fragile
+ *    heuristic risks silently under-fixing the genuine case this exists for. So
+ *    instead of guessing, every rewrite snapshots the PRE-repoint text into
+ *    `promptRevisions` first — the exact mechanism the customer's own manual
+ *    edit already uses (`agentModeController.ts`'s `updateScheduledChat`) — so
+ *    an unwanted rewrite is always visible and reversible, never silently lost.
+ * 2. Two near-simultaneous reconnects for the same user (or a human editing the
+ *    schedule at that exact moment) could both read the same stale text before
+ *    either writes. Without a check, the second write would silently clobber
+ *    whatever the first one produced. `updateSchedule`'s `expect` parameter
+ *    makes the write conditional on `startingMessage` still being exactly what
+ *    was just read — the loser gets `ConditionalCheckFailedException` instead
+ *    of a lost update, and is treated as a no-op: the writer that won already
+ *    left correct state, and a schedule that's still stale gets another chance
+ *    on the next reconnect or gate evaluation either way.
+ */
+const REPOINT_REVISION_LIMIT = 10;
+
+export async function repointStaleAccountReferences(
+  ownerUserId: string,
+  newAccountId: string,
+): Promise<number> {
+  try {
+    const accounts = (await getAccountsByUserId(ownerUserId)) as any[];
+    const staleIds = accounts
+      .filter((a) => a.platform === 'unipile' && a.account_id !== newAccountId && a.config?.needs_reconnect)
+      .map((a) => a.account_id as string);
+    if (staleIds.length === 0) return 0;
+
+    const { scheduleDb } = await import('./db');
+    const schedules = (await scheduleDb.getSchedulesByUserId(ownerUserId)) || [];
+    let repointed = 0;
+    for (const s of schedules as any[]) {
+      const original = String(s?.startingMessage || '');
+      let updated = original;
+      for (const oldId of staleIds) {
+        if (updated.includes(oldId)) updated = updated.split(oldId).join(newAccountId);
+      }
+      if (updated === original) continue;
+
+      const existingRevisions = Array.isArray(s?.promptRevisions) ? s.promptRevisions : [];
+      const nextRevisions = [
+        ...existingRevisions,
+        { startingMessage: original, updatedAt: new Date().toISOString() },
+      ].slice(-REPOINT_REVISION_LIMIT);
+
+      try {
+        await scheduleDb.updateSchedule(
+          s.scheduleId,
+          {
+            startingMessage: updated,
+            promptRevisions: nextRevisions,
+            updatedAt: new Date().toISOString(),
+          } as any,
+          { startingMessage: original },
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException') {
+          console.log(`${TAG} repoint for schedule ${s.scheduleId} lost a concurrent write, skipping`);
+          continue;
+        }
+        throw writeError;
+      }
+      repointed += 1;
+      console.log(`${TAG} repointed schedule ${s.scheduleId} from stale account(s) to ${newAccountId}`);
+    }
+    return repointed;
+  } catch (error) {
+    console.error(`${TAG} Failed to repoint stale account references to ${newAccountId}:`, error);
+    return 0;
   }
 }
 

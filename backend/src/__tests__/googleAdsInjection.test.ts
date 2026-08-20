@@ -258,3 +258,70 @@ describe('conversionId is untrusted input spliced into generated source (CodeRab
     expect(injectGoogleAdsIntoLayout(installed, '')).not.toContain('Google Ads Tag');
   });
 });
+
+describe('a tag we did not install is still a tag (ENG-1328 e2e finding)', () => {
+  // Found by probing the real ENG-1182 lander before running the e2e. Its layout carries
+  // a hand-written gtag under the comment "{/* Google tag (gtag.js) … */}" — not our
+  // delimiter — so every check we had returned false and injection ADDED a second block.
+  //
+  // Same id: two gtag/js loaders on one page.
+  // Different id: TWO DISTINCT AW ids firing from one page — the ENG-910 double-count
+  // this guard exists to prevent, walked straight past because the guard only ever
+  // looked for its own handiwork.
+  const FOREIGN = LAYOUT_WITH_HEAD.replace(
+    '<title>Test</title>',
+    `<title>Test</title>
+        {/* Google tag (gtag.js) — hand-installed by the customer */}
+        <script async src="https://www.googletagmanager.com/gtag/js?id=AW-11112222333" />
+        <script dangerouslySetInnerHTML={{ __html: \`gtag('config', 'AW-11112222333');\` }} />`,
+  );
+
+  it('refuses to add a DIFFERENT id alongside one already on the page', () => {
+    expect(injectGoogleAdsIntoLayout(FOREIGN, AW)).toBe(FOREIGN);
+  });
+
+  it('never lets two distinct AW ids end up in one layout', () => {
+    const out = injectGoogleAdsIntoLayout(FOREIGN, AW);
+    expect([...new Set(out.match(/AW-[0-9]+/g) || [])]).toEqual(['AW-11112222333']);
+  });
+
+  it('reports not-installed for that refusal, so nothing claims success', () => {
+    expect(verifyGoogleAdsInjection(injectGoogleAdsIntoLayout(FOREIGN, AW), AW)).toBe(false);
+  });
+
+  it('treats a hand-written tag carrying OUR id as already installed', () => {
+    // The page is genuinely measurable with the right id. Refusing here would report
+    // not-installed for a tracked page and have RULE 7.5 block a launch that is fine.
+    const ours = LAYOUT_WITH_HEAD.replace(
+      '<title>Test</title>',
+      `<title>Test</title>
+        <script async src="https://www.googletagmanager.com/gtag/js?id=${AW}" />
+        <script dangerouslySetInnerHTML={{ __html: \`gtag('config', '${AW}');\` }} />`,
+    );
+    expect(injectGoogleAdsIntoLayout(ours, AW)).toBe(ours);
+    expect(verifyGoogleAdsInjection(ours, AW)).toBe(true);
+  });
+
+  it('does not duplicate the loader when our id is already hand-written', () => {
+    const ours = LAYOUT_WITH_HEAD.replace(
+      '<title>Test</title>',
+      `<title>Test</title>
+        <script async src="https://www.googletagmanager.com/gtag/js?id=${AW}" />
+        <script dangerouslySetInnerHTML={{ __html: \`gtag('config', '${AW}');\` }} />`,
+    );
+    const out = injectGoogleAdsIntoLayout(ours, AW);
+    expect((out.match(/gtag\/js\?id=/g) || []).length).toBe(1);
+  });
+
+  it('still lets removal clear OUR block even when a foreign tag is present', () => {
+    // Removal must stay possible; we just must not touch markup we did not write.
+    const mixed = injectGoogleAdsIntoLayout(LAYOUT_WITH_HEAD, AW).replace(
+      '<title>Test</title>',
+      `<title>Test</title>
+        <script async src="https://www.googletagmanager.com/gtag/js?id=AW-11112222333" />`,
+    );
+    const out = injectGoogleAdsIntoLayout(mixed, '');
+    expect(out).not.toContain('Google Ads Tag');
+    expect(out).toContain('AW-11112222333');
+  });
+});

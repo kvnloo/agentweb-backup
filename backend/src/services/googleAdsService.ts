@@ -14,6 +14,10 @@ import {
   type ConversionActionDrift,
   type ConversionTagPair,
 } from '../utils/googleAdsConversionActions';
+import {
+  summarizePartialFailure,
+  type ConversionUploadFailure,
+} from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -123,6 +127,11 @@ export class GoogleAdsService {
       pages++;
     } while (pageToken && pages < MAX_PAGES);
     return all;
+  }
+
+  /** Internal passthrough for endpoints that are not `:mutate` (e.g. conversionUploads). */
+  private async callApiPublic(method: 'GET' | 'POST', path: string, accessToken: string, body?: any, loginCustomerId?: string): Promise<any> {
+    return this.callApi(method, path, accessToken, body, loginCustomerId);
   }
 
   async mutate(customerId: string, accessToken: string, resource: string, operations: any[], loginCustomerId?: string): Promise<any> {
@@ -506,15 +515,15 @@ export class GoogleAdsService {
     if (params.name !== undefined) { update.name = params.name; updateMask.push('name'); requested.name = params.name; }
     if (params.status !== undefined) {
       const status = assertConversionActionStatus(params.status);
-      // REMOVE is refused as an operation (ENG-1329: it severs historical attribution and
-      // cannot be undone). status=REMOVED does exactly the same thing by another route, so
-      // allowing it here would refuse the front door and leave the window open.
+      // status=REMOVED reaches the same end as the REMOVE operation, and REMOVE carries the
+      // confirmation gate. Route it there rather than letting UPDATE be an unconfirmed
+      // back door to the same irreversible change.
       if (status === 'REMOVED') {
         throw new Error(
-          'Setting status=REMOVED retires the conversion action permanently and severs its '
-          + 'historical attribution — the same irreversible outcome as REMOVE, which this tool '
-          + 'deliberately does not support. Use status=HIDDEN to stop it counting toward goals '
-          + 'while keeping its history.',
+          'To stop a conversion action recording, use CONVERSION_ACTION REMOVE with '
+          + 'confirm_conversion_action_removal=true rather than UPDATE status=REMOVED — the '
+          + 'change is permanent and cannot be re-enabled, so it goes through the confirmation '
+          + 'step. Conversions already recorded stay in your reports either way.',
         );
       }
       update.status = status; updateMask.push('status'); requested.status = status;
@@ -543,6 +552,61 @@ export class GoogleAdsService {
 
     const stored = await this.getConversionActionByResourceName(customerId, accessToken, resourceName, loginCustomerId);
     return { resourceName, stored, drift: diffConversionAction(requested, stored || {}) };
+  }
+
+  /**
+   * Retire a conversion action. Google models this as a soft state, not a delete: the
+   * action stops recording, and conversions it already recorded stay in reporting — the
+   * same way a REMOVED campaign still returns its historical metrics.
+   *
+   * Scope note: ENG-1329 deferred this, on the stated basis that removal "severs historical
+   * attribution". The end-to-end run showed that premise is only half right — it cannot be
+   * undone, but nothing already attributed is lost — and that HIDDEN, the alternative every
+   * earlier message recommended, cannot be set through the API at all. That left no working
+   * retire path, which is the "if REMOVE is needed later" case that decision anticipated.
+   *
+   * The caller-facing confirmation lives in the handler, not here, so this stays a plain
+   * service method like removeBudget/removeCampaign.
+   */
+  async removeConversionAction(userId: string, customerId: string, resourceName: string): Promise<void> {
+    if (!resourceName) throw new Error('conversion_action_resource_name is required for CONVERSION_ACTION REMOVE.');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'conversionActions', [{ remove: resourceName }], loginCustomerId);
+  }
+
+  /**
+   * Upload offline conversions keyed on gclid (ENG-1325).
+   *
+   * `partialFailure` is on deliberately. A sweep of fifty leads where one click has aged
+   * past its lookback window should upload forty-nine, not zero — an all-or-nothing batch
+   * turns one stale row into a silent gap across the whole run. The caller gets the
+   * per-row failures back so "uploaded" never quietly means "some of them".
+   *
+   * `validateOnly` exists for the same reason the drift read-back does: this runs from a
+   * background sweep with nobody watching, so being able to rehearse a batch before
+   * committing it is the difference between a caught mistake and a discovered one.
+   */
+  async uploadClickConversions(
+    userId: string,
+    customerId: string,
+    conversions: Record<string, unknown>[],
+    opts?: { validateOnly?: boolean },
+  ): Promise<{ uploaded: number; failures: ConversionUploadFailure[]; raw: any }> {
+    if (!Array.isArray(conversions) || conversions.length === 0) {
+      throw new Error('At least one conversion is required for an offline conversion upload.');
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const raw = await this.callApiPublic(
+      'POST',
+      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      accessToken,
+      { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
+      loginCustomerId,
+    );
+    const failures = summarizePartialFailure(raw);
+    // Counted from what Google accepted, not from what we sent — those differ exactly
+    // when partial failure fires, which is the case this reporting exists for.
+    return { uploaded: Math.max(0, conversions.length - failures.length), failures, raw };
   }
 
   // ── Portfolio (shared) bidding strategies ─────────────────────────────────
