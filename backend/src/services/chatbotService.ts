@@ -210,6 +210,7 @@ export interface ChatSession {
       // step (e.g. "Generate 3 Images Per Hook — 18 total") from being marked done with
       // only a fraction generated (the xCures incident). Unset = no asset-count gate.
       expectedAssetCount?: number;
+      inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
     }>;
     createdAt: string;
     updatedAt: string;
@@ -3201,6 +3202,7 @@ export class ChatbotDB {
         requiredFunctionCalls?: string[];
         skillIds?: string[];
         expectedAssetCount?: number;
+        inputRequest?: import('./agentMode/core/workPlanInputRequest').WorkPlanInputRequestInput;
       }>;
       createdAt: string;
       updatedAt: string;

@@ -8,6 +8,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
@@ -30620,6 +30621,25 @@ ${strippedHtml}`;
         workPlan.updatedAt = new Date().toISOString();
         // Update the session (will throw error if stepCount is not sequential)
         await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+        // A configured input belongs to the step that just became active, not
+        // to a particular portal. Persist the same request the customer portal
+        // renders and an MCP client elicits natively. Answered historical
+        // requests may be replaced; a concurrent live request never is.
+        const nextInputStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending' && s.inputRequest);
+        if (nextInputStep?.inputRequest) {
+          await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...nextInputStep.inputRequest,
+              requestId: uuidv4(),
+              stepCount: nextInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+        }
 
         // Update function counts if they were modified
         if (countsModified) {
