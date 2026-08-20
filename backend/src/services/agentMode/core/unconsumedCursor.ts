@@ -95,7 +95,16 @@ function rowsFrom(result: unknown): number {
   // — they are only present when a caller passes an un-minimized result, which is
   // what every unit test did before production disagreed with them.
   const preserved = (result as Record<string, unknown>).rowCount;
-  if (typeof preserved === 'number' && Number.isFinite(preserved)) return preserved;
+  // Non-negative INTEGER, not merely finite (CodeRabbit, #2520). `Number.isFinite`
+  // accepts -1 and 1.5, either of which would print as a row count — "returned 1.5
+  // row(s)". Today `rowCount` is only ever written here from `array.length`, so the
+  // guard is defensive rather than load-bearing; it is present because every other
+  // input to this module is validated the same way (a non-string cursor is refused,
+  // an unnamed entry is skipped), and a lone unchecked field is how the next reader
+  // learns the wrong lesson. An invalid value falls through to the array below.
+  if (typeof preserved === 'number' && Number.isInteger(preserved) && preserved >= 0) {
+    return preserved;
+  }
   for (const key of ROW_KEYS) {
     const value = (result as Record<string, unknown>)[key];
     if (Array.isArray(value)) return value.length;
