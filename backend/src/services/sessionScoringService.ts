@@ -204,6 +204,7 @@ export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
 IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
 - If the conversation transcript contains a tool result reporting that a publish tool was blocked because "Require approval before publishing" is turned on, or because "this is an account-level setting on the schedule", that restriction is REAL. It is an owner-configured account/schedule setting, not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
+- Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
 - Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
 
 /**
