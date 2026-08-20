@@ -398,6 +398,28 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       ownPreviousWebhookId,
     );
 
+    // ENG-1403: carry the customer's own CHOICES forward across a reconnect.
+    //
+    // This object used to be built purely from the OAuth response, so every reconnect
+    // silently destroyed four settings. The worst was `attributionDisabled`: a customer who
+    // had explicitly opted OUT of Meta tracking was opted back IN without being asked, and
+    // we resumed sending their booking conversions. That is a real, shipped control —
+    // `connectedAccounts.ts` sets it and `calendlyWebhook.ts` honours it — so losing it
+    // reverses a decision the customer actually made.
+    //
+    // ⚠ AN ALLOWLIST, DELIBERATELY NOT `...prior`. A blanket spread of the previous config
+    // would resurrect the dead `access_token`/`refresh_token` this reconnect exists to
+    // replace, and an orphaned `webhook_id` that no longer exists on Calendly's side —
+    // turning a settings bug into a credentials bug. Name every field that may survive.
+    //
+    // ⚠ `attributionDisabled` is checked with `!== undefined`, NOT truthiness: `false` is a
+    // real value meaning "explicitly opted back in", and a truthy check would silently
+    // forget it.
+    //
+    // Scoped to THIS Calendly identity only — `existingAccount` is matched on
+    // `profile.user_uri` above, so another connection's settings can never leak in.
+    const prior = existingAccount?.config as CalendlyConfig | undefined;
+
     const config_: CalendlyConfig = {
       account_type: 'calendly',
       email: profile.email,
@@ -409,6 +431,12 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       organization_uri: profile.organization_uri!,
       booking_tracking_active: bookingTrackingActive,
       ...(bookingTrackingActive ? { webhook_id: webhookId, webhook_signing_key: webhookSigningKey } : {}),
+      // Preserved customer choices — spread conditionally so a first-time connection writes
+      // no key at all rather than an explicit `undefined`.
+      ...(prior?.attributionPixelId !== undefined ? { attributionPixelId: prior.attributionPixelId } : {}),
+      ...(prior?.attributionAccountId !== undefined ? { attributionAccountId: prior.attributionAccountId } : {}),
+      ...(prior?.booking_lead_list_id !== undefined ? { booking_lead_list_id: prior.booking_lead_list_id } : {}),
+      ...(prior?.attributionDisabled !== undefined ? { attributionDisabled: prior.attributionDisabled } : {}),
     };
 
     let account;
