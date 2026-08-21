@@ -60,6 +60,8 @@ jobs:
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
+      relay: ${{ steps.filter.outputs.relay }}
+      remotion: ${{ steps.filter.outputs.remotion }}
       # ENG-1041: "should this be tested" and "should this reach staging" are
       # different questions and were one boolean. See the filter step below.
       backend_deployable: ${{ steps.filter_deploy.outputs.backend_src == 'true' || steps.filter_deploy.outputs.deploy_ci == 'true' }}
@@ -106,6 +108,19 @@ jobs:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
+            # ENG-1377: three projects in this repo had no CI of any kind. Not
+            # dormant ones — measured over the six months to 2026-08-21,
+            # agent-engine took 52 commits (last 5 days ago),
+            # local-agent-relay 10 and remotion-lambda 10. local-agent-relay
+            # ships a 35-test unittest suite that nothing had ever run.
+            # Each filter includes this workflow for the ENG-743 reason: what
+            # gates a project's merges has to gate its own changes.
+            relay:
+              - 'local-agent-relay/**'
+              - '.github/workflows/tests.yml'
+            remotion:
+              - 'remotion-lambda/**'
+              - '.github/workflows/tests.yml'
             # ENG-1039: the EB config-conflict job classifies only
             # `.platform/*` and `.ebextensions/*.config` paths (see
             # eb-config-conflict.sh), yet it ran on every PR — 397 runs /
@@ -617,6 +632,104 @@ jobs:
       # corpus: 4 caught before, 12 now, no false positives either side.
       - name: Run pipefail hygiene suite
         run: bash .github/scripts/pipefail-hygiene.test.sh
+
+  # ENG-1377: local-agent-relay ships a 35-test unittest suite that nothing in
+  # this repo had ever run. It is plain `unittest` — no pytest, no plugins — so
+  # the only thing standing between it and CI was a job to call it.
+  #
+  # `tests/` has no `__init__.py`, so discovery needs `-t tests` as the
+  # top-level dir; `-t .` fails with "Start directory is not importable". The
+  # package itself is imported from `src/` via PYTHONPATH rather than an
+  # editable install, which keeps this job to one dependency.
+  #
+  # That one dependency is playwright, and only the Python module: browser.py
+  # imports it at module scope and tests/test_browser.py patches
+  # `playwright.sync_api.sync_playwright`, so `patch` has to be able to resolve
+  # the name. No `playwright install` — no browser binaries are launched, and
+  # downloading ~400MB of Chromium to satisfy a mock would be absurd.
+  relay-tests:
+    name: Local agent relay tests
+    needs: detect-changes
+    if: needs.detect-changes.outputs.relay == 'true'
+    # ubuntu-latest, not the ubuntu-slim used by ci-scripts-tests. slim is very
+    # likely fine for this and would be cheaper, but nothing here has run a
+    # setup-python/setup-node toolchain install on it yet, and a runner image
+    # guess that turns out wrong makes the job red on arrival. Worth trying
+    # once these two have a baseline of green runs to compare against.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-relay-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      # pyproject.toml declares `requires-python = ">=3.11"`. Pinned rather than
+      # floating so a new default runner Python cannot silently change what this
+      # suite runs against.
+      - name: Install test dependencies
+        working-directory: local-agent-relay
+        run: python -m pip install --disable-pip-version-check 'playwright>=1.45'
+
+      - name: Run tests
+        working-directory: local-agent-relay
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -t tests -p 'test_*.py' -v
+
+  # ENG-1377: remotion-lambda had no CI either, and its own `npm run build`
+  # (`npx tsc`) was ALREADY FAILING when this job was written — a real type
+  # error in src/Root.tsx that had been sitting on main. That is the argument
+  # for this job in one line: nothing was checking, so it broke and stayed
+  # broken. The fix ships in the same commit; see BrandedVideo.tsx.
+  #
+  # There are no tests here to run, so the typecheck IS the test. It is not a
+  # weaker check than `npm run build` — it is the same `tsc` invocation with
+  # --noEmit, so it reports the identical diagnostics without writing dist/.
+  remotion-tests:
+    name: Remotion lambda typecheck
+    needs: detect-changes
+    if: needs.detect-changes.outputs.remotion == 'true'
+    # ubuntu-latest, not the ubuntu-slim used by ci-scripts-tests. slim is very
+    # likely fine for this and would be cheaper, but nothing here has run a
+    # setup-python/setup-node toolchain install on it yet, and a runner image
+    # guess that turns out wrong makes the job red on arrival. Worth trying
+    # once these two have a baseline of green runs to compare against.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-remotion-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: 'npm'
+          cache-dependency-path: remotion-lambda/package-lock.json
+
+      # `npm ci`, which needs a lockfile — this project had none, so its pinned
+      # dependency versions were only pinned in package.json and everything
+      # transitive floated. The lockfile is committed in this same change.
+      - name: Install dependencies
+        working-directory: remotion-lambda
+        run: npm ci
+
+      - name: Type-check
+        working-directory: remotion-lambda
+        run: npx tsc --noEmit
 
   # ENG-836: prod deploys immutable, which forbids changing resource config and
   # instance config in one operation. PR #2237 did exactly that, EB accepted the

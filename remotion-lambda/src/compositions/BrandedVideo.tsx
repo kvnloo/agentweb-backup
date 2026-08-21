@@ -10,7 +10,7 @@ import {
   Easing,
 } from "remotion";
 
-export interface BrandedVideoProps {
+export type BrandedVideoProps = {
   /** S3 URL of the first (or only) raw AI-generated video clip */
   clipUrl: string;
   /** Additional clip URLs to concatenate after clipUrl (for >8s videos) */
@@ -42,7 +42,7 @@ export interface BrandedVideoProps {
   audioUrl?: string;
   /** Volume for the voiceover track (0.0–1.0, default: 1.0) */
   audioVolume?: number;
-}
+};
 
 /** Animated lower-third headline shown at the start */
 const IntroOverlay: React.FC<{
