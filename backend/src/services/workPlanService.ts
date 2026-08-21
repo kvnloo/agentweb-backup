@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { buildWorkPlanInputRequest, type WorkPlanInputField } from './agentMode/core/workPlanInputRequest';
 
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -42,6 +43,7 @@ export interface WorkPlanStep {
    *  setWorkPlanStatus. Set this on multi-image steps (e.g. "Generate 18 images") so
    *  the step cannot be closed with only a fraction generated. */
   expectedAssetCount?: number;
+  inputRequest?: { title: string; prompt: string; fields: WorkPlanInputField[] };
 }
 
 export interface WorkPlan {
@@ -114,14 +116,16 @@ export class WorkPlanService {
   private validateSteps(steps: WorkPlanStep[] | undefined): void {
     if (!steps) return;
     steps.forEach((step, idx) => {
-      if (step.userInstructions === undefined || step.userInstructions === null) return;
-      if (typeof step.userInstructions !== 'string') {
+      if (step.userInstructions !== undefined && step.userInstructions !== null && typeof step.userInstructions !== 'string') {
         throw new Error(`step ${idx + 1}: userInstructions must be a string`);
       }
-      if (step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
+      if (typeof step.userInstructions === 'string' && step.userInstructions.length > USER_INSTRUCTIONS_MAX_LENGTH) {
         throw new Error(
           `step ${idx + 1}: userInstructions exceeds ${USER_INSTRUCTIONS_MAX_LENGTH} characters (got ${step.userInstructions.length})`,
         );
+      }
+      if (step.inputRequest !== undefined) {
+        buildWorkPlanInputRequest({ requestId: `validation-step-${idx + 1}`, stepCount: idx + 1, ...step.inputRequest, createdAt: '1970-01-01T00:00:00.000Z' });
       }
     });
   }

@@ -44,6 +44,11 @@ import {
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
+import WorkPlanInputEditor from "../components/WorkPlanInputEditor";
+import {
+  type EditableWorkPlanInputRequest,
+  validateEditableInputRequest,
+} from "../components/workPlanInputSchema";
 
 /** Backend-enforced cap. Keep in sync with USER_INSTRUCTIONS_MAX_LENGTH in
  *  backend/src/services/workPlanService.ts. */
@@ -61,6 +66,7 @@ interface WorkPlanStep {
   /** Media assets this step must actually produce before it can be marked
    *  completed. Enforced at run time by the session work plan's asset gate. */
   expectedAssetCount?: number;
+  inputRequest?: EditableWorkPlanInputRequest;
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -456,7 +462,7 @@ export default function WorkPlans() {
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
   };
 
-  const updateStep = (index: number, field: string, value: string | string[] | number | undefined) => {
+  const updateStep = (index: number, field: string, value: string | string[] | number | boolean | WorkPlanStep['inputRequest'] | undefined) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
@@ -482,6 +488,10 @@ export default function WorkPlans() {
       setError("Failed to update visibility");
     }
   };
+
+  const inputRequestErrors = steps.flatMap((step) => (
+    step.inputRequest ? validateEditableInputRequest(step.inputRequest) : []
+  ));
 
   if (loading) {
     return (
@@ -798,7 +808,10 @@ export default function WorkPlans() {
 
             <Box>
               <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
-                <Typography variant="subtitle2">Steps</Typography>
+                <Box>
+                  <Typography variant="subtitle2">Customer journey</Typography>
+                  <Typography variant="caption" color="text.secondary">Write what the customer sees first. Keep agent-only instructions tucked away.</Typography>
+                </Box>
                 <Button size="small" startIcon={<AddIcon />} onClick={addStep}>Add Step</Button>
               </Box>
               {steps.map((step, i) => (
@@ -808,15 +821,8 @@ export default function WorkPlans() {
                     <TextField
                       value={step.title}
                       onChange={(e) => updateStep(i, "title", e.target.value)}
-                      placeholder={`Step ${i + 1} title`}
-                      size="small"
-                      fullWidth
-                      sx={{ mb: 0.5 }}
-                    />
-                    <TextField
-                      value={step.description || ""}
-                      onChange={(e) => updateStep(i, "description", e.target.value)}
-                      placeholder="LLM prompt for this step (not shown to users)"
+                      label="Step name"
+                      placeholder={`e.g., Share your event guest list`}
                       size="small"
                       fullWidth
                       sx={{ mb: 0.5 }}
@@ -827,7 +833,8 @@ export default function WorkPlans() {
                         const next = e.target.value.slice(0, USER_INSTRUCTIONS_MAX_LENGTH);
                         updateStep(i, "userInstructions", next);
                       }}
-                      placeholder="User Instructions: what should the user do at this step? What should they expect? (Shown to users when they expand this step.)"
+                      label="What should the customer do?"
+                      placeholder="e.g., Paste the guest-list link. Emma will pull in recent registrations."
                       size="small"
                       fullWidth
                       multiline
@@ -847,6 +854,40 @@ export default function WorkPlans() {
                       }}
                       sx={{ mb: 0.5 }}
                     />
+                    <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, px: 1.5, py: 1, mb: 1 }}>
+                      <FormControlLabel
+                        control={<Switch checked={Boolean(step.inputRequest)} onChange={(e) => updateStep(i, 'inputRequest', e.target.checked ? {
+                          title: step.title || `Details for step ${i + 1}`,
+                          prompt: 'Share the details Emma needs to continue.',
+                          fields: [{ id: 'details', label: 'Details', type: 'text', required: true }],
+                        } : undefined)} />}
+                        label="Collect details from the customer before this step"
+                      />
+                      {step.inputRequest && (
+                        <Box sx={{ mt: 1 }}>
+                          <WorkPlanInputEditor
+                            value={step.inputRequest}
+                            onChange={(inputRequest) => updateStep(i, 'inputRequest', inputRequest)}
+                          />
+                        </Box>
+                      )}
+                    </Box>
+                    <Box component="details" sx={{ mb: 1 }}>
+                      <Box component="summary" sx={{ cursor: "pointer", color: "text.secondary", fontSize: "0.8rem", mb: 1 }}>
+                        Advanced agent instructions
+                      </Box>
+                      <TextField
+                        value={step.description || ""}
+                        onChange={(e) => updateStep(i, "description", e.target.value)}
+                        label="Instructions for Emma only"
+                        placeholder="Optional context, rules, or constraints for the agent"
+                        size="small"
+                        fullWidth
+                        multiline
+                        minRows={2}
+                        helperText="Customers never see this text."
+                      />
+                    </Box>
                     <Autocomplete
                       multiple
                       freeSolo
@@ -1015,7 +1056,12 @@ export default function WorkPlans() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button onClick={() => handleSave()} variant="contained" disabled={saving}>
+          <Button
+            onClick={() => handleSave()}
+            variant="contained"
+            disabled={saving || inputRequestErrors.length > 0}
+            title={inputRequestErrors[0] || undefined}
+          >
             {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
           </Button>
         </DialogActions>
