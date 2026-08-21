@@ -17,10 +17,10 @@ export class GatewayContractError extends Error {
 
 const UPSTREAM_MODEL_ID = /^[^/\s]+\/[^/\s]+$/;
 
-// These are the only provider-native logical IDs in AgentModeService's model
-// registry. Keep the non-mechanical Anthropic conversions explicit: Bedrock's
-// dated/inference-profile suffixes are not OpenRouter model IDs, and guessing at
-// them would turn a newly added model into an untested production route.
+// These are the provider-native logical IDs used by migrated consumers. Keep
+// the non-mechanical Anthropic conversions explicit: Bedrock/Vertex identifiers
+// are not OpenRouter model IDs, and guessing at them would turn a newly added
+// model into an untested production route.
 const DIRECT_LOGICAL_MODEL_TO_OPENROUTER_ID: Readonly<Record<string, string>> = {
   'gpt-5.4': 'openai/gpt-5.4',
   'gpt-5.4-nano': 'openai/gpt-5.4-nano',
@@ -37,6 +37,7 @@ const DIRECT_LOGICAL_MODEL_TO_OPENROUTER_ID: Readonly<Record<string, string>> = 
   'anthropic.claude-opus-5': 'anthropic/claude-opus-5',
   'anthropic.claude-sonnet-5': 'anthropic/claude-sonnet-5',
   'anthropic.claude-haiku-4-5-20251001-v1:0': 'anthropic/claude-haiku-4.5',
+  'claude-sonnet-4-6': 'anthropic/claude-sonnet-4.6',
 };
 
 export const GATEWAY_TASK_CLASSES = [
