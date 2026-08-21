@@ -25,9 +25,21 @@ throttling. AgentWeb must not add a fallback graph after an OpenRouter failure.
 | `usage` | Actual input, output, cache-read, cache-write tokens and OpenRouter cost. |
 | `error` | Typed auth, invalid-model, rate-limit, timeout, malformed-response, or stream-terminal error. |
 
-`normalizeOpenRouterModelId` in `src/utils/openRouterGatewayContract.ts` is the
-only model-ID transformation. It intentionally performs no network access,
-provider selection, retry, or fallback.
+`normalizeOpenRouterModelId` preserves the existing explicit
+`openrouter/provider/model` namespace behavior. The migration-only
+`resolveOpenRouterUpstreamModelId` in the same module owns the verified mapping
+from AgentWeb's direct-provider logical IDs to OpenRouter wire IDs. Both are
+pure: neither performs network access, provider selection, retry, or fallback.
+
+## Runtime canary
+
+`OPENROUTER_GATEWAY_TASK_CLASSES` is an exact comma-separated allow-list of the
+task classes above. Unset/empty preserves all incumbent routes. ENG-1430 first
+annotates only the interactive Agent Mode primary and backup calls; setting
+`interactive_chat` moves that slice to OpenRouter, and removing it rolls back
+without a code deploy or persisted-data change. OpenRouter receives
+`allow_fallbacks=true` and owns upstream-provider recovery; AgentWeb performs no
+additional retry for a gateway request.
 
 ## Direct text/chat/tool inventory at baseline
 
