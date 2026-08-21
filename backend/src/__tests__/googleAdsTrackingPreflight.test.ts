@@ -372,3 +372,47 @@ describe('mixed GTM and GA4 sets get the right advice each (CodeRabbit, #2522)',
     expect(out.message).toMatch(/GA4 property measures analytics/);
   });
 });
+
+/*
+ * Found by running the gate against real pages rather than fixtures — no unit test in
+ * this file caught it, because every fixture spelled its ids the way Google issues them.
+ */
+describe('a word in a URL slug must not authorise ad spend (live finding, case sensitivity)', () => {
+  it('does not read the /ai-gtm-agent nav link on www.agentweb.pro as a GTM container', () => {
+    // Copied from the served HTML of our own marketing site.
+    const html = '<nav><a href="/ai-gtm-agent"><span>AI GTM Agent</span></a></nav>';
+    expect(detectTrackingSnippets(html)).toEqual([]);
+  });
+
+  it('does not read a hashed build class as a GA4 measurement id', () => {
+    expect(detectTrackingSnippets('<div class="g-a1b2c3 grid"></div>')).toEqual([]);
+  });
+
+  it('does not read a lower-case aw-123456 token as a Google Ads tag', () => {
+    expect(detectTrackingSnippets('<a href="/pricing?ref=aw-123456">Pricing</a>')).toEqual([]);
+  });
+
+  it('BLOCKS an untracked page that merely links to a gtm-something slug', async () => {
+    // The whole point: before this fix the page below was 'measured', so the gate
+    // permitted a launch onto a lander that fires nothing at all.
+    const html = '<html><body><a href="/ai-gtm-agent">AI GTM Agent</a><form></form></body></html>';
+    const result = await preflightTrackingGate(['https://acme.test/lp'], {
+      fetchHtml: async () => html,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.blockedUrls.map((b) => b.status)).toEqual(['unmeasured']);
+  });
+
+  it('still detects real, upper-case ids in every position they legitimately appear', () => {
+    const html = [
+      '<script src="https://www.googletagmanager.com/gtag/js?id=G-KKJE0Q33LF"></script>',
+      '<script>gtag(\'config\', \'AW-18192751758\');</script>',
+      '<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-NFWK798Z"></iframe></noscript>',
+    ].join('');
+    expect(detectTrackingSnippets(html).sort()).toEqual([
+      'AW:AW-18192751758',
+      'GA4:G-KKJE0Q33LF',
+      'GTM:GTM-NFWK798Z',
+    ]);
+  });
+});

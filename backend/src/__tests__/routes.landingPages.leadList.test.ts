@@ -6,6 +6,7 @@ process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
 const mockGetLandingPageById = jest.fn();
 const mockUpdateLeadList = jest.fn();
 const mockGetLeadListById = jest.fn();
+const mockUpdateLeadListRecord = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockCanEditItem = jest.fn();
@@ -22,7 +23,10 @@ jest.mock('../services/v0Service', () => {
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   orgDb: { getOrgById: (...a: any[]) => mockGetOrgById(...a) },
-  crmDb: { getLeadListById: (...a: any[]) => mockGetLeadListById(...a) },
+  crmDb: {
+    getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
+    updateLeadList: (...a: any[]) => mockUpdateLeadListRecord(...a),
+  },
 }));
 
 jest.mock('../services/orgShareService', () => ({
@@ -53,6 +57,7 @@ describe('PATCH /generated/:id/lead-list', () => {
     mockGetLandingPageById.mockResolvedValue(ownedPage);
     mockGetUserById.mockResolvedValue({ userId: 'u1' });
     mockUpdateLeadList.mockResolvedValue(undefined);
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
   });
 
   it('happy path: sets leadListId', async () => {
@@ -104,5 +109,71 @@ describe('PATCH /generated/:id/lead-list', () => {
     mockUpdateLeadList.mockRejectedValue(Object.assign(new Error('cond fail'), { code: 'ConditionalCheckFailedException' }));
     const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
     expect(res.status).toBe(409);
+  });
+});
+
+/**
+ * ENG-967: attaching a lead list has to make that list actually able to RECEIVE the
+ * page's submissions. The generated capture route posts to /api/webhooks/forward-lead,
+ * which 403s any list with publicAccessEnabled !== true — and the visitor still sees a
+ * success screen. Binding without enabling is a page that reports "saving leads to X"
+ * while dropping every single one, indefinitely.
+ */
+describe('PATCH /generated/:id/lead-list — public submissions on the attached list (ENG-967)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetLandingPageById.mockResolvedValue(ownedPage);
+    mockGetUserById.mockResolvedValue({ userId: 'u1' });
+    mockUpdateLeadList.mockResolvedValue(undefined);
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
+  });
+
+  it('FAIL CASE: attaching a private list enables public access on it', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1', publicAccessEnabled: false });
+
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLeadListRecord).toHaveBeenCalledWith('l1', { publicAccessEnabled: true });
+  });
+
+  it('FAIL CASE: a list with publicAccessEnabled entirely absent is still enabled', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1' });
+
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLeadListRecord).toHaveBeenCalledWith('l1', { publicAccessEnabled: true });
+  });
+
+  it('FAIL CASE: the enabling write failing is reported, not swallowed as a clean save', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1', publicAccessEnabled: false });
+    mockUpdateLeadListRecord.mockRejectedValue(new Error('dynamo blip'));
+
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
+
+    // The page IS bound (the DynamoDB write already happened), so this is a 200 with a
+    // warning — never a silent success.
+    expect(res.status).toBe(200);
+    expect(res.body.captureSyncWarning).toEqual(expect.stringContaining('public'));
+    expect(res.body.warnings).toEqual([expect.stringContaining('public')]);
+  });
+
+  it('SUCCESS: an already-public list is not re-written', async () => {
+    mockGetLeadListById.mockResolvedValue({ listId: 'l1', userId: 'u1', publicAccessEnabled: true });
+
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: 'l1' });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLeadListRecord).not.toHaveBeenCalled();
+    expect(res.body.captureSyncWarning).toBeUndefined();
+    expect(res.body.warnings).toBeUndefined();
+  });
+
+  it('SUCCESS: detaching (null) never flips any list public', async () => {
+    const res = await request(app).patch('/api/landing-pages/v0/generated/p1/lead-list').send({ leadListId: null });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLeadListRecord).not.toHaveBeenCalled();
   });
 });
