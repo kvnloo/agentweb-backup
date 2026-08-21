@@ -183,15 +183,8 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         self.assertIsNotNone(result.error)
         self.assertIn("SyntaxError", result.error)
 
-class TestOpenRouterExportsEnvVar(unittest.TestCase):
-    """ENG-389: browser-use's own preflight check (browser_use/agent/views.py's
-    REQUIRED_LLM_API_ENV_VARS = {'ChatOpenAI': ['OPENAI_API_KEY']}) reads
-    OPENAI_API_KEY directly from os.environ, independent of the api_key
-    passed to ChatOpenAI's constructor. Without exporting it, every
-    openai->openai-> task failed with "The api_key client option must be
-    set..." even though the secret itself was fine - found via live testing
-    against the real pipeline (Dev tables), confirmed by inspecting the
-    installed browser-use package on the VM directly."""
+class TestOpenRouterDoesNotExportEnvVar(unittest.TestCase):
+    """Gateway construction must not replace credentials for sibling callers."""
 
     def setUp(self):
         self.original_env = os.environ.pop('OPENAI_API_KEY', None)
@@ -204,10 +197,10 @@ class TestOpenRouterExportsEnvVar(unittest.TestCase):
 
     @patch('openrouter_gateway.ChatOpenAI')
     @patch('openrouter_gateway.secrets_manager.get_openrouter_api_key', return_value='or-test-key-123')
-    def test_get_llm_exports_browser_use_compatibility_key(self, mock_get_key, mock_client):
+    def test_get_llm_does_not_export_browser_use_compatibility_key(self, mock_get_key, mock_client):
         self.assertNotIn('OPENAI_API_KEY', os.environ)
         get_llm('openai->openai->gpt-4o')
-        self.assertEqual(os.environ.get('OPENAI_API_KEY'), 'or-test-key-123')
+        self.assertNotIn('OPENAI_API_KEY', os.environ)
         mock_client.assert_called_once()
 
 

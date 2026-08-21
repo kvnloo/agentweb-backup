@@ -39,17 +39,50 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
 
     monkeypatch.setattr(gateway, "ChatOpenAI", FakeChatOpenAI)
     monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
 
     gateway.create_openrouter_llm("openai/gpt-4.1")
 
     assert captured["base_url"] == "https://openrouter.ai/api/v1"
     assert captured["model"] == "openai/gpt-4.1"
     assert captured["max_retries"] == 1
+    assert captured["temperature"] == 0.0
+    assert gateway.os.environ["OPENAI_API_KEY"] == "direct-openai-key"
     assert captured["extra_body"] == {
         "provider": {"allow_fallbacks": True, "require_parameters": True},
         "plugins": [{"id": "context-compression"}],
         "models": ["google/gemini-3.5-flash"],
     }
+
+
+def test_reasoning_routes_omit_temperature(monkeypatch):
+    gateway = load_gateway()
+    captured = {}
+    monkeypatch.setattr(gateway, "ChatOpenAI", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    gateway.create_openrouter_llm("openai/o3-mini")
+
+    assert "temperature" not in captured
+
+
+def test_browser_compatibility_key_is_scoped_and_restored(monkeypatch):
+    gateway = load_gateway()
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+
+    with gateway.openrouter_browser_compatibility_env():
+        assert gateway.os.environ["OPENAI_API_KEY"] == "or-test-key"
+
+    assert gateway.os.environ["OPENAI_API_KEY"] == "direct-openai-key"
+
+
+def test_openrouter_browser_model_uses_raw_tools_for_no_tool_slugs():
+    gateway = load_gateway()
+
+    assert gateway.browser_tool_calling_method("deepseek/deepseek-r1") == "raw"
+    assert gateway.browser_tool_calling_method("deepseek/deepseek-reasoner") == "raw"
+    assert gateway.browser_tool_calling_method("openai/gpt-4.1") == "auto"
 
 
 def test_openrouter_key_uses_the_existing_environment_aware_secret_seam():

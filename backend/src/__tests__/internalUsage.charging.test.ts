@@ -184,6 +184,28 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(cost).toBeCloseTo(1, 5); // 2M cache-read at $0.50/M
   });
 
+  it("uses OpenRouter's exact per-call cost when the engine reports it", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({
+        records: [
+          record({
+            model: "openai/gpt-4.1",
+            provider: "openrouter",
+            inputTokens: 91,
+            outputTokens: 13,
+            costUsdOverride: 0.000286,
+          }),
+        ],
+      });
+
+    const [, , cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(cost).toBeCloseTo(0.000286, 9);
+    const [ledgerInc] = mockIncrementUsageWithChargeEvent.mock.calls[0];
+    expect(ledgerInc.costMicroUsd).toBe(286);
+  });
+
   it("bills each user separately when an admin submits a mixed batch", async () => {
     await request(app)
       .post("/api/internal/usage")
