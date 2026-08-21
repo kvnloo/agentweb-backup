@@ -1594,16 +1594,31 @@ export function _setOpenRouterClientForTest(client: AnthropicLikeClient | null):
   openRouterClientPromise = null;
 }
 
+function containsImageInput(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsImageInput);
+  if (!value || typeof value !== 'object') return false;
+  const block = value as Record<string, unknown>;
+  if (block.type === 'image' || block.type === 'image_url' || block.type === 'input_image') {
+    return true;
+  }
+  return containsImageInput(block.content);
+}
+
 async function callOpenRouter(
   client: AnthropicLikeClient,
   params: Anthropic.MessageCreateParamsNonStreaming,
   sessionId: string,
 ): Promise<Anthropic.Message> {
+  const upstreamModel = resolveOpenRouterUpstreamModelId(params.model);
+  const managedFallback = containsImageInput(params.messages)
+    ? 'google/gemini-3.5-flash'
+    : 'deepseek/deepseek-v4-flash';
   const request = {
     ...params,
-    model: resolveOpenRouterUpstreamModelId(params.model),
+    model: upstreamModel,
     provider: { allow_fallbacks: true, require_parameters: true },
     plugins: [{ id: 'context-compression' }],
+    ...(upstreamModel !== managedFallback ? { fallbacks: [{ model: managedFallback }] } : {}),
     ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),
   };
 
