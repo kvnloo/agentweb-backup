@@ -169,6 +169,39 @@ describe('SessionScoring - fabrication grounding (ENG-1223)', () => {
     expect(getUserMessage()).toContain('[TOOL CALL MANIFEST: 1 tool call(s) made in this session: get_connected_accounts (success)');
   });
 
+  it('computes the manifest from the FULL session, not just the last 50 scored messages, so an earlier tool call is not falsely reported as zero', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(4, { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 }));
+
+    // An early tool call (message 0-2) falls outside the last-50-message
+    // window used to build the transcript sent to the judge, followed by
+    // enough filler turns to push it out of MAX_MESSAGES_FOR_SCORING (50).
+    const earlyToolCallMessages: ChatMessage[] = [
+      { role: 'user', content: 'List connected Google Ads accounts.' },
+      {
+        role: 'assistant',
+        content: '',
+        metadata: { toolCalls: [{ id: 'tc1', name: 'get_connected_accounts' }] },
+      } as any,
+      {
+        role: 'tool',
+        name: 'get_connected_accounts',
+        tool_call_id: 'tc1',
+        content: JSON.stringify({ success: true, accounts: [{ name: 'Real Account' }] }),
+      } as any,
+    ];
+    const filler: ChatMessage[] = Array.from({ length: 60 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: `filler turn ${i}`,
+    }));
+    const messages = [...earlyToolCallMessages, ...filler];
+
+    await scoreSession(messages, messages.length);
+
+    // Must NOT falsely claim zero tool calls happened anywhere in the session.
+    expect(getUserMessage()).not.toContain('[TOOL CALL MANIFEST: 0 tool calls were made anywhere in this session');
+    expect(getUserMessage()).toContain('[TOOL CALL MANIFEST: 1 tool call(s) made in this session: get_connected_accounts (success)');
+  });
+
   it('REGRESSION FIXTURE (session 0e5792fd): overrides a Fangfang-shaped verdict that credits "successfully simulated/executed" fabricated data — final score <= 2, dataAccuracy forced to 1', async () => {
     // Mirrors Fangfang Judge's actual verdict on 0e5792fd-4982-4547-acf1-0a1c738cca59:
     // score 4, dimensions all 5, reason crediting "successfully simulated/executed".
@@ -222,6 +255,27 @@ describe('SessionScoring - fabrication grounding (ENG-1223)', () => {
 
     expect(result.score).toBe(5);
     expect(result.dimensions?.dataAccuracy).toBe(5);
+  });
+
+  it('does NOT override a genuine tool-free simulation/roleplay request scored correctly (zero tool calls, "simulat" language present but not crediting a fabricated result as success)', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(
+        5,
+        { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 },
+        'The user asked the assistant to simulate a mock job interview, which it did well and stayed in character throughout.'
+      )
+    );
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Simulate a mock job interview with me for a software engineering role.' },
+      { role: 'assistant', content: 'Sure — let\'s begin. Tell me about yourself...' },
+    ];
+
+    const result = await scoreSession(messages, messages.length);
+
+    expect(result.score).toBe(5);
+    expect(result.dimensions?.dataAccuracy).toBe(5);
+    expect(result.dimensions?.goalCompletion).toBe(5);
   });
 
   it('does NOT touch a normal, accurate, tool-free chat reply (zero tool calls but no "simulat" language)', async () => {
