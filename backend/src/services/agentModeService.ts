@@ -26,6 +26,7 @@ import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import {
   createGeminiNativeClient,
   normalizeProviderRequestTimeoutMs,
+  sanitizeGeminiSchema,
 } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
@@ -3457,12 +3458,27 @@ export class AgentModeService {
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
+      let boundedTools = tools;
       if (maxTools && tools.length > maxTools) {
         console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        params.tools = tools.slice(0, maxTools);
-      } else {
-        params.tools = tools;
+        boundedTools = tools.slice(0, maxTools);
       }
+      // OpenRouter normalizes the transport, but the selected provider still
+      // validates its own function-declaration schema. Native Gemini calls pass
+      // through this same allowlist in geminiNativeClient; apply it at the shared
+      // gateway boundary too so third-party MCP keywords cannot 400 the turn.
+      params.tools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
+        ? boundedTools.map((tool: any) => ({
+            ...tool,
+            function: {
+              ...tool.function,
+              parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
+                type: 'object',
+                properties: {},
+              },
+            },
+          }))
+        : boundedTools;
       params.tool_choice = tool_choice || 'auto';
     }
 
