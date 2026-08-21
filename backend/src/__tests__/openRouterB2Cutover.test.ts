@@ -74,6 +74,13 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
     }
   });
 
+  it('routes the LinkedIn title-company parser through callLLM instead of a direct Gemini client', () => {
+    const source = read('services/agentModeService.ts');
+    expect(source).not.toMatch(/getClientForModel\('gemini-2\.5-flash'\)/);
+    expect(source).not.toMatch(/model:\s*'gemini-2\.5-flash'/);
+    expect(source).toContain("taskClass: 'nonstandard_consumer'");
+  });
+
   it('keeps the documented Gemini Live voice exception outside the text gateway', () => {
     const source = read('services/liveVoiceService.ts');
     expect(source).toMatch(/\.live\.connect\s*\(/);

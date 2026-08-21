@@ -1051,6 +1051,7 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
   'gpt-5-chat-2': 'gpt-5.5',
   'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -4639,8 +4640,8 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
-        const chatTaskClass: GatewayTaskClass | undefined = isScheduledSession
-          ? undefined
+        const chatTaskClass: GatewayTaskClass = isScheduledSession
+          ? 'scheduled_background'
           : 'interactive_chat';
         const providerForChatRoute = (logicalModel: string): string =>
           logicalModel.startsWith('openrouter/') ||
@@ -34711,8 +34712,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       if (llmTitles.length > 0) {
         try {
-          const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
@@ -36064,19 +36064,19 @@ function parseCompanyFromTitle(title: any): string | null {
 }
 
 /**
- * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * Tier 3 of company resolution: ONE shared-gateway call per page that takes the
  * full batch of titles and returns a parallel array of company names (or
- * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * "NONE"). Caller passes the gateway seam so the helper stays pure and
  * easily mockable. On any error or response-shape mismatch, returns an
  * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
  */
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
-  llmClient: any,
+  gateway: Pick<AgentModeService, 'callLLM'> | null,
   userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
-  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  if (!gateway?.callLLM) return titles.map(() => 'NONE');
   try {
     const systemPrompt = [
       'You extract company names from professional / LinkedIn titles in batch.',
@@ -36093,24 +36093,19 @@ async function batchParseCompaniesFromTitlesWithLLM(
       '- Use "NONE" (uppercase) when uncertain.',
     ].join('\n');
     const userPrompt = `Titles: ${JSON.stringify(titles)}`;
-    const completion = await llmClient.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages: [
+    const completion = await gateway.callLLM(
+      'gemini-3.1-flash-lite',
+      [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_completion_tokens: Math.max(500, titles.length * 30),
-      temperature: 0.1,
-    });
-    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
-    // until a price row exists) — token visibility is still worth having.
-    if ((completion as any)?.usage) {
-      meterUsageFromResponse(
-        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
-        completion
-      );
-    }
+      {
+        max_completion_tokens: Math.max(500, titles.length * 30),
+        temperature: 0.1,
+        usageContext: { userId, feature: 'title_company_parse' },
+        taskClass: 'nonstandard_consumer',
+      },
+    );
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

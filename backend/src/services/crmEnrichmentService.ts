@@ -271,7 +271,7 @@ export class CrmEnrichmentService {
   // Fallback used by llmCallWithTimeout when the primary model times out.
   // Cross-vendor on purpose — if Azure throttles, Gemini absorbs; if Gemini
   // queues, Azure absorbs.
-  private static readonly LLM_FALLBACK_MODEL = 'gemini-2.5-flash';
+  private static readonly LLM_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 
   // Per-call ceiling. The OpenAI SDK aborts the underlying fetch when this
   // fires. Chosen so the worst case for a 2-sample preview is ~2 min.

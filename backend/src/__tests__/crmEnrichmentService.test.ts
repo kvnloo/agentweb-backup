@@ -1858,7 +1858,7 @@ describe('CrmEnrichmentService cross-provider timeout fallback', () => {
     expect(result.fields.company_size).toBe('51-200');
     expect(primaryCreate).toHaveBeenCalledTimes(1);
     expect(fallbackCreate).toHaveBeenCalledTimes(1);
-    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
+    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-3.1-flash-lite');
   });
 
   it('does not resolve the fallback client when the primary succeeds', async () => {
