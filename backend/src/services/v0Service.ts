@@ -20,6 +20,7 @@ import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, h
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
+import { runMeteredV0Attempt } from "./v0UsageMeter";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -1465,7 +1466,10 @@ async function generateFirstPage(
       // minting an orphan, credit-burning chat on every "timeout". Async returns the
       // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        () => runMeteredV0Attempt(
+          { ownerUserId: userId, operation: "generate", sessionId: originatingSessionId },
+          () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })
+        ),
         "v0 chat creation",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1851,7 +1855,10 @@ async function addPageToExistingRepo(
       // responseMode async — see the first-page call site for why sync mode cannot
       // survive the 300s attempt timeout. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        () => runMeteredV0Attempt(
+          { ownerUserId: userId, operation: "generate", sessionId: originatingSessionId },
+          () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" })
+        ),
         "v0 chat creation (additional page)",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1955,7 +1962,9 @@ async function addPageToExistingRepo(
               chatId,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                () => runMeteredV0Attempt(
+                  { ownerUserId: userId, operation: "correction", sessionId: originatingSessionId },
+                  () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -1963,7 +1972,8 @@ async function addPageToExistingRepo(
                     "fetch('/api/capture', ...) JSON body, and on a successful response call " +
                     "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
                     `Issue: ${pixelCheck.reason}`,
-                }),
+                  })
+                ),
                 "v0 correction message (pixel lead event, additional page)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -2001,14 +2011,17 @@ async function addPageToExistingRepo(
               chatId,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                () => runMeteredV0Attempt(
+                  { ownerUserId: userId, operation: "correction", sessionId: originatingSessionId },
+                  () => v0.chats.sendMessage({
                   chatId,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
                     `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
                     "appended as an email= query param (URL-encoded). " +
                     `Issue: ${bridgeCheck.reason}`,
-                }),
+                  })
+                ),
                 "v0 correction message (bridge-out redirect, additional page)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -2049,14 +2062,17 @@ async function addPageToExistingRepo(
             // that was really 1. (ENG-287 residual)
             attempt: validationAttempt,
             send: () => withRetry(
-              () => v0.chats.sendMessage({
+              () => runMeteredV0Attempt(
+                { ownerUserId: userId, operation: "correction", sessionId: originatingSessionId },
+                () => v0.chats.sendMessage({
                 chatId,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
                   "not markdown, not a prompt description, not empty files. " +
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
-              }),
+                })
+              ),
               "v0 correction message (additional page)",
               // A correction that outlives the attempt timeout must fail once, not be
               // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
@@ -3047,7 +3063,9 @@ export async function deployLandingPage(
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                () => runMeteredV0Attempt(
+                  { ownerUserId: userId, operation: "correction", sessionId: record.originatingSessionId },
+                  () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
@@ -3055,7 +3073,8 @@ export async function deployLandingPage(
                     "fetch('/api/capture', ...) JSON body, and on a successful response call " +
                     "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
                     `Issue: ${pixelCheck.reason}`,
-                }),
+                  })
+                ),
                 "v0 correction message (pixel lead event)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -3092,14 +3111,17 @@ export async function deployLandingPage(
               chatId: record.v0ChatId!,
               attempt: validationAttempt,
               send: () => withRetry(
-                () => v0.chats.sendMessage({
+                () => runMeteredV0Attempt(
+                  { ownerUserId: userId, operation: "correction", sessionId: record.originatingSessionId },
+                  () => v0.chats.sendMessage({
                   chatId: record.v0ChatId!,
                   message:
                     "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
                     `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
                     "appended as an email= query param (URL-encoded). " +
                     `Issue: ${bridgeCheck.reason}`,
-                }),
+                  })
+                ),
                 "v0 correction message (bridge-out redirect)",
                 undefined, undefined, undefined,
                 { retryOnTimeout: false }
@@ -3139,14 +3161,17 @@ export async function deployLandingPage(
             // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
             attempt: validationAttempt,
             send: () => withRetry(
-              () => v0.chats.sendMessage({
+              () => runMeteredV0Attempt(
+                { ownerUserId: userId, operation: "correction", sessionId: record.originatingSessionId },
+                () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
                 message:
                   "The previous output was not valid code. Please generate actual React/Next.js code — " +
                   "not markdown, not a prompt description, not empty files. " +
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
-              }),
+                })
+              ),
               "v0 correction message",
               // A correction that outlives the attempt timeout must fail once, not be
               // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
@@ -5571,7 +5596,10 @@ export async function iterateLandingPage(
       // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
       // could grab the PRE-iteration version and silently ship the page without the edit.
       await withRetry(
-        () => v0.chats.sendMessage({ chatId, message, responseMode: "async" }),
+        () => runMeteredV0Attempt(
+          { ownerUserId: userId, operation: "iterate", sessionId: record.originatingSessionId },
+          () => v0.chats.sendMessage({ chatId, message, responseMode: "async" })
+        ),
         "v0 chat iterate",
         undefined, undefined, undefined,
         { retryOnTimeout: false }

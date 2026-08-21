@@ -5,6 +5,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { settingsService } from "../services/settingsService";
 import { userDb, orgDb, crmDb } from "../services/db";
 import { resolveOrgProfileField } from "../services/orgProfileResolver";
+import { withV0ActingUser } from "../services/v0UsageMeter";
 import {
   publishWithdrawnMidFlight,
   publishRevalidationForForwardedRun,
@@ -657,14 +658,16 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
     }
 
-    const result = await generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
-      siteId: typeof site_id === "string" ? site_id : undefined,
-      originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
-      mode: effectiveMode,
-      bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
-      metaPixelOverride,
-      googleAds,
-    });
+    const result = await withV0ActingUser(userId, () =>
+      generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
+        siteId: typeof site_id === "string" ? site_id : undefined,
+        originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
+        mode: effectiveMode,
+        bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
+        metaPixelOverride,
+        googleAds,
+      })
+    );
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
@@ -694,7 +697,7 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    const result = await deployLandingPage(auth.page.id, auth.page.userId);
+    const result = await withV0ActingUser(userId, () => deployLandingPage(auth.page.id, auth.page.userId));
     void emitLanderLifecycle("deploy_retried", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req) });
     res.json(result);
   } catch (error: any) {
@@ -727,7 +730,9 @@ router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) =>
     const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
 
-    const result = await iterateLandingPage(auth.page.id, auth.page.userId, message);
+    const result = await withV0ActingUser(userId, () =>
+      iterateLandingPage(auth.page.id, auth.page.userId, message)
+    );
     void emitLanderLifecycle("iterated", { pageId: auth.page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
     res.json(result);
   } catch (error: any) {
@@ -1016,7 +1021,9 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // permits.
     const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
 
-    const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
+    const result = await withV0ActingUser(userId, () =>
+      generateLandingPage(userId, original.prompt, newName, brandContext, leadListId)
+    );
     res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);

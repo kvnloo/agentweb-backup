@@ -49,9 +49,14 @@ interface VendorSignature {
  */
 const USAGE_RECORDER_IMPORT = /import\s*\{[^}]*\b(?:recordUsage|recordVendorUsage)\b[^}]*\}\s*from\s*['"][^'"]*usageRecorderService['"]/;
 const USAGE_RECORDER_CALL = /\b(?:recordUsage|recordVendorUsage)\s*\(/;
+const V0_METER_IMPORT = /import\s*\{[^}]*\brunMeteredV0Attempt\b[^}]*\}\s*from\s*['"][^'"]*v0UsageMeter['"]/;
+const V0_METER_CALL = /\brunMeteredV0Attempt\s*\(/;
 
 function isMetered(content: string): boolean {
-  return USAGE_RECORDER_IMPORT.test(content) && USAGE_RECORDER_CALL.test(content);
+  return (
+    (USAGE_RECORDER_IMPORT.test(content) && USAGE_RECORDER_CALL.test(content)) ||
+    (V0_METER_IMPORT.test(content) && V0_METER_CALL.test(content))
+  );
 }
 
 interface AllowlistEntry {
@@ -95,12 +100,6 @@ const VENDOR_SIGNATURES: VendorSignature[] = [
  * meter the module instead.
  */
 const VENDOR_ALLOWLIST: AllowlistEntry[] = [
-  {
-    path: 'services/v0Service.ts',
-    vendor: 'v0 (Vercel)',
-    issue: 'ENG-694',
-    reason: '9 billable v0.chats.create/sendMessage sites; none record usage yet.',
-  },
   {
     path: 'search/youSearchProvider.ts',
     vendor: 'You.com search',
@@ -409,7 +408,6 @@ describe('Vendor metering coverage guard (ENG-701, real repo)', () => {
       'Remotion Lambda (services/remotionService.ts) — ENG-699',
       'You.com search (search/youSearchProvider.ts) — ENG-695',
       'enrich.so (services/enrichSoServiceFactory.ts) — ENG-696',
-      'v0 (Vercel) (services/v0Service.ts) — ENG-694',
     ]);
   });
 });
