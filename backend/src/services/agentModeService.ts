@@ -395,15 +395,6 @@ import {
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
-// Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
-// Used for updateEmailDraftForLead to match generateBlogContent pattern
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
-
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
  *
@@ -14102,10 +14093,9 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      // Call LLM to generate email using direct chat completion (same as generateBlogContent)
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
+      const completion = await this.callLLM(
+        process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+        [
           {
             role: "system",
             content: emailDraftFormat === 'text'
@@ -14114,24 +14104,14 @@ ${emailDraftFormat === 'text'
           },
           { role: "user", content: emailPrompt },
         ],
+        {
         temperature: 0.8,
-        max_tokens: 3000,
-        response_format: { type: 'json_object' }
-      });
-
-      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
-      if ((completion as any)?.usage) {
-        meterUsageFromResponse(
-          {
-            userId,
-            sessionId,
-            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-            provider: 'azure-openai',
-            feature: 'email_draft',
-          },
-          completion
-        );
-      }
+          max_completion_tokens: 3000,
+          response_format: { type: 'json_object' },
+          usageContext: { userId, sessionId, feature: 'email_draft' },
+          taskClass: 'content_generation',
+        },
+      );
 
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
@@ -15876,7 +15856,7 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' } });
+      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -15971,6 +15951,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 200,
         temperature: 0.3,
+        taskClass: 'nonstandard_consumer',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16019,6 +16000,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 20,
         temperature: 0.3,
+        taskClass: 'scheduled_background',
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16082,6 +16064,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 150,
         temperature: 0,
         response_format: { type: 'json_object' },
+        taskClass: 'scheduled_background',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16141,6 +16124,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 120,
         temperature: 0.7,
         response_format: { type: 'text' },
+        taskClass: 'interactive_chat',
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -16198,7 +16182,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0 });
+    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16234,7 +16218,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0 });
+    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16261,6 +16245,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ], {
         max_completion_tokens: 10,
         temperature: 0,
+        taskClass: 'mcp_api',
       });
 
       const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
@@ -29136,7 +29121,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         ], {
           temperature: 0.1,
           response_format: { type: 'json_object' },
-          max_completion_tokens: maxTokens
+          max_completion_tokens: maxTokens,
+          taskClass: 'content_generation',
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;

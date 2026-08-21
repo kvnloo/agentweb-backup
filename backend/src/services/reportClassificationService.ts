@@ -26,7 +26,7 @@ export async function classifyReport(filename: string, contentExcerpt: string): 
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userMessage },
       ],
-      { temperature: 0, max_completion_tokens: 5 }
+      { temperature: 0, max_completion_tokens: 5, taskClass: 'nonstandard_consumer' }
     );
 
     const timeoutPromise = new Promise<never>((_, reject) =>

@@ -321,6 +321,8 @@ export async function generateEngagementMemory(
   ], {
     temperature: 0.7,
     max_completion_tokens: 1500,
+    usageContext: { userId, feature: 'content_gen' },
+    taskClass: 'content_generation',
   });
 
   const generatedContent = response.choices[0]?.message?.content?.trim() || '';
@@ -341,4 +343,3 @@ export async function generateEngagementMemory(
 
   return memory;
 }
-
