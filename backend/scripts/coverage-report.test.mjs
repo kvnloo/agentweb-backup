@@ -140,6 +140,35 @@ test('no arguments is fatal', () => {
   assert.equal(res.code, 2);
 });
 
+// CodeRabbit on #2547: a corrupt artifact must exit 2 (bad input), never 1.
+// Exit 1 is reserved for "coverage is genuinely below the bar", and confusing
+// the two sends someone hunting for a regression that is really a broken file.
+for (const [label, payload] of [
+  ['null', 'null'],
+  ['an array', '[1, 2]'],
+  ['a number', '42'],
+]) {
+  test(`an artifact containing ${label} is fatal, not a crash`, () => {
+    const p = path.join(tmp, `bad-${label.replace(/\W/g, '')}.json`);
+    fs.writeFileSync(p, payload);
+    const res = run([p]);
+    assert.equal(res.code, 2, `expected exit 2, got ${res.code}`);
+    assert.match(res.stderr, /not a JSON object of file coverage/);
+  });
+}
+
+test('a coverage-summary.json passed by mistake is fatal, and says so', () => {
+  // The realistic corruption: right file name, wrong reporter. istanbul throws
+  // a bare Error here, which would otherwise surface as an exit-1 stack trace.
+  const p = writeArtifact('summary-shaped.json', {
+    total: { lines: { total: 1, covered: 1, skipped: 0, pct: 100 } },
+  });
+  const res = run([p]);
+  assert.equal(res.code, 2);
+  assert.match(res.stderr, /could not merge/);
+  assert.match(res.stderr, /not a summary/);
+});
+
 test('the markdown names its measured scope and every threshold', () => {
   const full = writeArtifact('md.json', {
     [path.join(BACKEND_ROOT, 'src/routes/x.ts')]: fileCoverage('src/routes/x.ts', [1, 1, 1, 1]),

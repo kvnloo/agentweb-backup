@@ -56,10 +56,28 @@ for (const input of inputs) {
   } catch (err) {
     die(`could not parse ${input}: ${err.message}`);
   }
+  // `JSON.parse` happily returns null, a number or an array, and Object.keys
+  // throws on the first of those — an uncaught TypeError and exit 1, which is
+  // the code this script reserves for "coverage is below the bar". A corrupt
+  // artifact must not be indistinguishable from a real regression.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    die(`coverage input is not a JSON object of file coverage: ${input}`);
+  }
   const fileCount = Object.keys(parsed).length;
   if (fileCount === 0) die(`coverage input has no files: ${input}`);
   console.log(`coverage-report: merging ${fileCount} files from ${input}`);
-  map.merge(parsed);
+  // istanbul throws a bare Error on a well-formed object with the wrong shape.
+  // The realistic way to get here is passing coverage-summary.json instead of
+  // coverage-final.json, which is an easy mistake and deserves a message that
+  // says so rather than a stack trace.
+  try {
+    map.merge(parsed);
+  } catch (err) {
+    die(
+      `could not merge ${input}: ${err.message}. ` +
+        'Expected an istanbul coverage-final.json (per-file counters), not a summary.',
+    );
+  }
 }
 
 if (!fs.existsSync(THRESHOLDS_PATH)) die(`missing ${THRESHOLDS_PATH}`);
