@@ -216,24 +216,16 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
-  it('retries a transient 429 from OpenRouter and succeeds on the next attempt', async () => {
+  it('does not retry a transient 429 after OpenRouter exhausts its provider fallbacks', async () => {
     const rateLimitErr = Object.assign(new Error('Rate limit exceeded'), { status: 429 });
-    create
-      .mockRejectedValueOnce(rateLimitErr)
-      .mockResolvedValueOnce({
-        id: 'gen-125',
-        usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0.000001 },
-        choices: [{ message: { content: 'ok' } }],
-      });
+    create.mockRejectedValue(rateLimitErr);
     (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
-    (svc as any).sleep = jest.fn().mockResolvedValue(undefined); // skip real backoff delay
 
-    const res: any = await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+    await expect(svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
       usageContext: { userId: 'u1', feature: 'agent_task' },
-    });
+    })).rejects.toBe(rateLimitErr);
 
-    expect(create).toHaveBeenCalledTimes(2);
-    expect(res.id).toBe('gen-125');
+    expect(create).toHaveBeenCalledTimes(1);
   });
 
   it('does not retry a non-transient 402 (exhausted balance) — fails immediately', async () => {
