@@ -113,6 +113,50 @@ describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
     }]);
   });
 
+  it('marks the last eligible text block in mixed typed content', () => {
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe this image' },
+        { type: 'image_url', image_url: { url: 'https://example.com/input.png' } },
+        { type: 'text', text: 'Use one sentence' },
+      ],
+    }];
+
+    expect(applyOpenRouterCacheBreakpoints(messages, false)[0].content).toEqual([
+      { type: 'text', text: 'Describe this image' },
+      { type: 'image_url', image_url: { url: 'https://example.com/input.png' } },
+      { type: 'text', text: 'Use one sentence', cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('does not mutate nested typed content blocks', () => {
+    const messages = [{
+      role: 'system',
+      content: [{ type: 'text', text: 'Stable instructions', metadata: { source: 'policy' } }],
+    }];
+    const originalMessage = messages[0];
+    const originalContent = messages[0].content;
+    const originalBlock = messages[0].content[0];
+
+    const cached = applyOpenRouterCacheBreakpoints(messages, true);
+
+    expect(messages).toEqual([{
+      role: 'system',
+      content: [{ type: 'text', text: 'Stable instructions', metadata: { source: 'policy' } }],
+    }]);
+    expect(cached).not.toBe(messages);
+    expect(cached[0]).not.toBe(originalMessage);
+    expect(cached[0].content).not.toBe(originalContent);
+    expect(cached[0].content[0]).not.toBe(originalBlock);
+    expect(cached[0].content[0]).toEqual({
+      type: 'text',
+      text: 'Stable instructions',
+      metadata: { source: 'policy' },
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    });
+  });
+
   it('leaves message shapes unchanged when no text block can carry a breakpoint', () => {
     const messages = [
       { role: 'assistant', content: null, tool_calls: [{ id: 'tool-1' }] },

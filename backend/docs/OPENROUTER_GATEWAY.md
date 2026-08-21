@@ -5,9 +5,11 @@
 
 ## Contract
 
-AgentWeb decides a logical model for a task. The gateway converts only the
-logical `openrouter/<provider>/<model>` identifier into OpenRouter's
-`<provider>/<model>` wire identifier. It owns the HTTP request boundary,
+AgentWeb decides a logical model for a task. Explicit
+`openrouter/<provider>/<model>` IDs use the normalization path, while migrated
+direct-provider logical IDs use the verified resolver below. Both produce an
+OpenRouter `<provider>/<model>` wire identifier. The gateway owns the HTTP
+request boundary,
 bounded timeout, typed transport errors, streamed terminal usage extraction,
 and exactly-one ledger event keyed by the logical decision and request event ID.
 

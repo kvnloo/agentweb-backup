@@ -102,11 +102,28 @@ export function applyOpenRouterCacheBreakpoints(messages: readonly any[], humanP
 
   const applyAt = (index: number): boolean => {
     const message = result[index];
-    if (!message || typeof message.content !== 'string' || message.content.length === 0) return false;
-    result[index] = {
-      ...message,
-      content: [{ type: 'text', text: message.content, cache_control: cacheControl }],
-    };
+    if (!message) return false;
+    if (typeof message.content === 'string' && message.content.length > 0) {
+      result[index] = {
+        ...message,
+        content: [{ type: 'text', text: message.content, cache_control: cacheControl }],
+      };
+      return true;
+    }
+    if (!Array.isArray(message.content)) return false;
+
+    let textIndex = -1;
+    for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = message.content[blockIndex];
+      if (block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+        textIndex = blockIndex;
+        break;
+      }
+    }
+    if (textIndex < 0) return false;
+    const content = [...message.content];
+    content[textIndex] = { ...content[textIndex], cache_control: cacheControl };
+    result[index] = { ...message, content };
     return true;
   };
 
