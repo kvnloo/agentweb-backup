@@ -1753,12 +1753,38 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
 
     try {
       await runCodingAgent('change the heading', context);
-      expect(MockAnthropic).toHaveBeenCalledWith(expect.objectContaining({ maxRetries: 1 }));
+      expect(MockAnthropic).toHaveBeenCalledWith(expect.objectContaining({
+        maxRetries: 1,
+        defaultHeaders: expect.objectContaining({ 'X-OpenRouter-Metadata': 'enabled' }),
+      }));
     } finally {
       if (originalEnvKey === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = originalEnvKey;
       _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
     }
+  });
+
+  test('uses upstream inference cost when a BYOK provider bills outside OpenRouter', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'openai/gpt-5.6-terra',
+      openrouter_metadata: { is_byok: true },
+      usage: {
+        input_tokens: 1_000,
+        output_tokens: 1_000,
+        cost: 0,
+        cost_details: { upstream_inference_cost: 0.0042 },
+      },
+    });
+
+    const result = await runCodingAgent('change the heading', context);
+
+    expect(result.usageTotals?.costUsd).toBeCloseTo(0.0042, 9);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'openai/gpt-5.6-terra',
+      costUsdOverride: 0.0042,
+    }));
   });
 
   test('omits session_id when the local session id exceeds OpenRouter limits', async () => {
