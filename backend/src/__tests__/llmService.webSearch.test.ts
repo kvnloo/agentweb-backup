@@ -153,10 +153,10 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
       text: async () => '{"output_text":"{\\"ok\\":1}"}',
     });
     (global as any).fetch = fetchMock;
-    process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
-    delete process.env.AZURE_OPENAI_RESPONSES_API_VERSION;
 
     const svc = makeService();
+    process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
+    delete process.env.AZURE_OPENAI_RESPONSES_API_VERSION;
     await svc.generateJSONContentWithWebSearch('s', 'u');
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toBe(
