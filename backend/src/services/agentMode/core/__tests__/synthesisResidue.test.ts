@@ -368,6 +368,17 @@ describe('detectFalseCompletionClaim', () => {
     expect(detectFalseCompletionClaim('I reviewed all 12 line items in the report.', [])).toBeNull();
   });
 
+  // Live repro: N_OF_N_PATTERN/N_SLASH_N_PATTERN had no noun-proximity requirement,
+  // unlike ALL_N_NOUN_PATTERN above, so an unrelated same-number ratio was misread
+  // as an asset-completion claim.
+  it('does NOT flag an unrelated "N of N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('I reviewed 10 of 10 pages in the brief.', [])).toBeNull();
+  });
+
+  it('does NOT flag an unrelated "N/N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('That covers 3/3 of the brief.', [])).toBeNull();
+  });
+
   it('does NOT flag a claim the model already qualifies as partial', () => {
     expect(detectFalseCompletionClaim('I rendered 4 of the 12 requested sizes.', [])).toBeNull();
   });
@@ -383,6 +394,52 @@ describe('detectFalseCompletionClaim', () => {
       { name: 'generate_image', result: { deferred: true } },
     ]);
     expect(claim).toEqual({ claimed: 2, actual: 1 });
+  });
+
+  // ENG-1331 manager follow-up / ENG-1188 anti-pattern: toolCalls is the WHOLE
+  // TURN's ledger, which in an AUTOCOMPLETE work-plan session can span multiple
+  // steps/variants closed via set_work_plan_status inside the same turn. Without
+  // scoping to "since the last step boundary", an earlier variant's successful
+  // assets would mask a later variant's shortfall — the exact bug the guard exists
+  // to catch.
+  it('does NOT let an earlier step/variant\'s assets mask a later step\'s shortfall', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        // Variant 1-3: 40 successful renders, closed out via set_work_plan_status.
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', result: { success: true } },
+        // Variant 4: only 4 of the claimed 12 actually rendered.
+        ...fourScreenshots,
+      ],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('still counts the whole ledger when no step boundary is present', () => {
+    expect(
+      detectFalseCompletionClaim('All 4 sizes have been rendered, QA\'d, and saved.', fourScreenshots),
+    ).toBeNull();
+  });
+
+  it('does NOT treat a FAILED set_work_plan_status call as a step boundary', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          name: 'playwright_browser_take_screenshot',
+          result: { success: true, screenshotUrl: `https://s3.example.com/earlier-${i + 1}.png` },
+        })),
+        { name: 'set_work_plan_status', error: 'validation failed: insufficient assets' },
+        ...fourScreenshots,
+      ],
+    );
+    // The failed call never closed the step, so the earlier 40 are still "this
+    // step's" work and legitimately back the claim.
+    expect(claim).toBeNull();
   });
 
   it('takes the largest claim when multiple numeric completion claims appear', () => {
@@ -404,6 +461,22 @@ describe('buildFalseClaimCorrectionFooter', () => {
     expect(footer).toContain('4');
     expect(footer).toContain('playwright_browser_take_screenshot');
     expect(footer).toContain('https://s3.example.com/1.png');
+  });
+
+  // ENG-1331 manager follow-up: the footer must be scoped the same way the claim
+  // detection was, or the "only 4 of 12" correction would sit next to a ledger
+  // listing 44 successes from an earlier, already-closed step/variant.
+  it('scopes its ledger to since the last step boundary, excluding an earlier step\'s assets', () => {
+    const footer = buildFalseClaimCorrectionFooter(
+      { claimed: 12, actual: 4 },
+      [
+        { name: 'save_file', result: { success: true, file_url: 'https://s3.example.com/earlier-step.html' } },
+        { name: 'set_work_plan_status', result: { success: true } },
+        ...fourScreenshotsForFooterTest(),
+      ],
+    );
+    expect(footer).not.toContain('earlier-step.html');
+    expect(footer).toContain('playwright_browser_take_screenshot');
   });
 
   it('handles an empty ledger without throwing', () => {
