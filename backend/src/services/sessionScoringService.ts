@@ -67,6 +67,90 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
   return lines.join("\n");
 }
 
+/** Best-effort success/failure classification of a tool result payload. */
+function describeToolOutcome(content: unknown): "success" | "failed" | "unknown" {
+  const raw = typeof content === "string" ? content : JSON.stringify(content ?? "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (parsed.success === false || parsed.error) return "failed";
+      if (parsed.success === true) return "success";
+    }
+  } catch {
+    // Not JSON — no structured outcome to read, fall through to unknown.
+  }
+  return "unknown";
+}
+
+/**
+ * Ground-truth tool-call manifest for a session: the real count of tool calls
+ * the assistant actually made, their names, and (best-effort) outcomes.
+ *
+ * ENG-1223: a judge reading only the prose transcript can be talked into
+ * crediting a well-written simulation as if a tool had actually run. Computing
+ * this in code — rather than asking the judge to infer it from the transcript
+ * — gives the judge a fact it cannot be argued out of. Zero tool calls in the
+ * WHOLE session is called out explicitly, since that is exactly the shape of
+ * this bug's repro (attributionBasis 'selection-only', zero tool calls, but a
+ * response presenting invented account/query data as if retrieved live).
+ */
+function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: string } {
+  const entries: string[] = [];
+
+  for (const m of messages) {
+    if (m.role !== "assistant" || isRunFailurePlaceholder(m)) continue;
+    const toolCalls: Array<{ id?: string; name: string }> = (m as any).metadata?.toolCalls || [];
+    for (const tc of toolCalls) {
+      const resultMsg = tc.id
+        ? messages.find((mm: any) => mm.role === "tool" && mm.tool_call_id === tc.id)
+        : undefined;
+      const outcome = resultMsg ? describeToolOutcome((resultMsg as any).content) : "unknown";
+      entries.push(outcome === "unknown" ? tc.name : `${tc.name} (${outcome})`);
+    }
+  }
+
+  if (entries.length === 0) {
+    return {
+      count: 0,
+      text: "[TOOL CALL MANIFEST: 0 tool calls were made anywhere in this session. Any specific data the assistant's responses present as retrieved, queried, fetched, or executed via a tool (account names, IDs, numbers, query rows, etc.) was NOT obtained from a real tool call — treat it as fabricated/simulated, not verified data.]",
+    };
+  }
+
+  return {
+    count: entries.length,
+    text: `[TOOL CALL MANIFEST: ${entries.length} tool call(s) made in this session: ${entries.join(", ")}. Only data actually returned by these calls (see "tool result" lines) is verified — anything else the assistant presents as tool-derived is not.]`,
+  };
+}
+
+/**
+ * Structural backstop for ENG-1223: a judge that still credits a fabricated
+ * simulation as success despite FABRICATION_GROUNDING_CLAUSE and the tool-call
+ * manifest — the exact way Fangfang Judge scored dataAccuracy 5 while its own
+ * "reason" said "successfully simulated/executed" — is overridden rather than
+ * trusted.
+ *
+ * Scoped narrowly on purpose: it only fires when the session made ZERO tool
+ * calls AND the judge's own reason text still uses "simulat" language to
+ * describe the outcome. A normal, accurate, tool-free chat reply (where
+ * dataAccuracy 5 is correct and "simulat" never appears) is never touched.
+ */
+function applyFabricationGuard(
+  toolCallCount: number,
+  reason: string,
+  score: number,
+  dimensions: ScoringResult["dimensions"]
+): { score: number; dimensions: ScoringResult["dimensions"] } {
+  if (toolCallCount > 0 || !/simulat/i.test(reason)) {
+    return { score, dimensions };
+  }
+
+  const guardedDimensions = dimensions
+    ? { ...dimensions, dataAccuracy: 1, goalCompletion: Math.min(dimensions.goalCompletion, 2) }
+    : dimensions;
+
+  return { score: Math.min(score, 2), dimensions: guardedDimensions };
+}
+
 export const DEFAULT_SCORING_SYSTEM_PROMPT = `You are an expert at evaluating user satisfaction in AI chat sessions.
 Analyze the conversation and rate the user's satisfaction on a scale of 1-5:
 1 = Very unsatisfied (frustrated, angry, repeated failures, gave up)
@@ -234,6 +318,46 @@ IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a f
 - Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
 - Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
 - Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
+
+/**
+ * ENG-1223: Fangfang Judge scored a session 4/5 (dataAccuracy 5, goalCompletion
+ * 5) for a turn where the assistant made ZERO tool calls (attributionBasis
+ * 'selection-only') and invented a Google Ads account ("Acme Widgets Main")
+ * plus fabricated GAQL query rows, after the user pushed back on an initial
+ * "I don't have API access" response. Fangfang's own reason called this
+ * "successfully simulated/executed" — crediting a convincing simulation as
+ * equivalent to actually performing the action. Matt Judge and the general
+ * satisfaction judge both caught it (score 1 and 2); Fangfang did not, because
+ * the rubric evaluated whether the RESPONSE LOOKS like it satisfies the
+ * request, with no grounding check against whether tool calls actually
+ * occurred.
+ *
+ * The transcript is prefixed at call time with a [TOOL CALL MANIFEST: ...]
+ * line (see `buildToolCallManifest`) stating the real, code-computed count and
+ * outcome of every tool call in the session — ground truth the judge cannot
+ * talk itself out of the way it can talk itself into crediting a well-written
+ * simulation.
+ *
+ * APPENDED at call time, same reasoning as the other clauses above:
+ * production carries a live `default-scoring-prompt` AW-Settings override,
+ * and a custom `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge) is
+ * entirely user-authored. Editing only DEFAULT_SCORING_SYSTEM_PROMPT's
+ * literal text would leave whatever prompt is ACTUALLY configured blind to
+ * this rule — exactly how Fangfang's prompt missed it (ENG-392).
+ *
+ * `scoreSession`/`scoreSessionWithJudge` also apply a narrow, code-level
+ * backstop (`applyFabricationGuard`) for the case where a judge still uses
+ * "simulat" language to credit success despite this clause — see that
+ * function for why it is scoped to zero-tool-call sessions only.
+ */
+export const FABRICATION_GROUNDING_CLAUSE = `
+
+CRITICAL — ground dataAccuracy and goalCompletion in the TOOL CALL MANIFEST, not in how convincing the response reads:
+- The transcript below is prefixed with a line like "[TOOL CALL MANIFEST: ...]" stating exactly how many tool calls were made in this session, their names, and their outcomes. Treat that manifest as ground truth over the assistant's own prose — the assistant's text is not evidence that a tool was actually called.
+- If the assistant's response presents specific data as if it came from a tool or external system — account names, IDs, numbers, query rows, connected-account details, search results, etc. — but the manifest shows ZERO tool calls (or no matching tool call) that could have produced it, that data is FABRICATED. dataAccuracy must not exceed 2 in that case, no matter how plausible, specific, or well-formatted the data looks.
+- This applies even when the assistant initially said it lacked access or couldn't call a tool, and only produced the data after the user pushed back or gave a "nudge" — producing invented data on demand is not compliance, it is a worse failure than the original refusal.
+- Simulated, illustrative, example, or placeholder data presented AS IF it were real is a dataAccuracy 1 — never treat it as goal completion, regardless of how well-formatted it is.
+- Do not use language like "successfully simulated", "simulated/executed", or similar framing that credits a simulation as equivalent to actually performing the action to justify a passing score on any dimension. If explaining a high score would require saying the assistant "simulated" a result, that is a signal the score is wrong — score the fabrication instead, and reason about it plainly (e.g. "the assistant fabricated data with no tool call to back it").`;
 
 /**
  * Read the judge's zero-task verdict, failing OPEN.
@@ -764,21 +888,24 @@ export async function scoreSession(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(pageIdentifier, sessionType);
+  const manifest = buildToolCallManifest(recentMessages);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n${manifest.text}\n\n${baseConversationText}`
+    : `${manifest.text}\n\n${baseConversationText}`;
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  // Append the zero-task clause, the ENG-1312 verbosity/permission clause, and
-  // the ENG-1245 publish-approval-withholding clause to whatever prompt is
-  // configured — the stored override, if any, would otherwise mask them
-  // entirely (ENG-392/ENG-830).
+  // Append the zero-task clause, the ENG-1312 verbosity/permission clause, the
+  // ENG-1245 publish-approval-withholding clause, and the ENG-1223
+  // fabrication-grounding clause to whatever prompt is configured — the
+  // stored override, if any, would otherwise mask them entirely
+  // (ENG-392/ENG-830).
   const systemPrompt =
     (await getDefaultScoringPrompt()) +
     NO_TASK_JUDGMENT_CLAUSE +
     VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
-    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE;
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+    FABRICATION_GROUNDING_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -806,12 +933,14 @@ export async function scoreSession(
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  const reason = parsed.reason || "No reason provided";
+  const guarded = applyFabricationGuard(manifest.count, reason, score, parseDimensions(parsed));
 
   return {
-    score,
-    reason: parsed.reason || "No reason provided",
+    score: guarded.score,
+    reason,
     evaluatedMessageIndex: currentMessageCount,
-    dimensions: parseDimensions(parsed),
+    dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
   };
 }
@@ -835,9 +964,10 @@ export async function scoreSessionWithJudge(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(undefined, sessionType);
+  const manifest = buildToolCallManifest(recentMessages);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n${manifest.text}\n\n${baseConversationText}`
+    : `${manifest.text}\n\n${baseConversationText}`;
 
   const { agentModeService } = await import("./agentModeService");
 
@@ -851,16 +981,18 @@ export async function scoreSessionWithJudge(
       // Same appended clauses as the general scorer, so a custom judge cannot
       // disagree with it about whether a zero-task session is in the cohort
       // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
-      // ENG-1312 verbosity/permission dimensions, or score a real
-      // publish-approval hold as fabricated (ENG-1245) just because its own
-      // prompt predates these rules.
+      // ENG-1312 verbosity/permission dimensions, score a real publish-approval
+      // hold as fabricated (ENG-1245), or credit a fabricated simulation as
+      // success (ENG-1223 — this is literally how Fangfang Judge produced this
+      // bug) just because its own prompt predates these rules.
       {
         role: "system",
         content:
           judge.systemPrompt +
           NO_TASK_JUDGMENT_CLAUSE +
           VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
-          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE,
+          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE +
+          FABRICATION_GROUNDING_CLAUSE,
       },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
@@ -881,12 +1013,14 @@ export async function scoreSessionWithJudge(
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
   const score = Math.max(1, Math.min(5, Math.round(parsed.score)));
+  const reason = parsed.reason || "No reason provided";
+  const guarded = applyFabricationGuard(manifest.count, reason, score, parseDimensions(parsed));
 
   return {
-    score,
-    reason: parsed.reason || "No reason provided",
+    score: guarded.score,
+    reason,
     evaluatedMessageIndex: currentMessageCount,
-    dimensions: parseDimensions(parsed),
+    dimensions: guarded.dimensions,
     taskRequested: parseTaskRequested(parsed),
   };
 }
