@@ -325,3 +325,30 @@ describe('a tag we did not install is still a tag (ENG-1328 e2e finding)', () =>
     expect(out).toContain('AW-11112222333');
   });
 });
+
+/*
+ * The guard's contract is that it and RULE 7.5's detector cannot disagree about whether a
+ * page carries a tag. RULE 7.5 became case-sensitive after a lower-case `gtm-agent` URL
+ * slug on our own marketing site was reading as a live GTM container; this side has to
+ * move with it, or the two answer differently on identical HTML.
+ */
+describe('the guard and RULE 7.5 must agree on what counts as a tag (case sensitivity)', () => {
+  const withScript = (inner: string) => LAYOUT_WITH_HEAD.replace(
+    '<title>Test</title>',
+    `<title>Test</title>\n        <script>${inner}</script>`,
+  );
+
+  it('does not treat a lower-case aw- token inside a script as a foreign Ads tag', () => {
+    // Before: this read as a second, conflicting AW id and injection was refused —
+    // silently leaving a genuinely untracked page with no tag at all.
+    const layout = withScript("const utm = 'aw-123456';");
+    const out = injectGoogleAdsIntoLayout(layout, 'AW-18192751758');
+    expect(verifyGoogleAdsInjection(out, 'AW-18192751758')).toBe(true);
+  });
+
+  it('still refuses when a real, upper-case foreign id is present', () => {
+    const layout = withScript("gtag('config', 'AW-11112222333');");
+    const out = injectGoogleAdsIntoLayout(layout, 'AW-18192751758');
+    expect(out).toBe(layout);
+  });
+});

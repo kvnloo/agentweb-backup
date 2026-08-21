@@ -75,7 +75,11 @@ function foreignGoogleAdsIds(content: string): string[] {
   // hand-written loader or config call inside a script IS a live tag, whoever wrote it.
   const ids = new Set<string>();
   for (const script of withoutOurs.match(/<script[\s\S]*?(?:\/>|<\/script>)/gi) || []) {
-    for (const id of script.match(/\bAW-[0-9]{6,}\b/gi) || []) ids.add(id.toUpperCase());
+    // Case-sensitive, to hold the invariant above: RULE 7.5's detector matches upper case
+    // only (a lower-case `gtm-agent` slug was reading as a container — see the comment on
+    // detectTrackingSnippets), so matching case-insensitively here would let the two
+    // disagree about whether the very same page carries a tag.
+    for (const id of script.match(/\bAW-[0-9]{6,}\b/g) || []) ids.add(id);
   }
   return [...ids];
 }
