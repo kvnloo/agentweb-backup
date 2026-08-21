@@ -1,8 +1,10 @@
 import {
   GatewayContractError,
   GatewayRequest,
+  applyOpenRouterCacheBreakpoints,
   normalizeOpenRouterModelId,
 } from '../utils/openRouterGatewayContract';
+import * as gatewayContract from '../utils/openRouterGatewayContract';
 
 describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', () => {
   it.each([
@@ -45,5 +47,123 @@ describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', (
       logicalModelId: 'openrouter/openai/gpt-4o-mini',
       eventId: 'completion-1',
     }));
+  });
+});
+
+describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
+  const resolveUpstreamModel = (logicalModelId: string) =>
+    (gatewayContract as any).resolveOpenRouterUpstreamModelId(logicalModelId);
+
+  it('keeps the already-working explicit OpenRouter namespace behavior', () => {
+    expect(normalizeOpenRouterModelId('openrouter/openai/gpt-4o-mini')).toBe('openai/gpt-4o-mini');
+  });
+
+  it('maps an AgentWeb GPT logical id to OpenRouter provider/model form', () => {
+    expect(resolveUpstreamModel('gpt-5.5')).toBe('openai/gpt-5.5');
+  });
+
+  it('maps an AgentWeb Gemini logical id to OpenRouter provider/model form', () => {
+    expect(resolveUpstreamModel('gemini-3.7-flash')).toBe('google/gemini-3.7-flash');
+  });
+
+  it('maps every registered Bedrock Claude logical id explicitly', () => {
+    expect(resolveUpstreamModel('anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(
+      'anthropic/claude-sonnet-4.5',
+    );
+    expect(resolveUpstreamModel('anthropic.claude-opus-4-6-v1')).toBe('anthropic/claude-opus-4.6');
+    expect(resolveUpstreamModel('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(
+      'anthropic/claude-haiku-4.5',
+    );
+  });
+
+  it('fails closed when a migrated logical id has no verified OpenRouter mapping', () => {
+    expect(() => resolveUpstreamModel('unknown-direct-model')).toThrow(GatewayContractError);
+  });
+
+  it('enables only an explicitly listed task class', () => {
+    const enabled = (gatewayContract as any).isOpenRouterGatewayEnabledForTaskClass;
+    expect(enabled('interactive_chat', 'interactive_chat,content_generation')).toBe(true);
+    expect(enabled('scheduled_background', 'interactive_chat,content_generation')).toBe(false);
+    expect(enabled(undefined, 'interactive_chat')).toBe(false);
+  });
+
+  it('uses explicit cache breakpoints without mutating the caller messages', () => {
+    const messages = [
+      { role: 'system', content: 'Stable instructions' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Latest question' },
+    ];
+
+    const cached = applyOpenRouterCacheBreakpoints(messages, true);
+
+    expect(cached[0].content).toEqual([{ type: 'text', text: 'Stable instructions', cache_control: { type: 'ephemeral', ttl: '1h' } }]);
+    expect(cached[1].content).toEqual([{ type: 'text', text: 'Earlier answer', cache_control: { type: 'ephemeral', ttl: '1h' } }]);
+    expect(messages).toEqual([
+      { role: 'system', content: 'Stable instructions' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Latest question' },
+    ]);
+  });
+
+  it('defaults a one-shot machine-paced breakpoint to five minutes', () => {
+    expect(applyOpenRouterCacheBreakpoints([
+      { role: 'user', content: 'Latest question' },
+    ], false)[0].content).toEqual([{
+      type: 'text', text: 'Latest question', cache_control: { type: 'ephemeral' },
+    }]);
+  });
+
+  it('marks the last eligible text block in mixed typed content', () => {
+    const messages = [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe this image' },
+        { type: 'image_url', image_url: { url: 'https://example.com/input.png' } },
+        { type: 'text', text: 'Use one sentence' },
+      ],
+    }];
+
+    expect(applyOpenRouterCacheBreakpoints(messages, false)[0].content).toEqual([
+      { type: 'text', text: 'Describe this image' },
+      { type: 'image_url', image_url: { url: 'https://example.com/input.png' } },
+      { type: 'text', text: 'Use one sentence', cache_control: { type: 'ephemeral' } },
+    ]);
+  });
+
+  it('does not mutate nested typed content blocks', () => {
+    const messages = [{
+      role: 'system',
+      content: [{ type: 'text', text: 'Stable instructions', metadata: { source: 'policy' } }],
+    }];
+    const originalMessage = messages[0];
+    const originalContent = messages[0].content;
+    const originalBlock = messages[0].content[0];
+
+    const cached = applyOpenRouterCacheBreakpoints(messages, true);
+
+    expect(messages).toEqual([{
+      role: 'system',
+      content: [{ type: 'text', text: 'Stable instructions', metadata: { source: 'policy' } }],
+    }]);
+    expect(cached).not.toBe(messages);
+    expect(cached[0]).not.toBe(originalMessage);
+    expect(cached[0].content).not.toBe(originalContent);
+    expect(cached[0].content[0]).not.toBe(originalBlock);
+    expect(cached[0].content[0]).toEqual({
+      type: 'text',
+      text: 'Stable instructions',
+      metadata: { source: 'policy' },
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    });
+  });
+
+  it('leaves message shapes unchanged when no text block can carry a breakpoint', () => {
+    const messages = [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tool-1' }] },
+      { role: 'tool', content: [{ type: 'image_url', image_url: { url: 'https://example.com/result.png' } }] },
+      { role: 'assistant', content: null },
+    ];
+
+    expect(applyOpenRouterCacheBreakpoints(messages, true)).toEqual(messages);
   });
 });
