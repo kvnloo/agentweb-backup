@@ -22,8 +22,27 @@ jest.mock('../services/intakeService', () => ({
   }),
 }));
 
+jest.mock('../services/linearService', () => ({
+  getIssueCommentsDetailed: jest.fn().mockResolvedValue([
+    {
+      body: [
+        '<!-- customer-symptom-verification:v1 -->',
+        '- Result: pass',
+        '- Evidence type: customer-symptom',
+        '- Checked: the customer-facing symptom',
+        '- Method: independent production readback',
+        '- Verifier: post-merge-verifier/run-123',
+      ].join('\n'),
+      createdAt: '2026-08-20T00:00:00.000Z',
+    },
+  ]),
+  reopenIssue: jest.fn().mockResolvedValue(undefined),
+  addIssueComment: jest.fn().mockResolvedValue(undefined),
+}));
+
 import integrationsRouter from '../routes/integrations';
 const intake = require('../services/intakeService');
+const linear = require('../services/linearService');
 
 const app = express();
 // Mirror app.ts: raw body for the linear webhook path, json elsewhere.
@@ -48,6 +67,7 @@ function transitionIntoDone(overrides: Record<string, any> = {}): any {
     data: {
       id: 'issue-1',
       title: 'A customer bug',
+      labels: [{ name: 'Bug' }, { name: 'Customer Reported' }],
       state: { id: DONE_STATE_ID, name: 'Done', type: 'completed' },
     },
     updatedFrom: { stateId: MERGED_STATE_ID },
@@ -177,6 +197,102 @@ describe('POST /api/integrations/linear/webhook — Done-only transition gating'
     const res = await post(transitionIntoDone({ type: 'Comment' }));
     expect(res.body.notified).toBe(0);
     expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/integrations/linear/webhook — customer symptom verification gate (ENG-1268)', () => {
+  it('blocks a customer-reported bug with no verification record and explains the missing evidence', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      { body: 'Fixed in PR #123.', createdAt: '2026-08-20T00:00:00.000Z' },
+    ]);
+
+    const res = await post(transitionIntoDone());
+
+    expect(res.body).toMatchObject({ ok: false, blocked: 'customer verification required' });
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+    expect(linear.addIssueComment).toHaveBeenCalledWith(
+      'issue-1',
+      expect.stringContaining('actual customer-facing symptom'),
+    );
+  });
+
+  it('rejects the three RankAI false-fixed comment shapes as code claims, not symptom proof', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      { body: 'Fixed and deployed on 2026-07-24.', createdAt: '2026-07-24T00:00:00.000Z' },
+      { body: 'The patch merged; resolving this.', createdAt: '2026-07-30T00:00:00.000Z' },
+      { body: 'Confirmed the code is live in production.', createdAt: '2026-08-03T00:00:00.000Z' },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('rejects a marker that reports code deployment instead of a customer-facing check', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Checked: PR #123 merged',
+          '- Method: GitHub checks green',
+          '- Verifier: fix-author',
+        ].join('\n'),
+        createdAt: '2026-08-20T00:00:00.000Z',
+      },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('rejects self-authored evidence even when the structured symptom fields are present', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: [
+          '<!-- customer-symptom-verification:v1 -->',
+          '- Result: pass',
+          '- Evidence type: customer-symptom',
+          '- Checked: live customer pixel fired',
+          '- Method: raw production readback',
+          '- Verifier: fix-author',
+        ].join('\n'),
+        createdAt: '2026-08-20T00:00:00.000Z',
+      },
+    ]);
+
+    await post(transitionIntoDone());
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('fails closed on the reporter-ticket rail when expanded labels are absent', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValueOnce([
+      {
+        body: '[reporter-ticket #42 customer@example.com] Affected user: customer@example.com',
+        createdAt: '2026-08-20T00:00:00.000Z',
+      },
+    ]);
+    const event = transitionIntoDone();
+    delete event.data.labels;
+
+    await post(event);
+
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).toHaveBeenCalledWith('issue-1', 'Verifying');
+  });
+
+  it('allows a complete symptom-level verification record to reach the existing resolve bridge', async () => {
+    const res = await post(transitionIntoDone());
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+    expect(linear.reopenIssue).not.toHaveBeenCalled();
   });
 });
 
