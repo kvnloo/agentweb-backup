@@ -155,6 +155,56 @@ async function resolveOrCreateDefaultLeadList(
   return inFlight;
 }
 
+/**
+ * ENG-967: a lead list a landing page is bound to MUST be able to RECEIVE that page's
+ * submissions. The generated capture route posts to /api/webhooks/forward-lead, which
+ * rejects any list with `publicAccessEnabled !== true` with a 403 — and the visitor is
+ * still shown a success screen. Binding a private list therefore produces a page that
+ * reports "saving leads to X" while silently dropping every submission, forever.
+ *
+ * /generate has enabled public access on the list it binds since ENG-449, but the two
+ * OTHER paths that bind a list did not: PATCH /generated/:id/lead-list (the portal's
+ * lead-list picker and the agent's MCP equivalent) and /generated/:id/duplicate. A list
+ * created anywhere else — crmDb.createLeadList defaults publicAccessEnabled to false,
+ * including the auto-provisioned default list — stayed private, so those two paths wired
+ * up a page whose form could never save a lead.
+ *
+ * Idempotent (no write when the list is already public) and never throws: it returns a
+ * warning string instead, so a caller can tell the user the truth rather than report a
+ * clean save.
+ *
+ * A MISSING list is a warning, not a success. `getLeadListById` returns null for a record
+ * that no longer exists, and a page bound to one POSTs into a 404 at forward-lead — the same
+ * silent drop, one step further along. This is not hypothetical: a read of all 167
+ * AW-LandingPages records on 2026-08-21 found three bound lists absent from AW-LeadLists.
+ * Nothing here can repair that (repointing a page at a different list is a judgement call),
+ * so it is reported rather than guessed at.
+ *
+ * @returns undefined when the list accepts public submissions, else a warning message.
+ */
+async function ensureLeadListAcceptsPublicSubmissions(leadListId: string): Promise<string | undefined> {
+  try {
+    const list = await crmDb.getLeadListById(leadListId);
+    if (!list) {
+      console.warn(`[LP GENERATION] Bound lead list ${leadListId} does not exist`);
+      return (
+        `Lead list ${leadListId} no longer exists, so this page's form has nowhere to save a ` +
+        "lead and every submission will be rejected. Attach an existing list to this page in CRM."
+      );
+    }
+    if (list.publicAccessEnabled) return undefined;
+    await crmDb.updateLeadList(leadListId, { publicAccessEnabled: true });
+    console.log(`[LP GENERATION] Auto-enabled public access on lead list ${leadListId}`);
+    return undefined;
+  } catch (err) {
+    console.warn(`[LP GENERATION] Could not auto-enable public access on lead list ${leadListId}:`, err);
+    return (
+      "Lead list saved, but public form submissions could not be enabled on it, so this page's " +
+      "form will keep rejecting every lead. Enable public access on the list in CRM settings."
+    );
+  }
+}
+
 function validateBranchName(branch: string): boolean {
   return branch === "main" || branch === REUSABLE_PREVIEW_BRANCH;
 }
@@ -592,16 +642,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Auto-enable public access on the lead list so the landing page form works.
     // Only the enabling WRITE is best-effort here: a transient DB hiccup on this side
-    // effect shouldn't block generation (unlike a genuinely missing explicit list).
-    try {
-      const boundLeadList = await crmDb.getLeadListById(effectiveLeadListId);
-      if (boundLeadList && !boundLeadList.publicAccessEnabled) {
-        await crmDb.updateLeadList(effectiveLeadListId, { publicAccessEnabled: true });
-        console.log(`[LP GENERATION] Auto-enabled public access on lead list ${effectiveLeadListId}`);
-      }
-    } catch (err) {
-      console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
-    }
+    // effect shouldn't block generation (unlike a genuinely missing explicit list) — but
+    // it is REPORTED rather than discarded, or a page whose form cannot save a lead is
+    // handed back as an unqualified success.
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(effectiveLeadListId);
 
     // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
     // single<->multi would re-home deployed pages across repos/domains); the first
@@ -622,7 +666,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       googleAds,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating landing page:", {
       userId: (req as unknown as AuthenticatedRequest).user?.userId,
@@ -960,8 +1004,20 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // request field, consistent with the "no page is ever generated unbound" intent.
     const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
 
+    // ENG-967: same as /generate — a bound list that isn't publicly submittable makes the
+    // copy's form drop every lead. The carried-over list is not necessarily public (the
+    // original may predate ENG-449), and a freshly provisioned default list never is.
+    //
+    // Deliberately NOT repeating the list-level canEditItem check PATCH /lead-list runs: this
+    // list is not caller-supplied. It is either the original page's own list — and ENG-449
+    // already binds it to the copy on the strength of the "edit" authorization above — or one
+    // this caller just had provisioned. Enabling submissions on a list we are binding anyway
+    // is strictly smaller than the bind itself, so a check here would reject nothing the bind
+    // permits.
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
+
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);
     res.status(500).json({ error: "Failed to duplicate landing page" });
@@ -2821,13 +2877,30 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
       throw err;
     }
 
+    // ENG-967: wiring the page to a list the platform will not accept public submissions
+    // for is the same class of silent drop ENG-310 closed one step later in the chain —
+    // the repo gets a correct capture route, and forward-lead 403s every lead it sends.
+    // Done BEFORE the repo sync so the list is ready by the time the redeploy goes live.
+    const warnings: string[] = [];
+    if (leadListId !== null) {
+      const publicAccessWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
+      if (publicAccessWarning) warnings.push(publicAccessWarning);
+    }
+
     // ENG-310: the DB write alone means nothing. The capture route lives in the page's
     // GitHub repo, so the repo has to be told too — otherwise the site keeps 404ing on
     // /api/capture while the record cheerfully claims a lead list.
     const captureSyncWarning = await syncLeadCaptureForPage(authz.page, leadListId);
+    if (captureSyncWarning) warnings.push(captureSyncWarning);
 
     const updated = await getLandingPageById(id);
-    return res.json(captureSyncWarning ? { ...updated, captureSyncWarning } : updated);
+    if (!warnings.length) return res.json(updated);
+    // `captureSyncWarning` is the field the portal's lead-list picker already reads and shows
+    // verbatim (PageLeadListPicker.tsx), so it keeps carrying every warning — each entry is a
+    // complete sentence, so joining stays readable. `warnings` is added alongside it so a
+    // caller can tell the two failures apart instead of parsing one blob; nothing depends on
+    // it yet, and dropping the joined field would silently mute the toast.
+    return res.json({ ...updated, captureSyncWarning: warnings.join(" "), warnings });
   } catch (err) {
     console.error("PATCH /lead-list failed:", err);
     return res.status(500).json({ error: "Failed to update lead list" });
