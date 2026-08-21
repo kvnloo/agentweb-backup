@@ -391,6 +391,23 @@ describe("resolveUsageDrivers", () => {
     expect(scheduleDrivers).toHaveLength(1);
     expect(scheduleDrivers[0].scheduleId).toBe("ghost");
     expect(scheduleDrivers[0].title).toBeNull();
+    // ENG-1438: null title alone cannot say WHICH state this is. Found in production —
+    // a real deleted schedule was rendering as "Untitled scheduled task", a task that
+    // does not exist described as one that does.
+    expect(scheduleDrivers[0].scheduleExists).toBe(false);
+  });
+
+  it("ENG-1438: an EXISTING but unnamed schedule is not reported as deleted", async () => {
+    // The other half of the distinction. Both used to produce `title: null`, so the UI
+    // had one sentence for two different truths.
+    mockQuery.mockResolvedValue([
+      { date: "2026-08-02", model: OPUS, feature: "agent_task:scheduled:sched-a", costMicroUsd: 50 * USD, callCount: 5 },
+    ]);
+    mockSchedules.mockResolvedValue([{ scheduleId: "sched-a", frequency: "daily" }]);
+
+    const { scheduleDrivers } = await resolveUsageDrivers("u1", { today: "2026-08-11" });
+    expect(scheduleDrivers[0].title).toBeNull();
+    expect(scheduleDrivers[0].scheduleExists).toBe(true);
   });
 
   it("looks up schedules across every pooled member, not only the root", async () => {

@@ -139,6 +139,18 @@ export interface UsageRecommendation {
 export interface ScheduleDriver {
   scheduleId: string;
   title: string | null;
+  /**
+   * ENG-1438 — whether the schedule RECORD still exists.
+   *
+   * `title: null` used to mean two different things: a schedule deleted mid-cycle, and one
+   * that exists but was never named. The UI could only render one sentence for both, and
+   * chose "Untitled scheduled task" — which for a deleted schedule is false, and which sat
+   * next to a Confirm button that would 404 on apply.
+   *
+   * The resolver has always known the difference (the schedule lookup either found a
+   * record or did not); it simply threw it away at the boundary. Now it does not.
+   */
+  scheduleExists: boolean;
   frequency: string | null;
   shareOfTotal: number;
   callCount: number;
@@ -642,6 +654,9 @@ export async function resolveUsageDrivers(
 
     scheduleDrivers = attribution.bySchedule.map((d) => {
       const meta = byId.get(d.key);
+      // Absent record = deleted mid-cycle. Present but unnamed is a different state and
+      // must stay distinguishable — see `scheduleExists` on ScheduleDriver.
+      const scheduleExists = meta !== undefined;
       const pinnedModel = (meta as { llmModel?: string } | undefined)?.llmModel || null;
       const effectiveModel = pinnedModel || platformDefault;
       const rec = effectiveModel ? recByFromModel.get(effectiveModel) : undefined;
@@ -656,6 +671,7 @@ export async function resolveUsageDrivers(
         // under its id with a null title so the UI can say "deleted schedule",
         // rather than dropping spend the customer was charged for.
         title: meta?.scheduleName ?? null,
+        scheduleExists,
         frequency: meta?.frequency ?? null,
         shareOfTotal: d.shareOfTotal,
         callCount: d.callCount,
@@ -678,6 +694,16 @@ export async function resolveUsageDrivers(
   await Promise.all(
     ranked.map((rec) =>
       recordUsageTelemetry(usage.billingUserId, USAGE_TELEMETRY_EVENTS.recommendationShown, {
+        // ENG-1436: this event fires on every drivers read, but the panel renders
+        // recommendations ONLY when the customer is off track. In 48h of production, 31 of
+        // 60 events (52%) went to accounts that could not see them — so the `shown` leg of
+        // AC12's funnel overcounted roughly twofold and any decline rate drawn from it was
+        // wrong by about half.
+        //
+        // The event cannot be gated here without the server guessing at a render rule it
+        // does not own. Carrying `onTrack` instead makes every row — including the ones
+        // already collected — filterable, which is what the analysis actually needs.
+        onTrack: baseline.onTrack,
         fromModel: rec.fromModel,
         toModel: rec.toModel,
         estimatedDaysRecovered: rec.estimatedDaysRecovered,
@@ -735,6 +761,10 @@ export function toCustomerDrivers(resolved: ResolvedUsageDrivers) {
     scheduleDrivers: resolved.scheduleDrivers.map((d) => ({
       scheduleId: d.scheduleId,
       title: d.title,
+      // ENG-1438: crosses the customer boundary. It carries no economics — only whether
+      // the named work still exists — and without it the UI cannot tell a deleted task
+      // from an unnamed one, which is the whole defect.
+      scheduleExists: d.scheduleExists,
       frequency: d.frequency,
       shareOfTotal: d.shareOfTotal,
       callCount: d.callCount,
