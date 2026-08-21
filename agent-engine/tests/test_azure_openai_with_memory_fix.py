@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Test Azure OpenAI models with memory fix applied.
-This test verifies that gpt-4o and gpt-4.1 work after fixing the memory issue.
-"""
+"""Test gateway-backed models with the memory fix applied."""
 
 import os
 import sys
@@ -30,8 +27,8 @@ except ImportError:
 
 from task_utils import get_llm
 
-class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
-    """Test Azure OpenAI models with memory fix applied."""
+class TestOpenRouterWithMemoryFix(unittest.TestCase):
+    """The transport cutover must retain the unrelated memory initialization."""
     
     def setUp(self):
         """Set up test fixtures."""
@@ -46,15 +43,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
         """Test gpt-4o initialization with memory fix."""
         print("\n=== Testing gpt-4o with Memory Fix ===")
         
-        # Set up mock Azure credentials
-        with patch('task_utils.AzureChatOpenAI') as mock_azure:
+        with patch('openrouter_gateway.ChatOpenAI') as mock_openrouter, \
+             patch('openrouter_gateway.secrets_manager.get_openrouter_api_key', return_value='or-test-key'):
             mock_instance = Mock()
-            mock_azure.return_value = mock_instance
-            
-            # Set up environment variables for gpt-4o
-            os.environ['AZURE_OPENAI_ENDPOINT'] = 'https://test.openai.azure.com/'
-            os.environ['AZURE_OPENAI_API_KEY'] = 'test-api-key'
-            os.environ['AZURE_OPENAI_API_VERSION'] = '2024-08-01-preview'
+            mock_openrouter.return_value = mock_instance
             
             # Test gpt-4o initialization
             try:
@@ -64,12 +56,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
                 self.assertIsNotNone(llm)
                 self.assertEqual(llm_name, "azure->openai->gpt-4o")
                 
-                # Verify AzureChatOpenAI was called with correct parameters
-                mock_azure.assert_called_once()
-                call_args = mock_azure.call_args
-                self.assertEqual(call_args[1]['model_name'], 'gpt-4o')
-                self.assertEqual(call_args[1]['azure_endpoint'], 'https://test.openai.azure.com/')
-                self.assertEqual(call_args[1]['api_key'], 'test-api-key')
+                mock_openrouter.assert_called_once()
+                call_args = mock_openrouter.call_args
+                self.assertEqual(call_args[1]['model'], 'openai/gpt-4o')
+                self.assertEqual(call_args[1]['base_url'], 'https://openrouter.ai/api/v1')
                 
                 print("✅ gpt-4o initialization successful with memory fix")
                 
@@ -80,15 +70,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
         """Test gpt-4.1 initialization with memory fix."""
         print("\n=== Testing gpt-4.1 with Memory Fix ===")
         
-        # Set up mock Azure credentials
-        with patch('task_utils.AzureChatOpenAI') as mock_azure:
+        with patch('openrouter_gateway.ChatOpenAI') as mock_openrouter, \
+             patch('openrouter_gateway.secrets_manager.get_openrouter_api_key', return_value='or-test-key'):
             mock_instance = Mock()
-            mock_azure.return_value = mock_instance
-            
-            # Set up environment variables for gpt-4.1
-            os.environ['AZURE_OPENAI_ENDPOINT2'] = 'https://test2.openai.azure.com/'
-            os.environ['AZURE_OPENAI_API_KEY2'] = 'test-api-key-2'
-            os.environ['AZURE_OPENAI_API_VERSION2'] = '2024-12-01-preview'
+            mock_openrouter.return_value = mock_instance
             
             # Test gpt-4.1 initialization
             try:
@@ -98,12 +83,10 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
                 self.assertIsNotNone(llm)
                 self.assertEqual(llm_name, "azure->openai->gpt-4.1")
                 
-                # Verify AzureChatOpenAI was called with correct parameters
-                mock_azure.assert_called_once()
-                call_args = mock_azure.call_args
-                self.assertEqual(call_args[1]['model_name'], 'gpt-4.1')
-                self.assertEqual(call_args[1]['azure_endpoint'], 'https://test2.openai.azure.com/')
-                self.assertEqual(call_args[1]['api_key'], 'test-api-key-2')
+                mock_openrouter.assert_called_once()
+                call_args = mock_openrouter.call_args
+                self.assertEqual(call_args[1]['model'], 'openai/gpt-4.1')
+                self.assertEqual(call_args[1]['max_retries'], 1)
                 
                 print("✅ gpt-4.1 initialization successful with memory fix")
                 
@@ -134,7 +117,9 @@ class TestAzureOpenAIWithMemoryFix(unittest.TestCase):
                 mock_llm = Mock()
                 mock_get_llm.return_value = (mock_llm, "test-llm")
                 
-                agent = WebAgent(user_id="test", full_llm_name="test-llm")
+                # This test exercises construction and memory initialization,
+                # not the separately-covered customer cookie/S3 path.
+                agent = WebAgent(user_id=None, full_llm_name="test-llm")
                 self.assertIsNotNone(agent)
                 print("✅ WebAgent instantiated successfully with memory fix")
                 

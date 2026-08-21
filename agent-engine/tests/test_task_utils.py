@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 
 # Add parent directory to path to import task_utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from task_utils import run_python_code_in_sandbox, get_openai_llm, get_openai_llm_think
+from task_utils import run_python_code_in_sandbox, get_llm
 from browser_use.agent.views import ActionResult
 
 class TestRunPythonCodeInSandbox(unittest.TestCase):
@@ -183,15 +183,8 @@ class TestRunPythonCodeInSandbox(unittest.TestCase):
         self.assertIsNotNone(result.error)
         self.assertIn("SyntaxError", result.error)
 
-class TestOpenAIExportsEnvVar(unittest.TestCase):
-    """ENG-389: browser-use's own preflight check (browser_use/agent/views.py's
-    REQUIRED_LLM_API_ENV_VARS = {'ChatOpenAI': ['OPENAI_API_KEY']}) reads
-    OPENAI_API_KEY directly from os.environ, independent of the api_key
-    passed to ChatOpenAI's constructor. Without exporting it, every
-    openai->openai-> task failed with "The api_key client option must be
-    set..." even though the secret itself was fine - found via live testing
-    against the real pipeline (Dev tables), confirmed by inspecting the
-    installed browser-use package on the VM directly."""
+class TestOpenRouterDoesNotExportEnvVar(unittest.TestCase):
+    """Gateway construction must not replace credentials for sibling callers."""
 
     def setUp(self):
         self.original_env = os.environ.pop('OPENAI_API_KEY', None)
@@ -202,18 +195,14 @@ class TestOpenAIExportsEnvVar(unittest.TestCase):
         else:
             os.environ.pop('OPENAI_API_KEY', None)
 
-    @patch('task_utils.secrets_manager.get_openai_api_key', return_value='sk-test-key-123')
-    def test_get_openai_llm_exports_env_var(self, mock_get_key):
+    @patch('openrouter_gateway.ChatOpenAI')
+    @patch('openrouter_gateway.secrets_manager.get_openrouter_api_key', return_value='or-test-key-123')
+    def test_get_llm_does_not_export_browser_use_compatibility_key(self, mock_get_key, mock_client):
         self.assertNotIn('OPENAI_API_KEY', os.environ)
-        get_openai_llm('gpt-4o')
-        self.assertEqual(os.environ.get('OPENAI_API_KEY'), 'sk-test-key-123')
-
-    @patch('task_utils.secrets_manager.get_openai_api_key', return_value='sk-test-key-456')
-    def test_get_openai_llm_think_exports_env_var(self, mock_get_key):
+        get_llm('openai->openai->gpt-4o')
         self.assertNotIn('OPENAI_API_KEY', os.environ)
-        get_openai_llm_think('o3-mini')
-        self.assertEqual(os.environ.get('OPENAI_API_KEY'), 'sk-test-key-456')
+        mock_client.assert_called_once()
 
 
 if __name__ == '__main__':
-    unittest.main() 
+    unittest.main()

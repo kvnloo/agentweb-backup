@@ -105,10 +105,10 @@ const DIRECT_PYTHON_TEXT_PROVIDER_MODULES = [
 ] as const;
 
 const AGENT_ENGINE_ALLOWLIST = new Set<string>([
-  // Transitional text routes owned by ENG-1416. web_agent.py also contains
-  // separately documented image-generation imports that remain out of scope.
-  'task_monitor.py',
-  'task_utils.py',
+  // The only text/tool client construction seam after ENG-1450.
+  'openrouter_gateway.py',
+  // Bounded non-text capability exceptions: image generation/editing and
+  // Gemini file/video analysis. These remain tracked for ENG-1452 review.
   'web_agent.py',
 ]);
 
