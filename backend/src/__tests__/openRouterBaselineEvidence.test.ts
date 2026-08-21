@@ -213,6 +213,34 @@ describe('ENG-1423 executable baseline evidence', () => {
     expect(now).toBe(30);
   });
 
+  it('rejects a successful generation detail that arrives at the deadline', async () => {
+    let now = 0;
+
+    await expect(pollOpenRouterGenerationDetail('gen-late-success', async () => {
+      now = 30;
+      return { status: 200, body: { data: {
+        id: 'gen-late-success', model: 'openai/gpt-4o-mini', provider_name: 'OpenAI', latency: 5,
+        generation_time: 6, native_tokens_prompt: 3, native_tokens_completion: 1,
+        native_tokens_cached: 0, total_cost: 0.000001, finish_reason: 'stop',
+      } } };
+    }, {
+      maxElapsedMs: 30,
+      nowMs: () => now,
+    })).rejects.toThrow('not indexed within 30ms');
+  });
+
+  it('converts a transport rejection at the deadline to the deadline error', async () => {
+    let now = 0;
+
+    await expect(pollOpenRouterGenerationDetail('gen-timeout', async () => {
+      now = 30;
+      throw new Error('request aborted');
+    }, {
+      maxElapsedMs: 30,
+      nowMs: () => now,
+    })).rejects.toThrow('not indexed within 30ms');
+  });
+
   it('fails loudly on a non-404 generation lookup response', async () => {
     await expect(pollOpenRouterGenerationDetail(
       'gen-500',

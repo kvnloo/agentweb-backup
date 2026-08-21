@@ -96,13 +96,23 @@ export async function pollOpenRouterGenerationDetail(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const nowMs = options.nowMs ?? Date.now;
   const startedAt = nowMs();
+  const deadlineExpired = (): boolean => Math.max(0, nowMs() - startedAt) >= maxElapsedMs;
+  const deadlineError = (): Error =>
+    new Error(`OpenRouter generation ${generationId} was not indexed within ${maxElapsedMs}ms`);
   let attempts = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const elapsedMs = Math.max(0, nowMs() - startedAt);
     const remainingMs = maxElapsedMs - elapsedMs;
     if (remainingMs <= 0) break;
     attempts = attempt;
-    const response = await fetchDetail(generationId, remainingMs);
+    let response: GenerationDetailResponse;
+    try {
+      response = await fetchDetail(generationId, remainingMs);
+    } catch (error) {
+      if (deadlineExpired()) throw deadlineError();
+      throw error;
+    }
+    if (deadlineExpired()) throw deadlineError();
     if (response.status === 404) {
       const remainingAfterFetchMs = maxElapsedMs - Math.max(0, nowMs() - startedAt);
       if (attempt < maxAttempts && remainingAfterFetchMs > 0 && delayMs > 0) {
@@ -152,9 +162,7 @@ export async function pollOpenRouterGenerationDetail(
         : {}),
     };
   }
-  if (Math.max(0, nowMs() - startedAt) >= maxElapsedMs) {
-    throw new Error(`OpenRouter generation ${generationId} was not indexed within ${maxElapsedMs}ms`);
-  }
+  if (deadlineExpired()) throw deadlineError();
   throw new Error(`OpenRouter generation ${generationId} was not indexed after ${attempts} attempts`);
 }
 
