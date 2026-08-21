@@ -507,6 +507,23 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 
+  it("FAIL CASE (ENG-967): a failed enabling write is reported, not returned as a clean 201", async () => {
+    // The write stays best-effort — a DB hiccup must not block generation — but handing back
+    // an unqualified success for a page whose form cannot save a lead is the silent drop again.
+    mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
+    mockGetLeadListById.mockResolvedValue({ id: "list-123", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-123" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("page-1");
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
+  });
+
   it("SUCCESS (ENG-449 capture-or-fail): lead_list_id omitted → auto-resolves the existing default list, generation proceeds bound to it", async () => {
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
@@ -1591,6 +1608,52 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
 
     expect(res.status).toBe(201);
     expect(mockUpdateLeadList).toHaveBeenCalledWith("list-original", { publicAccessEnabled: true });
+  });
+
+  it("FAIL CASE (ENG-967): a carried-over list that no longer exists is reported, never treated as fine", async () => {
+    // Three such binds existed in production on 2026-08-21 — a page POSTing into a 404 at
+    // forward-lead. Nothing here can repair it (repointing is a judgement call), so it is said.
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-deleted",
+    });
+    mockGetLeadListById.mockResolvedValue(null);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+    expect(res.body.warnings).toEqual([expect.stringContaining("list-deleted")]);
+  });
+
+  it("FAIL CASE (ENG-967): a failed enabling write on the copy is reported, not a clean 201", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockUpdateLeadList.mockRejectedValueOnce(new Error("dynamo blip"));
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([expect.stringContaining("public")]);
   });
 
   it("SUCCESS (ENG-967): an already-public carried-over list is not re-written", async () => {

@@ -7317,6 +7317,31 @@ were written from the autofix runner, whose IAM role is denied `Scan`/`Query` on
 claim that could not be read was recorded as if it had been** — the failure mode this repo's
 own evidence rules exist to prevent.
 
+### How much of this class exists in production — measured, 2026-08-21
+
+Read-only pass over the whole table, the same logic the backfill applies: **167 landing pages,
+93 distinct page-bound lead lists.**
+
+| | count |
+| --- | --- |
+| private list bound to a page (**the defect**) | **0** |
+| already public, capturing | 27 |
+| already public, zero leads | 63 |
+| **bound list absent from `AW-LeadLists`** | **3** |
+
+**Nothing needs repairing today** — the backfill script would write zero rows, so it does not
+need running and does not need a data-plane request. It stays as the instrument for the next
+time, and as the dry-run diagnostic.
+
+⚠ **The 3 missing lists are the same failure one step further along** — a page POSTing into a
+404 at `forward-lead` rather than a 403. `list_1779684022346_4pi8auc7f` (bound to a **live,
+200-serving** generated page, `lp-demystifying-ai-agentweb-lead-18.vercel.app`),
+`list_1779490637995_k743eormt` (two Every.io records — **a managed client**; its URL did not
+respond to a probe, so its liveness is **unread, not dead**), and `list_1779299615576_cy7dj7h1i`
+(page 404s). `ensureLeadListAcceptsPublicSubmissions` now returns a warning for this state
+instead of reading it as success; repointing an existing page is a judgement call, not a
+backfill.
+
 ### Remediation for pages that are already broken
 
 `src/scripts/backfill-eng967-lead-list-public-access.ts`. The code fix only runs on a future

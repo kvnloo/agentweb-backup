@@ -173,12 +173,26 @@ async function resolveOrCreateDefaultLeadList(
  * warning string instead, so a caller can tell the user the truth rather than report a
  * clean save.
  *
+ * A MISSING list is a warning, not a success. `getLeadListById` returns null for a record
+ * that no longer exists, and a page bound to one POSTs into a 404 at forward-lead — the same
+ * silent drop, one step further along. This is not hypothetical: a read of all 167
+ * AW-LandingPages records on 2026-08-21 found three bound lists absent from AW-LeadLists.
+ * Nothing here can repair that (repointing a page at a different list is a judgement call),
+ * so it is reported rather than guessed at.
+ *
  * @returns undefined when the list accepts public submissions, else a warning message.
  */
 async function ensureLeadListAcceptsPublicSubmissions(leadListId: string): Promise<string | undefined> {
   try {
     const list = await crmDb.getLeadListById(leadListId);
-    if (!list || list.publicAccessEnabled) return undefined;
+    if (!list) {
+      console.warn(`[LP GENERATION] Bound lead list ${leadListId} does not exist`);
+      return (
+        `Lead list ${leadListId} no longer exists, so this page's form has nowhere to save a ` +
+        "lead and every submission will be rejected. Attach an existing list to this page in CRM."
+      );
+    }
+    if (list.publicAccessEnabled) return undefined;
     await crmDb.updateLeadList(leadListId, { publicAccessEnabled: true });
     console.log(`[LP GENERATION] Auto-enabled public access on lead list ${leadListId}`);
     return undefined;
@@ -628,8 +642,10 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Auto-enable public access on the lead list so the landing page form works.
     // Only the enabling WRITE is best-effort here: a transient DB hiccup on this side
-    // effect shouldn't block generation (unlike a genuinely missing explicit list).
-    await ensureLeadListAcceptsPublicSubmissions(effectiveLeadListId);
+    // effect shouldn't block generation (unlike a genuinely missing explicit list) — but
+    // it is REPORTED rather than discarded, or a page whose form cannot save a lead is
+    // handed back as an unqualified success.
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(effectiveLeadListId);
 
     // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
     // single<->multi would re-home deployed pages across repos/domains); the first
@@ -650,7 +666,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       googleAds,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating landing page:", {
       userId: (req as unknown as AuthenticatedRequest).user?.userId,
@@ -998,10 +1014,10 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // this caller just had provisioned. Enabling submissions on a list we are binding anyway
     // is strictly smaller than the bind itself, so a check here would reject nothing the bind
     // permits.
-    await ensureLeadListAcceptsPublicSubmissions(leadListId);
+    const leadListWarning = await ensureLeadListAcceptsPublicSubmissions(leadListId);
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
-    res.status(201).json(result);
+    res.status(201).json(leadListWarning ? { ...result, warnings: [leadListWarning] } : result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);
     res.status(500).json({ error: "Failed to duplicate landing page" });
