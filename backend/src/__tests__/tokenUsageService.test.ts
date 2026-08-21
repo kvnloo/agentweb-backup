@@ -112,6 +112,54 @@ describe("getUserTokenUsage - failure cases", () => {
   });
 });
 
+// ENG-1163 rework: getEffectiveLlmUsagePolicy (called unconditionally by
+// generateSharedResponse's resolveEffectiveModelForUser, right after the
+// checkTokenUsage gate) calls getUserTokenUsage directly — bypassing
+// checkTokenUsage's anon_ short-circuit entirely. Without a matching guard
+// here, an anon-owned session still throws "User not found" on its first
+// reply even after the checkTokenUsage fix, just one call deeper. Verified
+// live on the ENG-1163 preview: turn 1 500'd from this exact stack before
+// this guard was added.
+describe("getUserTokenUsage - anonymous session owner (ENG-1163)", () => {
+  it("does not throw for an anon_ userId with no AW-Users row, and never queries user records", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [] });
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalTokens).toBe(0);
+    expect(result.totalCost).toBe(0);
+    expect(result.bonus).toBe(0);
+    expect(result.month).toBe(currentMonth());
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it("sums prior anon session cost into totalCost", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({ sessions: [{ totalCost: 0.45 }] });
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalCost).toBe(0.45);
+  });
+
+  it("fails closed to the anonymous cost cap when the session-cost lookup errors", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.totalCost).toBeGreaterThan(0);
+  });
+
+  it("still throws for a real (non-anonymous) userId with no AW-Users row", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+
+    await expect(getUserTokenUsage("1746747115266")).rejects.toThrow("User not found");
+    expect(mockGetUserSessions).not.toHaveBeenCalled();
+  });
+});
+
 describe("checkTokenUsage - blocked at 100%", () => {
   it("blocks when user has used all tokens", async () => {
     mockGetUserById.mockResolvedValue({
