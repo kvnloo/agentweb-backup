@@ -906,6 +906,9 @@ describe('runCodingAgent', () => {
     const imageBlock = trBlock.content.find((b: any) => b.type === 'image');
     expect(imageBlock).toBeDefined();
     expect(imageBlock.source).toMatchObject({ type: 'base64', media_type: 'image/jpeg', data: 'BASE64IMAGEDATA' });
+    expect(mockCreate.mock.calls[1][0].fallbacks).toEqual([
+      { model: 'google/gemini-3.5-flash' },
+    ]);
   });
 
   test('take_screenshot returns a text error (no image block) when browser tools are unavailable', async () => {
@@ -1665,6 +1668,7 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
     expect(gatewayCreate.mock.calls[0][0]).toEqual(expect.objectContaining({
       provider: { allow_fallbacks: true, require_parameters: true },
       plugins: [{ id: 'context-compression' }],
+      fallbacks: [{ model: 'deepseek/deepseek-v4-flash' }],
       session_id: context.sessionId,
     }));
   });
