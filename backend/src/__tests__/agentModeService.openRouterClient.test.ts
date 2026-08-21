@@ -240,6 +240,43 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       }));
     });
 
+    it('delegates text overflow to a cheap long-context model fallback', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'openrouter/openai/gpt-4o-mini',
+        [{ role: 'user', content: 'A text payload near the context limit' }],
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        models: ['deepseek/deepseek-v4-flash'],
+      }));
+    });
+
+    it('uses a multimodal long-context fallback when the request contains an image', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'openrouter/openai/gpt-4o-mini',
+        [{ role: 'user', content: [
+          { type: 'text', text: 'Describe this image' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+        ] }],
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        models: ['google/gemini-3.5-flash'],
+      }));
+    });
+
     it('enables context compression for task-class canary traffic', async () => {
       process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
