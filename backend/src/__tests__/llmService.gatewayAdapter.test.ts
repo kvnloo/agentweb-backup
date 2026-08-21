@@ -67,12 +67,54 @@ describe('LLMService shared gateway adapter', () => {
     expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({ timeoutMs: 30 * 60 * 1000 }));
   });
 
+  it('forwards an explicit product task class instead of collapsing every caller together', async () => {
+    await new LLMService('gpt-5.5', 0.2, 1000, { taskClass: 'content_generation' })
+      .generateRaw('system', 'user');
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({
+      taskClass: 'content_generation',
+    }));
+  });
+
+  it('does not claim gateway metering when the response omits usage', async () => {
+    mockCallLLM.mockResolvedValueOnce({ choices: [{ message: { content: 'ok' } }] });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await new LLMService('gpt-5.5').generateRaw('system', 'user');
+      expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        '[LLMService] gateway response omitted usage',
+        { model: 'gpt-5.5' },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('does not double-meter a response already metered by callLLM', async () => {
     await new LLMService('gpt-5.5').generateRaw('system', 'user', undefined, {
       userId: 'user-1',
       feature: 'content_gen',
     });
     expect(mockMeterUserUsage).not.toHaveBeenCalled();
+  });
+
+  it('keeps compatibility metering fail-open while making a synchronous failure observable', async () => {
+    mockCallLLM.mockResolvedValueOnce({ choices: [{ message: { content: 'ok' } }] });
+    mockMeterUserUsage.mockImplementationOnce(() => { throw new Error('meter unavailable'); });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await expect(new LLMService('gpt-5.5').generateRaw('system', 'user'))
+        .resolves.toBe('ok');
+      expect(warn).toHaveBeenCalledWith(
+        '[LLMService] local metering failed',
+        expect.objectContaining({
+          model: 'gpt-5.5',
+          error: 'meter unavailable',
+        }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('still exposes normalized usage through the legacy callback', async () => {

@@ -7,10 +7,19 @@ const withInvoke = (service: LLMService, invoke: jest.Mock): LLMService => {
 
 describe('LLMService shared-gateway compatibility facade', () => {
   it('constructs without provider credentials or provider SDK clients', () => {
-    delete process.env.AZURE_OPENAI_API_KEY;
-    delete process.env.AZURE_OPENAI_ENDPOINT;
-    expect(() => new LLMService('gpt-5.5')).not.toThrow();
-    expect(() => new LLMService('anthropic.claude-sonnet-4-6')).not.toThrow();
+    const previousApiKey = process.env.AZURE_OPENAI_API_KEY;
+    const previousEndpoint = process.env.AZURE_OPENAI_ENDPOINT;
+    try {
+      delete process.env.AZURE_OPENAI_API_KEY;
+      delete process.env.AZURE_OPENAI_ENDPOINT;
+      expect(() => new LLMService('gpt-5.5')).not.toThrow();
+      expect(() => new LLMService('anthropic.claude-sonnet-4-6')).not.toThrow();
+    } finally {
+      if (previousApiKey === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = previousApiKey;
+      if (previousEndpoint === undefined) delete process.env.AZURE_OPENAI_ENDPOINT;
+      else process.env.AZURE_OPENAI_ENDPOINT = previousEndpoint;
+    }
   });
 
   it('createLLMService preserves the public factory contract', () => {

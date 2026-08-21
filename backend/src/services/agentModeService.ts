@@ -23,7 +23,10 @@ import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFa
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
-import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import {
+  createGeminiNativeClient,
+  normalizeProviderRequestTimeoutMs,
+} from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -2236,7 +2239,10 @@ export class AgentModeService {
                 const controller = new AbortController();
                 const timeout = setTimeout(
                   () => controller.abort(),
-                  requestOptions?.timeout ?? VERTEX_REQUEST_TIMEOUT_MS,
+                  normalizeProviderRequestTimeoutMs(
+                    requestOptions?.timeout,
+                    VERTEX_REQUEST_TIMEOUT_MS,
+                  ),
                 );
                 let response: Response;
                 try {
@@ -2501,7 +2507,10 @@ export class AgentModeService {
             });
 
             const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(requestOptions?.timeout ?? BEDROCK_REQUEST_TIMEOUT_MS),
+              abortSignal: AbortSignal.timeout(normalizeProviderRequestTimeoutMs(
+                requestOptions?.timeout,
+                BEDROCK_REQUEST_TIMEOUT_MS,
+              )),
             });
 
             // Extract response content

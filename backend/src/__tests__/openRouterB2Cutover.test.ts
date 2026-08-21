@@ -93,8 +93,8 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
   it('propagates caller timeouts through every provider wrapper', () => {
     const agentModeService = read('services/agentModeService.ts');
     const geminiNativeClient = read('services/agentMode/core/geminiNativeClient.ts');
-    expect(geminiNativeClient).toMatch(/requestTimeoutMs:\s*requestOptions\?\.timeout/);
-    expect(agentModeService).toMatch(/setTimeout\([\s\S]{0,100}requestOptions\?\.timeout\s*\?\?\s*VERTEX_REQUEST_TIMEOUT_MS/);
-    expect(agentModeService).toMatch(/AbortSignal\.timeout\(requestOptions\?\.timeout\s*\?\?\s*BEDROCK_REQUEST_TIMEOUT_MS\)/);
+    expect(geminiNativeClient).toMatch(/normalizeProviderRequestTimeoutMs\([\s\S]{0,100}opts\.requestTimeoutMs,[\s\S]{0,100}GEMINI_REQUEST_TIMEOUT_MS/);
+    expect(agentModeService).toMatch(/setTimeout\([\s\S]{0,150}normalizeProviderRequestTimeoutMs\([\s\S]{0,100}requestOptions\?\.timeout,[\s\S]{0,100}VERTEX_REQUEST_TIMEOUT_MS/);
+    expect(agentModeService).toMatch(/AbortSignal\.timeout\(normalizeProviderRequestTimeoutMs\([\s\S]{0,100}requestOptions\?\.timeout,[\s\S]{0,100}BEDROCK_REQUEST_TIMEOUT_MS/);
   });
 });

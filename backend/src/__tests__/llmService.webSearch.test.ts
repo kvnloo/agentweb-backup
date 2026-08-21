@@ -42,6 +42,7 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     );
     expect(init.method).toBe('POST');
     expect(init.headers['api-key']).toBe('test-key-xyz');
+    expect(init.signal).toBeInstanceOf(AbortSignal);
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({
       model: 'gpt-5-chat-2',
@@ -67,16 +68,34 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
   });
 
   it('surfaces a useful error on non-2xx response', async () => {
+    const readBody = jest.fn().mockResolvedValue('{"error":{"message":"bad api version"}}');
     (global as any).fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 400,
-      text: async () => '{"error":{"message":"bad api version"}}',
+      text: readBody,
     });
 
     const svc = makeService();
     await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
       /Azure Responses API 400.*bad api version/,
     );
+    expect(readBody).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces bounded response context when Azure returns invalid JSON', async () => {
+    const invalidBody = `<html>${'x'.repeat(500)}</html>`;
+    const readBody = jest.fn().mockResolvedValue(invalidBody);
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 502,
+      text: readBody,
+    });
+
+    const svc = makeService();
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
+      /Azure Responses API 502 returned invalid JSON: <html>x+/,
+    );
+    expect(readBody).toHaveBeenCalledTimes(1);
   });
 
   it('throws when AZURE_OPENAI_ENDPOINT / API_KEY are unset', async () => {
@@ -163,6 +182,7 @@ describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
       config: {
         systemInstruction: 'sys',
         tools: [{ googleSearch: {} }],
+        httpOptions: { timeout: 2 * 60 * 1000 },
       },
     });
 

@@ -68,13 +68,23 @@ describe('LLMService.generateJsonRobust', () => {
         content: '{"ok":true}',
       });
     const svc = makeService(invoke);
-    const out = await svc.generateJsonRobust<{ ok: boolean }>('sys', 'user');
-    expect(out).toEqual({ ok: true });
-    expect(invoke).toHaveBeenCalledTimes(2);
-    // Retry should have been called with a stricter system prompt
-    const secondCall = invoke.mock.calls[1][0];
-    const systemContent = String(secondCall[0]?.content || '');
-    expect(systemContent).toContain('valid JSON');
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const out = await svc.generateJsonRobust<{ ok: boolean }>('sys', 'user');
+      expect(out).toEqual({ ok: true });
+      expect(invoke).toHaveBeenCalledTimes(2);
+      // Retry should have been called with a stricter system prompt
+      const secondCall = invoke.mock.calls[1][0];
+      const systemContent = String(secondCall[0]?.content || '');
+      expect(systemContent).toContain('valid JSON');
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('first extraction failed'),
+        expect.objectContaining({ rawLength: 40, model: 'gpt-4' }),
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('I cannot generate JSON');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('throws JsonExtractError with raw snippet when both attempts fail', async () => {

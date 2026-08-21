@@ -1,11 +1,13 @@
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
 import { meterUserUsage } from '../services/usageRecorderService';
+import type { GatewayTaskClass } from './openRouterGatewayContract';
 
 export type OutputFormat = 'json' | 'xml';
 
 const STRICT_JSON_SUFFIX =
   '\n\nCRITICAL: You MUST respond with only valid JSON. No preamble, no markdown fences, no commentary. Output the JSON value and NOTHING else.';
+const WEB_SEARCH_TIMEOUT_MS = 2 * 60 * 1000;
 
 export interface LLMUsageData {
   inputTokens: number;
@@ -28,6 +30,8 @@ export interface LLMUsageContext {
 export interface LLMServiceOptions {
   /** Long generations receive a longer gateway deadline; callers still receive one final response. */
   streaming?: boolean;
+  /** Product task class for independent gateway canary and rollback. */
+  taskClass?: GatewayTaskClass;
 }
 
 type InvokeResponse = {
@@ -58,6 +62,7 @@ export class LLMService {
   private readonly temperature: number | null;
   private readonly maxTokens?: number;
   private readonly longRunning: boolean;
+  private readonly taskClass: GatewayTaskClass;
 
   constructor(
     modelName?: string,
@@ -75,6 +80,7 @@ export class LLMService {
     this.temperature = temperature;
     this.maxTokens = maxTokens;
     this.longRunning = options.streaming === true;
+    this.taskClass = options.taskClass || 'nonstandard_consumer';
     this.gatewayAdapter = { invoke: (messages) => this.invokeGateway(messages) };
     this.chatModel = this.gatewayAdapter;
   }
@@ -95,12 +101,16 @@ export class LLMService {
       max_completion_tokens: this.maxTokens,
       timeoutMs: this.longRunning ? 30 * 60 * 1000 : undefined,
       usageContext: usageContext || { feature: 'unknown' },
-      taskClass: 'nonstandard_consumer',
+      taskClass: this.taskClass,
     });
-    const usage: any = response?.usage || {};
+    const usage: any = response?.usage;
+    const hasUsage = !!usage && typeof usage === 'object';
+    if (!hasUsage) {
+      console.warn('[LLMService] gateway response omitted usage', { model: this.modelName });
+    }
     return {
       content: response?.choices?.[0]?.message?.content || '',
-      usage_metadata: {
+      usage_metadata: hasUsage ? {
         input_tokens: usage.prompt_tokens || 0,
         output_tokens: usage.completion_tokens || 0,
         total_tokens: usage.total_tokens || 0,
@@ -108,8 +118,8 @@ export class LLMService {
           cache_read: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
           cache_creation: usage.cache_creation_input_tokens || 0,
         },
-      },
-      __agentwebGatewayMetered: true,
+      } : undefined,
+      __agentwebGatewayMetered: hasUsage ? true : undefined,
     };
   }
 
@@ -151,8 +161,13 @@ export class LLMService {
           cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWriteTokens,
         });
-      } catch {
+      } catch (error) {
         // Metering remains fail-open for injected/test and direct web-search responses.
+        console.warn('[LLMService] local metering failed', {
+          model: usage.model,
+          feature: usageContext?.feature,
+          error: error instanceof Error ? error.message : error,
+        });
       }
     }
     onUsage?.(usage);
@@ -228,7 +243,8 @@ export class LLMService {
     } catch (error) {
       if (!(error instanceof JsonExtractError)) throw error;
       console.warn('[LLMService] generateJsonRobust: first extraction failed, retrying with strict prompt', {
-        firstSnippet: error.rawSnippet.slice(0, 120),
+        rawLength: error.rawSnippet.length,
+        model: this.modelName,
       });
     }
 
@@ -287,7 +303,11 @@ export class LLMService {
       const response = await new GoogleGenAI({ apiKey: apiKey.trim() }).models.generateContent({
         model: this.modelName,
         contents: userPrompt,
-        config: { systemInstruction: systemPrompt, tools: [{ googleSearch: {} }] },
+        config: {
+          systemInstruction: systemPrompt,
+          tools: [{ googleSearch: {} }],
+          httpOptions: { timeout: WEB_SEARCH_TIMEOUT_MS },
+        },
       });
       const usage = (response as any)?.usageMetadata;
       this.observeUsage({
@@ -306,25 +326,44 @@ export class LLMService {
     const apiKey = process.env.AZURE_OPENAI_API_KEY;
     if (!apiKey || !endpoint) throw new Error('AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set');
     const apiVersion = process.env.AZURE_OPENAI_RESPONSES_API_VERSION || '2025-03-01-preview';
-    const response = await fetch(`${endpoint.replace(/\/$/, '')}/openai/responses?api-version=${apiVersion}`, {
+    const url = `${endpoint.replace(/\/$/, '')}/openai/responses?api-version=${apiVersion}`;
+    const requestBody = JSON.stringify({
+      model: this.modelName,
+      instructions: systemPrompt,
+      input: userPrompt,
+      tools: [{ type: 'web_search' }],
+    });
+    const debug = process.env.LLM_WEB_SEARCH_DEBUG === '1';
+    const requestStartedAt = Date.now();
+    if (debug) {
+      console.log('[llm.webSearch] → POST', url);
+      console.log('[llm.webSearch] → headers: api-key=[redacted], Content-Type=application/json');
+      console.log('[llm.webSearch] → body:', requestBody.slice(0, 500));
+    }
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.modelName,
-        instructions: systemPrompt,
-        input: userPrompt,
-        tools: [{ type: 'web_search' }],
-      }),
+      body: requestBody,
+      signal: AbortSignal.timeout(WEB_SEARCH_TIMEOUT_MS),
     });
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Azure Responses API ${response.status}: ${body.slice(0, 300)}`);
+    const responseBody = await response.text().catch(() => '');
+    if (debug) {
+      console.log(`[llm.webSearch] ← status=${response.status} in ${Date.now() - requestStartedAt}ms`);
+      console.log('[llm.webSearch] ← body:', responseBody.slice(0, 800));
     }
-    const payload = JSON.parse(await response.text()) as {
+    if (!response.ok) {
+      throw new Error(`Azure Responses API ${response.status}: ${responseBody.slice(0, 300)}`);
+    }
+    let payload: {
       output_text?: string;
       output?: Array<{ content?: Array<{ text?: string }> }>;
       usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
     };
+    try {
+      payload = JSON.parse(responseBody);
+    } catch {
+      throw new Error(`Azure Responses API ${response.status} returned invalid JSON: ${responseBody.slice(0, 300)}`);
+    }
     const text = payload.output_text || payload.output?.flatMap((item) => item.content || [])
       .map((content) => content.text || '').filter(Boolean).join('') || '';
     this.observeUsage({
