@@ -77,6 +77,8 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLandingPagesByOwner = jest.fn();
 const mockSyncLeadCaptureFilesToRepo = jest.fn();
 const mockGetLeadListById = jest.fn();
+/** crmDb.updateLeadList — distinct from v0Service.updateLandingPageLeadList above. */
+const mockUpdateLeadListRecord = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockCanEditItem = jest.fn();
@@ -95,7 +97,10 @@ jest.mock("../services/v0Service", () => {
 jest.mock("../services/db", () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   orgDb: { getOrgById: (...a: any[]) => mockGetOrgById(...a) },
-  crmDb: { getLeadListById: (...a: any[]) => mockGetLeadListById(...a) },
+  crmDb: {
+    getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
+    updateLeadList: (...a: any[]) => mockUpdateLeadListRecord(...a),
+  },
 }));
 
 jest.mock("../services/orgShareService", () => ({
@@ -547,7 +552,12 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     mockGetLandingPageById.mockResolvedValue(rootPage);
     mockGetUserById.mockResolvedValue({ userId: "u1" });
     mockUpdateLeadList.mockResolvedValue(undefined);
-    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1" });
+    // ENG-967: a page-bound list is publicly submittable in the healthy state this suite
+    // describes. Leaving the flag off here would make every case below also exercise the
+    // enabling write and carry its warning — the binding behaviour is covered on its own in
+    // routes.landingPages.leadList.test.ts.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: true });
+    mockUpdateLeadListRecord.mockResolvedValue(undefined);
     mockGetLandingPagesByOwner.mockResolvedValue([rootPage, pricingPage, otherSitePage]);
     mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: true });
   });
@@ -644,6 +654,23 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(res.status).toBe(200);
     expect(mockSyncLeadCaptureFilesToRepo).not.toHaveBeenCalled();
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+
+  it("ENG-967: a failed public-access enable and a failed repo sync BOTH surface", async () => {
+    // Two independent failures, one response field. Reporting only the sync failure would
+    // tell the customer to check GitHub while their form keeps 403ing at forward-lead.
+    mockGetLeadListById.mockResolvedValue({ listId: "list_home", userId: "u1", publicAccessEnabled: false });
+    mockUpdateLeadListRecord.mockRejectedValue(new Error("dynamo blip"));
+    mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: false, reason: "github 500: boom" });
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p1/lead-list")
+      .send({ leadListId: "list_home" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toHaveLength(2);
+    expect(res.body.captureSyncWarning).toMatch(/public/);
+    expect(res.body.captureSyncWarning).toMatch(/boom/);
   });
 
   it("an up-to-date repo is not a warning", async () => {
