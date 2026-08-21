@@ -154,6 +154,7 @@ describe('ENG-1430: Emma has one shared record-and-charge point', () => {
         usageContext: { userId: 'user-1', sessionId: 'sess-1', feature: 'chat' },
       }),
     );
+    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
   });
 
   it('does not instantiate an Azure chat client beside callLLM', async () => {

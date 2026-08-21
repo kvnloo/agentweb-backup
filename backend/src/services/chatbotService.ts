@@ -4254,7 +4254,8 @@ export function calculateCost(
 // Helper function to log token usage
 function logTokenUsage(
   response: OpenAI.Chat.ChatCompletion,
-  context: string = ""
+  context: string = "",
+  pricingModel: string = response.model
 ) {
   const usage = response.usage;
   if (!usage) return;
@@ -4263,7 +4264,7 @@ function logTokenUsage(
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model,
+    pricingModel,
     u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
     u.cache_creation_input_tokens || 0,
     u.cache_creation_by_ttl
@@ -4891,7 +4892,8 @@ export async function generateChatResponse(
       // Log token usage for this iteration
       logTokenUsage(
         response,
-        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`,
+        activeModel,
       );
 
       // Add assistant message to messages array (for next iteration)
@@ -4909,7 +4911,7 @@ export async function generateChatResponse(
         // No tool calls - we're done
         iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
-        finalUsageData = logTokenUsage(response, "Final response");
+        finalUsageData = logTokenUsage(response, "Final response", activeModel);
         break;
       }
 

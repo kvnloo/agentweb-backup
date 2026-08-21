@@ -220,4 +220,80 @@ describe('generateChatResponse — shared interactive gateway', () => {
     );
     expect(mockCallLLM).toHaveBeenCalledTimes(2);
   });
+
+  it('propagates a rejected shared-gateway request', async () => {
+    seedSession();
+    mockCallLLM.mockRejectedValueOnce(new Error('gateway unavailable'));
+
+    await expect(generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    })).rejects.toThrow('gateway unavailable');
+  });
+
+  it('rejects a shared completion with no assistant message', async () => {
+    seedSession();
+    mockCallLLM.mockResolvedValueOnce({
+      ...makeCompletion(),
+      choices: [],
+    });
+
+    await expect(generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    })).rejects.toThrow('No response from LLM');
+  });
+
+  it('records a failed tool call and continues through the shared gateway', async () => {
+    seedSession();
+    mockCallLLM
+      .mockResolvedValueOnce({
+        ...makeCompletion('', 'openai/gpt-5.4'),
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              id: 'tool-1',
+              function: { name: 'search_user_guide', arguments: '{}' },
+            }],
+          },
+        }],
+      })
+      .mockResolvedValueOnce(makeCompletion('Recovered', 'openai/gpt-5.4'));
+    mockExecuteTool.mockRejectedValueOnce(new Error('tool unavailable'));
+
+    const result = await generateChatResponse('sess-1', 'Help', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    });
+
+    expect(typeof result === 'string' ? result : result.content).toBe('Recovered');
+    expect(typeof result === 'string' ? [] : result.toolCalls).toEqual([
+      expect.objectContaining({ id: 'tool-1', error: 'tool unavailable' }),
+    ]);
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+  });
+
+  it('prices upstream gateway responses with the logical model', async () => {
+    seedSession();
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await generateChatResponse('sess-1', 'Hello', {
+        portalType: 'customer',
+        userId: 'user-1',
+        model: 'gpt-5.4',
+      });
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(
+        /\[Token Usage\] Model: openrouter\/upstream-model .* Cost: \$[0-9]/,
+      ));
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
