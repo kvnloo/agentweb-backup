@@ -4984,7 +4984,7 @@ export class AgentModeService {
           }
 
           if (requireWorkPlanDisposition) {
-            const latestSession = await chatbotDb.getChatSession(sessionId);
+            const latestSession = await chatbotDb.getChatSession(sessionId, true);
             workPlanTurnDisposition = decideWorkPlanTurnDisposition({
               before: workPlanTurnBefore,
               after: snapshotWorkPlanTurn(latestSession),
@@ -5005,8 +5005,8 @@ export class AgentModeService {
                 content = '';
                 responseMessage = null;
                 (messages as any[]).push({
-                  role: 'user',
-                  content: '[SYSTEM — workplan control recovery] This workplan progression turn cannot end with a prose-only question or a “Next Step” paragraph. Continue the work and call set_work_plan_status when the current step is complete, or call ask_user_question for the one blocking choice. Do not repeat the prior recap.',
+                  role: 'system',
+                  content: '[SYSTEM — workplan control recovery, internal instruction, not from the user] This workplan progression turn cannot end with a prose-only question or a “Next Step” paragraph. Continue the work and call set_work_plan_status when the current step is complete, or call ask_user_question for the one blocking choice. Do not repeat the prior recap.',
                 });
                 console.warn(`AgentMode: workplan turn missing structured disposition in session ${sessionId}; retrying once`);
                 continue;
