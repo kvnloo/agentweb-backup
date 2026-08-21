@@ -1,6 +1,7 @@
 """ENG-1450 contract for the agent-engine OpenRouter cutover."""
 
 import importlib.util
+import os
 from pathlib import Path
 
 from usage_reporter import parse_full_llm_name
@@ -47,7 +48,7 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
     assert captured["model"] == "openai/gpt-4.1"
     assert captured["max_retries"] == 1
     assert captured["temperature"] == 0.0
-    assert gateway.os.environ["OPENAI_API_KEY"] == "direct-openai-key"
+    assert os.environ["OPENAI_API_KEY"] == "direct-openai-key"
     assert captured["extra_body"] == {
         "provider": {"allow_fallbacks": True, "require_parameters": True},
         "plugins": [{"id": "context-compression"}],
@@ -66,15 +67,12 @@ def test_reasoning_routes_omit_temperature(monkeypatch):
     assert "temperature" not in captured
 
 
-def test_browser_compatibility_key_is_scoped_and_restored(monkeypatch):
+def test_browser_construction_has_no_process_global_credential_shim():
     gateway = load_gateway()
-    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    web_agent_source = (AGENT_ENGINE_ROOT / "web_agent.py").read_text()
 
-    with gateway.openrouter_browser_compatibility_env():
-        assert gateway.os.environ["OPENAI_API_KEY"] == "or-test-key"
-
-    assert gateway.os.environ["OPENAI_API_KEY"] == "direct-openai-key"
+    assert not hasattr(gateway, "openrouter_browser_compatibility_env")
+    assert "openrouter_browser_compatibility_env" not in web_agent_source
 
 
 def test_openrouter_browser_model_uses_raw_tools_for_no_tool_slugs():

@@ -143,6 +143,24 @@ describe('POST /api/internal/usage', () => {
     expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
+  it('skips exact-cost overrides that could overflow a full batch in micro-USD', async () => {
+    const records = [
+      validRecord,
+      { ...validRecord, costUsdOverride: Number.MAX_VALUE },
+    ];
+    const res = await request(app)
+      .post('/api/internal/usage')
+      .send({ records })
+      .expect(202);
+
+    expect(res.body).toEqual({ accepted: 1, skipped: 1 });
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
+    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ costMicroUsd: expect.any(Number) }),
+      expect.anything()
+    );
+  });
+
   it("forwards a valid record's ledger contribution via the atomic charge write, namespaced as engine spend", async () => {
     const minimal = {
       model: 'gemini-3.5-flash',

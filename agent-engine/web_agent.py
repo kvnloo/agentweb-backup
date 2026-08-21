@@ -29,7 +29,7 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
-from openrouter_gateway import browser_tool_calling_method, openrouter_browser_compatibility_env
+from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
 from datetime import datetime, timezone
@@ -4113,11 +4113,7 @@ class WebAgent:
             ),
         }
 
-        # browser-use checks OPENAI_API_KEY independently from the credential
-        # already bound to ChatOpenAI. Scope the compatibility export to its
-        # constructor so direct OpenAI callers in this process keep their key.
-        with openrouter_browser_compatibility_env():
-            self.agent = Agent(**agent_kwargs)
+        self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
 
     async def cleanup(self):

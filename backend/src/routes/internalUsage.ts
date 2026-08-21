@@ -39,6 +39,9 @@ const router = express.Router();
 
 /** Hard cap on batch size — one task run produces far fewer records. */
 const MAX_RECORDS_PER_BATCH = 500;
+/** Keep a full batch's summed micro-USD cost within JavaScript's safe integer range. */
+const MAX_COST_USD_OVERRIDE_PER_RECORD =
+  Number.MAX_SAFE_INTEGER / (MAX_RECORDS_PER_BATCH * 1_000_000);
 
 interface IncomingUsageRecord {
   userId?: string;
@@ -55,6 +58,13 @@ interface IncomingUsageRecord {
 
 function isNonNegativeFiniteNumber(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isValidCostUsdOverride(value: unknown): value is number {
+  return (
+    isNonNegativeFiniteNumber(value) &&
+    (value as number) <= MAX_COST_USD_OVERRIDE_PER_RECORD
+  );
 }
 
 /**
@@ -88,7 +98,7 @@ function isValidRecord(record: unknown): record is IncomingUsageRecord {
   if (typeof r.model !== "string" || r.model.trim() === "") return false;
   if (!isNonNegativeFiniteNumber(r.inputTokens)) return false;
   if (!isNonNegativeFiniteNumber(r.outputTokens)) return false;
-  if (r.costUsdOverride !== undefined && !isNonNegativeFiniteNumber(r.costUsdOverride)) return false;
+  if (r.costUsdOverride !== undefined && !isValidCostUsdOverride(r.costUsdOverride)) return false;
   return true;
 }
 
@@ -238,7 +248,7 @@ router.post(
           : 0;
         const recordProvider =
           typeof record.provider === "string" && record.provider ? record.provider : "unknown";
-        const costUsdOverride = isNonNegativeFiniteNumber(record.costUsdOverride)
+        const costUsdOverride = isValidCostUsdOverride(record.costUsdOverride)
           ? record.costUsdOverride
           : undefined;
 
