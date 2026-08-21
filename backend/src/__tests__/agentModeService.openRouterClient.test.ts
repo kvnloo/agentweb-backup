@@ -302,6 +302,55 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     ]);
   });
 
+  it('reserves one capped Gemini tool slot for the web-search server tool', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+    const callerTools = Array.from({ length: 128 }, (_, index) => ({
+      type: 'function',
+      function: {
+        name: `tool_${index}`,
+        parameters: { type: 'object', properties: {} },
+      },
+    }));
+
+    try {
+      await service.callLLM(
+        'gemini-3.7-flash',
+        [{ role: 'user', content: 'Search, then use a function' }],
+        { webSearch: true, tools: callerTools } as any,
+      );
+
+      const requestTools = create.mock.calls[0][0].tools;
+      expect(requestTools).toHaveLength(128);
+      expect(requestTools.slice(0, 127).map((tool: any) => tool.function.name))
+        .toEqual(callerTools.slice(0, 127).map((tool) => tool.function.name));
+      expect(requestTools[127]).toEqual({ type: 'openrouter:web_search' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('reserving one web-search slot'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('propagates an OpenRouter tool failure without masking or retrying it', async () => {
+    const service = new AgentModeService();
+    const toolError = Object.assign(new Error('invalid tool schema'), { status: 400 });
+    const create = jest.fn().mockRejectedValue(toolError);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await expect(service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Use search' }],
+      { webSearch: true } as any,
+    )).rejects.toBe(toolError);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it('delegates ordered model fallback to OpenRouter on the wire', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });

@@ -3519,9 +3519,15 @@ export class AgentModeService {
     let boundedTools = callerTools;
     if (callerTools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
-      if (maxTools && callerTools.length > maxTools) {
-        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        boundedTools = callerTools.slice(0, maxTools);
+      const callerToolLimit = typeof maxTools === 'number'
+        ? Math.max(0, maxTools - (webSearch ? 1 : 0))
+        : undefined;
+      if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
+        console.warn(
+          `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+        );
+        boundedTools = callerTools.slice(0, callerToolLimit);
       }
     }
     // OpenRouter normalizes the transport, but the selected provider still
