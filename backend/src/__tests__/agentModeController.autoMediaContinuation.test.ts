@@ -23,6 +23,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { requestCancel } from '../utils/sseProgress';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { checkTokenUsage } from '../services/tokenUsageService';
 
 jest.mock('../services/durableLandingService', () => ({
   findInFlightJobForSession: jest.fn().mockResolvedValue(null),
@@ -115,6 +116,7 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const mockRequestCancel = requestCancel as jest.Mock;
 const mockSendOncallAlert = sendAgentModeOncallAlert as jest.Mock;
+const mockCheckTokenUsage = checkTokenUsage as jest.Mock;
 
 describe('AgentModeController - automatic media-batch continuation (ENG-1239)', () => {
   const mockUserId = 'user-media-batch';
@@ -333,6 +335,94 @@ describe('AgentModeController - automatic media-batch continuation (ENG-1239)', 
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
 
     consoleErrorSpy.mockRestore();
+  });
+
+  /**
+   * ENG-1239 (rework, code review): every other generateSessionResponse call site gates on
+   * the customer's token/cost allowance before generating — scheduleAutoMediaContinuation
+   * bypassed that gate entirely, which would let an auto-continuation generate (and bill)
+   * an image for a customer whose allowance is already exhausted. The fix added a
+   * checkTokenUsage call before claiming the session lock; these two tests cover the
+   * skip-on-exhausted and fail-closed-on-error branches, which had no coverage.
+   */
+  describe('checkTokenUsage entitlement gate', () => {
+    it('does NOT auto-continue when the customer has exhausted their usage allowance', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      // The customer's own turn 1 request passes through its own, separate checkTokenUsage
+      // gate (agentModeController's main request handler) before ever reaching
+      // scheduleAutoMediaContinuation's gate — queue that first call as allowed so turn 1
+      // succeeds normally, then make the auto-continuation's OWN check the exhausted one.
+      mockCheckTokenUsage
+        .mockResolvedValueOnce({
+          allowed: true, warning: false, used: 0, allowance: 100,
+          bonus: 0, effectiveAllowance: 100, percentUsed: 0, month: '2026-08',
+        })
+        .mockResolvedValueOnce({
+          allowed: false, warning: true, used: 100, allowance: 100,
+          bonus: 0, effectiveAllowance: 100, percentUsed: 100, month: '2026-08',
+        });
+
+      // Turn 1 (the customer's real request): 3 images succeed, the 4th is deferred.
+      mockWorkerService.runInWorker.mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      );
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush();
+
+      // The usage check ran before any continuation work, and no second worker turn
+      // (the auto-continuation itself) was ever attempted — no image generated, no charge.
+      expect(mockCheckTokenUsage).toHaveBeenCalledWith(mockUserId);
+      expect(mockCheckTokenUsage).toHaveBeenCalledTimes(2);
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('usage limit'),
+      );
+      // The manual "continue" prompt is left as the customer's only path — no lock held.
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(mockIoEmit).not.toHaveBeenCalled();
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('fails closed (does not auto-continue) when the usage check itself errors', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      // Same reasoning as above: turn 1's own gate must pass first so it reaches the
+      // deferred state; the auto-continuation's own check is the one that errors.
+      mockCheckTokenUsage
+        .mockResolvedValueOnce({
+          allowed: true, warning: false, used: 0, allowance: 100,
+          bonus: 0, effectiveAllowance: 100, percentUsed: 0, month: '2026-08',
+        })
+        .mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+      mockWorkerService.runInWorker.mockResolvedValueOnce(
+        workerResponse(
+          '⚠️ Media generation paused for this turn — 3 of 4 images are done. Reply "continue" to get the last one.',
+          [imageToolCall(1), imageToolCall(2), imageToolCall(3), deferredToolCall()],
+        ),
+      );
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(), res);
+      await flush();
+
+      // A lookup failure must not be treated as "allowed" — no continuation attempt,
+      // no crash (this call site is unawaited fire-and-forget and must never reject).
+      expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('usage check failed'),
+        expect.any(Error),
+      );
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+      expect(mockIoEmit).not.toHaveBeenCalled();
+
+      consoleErrorSpy.mockRestore();
+    });
   });
 
   /**

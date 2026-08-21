@@ -234,6 +234,54 @@ export function resolveSchedulePublishAuthorization(
 }
 
 /**
+ * ENG-1245 — WHY a schedule resolves to unauthorized, for accurate owner-facing
+ * reporting only. Deliberately NOT part of `SchedulePublishAuthorization`'s own
+ * shape (asserted with exact-object equality across every case above) — this is
+ * read solely by the prompt-construction call site that decides which withheld
+ * explanation to show the owner.
+ *
+ * Session 0e5af215 (2026-08-15) and every daily run since — through today —
+ * told the owner "you turned ON Require approval before publishing, turn it
+ * OFF to unblock." The live schedule record has `requirePublishApproval:
+ * false`. The real reason: this schedule was never granted standing
+ * autopublish authorization, and its `requiredFunctionCalls` names no publish
+ * tool, so the legacy opt-out above finds no scope and falls to UNAUTHORIZED.
+ * Telling the owner to flip a switch that is already off fixes nothing and
+ * hides a real regression (ENG-1245) — it also happens to point at "Publish
+ * without my review" wording that does not exist anywhere in the schedule UI,
+ * which only ever offers "Require approval before publishing".
+ *
+ * Only the literal `requirePublishApproval === true` case is that specific,
+ * named toggle. Two other unauthorized cases are worth telling apart too — not
+ * everything collapses to "never asked":
+ *
+ *  - `'revoked'` — `autopublishAuthorized === false`, an explicit owner decision,
+ *    just not the "Require approval before publishing" toggle. Reporting this as
+ *    "not been granted" (implying nobody ever considered it) would understate a
+ *    real choice the owner made.
+ *  - `'not_granted'` — everything else: truly never asked, or a grant with no
+ *    approved tool scope (consent given but nothing usable — there is no active
+ *    grant right now, and unlike an explicit `false` this was never a deliberate
+ *    "no").
+ */
+export type PublishAuthorizationWithholdReason = 'require_publish_approval' | 'revoked' | 'not_granted';
+
+export function describePublishAuthorizationWithholdReason(
+  schedule: SchedulePublishAuthorizationInput | null | undefined
+): PublishAuthorizationWithholdReason | undefined {
+  if (!schedule) return undefined;
+  // CodeRabbit: this function only explains WHY a schedule is withheld — it must
+  // never assert a withholding reason for a schedule that resolveSchedulePublishAuthorization
+  // says is actually authorized (e.g. a usable explicit grant). Every current
+  // caller already guards on `.authorized` before reaching here, but the
+  // function's own contract has to hold for any caller that doesn't.
+  if (resolveSchedulePublishAuthorization(schedule).authorized) return undefined;
+  if (schedule.requirePublishApproval === true) return 'require_publish_approval';
+  if (schedule.autopublishAuthorized === false) return 'revoked';
+  return 'not_granted';
+}
+
+/**
  * Narrow a schedule's required-function list to what this run is actually allowed
  * to be nudged for.
  *
