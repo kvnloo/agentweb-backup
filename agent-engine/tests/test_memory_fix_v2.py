@@ -224,7 +224,9 @@ def test_web_agent_with_memory_fix_v2():
             mock_llm = Mock()
             mock_get_llm.return_value = (mock_llm, "test-llm")
             
-            agent = WebAgent(user_id="test", full_llm_name="test-llm")
+            # Cookie/S3 integration is covered separately; this assertion is
+            # only about memory initialization during agent construction.
+            agent = WebAgent(user_id=None, full_llm_name="test-llm")
             assert agent is not None
             print("✅ WebAgent instantiated successfully with enhanced memory fix")
             
