@@ -87,13 +87,13 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     const readBody = jest.fn().mockResolvedValue(invalidBody);
     (global as any).fetch = jest.fn().mockResolvedValue({
       ok: true,
-      status: 502,
+      status: 200,
       text: readBody,
     });
 
     const svc = makeService();
     await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      /Azure Responses API 502 returned invalid JSON: <html>x+/,
+      /Azure Responses API 200 returned invalid JSON: <html>x+/,
     );
     expect(readBody).toHaveBeenCalledTimes(1);
   });
