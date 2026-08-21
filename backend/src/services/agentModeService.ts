@@ -3040,10 +3040,15 @@ export class AgentModeService {
     // default-visible pick regardless of how they benchmark).
     // resolveGenerationModel/resolveFallbackModel are untouched — an
     // existing session or schedule pinned to either id is unaffected.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Google accepts at most 128 function declarations per request. This limit
+    // applies whether Gemini is reached directly or through OpenRouter: the
+    // gateway can fail over transports, but it cannot make an invalid upstream
+    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
+    // catalog, so omitting this cap made Gemini fail deterministically with 400.
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
     // live against three independent sources (ai.google.dev/deepmind.google/
     // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
@@ -3055,7 +3060,7 @@ export class AgentModeService {
     // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,

@@ -203,7 +203,7 @@ describe('shortenInviteNoteToLimit — gateway attribution', () => {
   it('does not require usage metadata from the gateway response', async () => {
     const longNote = 'x'.repeat(260);
     const shortNote = 'Fang, fits fine.';
-    const { client } = makeClient([json(shortNote)]);
+    const { create, client } = makeClient([json(shortNote)]);
 
     await shortenInviteNoteToLimit(client, longNote, 200, 2, 'user-1', 'sess-1');
 

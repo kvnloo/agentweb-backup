@@ -30,6 +30,7 @@ import {
 } from '../services/unipileConnectionsDb';
 import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
 import { deleteSentInvitationsByProfileUrls } from '../services/unipileSentInvitationsDb';
+import { agentModeService } from '../services/agentModeService';
 
 export {
   sentInvitationChanged,

@@ -97,7 +97,7 @@ export class LLMService {
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: 'nonstandard_consumer',
     });
-    const usage = response?.usage || {};
+    const usage: any = response?.usage || {};
     return {
       content: response?.choices?.[0]?.message?.content || '',
       usage_metadata: {
