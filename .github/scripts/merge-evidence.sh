@@ -222,7 +222,7 @@ if [ -z "${pr_state}" ] || [ -z "${pr_mergeable}" ]; then
 fi
 
 head_sha="$(printf '%s' "${head_sha}" | tr '[:upper:]' '[:lower:]')"
-if ! printf '%s' "${head_sha}" | grep -qE '^[0-9a-f]{40}$'; then
+if ! grep -qE '^[0-9a-f]{40}$' <<<"${head_sha}"; then
   surface 'gh pr view response (raw)' "${pr_json}"
   hard_fail "unparseable head SHA for ${REPO}#${PR_NUMBER}: '${head_sha}'. Every check result below is keyed on this SHA, so a bad value would silently evaluate the wrong commit."
 fi
@@ -456,7 +456,7 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
 fi
 
 effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
-if ! printf '%s' "${effective_count}" | grep -qE '^[0-9]+$'; then
+if ! grep -qE '^[0-9]+$' <<<"${effective_count}"; then
   hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"
 fi
 

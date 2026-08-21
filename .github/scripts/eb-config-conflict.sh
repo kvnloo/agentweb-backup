@@ -142,7 +142,7 @@ matched_needles() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       printf '%s\n' "${needle}"
     fi
   done
@@ -153,7 +153,7 @@ contains_any() {
   local content="$1" needle
   shift
   for needle in "$@"; do
-    if printf '%s' "${content}" | grep -qF "${needle}"; then
+    if grep -qF "${needle}" <<<"${content}"; then
       return 0
     fi
   done
