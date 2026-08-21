@@ -10,15 +10,12 @@
 import { normalizeUsageFromResponse } from '../../utils/llmClients';
 import { computeCostMicroUsd } from '../../services/usageRecorderService';
 import { getModelPrice } from '../../utils/llmPricing';
+import {
+  normalizeOpenRouterModelId,
+  type GatewayTaskClass,
+} from '../../utils/openRouterGatewayContract';
 
-export type BaselineTaskClass =
-  | 'interactive_chat'
-  | 'scheduled_background'
-  | 'content_generation'
-  | 'mcp_api'
-  | 'agent_engine'
-  | 'coding_agent'
-  | 'nonstandard_consumer';
+export type BaselineTaskClass = GatewayTaskClass;
 
 export interface BaselineFixture {
   fixtureId: string;
@@ -251,7 +248,7 @@ export function getBaselineFixture(fixtureId: string): BaselineFixture | undefin
 
 export function buildBaselineRequest(fixture: BaselineFixture, logicalModel: string): Record<string, unknown> {
   return {
-    model: logicalModel.startsWith('openrouter/') ? logicalModel.slice('openrouter/'.length) : logicalModel,
+    model: normalizeOpenRouterModelId(logicalModel),
     messages: fixture.messages,
     max_completion_tokens: fixture.outputKind === 'structured_json' ? 256 : 96,
     ...(fixture.tools ? { tools: fixture.tools, tool_choice: fixture.toolChoice } : {}),
