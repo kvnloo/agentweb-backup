@@ -1025,6 +1025,49 @@ interface LLMCallOptions {
   fallbackModels?: string[];
 }
 
+function nonNegativeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : 0;
+}
+
+/**
+ * Convert an OpenAI-compatible usage object into the ledger's disjoint token
+ * dimensions. OpenRouter follows OpenAI's contract: `prompt_tokens` includes
+ * cache reads and `prompt_tokens_details.cached_tokens` identifies that subset.
+ * Our ledger prices uncached input and cache reads separately, so forwarding
+ * both fields verbatim double-counts the cached portion.
+ *
+ * Provider-native Bedrock/Vertex adapters already report uncached input and
+ * cache reads as disjoint counters; their existing semantics stay unchanged.
+ * External counters are finite/non-negative and the OpenRouter cache subset is
+ * bounded by its prompt total so malformed provider data cannot inflate usage.
+ */
+function normalizeCallUsageTokens(usage: any, provider: string): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+} {
+  const promptTokens = nonNegativeTokenCount(usage?.prompt_tokens);
+  const outputTokens = nonNegativeTokenCount(usage?.completion_tokens);
+  const providerCacheReadTokens = nonNegativeTokenCount(usage?.cache_read_input_tokens);
+  const openAiCacheReadTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cached_tokens);
+  const reportedCacheReadTokens = providerCacheReadTokens || openAiCacheReadTokens;
+  const cacheReadTokens = provider === 'openrouter'
+    ? Math.min(promptTokens, reportedCacheReadTokens)
+    : reportedCacheReadTokens;
+
+  return {
+    inputTokens: provider === 'openrouter'
+      ? promptTokens - cacheReadTokens
+      : promptTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens: nonNegativeTokenCount(usage?.cache_creation_input_tokens),
+  };
+}
+
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
@@ -3578,6 +3621,7 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
             // ENG-200: meter the main agent turn — record shadow burn AND charge
             // the per-user cost cap when a real user is attributable (org members
             // resolve to the owner). Cost (incl. cache tokens) is computed once
@@ -3597,10 +3641,10 @@ export class AgentModeService {
               // the "retries defeat charge dedup" Greptile P1 for the highest-
               // volume metering site in the codebase.
               eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: usage.prompt_tokens || 0,
-              outputTokens: usage.completion_tokens || 0,
-              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
-              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
               // OpenRouter's cost is authoritative for OpenRouter-billed calls.
