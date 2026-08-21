@@ -105,10 +105,13 @@ describe('POST /api/subscription/usage-runway/decline', () => {
     // the handler runs, so that would have tested the body parser, not this bound.
     const many = Array.from({ length: 500 }, (_, i) => ({ fromModel: `m${i}`, toModel: 'b' }));
 
-    await request(app)
+    const res = await request(app)
       .post('/api/subscription/usage-runway/decline')
       .send({ reason: DECLINE_REASONS.previewCleared, selections: many });
 
+    // Asserted first: forwarding the right argument and then answering 500 would
+    // otherwise pass this test, which is the failure mode the whole file is about.
+    expect(res.status).toBe(200);
     const forwarded = mockRecord.mock.calls[0][1].selections;
     expect(forwarded).toHaveLength(MAX_DECLINE_SELECTIONS);
     expect(forwarded[0].fromModel).toBe('m0');
@@ -141,13 +144,16 @@ describe('POST /api/subscription/usage-runway/decline', () => {
   });
 
   it('writes nothing: the route never touches the apply or preview paths', async () => {
-    await request(app)
+    const res = await request(app)
       .post('/api/subscription/usage-runway/decline')
       .send({
         reason: DECLINE_REASONS.previewCleared,
         selections: [{ fromModel: 'a', toModel: 'b' }],
       });
 
+    // "Called exactly once" is true of a request that then failed, so the status is
+    // asserted too — otherwise this passes on a route that records and then 500s.
+    expect(res.status).toBe(200);
     // The only collaborator a decline is allowed to have. If a future edit makes this
     // route apply or preview something, this fails rather than silently writing a model.
     expect(mockRecord).toHaveBeenCalledTimes(1);
