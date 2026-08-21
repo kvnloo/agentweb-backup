@@ -667,9 +667,21 @@ export async function resolveUsageDrivers(
         recommendedModel: rec?.toModel ?? null,
         estimatedDaysRecovered: rec?.estimatedDaysRecovered ?? null,
         confidence: rec?.confidence ?? null,
-        // A schedule deleted mid-cycle still consumed the allowance. Report it
-        // under its id with a null title so the UI can say "deleted schedule",
-        // rather than dropping spend the customer was charged for.
+        // A schedule deleted mid-cycle still consumed the allowance, so it is reported
+        // under its id rather than dropped — dropping it would make the driver list
+        // total less than the bill, which is the failure `reconciles` exists to catch.
+        //
+        // ENG-1439: this comment used to claim the UI says "deleted schedule". It does
+        // not, and cannot usefully: `ScheduleSwitchList` is the ONLY consumer of
+        // `scheduleDrivers`, and it shows only rows with a switch to offer — so a
+        // deleted schedule (which has no actionable switch) is invisible to the
+        // customer, as is any other spend without an available action. Measured in
+        // production 2026-08-21: 4 deleted schedules held $16.82, 7.3% of all
+        // schedule-attributed spend that cycle.
+        //
+        // The field is real and load-bearing for reconciliation and for
+        // `scheduleExists`; it is simply not yet rendered. Stated plainly here rather
+        // than described as behaviour that exists.
         title: meta?.scheduleName ?? null,
         scheduleExists,
         frequency: meta?.frequency ?? null,
