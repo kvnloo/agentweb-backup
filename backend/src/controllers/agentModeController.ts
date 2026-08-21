@@ -2663,7 +2663,18 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
 // avoid. The marker is emitted only on the withheld branch, so it distinguishes a
 // deliberate, complete withhold from a genuine mid-run halt.
-const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+//
+// ENG-1245: three variants, not one. getScheduledSessionOverride's withheld branch
+// used to always end on the same sentence regardless of WHY the run is withheld —
+// which meant a schedule that was simply never granted standing publish
+// authorization (or had a prior grant revoked) still had its own terminal marker
+// assert "requires approval before publishing", even though that specific owner
+// setting is off and uninvolved. The marker's JOB (end the run, suppress the
+// confirmation-halt classifier) doesn't depend on which is true, so all three
+// variants get the same infra treatment — only their wording differs, matching
+// whichever explanation the model actually gave immediately above it.
+const PUBLISH_WITHHELD_MARKER =
+  /PUBLISH WITHHELD:\s*this schedule('s publish authorization has been revoked| (requires approval before publishing|has not been granted standing publish authorization))/i;
 
 // NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
 // must confirm the run was actually withheld before honouring it — see the
