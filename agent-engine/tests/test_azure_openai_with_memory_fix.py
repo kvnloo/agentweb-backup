@@ -117,7 +117,9 @@ class TestOpenRouterWithMemoryFix(unittest.TestCase):
                 mock_llm = Mock()
                 mock_get_llm.return_value = (mock_llm, "test-llm")
                 
-                agent = WebAgent(user_id="test", full_llm_name="test-llm")
+                # This test exercises construction and memory initialization,
+                # not the separately-covered customer cookie/S3 path.
+                agent = WebAgent(user_id=None, full_llm_name="test-llm")
                 self.assertIsNotNone(agent)
                 print("✅ WebAgent instantiated successfully with memory fix")
                 
