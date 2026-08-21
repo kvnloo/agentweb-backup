@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _rollbackEditedFiles } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -60,6 +60,7 @@ const mockCreate = jest.fn();
 const mockClient = {
   messages: { create: mockCreate }
 } as any;
+_setDeploymentSleepForTest(async () => {});
 
 describe('applySearchReplace', () => {
   // --- FAIL CASES ---

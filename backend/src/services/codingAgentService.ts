@@ -172,6 +172,12 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && (error.name === 'AbortError' || /cancelled|aborted/i.test(error.message));
 }
 
+// Injectable only so deployment-polling tests do not wait on Vercel's real interval.
+let deploymentSleep: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+export function _setDeploymentSleepForTest(fn: (ms: number) => Promise<void>): void {
+  deploymentSleep = fn;
+}
+
 function isBuildOrDeploymentFailure(result: CodingAgentResult): boolean {
   const text = `${result.message || ''} ${result.acceptance?.summary || ''}`.toLowerCase();
   return /build failed|vercel build failed|deployment failed|buildstatus["']?\s*:\s*["']?error|failed to deploy/.test(text);
@@ -1425,7 +1431,7 @@ async function executeTool(
           if (attempt < MAX_POLL_ATTEMPTS) {
             console.log(`[CODING AGENT] check_deployment: branch="${branch}" status="${lastData.buildStatus}" (attempt ${attempt}/${MAX_POLL_ATTEMPTS}), retrying in ${POLL_INTERVAL_MS / 1000}s...`);
             throwIfAborted(context.abortSignal);
-            await _sleepFn(POLL_INTERVAL_MS);
+            await deploymentSleep(POLL_INTERVAL_MS);
             throwIfAborted(context.abortSignal);
           }
         }
