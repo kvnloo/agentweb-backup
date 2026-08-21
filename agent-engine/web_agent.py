@@ -12,9 +12,7 @@ import browser_use
 from browser_use import Agent, Controller
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import BrowserContextConfig, BrowserContext
-from langchain_aws import ChatBedrock
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from pydantic import SecretStr, BaseModel
+from pydantic import BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
@@ -22,7 +20,7 @@ import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
-from aws_utils import get_dynamodb_resource, get_bedrock_client, get_s3_client
+from aws_utils import get_dynamodb_resource, get_s3_client
 import time
 import asyncio
 import random
@@ -31,6 +29,7 @@ import base64  # Add at the top with other imports
 import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
+from openrouter_gateway import browser_tool_calling_method
 from knowledge_base_utils import get_knowledge_base_manager
 from partial_extraction import collect_partial_extraction, build_incomplete_run_message
 from datetime import datetime, timezone
@@ -53,8 +52,8 @@ TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 # Azure AI Services credentials used for image generation/editing (gpt-image-*, FLUX.*).
 # Sourced from the environment so the resource can be rotated without a code change.
 #
-# These are deliberately SEPARATE from the AZURE_OPENAI_*2 pair used by the chat client in
-# task_utils.get_azure_openai_llm2(). Image generation and chat historically shared
+# These are deliberately SEPARATE from the retired AZURE_OPENAI_*2 chat pair.
+# Image generation and chat historically shared
 # AZURE_OPENAI_API_KEY2 while pointing at different resources, so repointing the image
 # endpoint alone would authenticate the new endpoint with the old resource's key (401).
 # Endpoint and key move together as a pair.
@@ -88,7 +87,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 global_use_vision = True
-global_tool_calling_method_for_azure: Optional[str] = "function_calling"
 
 controller = Controller()
 
@@ -4109,15 +4107,12 @@ class WebAgent:
             "max_failures": 5,
             "retry_delay": 60,
             "generate_gif": self.generate_gif,
-            "validate_output": validate_output
+            "validate_output": validate_output,
+            "tool_calling_method": browser_tool_calling_method(
+                getattr(self.llm, "model_name", "")
+            ),
         }
 
-        # Conditionally add tool_calling_method for Azure OpenAI LLMs
-        # self.llm_name is available from __init__ (e.g., "azure->openai->gpt-4o")
-        if self.llm_name and "azure->openai" in self.llm_name.lower() and global_tool_calling_method_for_azure:
-            agent_kwargs["tool_calling_method"] = global_tool_calling_method_for_azure
-            logger.info(f"Using tool_calling_method '{global_tool_calling_method_for_azure}' for Azure OpenAI LLM.")
-        
         self.agent = Agent(**agent_kwargs)
         logger.info("Agent initialized successfully.")
 
