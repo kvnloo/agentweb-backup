@@ -78,6 +78,52 @@ export interface GatewayResponse<T> {
   usage: GatewayUsage;
 }
 
+type OpenRouterCacheControl = { type: 'ephemeral'; ttl?: '1h' };
+
+/**
+ * Add Anthropic-compatible explicit cache breakpoints without mutating caller messages.
+ *
+ * OpenRouter's top-level automatic `cache_control` currently restricts routing to
+ * Anthropic's first-party endpoint. Explicit content-block breakpoints preserve
+ * the same TTL behavior across Anthropic, Bedrock, and Vertex, so OpenRouter can
+ * still own provider failover. The two normal checkpoints mirror AgentWeb's
+ * incumbent Bedrock behavior: the stable system prefix and the conversation
+ * prefix immediately before the newest message.
+ */
+export function applyOpenRouterCacheBreakpoints(messages: readonly any[], humanPaced: boolean): any[] {
+  const result = [...messages];
+  const cacheControl: OpenRouterCacheControl = humanPaced
+    ? { type: 'ephemeral', ttl: '1h' }
+    : { type: 'ephemeral' };
+  const checkpoints = new Set<number>(result.length > 2 ? [result.length - 2] : []);
+  for (let index = result.length - 1; index >= 0; index -= 1) {
+    if (result[index]?.role === 'system') { checkpoints.add(index); break; }
+  }
+
+  const applyAt = (index: number): boolean => {
+    const message = result[index];
+    if (!message || typeof message.content !== 'string' || message.content.length === 0) return false;
+    result[index] = {
+      ...message,
+      content: [{ type: 'text', text: message.content, cache_control: cacheControl }],
+    };
+    return true;
+  };
+
+  let applied = false;
+  for (const index of checkpoints) applied = applyAt(index) || applied;
+
+  // Short one-shot calls may have neither a system message nor a conversation
+  // prefix. Cache their last text block, matching top-level automatic caching.
+  if (!applied) {
+    for (let index = result.length - 1; index >= 0; index -= 1) {
+      if (applyAt(index)) break;
+    }
+  }
+
+  return result;
+}
+
 /**
  * Convert AgentWeb's OpenRouter logical ID to a validated upstream wire ID.
  *

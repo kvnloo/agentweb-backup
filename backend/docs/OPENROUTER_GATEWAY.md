@@ -41,7 +41,10 @@ removing it rolls back without a code deploy or persisted-data change. Both
 surfaces use the same `AgentModeService.callLLM` boundary, so the sidebar no
 longer selects provider clients, retries, or meters independently. OpenRouter receives
 `allow_fallbacks=true` and owns upstream-provider recovery; AgentWeb performs no
-additional retry for a gateway request.
+additional retry for a gateway request. Claude prompt caching uses explicit
+content-block breakpoints rather than OpenRouter's top-level automatic flag:
+the explicit form preserves routing across Anthropic, Bedrock, and Vertex while
+retaining the existing five-minute and human-paced one-hour TTL behavior.
 
 ## Direct text/chat/tool inventory at baseline
 

@@ -292,8 +292,18 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       model: 'anthropic/claude-sonnet-5',
       session_id: 'session-1',
-      cache_control: { type: 'ephemeral', ttl: '1h' },
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: 'Hello',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          }],
+        },
+      ],
     }));
+    expect(create.mock.calls[0][0]).not.toHaveProperty('cache_control');
   });
 
   it('does not add an AgentWeb retry loop on top of OpenRouter provider fallback', async () => {

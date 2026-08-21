@@ -104,6 +104,7 @@ import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
+  applyOpenRouterCacheBreakpoints,
   isOpenRouterGatewayEnabledForTaskClass,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
@@ -3395,12 +3396,10 @@ export class AgentModeService {
         params.session_id = usageContext.sessionId;
       }
       if (upstreamModel.startsWith('anthropic/')) {
-        // Top-level automatic caching advances the breakpoint as the agent
-        // conversation grows. Five minutes is the OpenRouter default; only a
-        // human-paced conversation pays for the existing one-hour behavior.
-        params.cache_control = humanPaced
-          ? { type: 'ephemeral', ttl: '1h' }
-          : { type: 'ephemeral' };
+        // Explicit content-block breakpoints retain OpenRouter's full Anthropic,
+        // Bedrock, and Vertex fallback pool. Its top-level automatic cache flag
+        // would silently restrict this request to Anthropic first-party only.
+        params.messages = applyOpenRouterCacheBreakpoints(messages, humanPaced);
       }
     }
 

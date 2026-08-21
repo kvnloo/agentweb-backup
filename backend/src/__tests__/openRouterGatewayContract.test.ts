@@ -1,6 +1,7 @@
 import {
   GatewayContractError,
   GatewayRequest,
+  applyOpenRouterCacheBreakpoints,
   normalizeOpenRouterModelId,
 } from '../utils/openRouterGatewayContract';
 import * as gatewayContract from '../utils/openRouterGatewayContract';
@@ -84,5 +85,41 @@ describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
     expect(enabled('interactive_chat', 'interactive_chat,content_generation')).toBe(true);
     expect(enabled('scheduled_background', 'interactive_chat,content_generation')).toBe(false);
     expect(enabled(undefined, 'interactive_chat')).toBe(false);
+  });
+
+  it('uses explicit cache breakpoints without mutating the caller messages', () => {
+    const messages = [
+      { role: 'system', content: 'Stable instructions' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Latest question' },
+    ];
+
+    const cached = applyOpenRouterCacheBreakpoints(messages, true);
+
+    expect(cached[0].content).toEqual([{ type: 'text', text: 'Stable instructions', cache_control: { type: 'ephemeral', ttl: '1h' } }]);
+    expect(cached[1].content).toEqual([{ type: 'text', text: 'Earlier answer', cache_control: { type: 'ephemeral', ttl: '1h' } }]);
+    expect(messages).toEqual([
+      { role: 'system', content: 'Stable instructions' },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Latest question' },
+    ]);
+  });
+
+  it('defaults a one-shot machine-paced breakpoint to five minutes', () => {
+    expect(applyOpenRouterCacheBreakpoints([
+      { role: 'user', content: 'Latest question' },
+    ], false)[0].content).toEqual([{
+      type: 'text', text: 'Latest question', cache_control: { type: 'ephemeral' },
+    }]);
+  });
+
+  it('leaves message shapes unchanged when no text block can carry a breakpoint', () => {
+    const messages = [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'tool-1' }] },
+      { role: 'tool', content: [{ type: 'image_url', image_url: { url: 'https://example.com/result.png' } }] },
+      { role: 'assistant', content: null },
+    ];
+
+    expect(applyOpenRouterCacheBreakpoints(messages, true)).toEqual(messages);
   });
 });
