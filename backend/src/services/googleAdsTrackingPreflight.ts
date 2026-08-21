@@ -77,17 +77,40 @@ export function detectTrackingSnippets(html: string): string[] {
   if (!html || typeof html !== 'string') return [];
   const found = new Set<string>();
 
+  /*
+   * CASE-SENSITIVE ON PURPOSE. Google issues every one of these ids in upper case and
+   * pages embed them verbatim, so the `i` flag these patterns used to carry bought no
+   * real detection — and it cost a false PASS, which is the one error this gate exists
+   * to prevent.
+   *
+   * Found live on our own marketing site: www.agentweb.pro has a nav link to
+   * `/ai-gtm-agent` (the AI GTM Agent product page). Matched case-insensitively, the
+   * slug `gtm-agent` reads as container `GTM-AGENT`, so the page was reported as
+   * carrying a GTM container it does not have. The same hole swallows GA4: a hashed
+   * build class like `g-a1b2c3` scores as measurement id `G-A1B2C3`.
+   *
+   * The consequence is the ENG-334 / ThinkingAI incident verbatim — a landing page with
+   * no tracking whatsoever is classified `measured`, skips the BLOCK, and spends paid
+   * traffic on a funnel that cannot report a single conversion. A word in a URL slug
+   * must never be able to authorise ad spend.
+   *
+   * Matching upper case only removes that entire class (slugs, kebab-case hrefs, hashed
+   * CSS class names and minified identifiers are lower case). The residual risk is an
+   * upper-case literal in copy — far rarer, and it fails toward BLOCK-with-override
+   * rather than toward silent spend.
+   */
+
   // GA4 measurement ID: G-XXXXXXXXXX (also matches googletagmanager.com/gtag/js?id=G-…)
-  for (const m of html.match(/\bG-[A-Z0-9]{6,}\b/gi) || []) {
-    found.add(`GA4:${m.toUpperCase()}`);
+  for (const m of html.match(/\bG-[A-Z0-9]{6,}\b/g) || []) {
+    found.add(`GA4:${m}`);
   }
   // GTM container: GTM-XXXXXXX (also matches gtm.js?id=GTM-… and the ns.html noscript iframe)
-  for (const m of html.match(/\bGTM-[A-Z0-9]{4,}\b/gi) || []) {
-    found.add(`GTM:${m.toUpperCase()}`);
+  for (const m of html.match(/\bGTM-[A-Z0-9]{4,}\b/g) || []) {
+    found.add(`GTM:${m}`);
   }
   // Google Ads conversion / remarketing tag: AW-123456789
-  for (const m of html.match(/\bAW-[0-9]{6,}\b/gi) || []) {
-    found.add(`AW:${m.toUpperCase()}`);
+  for (const m of html.match(/\bAW-[0-9]{6,}\b/g) || []) {
+    found.add(`AW:${m}`);
   }
 
   return [...found];
