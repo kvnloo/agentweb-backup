@@ -20,6 +20,21 @@ import {
 } from '../utils/googleAdsOfflineConversions';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
+
+/**
+ * Every Google Ads call goes through callApi, and it had no timeout at all — an axios
+ * request with none waits forever on a stalled connection.
+ *
+ * That is not an abstract risk here. A hung call blocks the agent-mode tool call that
+ * made it, and on the offline-conversion path (ENG-1325) it would stall a background
+ * sweep with nobody watching, so the symptom is "conversions stopped uploading" with no
+ * error anywhere.
+ *
+ * 60s rather than something tighter: a GAQL search over a large account is legitimately
+ * slow, and a timeout that fires on normal traffic is worse than none — it turns a slow
+ * read into a spurious failure. This is a ceiling on hanging, not a latency target.
+ */
+const GOOGLE_ADS_HTTP_TIMEOUT_MS = 60_000;
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
 
 export interface GoogleAdAccount {
@@ -86,8 +101,8 @@ export class GoogleAdsService {
     }
     try {
       const response = method === 'GET'
-        ? await axios.get(url, { headers })
-        : await axios.post(url, body, { headers });
+        ? await axios.get(url, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS })
+        : await axios.post(url, body, { headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS });
       if (process.env.NODE_ENV !== 'production') {
         console.log('[GoogleAds] callApi response:', JSON.stringify(response.data, null, 2));
       }
@@ -162,7 +177,10 @@ export class GoogleAdsService {
         client_secret: secrets.clientSecret,
         refresh_token: refreshToken,
         grant_type: 'refresh_token',
-      }).toString(), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+      }).toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
+      });
       const { access_token, expires_in } = response.data as { access_token: string; expires_in: number };
       await updateAccountTokens(userId, 'google_ads', {
         access_token,
@@ -221,6 +239,7 @@ export class GoogleAdsService {
   async listAccountHierarchy(accessToken: string): Promise<GoogleAdsAccountNode[]> {
     const secrets = await getGoogleAdsCredentials();
     const response = await axios.get(`${GOOGLE_ADS_API_BASE}/customers:listAccessibleCustomers`, {
+      timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'developer-token': secrets.developerToken,
@@ -618,7 +637,12 @@ export class GoogleAdsService {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const raw = await this.callApiPublic(
       'POST',
-      `/customers/${customerId}/conversionUploads:uploadClickConversions`,
+      // `resource:method`, not a sub-collection. Verified against the real API: the
+      // sub-collection form returned Google's own 404 naming the URL
+      // `/v24/customers/…/conversionUploads:uploadClickConversions`. Same shape as the
+      // two other custom methods in this service, `customers:listAccessibleCustomers`
+      // and `geoTargetConstants:suggest`.
+      `/customers/${customerId}:uploadClickConversions`,
       accessToken,
       { conversions, partialFailure: true, validateOnly: opts?.validateOnly === true },
       loginCustomerId,
@@ -1008,6 +1032,7 @@ export class GoogleAdsService {
     let response;
     try {
       response = await axios.post(`${GOOGLE_ADS_API_BASE}/geoTargetConstants:suggest`, { locale, locationNames: { names: [query] } }, {
+        timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'developer-token': secrets.developerToken,
