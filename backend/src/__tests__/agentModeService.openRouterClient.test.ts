@@ -39,6 +39,7 @@ jest.mock('openai', () => jest.fn().mockImplementation((config: any) => ({ _conf
 
 import { AgentModeService } from '../services/agentModeService';
 import { getSecret } from '../utils/secretsManager';
+import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const MockOpenAI = require('openai') as jest.Mock;
 const mockGetSecret = getSecret as jest.Mock;
@@ -51,6 +52,7 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   function openRouterConfig(): any {
@@ -78,6 +80,15 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
         'X-Title': expect.any(String),
       })
     );
+  });
+
+  it('disables SDK retries and applies a bounded timeout', async () => {
+    const service = new AgentModeService();
+    await service.getOpenRouterClient();
+    expect(openRouterConfig()).toEqual(expect.objectContaining({
+      maxRetries: 0,
+      timeout: 5 * 60 * 1000,
+    }));
   });
 
   it('caches the client — a second call does not construct a new one', async () => {
@@ -121,6 +132,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   it('routes an openrouter/*-prefixed model id to the OpenRouter client', async () => {
@@ -182,6 +194,134 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }));
+  });
+
+  it('canary-routes an interactive GPT call through OpenRouter', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gpt-5.4',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat', temperature: 0.1 } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request).toEqual(expect.objectContaining({
+      model: 'openai/gpt-5.4',
+      provider: { allow_fallbacks: true, require_parameters: true },
+    }));
+    expect(request).not.toHaveProperty('temperature');
+  });
+
+  it('has a verified gateway mapping for every selectable direct-provider model', () => {
+    const service = new AgentModeService();
+    const directModelIds = Object.entries((service as any).llmModels)
+      .filter(([, config]: any) => !config.isLive)
+      .map(([modelId]) => modelId)
+      .filter((modelId) => !modelId.startsWith('openrouter/'));
+
+    expect(directModelIds.length).toBeGreaterThan(0);
+    for (const modelId of directModelIds) {
+      expect(resolveOpenRouterUpstreamModelId(modelId)).toMatch(/^[^/\s]+\/[^/\s]+$/);
+    }
+  });
+
+  it('canary-routes an interactive Gemini call through OpenRouter', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat', max_completion_tokens: 321 } as any,
+    );
+
+    const request = create.mock.calls[0][0];
+    expect(request).toEqual(expect.objectContaining({
+      model: 'google/gemini-3.7-flash',
+      max_tokens: 321,
+    }));
+    expect(request).not.toHaveProperty('max_completion_tokens');
+  });
+
+  it('preserves provider-native token and temperature fields while the canary is disabled', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    (service as any).llmModels['gpt-5.4'].client = { chat: { completions: { create } } };
+
+    await service.callLLM(
+      'gpt-5.4',
+      [{ role: 'user', content: 'Hello' }],
+      { max_completion_tokens: 321, temperature: 0.1 } as any,
+    );
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-5.4',
+      max_completion_tokens: 321,
+      temperature: 0.1,
+    }));
+  });
+
+  it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'anthropic.claude-sonnet-5',
+      [{ role: 'user', content: 'Hello' }],
+      {
+        taskClass: 'interactive_chat',
+        humanPaced: true,
+        usageContext: { userId: 'user-1', sessionId: 'session-1', feature: 'agent_task' },
+      } as any,
+    );
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'anthropic/claude-sonnet-5',
+      session_id: 'session-1',
+      messages: [
+        {
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: 'Hello',
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          }],
+        },
+      ],
+    }));
+    expect(create.mock.calls[0][0]).not.toHaveProperty('cache_control');
+  });
+
+  it('does not add an AgentWeb retry loop on top of OpenRouter provider fallback', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+    const service = new AgentModeService();
+    const error = Object.assign(new Error('rate limited'), { status: 429 });
+    const create = jest.fn().mockRejectedValue(error);
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await expect(service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Hello' }],
+      { taskClass: 'interactive_chat' } as any,
+    )).rejects.toBe(error);
+
+    expect(create).toHaveBeenCalledTimes(1);
   });
 
   // 2026-08-19: was adminOnly: true on every new-roster entry (gated as

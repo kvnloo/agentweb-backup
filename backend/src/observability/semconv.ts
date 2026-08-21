@@ -56,11 +56,13 @@ export const ATTR_TOOL_ERROR_CLASS = 'agentweb.tool.error_class';
 
 /**
  * Provider name for a model id — mirrors the routing branch in
- * `agentModeService.callLLM` (gemini-* / anthropic.* Bedrock / claude-* Vertex /
- * everything else Azure OpenAI). Values follow semconv gen_ai.provider.name
- * well-known values where they exist.
+ * `agentModeService.callLLM` for model-id-native routes. Task-class canaries can
+ * override this at the span boundary because a GPT/Gemini/Claude logical id may
+ * deliberately travel through OpenRouter. Values follow semconv
+ * gen_ai.provider.name well-known values where they exist.
  */
 export function providerForModel(model: string): string {
+  if (model.startsWith('openrouter/')) return 'openrouter';
   if (model.startsWith('gemini-')) return 'gemini';
   if (model.startsWith('anthropic.')) return 'aws.bedrock';
   if (model.startsWith('claude-')) return 'gcp.vertex_ai';

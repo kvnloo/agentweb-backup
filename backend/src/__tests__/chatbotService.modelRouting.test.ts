@@ -1,11 +1,9 @@
 /**
- * Tests for generateChatResponse model routing:
- * - Gemini  → agentModeService.getGeminiClient() → tool-calling loop
- * - Claude  → agentModeService.getBedrockClient() → tool-calling loop
- * - Azure   → default OpenAI client → tool-calling loop
+ * ENG-1430: Emma sidebar routing belongs to the shared AgentModeService.callLLM
+ * boundary. The sidebar must preserve logical model identity and conversation /
+ * tool behavior without selecting a naked provider client of its own.
  */
 
-// ── DynamoDB mock (module-level, shared by chatbotService on import) ──────────
 const queryPromiseMock = jest.fn();
 const getPromiseMock = jest.fn();
 const putPromiseMock = jest.fn().mockResolvedValue({});
@@ -28,35 +26,28 @@ jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
 }));
 
-// ── Client create mocks ───────────────────────────────────────────────────────
-const mockBedrockClientCreate = jest.fn();
-const mockGeminiClientCreate = jest.fn();
+const mockCallLLM = jest.fn();
+const mockGetDefaultModel = jest.fn().mockResolvedValue('gpt-5.4');
+const mockExecuteTool = jest.fn().mockResolvedValue({ success: true });
+const mockInitialize = jest.fn().mockResolvedValue(undefined);
+const mockAgentModeService = {
+  callLLM: mockCallLLM,
+  getDefaultModel: mockGetDefaultModel,
+  executeTool: mockExecuteTool,
+  initialize: mockInitialize,
+  getAdminToolNames: jest.fn().mockReturnValue([]),
+};
 
-const mockGetBedrockClient = jest.fn().mockResolvedValue({
-  chat: { completions: { create: mockBedrockClientCreate } },
+jest.mock('../services/agentModeService', () => {
+  const AgentModeService = jest.fn().mockImplementation(() => mockAgentModeService);
+  Object.assign(AgentModeService, {
+    FOUNDATION_TOOLS: [],
+    buildWorkPlanContextMessages: jest.fn().mockReturnValue([]),
+  });
+  return { AgentModeService, agentModeService: mockAgentModeService };
 });
-const mockGetGeminiClient = jest.fn().mockResolvedValue({
-  chat: { completions: { create: mockGeminiClientCreate } },
-});
 
-jest.mock('../services/agentModeService', () => ({
-  AgentModeService: jest.fn().mockImplementation(() => ({
-    getBedrockClient: mockGetBedrockClient,
-    getGeminiClient: mockGetGeminiClient,
-    executeTool: jest.fn(),
-  })),
-  agentModeService: {
-    getBedrockClient: mockGetBedrockClient,
-    getGeminiClient: mockGetGeminiClient,
-    executeTool: jest.fn(),
-  },
-}));
-
-// ── OpenAI mock (used for the module-level default `openai` client init) ─────
-jest.mock('openai', () => jest.fn().mockImplementation(() => ({
-  chat: { completions: { create: jest.fn() } },
-})));
-
+jest.mock('openai', () => jest.fn());
 jest.mock('@google-cloud/discoveryengine', () => ({
   EngineServiceClient: jest.fn(),
   SearchServiceClient: jest.fn(),
@@ -76,140 +67,233 @@ jest.mock('../utils/s3Utils', () => ({
 
 import { generateChatResponse, __resetEmmaSystemContextCache } from '../services/chatbotService';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/** Minimal OpenAI-format completion with no tool calls */
-function makeCompletion(content = 'Hello') {
+function makeCompletion(content = 'Hello', model = 'openrouter/upstream-model') {
   return {
+    id: 'completion-1',
     choices: [{ message: { role: 'assistant', content, tool_calls: null } }],
     usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-    model: 'test-model',
+    model,
   };
 }
 
-/** Seed DynamoDB so getChatSession returns a valid session */
-function seedSessionMocks() {
-  const session = {
-    sessionId: 'sess-1',
-    userId: 'user-1',
-    portalType: 'customer',
-    messages: [{ role: 'user', content: 'Hello' }],
-    pageIdentifier: 'customer-portal',
-    createdAt: '2024-01-01T00:00:00Z',
-    updatedAt: '2024-01-01T00:00:00Z',
-  };
-  getPromiseMock.mockResolvedValue({ Item: session });
+function seedSession(llmModel?: string) {
+  getPromiseMock.mockResolvedValue({
+    Item: {
+      sessionId: 'sess-1',
+      userId: 'user-1',
+      portalType: 'customer',
+      messages: [{ role: 'user', content: 'Hello' }],
+      pageIdentifier: 'customer-portal',
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+      ...(llmModel ? { llmModel } : {}),
+    },
+  });
   queryPromiseMock.mockResolvedValue({ Items: [] });
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-describe('generateChatResponse — model routing', () => {
+describe('generateChatResponse — shared interactive gateway', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     __resetEmmaSystemContextCache();
     putPromiseMock.mockResolvedValue({});
     updatePromiseMock.mockResolvedValue({});
+    mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+    mockCallLLM.mockResolvedValue(makeCompletion());
   });
 
-  // ── Gemini ────────────────────────────────────────────────────────────────
+  it.each([
+    'gpt-5.4',
+    'gemini-3.1-flash-lite',
+    'anthropic.claude-sonnet-4-6',
+    'openrouter/deepseek/deepseek-v4-flash',
+  ])('routes logical model %s through callLLM with interactive attribution', async (logicalModel) => {
+    seedSession();
 
-  describe('Gemini model', () => {
-    it('calls agentModeService.getGeminiClient for gemini models', async () => {
-      seedSessionMocks();
-      mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
-
-      await generateChatResponse(
-        'sess-1', 'Hello',
-        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-flash' }
-      );
-
-      expect(mockGetGeminiClient).toHaveBeenCalledTimes(1);
-      expect(mockGetBedrockClient).not.toHaveBeenCalled();
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: logicalModel,
     });
 
-    it('returns content from the Gemini completion', async () => {
-      seedSessionMocks();
-      mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
-
-      const result = await generateChatResponse(
-        'sess-1', 'Hello',
-        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-flash' }
-      );
-
-      const content = typeof result === 'string' ? result : (result as any).content;
-      expect(content).toBe('Gemini says hi');
-    });
-
-    it('does NOT call Bedrock for a gemini model', async () => {
-      seedSessionMocks();
-      mockGeminiClientCreate.mockResolvedValue(makeCompletion());
-
-      await generateChatResponse(
-        'sess-1', 'Hi',
-        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-pro' }
-      );
-
-      expect(mockGetBedrockClient).not.toHaveBeenCalled();
-    });
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      logicalModel,
+      expect.any(Array),
+      expect.objectContaining({
+        taskClass: 'interactive_chat',
+        humanPaced: true,
+        usageContext: { userId: 'user-1', sessionId: 'sess-1', feature: 'chat' },
+      }),
+    );
   });
 
-  // ── Claude ────────────────────────────────────────────────────────────────
+  it('returns the shared completion content unchanged', async () => {
+    seedSession();
+    mockCallLLM.mockResolvedValue(makeCompletion('Gateway says hi'));
 
-  describe('Claude / Bedrock model', () => {
-    it('calls agentModeService.getBedrockClient with the model ID', async () => {
-      seedSessionMocks();
-      mockBedrockClientCreate.mockResolvedValue(makeCompletion('Claude says hi'));
-
-      await generateChatResponse(
-        'sess-1', 'Hello',
-        { portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-sonnet-4-6' }
-      );
-
-      expect(mockGetBedrockClient).toHaveBeenCalledWith('anthropic.claude-sonnet-4-6');
-      expect(mockGetGeminiClient).not.toHaveBeenCalled();
+    const result = await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
     });
 
-    it('returns the assistant message from the Bedrock completion', async () => {
-      seedSessionMocks();
-      mockBedrockClientCreate.mockResolvedValue(makeCompletion('Bedrock response'));
+    expect(typeof result === 'string' ? result : result.content).toBe('Gateway says hi');
+  });
 
-      const result = await generateChatResponse(
-        'sess-1', 'Hi',
-        { portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-sonnet-4-6' }
-      );
+  it('does not include the legacy partner portal in the Emma canary', async () => {
+    seedSession();
 
-      const content = typeof result === 'string' ? result : (result as any).content;
-      expect(content).toBe('Bedrock response');
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'gpt-5.4',
     });
 
-    it('routes claude-* model names (not just anthropic. prefix) to Bedrock', async () => {
-      seedSessionMocks();
-      mockBedrockClientCreate.mockResolvedValue(makeCompletion('ok'));
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'gpt-5.4',
+      expect.any(Array),
+      expect.not.objectContaining({ taskClass: 'interactive_chat' }),
+    );
+  });
 
-      await generateChatResponse(
-        'sess-1', 'Hi',
-        { portalType: 'customer', userId: 'user-1', model: 'claude-opus-4' }
-      );
+  it('uses the persisted session model before the system default', async () => {
+    seedSession('gemini-3.7-flash');
 
-      expect(mockGetBedrockClient).toHaveBeenCalledWith('claude-opus-4');
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
     });
 
-    it('does NOT route generic model "sonnet-x" to Bedrock (fragile-match guard)', async () => {
-      // A hypothetical model named "sonnet-v2" that is NOT Claude should use Azure OpenAI.
-      // The isClaudeModel check no longer matches on 'sonnet' alone.
-      seedSessionMocks();
-      try {
-        await generateChatResponse(
-          'sess-1', 'Hi',
-          { portalType: 'customer', userId: 'user-1', model: 'sonnet-v2-custom' }
-        );
-      } catch {
-        // Expected — Azure OpenAI is not configured in tests
-      }
+    expect(mockCallLLM).toHaveBeenCalledWith('gemini-3.7-flash', expect.any(Array), expect.any(Object));
+    expect(mockGetDefaultModel).not.toHaveBeenCalled();
+  });
 
-      expect(mockGetBedrockClient).not.toHaveBeenCalled();
-      expect(mockGetGeminiClient).not.toHaveBeenCalled();
+  it('uses the shared system default when neither request nor session selects a model', async () => {
+    seedSession();
+    mockGetDefaultModel.mockResolvedValue('anthropic.claude-sonnet-5');
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
     });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'anthropic.claude-sonnet-5',
+      expect.any(Array),
+      expect.any(Object),
+    );
+  });
+
+  it('keeps logical model identity when an OpenRouter response requests a tool', async () => {
+    seedSession();
+    mockCallLLM
+      .mockResolvedValueOnce({
+        ...makeCompletion('', 'openai/gpt-5.4'),
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              id: 'tool-1',
+              function: { name: 'search_user_guide', arguments: '{}' },
+            }],
+          },
+        }],
+      })
+      .mockResolvedValueOnce(makeCompletion('Done', 'openai/gpt-5.4'));
+
+    await generateChatResponse('sess-1', 'Help', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    });
+
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      'gpt-5.4',
+      'search_user_guide',
+      {},
+      'user-1',
+      'sess-1',
+      false,
+      undefined,
+    );
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a rejected shared-gateway request', async () => {
+    seedSession();
+    mockCallLLM.mockRejectedValueOnce(new Error('gateway unavailable'));
+
+    await expect(generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    })).rejects.toThrow('gateway unavailable');
+  });
+
+  it('rejects a shared completion with no assistant message', async () => {
+    seedSession();
+    mockCallLLM.mockResolvedValueOnce({
+      ...makeCompletion(),
+      choices: [],
+    });
+
+    await expect(generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    })).rejects.toThrow('No response from LLM');
+  });
+
+  it('records a failed tool call and continues through the shared gateway', async () => {
+    seedSession();
+    mockCallLLM
+      .mockResolvedValueOnce({
+        ...makeCompletion('', 'openai/gpt-5.4'),
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              id: 'tool-1',
+              function: { name: 'search_user_guide', arguments: '{}' },
+            }],
+          },
+        }],
+      })
+      .mockResolvedValueOnce(makeCompletion('Recovered', 'openai/gpt-5.4'));
+    mockExecuteTool.mockRejectedValueOnce(new Error('tool unavailable'));
+
+    const result = await generateChatResponse('sess-1', 'Help', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    });
+
+    expect(typeof result === 'string' ? result : result.content).toBe('Recovered');
+    expect(typeof result === 'string' ? [] : result.toolCalls).toEqual([
+      expect.objectContaining({ id: 'tool-1', error: 'tool unavailable' }),
+    ]);
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+  });
+
+  it('prices upstream gateway responses with the logical model', async () => {
+    seedSession();
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await generateChatResponse('sess-1', 'Hello', {
+        portalType: 'customer',
+        userId: 'user-1',
+        model: 'gpt-5.4',
+      });
+
+      expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(
+        /\[Token Usage\] Model: gpt-5\.4 .* Cost: \$[0-9]/,
+      ));
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
