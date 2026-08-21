@@ -29,6 +29,16 @@ jest.mock('../services/db', () => ({
 }));
 
 const mockGeminiCreate = jest.fn();
+const mockGetClientForModel = jest.fn().mockResolvedValue({
+  chat: { completions: { create: mockGeminiCreate } },
+});
+const mockCallLLM = jest.fn(async (model: string, messages: unknown[], options: Record<string, any> = {}) => {
+  const client = await mockGetClientForModel(model);
+  return client.chat.completions.create(
+    { model, messages, ...options },
+    { timeout: options.timeoutMs },
+  );
+});
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     youSearchWeb: jest.fn(),
@@ -40,18 +50,9 @@ jest.mock('../services/agentModeService', () => ({
         },
       },
     }),
-    getClientForModel: jest.fn().mockResolvedValue({
-      chat: {
-        completions: {
-          create: mockGeminiCreate,
-        },
-      },
-    }),
+    getClientForModel: mockGetClientForModel,
+    callLLM: mockCallLLM,
   },
-}));
-
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: jest.fn(),
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -93,7 +94,6 @@ import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
-import { meterUserUsage } from '../services/usageRecorderService';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 
@@ -191,7 +191,7 @@ describe('CrmEnrichmentService', () => {
   });
 
   describe('execute - per-user metering (ENG-200)', () => {
-    it('charges the extraction LLM turn to the caller (userId + token counts) via meterUserUsage', async () => {
+    it('charges the extraction LLM turn through the shared gateway usage context', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       mockCrmDb.getLeadsByListId.mockResolvedValue({
         items: [createLead({ leadId: 'lead1' })],
@@ -220,12 +220,14 @@ describe('CrmEnrichmentService', () => {
 
       await service.execute(spec);
 
-      expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-        userId: 'user1',
-        feature: 'crm_enrichment_extract',
-        inputTokens: 300,
-        outputTokens: 50,
-      }));
+      expect(mockCallLLM).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Array),
+        expect.objectContaining({
+          usageContext: { userId: 'user1', feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
+      );
     });
   });
 
@@ -1858,7 +1860,7 @@ describe('CrmEnrichmentService cross-provider timeout fallback', () => {
     expect(result.fields.company_size).toBe('51-200');
     expect(primaryCreate).toHaveBeenCalledTimes(1);
     expect(fallbackCreate).toHaveBeenCalledTimes(1);
-    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-2.5-flash');
+    expect(fallbackCreate.mock.calls[0][0].model).toBe('gemini-3.1-flash-lite');
   });
 
   it('does not resolve the fallback client when the primary succeeds', async () => {

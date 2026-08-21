@@ -2,8 +2,6 @@
 
 // Mock OpenAI before importing agentModeService (which creates module-level openai instance)
 // Create the mock function inside the factory to ensure it's accessible
-const mockChatCompletionsCreate = jest.fn();
-
 jest.mock('openai', () => {
   // Create mock function that will be shared
   const createMock = jest.fn();
@@ -78,6 +76,10 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       // If mockCreate is not available, create a fallback
       console.warn('OpenAI mock not found, tests may fail');
     }
+    jest.spyOn(agentModeService, 'callLLM').mockImplementation(
+      (model: string, messages: any[], options: any) =>
+        mockCreate({ model, messages, ...options }),
+    );
   });
 
   describe('Success cases', () => {

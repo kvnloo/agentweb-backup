@@ -23,7 +23,11 @@ import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFa
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
-import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import {
+  createGeminiNativeClient,
+  normalizeProviderRequestTimeoutMs,
+  sanitizeGeminiSchema,
+} from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -394,15 +398,6 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
-
-// Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
-// Used for updateEmailDraftForLead to match generateBlogContent pattern
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
 
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
@@ -832,6 +827,8 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Internal workload model: callable by services but never selectable in the customer picker. */
+  internalOnly?: boolean;
   /**
    * Usage/cost tier for the model picker UI. Only used as a fallback when
    * getModelPrice() has no entry for this model — otherwise the picker's
@@ -1022,6 +1019,64 @@ interface LLMCallOptions {
   humanPaced?: boolean;
   /** Stable product taxonomy used by the reversible OpenRouter cutover canary. */
   taskClass?: GatewayTaskClass;
+  /** Per-request transport deadline for bounded background and judge calls. */
+  timeoutMs?: number;
+  /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
+  fallbackModels?: string[];
+}
+
+function nonNegativeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : 0;
+}
+
+/**
+ * Convert an OpenAI-compatible usage object into the ledger's disjoint token
+ * dimensions. OpenRouter follows OpenAI's contract: `prompt_tokens` includes
+ * cache reads/writes and `prompt_tokens_details` identifies those subsets. Our
+ * ledger prices uncached input, cache reads, and cache writes separately, so
+ * forwarding the inclusive prompt total double-counts the cached portion.
+ *
+ * Provider-native Bedrock/Vertex adapters already report uncached input and
+ * cache reads as disjoint counters; their existing semantics stay unchanged.
+ * External counters are finite/non-negative and the OpenRouter cache subset is
+ * bounded by its prompt total so malformed provider data cannot inflate usage.
+ */
+function normalizeCallUsageTokens(usage: any, provider: string): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+} {
+  const promptTokens = nonNegativeTokenCount(usage?.prompt_tokens);
+  const outputTokens = nonNegativeTokenCount(usage?.completion_tokens);
+  const providerCacheReadTokens = nonNegativeTokenCount(usage?.cache_read_input_tokens);
+  const openAiCacheReadTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cached_tokens);
+  const reportedCacheReadTokens = providerCacheReadTokens || openAiCacheReadTokens;
+  const providerCacheWriteTokens = nonNegativeTokenCount(usage?.cache_creation_input_tokens);
+  const openAiCacheWriteTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cache_write_tokens);
+
+  if (provider !== 'openrouter') {
+    return {
+      inputTokens: promptTokens,
+      outputTokens,
+      cacheReadTokens: reportedCacheReadTokens,
+      cacheWriteTokens: providerCacheWriteTokens,
+    };
+  }
+
+  const cacheReadTokens = Math.min(promptTokens, reportedCacheReadTokens);
+  const remainingPromptTokens = promptTokens - cacheReadTokens;
+  const reportedCacheWriteTokens = providerCacheWriteTokens || openAiCacheWriteTokens;
+  const cacheWriteTokens = Math.min(remainingPromptTokens, reportedCacheWriteTokens);
+
+  return {
+    inputTokens: remainingPromptTokens - cacheWriteTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  };
 }
 
 // Diagnosis agent configuration
@@ -1058,6 +1113,7 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
   'gpt-5-chat-2': 'gpt-5.5',
   'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -2160,7 +2216,7 @@ export class AgentModeService {
           _projectId: projectId,
           chat: {
             completions: {
-              create: async (params: any) => {
+              create: async (params: any, requestOptions?: { timeout?: number }) => {
                 const token = await auth.getAccessToken();
                 const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
 
@@ -2236,7 +2292,13 @@ export class AgentModeService {
                 }
 
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+                const timeout = setTimeout(
+                  () => controller.abort(),
+                  normalizeProviderRequestTimeoutMs(
+                    requestOptions?.timeout,
+                    VERTEX_REQUEST_TIMEOUT_MS,
+                  ),
+                );
                 let response: Response;
                 try {
                   response = await fetch(url, {
@@ -2401,7 +2463,6 @@ export class AgentModeService {
         authSchemePreference: ['httpBearerAuth'],
         requestHandler: {
           connectionTimeout: 10_000,
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     } else {
@@ -2419,7 +2480,6 @@ export class AgentModeService {
         } : undefined,
         requestHandler: {
           connectionTimeout: 10_000, // 10s to establish connection
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     }
@@ -2443,7 +2503,7 @@ export class AgentModeService {
     return {
       chat: {
         completions: {
-          create: async (params: any) => {
+          create: async (params: any, requestOptions?: { timeout?: number }) => {
             // Convert OpenAI messages to Bedrock Converse format
             const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
 
@@ -2502,7 +2562,10 @@ export class AgentModeService {
             });
 
             const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+              abortSignal: AbortSignal.timeout(normalizeProviderRequestTimeoutMs(
+                requestOptions?.timeout,
+                BEDROCK_REQUEST_TIMEOUT_MS,
+              )),
             });
 
             // Extract response content
@@ -3047,10 +3110,15 @@ export class AgentModeService {
     // default-visible pick regardless of how they benchmark).
     // resolveGenerationModel/resolveFallbackModel are untouched — an
     // existing session or schedule pinned to either id is unaffected.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Google accepts at most 128 function declarations per request. This limit
+    // applies whether Gemini is reached directly or through OpenRouter: the
+    // gateway can fail over transports, but it cannot make an invalid upstream
+    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
+    // catalog, so omitting this cap made Gemini fail deterministically with 400.
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
     // live against three independent sources (ai.google.dev/deepmind.google/
     // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
@@ -3062,7 +3130,7 @@ export class AgentModeService {
     // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -3092,6 +3160,10 @@ export class AgentModeService {
     //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
     //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
     'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Workload-specific research agent. It is intentionally callable only from
+    // DeepResearchService, not exposed as a general chat-picker model.
+    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
+    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -3178,7 +3250,9 @@ export class AgentModeService {
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
-    const models = Object.keys(this.llmModels).filter(m => isAdmin || !this.llmModels[m].adminOnly);
+    const models = Object.keys(this.llmModels).filter(
+      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
+    );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -3369,10 +3443,12 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" },
+      response_format = null,
       usageContext = null,
       humanPaced = false,
       taskClass,
+      timeoutMs,
+      fallbackModels,
     } = options || {};
 
     // Explicit openrouter/* models have always used the gateway. Direct-provider
@@ -3385,13 +3461,33 @@ export class AgentModeService {
     const params: any = {
       model: upstreamModel,
       messages: messages,
-      response_format: response_format || { type: "text" },
     };
+    // Provider-native clients keep their historical explicit text default.
+    // On OpenRouter, omit that no-op field unless a caller actually requests
+    // structured JSON: require_parameters must not exclude a model such as
+    // Sonar Deep Research merely because it does not advertise response_format.
+    if (!useOpenRouterGateway || response_format) {
+      params.response_format = response_format || { type: 'text' };
+    }
 
     if (useOpenRouterGateway) {
       // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
       // compatibility for migrated calls.
       params.provider = { allow_fallbacks: true, require_parameters: true };
+      // OpenRouter reports its own billed amount as zero for BYOK requests even
+      // though Bedrock/Vertex still bill the underlying inference. Request the
+      // routing flag so metering can distinguish BYOK from a genuinely free
+      // OpenRouter call and fall back to our provider price book when needed.
+      params.usage = { include: true };
+      if (fallbackModels?.length) {
+        params.models = fallbackModels.map((fallbackModel) => {
+          const normalizedFallback = this.normalizeModelId(fallbackModel);
+          if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
+            throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
+          }
+          return resolveOpenRouterUpstreamModelId(normalizedFallback);
+        });
+      }
       if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
         params.session_id = usageContext.sessionId;
       }
@@ -3416,12 +3512,27 @@ export class AgentModeService {
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
+      let boundedTools = tools;
       if (maxTools && tools.length > maxTools) {
         console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        params.tools = tools.slice(0, maxTools);
-      } else {
-        params.tools = tools;
+        boundedTools = tools.slice(0, maxTools);
       }
+      // OpenRouter normalizes the transport, but the selected provider still
+      // validates its own function-declaration schema. Native Gemini calls pass
+      // through this same allowlist in geminiNativeClient; apply it at the shared
+      // gateway boundary too so third-party MCP keywords cannot 400 the turn.
+      params.tools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
+        ? boundedTools.map((tool: any) => ({
+            ...tool,
+            function: {
+              ...tool.function,
+              parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
+                type: 'object',
+                properties: {},
+              },
+            },
+          }))
+        : boundedTools;
       params.tool_choice = tool_choice || 'auto';
     }
 
@@ -3506,7 +3617,12 @@ export class AgentModeService {
     const baseDelayMs = 2000;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const res = await client.chat.completions.create(params);
+        const res = await client.chat.completions.create(
+          params,
+          timeoutMs || useOpenRouterGateway
+            ? { timeout: timeoutMs ?? 5 * 60 * 1000, ...(useOpenRouterGateway ? { maxRetries: 0 } : {}) }
+            : undefined,
+        );
         // Shadow usage metering (Ship 1): every client returned above (Azure
         // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
         // wrapper) responds in OpenAI shape, so `res.usage` is the single
@@ -3516,6 +3632,7 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
             // ENG-200: meter the main agent turn — record shadow burn AND charge
             // the per-user cost cap when a real user is attributable (org members
             // resolve to the owner). Cost (incl. cache tokens) is computed once
@@ -3535,20 +3652,18 @@ export class AgentModeService {
               // the "retries defeat charge dedup" Greptile P1 for the highest-
               // volume metering site in the codebase.
               eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: usage.prompt_tokens || 0,
-              outputTokens: usage.completion_tokens || 0,
-              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
-              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
-              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
-              // present, not opt-in) — ground truth from the vendor that actually
-              // billed us, not a static per-token guess our own price table (which
-              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
-              // otherwise have to estimate. Omitted for every other provider, so
-              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              // OpenRouter's cost is authoritative for OpenRouter-billed calls.
+              // BYOK calls report zero because the upstream provider bills us
+              // directly, so omit the override and let the provider price book
+              // calculate economic cost from the returned tokens instead.
               costUsdOverride:
-                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                providerLabel === 'openrouter' && usage.is_byok !== true && typeof usage.cost === 'number'
                   ? usage.cost
                   : undefined,
             });
@@ -4634,8 +4749,8 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
-        const chatTaskClass: GatewayTaskClass | undefined = isScheduledSession
-          ? undefined
+        const chatTaskClass: GatewayTaskClass = isScheduledSession
+          ? 'scheduled_background'
           : 'interactive_chat';
         const providerForChatRoute = (logicalModel: string): string =>
           logicalModel.startsWith('openrouter/') ||
@@ -4675,9 +4790,8 @@ export class AgentModeService {
             usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn,
-            // ENG-1430: only this customer-facing loop participates in the first
-            // reversible OpenRouter cutover. Internal judges/scheduled helpers
-            // remain on their characterized paths until their own slices.
+            // Scheduled and interactive conversations canary independently;
+            // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
           });
         } catch (callError) {
@@ -14094,10 +14208,9 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      // Call LLM to generate email using direct chat completion (same as generateBlogContent)
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
+      const completion = await this.callLLM(
+        process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+        [
           {
             role: "system",
             content: emailDraftFormat === 'text'
@@ -14106,24 +14219,14 @@ ${emailDraftFormat === 'text'
           },
           { role: "user", content: emailPrompt },
         ],
+        {
         temperature: 0.8,
-        max_tokens: 3000,
-        response_format: { type: 'json_object' }
-      });
-
-      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
-      if ((completion as any)?.usage) {
-        meterUsageFromResponse(
-          {
-            userId,
-            sessionId,
-            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-            provider: 'azure-openai',
-            feature: 'email_draft',
-          },
-          completion
-        );
-      }
+          max_completion_tokens: 3000,
+          response_format: { type: 'json_object' },
+          usageContext: { userId, sessionId, feature: 'email_draft' },
+          taskClass: 'content_generation',
+        },
+      );
 
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
@@ -14216,22 +14319,14 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      // Use Gemini for message drafting (fast, cost-effective)
-      const geminiClient = await this.getGeminiClient();
-      const messageCompletion = await geminiClient.chat.completions.create({
-        model: 'gemini-3.5-flash',
-        messages: [{ role: "user", content: messagePrompt }],
+      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
+        { role: 'user', content: messagePrompt },
+      ], {
         temperature: 0.8,
-        max_tokens: 2048,
-      } as any);
-
-      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-      if ((messageCompletion as any)?.usage) {
-        meterUsageFromResponse(
-          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
-          messageCompletion
-        );
-      }
+        max_completion_tokens: 2048,
+        usageContext: { userId, sessionId, feature: 'invite_message' },
+        taskClass: 'content_generation',
+      });
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
@@ -14267,7 +14362,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
+          noteText = await shortenInviteNoteToLimit(this, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -15876,7 +15971,7 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' } });
+      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -15971,6 +16066,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 200,
         temperature: 0.3,
+        taskClass: 'nonstandard_consumer',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16019,6 +16115,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 20,
         temperature: 0.3,
+        taskClass: 'scheduled_background',
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16082,6 +16179,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 150,
         temperature: 0,
         response_format: { type: 'json_object' },
+        taskClass: 'scheduled_background',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16141,6 +16239,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 120,
         temperature: 0.7,
         response_format: { type: 'text' },
+        taskClass: 'interactive_chat',
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -16198,7 +16297,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0 });
+    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16234,7 +16333,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0 });
+    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16261,6 +16360,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ], {
         max_completion_tokens: 10,
         temperature: 0,
+        taskClass: 'mcp_api',
       });
 
       const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
@@ -29136,7 +29236,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         ], {
           temperature: 0.1,
           response_format: { type: 'json_object' },
-          max_completion_tokens: maxTokens
+          max_completion_tokens: maxTokens,
+          taskClass: 'content_generation',
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -34719,8 +34820,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       if (llmTitles.length > 0) {
         try {
-          const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
@@ -36072,19 +36172,19 @@ function parseCompanyFromTitle(title: any): string | null {
 }
 
 /**
- * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * Tier 3 of company resolution: ONE shared-gateway call per page that takes the
  * full batch of titles and returns a parallel array of company names (or
- * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * "NONE"). Caller passes the gateway seam so the helper stays pure and
  * easily mockable. On any error or response-shape mismatch, returns an
  * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
  */
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
-  llmClient: any,
+  gateway: Pick<AgentModeService, 'callLLM'> | null,
   userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
-  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  if (!gateway?.callLLM) return titles.map(() => 'NONE');
   try {
     const systemPrompt = [
       'You extract company names from professional / LinkedIn titles in batch.',
@@ -36101,24 +36201,19 @@ async function batchParseCompaniesFromTitlesWithLLM(
       '- Use "NONE" (uppercase) when uncertain.',
     ].join('\n');
     const userPrompt = `Titles: ${JSON.stringify(titles)}`;
-    const completion = await llmClient.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages: [
+    const completion = await gateway.callLLM(
+      'gemini-3.1-flash-lite',
+      [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_completion_tokens: Math.max(500, titles.length * 30),
-      temperature: 0.1,
-    });
-    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
-    // until a price row exists) — token visibility is still worth having.
-    if ((completion as any)?.usage) {
-      meterUsageFromResponse(
-        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
-        completion
-      );
-    }
+      {
+        max_completion_tokens: Math.max(500, titles.length * 30),
+        temperature: 0.1,
+        usageContext: { userId, feature: 'title_company_parse' },
+        taskClass: 'nonstandard_consumer',
+      },
+    );
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

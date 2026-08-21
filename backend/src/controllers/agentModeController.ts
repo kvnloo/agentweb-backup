@@ -2771,7 +2771,7 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
         // The closing of the message is where a halt lives; cap input for cost.
         { role: 'user', content: content.slice(-2500) },
       ],
-      { temperature: 0, max_completion_tokens: 3 }
+      { temperature: 0, max_completion_tokens: 3, taskClass: 'scheduled_background' }
     );
     const timeoutPromise = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('confirmation judge timed out')), CONFIRMATION_JUDGE_TIMEOUT_MS)

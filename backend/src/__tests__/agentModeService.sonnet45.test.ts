@@ -655,9 +655,13 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gpt-5.5'].maxTools).toBe(128);
     });
 
-    it('should NOT set maxTools on Gemini or Bedrock models', () => {
+    it('should enforce Google\'s 128-function limit on Gemini but not Bedrock models', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.1-pro-preview'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.1-flash-lite'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3.7-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3-flash-preview'].maxTools).toBe(128);
       expect(llmModels['anthropic.claude-sonnet-4-6'].maxTools).toBeUndefined();
     });
 
@@ -706,9 +710,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.5-flash'].client).toBeNull();
     });
 
-    it('should NOT set maxTools on Gemini 3.5 Flash', () => {
+    it('should set maxTools on Gemini 3.5 Flash', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.5-flash'].maxTools).toBeUndefined();
+      expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
     });
 
     it('should return only anthropic non-opus models from getReportsModelOptions for non-admins', async () => {
@@ -750,7 +754,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
       const llmModels = (agentModeService as any).llmModels;
-      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const allModels = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -766,7 +771,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should place the configured default model first in the list for admins (including opus)', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels);
+      const llmModels = (agentModeService as any).llmModels;
+      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].internalOnly);
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: nonFirstModel,
@@ -819,7 +825,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const naturalOrder = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });
@@ -1098,7 +1105,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
-  describe('callLLM maxTools truncation (Azure OpenAI 128-tool limit)', () => {
+  describe('callLLM maxTools truncation (provider 128-tool limits)', () => {
     it('should truncate tools to maxTools limit for gpt-5.4', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'response', tool_calls: null } }],
@@ -1137,6 +1144,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const calledParams = mockCreate.mock.calls[0][0];
       expect(calledParams.tools).toHaveLength(128);
+    });
+
+    it('should truncate Gemini tools to Google\'s 128-function limit', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue({
+        chat: { completions: { create: mockCreate } },
+      });
+      const tools = Array.from({ length: 207 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } }
+      }));
+
+      await (agentModeService as any).callLLM(
+        'gemini-3.1-flash-lite',
+        [{ role: 'user', content: 'test' }],
+        { tools },
+      );
+
+      expect(mockCreate.mock.calls[0][0].tools).toHaveLength(128);
     });
   });
 

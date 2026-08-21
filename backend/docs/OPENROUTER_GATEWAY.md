@@ -1,7 +1,7 @@
 # OpenRouter Gateway Contract and Migration Inventory
 
 **Owner:** ENG-1413 program; foundation: ENG-1414
-**Status:** inventory baseline plus ENG-1430 interactive canary
+**Status:** inventory baseline plus ENG-1430 interactive and ENG-1431 background canaries
 
 ## Contract
 
@@ -24,7 +24,7 @@ throttling. AgentWeb must not add a fallback graph after an OpenRouter failure.
 | `logicalModelId` | AgentWeb ID retained for policy, entitlement, and ledger attribution. |
 | `upstreamModelId` | Validated `provider/model` ID sent only at the OpenRouter boundary. |
 | `eventId` | Idempotency key for one completion's cost/usage event. |
-| `usage` | Actual input, output, cache-read, cache-write tokens and OpenRouter cost. |
+| `usage` | Actual input, output, cache-read, cache-write tokens, OpenRouter cost, and BYOK routing flag. |
 | `error` | Typed auth, invalid-model, rate-limit, timeout, malformed-response, or stream-terminal error. |
 
 `normalizeOpenRouterModelId` preserves the existing explicit
@@ -47,6 +47,18 @@ additional retry for a gateway request. Claude prompt caching uses explicit
 content-block breakpoints rather than OpenRouter's top-level automatic flag:
 the explicit form preserves routing across Anthropic, Bedrock, and Vertex while
 retaining the existing five-minute and human-paced one-hour TTL behavior.
+Gateway requests include OpenRouter usage metadata. OpenRouter-billed calls use
+its reported cost; BYOK calls fall back to AgentWeb's provider price book because
+the upstream provider bills those calls directly while OpenRouter reports zero
+OpenRouter-billed spend.
+
+ENG-1431 adds `scheduled_background`, `content_generation`, `mcp_api`, and
+`nonstandard_consumer` at that same boundary. Each token is independently
+reversible: adding it moves only that task class to OpenRouter, while removing
+it restores the centralized incumbent provider path without changing customer
+data or deploying code. `agent_engine` and `coding_agent` remain disabled until
+ENG-1416 proves their native tool/streaming contracts; they are not implicit
+fallbacks for this slice.
 
 ## Direct text/chat/tool inventory at baseline
 

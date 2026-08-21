@@ -203,6 +203,177 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
+  it('falls back to the price book for BYOK usage instead of recording OpenRouter billed cost as economic cost', async () => {
+    create.mockResolvedValue({
+      id: 'gen-byok',
+      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: true },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: undefined })
+    );
+  });
+
+  it('preserves a provider-reported zero for non-BYOK OpenRouter usage', async () => {
+    create.mockResolvedValue({
+      id: 'gen-free',
+      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: false },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: 0 })
+    );
+  });
+
+  it('does not double-count OpenRouter cache reads that are already included in prompt_tokens', async () => {
+    create.mockResolvedValue({
+      id: 'gen-cached',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 80 },
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 20,
+        outputTokens: 20,
+        cacheReadTokens: 80,
+      })
+    );
+  });
+
+  it('splits OpenRouter cache writes reported inside prompt-token details', async () => {
+    create.mockResolvedValue({
+      id: 'gen-cache-write',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 50 },
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 20,
+        cacheReadTokens: 30,
+        cacheWriteTokens: 50,
+      })
+    );
+  });
+
+  it('bounds malformed OpenRouter cached-token counts to the reported prompt total', async () => {
+    create.mockResolvedValue({
+      id: 'gen-malformed-cache',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 140 },
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 0,
+        cacheReadTokens: 100,
+      })
+    );
+  });
+
+  it('splits OpenRouter cache reads reported in the Anthropic-compatible field', async () => {
+    create.mockResolvedValue({
+      id: 'gen-anthropic-cache-shape',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        cache_read_input_tokens: 70,
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 30,
+        cacheReadTokens: 70,
+      })
+    );
+  });
+
+  it('keeps uncached OpenRouter prompt tokens unchanged', async () => {
+    create.mockResolvedValue({
+      id: 'gen-uncached',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 0 },
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 100,
+        cacheReadTokens: 0,
+      })
+    );
+  });
+
   it('does not send costUsdOverride for a non-openrouter provider (bedrock unaffected)', async () => {
     const bedrockCreate = jest.fn().mockResolvedValue(fakeResponse);
     (svc as any).llmModels[MODEL].client = { chat: { completions: { create: bedrockCreate } } };

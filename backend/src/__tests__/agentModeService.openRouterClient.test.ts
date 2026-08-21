@@ -181,7 +181,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         model: modelId.slice('openrouter/'.length),
-      }));
+      }), { maxRetries: 0, timeout: 5 * 60 * 1000 });
     }
   });
 
@@ -193,7 +193,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
 
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }));
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }), undefined);
   });
 
   it('canary-routes an interactive GPT call through OpenRouter', async () => {
@@ -214,8 +214,66 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
       provider: { allow_fallbacks: true, require_parameters: true },
+      usage: { include: true },
     }));
     expect(request).not.toHaveProperty('temperature');
+    expect(request).not.toHaveProperty('response_format');
+  });
+
+  it('preserves an explicitly requested JSON response format on the gateway', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'nonstandard_consumer';
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Return JSON' }],
+      { taskClass: 'nonstandard_consumer', response_format: { type: 'json_object' } } as any,
+    );
+
+    expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      response_format: { type: 'json_object' },
+    }));
+  });
+
+  it('delegates ordered model fallback to OpenRouter on the wire', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    );
+
+    expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      model: 'perplexity/sonar-deep-research',
+      models: ['perplexity/sonar-pro-search'],
+      provider: { allow_fallbacks: true, require_parameters: true },
+      usage: { include: true },
+    }));
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unregistered fallback before sending a gateway request', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn();
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { fallbackModels: ['unregistered/model'] } as any,
+    )).rejects.toThrow("Invalid OpenRouter fallback model 'unregistered/model'");
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('has a verified gateway mapping for every selectable direct-provider model', () => {
@@ -253,6 +311,98 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).not.toHaveProperty('max_completion_tokens');
   });
 
+  describe('Gemini tool schemas through OpenRouter', () => {
+    const buildGatewayTools = () => [
+      {
+        type: 'function',
+        function: {
+          name: 'search_records',
+          description: 'Search records',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              query: { type: 'string', 'x-aliases': ['q'] },
+            },
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'send_message',
+          description: 'Send a message',
+          parameters: {
+            type: 'object',
+            properties: {
+              recipients: {
+                type: ['array', 'string'],
+                items: { type: 'string', uniqueItems: true },
+              },
+            },
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'choose_mode',
+          description: 'Choose a mode',
+          parameters: {
+            type: 'object',
+            properties: {
+              mode: { oneOf: [{ const: 'fast' }, { const: 'safe' }] },
+            },
+          },
+        },
+      },
+    ];
+
+    const callGateway = async (model: string) => {
+      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      const gatewayTools = buildGatewayTools();
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        model,
+        [{ role: 'user', content: 'Use a tool' }],
+        { taskClass: 'interactive_chat', tools: gatewayTools } as any,
+      );
+
+      return create.mock.calls[0][0].tools;
+    };
+
+    it('strips unsupported keywords from Gemini gateway tool schemas', async () => {
+      const tools = await callGateway('gemini-3.1-flash-lite');
+      expect(tools[0].function.parameters).toEqual({
+        type: 'object',
+        properties: { query: { type: 'string' } },
+      });
+    });
+
+    it('normalizes union types recursively for Gemini gateway tools', async () => {
+      const tools = await callGateway('gemini-3.1-flash-lite');
+      expect(tools[1].function.parameters.properties.recipients).toEqual({
+        type: 'array',
+        items: { type: 'string' },
+      });
+    });
+
+    it('drops unsupported schema combinators from Gemini gateway tools', async () => {
+      const tools = await callGateway('gemini-3.1-flash-lite');
+      expect(tools[2].function.parameters.properties.mode).toEqual({});
+    });
+
+    it('leaves non-Gemini gateway tool schemas byte-for-byte unchanged', async () => {
+      const tools = await callGateway('gpt-5.4');
+      expect(tools).toEqual(buildGatewayTools());
+    });
+  });
+
   it('preserves provider-native token and temperature fields while the canary is disabled', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
@@ -268,7 +418,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       model: 'gpt-5.4',
       max_completion_tokens: 321,
       temperature: 0.1,
-    }));
+    }), undefined);
   });
 
   it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
@@ -302,7 +452,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
           }],
         },
       ],
-    }));
+    }), { maxRetries: 0, timeout: 5 * 60 * 1000 });
     expect(create.mock.calls[0][0]).not.toHaveProperty('cache_control');
   });
 

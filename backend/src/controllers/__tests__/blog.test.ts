@@ -22,6 +22,12 @@ jest.mock('../../utils/llmService', () => ({
   }))
 }));
 
+// restyleContent shares the central gateway; keep this controller unit test
+// isolated from AgentMode's database/provider initialization.
+jest.mock('../../services/agentModeService', () => ({
+  agentModeService: { callLLM: jest.fn() },
+}));
+
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
   S3: jest.fn().mockImplementation(() => ({
@@ -960,4 +966,3 @@ describe('Blog Controller - Image Quality Defaulting', () => {
     });
   });
 });
-

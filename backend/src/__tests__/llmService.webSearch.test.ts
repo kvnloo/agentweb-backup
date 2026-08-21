@@ -25,7 +25,8 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
   it('POSTs to the Azure /openai/responses endpoint with web_search tool and parses output_text', async () => {
     const fetchMock = jest.fn().mockResolvedValue({
       ok: true,
-      text: async () => '{"output_text":"{\\"company\\":\\"Acme\\",\\"funding\\":\\"$10M\\"}"}',
+      status: 200,
+      text: async () => '{"output_text":"{\\"company\\":\\"Acme\\",\\"funding\\":\\"$10M\\"}","usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}',
     });
     (global as any).fetch = fetchMock;
 
@@ -42,6 +43,7 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
     );
     expect(init.method).toBe('POST');
     expect(init.headers['api-key']).toBe('test-key-xyz');
+    expect(init.signal).toBeInstanceOf(AbortSignal);
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({
       model: 'gpt-5-chat-2',
@@ -56,7 +58,8 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
       ok: true,
       text: async () => JSON.stringify({
         output: [
-          { content: [{ text: '{"x":' }, { text: '"ok"}' }] },
+          {},
+          { content: [{}, { text: '{"x":' }, { text: '"ok"}' }] },
         ],
       }),
     });
@@ -67,16 +70,47 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
   });
 
   it('surfaces a useful error on non-2xx response', async () => {
+    const readBody = jest.fn().mockResolvedValue('{"error":{"message":"bad api version"}}');
     (global as any).fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 400,
-      text: async () => '{"error":{"message":"bad api version"}}',
+      text: readBody,
     });
 
     const svc = makeService();
     await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
       /Azure Responses API 400.*bad api version/,
     );
+    expect(readBody).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a rejected Azure error-body read bounded to an empty diagnostic', async () => {
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: jest.fn().mockRejectedValue(new Error('socket closed')),
+    });
+
+    const svc = makeService();
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
+      'Azure Responses API 503:',
+    );
+  });
+
+  it('surfaces bounded response context when Azure returns invalid JSON', async () => {
+    const invalidBody = `<html>${'x'.repeat(500)}</html>`;
+    const readBody = jest.fn().mockResolvedValue(invalidBody);
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: readBody,
+    });
+
+    const svc = makeService();
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
+      /Azure Responses API 200 returned invalid JSON: <html>x+/,
+    );
+    expect(readBody).toHaveBeenCalledTimes(1);
   });
 
   it('throws when AZURE_OPENAI_ENDPOINT / API_KEY are unset', async () => {
@@ -119,14 +153,26 @@ describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
       text: async () => '{"output_text":"{\\"ok\\":1}"}',
     });
     (global as any).fetch = fetchMock;
-    process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
 
     const svc = makeService();
+    process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
+    delete process.env.AZURE_OPENAI_RESPONSES_API_VERSION;
     await svc.generateJSONContentWithWebSearch('s', 'u');
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toBe(
       'https://example.openai.azure.com/openai/responses?api-version=2025-03-01-preview',
     );
+  });
+
+  it('fails closed when a successful Azure payload contains no text output', async () => {
+    (global as any).fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => '{}',
+    });
+
+    const svc = makeService();
+    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toBeDefined();
   });
 });
 
@@ -146,12 +192,18 @@ describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
   });
 
   it('routes Gemini models through @google/genai with googleSearch tool and parses .text', async () => {
-    mockGenerateContent.mockResolvedValueOnce({ text: '{"city":"Boston","industry":"SaaS"}' });
+    mockGenerateContent.mockResolvedValueOnce({
+      text: '{"city":"Boston","industry":"SaaS"}',
+      usageMetadata: {
+        promptTokenCount: 7,
+        candidatesTokenCount: 5,
+        totalTokenCount: 12,
+        cachedContentTokenCount: 3,
+      },
+    });
 
     const svc = new LLMService('gemini-2.0-flash', 0);
-    // Constructor short-circuit branch — Gemini service must not initialize the
-    // Azure/Bedrock chatModel since the Gemini call uses a fresh GoogleGenAI client.
-    expect((svc as any).chatModel).toBeNull();
+    expect((svc as any).chatModel).toEqual(expect.objectContaining({ invoke: expect.any(Function) }));
 
     const out = await svc.generateJSONContentWithWebSearch<{ city: string; industry: string }>(
       'sys', 'user',
@@ -165,6 +217,7 @@ describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
       config: {
         systemInstruction: 'sys',
         tools: [{ googleSearch: {} }],
+        httpOptions: { timeout: 2 * 60 * 1000 },
       },
     });
 
