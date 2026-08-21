@@ -4271,7 +4271,7 @@ function logTokenUsage(
   );
 
   console.log(
-    `[Token Usage] Model: ${response.model} | Prompt: ${
+    `[Token Usage] Model: ${pricingModel} | Prompt: ${
       usage.prompt_tokens
     } | Completion: ${usage.completion_tokens} | Total: ${
       usage.total_tokens

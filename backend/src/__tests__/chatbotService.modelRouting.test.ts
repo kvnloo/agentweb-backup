@@ -290,7 +290,7 @@ describe('generateChatResponse — shared interactive gateway', () => {
       });
 
       expect(logSpy).toHaveBeenCalledWith(expect.stringMatching(
-        /\[Token Usage\] Model: openrouter\/upstream-model .* Cost: \$[0-9]/,
+        /\[Token Usage\] Model: gpt-5\.4 .* Cost: \$[0-9]/,
       ));
     } finally {
       logSpy.mockRestore();
