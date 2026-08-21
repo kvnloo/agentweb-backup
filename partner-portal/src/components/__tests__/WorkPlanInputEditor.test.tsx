@@ -65,4 +65,17 @@ describe('WorkPlanInputEditor', () => {
       'This answer card is malformed. Remove it and add it again.',
     ]);
   });
+
+  it.each([
+    ['non-array options', 'not-an-array'],
+    ['null option entries', [null, { value: 'b', label: 'B' }]],
+    ['option entries with non-string properties', [{ value: 1, label: 'A' }, { value: 'b', label: 'B' }]],
+  ])('returns a recoverable error for select fields with %s', (_case, options) => {
+    expect(validateEditableInputRequest({
+      ...fixture,
+      fields: [{ id: 'kind', label: 'Kind', type: 'select', options }],
+    })).toEqual([
+      'This answer card is malformed. Remove it and add it again.',
+    ]);
+  });
 });

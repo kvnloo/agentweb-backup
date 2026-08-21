@@ -31,6 +31,17 @@ export function isEditableWorkPlanInputRequest(value: unknown): value is Editabl
     && typeof field.id === 'string'
     && typeof field.label === 'string'
     && ['text', 'url', 'number', 'boolean', 'select'].includes(String(field.type))
+    && (
+      field.type !== 'select'
+      || (
+        Array.isArray(field.options)
+        && field.options.every((option) => (
+          isRecord(option)
+          && typeof option.value === 'string'
+          && typeof option.label === 'string'
+        ))
+      )
+    )
   ));
 }
 
