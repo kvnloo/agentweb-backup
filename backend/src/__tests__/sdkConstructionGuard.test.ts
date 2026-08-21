@@ -3,8 +3,8 @@
  *
  * Direct LLM SDK client construction bypasses the metered factory in
  * src/utils/llmClients.ts, which means those calls are invisible to usage
- * metering. This test greps backend/src for direct constructions and fails if
- * one appears OUTSIDE the allowlist.
+ * metering. This test parses backend/src and fails when a provider import
+ * appears outside the allowlist, regardless of construction spelling.
  *
  * The allowlist is seeded with the files that already construct clients today
  * (pre-migration). As the migration moves call sites onto llmClients.ts,
@@ -14,21 +14,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ts from 'typescript';
 
 const SRC_ROOT = path.join(__dirname, '..');
 
-/** Patterns that indicate a direct (unmetered) inference SDK construction. */
-const FORBIDDEN_PATTERNS: Array<{ name: string; re: RegExp }> = [
-  { name: 'new OpenAI(', re: /new\s+OpenAI\s*\(/ },
-  { name: 'new AzureOpenAI(', re: /new\s+AzureOpenAI\s*\(/ },
-  { name: 'new BedrockRuntimeClient(', re: /new\s+BedrockRuntimeClient\s*\(/ },
-  { name: 'new GoogleGenAI(', re: /new\s+GoogleGenAI\s*\(/ },
-];
-
 /**
- * Importing a text/chat provider SDK is the architectural boundary. Checking
- * the import source (rather than `new Foo`) closes alias, factory, require and
- * dynamic-import bypasses before they reach production.
+ * Importing a text/chat provider SDK is the architectural boundary. AST
+ * traversal (rather than regex or `new Foo`) closes alias, factory, require,
+ * dynamic-import, TSX, and comment/string false-positive gaps.
  */
 const DIRECT_TEXT_PROVIDER_SDKS = [
   'openai',
@@ -43,46 +36,33 @@ const DIRECT_TEXT_PROVIDER_SDKS = [
   '@langchain/anthropic',
 ] as const;
 
-function findDirectProviderSdkImports(content: string): string[] {
-  return DIRECT_TEXT_PROVIDER_SDKS.filter((packageName) => {
-    const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // ES import/export-from, CommonJS require, and dynamic import. `\\s*`
-    // intentionally permits multiline formatting and arbitrary aliases.
-    return new RegExp(
-      `(?:\\b(?:import|export)\\s+(?:type\\s+)?[\\s\\S]*?\\bfrom\\s*|\\brequire\\s*\\(|\\bimport\\s*\\()\\s*['\"]${escaped}['\"]`,
-    ).test(content);
-  });
-}
-
-/**
- * Finds both literal SDK construction and the common import-alias bypass.
- * This is intentionally source-level rather than a lint rule: it runs in the
- * existing Jest gate and covers TypeScript's default and named import forms.
- */
-function findForbiddenSdkConstruction(content: string): string[] {
-  const found = FORBIDDEN_PATTERNS
-    .filter(({ re }) => re.test(content))
-    .map(({ name }) => name);
-
-  const aliases: Array<{ packageName: string; exportName?: string }> = [
-    { packageName: 'openai' },
-    { packageName: '@google/genai', exportName: 'GoogleGenAI' },
-    { packageName: '@aws-sdk/client-bedrock-runtime', exportName: 'BedrockRuntimeClient' },
-    { packageName: '@azure/openai', exportName: 'AzureOpenAI' },
-  ];
-
-  for (const { packageName, exportName } of aliases) {
-    const escapedPackage = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const aliasMatch = exportName
-      ? new RegExp(`import\\s+\\{[^}]*\\b${exportName}\\s+as\\s+([A-Za-z_$][\\w$]*)[^}]*\\}\\s+from\\s+['\"]${escapedPackage}['\"]`).exec(content)
-      : new RegExp(`import\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+['\"]${escapedPackage}['\"]`).exec(content);
-    const alias = aliasMatch?.[1];
-    if (alias && new RegExp(`new\\s+${alias}\\s*\\(`).test(content)) {
-      found.push(`aliased ${exportName || packageName} construction (${alias})`);
+function findDirectProviderSdkImports(content: string, fileName = 'source.ts'): string[] {
+  const sourceFile = ts.createSourceFile(
+    fileName,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    fileName.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  const found = new Set<string>();
+  const recordModule = (moduleSpecifier: ts.Expression | undefined): void => {
+    if (!moduleSpecifier || !ts.isStringLiteralLike(moduleSpecifier)) return;
+    if ((DIRECT_TEXT_PROVIDER_SDKS as readonly string[]).includes(moduleSpecifier.text)) {
+      found.add(moduleSpecifier.text);
     }
-  }
-
-  return found;
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      recordModule(node.moduleSpecifier);
+    } else if (ts.isCallExpression(node) && node.arguments.length === 1) {
+      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require';
+      const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      if (isRequire || isDynamicImport) recordModule(node.arguments[0]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return DIRECT_TEXT_PROVIDER_SDKS.filter((packageName) => found.has(packageName));
 }
 
 /**
@@ -115,7 +95,7 @@ const ALLOWLIST = new Set<string>([
 ]);
 
 function assertNoForbiddenProviderImports(file: string, content: string): void {
-  const imports = findDirectProviderSdkImports(content);
+  const imports = findDirectProviderSdkImports(content, file);
   if (imports.length > 0 && !ALLOWLIST.has(file)) {
     throw new Error(
       `Direct provider SDK import in ${file}: ${imports.join(', ')}. ` +
@@ -133,8 +113,9 @@ function listSourceFiles(dir: string, acc: string[] = []): string[] {
       listSourceFiles(full, acc);
     } else if (
       entry.isFile() &&
-      entry.name.endsWith('.ts') &&
+      (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) &&
       !entry.name.endsWith('.test.ts') &&
+      !entry.name.endsWith('.test.tsx') &&
       !entry.name.endsWith('.d.ts')
     ) {
       acc.push(full);
@@ -173,10 +154,25 @@ describe('SDK construction guard alias resistance (ENG-1414)', () => {
   it.each([
     ["import Client from 'openai';\nmakeClient(Client);"],
     ["import * as Google from '@google/genai';\nGoogle.makeClient();"],
+    ["export { OpenAI } from '@azure/openai';"],
     ["const sdk = require('@aws-sdk/client-bedrock-runtime');\nmakeClient(sdk);"],
     ["const sdk = await import(\n  '@azure/openai'\n);\nmakeClient(sdk);"],
   ])('rejects a deliberately introduced forbidden provider import regardless of construction spelling', (source) => {
     expect(() => assertNoForbiddenProviderImports('services/newConsumer.ts', source)).toThrow(/Direct provider SDK import/);
+  });
+
+  it('parses TSX imports instead of skipping backend TSX source', () => {
+    expect(() => assertNoForbiddenProviderImports(
+      'services/newConsumer.tsx',
+      "import Client from 'openai';\nexport const view = <div>{Client.name}</div>;",
+    )).toThrow(/Direct provider SDK import/);
+  });
+
+  it('ignores provider-looking text inside comments and strings', () => {
+    expect(() => assertNoForbiddenProviderImports(
+      'services/commentOnly.ts',
+      "// import Client from 'openai';\nconst example = \"require('@google/genai')\";",
+    )).not.toThrow();
   });
 
   it('passes the approved gateway and documented non-text exceptions', () => {
