@@ -32,6 +32,7 @@ import {
   recordRecommendationDeclined,
   InvalidDeclineInputError,
   DECLINE_REASONS,
+  MAX_DECLINE_SELECTIONS,
 } from '../services/llmUsageDeclineService';
 
 const app = express();
@@ -94,6 +95,23 @@ describe('POST /api/subscription/usage-runway/decline', () => {
 
     expect(res.status).toBe(400);
     expect(mockRecord).toHaveBeenCalledWith('member-9', expect.objectContaining({ selections: [] }));
+  });
+
+  it('bounds the list BEFORE normalising it, so a huge array costs nothing (CodeRabbit)', async () => {
+    // The service slices too, but only there means the route still normalises the whole
+    // array first. The bound should cost nothing to exceed, not merely limit what is
+    // recorded.
+    // 500, not 5,000: express's default 100kb JSON limit rejects the larger body before
+    // the handler runs, so that would have tested the body parser, not this bound.
+    const many = Array.from({ length: 500 }, (_, i) => ({ fromModel: `m${i}`, toModel: 'b' }));
+
+    await request(app)
+      .post('/api/subscription/usage-runway/decline')
+      .send({ reason: DECLINE_REASONS.previewCleared, selections: many });
+
+    const forwarded = mockRecord.mock.calls[0][1].selections;
+    expect(forwarded).toHaveLength(MAX_DECLINE_SELECTIONS);
+    expect(forwarded[0].fromModel).toBe('m0');
   });
 
   it('SUCCESS: forwards the acting user and the selections as the customer saw them', async () => {

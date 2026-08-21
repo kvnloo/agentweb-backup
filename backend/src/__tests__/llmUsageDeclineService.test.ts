@@ -72,6 +72,27 @@ describe("recordRecommendationDeclined — refusals", () => {
     expect(emitted).toHaveLength(0);
   });
 
+  it.each([
+    ["empty", ""],
+    ["whitespace-only", "   "],
+  ])("FAIL: rejects a %s model identifier (CodeRabbit)", async (_label, value) => {
+    // A blank id records a decline that cannot be traced back to the recommendation the
+    // customer was shown — a funnel row that answers no question.
+    await expect(
+      recordRecommendationDeclined("u1", {
+        reason: DECLINE_REASONS.previewCleared,
+        selections: [{ fromModel: value, toModel: "b" }],
+      }),
+    ).rejects.toThrow(/non-empty/i);
+    await expect(
+      recordRecommendationDeclined("u1", {
+        reason: DECLINE_REASONS.previewCleared,
+        selections: [{ fromModel: "a", toModel: value }],
+      }),
+    ).rejects.toThrow(/non-empty/i);
+    expect(emitted).toHaveLength(0);
+  });
+
   it("FAIL: rejects an empty selection list — a decline of nothing is not a decline", async () => {
     await expect(
       recordRecommendationDeclined("u1", {

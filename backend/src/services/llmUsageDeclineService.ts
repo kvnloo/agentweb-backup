@@ -45,7 +45,7 @@ const VALID_REASONS: readonly string[] = Object.values(DECLINE_REASONS);
  * Same bound as the preview route. One request must not be able to turn into an
  * unbounded number of log lines.
  */
-const MAX_SELECTIONS = 20;
+export const MAX_DECLINE_SELECTIONS = 20;
 
 export interface DeclinedSelection {
   fromModel: string;
@@ -85,11 +85,20 @@ export async function recordRecommendationDeclined(
       "`selections` must contain at least one selection — a decline of nothing is not a decline",
     );
   }
-  const bounded = input.selections.slice(0, MAX_SELECTIONS);
+  const bounded = input.selections.slice(0, MAX_DECLINE_SELECTIONS);
   for (const s of bounded) {
-    if (!s || typeof s.fromModel !== "string" || typeof s.toModel !== "string") {
+    // Non-empty, not merely a string. A blank or whitespace-only id records a decline
+    // that cannot be traced back to the recommendation the customer was shown, which is a
+    // row in the funnel that answers no question.
+    if (
+      !s ||
+      typeof s.fromModel !== "string" ||
+      typeof s.toModel !== "string" ||
+      !s.fromModel.trim() ||
+      !s.toModel.trim()
+    ) {
       throw new InvalidDeclineInputError(
-        "each selection must have string `fromModel` and `toModel`",
+        "each selection must have non-empty string `fromModel` and `toModel`",
       );
     }
   }

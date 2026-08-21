@@ -3,6 +3,7 @@ import { authenticateToken } from '../middleware/auth';
 import {
   recordRecommendationDeclined,
   InvalidDeclineInputError,
+  MAX_DECLINE_SELECTIONS,
 } from '../services/llmUsageDeclineService';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
@@ -169,7 +170,10 @@ router.post('/usage-runway/decline', authenticateToken, async (req, res) => {
 
     const result = await recordRecommendationDeclined(userId, {
       reason,
-      selections: (selections || []).map((s: any) => ({
+      // Bounded BEFORE the map. The service slices too, but doing it only there means a
+      // caller can still make the route normalise an arbitrarily long array first — the
+      // bound should cost nothing to exceed, not merely limit what gets recorded.
+      selections: (selections || []).slice(0, MAX_DECLINE_SELECTIONS).map((s: any) => ({
         fromModel: s?.fromModel,
         toModel: s?.toModel,
         // Taken as the customer saw them. Recomputing here would record a number they
