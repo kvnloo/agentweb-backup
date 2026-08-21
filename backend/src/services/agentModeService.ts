@@ -3506,9 +3506,10 @@ export class AgentModeService {
             part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
           )
         );
-        const managedFallback = hasImageInput
-          ? 'google/gemini-3.5-flash'
-          : 'deepseek/deepseek-v4-flash';
+        const managedFallbackId = hasImageInput
+          ? 'gemini-3.5-flash'
+          : 'openrouter/deepseek/deepseek-v4-flash';
+        const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
         if (upstreamModel !== managedFallback) params.models = [managedFallback];
       }
       if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {

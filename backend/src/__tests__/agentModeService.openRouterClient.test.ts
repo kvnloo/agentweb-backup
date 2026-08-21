@@ -240,7 +240,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       }));
     });
 
-    it('delegates text overflow to a cheap long-context model fallback', async () => {
+    it('configures a cheap long-context managed fallback for text requests', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -254,6 +254,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
       expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
         models: ['deepseek/deepseek-v4-flash'],
+        plugins: expectedPlugin,
       }));
     });
 
@@ -274,6 +275,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
       expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
         models: ['google/gemini-3.5-flash'],
+        plugins: expectedPlugin,
       }));
     });
 
