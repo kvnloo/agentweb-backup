@@ -42,6 +42,7 @@ describe('ENG-1423 executable baseline evidence', () => {
       'coding_agent',
       'nonstandard_consumer',
     ];
+    expect(BASELINE_FIXTURES).toHaveLength(expected.length);
     expect(new Set(BASELINE_FIXTURES.map((f) => f.taskClass)))
       .toEqual(new Set(expected));
   });
@@ -189,6 +190,27 @@ describe('ENG-1423 executable baseline evidence', () => {
       async () => ({ status: 404, body: { error: 'not found' } }),
       { maxAttempts: 2, delayMs: 0 },
     )).rejects.toThrow('not indexed after 2 attempts');
+  });
+
+  it('caps slow generation polling at the aggregate deadline', async () => {
+    let now = 0;
+    const fetchDetail = jest.fn(async (_generationId: string, timeoutMs?: number) => {
+      expect(timeoutMs).toBe(30);
+      now += 20;
+      return { status: 404, body: { error: 'not found' } };
+    });
+    const sleep = jest.fn(async (ms: number) => { now += ms; });
+
+    await expect(pollOpenRouterGenerationDetail('gen-slow', fetchDetail, {
+      maxAttempts: 30,
+      delayMs: 15,
+      maxElapsedMs: 30,
+      nowMs: () => now,
+      sleep,
+    })).rejects.toThrow('not indexed within 30ms');
+    expect(fetchDetail).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(10);
+    expect(now).toBe(30);
   });
 
   it('fails loudly on a non-404 generation lookup response', async () => {

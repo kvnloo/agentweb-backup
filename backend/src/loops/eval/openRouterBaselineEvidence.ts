@@ -81,16 +81,33 @@ export interface GenerationDetailResponse {
 
 export async function pollOpenRouterGenerationDetail(
   generationId: string,
-  fetchDetail: (generationId: string) => Promise<GenerationDetailResponse>,
-  options: { maxAttempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+  fetchDetail: (generationId: string, timeoutMs?: number) => Promise<GenerationDetailResponse>,
+  options: {
+    maxAttempts?: number;
+    delayMs?: number;
+    maxElapsedMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    nowMs?: () => number;
+  } = {},
 ): Promise<OpenRouterGenerationDetail> {
   const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? 8));
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 750));
+  const maxElapsedMs = Math.max(1, Math.floor(options.maxElapsedMs ?? 30_000));
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const nowMs = options.nowMs ?? Date.now;
+  const startedAt = nowMs();
+  let attempts = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const response = await fetchDetail(generationId);
+    const elapsedMs = Math.max(0, nowMs() - startedAt);
+    const remainingMs = maxElapsedMs - elapsedMs;
+    if (remainingMs <= 0) break;
+    attempts = attempt;
+    const response = await fetchDetail(generationId, remainingMs);
     if (response.status === 404) {
-      if (attempt < maxAttempts) await sleep(delayMs);
+      const remainingAfterFetchMs = maxElapsedMs - Math.max(0, nowMs() - startedAt);
+      if (attempt < maxAttempts && remainingAfterFetchMs > 0 && delayMs > 0) {
+        await sleep(Math.min(delayMs, remainingAfterFetchMs));
+      }
       continue;
     }
     if (response.status !== 200) {
@@ -135,7 +152,10 @@ export async function pollOpenRouterGenerationDetail(
         : {}),
     };
   }
-  throw new Error(`OpenRouter generation ${generationId} was not indexed after ${maxAttempts} attempts`);
+  if (Math.max(0, nowMs() - startedAt) >= maxElapsedMs) {
+    throw new Error(`OpenRouter generation ${generationId} was not indexed within ${maxElapsedMs}ms`);
+  }
+  throw new Error(`OpenRouter generation ${generationId} was not indexed after ${attempts} attempts`);
 }
 
 const exactTextFixture = (
