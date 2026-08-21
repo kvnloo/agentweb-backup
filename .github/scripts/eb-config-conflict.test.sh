@@ -384,66 +384,22 @@ run_check "$(cd "${SCRIPT_DIR}/../.." && pwd)" \
   backend/.ebextensions/timeout.config
 check 'ENG-836: the live repo timeout.config alone is not a conflict' 0 ''
 
-# ENG-1412: every shell script must avoid the pipefail/SIGPIPE shape that made
-# the mixed-class fixture report a false green. A structural assertion is
-# deterministic even though the original timing race is not. Keep the
-# detector broad enough to cover continued lines, combined short options, and
-# the long quiet option.
-PIPE_GREP_PATTERN='printf(?:[^\n]|\\\n)*\|\s*grep\s+(?:-[^\s]*q[^\s]*|--quiet(?:\s|$))'
-# Keep this assertion dependency-free: GitHub's stock runner does not install
-# ripgrep. Python is already required by the repository's CI tooling and lets
-# the detector safely span shell line continuations.
-find_pipe_grep_matches() {
-  python3 - "${PIPE_GREP_PATTERN}" "$@" <<'PY'
-import pathlib
-import re
-import sys
-
-pattern = re.compile(sys.argv[1])
-for raw_path in sys.argv[2:]:
-    path = pathlib.Path(raw_path)
-    text = path.read_text(encoding="utf-8")
-    for match in pattern.finditer(text):
-        line = text.count("\n", 0, match.start()) + 1
-        snippet = match.group(0).replace("\n", r"\n")
-        print(f"{path}:{line}:{snippet}")
-PY
-}
-PIPE_GREP_FIXTURES="${WORKDIR}/pipe-grep-fixtures"
-mkdir -p "${PIPE_GREP_FIXTURES}"
-cat >"${PIPE_GREP_FIXTURES}/combined-short.sh" <<'EOF'
-printf '%s' "value" | grep -Fq "value"
-EOF
-cat >"${PIPE_GREP_FIXTURES}/long-option.sh" <<'EOF'
-printf '%s' "value" | grep --quiet "value"
-EOF
-cat >"${PIPE_GREP_FIXTURES}/continued.sh" <<'EOF'
-printf '%s' "value" \
-  | grep -qF "value"
-EOF
-PIPE_GREP_FIXTURE_MATCHES="$(find_pipe_grep_matches "${PIPE_GREP_FIXTURES}"/*.sh || true)"
-TESTS_RUN=$(( TESTS_RUN + 1 ))
-if [ "$(find_pipe_grep_matches "${PIPE_GREP_FIXTURES}"/*.sh | wc -l)" -eq 3 ]; then
-  printf '  ok   %s\n' 'ENG-1412: detector catches combined, long, and continued printf-to-grep forms'
-else
-  printf '  FAIL %s\n       detector output:\n%s\n' \
-    'ENG-1412: detector catches combined, long, and continued printf-to-grep forms' \
-    "${PIPE_GREP_FIXTURE_MATCHES}"
-  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
-fi
-
-mapfile -t CI_SHELL_SCRIPTS < <(find "${SCRIPT_DIR}" -maxdepth 1 -name '*.sh' \
-  ! -name 'eb-config-conflict.test.sh' -print)
-PIPE_GREP_MATCHES="$(find_pipe_grep_matches "${CI_SHELL_SCRIPTS[@]}" || true)"
-TESTS_RUN=$(( TESTS_RUN + 1 ))
-if [ -z "${PIPE_GREP_MATCHES}" ]; then
-  printf '  ok   %s\n' 'ENG-1412: no CI shell script pipes printf into grep -q under pipefail'
-else
-  printf '  FAIL %s\n       forbidden matches:\n%s\n' \
-    'ENG-1412: no CI shell script pipes printf into grep -q under pipefail' \
-    "${PIPE_GREP_MATCHES}"
-  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
-fi
+# ENG-1412's structural assertion used to live here. It now lives in
+# .github/scripts/pipefail-hygiene.test.sh, which is where a rule about every
+# script in the directory belongs — this file's subject is EB resource/instance
+# config conflicts, and it was only the host because that is where the bug was
+# first caught.
+#
+# The move is also a widening. Measured head-to-head on a 12-shape corpus, the
+# pattern here caught 4 and the replacement catches 12, with no false positives
+# either side. It matched only pipelines that BEGIN with printf and END in grep,
+# so `jq ... | head -n 1` — which aborts deploy-failure-alert.sh outright under
+# set -e — was invisible to it, along with every other `head` case,
+# `grep --silent`, `grep -e X -q`, and any writer that is not printf.
+#
+# What it did better, and what the replacement now also handles: it regexed the
+# whole file, so it spanned a blank or comment line between `|` and the reader.
+# The line-joining replacement missed that until this comparison surfaced it.
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1
