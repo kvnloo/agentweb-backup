@@ -7,8 +7,15 @@
  * /generated/:id/duplicate. Every page bound before that shipped keeps whatever state it
  * has, so a page wired to a `publicAccessEnabled !== true` list goes on 403ing at
  * /api/webhooks/forward-lead (webhooks.ts) while the visitor is shown a success screen.
- * That is exactly the state ENG-967's "LP Leads - 2026 State of AI Marketing"
- * (list_1779584823329_md99qvwnk) is in. This script is the one-time repair.
+ * This script is the one-time repair for that class.
+ *
+ * ⚠ IT DOES NOT REPAIR EITHER LIST ENG-967 NAMES, and an earlier revision of this comment
+ * claimed it repaired one of them. Checked against production 2026-08-21:
+ * "LP Leads - 2026 State of AI Marketing" (list_1779584823329_md99qvwnk) is private, but NO
+ * AW-LandingPages record names it (Scan of all 167), no code in the org references it, and
+ * hireemma.ai/2026-state-of-ai-marketing returns 404 — so this script never enumerates it,
+ * and flipping it public would change nothing, because nothing posts to it. The other list
+ * is covered below. Both need CRM cleanup, not this script.
  *
  * ── What it changes ────────────────────────────────────────────────────────
  * ONLY `publicAccessEnabled: true`, and ONLY on a lead list that some landing page
@@ -27,13 +34,18 @@
  * ── What it deliberately does NOT fix ──────────────────────────────────────
  * A list that is ALREADY public and still has zero leads is NOT explained by this bug at
  * all — ENG-967's other list, "LP Leads - Emma Partner Network"
- * (list_1779822422539_l5yvansu2), is publicAccessEnabled=true in prod today and still
- * reports 0 leads. Whatever is dropping that page's leads is a different cause (no page
- * actually bound, capture route never deployed, or simply no traffic). The script cannot
- * repair that, so it reports those lists separately under NEEDS DIAGNOSIS, along with the
- * bound pages' status/URL, which is the information needed to tell those three apart.
- * Lists referenced by a page but missing from AW-LeadLists (a live lander POSTing into a
- * 404) are reported the same way.
+ * (list_1779822422539_l5yvansu2), is publicAccessEnabled=true in prod and still reports 0
+ * leads. Its cause was found and is not repairable here: the live /emma-partner-network form
+ * posts through /api/partner-capture -> PARTNER_LEAD_LIST_ID ->
+ * LANDERS['/emma-partner-network'].listId = list_1780522372186_ve7ebuzp8 ("Partner Network
+ * Briefs"), read from lib/landers.ts in agentweb-landing-page. The AW-LandingPages record
+ * names the other list; the form never did. That repo's own LANDERS.md already calls
+ * l5yvansu2 a duplicate and says to delete it.
+ *
+ * So the script reports every such list under NEEDS DIAGNOSIS with each bound page's
+ * status/URL/repo, which is what separates "no page bound" from "bound but never deployed"
+ * from "bound, deployed, posting somewhere else". Lists referenced by a page but missing
+ * from AW-LeadLists (a live lander POSTing into a 404) are reported the same way.
  *
  * ── Usage ──────────────────────────────────────────────────────────────────
  *   npx ts-node src/scripts/backfill-eng967-lead-list-public-access.ts                  # DRY RUN, all pages
