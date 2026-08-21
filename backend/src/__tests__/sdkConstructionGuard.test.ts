@@ -153,6 +153,7 @@ describe('SDK construction guard', () => {
 describe('SDK construction guard alias resistance (ENG-1414)', () => {
   it.each([
     ["import Client from 'openai';\nmakeClient(Client);"],
+    ["import/* comment */ Client from 'openai';\nnew Client();"],
     ["import * as Google from '@google/genai';\nGoogle.makeClient();"],
     ["export { OpenAI } from '@azure/openai';"],
     ["const sdk = require('@aws-sdk/client-bedrock-runtime');\nmakeClient(sdk);"],
