@@ -265,6 +265,34 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
+  it('splits OpenRouter cache writes reported inside prompt-token details', async () => {
+    create.mockResolvedValue({
+      id: 'gen-cache-write',
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 30, cache_write_tokens: 50 },
+        cost: 0,
+        is_byok: true,
+      },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'openrouter',
+        inputTokens: 20,
+        cacheReadTokens: 30,
+        cacheWriteTokens: 50,
+      })
+    );
+  });
+
   it('bounds malformed OpenRouter cached-token counts to the reported prompt total', async () => {
     create.mockResolvedValue({
       id: 'gen-malformed-cache',

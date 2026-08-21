@@ -1034,9 +1034,9 @@ function nonNegativeTokenCount(value: unknown): number {
 /**
  * Convert an OpenAI-compatible usage object into the ledger's disjoint token
  * dimensions. OpenRouter follows OpenAI's contract: `prompt_tokens` includes
- * cache reads and `prompt_tokens_details.cached_tokens` identifies that subset.
- * Our ledger prices uncached input and cache reads separately, so forwarding
- * both fields verbatim double-counts the cached portion.
+ * cache reads/writes and `prompt_tokens_details` identifies those subsets. Our
+ * ledger prices uncached input, cache reads, and cache writes separately, so
+ * forwarding the inclusive prompt total double-counts the cached portion.
  *
  * Provider-native Bedrock/Vertex adapters already report uncached input and
  * cache reads as disjoint counters; their existing semantics stay unchanged.
@@ -1054,17 +1054,28 @@ function normalizeCallUsageTokens(usage: any, provider: string): {
   const providerCacheReadTokens = nonNegativeTokenCount(usage?.cache_read_input_tokens);
   const openAiCacheReadTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cached_tokens);
   const reportedCacheReadTokens = providerCacheReadTokens || openAiCacheReadTokens;
-  const cacheReadTokens = provider === 'openrouter'
-    ? Math.min(promptTokens, reportedCacheReadTokens)
-    : reportedCacheReadTokens;
+  const providerCacheWriteTokens = nonNegativeTokenCount(usage?.cache_creation_input_tokens);
+  const openAiCacheWriteTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cache_write_tokens);
+
+  if (provider !== 'openrouter') {
+    return {
+      inputTokens: promptTokens,
+      outputTokens,
+      cacheReadTokens: reportedCacheReadTokens,
+      cacheWriteTokens: providerCacheWriteTokens,
+    };
+  }
+
+  const cacheReadTokens = Math.min(promptTokens, reportedCacheReadTokens);
+  const remainingPromptTokens = promptTokens - cacheReadTokens;
+  const reportedCacheWriteTokens = providerCacheWriteTokens || openAiCacheWriteTokens;
+  const cacheWriteTokens = Math.min(remainingPromptTokens, reportedCacheWriteTokens);
 
   return {
-    inputTokens: provider === 'openrouter'
-      ? promptTokens - cacheReadTokens
-      : promptTokens,
+    inputTokens: remainingPromptTokens - cacheWriteTokens,
     outputTokens,
     cacheReadTokens,
-    cacheWriteTokens: nonNegativeTokenCount(usage?.cache_creation_input_tokens),
+    cacheWriteTokens,
   };
 }
 
