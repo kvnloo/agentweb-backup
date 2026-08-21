@@ -35050,11 +35050,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
         /*
-         * The account's own time zone, read from Google rather than assumed. Google
-         * interprets the timestamp in it, so guessing UTC would silently shift every
-         * conversion by the account's real offset — and the only symptom is conversions
-         * landing on the wrong day, which nobody reads as a bug.
+         * Validate BEFORE resolving the time zone. getAccountTimeZone is a live Google
+         * call, so doing it first meant a future-dated timestamp or a value with no
+         * currency — both refusable locally — still cost a network round trip before
+         * being rejected. On a background sweep that is a request per bad row.
+         *
+         * The zone is only needed to FORMAT a conversion we have already accepted, so a
+         * throwaway placeholder validates everything else first. UTC is safe here purely
+         * because the result is discarded; the real formatting below uses the account's
+         * own zone, and getting that wrong would shift every conversion by the real
+         * offset with no symptom beyond conversions landing on the wrong day.
          */
+        const validateOnlyArgs = {
+          gclid: args.gclid,
+          conversionActionResourceName: args.conversion_action_resource_name,
+          conversionAt: new Date(args.conversion_at),
+          value: args.conversion_value,
+          currencyCode: args.currency_code,
+          orderId: args.order_id,
+        };
+        try {
+          buildClickConversion({ ...validateOnlyArgs, timeZone: 'UTC' });
+        } catch (err: any) {
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+
         const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
         let conversion: Record<string, unknown>;
         try {
@@ -35286,11 +35306,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
           // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
           // lookup failure must NOT break an otherwise-valid ad creation.
+          // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
+          // gate already computes the warning; relaying it here is what stops it being
+          // computed and discarded — the exact failure this ticket's own comment names.
+          let creativeTrackingWarning: string | undefined;
           try {
             const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
             if (parent) {
               const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
               if (!gate.proceed) return gate.blockResult;
+              creativeTrackingWarning = gate.warning;
             }
           } catch (gateErr) {
             console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
@@ -35306,7 +35331,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
           });
-          return { success: true, adResourceName: ad.resourceName };
+          return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
@@ -35365,10 +35390,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
         // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
         // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch.
+        let creativeTrackingWarning: string | undefined;
         try {
           const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
           const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
           if (!gate.proceed) return gate.blockResult;
+          creativeTrackingWarning = gate.warning;
         } catch (gateErr) {
           console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
         }
@@ -35384,7 +35412,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           videoAssets: args.video_assets,
           finalUrl: args.final_url,
         });
-        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+        return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
 
       if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
