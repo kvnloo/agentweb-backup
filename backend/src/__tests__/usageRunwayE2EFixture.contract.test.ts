@@ -22,6 +22,9 @@ describe('usage-runway E2E fixture contract', () => {
   });
 
   it('deletes the ephemeral user during teardown', () => {
+    expect(source).toMatch(
+      /if \(fixtureCreated\) \{[\s\S]*delete\(\{ TableName: USERS_TABLE, Key: \{ email: FIXTURE_EMAIL \} \}\)/,
+    );
     expect(source).toContain(
       'delete({ TableName: USERS_TABLE, Key: { email: FIXTURE_EMAIL } })',
     );
