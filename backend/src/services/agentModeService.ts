@@ -4635,13 +4635,21 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        const chatTaskClass: GatewayTaskClass | undefined = isScheduledSession
+          ? undefined
+          : 'interactive_chat';
+        const providerForChatRoute = (logicalModel: string): string =>
+          logicalModel.startsWith('openrouter/') ||
+          isOpenRouterGatewayEnabledForTaskClass(chatTaskClass)
+            ? 'openrouter'
+            : providerForModel(logicalModel);
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
         const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
           [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
           [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
-          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForChatRoute(llmModel),
           [ATTR_SESSION_ID]: sessionId,
         });
         try {
@@ -4671,7 +4679,7 @@ export class AgentModeService {
             // ENG-1430: only this customer-facing loop participates in the first
             // reversible OpenRouter cutover. Internal judges/scheduled helpers
             // remain on their characterized paths until their own slices.
-            taskClass: isScheduledSession ? undefined : 'interactive_chat',
+            taskClass: chatTaskClass,
           });
         } catch (callError) {
           // ENG-907: the backup-model retry below issues a SECOND full call of the same
@@ -4750,7 +4758,7 @@ export class AgentModeService {
                 usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn,
-                taskClass: isScheduledSession ? undefined : 'interactive_chat',
+                taskClass: chatTaskClass,
               }), synthesisRetryDeadlineMs);
               if (response === SYNTHESIS_RETRY_TIMED_OUT) {
                 console.warn(
@@ -4771,7 +4779,12 @@ export class AgentModeService {
             throw callError;
           }
         } finally {
-          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
+          endChatSpan(chatSpan, {
+            model: llmModel,
+            provider: providerForChatRoute(llmModel),
+            response,
+            inputMessages: trimmedMessages,
+          });
         }
         // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
         // loop instead of raising — the caller is milliseconds from its cap, and an

@@ -37,6 +37,7 @@ import {
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OPERATION_NAME,
   ATTR_GEN_AI_OUTPUT_MESSAGES,
+  ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   ATTR_GEN_AI_RESPONSE_MODEL,
@@ -310,6 +311,16 @@ describe('tracing: happy path span topology + attributes', () => {
     expect(chatSpan.status.code).toBe(SpanStatusCode.ERROR);
   });
 
+  it('chat span records an explicit transport provider for task-class gateway routes', async () => {
+    startInvokeAgentSpan('run-gateway-provider', { sessionId: 's' });
+    const chat = startRunChildSpan('run-gateway-provider', 'chat gpt-5.4', {});
+    endChatSpan(chat, { model: 'gpt-5.4', provider: 'openrouter', response: { choices: [] } });
+    endInvokeAgentSpan('run-gateway-provider', { verdict: 'ok' });
+    await flushTelemetry();
+    const chatSpan = exporter.getFinishedSpans().find((s) => s.name.startsWith('chat'))!;
+    expect(chatSpan.attributes[ATTR_GEN_AI_PROVIDER_NAME]).toBe('openrouter');
+  });
+
   it('double end + restart of the same runId does not throw', () => {
     startInvokeAgentSpan('run-dup', {});
     endInvokeAgentSpan('run-dup', { verdict: 'ok' });
@@ -361,6 +372,9 @@ describe('semconv: provider mapping mirrors callLLM routing', () => {
     ['gemini-2.5-pro', 'gemini'],
     ['anthropic.claude-sonnet-4-5', 'aws.bedrock'],
     ['claude-opus-4-8', 'gcp.vertex_ai'],
+    ['openrouter/openai/gpt-5.6-sol', 'openrouter'],
+    ['openrouter/deepseek/deepseek-v4-flash', 'openrouter'],
+    ['openrouter/anthropic/claude-sonnet-5', 'openrouter'],
     ['gpt-5', 'azure.ai.openai'],
   ])('%s -> %s', (model, provider) => {
     expect(providerForModel(model)).toBe(provider);
