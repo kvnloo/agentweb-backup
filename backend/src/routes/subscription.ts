@@ -1,5 +1,10 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
+import {
+  recordRecommendationDeclined,
+  InvalidDeclineInputError,
+  MAX_DECLINE_SELECTIONS,
+} from '../services/llmUsageDeclineService';
 import { getCustomerPortalPages } from '../services/customerPortalPages';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { resolveUsageRunway } from '../services/llmUsageRunwayResolverService';
@@ -142,6 +147,52 @@ router.post('/usage-runway/preview', authenticateToken, async (req, res) => {
  * that distinction is preserved here: a 403 would confirm the id exists and turn
  * this into an enumeration oracle for other tenants' schedule ids.
  */
+/**
+ * ENG-1210 AC12 — record that a customer turned a recommendation down.
+ *
+ * A read-only sibling of `/preview` in the sense that matters: it writes no model, no
+ * schedule and no ledger row. It only records that a decision happened, so the
+ * shown/accepted/declined funnel has its third leg.
+ *
+ * Kept separate from `/preview` rather than folded into it as a flag, because previewing
+ * and declining are opposite answers to the same question and conflating them would make
+ * every preview look like a rejection of whatever was not selected.
+ */
+router.post('/usage-runway/decline', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+    const { reason, selections } = req.body || {};
+    if (selections !== undefined && !Array.isArray(selections)) {
+      return res.status(400).json({ error: '`selections` must be an array' });
+    }
+
+    const result = await recordRecommendationDeclined(userId, {
+      reason,
+      // Bounded BEFORE the map. The service slices too, but doing it only there means a
+      // caller can still make the route normalise an arbitrarily long array first — the
+      // bound should cost nothing to exceed, not merely limit what gets recorded.
+      selections: (selections || []).slice(0, MAX_DECLINE_SELECTIONS).map((s: any) => ({
+        fromModel: s?.fromModel,
+        toModel: s?.toModel,
+        // Taken as the customer saw them. Recomputing here would record a number they
+        // were never shown, which is the same mistake the apply route avoids.
+        estimatedDaysRecovered:
+          typeof s?.estimatedDaysRecovered === 'number' ? s.estimatedDaysRecovered : null,
+        confidence: typeof s?.confidence === 'string' ? s.confidence : null,
+      })),
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof InvalidDeclineInputError) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Error recording a declined recommendation:', error);
+    return res.status(500).json({ error: 'Failed to record the decline' });
+  }
+});
+
 router.post('/usage-runway/apply', authenticateToken, async (req, res) => {
   try {
     const userId = (req as any).user?.userId;

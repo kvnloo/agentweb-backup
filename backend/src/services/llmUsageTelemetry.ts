@@ -44,6 +44,15 @@ export const USAGE_TELEMETRY_EVENTS = {
   changeApplied: "runway_change_applied",
   /** A confirmed switch was reverted. */
   changeUndone: "runway_change_undone",
+  /**
+   * A customer was shown a switch and explicitly turned it down (ENG-1210 AC12).
+   *
+   * Carries a `reason` naming the gesture, because "declined" is only queryable if
+   * every row means the same thing. It records a decline the customer PERFORMED —
+   * a recommendation that was shown and never engaged with produces nothing here,
+   * since that inference needs the queryable store described above.
+   */
+  recommendationDeclined: "runway_recommendation_declined",
 } as const;
 
 export type UsageTelemetryEvent =

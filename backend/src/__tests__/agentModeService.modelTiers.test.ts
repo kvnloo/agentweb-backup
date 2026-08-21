@@ -51,6 +51,7 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
         client: null, supportsTemperature: true, adminOnly: true,
         tier: 'ultra_premium', description: 'Frontier', name: 'Admin Only Model', provider: 'openai',
       },
+      'internal-only-model': { client: null, supportsTemperature: true, internalOnly: true },
       'voice-model': { client: null, supportsTemperature: true, isLive: true, tier: 'medium', description: 'Voice' },
       'legacy-model': {
         client: null, supportsTemperature: true, legacy: true,
@@ -85,6 +86,13 @@ describe('AgentModeService.getSupportedModelsWithMetadata', () => {
   it('excludes adminOnly models for a non-admin caller', async () => {
     const result = await svc.getSupportedModelsWithMetadata(false);
     expect(result.some((m: any) => m.id === 'admin-only-model')).toBe(false);
+  });
+
+  it('excludes internal workload models for both admin and non-admin pickers', async () => {
+    const customer = await svc.getSupportedModelsWithMetadata(false);
+    const admin = await svc.getSupportedModelsWithMetadata(true);
+    expect(customer.some((m: any) => m.id === 'internal-only-model')).toBe(false);
+    expect(admin.some((m: any) => m.id === 'internal-only-model')).toBe(false);
   });
 
   // FAIL case 3: a live-voice model must never appear in the text-chat picker.

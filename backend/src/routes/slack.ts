@@ -27,6 +27,7 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
 import { renderCitationMarkers } from "../utils/citations";
+import { agentModeService } from '../services/agentModeService';
 
 // ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
 // rides on the response's last assistant message; render as markdown links, which postThreadResponse's
@@ -99,18 +100,6 @@ async function extractAdminMessageIntent(
   rawMessage: string
 ): Promise<{ targetEmail: string; taskMessage: string } | null> {
   try {
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const apiKey = process.env.GEMINI_API_KEY || (await getSecret(`${environment}/AgentWeb/GeminiAPIKey`));
-    if (!apiKey?.trim()) {
-      console.warn('⚠️ Gemini API key not available, falling back to regex for admin channel parsing');
-      return null;
-    }
-
-    // Metered factory client (shadow usage metering). System context — admin
-    // channel parsing has no single attributable user, so no userId is passed.
-    const { getGeminiClient } = await import('../utils/llmClients');
-    const ai = await getGeminiClient({ feature: 'other' }, apiKey);
-
     const prompt = `Extract the target user email address and task description from this admin Slack message.
 
 Message: "${rawMessage}"
@@ -124,15 +113,15 @@ Respond with JSON only, no explanation:
 or if no email found:
 {"targetEmail": null, "taskMessage": null}`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-lite',
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const response = await agentModeService.callLLM('gemini-3.1-flash-lite', [
+      { role: 'user', content: prompt },
+    ], {
+      response_format: { type: 'json_object' },
+      usageContext: { feature: 'other' },
+      taskClass: 'mcp_api',
     });
 
-    const text = response.text?.trim();
+    const text = response.choices?.[0]?.message?.content?.trim();
     if (!text) return null;
 
     const parsed = JSON.parse(text);
