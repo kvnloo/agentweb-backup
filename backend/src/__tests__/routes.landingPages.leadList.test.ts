@@ -156,6 +156,7 @@ describe('PATCH /generated/:id/lead-list — public submissions on the attached 
     // warning — never a silent success.
     expect(res.status).toBe(200);
     expect(res.body.captureSyncWarning).toEqual(expect.stringContaining('public'));
+    expect(res.body.warnings).toEqual([expect.stringContaining('public')]);
   });
 
   it('SUCCESS: an already-public list is not re-written', async () => {
@@ -166,6 +167,7 @@ describe('PATCH /generated/:id/lead-list — public submissions on the attached 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadListRecord).not.toHaveBeenCalled();
     expect(res.body.captureSyncWarning).toBeUndefined();
+    expect(res.body.warnings).toBeUndefined();
   });
 
   it('SUCCESS: detaching (null) never flips any list public', async () => {

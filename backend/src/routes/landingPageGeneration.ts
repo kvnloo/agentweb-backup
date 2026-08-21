@@ -991,6 +991,13 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // ENG-967: same as /generate — a bound list that isn't publicly submittable makes the
     // copy's form drop every lead. The carried-over list is not necessarily public (the
     // original may predate ENG-449), and a freshly provisioned default list never is.
+    //
+    // Deliberately NOT repeating the list-level canEditItem check PATCH /lead-list runs: this
+    // list is not caller-supplied. It is either the original page's own list — and ENG-449
+    // already binds it to the copy on the strength of the "edit" authorization above — or one
+    // this caller just had provisioned. Enabling submissions on a list we are binding anyway
+    // is strictly smaller than the bind itself, so a check here would reject nothing the bind
+    // permits.
     await ensureLeadListAcceptsPublicSubmissions(leadListId);
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
@@ -2871,7 +2878,13 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
     if (captureSyncWarning) warnings.push(captureSyncWarning);
 
     const updated = await getLandingPageById(id);
-    return res.json(warnings.length ? { ...updated, captureSyncWarning: warnings.join(" ") } : updated);
+    if (!warnings.length) return res.json(updated);
+    // `captureSyncWarning` is the field the portal's lead-list picker already reads and shows
+    // verbatim (PageLeadListPicker.tsx), so it keeps carrying every warning — each entry is a
+    // complete sentence, so joining stays readable. `warnings` is added alongside it so a
+    // caller can tell the two failures apart instead of parsing one blob; nothing depends on
+    // it yet, and dropping the joined field would silently mute the toast.
+    return res.json({ ...updated, captureSyncWarning: warnings.join(" "), warnings });
   } catch (err) {
     console.error("PATCH /lead-list failed:", err);
     return res.status(500).json({ error: "Failed to update lead list" });
