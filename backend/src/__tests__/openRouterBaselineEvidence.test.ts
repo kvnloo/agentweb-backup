@@ -1,4 +1,5 @@
 import { normalizeOpenAIUsage } from '../utils/llmClients';
+import { GATEWAY_TASK_CLASSES } from '../utils/openRouterGatewayContract';
 import { parseArgs, resolveOutputPath } from '../loops/scripts/runOpenRouterBaseline';
 import {
   BASELINE_FIXTURES,
@@ -33,15 +34,7 @@ describe('ENG-1423 executable baseline evidence', () => {
     ])).toThrow('--out is required');
   });
   it('covers every Slice B/C task class with a stable executable fixture', () => {
-    const expected: BaselineTaskClass[] = [
-      'interactive_chat',
-      'scheduled_background',
-      'content_generation',
-      'mcp_api',
-      'agent_engine',
-      'coding_agent',
-      'nonstandard_consumer',
-    ];
+    const expected: readonly BaselineTaskClass[] = GATEWAY_TASK_CLASSES;
     expect(BASELINE_FIXTURES).toHaveLength(expected.length);
     expect(new Set(BASELINE_FIXTURES.map((f) => f.taskClass)))
       .toEqual(new Set(expected));
