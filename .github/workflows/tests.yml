@@ -662,10 +662,18 @@ jobs:
       group: ${{ github.workflow }}-relay-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
+      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
+      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
+      # job then executes code from the PR head — `unittest discover` imports
+      # and runs the PR-authored suite — which could read it back out. Nothing
+      # here needs the credential
+      # afterwards: the checkout itself still authenticates, and no step in
+      # this job runs git.
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -709,14 +717,33 @@ jobs:
       group: ${{ github.workflow }}-remotion-tests-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
     steps:
+      # persist-credentials: false — zizmor, via CodeRabbit on #2552. checkout
+      # defaults to leaving a GITHUB_TOKEN auth header in .git/config, and this
+      # job then executes code from the PR head — `npm ci` runs install
+      # lifecycle scripts from the PR-authored lockfile — which could read it
+      # back out. Nothing here needs the credential
+      # afterwards: the checkout itself still authenticates, and no step in
+      # this job runs git.
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
+      # node-version pinned (CodeRabbit on #2552). Without it the job floats on
+      # whatever the hosted runner image ships, so the image changing under us
+      # is indistinguishable from a real break. 22 is not a guess: this job's
+      # first green run (32477303755) reported `node: v22.23.2`, so this pins
+      # the version it is already known to pass on rather than picking one.
+      #
+      # Repo-wide gap, deliberately not fixed here: NOTHING in this repo pins
+      # Node — no .nvmrc, no `engines` in any package.json, no `node-version` in
+      # any workflow. Every other job floats too. Pinning one new job is worth
+      # doing on its own, but it is not the fix for that.
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: remotion-lambda/package-lock.json
 
