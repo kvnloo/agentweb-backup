@@ -1,7 +1,7 @@
 # OpenRouter Gateway Contract and Migration Inventory
 
 **Owner:** ENG-1413 program; foundation: ENG-1414
-**Status:** inventory baseline plus ENG-1430 interactive canary
+**Status:** inventory baseline plus ENG-1430 interactive and ENG-1431 background canaries
 
 ## Contract
 
@@ -47,6 +47,14 @@ additional retry for a gateway request. Claude prompt caching uses explicit
 content-block breakpoints rather than OpenRouter's top-level automatic flag:
 the explicit form preserves routing across Anthropic, Bedrock, and Vertex while
 retaining the existing five-minute and human-paced one-hour TTL behavior.
+
+ENG-1431 adds `scheduled_background`, `content_generation`, `mcp_api`, and
+`nonstandard_consumer` at that same boundary. Each token is independently
+reversible: adding it moves only that task class to OpenRouter, while removing
+it restores the centralized incumbent provider path without changing customer
+data or deploying code. `agent_engine` and `coding_agent` remain disabled until
+ENG-1416 proves their native tool/streaming contracts; they are not implicit
+fallbacks for this slice.
 
 ## Direct text/chat/tool inventory at baseline
 
