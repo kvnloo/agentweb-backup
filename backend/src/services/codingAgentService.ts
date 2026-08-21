@@ -1578,6 +1578,9 @@ async function getOpenRouterClient(): Promise<AnthropicLikeClient> {
       defaultHeaders: {
         'HTTP-Referer': 'https://app.agentweb.pro',
         'X-Title': 'AgentWeb',
+        // Exposes the selected provider and BYOK flag on both OpenRouter's
+        // OpenAI and Anthropic-compatible response shapes.
+        'X-OpenRouter-Metadata': 'enabled',
       },
     });
     openRouterClient = client;
@@ -1873,12 +1876,28 @@ async function runCodingAgentInternal(
               usageAcc.cacheWriteByTtl[ttl] = (usageAcc.cacheWriteByTtl[ttl] || 0) + tokens;
             }
           }
-          const gatewayCostUsd = typeof u.cost === 'number' && Number.isFinite(u.cost) && u.cost >= 0
+          const reportedGatewayCostUsd = typeof u.cost === 'number' && Number.isFinite(u.cost) && u.cost >= 0
             ? u.cost
             : undefined;
+          const upstreamInferenceCostUsd =
+            typeof u.cost_details?.upstream_inference_cost === 'number' &&
+            Number.isFinite(u.cost_details.upstream_inference_cost) &&
+            u.cost_details.upstream_inference_cost >= 0
+              ? u.cost_details.upstream_inference_cost
+              : undefined;
+          const routerMetadata = (response as any).openrouter_metadata;
+          const isByok = routerMetadata?.is_byok === true || (
+            reportedGatewayCostUsd === 0 &&
+            upstreamInferenceCostUsd !== undefined &&
+            upstreamInferenceCostUsd > 0
+          );
+          // OpenRouter's own `usage.cost` is the account charge for normal
+          // routing. BYOK can report zero there while Azure/Bedrock still bills
+          // us, so use the upstream inference cost for that case.
+          const billedCostUsd = isByok ? upstreamInferenceCostUsd : reportedGatewayCostUsd;
           const pricingModel = resolveOpenRouterUsagePricingModel(servedModel, model);
-          const turnCostMicroUsd = gatewayCostUsd !== undefined
-            ? Math.round(gatewayCostUsd * 1e6)
+          const turnCostMicroUsd = billedCostUsd !== undefined
+            ? Math.round(billedCostUsd * 1e6)
             : pricingModel
               ? computeCostMicroUsd(
                   pricingModel,
@@ -1901,7 +1920,7 @@ async function runCodingAgentInternal(
             cacheReadTokens,
             cacheWriteTokens,
             cacheWriteByTtl: turnCacheByTtl,
-            ...(gatewayCostUsd !== undefined || pricingModel
+            ...(billedCostUsd !== undefined || pricingModel
               ? { costUsdOverride: turnCostMicroUsd / 1e6 }
               : {}),
           });
