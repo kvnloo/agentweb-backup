@@ -10,6 +10,8 @@ import {
   isUnusableSynthesis,
   buildExecutedActionsFallback,
   buildExecutedActionsFooter,
+  detectFalseCompletionClaim,
+  buildFalseClaimCorrectionFooter,
 } from '../synthesisResidue';
 import { SYNTHESIS_NUDGE, CONTINUE_PROMPT, ANTI_LOOP_STOP_MESSAGE } from '../termination';
 import { buildTurnTimeBudgetNudge, type TurnTimeBudgetState } from '../../../../utils/turnTimeBudget';
@@ -314,3 +316,107 @@ describe('buildExecutedActionsFooter', () => {
     expect(footer).toContain('https://s3.example.com/xCures-Master-Banners-V2.html');
   });
 });
+
+// ENG-1331: a work-plan session generated and screenshot-exported 4 of 12 requested
+// display-ad sizes, then closed with "all 12 sizes have been rendered, QA'd, and
+// saved" — fluent, well-formed prose, not residue. The ENG-1054 guard above only
+// catches junk-shaped output (`isUnusableSynthesis`), so a plausible false claim
+// like this sailed straight through it. `detectFalseCompletionClaim` is the
+// independent truth check: it never judges whether text "looks like" an answer, it
+// parses any "all N <asset noun>" / "N of N" / "N/N" completion claim out of the
+// content and compares it against the ledger's actual successful asset-producing
+// tool calls.
+describe('detectFalseCompletionClaim', () => {
+  const fourScreenshots = Array.from({ length: 4 }, (_, i) => ({
+    name: 'playwright_browser_take_screenshot',
+    result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+  }));
+
+  it('flags an "all N <asset noun>" claim the ledger cannot back up', () => {
+    const claim = detectFalseCompletionClaim(
+      "All 12 sizes have been rendered, QA'd, and saved for Variant 4.",
+      fourScreenshots,
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 4 });
+  });
+
+  it('flags an "N of N" claim', () => {
+    expect(detectFalseCompletionClaim('Delivered 12 of 12 banners.', [])).toEqual({ claimed: 12, actual: 0 });
+  });
+
+  it('flags an "N/N" claim', () => {
+    expect(detectFalseCompletionClaim('12/12 images generated.', [])).toEqual({ claimed: 12, actual: 0 });
+  });
+
+  it('does NOT flag when the ledger backs the claim up exactly', () => {
+    expect(detectFalseCompletionClaim('All 4 sizes rendered.', fourScreenshots)).toBeNull();
+  });
+
+  it('does NOT flag when the ledger over-delivers relative to the claim', () => {
+    const claim = detectFalseCompletionClaim('All 4 sizes rendered.', [
+      ...fourScreenshots,
+      { name: 'playwright_browser_take_screenshot', result: { success: true, screenshotUrl: 'https://s3.example.com/5.png' } },
+    ]);
+    expect(claim).toBeNull();
+  });
+
+  it('does NOT flag text with no completion claim at all', () => {
+    expect(detectFalseCompletionClaim('Here are the assets you requested.', [])).toBeNull();
+  });
+
+  it('does NOT flag an unrelated "all N" claim with no asset noun nearby', () => {
+    expect(detectFalseCompletionClaim('I reviewed all 12 line items in the report.', [])).toBeNull();
+  });
+
+  it('does NOT flag a claim the model already qualifies as partial', () => {
+    expect(detectFalseCompletionClaim('I rendered 4 of the 12 requested sizes.', [])).toBeNull();
+  });
+
+  it('does NOT flag empty content', () => {
+    expect(detectFalseCompletionClaim('', [])).toBeNull();
+  });
+
+  it('counts a failed or deferred asset call as NOT produced', () => {
+    const claim = detectFalseCompletionClaim('All 2 images generated.', [
+      { name: 'generate_image', result: { success: true, imageUrl: 'https://s3.example.com/a.png' } },
+      { name: 'generate_image', error: 'boom' },
+      { name: 'generate_image', result: { deferred: true } },
+    ]);
+    expect(claim).toEqual({ claimed: 2, actual: 1 });
+  });
+
+  it('takes the largest claim when multiple numeric completion claims appear', () => {
+    const claim = detectFalseCompletionClaim(
+      'All 4 sizes for the first variant and all 12 sizes for the second variant were rendered.',
+      [{ name: 'playwright_browser_take_screenshot', result: { success: true } }],
+    );
+    expect(claim).toEqual({ claimed: 12, actual: 1 });
+  });
+});
+
+describe('buildFalseClaimCorrectionFooter', () => {
+  it('states both the claimed and actual counts, and the ledger backing them', () => {
+    const footer = buildFalseClaimCorrectionFooter(
+      { claimed: 12, actual: 4 },
+      fourScreenshotsForFooterTest(),
+    );
+    expect(footer).toContain('12');
+    expect(footer).toContain('4');
+    expect(footer).toContain('playwright_browser_take_screenshot');
+    expect(footer).toContain('https://s3.example.com/1.png');
+  });
+
+  it('handles an empty ledger without throwing', () => {
+    const footer = buildFalseClaimCorrectionFooter({ claimed: 12, actual: 0 }, []);
+    expect(typeof footer).toBe('string');
+    expect(footer).toContain('12');
+    expect(footer).toContain('0');
+  });
+});
+
+function fourScreenshotsForFooterTest() {
+  return Array.from({ length: 4 }, (_, i) => ({
+    name: 'playwright_browser_take_screenshot',
+    result: { success: true, screenshotUrl: `https://s3.example.com/${i + 1}.png` },
+  }));
+}
