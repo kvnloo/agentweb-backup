@@ -126,6 +126,24 @@ async function getAnonymousSessionCostUsedUsd(userId: string): Promise<number> {
 export async function getUserTokenUsage(
   userId: string
 ): Promise<{ month: string; totalTokens: number; totalCost: number; bonus: number }> {
+  // ENG-1163: mirrors checkTokenUsage's anon_ short-circuit. This function is
+  // also called directly (bypassing checkTokenUsage entirely) by
+  // getEffectiveLlmUsagePolicy — every generateSharedResponse turn reaches it
+  // via resolveEffectiveModelForUser right after the checkTokenUsage gate — so
+  // without this guard an anon-owned session still throws 'User not found' on
+  // its first reply even after the checkTokenUsage fix, just one call deeper.
+  if (typeof userId === 'string' && userId.startsWith('anon_')) {
+    const currentMonth = getCurrentMonth();
+    let totalCost: number;
+    try {
+      totalCost = await getAnonymousSessionCostUsedUsd(userId);
+    } catch (err) {
+      console.error(`[tokenUsageService] Failed to resolve anon session cost for ${userId}:`, err);
+      totalCost = ANONYMOUS_SESSION_COST_CAP_USD;
+    }
+    return { month: currentMonth, totalTokens: 0, totalCost, bonus: 0 };
+  }
+
   const user = await userDb.getUserById(userId);
   if (!user) throw new Error(`User not found: ${userId}`);
 
