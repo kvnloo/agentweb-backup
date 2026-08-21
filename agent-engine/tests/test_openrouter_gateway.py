@@ -46,6 +46,7 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
 
     assert captured["base_url"] == "https://openrouter.ai/api/v1"
     assert captured["model"] == "openai/gpt-4.1"
+    assert captured["api_key"].get_secret_value() == "or-test-key"
     assert captured["max_retries"] == 1
     assert captured["temperature"] == 0.0
     assert os.environ["OPENAI_API_KEY"] == "direct-openai-key"

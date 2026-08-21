@@ -155,10 +155,9 @@ describe('POST /api/internal/usage', () => {
 
     expect(res.body).toEqual({ accepted: 1, skipped: 1 });
     expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledTimes(1);
-    expect(mockIncrementUsageWithChargeEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ costMicroUsd: expect.any(Number) }),
-      expect.anything()
-    );
+    const [chargedUsage] = mockIncrementUsageWithChargeEvent.mock.calls[0];
+    expect(Number.isFinite(chargedUsage.costMicroUsd)).toBe(true);
+    expect(chargedUsage.costMicroUsd).toBeGreaterThanOrEqual(0);
   });
 
   it("forwards a valid record's ledger contribution via the atomic charge write, namespaced as engine spend", async () => {
