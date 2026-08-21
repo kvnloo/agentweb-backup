@@ -33,7 +33,7 @@ const assertUsesSharedGatewayOnly = (
   expect(offenders).toEqual([]);
 };
 
-describe('ENG-1431 OpenRouter B2 cutover', () => {
+describe('ENG-1431/1432 OpenRouter B2 cutover', () => {
   it('routes scheduled/background callers through callLLM instead of direct Azure or Gemini clients', () => {
     assertUsesSharedGatewayOnly([
       'cron/socialEngagementExecutor.ts',
@@ -63,16 +63,8 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
       'loops/instances/ai-eval-funnel/rcaEnricher.ts',
     ]);
 
-    // llmService retains exactly one provider-native web-search method until
-    // ENG-1432 proves the OpenRouter web plugin; its ordinary path is callLLM.
-    const sharedService = read('utils/llmService.ts');
-    expect(sharedService).toMatch(/\.callLLM\s*\(/);
-    expect(sharedService.match(/\.models\.generateContent\s*\(/g)).toHaveLength(1);
-    for (const pattern of FORBIDDEN_TEXT_PROVIDER_PATHS.filter(
-      (candidate) => String(candidate) !== String(/\.models\.generateContent\(/),
-    )) {
-      expect(sharedService).not.toMatch(pattern);
-    }
+    assertUsesSharedGatewayOnly(['utils/llmService.ts']);
+    expect(read('utils/llmService.ts')).toContain('webSearch: true');
   });
 
   it('routes the LinkedIn title-company parser through callLLM instead of a direct Gemini client', () => {

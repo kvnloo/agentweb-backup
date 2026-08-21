@@ -994,6 +994,8 @@ const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 interface LLMCallOptions {
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
+  /** Execute search through OpenRouter's provider-independent server tool. */
+  webSearch?: boolean;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -3441,6 +3443,7 @@ export class AgentModeService {
     const {
       tools = null,
       tool_choice = null,
+      webSearch = false,
       max_completion_tokens = null,
       temperature = null,
       response_format = null,
@@ -3451,9 +3454,9 @@ export class AgentModeService {
       fallbackModels,
     } = options || {};
 
-    // Explicit openrouter/* models have always used the gateway. Direct-provider
-    // logical IDs move only when their task class is enabled in the canary.
-    const useOpenRouterGateway = model.startsWith('openrouter/') ||
+    // Explicit openrouter/* models and provider-independent server tools always
+    // use the gateway. Other logical IDs move when their task-class canary is on.
+    const useOpenRouterGateway = webSearch || model.startsWith('openrouter/') ||
       isOpenRouterGatewayEnabledForTaskClass(taskClass);
     const upstreamModel = useOpenRouterGateway
       ? resolveOpenRouterUpstreamModelId(model)
@@ -3509,30 +3512,48 @@ export class AgentModeService {
       params.humanPaced = humanPaced;
     }
 
-    // Only add tools and tool_choice if tools are provided
-    if (tools && tools.length > 0) {
+    // Function tools and OpenRouter server tools share one wire-level array.
+    // Server-side web search forces the gateway above and must not be run by a
+    // provider-native adapter, which is the final ENG-1432 dual-path removal.
+    const callerTools = tools && tools.length > 0 ? tools : [];
+    let boundedTools = callerTools;
+    if (callerTools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
-      let boundedTools = tools;
-      if (maxTools && tools.length > maxTools) {
-        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        boundedTools = tools.slice(0, maxTools);
+      const callerToolLimit = typeof maxTools === 'number'
+        ? Math.max(0, maxTools - (webSearch ? 1 : 0))
+        : undefined;
+      if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
+        console.warn(
+          `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+        );
+        boundedTools = callerTools.slice(0, callerToolLimit);
       }
-      // OpenRouter normalizes the transport, but the selected provider still
-      // validates its own function-declaration schema. Native Gemini calls pass
-      // through this same allowlist in geminiNativeClient; apply it at the shared
-      // gateway boundary too so third-party MCP keywords cannot 400 the turn.
-      params.tools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
-        ? boundedTools.map((tool: any) => ({
-            ...tool,
-            function: {
-              ...tool.function,
-              parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
-                type: 'object',
-                properties: {},
-              },
+    }
+    // OpenRouter normalizes the transport, but the selected provider still
+    // validates its own function-declaration schema. Preserve non-function
+    // server tools rather than trying to sanitize a nonexistent `.function`.
+    const normalizedCallerTools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
+      ? boundedTools.map((tool: any) => tool?.type === 'function' ? ({
+          ...tool,
+          function: {
+            ...tool.function,
+            parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
+              type: 'object',
+              properties: {},
             },
-          }))
-        : boundedTools;
+          },
+        }) : tool)
+      : boundedTools;
+    const requestTools = webSearch
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      : normalizedCallerTools;
+    if (requestTools.length > 0) {
+      params.tools = requestTools;
+    }
+    // A server-only tool is selected by OpenRouter. Preserve the historical
+    // `auto` default only for caller-supplied function tools.
+    if (callerTools.length > 0) {
       params.tool_choice = tool_choice || 'auto';
     }
 
