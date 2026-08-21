@@ -24,7 +24,7 @@ import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter, detectFalseCompletionClaim, buildFalseClaimCorrectionFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -5031,6 +5031,24 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
+          }
+
+          // ENG-1331: independent of the residue guard above — this catches a
+          // FLUENT final answer that falsely claims more assets were completed
+          // than the ledger shows (production case: "all 12 sizes have been
+          // rendered, QA'd, and saved" when only 4 screenshots succeeded). It reads
+          // as a normal answer, so `isUnusableSynthesis` never flags it; this checks
+          // the claim's numbers against `toolCalls` instead of the text's shape.
+          if (synthesisResidueGuardEnabled && content) {
+            const falseClaim = detectFalseCompletionClaim(content, toolCalls);
+            if (falseClaim) {
+              console.warn(
+                `AgentMode: Final synthesis claims ${falseClaim.claimed} completed but the ledger shows only ` +
+                `${falseClaim.actual} succeeded asset-producing call(s) in session ${sessionId} — appending a correction`
+              );
+              content = `${content}\n\n${buildFalseClaimCorrectionFooter(falseClaim, toolCalls)}`;
+              if (responseMessage) responseMessage.content = content;
+            }
           }
 
           // Log the stop reason for debugging

@@ -370,6 +370,112 @@ function countsInclude(
 }
 
 /**
+ * ENG-1331: a work-plan session generated and screenshot-exported only 4 of 12
+ * requested display-ad sizes, then closed with "all 12 sizes have been rendered,
+ * QA'd, and saved" — fluent, well-formed prose, not the junk `isUnusableSynthesis`
+ * above exists to catch. The closing message was built from INTENT ("render all
+ * 12") rather than from what actually ran, so a claim like this reads as a normal
+ * answer and ships straight to the user.
+ *
+ * `detectFalseCompletionClaim` is the orthogonal truth check: instead of judging
+ * whether the text looks like an answer, it parses any explicit numeric completion
+ * claim ("all N <asset noun>", "N of N", "N/N") out of the content and compares it
+ * against the ledger's actual count of succeeded asset-producing tool calls. Only
+ * tool calls made THIS turn are in `toolCalls` (the caller resets the ledger per
+ * user turn), so this is naturally scoped the same way ENG-1188 scoped the
+ * `expectedAssetCount` gate — a prior variant's already-delivered assets can never
+ * paper over a later variant's shortfall.
+ */
+const ASSET_NOUN = '(?:sizes?|images?|banners?|ads?|assets?|variants?|creatives?|renders?|screenshots?|photos?|videos?|templates?|graphics?)';
+
+/** "all 12 sizes", "all 12 of the requested display sizes" (up to 6 words between). */
+const ALL_N_NOUN_PATTERN = new RegExp(`\\ball\\s+(\\d+)(?:\\s+\\S+){0,6}?\\s+${ASSET_NOUN}\\b`, 'gi');
+/** "12 of 12" — the backreference requires the SAME number twice, so "4 of 12" never matches. */
+const N_OF_N_PATTERN = /\b(\d+)\s+of\s+\1\b/gi;
+/** "12/12". */
+const N_SLASH_N_PATTERN = /\b(\d+)\s*\/\s*\1\b/g;
+
+const ASSET_PRODUCING_TOOL_NAMES = new Set([
+  'generate_image',
+  'generate_video',
+  'generate_voiceover',
+  'create_html_file',
+  'create_html_from_template',
+  'save_file',
+  'playwright_browser_take_screenshot',
+]);
+
+/** Total succeeded calls across every known asset-producing tool in the ledger. */
+function countProducedAssets(toolCalls: ExecutedToolCall[]): number {
+  const counts = tallyExecutedActions(toolCalls);
+  let total = 0;
+  for (const [name, { ok }] of counts) {
+    if (ASSET_PRODUCING_TOOL_NAMES.has(name)) total += ok;
+  }
+  return total;
+}
+
+export interface FalseCompletionClaim {
+  /** The largest numeric completion claim found in the content. */
+  claimed: number;
+  /** The ledger's actual count of succeeded asset-producing tool calls. */
+  actual: number;
+}
+
+/**
+ * Returns the claim/actual mismatch when `content` asserts a numeric completion
+ * ("all 12 sizes", "12 of 12", "12/12") that the ledger cannot back up, or `null`
+ * when there is no such claim or the ledger meets or exceeds it. A claim that
+ * already admits a shortfall (e.g. "4 of the 12 requested sizes") does not match
+ * any of these patterns, so an honest partial report is never flagged.
+ */
+export function detectFalseCompletionClaim(
+  content: unknown,
+  toolCalls: ExecutedToolCall[],
+): FalseCompletionClaim | null {
+  if (typeof content !== 'string' || !content.trim()) return null;
+
+  const claims = new Set<number>();
+  for (const pattern of [ALL_N_NOUN_PATTERN, N_OF_N_PATTERN, N_SLASH_N_PATTERN]) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const n = parseInt(match[1], 10);
+      if (Number.isFinite(n) && n > 0) claims.add(n);
+    }
+  }
+  if (claims.size === 0) return null;
+
+  const claimed = Math.max(...claims);
+  const actual = countProducedAssets(toolCalls);
+  if (actual >= claimed) return null;
+  return { claimed, actual };
+}
+
+/**
+ * Correction to APPEND when `detectFalseCompletionClaim` finds a claim the ledger
+ * cannot back up. Keeps the model's original prose (it may still hold other real,
+ * useful detail) but states the real count and the named shortfall right underneath
+ * it, so the user is never left believing more happened than actually did.
+ */
+export function buildFalseClaimCorrectionFooter(
+  claim: FalseCompletionClaim,
+  toolCalls: ExecutedToolCall[],
+): string {
+  const counts = tallyExecutedActions(toolCalls);
+  const ledgerLines = counts.size > 0 ? renderLedgerLines(counts) : '(No assets were actually produced.)';
+
+  return [
+    '---',
+    `⚠️ *Correction: the "${claim.claimed}" figure above is not accurate — only ${claim.actual} of ${claim.claimed} were actually produced this turn; the rest were never generated.* Here is what actually ran:`,
+    '',
+    ledgerLines,
+    '',
+    COUNT_BASIS_NOTE,
+  ].join('\n').trim();
+}
+
+/**
  * Render a truthful recap of what the run actually executed, for use when the model
  * could not produce a written synthesis at all. It reports only tool names and
  * outcome counts — never invented results — so it cannot manufacture a false success.
