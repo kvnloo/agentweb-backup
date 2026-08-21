@@ -59,8 +59,10 @@ module.exports = {
   // ENG-1376: this used to read `src/utils/**/*.ts` only — 112 of the 811
   // source files under src/. The 98.35% the CI comment advertised was 98.35%
   // *of src/utils*, and nothing said so, so it read as a backend-wide number.
-  // Measured over the widened scope the same suites score ~64% statements /
-  // ~55% branches. Nothing regressed; the denominator was wrong.
+  // Measured over the widened scope, with both test jobs' coverage merged, the
+  // same suites score 74.02% statements / 64.75% branches / 74.89% functions /
+  // 74.79% lines over 729 files (PR #2547 CI). Nothing regressed; the
+  // denominator was wrong.
   //
   // Exclusions, and why each one is not a dodge:
   //   *.d.ts          - ambient declarations, no executable statements.

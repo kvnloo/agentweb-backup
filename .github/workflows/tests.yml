@@ -214,8 +214,13 @@ jobs:
     # newer commit on the same PR cancels this job's superseded run. Draft flag
     # in the group name per ENG-1277 — see the detect-changes job comment.
     # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
-    # 360-minute default before anyone notices.
-    timeout-minutes: 30
+    # 360-minute default before anyone notices. ENG-1376 raised it from 30:
+    # instrumenting this job for coverage took it from 12.6 min to 18.6 min
+    # (measured, PR #2547), leaving 11 min of headroom on a 30-min ceiling. The
+    # ceiling is there to catch a HUNG job, not a slow one, and 40 still does
+    # that inside GitHub's default — while a spurious kill costs a full ~19-min
+    # re-run plus the evidence merge-evidence.sh demands.
+    timeout-minutes: 40
     concurrency:
       group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
@@ -296,9 +301,10 @@ jobs:
     # Distinct group from backend-tests-a so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run. Draft flag
     # in the group name per ENG-1277 — see the detect-changes job comment.
-    # ENG-1371: explicit ceiling; without one a hung job burns GitHub's
-    # 360-minute default before anyone notices.
-    timeout-minutes: 30
+    # ENG-1371: explicit ceiling; see backend-tests-a for why ENG-1376 raised
+    # this from 30. Widening the coverage scope took this job from 11.7 min to
+    # 16.3 min (measured, PR #2547).
+    timeout-minutes: 40
     concurrency:
       group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}-${{ github.event.pull_request.draft }}
       cancel-in-progress: true
