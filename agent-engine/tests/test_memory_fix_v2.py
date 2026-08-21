@@ -21,7 +21,6 @@ from memory_fix_v2 import (
     create_memory_config_v2,
     disable_memory_completely,
     apply_memory_fix_v2,
-    test_memory_fix_v2
 )
 
 class TestMemoryFixV2(unittest.TestCase):
