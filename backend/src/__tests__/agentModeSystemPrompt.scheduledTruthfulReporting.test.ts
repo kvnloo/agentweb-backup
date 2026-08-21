@@ -241,3 +241,116 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
     });
   });
 });
+
+/**
+ * ENG-1245 — the withheld branch above unconditionally claimed "the owner has
+ * turned ON Require approval before publishing" and told the run to instruct
+ * the owner to turn it OFF. That is only true when `requirePublishApproval`
+ * really is `true`. Schedule 1d001fba-0fb7-4bcd-80f6-6041b244a442 ("Harsha
+ * Daily X Post (Autonomous)") has `requirePublishApproval: false` and has
+ * posted nothing since 2026-08-13 (the day after PR #2263/ENG-827 deployed)
+ * because it was simply never granted standing publish authorization — a
+ * different condition the old text actively misdescribed, sending the owner
+ * to toggle a switch that was already off and would change nothing.
+ *
+ * The third, optional `withholdReason` argument lets the caller (which reads
+ * the schedule and can tell the two apart via
+ * describePublishAuthorizationWithholdReason) select the accurate text. Every
+ * call site that omits it — every test above — must keep behaving exactly as
+ * before: that is the regression guard for the ENG-803 marker infra pinned in
+ * this same file.
+ */
+describe('getScheduledSessionOverride — accurate withhold reason (ENG-1245)', () => {
+  const genuineHold = getScheduledSessionOverride('scheduled', false, 'require_publish_approval');
+  const neverGranted = getScheduledSessionOverride('scheduled', false, 'not_granted');
+  const revoked = getScheduledSessionOverride('scheduled', false, 'revoked');
+  const omittedReason = getScheduledSessionOverride('scheduled', false);
+
+  it('omitting the reason behaves identically to the explicit genuine-hold branch (backward compatible default)', () => {
+    expect(omittedReason).toBe(genuineHold);
+  });
+
+  it('the genuine-hold branch is unchanged: still names and blames "Require approval before publishing"', () => {
+    expect(genuineHold).toContain('The owner has turned ON "Require approval before publishing"');
+    expect(genuineHold).toContain('turn OFF "Require approval before publishing"');
+  });
+
+  it('the never-granted branch does NOT claim the owner turned on "Require approval before publishing", nor instruct turning it off as the fix', () => {
+    expect(neverGranted).not.toContain('The owner has turned ON "Require approval before publishing"');
+    // The genuine-hold branch's actual instruction to fix it this way — the never-granted
+    // branch must not repeat this AFFIRMATIVE instruction (it may still mention the setting
+    // by name to explicitly rule it out, the same way it already rules out "Full autonomy").
+    expect(neverGranted).not.toContain('turn OFF "Require approval before publishing" in this schedule\'s settings, and the next run will post');
+  });
+
+  it('the never-granted branch tells the truth: that setting is not the blocker, and toggling it will not help', () => {
+    expect(neverGranted).toContain('not been granted standing');
+    expect(neverGranted).toContain('publish authorization');
+    // Explicitly steers away from the wrong fix, the same way the genuine-hold
+    // branch already steers away from "Full autonomy".
+    expect(neverGranted).toMatch(/Require approval before publishing.*(is already off|not what|will not change|does not (govern|change))/i);
+  });
+
+  it('the never-granted branch ends on its OWN accurate terminal marker, not the genuine-hold one', () => {
+    // ENG-1245: originally these had to stay byte-identical because
+    // PUBLISH_WITHHELD_MARKER in agentModeController.ts only matched one string.
+    // That regex now matches both variants (see scheduledPublishWithheldContinuation
+    // .test.ts), so the marker can finally say the true reason instead of always
+    // blaming "requires approval before publishing" on a schedule where that
+    // specific setting was never touched.
+    expect(neverGranted).toContain('PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.');
+    expect(neverGranted).not.toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+    expect(genuineHold).toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+  });
+
+  /**
+   * ENG-1245 — 'revoked' is its own reason, not folded into 'not_granted'. An
+   * owner who previously authorized a schedule and then explicitly revoked it
+   * made a real decision; describing that as "has not been granted" implies
+   * nobody ever considered it, which understates what actually happened. It
+   * still must not be confused with the "Require approval before publishing"
+   * toggle — that's a different, unrelated setting.
+   */
+  describe('the revoked branch (ENG-1245)', () => {
+    it('does not claim the owner turned on "Require approval before publishing"', () => {
+      expect(revoked).not.toContain('The owner has turned ON "Require approval before publishing"');
+      expect(revoked).not.toContain('turn OFF "Require approval before publishing" in this schedule\'s settings, and the next run will post');
+    });
+
+    it('does not reuse the never-granted branch\'s "has not been granted" wording — a revocation is a real decision, not silence', () => {
+      expect(revoked).not.toContain('has not been granted standing');
+    });
+
+    it('accurately says authorization was revoked', () => {
+      expect(revoked).toMatch(/revoked/i);
+    });
+
+    it('ends on its own distinct terminal marker', () => {
+      expect(revoked).toContain('PUBLISH WITHHELD: this schedule\'s publish authorization has been revoked.');
+      expect(revoked).not.toContain('PUBLISH WITHHELD: this schedule has not been granted standing publish authorization.');
+      expect(revoked).not.toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+    });
+
+    it('keeps every unconditional rule the other branches have', () => {
+      for (const text of ['THIS BLOCK IS reason (1) above', 'Do NOT call any tool that publishes externally',
+        'twitter_manage_post', 'COMPLETE terminal state', 'It is not unfinished work', 'State it ONCE and stop',
+        'Do NOT ask the owner a question', 'do NOT phrase the ending as waiting on their confirmation']) {
+        expect(revoked).toContain(text);
+      }
+    });
+  });
+
+  it('the never-granted branch keeps every unconditional rule the genuine-hold branch has', () => {
+    for (const text of ['THIS BLOCK IS reason (1) above', 'Do NOT call any tool that publishes externally',
+      'twitter_manage_post', 'COMPLETE terminal state', 'It is not unfinished work', 'State it ONCE and stop',
+      'Do NOT ask the owner a question', 'do NOT phrase the ending as waiting on their confirmation']) {
+      expect(neverGranted).toContain(text);
+    }
+  });
+
+  it('the AUTHORIZED branch ignores withholdReason entirely — it is only consulted on the withheld branch', () => {
+    expect(getScheduledSessionOverride('scheduled', true, 'not_granted')).toBe(
+      getScheduledSessionOverride('scheduled', true)
+    );
+  });
+});
