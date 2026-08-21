@@ -86,7 +86,7 @@ class TestOpenRouterWithMemoryFix(unittest.TestCase):
                 mock_openrouter.assert_called_once()
                 call_args = mock_openrouter.call_args
                 self.assertEqual(call_args[1]['model'], 'openai/gpt-4.1')
-                self.assertEqual(call_args[1]['max_retries'], 0)
+                self.assertEqual(call_args[1]['max_retries'], 1)
                 
                 print("✅ gpt-4.1 initialization successful with memory fix")
                 
