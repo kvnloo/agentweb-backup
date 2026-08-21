@@ -3495,6 +3495,21 @@ export class AgentModeService {
           }
           return resolveOpenRouterUpstreamModelId(normalizedFallback);
         });
+      } else {
+        // Compression can still leave a request above a small primary model's
+        // context limit. Keep failover inside OpenRouter: a cheap 1M-context
+        // text/tool model for normal calls, or a multimodal 1M-context model
+        // when any message contains an image. Explicit caller fallbacks above
+        // remain authoritative.
+        const hasImageInput = messages.some((message: any) =>
+          Array.isArray(message?.content) && message.content.some((part: any) =>
+            part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
+          )
+        );
+        const managedFallback = hasImageInput
+          ? 'google/gemini-3.5-flash'
+          : 'deepseek/deepseek-v4-flash';
+        if (upstreamModel !== managedFallback) params.models = [managedFallback];
       }
       if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
         params.session_id = usageContext.sessionId;
