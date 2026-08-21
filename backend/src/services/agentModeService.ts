@@ -4671,7 +4671,7 @@ export class AgentModeService {
             // ENG-1430: only this customer-facing loop participates in the first
             // reversible OpenRouter cutover. Internal judges/scheduled helpers
             // remain on their characterized paths until their own slices.
-            taskClass: 'interactive_chat',
+            taskClass: isScheduledSession ? undefined : 'interactive_chat',
           });
         } catch (callError) {
           // ENG-907: the backup-model retry below issues a SECOND full call of the same
@@ -4750,7 +4750,7 @@ export class AgentModeService {
                 usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
                 humanPaced: humanPacedTurn,
-                taskClass: 'interactive_chat',
+                taskClass: isScheduledSession ? undefined : 'interactive_chat',
               }), synthesisRetryDeadlineMs);
               if (response === SYNTHESIS_RETRY_TIMED_OUT) {
                 console.warn(
