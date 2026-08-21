@@ -220,6 +220,113 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).not.toHaveProperty('response_format');
   });
 
+  describe('managed context overflow handling', () => {
+    const expectedPlugin = [{ id: 'context-compression' }];
+
+    it('enables OpenRouter context compression for explicit gateway models', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'openrouter/openai/gpt-4o-mini',
+        [{ role: 'user', content: 'A payload near the context limit' }],
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        plugins: expectedPlugin,
+      }));
+    });
+
+    it('configures a cheap long-context managed fallback for text requests', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'openrouter/openai/gpt-4o-mini',
+        [{ role: 'user', content: 'A text payload near the context limit' }],
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        models: ['deepseek/deepseek-v4-flash'],
+        plugins: expectedPlugin,
+      }));
+    });
+
+    it('uses a multimodal long-context fallback when the request contains an image', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'openrouter/openai/gpt-4o-mini',
+        [{ role: 'user', content: [
+          { type: 'text', text: 'Describe this image' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+        ] }],
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        models: ['google/gemini-3.5-flash'],
+        plugins: expectedPlugin,
+      }));
+    });
+
+    it('enables context compression for task-class canary traffic', async () => {
+      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'gpt-5.4',
+        [{ role: 'user', content: 'A payload near the context limit' }],
+        { taskClass: 'interactive_chat' } as any,
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        plugins: expectedPlugin,
+      }));
+    });
+
+    it('enables context compression when server-side web search forces the gateway', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+        chat: { completions: { create } },
+      } as any);
+
+      await service.callLLM(
+        'gemini-3.7-flash',
+        [{ role: 'user', content: 'Search a large retained conversation' }],
+        { webSearch: true } as any,
+      );
+
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+        plugins: expectedPlugin,
+      }));
+    });
+
+    it('does not send an OpenRouter plugin to a provider-native control', async () => {
+      const service = new AgentModeService();
+      const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      (service as any).llmModels['gpt-5.4'].client = { chat: { completions: { create } } };
+
+      await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
+
+      expect(create.mock.calls[0][0]).not.toHaveProperty('plugins');
+    });
+  });
+
   it('preserves an explicitly requested JSON response format on the gateway', async () => {
     process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'nonstandard_consumer';
     const service = new AgentModeService();
