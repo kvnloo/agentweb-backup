@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { imageService } from "../services/imageGeneration";
 import { getSecret } from '../utils/secretsManager';
-import { getGeminiClient } from '../utils/llmClients';
+import { agentModeService } from '../services/agentModeService';
 import { CONTENT_RESTYLE_MODEL } from '../config';
 import axios from "axios";
 import AWS from "aws-sdk";
@@ -579,27 +579,18 @@ OUTPUT FORMAT (STRICT JSON):
 }`;
 
   try {
-    // Get Gemini API key from secrets manager
-    const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-    const secretName = `${environment}/AgentWeb/GeminiAPIKey`;
-    const apiKey = await getSecret(secretName);
-    
-    // Metered Gemini client (Ship 1 shadow metering). restyleContent is a
-    // utility with no user in scope, so usage attributes to "system".
-    const ai = await getGeminiClient({ feature: 'content_gen' }, apiKey);
-
     const systemInstruction = "You are an expert content editor. Restyle content while preserving key information. Always respond with valid JSON only, no markdown code blocks.";
-    
-    const response = await ai.models.generateContent({
-      model: CONTENT_RESTYLE_MODEL,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        temperature: 0.7,
-      },
+    const response = await agentModeService.callLLM(CONTENT_RESTYLE_MODEL, [
+      { role: 'system', content: systemInstruction },
+      { role: 'user', content: prompt },
+    ], {
+      temperature: 0.7,
+      response_format: { type: 'json_object' },
+      usageContext: { feature: 'content_gen' },
+      taskClass: 'content_generation',
     });
 
-    const responseContent = response.text || '';
+    const responseContent = response.choices?.[0]?.message?.content || '';
     if (!responseContent) {
       throw new Error("No content generated from LLM");
     }

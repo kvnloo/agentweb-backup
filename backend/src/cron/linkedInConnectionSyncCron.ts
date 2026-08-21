@@ -10,7 +10,6 @@
  * Manual resync (per-lead or per-list) calls syncConnectionsForAccount() directly.
  */
 
-import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
 import { linkedInOutreachService, isProvenDisconnectError } from '../services/linkedInOutreachService';
 import {
   getUnipileHealth,
@@ -391,23 +390,17 @@ Good: "Glad we connected, John. Still think your take on isolating the browser i
 
 Respond with JSON: {"content": "the message text"}`;
 
-  // Un-metered client + explicit meter below: with a real userId this LLM spend
-  // must be charged to that user's cap (tokens + cost), not just recorded (ENG-200).
-  const openai = getAzureClient({ userId, feature: 'linkedin_cron' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
-  const completion = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-    messages: [
+  const model = process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5';
+  const completion = await agentModeService.callLLM(model, [
       { role: 'system', content: 'You write concise, genuine LinkedIn messages. Respond only with valid JSON.' },
       { role: 'user', content: prompt },
-    ],
+    ], {
     temperature: 0.7,
-    max_tokens: 200,
+    max_completion_tokens: 200,
     response_format: { type: 'json_object' },
+    usageContext: { userId, feature: 'linkedin_cron' },
+    taskClass: 'scheduled_background',
   });
-  meterUsageFromResponse(
-    { userId, model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4', provider: 'azure-openai', feature: 'linkedin_cron' },
-    completion
-  );
 
   const raw = completion.choices[0]?.message?.content;
   if (!raw) return;

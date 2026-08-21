@@ -1,5 +1,7 @@
-import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
+import { agentModeService } from './agentModeService';
 import { searchPlatformKnowledgeBase } from './chatbotService';
+
+const GROWTH_MODEL = process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5.5';
 
 export interface GrowthGeniusMessage {
   id: string;
@@ -24,21 +26,6 @@ export interface GrowthGeniusSession {
 }
 
 export class GrowthGeniusService {
-  /**
-   * Metered Azure client for Growth Genius. Preserves the original bespoke
-   * deployment + api-version (GROWTH_GENIUS env vars) so usage is recorded
-   * without changing which endpoint/version the calls hit.
-   */
-  private client(userId?: string) {
-    return getAzureClient(
-      { userId, feature: 'growth_genius' },
-      process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-      // Un-metered: this service meters each call explicitly via
-      // meterUsageFromResponse; auto-metering here would double-record (ENG-200).
-      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || '2025-01-01-preview', metered: false }
-    );
-  }
-
   private getSystemPrompt(): string {
     return `You are Growth Genius, an AI-powered growth marketing assistant specializing in startup growth strategies, marketing tactics, and business scaling advice.
 
@@ -95,26 +82,17 @@ Remember: You're here to help startups and businesses grow through smart marketi
     try {
       console.log('GrowthGenius: Generating session title for message:', userMessage);
 
-      const response = await this.client(userId).chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-        messages: [
+      const response = await agentModeService.callLLM(GROWTH_MODEL, [
           {
             role: 'system',
             content: `Generate a session title (max 60 characters) based on the user's message. Output ONLY the title text — no quotes, no punctuation at the end, no explanation.`
           },
           { role: 'user', content: userMessage.slice(0, 500) }
-        ],
-        max_completion_tokens: 20
-      });
-
-      // Charge this title call to the user's quota too (all-cost-to-user policy); it's
-      // its own LLM call with real cost, separate from the main Growth Genius turn.
-      meterUsageFromResponse({
-        userId,
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-        provider: 'azure',
-        feature: 'growth_genius_title',
-      }, response);
+        ], {
+          max_completion_tokens: 20,
+          usageContext: { userId, feature: 'growth_genius_title' },
+          taskClass: 'scheduled_background',
+        });
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
       // Extract first line, strip markdown, hard-truncate to 60 chars
@@ -144,12 +122,10 @@ Remember: You're here to help startups and businesses grow through smart marketi
       const initialContext = this.buildContext(userMessage, sessionHistory, [], selectedStartupId);
       
       // First API call: Ask the model to use the functions
-      const response = await this.client(userId).chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-        messages: [
+      const response = await agentModeService.callLLM(GROWTH_MODEL, [
           { role: 'system', content: this.getSystemPrompt() },
           { role: 'user', content: initialContext }
-        ],
+        ], {
         tools: [
           {
             type: 'function',
@@ -174,15 +150,10 @@ Remember: You're here to help startups and businesses grow through smart marketi
           }
         ],
         tool_choice: 'auto',
-        max_completion_tokens: 1500
-      });
-
-      meterUsageFromResponse({
-        userId,
-        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-        provider: 'azure',
-        feature: 'growth_genius',
-      }, response);
+          max_completion_tokens: 1500,
+          usageContext: { userId, feature: 'growth_genius' },
+          taskClass: 'scheduled_background',
+        });
 
       const responseMessage = response.choices[0].message;
       console.log('GrowthGenius: Initial response received');
@@ -233,9 +204,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         
         // Second API call: Get the final response with knowledge base results
         const finalContext = this.buildContext(userMessage, sessionHistory, knowledgeBaseResults, selectedStartupId);
-        const finalResponse = await this.client(userId).chat.completions.create({
-          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-          messages: [
+        const finalResponse = await agentModeService.callLLM(GROWTH_MODEL, [
             { role: 'system', content: this.getSystemPrompt() },
             { role: 'user', content: finalContext },
             responseMessage, // Include the assistant's response with tool calls
@@ -249,16 +218,11 @@ Remember: You're here to help startups and businesses grow through smart marketi
                 count: knowledgeBaseResults.length
               })
             })) || []
-          ],
-          max_completion_tokens: 1500
-        });
-
-        meterUsageFromResponse({
-          userId,
-          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-          provider: 'azure',
-          feature: 'growth_genius',
-        }, finalResponse);
+          ], {
+            max_completion_tokens: 1500,
+            usageContext: { userId, feature: 'growth_genius' },
+            taskClass: 'scheduled_background',
+          });
 
         const finalContent = finalResponse.choices[0]?.message?.content || 'Sorry, I could not generate a response.';
         console.log('GrowthGenius: Final response generated with knowledge base context');

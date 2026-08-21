@@ -1,5 +1,5 @@
 import yaml from 'js-yaml';
-import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
+import { agentModeService } from './agentModeService';
 import { taskDb } from './db';
 import { Task } from '../types/task';
 
@@ -200,27 +200,21 @@ When creating task nodes, you can either:
 If referencing an existing task, use its taskId and the task's prompt will be automatically used.
 If creating a new task, provide a prompt that describes what the task should do.`;
 
-  // Un-metered: metered explicitly below via meterUsageFromResponse; auto-metering
-  // here would double-record the same response (ENG-200).
-  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
-  const completion = await openai.chat.completions.create({
-    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-    messages: [
+  const completion = await agentModeService.callLLM(
+    process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+    [
       { role: 'system', content: systemMessage },
       { role: 'user', content: `Current workflow:\n${currentYaml || 'None'}\n\nGenerate workflow: ${description}` }
     ],
-    functions: [functionDefinition],
-    function_call: { name: 'generate_workflow' }
-  });
+    {
+      tools: [{ type: 'function', function: functionDefinition }],
+      tool_choice: { type: 'function', function: { name: 'generate_workflow' } },
+      usageContext: { userId, feature: 'workflow_gen' },
+      taskClass: 'scheduled_background',
+    },
+  );
 
-  meterUsageFromResponse({
-    userId,
-    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-    provider: 'azure',
-    feature: 'workflow_gen',
-  }, completion);
-
-  const functionCall = completion.choices[0].message.function_call;
+  const functionCall = completion.choices[0].message.tool_calls?.[0]?.function;
   if (!functionCall?.arguments) {
     throw new Error('No workflow definition generated');
   }
@@ -268,28 +262,22 @@ export async function generateWorkflowFromDescription(
     const { nodes, edges } = generateVisualization(workflowData);
 
     // Get a user-friendly explanation of the workflow
-    // Un-metered: metered explicitly below via meterUsageFromResponse; auto-metering
-  // here would double-record the same response (ENG-200).
-  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
-    const explanation = await openai.chat.completions.create({
-      model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-      messages: [
+    const explanation = await agentModeService.callLLM(
+      process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+      [
         { 
           role: 'system', 
           content: 'Provide a one-sentence high-level summary of what this workflow does. Do not explain individual steps or implementation details as they are visible in the workflow itself.' 
         },
         { role: 'user', content: `Summarize this workflow:\n${yamlContent}` }
       ],
-      temperature: 0.7,
-      max_tokens: 150
-    });
-
-    meterUsageFromResponse({
-      userId,
-      model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-      provider: 'azure',
-      feature: 'workflow_explain',
-    }, explanation);
+      {
+        temperature: 0.7,
+        max_completion_tokens: 150,
+        usageContext: { userId, feature: 'workflow_explain' },
+        taskClass: 'scheduled_background',
+      },
+    );
 
     return {
       yaml: yamlContent,
@@ -301,4 +289,4 @@ export async function generateWorkflowFromDescription(
     console.error('Error generating workflow:', error);
     throw error;
   }
-} 
+}

@@ -1022,6 +1022,8 @@ interface LLMCallOptions {
   humanPaced?: boolean;
   /** Stable product taxonomy used by the reversible OpenRouter cutover canary. */
   taskClass?: GatewayTaskClass;
+  /** Per-request transport deadline for bounded background and judge calls. */
+  timeoutMs?: number;
 }
 
 // Diagnosis agent configuration
@@ -3373,6 +3375,7 @@ export class AgentModeService {
       usageContext = null,
       humanPaced = false,
       taskClass,
+      timeoutMs,
     } = options || {};
 
     // Explicit openrouter/* models have always used the gateway. Direct-provider
@@ -3506,7 +3509,12 @@ export class AgentModeService {
     const baseDelayMs = 2000;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const res = await client.chat.completions.create(params);
+        const res = await client.chat.completions.create(
+          params,
+          timeoutMs || useOpenRouterGateway
+            ? { timeout: timeoutMs ?? 5 * 60 * 1000, ...(useOpenRouterGateway ? { maxRetries: 0 } : {}) }
+            : undefined,
+        );
         // Shadow usage metering (Ship 1): every client returned above (Azure
         // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
         // wrapper) responds in OpenAI shape, so `res.usage` is the single
@@ -14216,22 +14224,14 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      // Use Gemini for message drafting (fast, cost-effective)
-      const geminiClient = await this.getGeminiClient();
-      const messageCompletion = await geminiClient.chat.completions.create({
-        model: 'gemini-3.5-flash',
-        messages: [{ role: "user", content: messagePrompt }],
+      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
+        { role: 'user', content: messagePrompt },
+      ], {
         temperature: 0.8,
-        max_tokens: 2048,
-      } as any);
-
-      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-      if ((messageCompletion as any)?.usage) {
-        meterUsageFromResponse(
-          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
-          messageCompletion
-        );
-      }
+        max_completion_tokens: 2048,
+        usageContext: { userId, sessionId, feature: 'invite_message' },
+        taskClass: 'content_generation',
+      });
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
@@ -14267,7 +14267,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
+          noteText = await shortenInviteNoteToLimit(undefined, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),

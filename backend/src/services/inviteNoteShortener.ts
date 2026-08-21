@@ -12,7 +12,7 @@
  * looped on over-limit notes in a real session, so it stays pure deterministic trim.
  */
 
-import { meterUsageFromResponse } from '../utils/llmClients';
+import { agentModeService } from './agentModeService';
 
 /** Extract the note text from a Gemini JSON-ish response, tolerating markdown fences. */
 function extractContent(raw: string): string {
@@ -56,7 +56,7 @@ function extractContent(raw: string): string {
  * The caller is responsible for the final hard trim.
  */
 export async function shortenInviteNoteToLimit(
-  geminiClient: any,
+  _legacyClient: unknown,
   note: string,
   limit: number,
   attempts: number = 2,
@@ -74,24 +74,14 @@ Reply with ONLY valid JSON: {"content": "the shorter note"}
 Note to shorten:
 ${best}`;
     try {
-      const completion = await geminiClient.chat.completions.create({
-        model: 'gemini-3.5-flash',
-        messages: [{ role: 'user', content: prompt }],
+      const completion = await agentModeService.callLLM('gemini-3.5-flash', [
+        { role: 'user', content: prompt },
+      ], {
         temperature: 0.4,
-        max_tokens: 2048,
+        max_completion_tokens: 2048,
+        usageContext: { userId, sessionId, feature: 'invite_note_shorten' },
+        taskClass: 'content_generation',
       });
-      // Meter this direct Gemini completion (bypasses callLLM): shadow analytics +
-      // the per-user cap. Only when usage is present, so an empty response records
-      // nothing. meterUsageFromResponse is fail-open, so no try/catch needed.
-      if ((completion as any)?.usage) {
-        meterUsageFromResponse({
-          userId,
-          sessionId,
-          model: 'gemini-3.5-flash',
-          provider: 'gemini',
-          feature: 'invite_note_shorten',
-        }, completion);
-      }
 
       const candidate = extractContent(completion?.choices?.[0]?.message?.content || '');
       // Only accept a candidate that actually moves us forward (shorter than best).

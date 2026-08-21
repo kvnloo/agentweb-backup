@@ -2,7 +2,6 @@ import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
-import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import { isCronEnabled } from '../utils/instanceState';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
@@ -563,23 +562,14 @@ export class SocialEngagementExecutor {
             if (recentComments && recentComments.length > 0) {
                 systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent comments you've already written. Make sure your new comment is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: `Post content: ${postContent}` },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: `Post content: ${postContent}` },
+            ], {
                 temperature: COMMENT_TEMPERATURE,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_comment' },
+                taskClass: 'scheduled_background',
             });
-            // Charge automated engagement spend to the account owner's quota — policy:
-            // every LLM call with a real userId is billed to that user, nothing absorbed.
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_comment',
-            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
@@ -593,21 +583,14 @@ export class SocialEngagementExecutor {
 
     private async generateReactionType(content: string, engagingUserId?: string): Promise<LinkedInReaction> {
         try {
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: REACTION_SYSTEM_PROMPT },
-                    { role: 'user', content: content || '[No content available]' },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: REACTION_SYSTEM_PROMPT },
+                { role: 'user', content: content || '[No content available]' },
+            ], {
                 temperature: 0.1,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_reaction' },
+                taskClass: 'scheduled_background',
             });
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_reaction',
-            }, completion);
             const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
             if (VALID_REACTIONS.includes(raw)) return raw;
             console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
@@ -704,22 +687,14 @@ export class SocialEngagementExecutor {
             if (recentComments && recentComments.length > 0) {
                 systemPrompt += `\n\nDo NOT repeat or closely echo any of these recent replies you've already written. Make sure your new reply is structurally and tonally distinct from all of these:\n${recentComments.map((c, i) => `${i + 1}. "${c}"`).join('\n')}`;
             }
-            const geminiClient = await agentModeService.getGeminiClient();
-            const completion = await geminiClient.chat.completions.create({
-                model: COMMENT_MODEL,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: `Comment: ${commentText}` },
-                ],
+            const completion = await agentModeService.callLLM(COMMENT_MODEL, [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: `Comment: ${commentText}` },
+            ], {
                 temperature: COMMENT_TEMPERATURE,
+                usageContext: { userId: engagingUserId, feature: 'social_engagement_reply' },
+                taskClass: 'scheduled_background',
             });
-            // Charge automated reply spend to the account owner's quota (all-cost-to-user policy).
-            meterUsageFromResponse({
-                userId: engagingUserId,
-                model: COMMENT_MODEL,
-                provider: 'gemini',
-                feature: 'social_engagement_reply',
-            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);

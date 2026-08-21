@@ -3,7 +3,7 @@ import { usablePublicIdentifier, usableProfileUrl, withoutFabricatedProfileField
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
-import { meterUsageFromResponse } from '../utils/llmClients';
+import { isOpenRouterGatewayEnabledForTaskClass } from '../utils/openRouterGatewayContract';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -349,6 +349,12 @@ export class CrmEnrichmentService {
     fallbackModel: string = CrmEnrichmentService.LLM_FALLBACK_MODEL,
   ): Promise<any> {
     const fallback = fallbackModel;
+
+    // OpenRouter owns upstream failover for the migrated judge/enrichment path.
+    // The legacy circuit breaker remains only as the default-off rollback path.
+    if (isOpenRouterGatewayEnabledForTaskClass('nonstandard_consumer')) {
+      return call(primaryModel);
+    }
 
     // Circuit open: skip the primary entirely for the cooldown period. Saves
     // a 60s timeout per call when Gemini's preview model is broadly degraded.
@@ -1029,30 +1035,19 @@ export class CrmEnrichmentService {
 
     try {
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        async (model) => {
-          // Resolve the client from the model actually selected. A timeout can
-          // cross providers; reusing the primary client's transport with the
-          // fallback model silently sends the fallback request to the wrong API.
-          const llmClient = await agentModeService.getClientForModel(model);
-          return llmClient.chat.completions.create({
-            model,
-            temperature: 0,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt },
-            ],
-            response_format: { type: 'json_object' },
-          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
-        },
+        (model) => agentModeService.callLLM(model, [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ], {
+          temperature: 0,
+          response_format: { type: 'json_object' },
+          timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+          usageContext: { userId: spec.userId, feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
         dataExtractionModel,
         'extractFieldsViaLLM:json',
       );
-      meterUsageFromResponse({
-        userId: spec.userId,
-        model: dataExtractionModel,
-        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_extract',
-      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
@@ -1063,26 +1058,18 @@ export class CrmEnrichmentService {
       const strictRetryPrompt = buildDataExtractionRetryPrompt(userPrompt, retryExample);
 
       const retry = await CrmEnrichmentService.llmCallWithTimeout(
-        async (model) => {
-          const llmClient = await agentModeService.getClientForModel(model);
-          return llmClient.chat.completions.create({
-            model,
-            temperature: 0,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: strictRetryPrompt },
-            ],
-          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
-        },
+        (model) => agentModeService.callLLM(model, [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: strictRetryPrompt },
+        ], {
+          temperature: 0,
+          timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+          usageContext: { userId: spec.userId, feature: 'crm_enrichment_extract' },
+          taskClass: 'nonstandard_consumer',
+        }),
         dataExtractionModel,
         'extractFieldsViaLLM:plain',
       );
-      meterUsageFromResponse({
-        userId: spec.userId,
-        model: dataExtractionModel,
-        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_extract',
-      }, retry);
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
@@ -1197,27 +1184,19 @@ export class CrmEnrichmentService {
 
     try {
       const completion = await CrmEnrichmentService.llmCallWithTimeout(
-        async (model) => {
-          const llmClient = await agentModeService.getClientForModel(model);
-          return llmClient.chat.completions.create({
-            model,
-            temperature: 0,
-            messages: [
+        (model) => agentModeService.callLLM(model, [
               { role: 'system', content: buildCriticSystemPrompt() },
               { role: 'user', content: buildCriticUserPrompt(claims, sourceContext) },
-            ],
+            ], {
+            temperature: 0,
             response_format: { type: 'json_object' },
-          }, { timeout: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS });
-        },
+            timeoutMs: CrmEnrichmentService.LLM_CALL_TIMEOUT_MS,
+            usageContext: { userId, feature: 'crm_enrichment_critic' },
+            taskClass: 'nonstandard_consumer',
+          }),
         enrichConfig.dataExtractionModel,
         'criticPass',
       );
-      meterUsageFromResponse({
-        userId,
-        model: enrichConfig.dataExtractionModel,
-        provider: enrichConfig.dataExtractionModel.startsWith('anthropic') || enrichConfig.dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_critic',
-      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       const parsed = JSON.parse(raw) as Record<string, { verdict?: string; reason?: string }>;
       for (const c of claims) {
@@ -2155,8 +2134,6 @@ export class CrmEnrichmentService {
 
     const userPrompt = `${existingFieldsSection}Enrichment goal or instruction:\n${goal}`;
 
-    const llmClient = await agentModeService.getClientForModel(enrichmentModel);
-
     const fallback = {
       instruction: goal,
       outputFields: [] as string[],
@@ -2169,39 +2146,27 @@ export class CrmEnrichmentService {
 
     let raw = '';
     try {
-      const completion = await llmClient.chat.completions.create({
-        model: enrichmentModel,
-        temperature: 0.2,
-        messages: [
+      const completion = await agentModeService.callLLM(enrichmentModel, [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
-        ],
+        ], {
+        temperature: 0.2,
         response_format: { type: 'json_object' },
+        usageContext: { userId, feature: 'crm_enrichment_suggest' },
+        taskClass: 'nonstandard_consumer',
       });
-      meterUsageFromResponse({
-        userId,
-        model: enrichmentModel,
-        provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-        feature: 'crm_enrichment_suggest',
-      }, completion);
       raw = completion.choices?.[0]?.message?.content || '';
     } catch (err) {
       // Retry without json_object mode
       try {
-        const retry = await llmClient.chat.completions.create({
-          model: enrichmentModel,
-          temperature: 0.2,
-          messages: [
+        const retry = await agentModeService.callLLM(enrichmentModel, [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: `${userPrompt}\n\nCRITICAL: Return ONLY a valid JSON object. No markdown, no backticks.` },
-          ],
+          ], {
+          temperature: 0.2,
+          usageContext: { userId, feature: 'crm_enrichment_suggest' },
+          taskClass: 'nonstandard_consumer',
         });
-        meterUsageFromResponse({
-          userId,
-          model: enrichmentModel,
-          provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-          feature: 'crm_enrichment_suggest',
-        }, retry);
         raw = retry.choices?.[0]?.message?.content || '';
         raw = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
       } catch (retryErr) {

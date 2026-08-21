@@ -22,7 +22,6 @@ import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { buildFieldMappingSystemPrompt, buildFieldMappingUserPrompt } from './enrichmentPrompts';
-import { meterUsageFromResponse } from '../utils/llmClients';
 
 // ── Tier 1: hand-curated alias map ───────────────────────────────────────────
 //
@@ -252,22 +251,15 @@ async function llmMapFieldsToCanonical(
     // Use the configured enrichment model — same one as suggestEnrichment.
     const { CrmEnrichmentService } = await import('./crmEnrichmentService');
     const { enrichmentModel } = await CrmEnrichmentService.getEnrichmentConfig();
-    const llm = await agentModeService.getClientForModel(enrichmentModel);
-    const completion = await llm.chat.completions.create({
-      model: enrichmentModel,
-      temperature: 0,
-      messages: [
+    const completion = await agentModeService.callLLM(enrichmentModel, [
         { role: 'system', content: system },
         { role: 'user', content: user },
-      ],
+      ], {
+      temperature: 0,
       response_format: { type: 'json_object' },
+      usageContext: { userId, feature: 'crm_enrichment_field_alias' },
+      taskClass: 'nonstandard_consumer',
     });
-    meterUsageFromResponse({
-      userId,
-      model: enrichmentModel,
-      provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
-      feature: 'crm_enrichment_field_alias',
-    }, completion);
     const raw = completion.choices?.[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return {};
