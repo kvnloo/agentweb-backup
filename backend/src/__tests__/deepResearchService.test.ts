@@ -30,7 +30,7 @@ describe('DeepResearchService OpenRouter cutover', () => {
     expect(mockCallLLM.mock.calls[0][0]).toBe('openrouter/perplexity/sonar-deep-research');
     expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({
       taskClass: 'content_generation',
-      timeoutMs: 20 * 60 * 1000,
+      timeoutMs: 9 * 60 * 1000,
       usageContext: { userId: 'user-1', feature: 'content_gen' },
       fallbackModels: ['openrouter/perplexity/sonar-pro-search'],
     }));
@@ -56,7 +56,11 @@ describe('DeepResearchService OpenRouter cutover', () => {
     expect(prompt).toMatch(/cite.*inline/i);
   });
 
-  it('uses a larger output budget for comprehensive research', async () => {
+  it('preserves depth ordering within the fallback model output ceiling', async () => {
+    await service.performDeepResearch({ topic: 'A', depth: 'overview' });
+    const overviewBudget = mockCallLLM.mock.calls[0][2].max_completion_tokens;
+    mockCallLLM.mockClear();
+
     await service.performDeepResearch({ topic: 'A', depth: 'detailed' });
     const detailedBudget = mockCallLLM.mock.calls[0][2].max_completion_tokens;
     mockCallLLM.mockClear();
@@ -64,7 +68,12 @@ describe('DeepResearchService OpenRouter cutover', () => {
     await service.performDeepResearch({ topic: 'A', depth: 'comprehensive' });
     const comprehensiveBudget = mockCallLLM.mock.calls[0][2].max_completion_tokens;
 
-    expect(comprehensiveBudget).toBeGreaterThan(detailedBudget);
+    expect([overviewBudget, detailedBudget, comprehensiveBudget]).toEqual([
+      5_000,
+      7_000,
+      8_000,
+    ]);
+    expect(comprehensiveBudget).toBeLessThanOrEqual(8_000);
   });
 
   it('returns the existing report contract with title and bounded summary', async () => {

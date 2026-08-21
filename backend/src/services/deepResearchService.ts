@@ -2,7 +2,8 @@ import { agentModeService } from './agentModeService';
 
 const DEEP_RESEARCH_MODEL = 'openrouter/perplexity/sonar-deep-research';
 const DEEP_RESEARCH_FALLBACK_MODEL = 'openrouter/perplexity/sonar-pro-search';
-const DEEP_RESEARCH_TIMEOUT_MS = 20 * 60 * 1000;
+// Return our stable error contract before the ALB/Nginx 600-second request budget closes.
+const DEEP_RESEARCH_TIMEOUT_MS = 9 * 60 * 1000;
 
 interface DeepResearchResult {
   success: boolean;
@@ -71,9 +72,9 @@ export class DeepResearchService {
         [{ role: 'user', content: this.buildPrompt(params) }],
         {
           max_completion_tokens: params.depth === 'comprehensive'
-            ? 16_000
+            ? 8_000
             : params.depth === 'detailed'
-              ? 10_000
+              ? 7_000
               : 5_000,
           temperature: 0.2,
           timeoutMs: DEEP_RESEARCH_TIMEOUT_MS,
