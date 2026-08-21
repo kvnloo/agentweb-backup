@@ -312,7 +312,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   describe('Gemini tool schemas through OpenRouter', () => {
-    const gatewayTools = [
+    const buildGatewayTools = () => [
       {
         type: 'function',
         function: {
@@ -362,6 +362,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+      const gatewayTools = buildGatewayTools();
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
         chat: { completions: { create } },
       } as any);
@@ -398,7 +399,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     it('leaves non-Gemini gateway tool schemas byte-for-byte unchanged', async () => {
       const tools = await callGateway('gpt-5.4');
-      expect(tools).toEqual(gatewayTools);
+      expect(tools).toEqual(buildGatewayTools());
     });
   });
 
