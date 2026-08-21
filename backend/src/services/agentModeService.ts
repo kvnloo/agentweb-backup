@@ -41,7 +41,7 @@ import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoa
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
-import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization, describePublishAuthorizationWithholdReason, PublishAuthorizationWithholdReason } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import { meteringFeature } from './llmUsageAttributionService';
 import { RunEmitter } from './agentMode/streamEvents';
@@ -3714,7 +3714,9 @@ export class AgentModeService {
    * ordinary state of every draft-only run, and also the state of a run whose stamp
    * could not be written (which the runner downgrades to draft-only for this reason).
    */
-  private async resolveScheduledPublishAuthorization(currentSession: any): Promise<SchedulePublishAuthorization> {
+  private async resolveScheduledPublishAuthorization(
+    currentSession: any
+  ): Promise<SchedulePublishAuthorization & { reason?: PublishAuthorizationWithholdReason }> {
     if (currentSession?.sessionType !== 'scheduled') return { authorized: true, tools: [] };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) {
@@ -3726,8 +3728,16 @@ export class AgentModeService {
     try {
       // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
       // schedule too, so a vanished record withholds rather than publishes.
-      const live = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleId));
-      return narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      const live = resolveSchedulePublishAuthorization(schedule);
+      const resolved = narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
+      // ENG-1245: attach WHY, read straight off the live schedule record, so the
+      // prompt can tell the owner the true blocker instead of unconditionally
+      // naming "Require approval before publishing" (see
+      // describePublishAuthorizationWithholdReason for why that was wrong for
+      // Harsha's schedule and every other legacy schedule never granted standing
+      // publish authorization).
+      return resolved.authorized ? resolved : { ...resolved, reason: describePublishAuthorizationWithholdReason(schedule) };
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
@@ -3951,7 +3961,15 @@ export class AgentModeService {
       const publishAuthorization =
         publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
       const publishAuthorized = publishAuthorization.authorized;
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
+      // ENG-1245: reason is only ever present on the withheld branch, and only when
+      // resolveScheduledPublishAuthorization derived it (an override supplied by a
+      // caller elsewhere carries no reason, so this falls back to the pre-existing,
+      // genuine-hold text — see getScheduledSessionOverride's default).
+      const sessionTypeLabel = getScheduledSessionOverride(
+        currentSession?.sessionType,
+        publishAuthorized,
+        (publishAuthorization as { reason?: PublishAuthorizationWithholdReason }).reason
+      );
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
@@ -8299,17 +8317,39 @@ export class AgentModeService {
    * liveVoiceService) are unaffected — there is no owner schedule setting to apply
    * to them, and a human is present.
    */
-  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+  // ENG-1245: `reason` used to be the boolean-shaped 'required' | 'unverifiable'.
+  // 'required' unconditionally blamed "Require approval before publishing" — true
+  // only when that literal toggle is why the schedule is unauthorized. A legacy
+  // schedule that was simply never granted standing publish authorization (that
+  // toggle is OFF; see describePublishAuthorizationWithholdReason) got the exact
+  // same false claim and the exact same no-op remedy ("turn it OFF" — it already
+  // is). Split into the same two withheld reasons getScheduledSessionOverride
+  // uses, so the dispatch-guard error and the prompt-level report never disagree
+  // about why a run did not publish.
+  private static publishApprovalBlock(
+    toolName: string,
+    reason: PublishAuthorizationWithholdReason | 'unverifiable'
+  ) {
     const detail =
-      reason === 'required'
+      reason === 'require_publish_approval'
         ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : reason === 'revoked'
+        ? `the owner previously authorized this schedule to publish unattended and has since revoked that authorization, so ${toolName} cannot publish on the owner's behalf in this run.`
+        : reason === 'not_granted'
+        ? `${toolName} cannot publish because this schedule has not been granted standing authorization to publish unattended.`
         : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    const unblockInstruction =
+      reason === 'require_publish_approval'
+        ? `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`
+        : reason === 'revoked'
+        ? `Save the drafts, and report plainly that nothing was published and why — publish authorization for this schedule was revoked. Do NOT tell the owner to turn "Require approval before publishing" OFF — that is a different, unrelated setting. They (or an admin) would need to re-authorize this schedule for a future run to publish.`
+        : `Save the drafts, and report plainly that nothing was published and why. Do NOT tell the owner to turn "Require approval before publishing" OFF — that setting is not why this was blocked and toggling it will not change anything.`;
     return {
       success: false as const,
       error:
         `Blocked: ${detail} ` +
         `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
-        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+        unblockInstruction,
       publishApprovalRequired: true as const,
     };
   }
@@ -8360,7 +8400,13 @@ export class AgentModeService {
 
     try {
       // resolvePublishAuthorized also returns false for a missing/deleted schedule.
-      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (resolvePublishAuthorized(schedule)) return null;
+      console.warn(
+        `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} is not authorized to publish.`
+      );
+      // ENG-1245: name the TRUE reason, not just "required" — see publishApprovalBlock.
+      return AgentModeService.publishApprovalBlock(toolName, describePublishAuthorizationWithholdReason(schedule) ?? 'unverifiable');
     } catch (scheduleError) {
       console.error(
         `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
@@ -8368,11 +8414,6 @@ export class AgentModeService {
       );
       return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
     }
-
-    console.warn(
-      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
-    );
-    return AgentModeService.publishApprovalBlock(toolName, 'required');
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
@@ -35009,11 +35050,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
         /*
-         * The account's own time zone, read from Google rather than assumed. Google
-         * interprets the timestamp in it, so guessing UTC would silently shift every
-         * conversion by the account's real offset — and the only symptom is conversions
-         * landing on the wrong day, which nobody reads as a bug.
+         * Validate BEFORE resolving the time zone. getAccountTimeZone is a live Google
+         * call, so doing it first meant a future-dated timestamp or a value with no
+         * currency — both refusable locally — still cost a network round trip before
+         * being rejected. On a background sweep that is a request per bad row.
+         *
+         * The zone is only needed to FORMAT a conversion we have already accepted, so a
+         * throwaway placeholder validates everything else first. UTC is safe here purely
+         * because the result is discarded; the real formatting below uses the account's
+         * own zone, and getting that wrong would shift every conversion by the real
+         * offset with no symptom beyond conversions landing on the wrong day.
          */
+        const validateOnlyArgs = {
+          gclid: args.gclid,
+          conversionActionResourceName: args.conversion_action_resource_name,
+          conversionAt: new Date(args.conversion_at),
+          value: args.conversion_value,
+          currencyCode: args.currency_code,
+          orderId: args.order_id,
+        };
+        try {
+          buildClickConversion({ ...validateOnlyArgs, timeZone: 'UTC' });
+        } catch (err: any) {
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+
         const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
         let conversion: Record<string, unknown>;
         try {
@@ -35245,11 +35306,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
           // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
           // lookup failure must NOT break an otherwise-valid ad creation.
+          // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
+          // gate already computes the warning; relaying it here is what stops it being
+          // computed and discarded — the exact failure this ticket's own comment names.
+          let creativeTrackingWarning: string | undefined;
           try {
             const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
             if (parent) {
               const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
               if (!gate.proceed) return gate.blockResult;
+              creativeTrackingWarning = gate.warning;
             }
           } catch (gateErr) {
             console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
@@ -35265,7 +35331,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
           });
-          return { success: true, adResourceName: ad.resourceName };
+          return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
@@ -35324,10 +35390,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
         // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
         // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch.
+        let creativeTrackingWarning: string | undefined;
         try {
           const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
           const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
           if (!gate.proceed) return gate.blockResult;
+          creativeTrackingWarning = gate.warning;
         } catch (gateErr) {
           console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
         }
@@ -35343,7 +35412,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           videoAssets: args.video_assets,
           finalUrl: args.final_url,
         });
-        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+        return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
 
       if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
