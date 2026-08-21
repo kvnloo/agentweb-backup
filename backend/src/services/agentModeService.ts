@@ -3428,11 +3428,24 @@ export class AgentModeService {
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
-      params.max_completion_tokens = max_completion_tokens;
+      // OpenRouter normalizes the cross-provider limit as max_tokens. Gemini's
+      // endpoints do not advertise max_completion_tokens, so require_parameters
+      // would correctly reject the old provider-native field.
+      if (useOpenRouterGateway) params.max_tokens = max_completion_tokens;
+      else params.max_completion_tokens = max_completion_tokens;
     }
 
     // Only add temperature if model supports it and value is provided
-    if (this.llmModels[model].supportsTemperature && temperature !== null) {
+    // OpenRouter's live model metadata marks GPT-5.x temperature unsupported,
+    // even though the legacy Azure deployments accepted it. Suppress it only
+    // on the gateway route; the default-off direct path remains unchanged.
+    const gatewaySupportsTemperature = !useOpenRouterGateway ||
+      !upstreamModel.startsWith('openai/gpt-5.');
+    if (
+      this.llmModels[model].supportsTemperature &&
+      gatewaySupportsTemperature &&
+      temperature !== null
+    ) {
       params.temperature = temperature;
     }
 

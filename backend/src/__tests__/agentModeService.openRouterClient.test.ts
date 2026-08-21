@@ -205,15 +205,17 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     } as any);
 
     await service.callLLM(
-      'gpt-5.5',
+      'gpt-5.4',
       [{ role: 'user', content: 'Hello' }],
-      { taskClass: 'interactive_chat' } as any,
+      { taskClass: 'interactive_chat', temperature: 0.1 } as any,
     );
 
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'openai/gpt-5.5',
+    const request = create.mock.calls[0][0];
+    expect(request).toEqual(expect.objectContaining({
+      model: 'openai/gpt-5.4',
       provider: { allow_fallbacks: true, require_parameters: true },
     }));
+    expect(request).not.toHaveProperty('temperature');
   });
 
   it('has a verified gateway mapping for every selectable direct-provider model', () => {
@@ -240,10 +242,33 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     await service.callLLM(
       'gemini-3.7-flash',
       [{ role: 'user', content: 'Hello' }],
-      { taskClass: 'interactive_chat' } as any,
+      { taskClass: 'interactive_chat', max_completion_tokens: 321 } as any,
     );
 
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'google/gemini-3.7-flash' }));
+    const request = create.mock.calls[0][0];
+    expect(request).toEqual(expect.objectContaining({
+      model: 'google/gemini-3.7-flash',
+      max_tokens: 321,
+    }));
+    expect(request).not.toHaveProperty('max_completion_tokens');
+  });
+
+  it('preserves provider-native token and temperature fields while the canary is disabled', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    (service as any).llmModels['gpt-5.4'].client = { chat: { completions: { create } } };
+
+    await service.callLLM(
+      'gpt-5.4',
+      [{ role: 'user', content: 'Hello' }],
+      { max_completion_tokens: 321, temperature: 0.1 } as any,
+    );
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-5.4',
+      max_completion_tokens: 321,
+      temperature: 0.1,
+    }));
   });
 
   it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
