@@ -6,6 +6,7 @@ to OpenRouter upstream IDs and constructs a client.
 """
 
 import os
+from contextlib import contextmanager
 
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
@@ -14,6 +15,7 @@ import secrets_manager
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_BROWSER_RAW_TOOL_MODELS = {"deepseek-r1", "deepseek-reasoner"}
 
 # Only aliases whose old upstream ID no longer exists on OpenRouter belong here.
 LEGACY_MODEL_UPGRADES = {
@@ -68,8 +70,6 @@ def create_openrouter_llm(model: str):
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is not set")
 
-    # browser-use checks this conventional variable independently of the client.
-    os.environ["OPENAI_API_KEY"] = api_key
     extra_body = {
         "provider": {"allow_fallbacks": True, "require_parameters": True},
         "plugins": [{"id": "context-compression"}],
@@ -97,6 +97,30 @@ def create_openrouter_llm(model: str):
     if not model.startswith(("openai/o", "openai/gpt-5")):
         kwargs["temperature"] = 0.0
     return ChatOpenAI(**kwargs)
+
+
+@contextmanager
+def openrouter_browser_compatibility_env():
+    """Expose the gateway key only while browser-use validates its LLM."""
+    api_key = (secrets_manager.get_openrouter_api_key() or "").strip()
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY is not set")
+
+    previous = os.environ.get("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = api_key
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = previous
+
+
+def browser_tool_calling_method(model: str) -> str:
+    """Match browser-use's no-tool list after OpenRouter adds a namespace."""
+    model_slug = (model or "").rsplit("/", 1)[-1].lower()
+    return "raw" if model_slug in _BROWSER_RAW_TOOL_MODELS else "auto"
 
 
 def get_openrouter_llm(full_llm_name: str):

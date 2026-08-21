@@ -49,6 +49,7 @@ interface IncomingUsageRecord {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  costUsdOverride?: number;
   feature?: string;
 }
 
@@ -87,6 +88,7 @@ function isValidRecord(record: unknown): record is IncomingUsageRecord {
   if (typeof r.model !== "string" || r.model.trim() === "") return false;
   if (!isNonNegativeFiniteNumber(r.inputTokens)) return false;
   if (!isNonNegativeFiniteNumber(r.outputTokens)) return false;
+  if (r.costUsdOverride !== undefined && !isNonNegativeFiniteNumber(r.costUsdOverride)) return false;
   return true;
 }
 
@@ -236,6 +238,9 @@ router.post(
           : 0;
         const recordProvider =
           typeof record.provider === "string" && record.provider ? record.provider : "unknown";
+        const costUsdOverride = isNonNegativeFiniteNumber(record.costUsdOverride)
+          ? record.costUsdOverride
+          : undefined;
 
         // Charge the RESOLVED user, never the record's claim — otherwise any
         // engine token could drain someone else's quota by naming them.
@@ -253,14 +258,15 @@ router.post(
             };
           entry.tokens +=
             record.inputTokens! + record.outputTokens! + cacheReadTokens + cacheWriteTokens;
-          entry.cost +=
+          entry.cost += costUsdOverride ?? (
             computeCostMicroUsd(
               record.model!,
               record.inputTokens!,
               record.outputTokens!,
               cacheReadTokens,
               cacheWriteTokens
-            ) / 1e6;
+            ) / 1e6
+          );
           entry.calls += 1;
           entry.inputTokens += record.inputTokens!;
           entry.outputTokens += record.outputTokens!;
@@ -283,6 +289,7 @@ router.post(
               record.outputTokens,
               cacheReadTokens,
               cacheWriteTokens,
+              costUsdOverride ?? "",
               chargeFeature,
             ].join("|")
           );
@@ -305,6 +312,7 @@ router.post(
             outputTokens: record.outputTokens!,
             cacheReadTokens,
             cacheWriteTokens,
+            costUsdOverride,
             date: requestDate,
           },
         });

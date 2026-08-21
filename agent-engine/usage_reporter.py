@@ -14,6 +14,7 @@ public entry point swallows all exceptions and at most logs a warning.
 """
 
 import logging
+import math
 import os
 import threading
 import uuid
@@ -37,7 +38,7 @@ def parse_full_llm_name(full_llm_name):
     """
     try:
         parts = (full_llm_name or "").split("->")
-        if len(parts) == 3 and parts[1].strip() and parts[2].strip():
+        if len(parts) == 3 and all(part.strip() for part in parts):
             return "openrouter", parts[2].strip()
     except Exception:
         pass
@@ -51,6 +52,43 @@ def _coerce_count(value):
         return n if n >= 0 else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _non_negative_float(value):
+    """Return a finite non-negative float, otherwise None."""
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _dict_or_empty(value):
+    """Treat malformed SDK metadata as absent instead of dropping all usage."""
+    return value if isinstance(value, dict) else {}
+
+
+def _openrouter_attribution(message, llm_output):
+    """Extract the model actually served and OpenRouter's exact call cost."""
+    metadata = _dict_or_empty(getattr(message, "response_metadata", None))
+    llm_output = _dict_or_empty(llm_output)
+    token_usage = _dict_or_empty(metadata.get("token_usage") or llm_output.get("token_usage"))
+    model = metadata.get("model_name") or metadata.get("model") or llm_output.get("model_name")
+    model = model.strip() if isinstance(model, str) and model.strip() else None
+
+    is_byok = token_usage.get("is_byok", metadata.get("is_byok"))
+    cost_details = _dict_or_empty(token_usage.get("cost_details") or metadata.get("cost_details"))
+    if is_byok is True:
+        cost = _non_negative_float(cost_details.get("upstream_inference_cost"))
+    else:
+        cost = _non_negative_float(token_usage.get("cost"))
+
+    attribution = {}
+    if model:
+        attribution["model"] = model
+    if cost is not None:
+        attribution["cost_usd_override"] = cost
+    return attribution
 
 
 def extract_usage_from_llm_result(response):
@@ -69,35 +107,40 @@ def extract_usage_from_llm_result(response):
     """
     try:
         # 1. Per-generation message usage_metadata
-        for generations in getattr(response, "generations", None) or []:
-            for generation in generations or []:
+        generation_groups = getattr(response, "generations", None)
+        for generations in generation_groups if isinstance(generation_groups, (list, tuple)) else []:
+            for generation in generations if isinstance(generations, (list, tuple)) else []:
                 message = getattr(generation, "message", None)
-                meta = getattr(message, "usage_metadata", None)
+                meta = _dict_or_empty(getattr(message, "usage_metadata", None))
                 if meta:
-                    details = meta.get("input_token_details") or {}
-                    return {
+                    details = _dict_or_empty(meta.get("input_token_details"))
+                    usage = {
                         "input_tokens": _coerce_count(meta.get("input_tokens")),
                         "output_tokens": _coerce_count(meta.get("output_tokens")),
                         "cache_read_tokens": _coerce_count(details.get("cache_read")),
                         "cache_write_tokens": _coerce_count(details.get("cache_creation")),
                     }
+                    usage.update(_openrouter_attribution(message, getattr(response, "llm_output", None)))
+                    return usage
 
-        llm_output = getattr(response, "llm_output", None) or {}
+        llm_output = _dict_or_empty(getattr(response, "llm_output", None))
 
         # 2. OpenAI-style token_usage
-        token_usage = llm_output.get("token_usage") or {}
+        token_usage = _dict_or_empty(llm_output.get("token_usage"))
         if token_usage:
-            return {
+            usage = {
                 "input_tokens": _coerce_count(token_usage.get("prompt_tokens")),
                 "output_tokens": _coerce_count(token_usage.get("completion_tokens")),
                 "cache_read_tokens": _coerce_count(
-                    (token_usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                    _dict_or_empty(token_usage.get("prompt_tokens_details")).get("cached_tokens")
                 ),
                 "cache_write_tokens": 0,
             }
+            usage.update(_openrouter_attribution(None, llm_output))
+            return usage
 
         # 3. Anthropic-style usage
-        usage = llm_output.get("usage") or {}
+        usage = _dict_or_empty(llm_output.get("usage"))
         if usage:
             return {
                 "input_tokens": _coerce_count(usage.get("input_tokens")),
@@ -144,12 +187,19 @@ class UsageReporter:
                         "cache_read_tokens": 0,
                         "cache_write_tokens": 0,
                         "calls": 0,
+                        "cost_usd_override": 0.0,
+                        "cost_override_complete": True,
                     },
                 )
                 bucket["input_tokens"] += _coerce_count(usage.get("input_tokens"))
                 bucket["output_tokens"] += _coerce_count(usage.get("output_tokens"))
                 bucket["cache_read_tokens"] += _coerce_count(usage.get("cache_read_tokens"))
                 bucket["cache_write_tokens"] += _coerce_count(usage.get("cache_write_tokens"))
+                cost_override = _non_negative_float(usage.get("cost_usd_override"))
+                if cost_override is None:
+                    bucket["cost_override_complete"] = False
+                else:
+                    bucket["cost_usd_override"] += cost_override
                 bucket["calls"] += 1
         except Exception as e:
             logger.debug(f"usage_reporter: add failed: {e}")
@@ -161,19 +211,20 @@ class UsageReporter:
             for (provider, model), totals in self._totals.items():
                 if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
                     continue
-                records.append(
-                    {
-                        "userId": user_id,
-                        "taskId": task_id,
-                        "model": model,
-                        "provider": provider,
-                        "feature": self.feature,
-                        "inputTokens": totals["input_tokens"],
-                        "outputTokens": totals["output_tokens"],
-                        "cacheReadTokens": totals["cache_read_tokens"],
-                        "cacheWriteTokens": totals["cache_write_tokens"],
-                    }
-                )
+                record = {
+                    "userId": user_id,
+                    "taskId": task_id,
+                    "model": model,
+                    "provider": provider,
+                    "feature": self.feature,
+                    "inputTokens": totals["input_tokens"],
+                    "outputTokens": totals["output_tokens"],
+                    "cacheReadTokens": totals["cache_read_tokens"],
+                    "cacheWriteTokens": totals["cache_write_tokens"],
+                }
+                if totals["cost_override_complete"]:
+                    record["costUsdOverride"] = totals["cost_usd_override"]
+                records.append(record)
         return records
 
     def _create_token(self, user_id):
@@ -244,7 +295,11 @@ class UsageCallbackHandler(BaseCallbackHandler):
         try:
             usage = extract_usage_from_llm_result(response)
             if usage:
-                self._reporter.add(usage)
+                self._reporter.add(
+                    usage,
+                    model=usage.get("model"),
+                    provider="openrouter",
+                )
         except Exception as e:
             logger.debug(f"usage_reporter: on_llm_end failed: {e}")
 
