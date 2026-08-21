@@ -3482,6 +3482,11 @@ export class AgentModeService {
       // routing flag so metering can distinguish BYOK from a genuinely free
       // OpenRouter call and fall back to our provider price book when needed.
       params.usage = { include: true };
+      // OpenRouter applies this managed transform only when a request exceeds
+      // the selected model's context window. One gateway-level opt-in keeps
+      // smaller-context selectable models usable without rebuilding prompt
+      // truncation or provider-specific fallback logic in AgentWeb.
+      params.plugins = [{ id: 'context-compression' }];
       if (fallbackModels?.length) {
         params.models = fallbackModels.map((fallbackModel) => {
           const normalizedFallback = this.normalizeModelId(fallbackModel);
