@@ -74,13 +74,17 @@ router.post('/linear/webhook', async (req, res) => {
 
     if (transitionedIntoDone) {
       const { addIssueComment, getIssueCommentsDetailed, reopenIssue } = await import('../services/linearService');
-      const comments = await getIssueCommentsDetailed(payload.data.id);
-      const labels = Array.isArray(payload?.data?.labels) ? payload.data.labels : [];
+      const hasExpandedLabels = Array.isArray(payload?.data?.labels);
+      const labels = hasExpandedLabels ? payload.data.labels : [];
       const hasCustomerLabels =
         labels.some((label: any) => label?.name === 'Bug') &&
         labels.some((label: any) => label?.name === 'Customer Reported');
-      // The reporter-ticket marker is the actual private-canonical notification rail. Treat it as
-      // authoritative even if a Linear webhook payload ever omits expanded labels.
+      // Explicit non-customer labels need no new preflight dependency. When expanded labels are
+      // omitted, comments remain authoritative because the reporter-ticket marker is the actual
+      // private-canonical notification rail.
+      const comments = hasCustomerLabels || !hasExpandedLabels
+        ? await getIssueCommentsDetailed(payload.data.id)
+        : [];
       const hasReporterTicket = comments.some((comment) => /\[reporter-ticket #\d+\s+[^\]\s]+\]/i.test(comment.body));
       const isCustomerBug = hasCustomerLabels || hasReporterTicket;
 

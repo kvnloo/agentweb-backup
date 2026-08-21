@@ -201,6 +201,21 @@ describe('POST /api/integrations/linear/webhook — Done-only transition gating'
 });
 
 describe('POST /api/integrations/linear/webhook — customer symptom verification gate (ENG-1268)', () => {
+  it('does not add a preflight comment dependency for an explicitly non-customer issue', async () => {
+    const res = await post(transitionIntoDone({
+      data: {
+        id: 'issue-1',
+        title: 'An internal bug',
+        labels: [{ name: 'Bug' }],
+        state: { id: DONE_STATE_ID, name: 'Done', type: 'completed' },
+      },
+    }));
+
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(linear.getIssueCommentsDetailed).not.toHaveBeenCalled();
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+  });
+
   it('blocks a customer-reported bug with no verification record and explains the missing evidence', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValueOnce([
       { body: 'Fixed in PR #123.', createdAt: '2026-08-20T00:00:00.000Z' },
