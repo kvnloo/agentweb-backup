@@ -121,8 +121,9 @@ const PYTHON_IMPORT_AST_SCRIPT = [
   'for node in ast.walk(tree):',
   '    if isinstance(node, ast.Import):',
   '        modules.extend(alias.name for alias in node.names)',
-  '    elif isinstance(node, ast.ImportFrom) and node.module:',
+  '    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:',
   '        modules.append(node.module)',
+  '        modules.extend(f"{node.module}.{alias.name}" for alias in node.names)',
   'print(json.dumps(modules))',
 ].join('\n');
 
@@ -249,6 +250,7 @@ describe('agent-engine provider import guard (ENG-1414)', () => {
     ['from openai import OpenAI\nclient = OpenAI()'],
     ['import anthropic as provider\nclient = provider.Anthropic()'],
     ['from langchain_openai import (\n    ChatOpenAI as Client,\n)\nclient = Client()'],
+    ['from google import genai\nclient = genai.Client()'],
   ])('detects a deliberately introduced Python provider import', (source) => {
     expect(findDirectPythonProviderImports(source)).not.toEqual([]);
   });
@@ -258,6 +260,7 @@ describe('agent-engine provider import guard (ENG-1414)', () => {
       '# from openai import OpenAI',
       'example = "import anthropic"',
       'long_example = """from langchain_openai import ChatOpenAI"""',
+      'from .openai import OpenAI',
     ].join('\n'))).toEqual([]);
   });
 
