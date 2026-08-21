@@ -15,8 +15,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
+import { spawnSync } from 'child_process';
 
 const SRC_ROOT = path.join(__dirname, '..');
+const AGENT_ENGINE_ROOT = path.join(SRC_ROOT, '..', '..', 'agent-engine');
 
 /**
  * Importing a text/chat provider SDK is the architectural boundary. AST
@@ -94,6 +96,52 @@ const ALLOWLIST = new Set<string>([
   'loops/instances/ai-eval-funnel/rcaEnricher.ts',
 ]);
 
+const DIRECT_PYTHON_TEXT_PROVIDER_MODULES = [
+  'openai',
+  'anthropic',
+  'langchain_openai',
+  'langchain_aws',
+  'langchain_google_genai',
+  'langchain_anthropic',
+  'google.genai',
+] as const;
+
+const AGENT_ENGINE_ALLOWLIST = new Set<string>([
+  // Transitional text routes owned by ENG-1416. web_agent.py also contains
+  // separately documented image-generation imports that remain out of scope.
+  'task_monitor.py',
+  'task_utils.py',
+  'web_agent.py',
+]);
+
+const PYTHON_IMPORT_AST_SCRIPT = [
+  'import ast, json, sys',
+  'tree = ast.parse(sys.stdin.read())',
+  'modules = []',
+  'for node in ast.walk(tree):',
+  '    if isinstance(node, ast.Import):',
+  '        modules.extend(alias.name for alias in node.names)',
+  '    elif isinstance(node, ast.ImportFrom) and node.module:',
+  '        modules.append(node.module)',
+  'print(json.dumps(modules))',
+].join('\n');
+
+function findDirectPythonProviderImports(content: string): string[] {
+  const parsed = spawnSync('python3', ['-c', PYTHON_IMPORT_AST_SCRIPT], {
+    input: content,
+    encoding: 'utf8',
+  });
+  if (parsed.status !== 0) {
+    throw new Error(`Unable to parse agent-engine Python source: ${parsed.stderr || 'unknown error'}`);
+  }
+  const importedModules = JSON.parse(parsed.stdout) as string[];
+  return DIRECT_PYTHON_TEXT_PROVIDER_MODULES.filter((providerModule) =>
+    importedModules.some((importedModule) =>
+      importedModule === providerModule || importedModule.startsWith(`${providerModule}.`),
+    ),
+  );
+}
+
 function assertNoForbiddenProviderImports(file: string, content: string): void {
   const imports = findDirectProviderSdkImports(content, file);
   if (imports.length > 0 && !ALLOWLIST.has(file)) {
@@ -118,6 +166,19 @@ function listSourceFiles(dir: string, acc: string[] = []): string[] {
       !entry.name.endsWith('.test.tsx') &&
       !entry.name.endsWith('.d.ts')
     ) {
+      acc.push(full);
+    }
+  }
+  return acc;
+}
+
+function listPythonSourceFiles(dir: string, acc: string[] = []): string[] {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (['tests', '__pycache__', '.venv', 'venv'].includes(entry.name)) continue;
+      listPythonSourceFiles(full, acc);
+    } else if (entry.isFile() && entry.name.endsWith('.py')) {
       acc.push(full);
     }
   }
@@ -180,6 +241,52 @@ describe('SDK construction guard alias resistance (ENG-1414)', () => {
     expect(() => assertNoForbiddenProviderImports('utils/llmClients.ts', "import OpenAI from 'openai';")).not.toThrow();
     expect(() => assertNoForbiddenProviderImports('services/liveVoiceService.ts', "import { GoogleGenAI } from '@google/genai';")).not.toThrow();
     expect(() => assertNoForbiddenProviderImports('services/videoGeneration.ts', "const sdk = require('@google/genai');")).not.toThrow();
+  });
+});
+
+describe('agent-engine provider import guard (ENG-1414)', () => {
+  it.each([
+    ['from openai import OpenAI\nclient = OpenAI()'],
+    ['import anthropic as provider\nclient = provider.Anthropic()'],
+    ['from langchain_openai import (\n    ChatOpenAI as Client,\n)\nclient = Client()'],
+  ])('detects a deliberately introduced Python provider import', (source) => {
+    expect(findDirectPythonProviderImports(source)).not.toEqual([]);
+  });
+
+  it('ignores provider-looking text in Python comments and strings', () => {
+    expect(findDirectPythonProviderImports([
+      '# from openai import OpenAI',
+      'example = "import anthropic"',
+      'long_example = """from langchain_openai import ChatOpenAI"""',
+    ].join('\n'))).toEqual([]);
+  });
+
+  it('has no new direct provider import outside the ENG-1416 migration inventory', () => {
+    for (const file of listPythonSourceFiles(AGENT_ENGINE_ROOT)) {
+      const rel = path.relative(AGENT_ENGINE_ROOT, file).split(path.sep).join('/');
+      const imports = findDirectPythonProviderImports(fs.readFileSync(file, 'utf8'));
+      if (imports.length > 0 && !AGENT_ENGINE_ALLOWLIST.has(rel)) {
+        throw new Error(
+          `Direct provider SDK import in agent-engine/${rel}: ${imports.join(', ')}. ` +
+          'Route text/chat/tool calls through the approved OpenRouter gateway or document a bounded capability exception.',
+        );
+      }
+    }
+  });
+
+  it('prunes agent-engine allowlist entries after their direct imports move', () => {
+    const stale: string[] = [];
+    for (const rel of AGENT_ENGINE_ALLOWLIST) {
+      const full = path.join(AGENT_ENGINE_ROOT, rel);
+      if (!fs.existsSync(full)) {
+        stale.push(`${rel} (file deleted — remove from allowlist)`);
+        continue;
+      }
+      if (findDirectPythonProviderImports(fs.readFileSync(full, 'utf8')).length === 0) {
+        stale.push(`${rel} (no longer imports a direct provider SDK — remove from allowlist)`);
+      }
+    }
+    expect(stale).toEqual([]);
   });
 });
 
