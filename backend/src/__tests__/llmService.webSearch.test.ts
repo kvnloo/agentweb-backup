@@ -1,245 +1,116 @@
-/**
- * Bug regression: `generateJSONContentWithWebSearch` used to reach into
- * `chatModel.client`, but @langchain/openai v1.x no longer exposes the
- * underlying openai client through that property, so the v3 web-tier
- * extraction failed on every call and the toast claimed leads were
- * "enriched" with zero fields actually written. The fix bypasses LangChain
- * and calls Azure's Responses endpoint via raw HTTP.
- *
- * Tests stub global `fetch` so no real network call happens.
- */
+const mockCallLLM = jest.fn();
+const mockMeterUserUsage = jest.fn();
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: { callLLM: mockCallLLM },
+}));
+jest.mock('../services/usageRecorderService', () => ({ meterUserUsage: mockMeterUserUsage }));
 
 import { LLMService } from '../utils/llmService';
 
-function makeService(): LLMService {
-  process.env.AZURE_OPENAI_API_KEY = 'test-key-xyz';
-  process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com';
-  process.env.AZURE_OPENAI_RESPONSES_API_VERSION = '2025-03-01-preview';
-  return new LLMService('gpt-5-chat-2', 0);
-}
-
-describe('LLMService.generateJSONContentWithWebSearch — Azure path', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => { global.fetch = originalFetch; });
-
-  it('POSTs to the Azure /openai/responses endpoint with web_search tool and parses output_text', async () => {
-    const fetchMock = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => '{"output_text":"{\\"company\\":\\"Acme\\",\\"funding\\":\\"$10M\\"}","usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}',
-    });
-    (global as any).fetch = fetchMock;
-
-    const svc = makeService();
-    const out = await svc.generateJSONContentWithWebSearch<{ company: string; funding: string }>(
-      'sys-prompt', 'user-prompt',
-    );
-
-    expect(out).toEqual({ company: 'Acme', funding: '$10M' });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe(
-      'https://example.openai.azure.com/openai/responses?api-version=2025-03-01-preview',
-    );
-    expect(init.method).toBe('POST');
-    expect(init.headers['api-key']).toBe('test-key-xyz');
-    expect(init.signal).toBeInstanceOf(AbortSignal);
-    const body = JSON.parse(init.body);
-    expect(body).toMatchObject({
-      model: 'gpt-5-chat-2',
-      instructions: 'sys-prompt',
-      input: 'user-prompt',
-      tools: [{ type: 'web_search' }],
-    });
-  });
-
-  it('falls back to the output[].content[].text shape when output_text is absent', async () => {
-    (global as any).fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      text: async () => JSON.stringify({
-        output: [
-          {},
-          { content: [{}, { text: '{"x":' }, { text: '"ok"}' }] },
-        ],
-      }),
-    });
-
-    const svc = makeService();
-    const out = await svc.generateJSONContentWithWebSearch<{ x: string }>('s', 'u');
-    expect(out).toEqual({ x: 'ok' });
-  });
-
-  it('surfaces a useful error on non-2xx response', async () => {
-    const readBody = jest.fn().mockResolvedValue('{"error":{"message":"bad api version"}}');
-    (global as any).fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 400,
-      text: readBody,
-    });
-
-    const svc = makeService();
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      /Azure Responses API 400.*bad api version/,
-    );
-    expect(readBody).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps a rejected Azure error-body read bounded to an empty diagnostic', async () => {
-    (global as any).fetch = jest.fn().mockResolvedValue({
-      ok: false,
-      status: 503,
-      text: jest.fn().mockRejectedValue(new Error('socket closed')),
-    });
-
-    const svc = makeService();
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      'Azure Responses API 503:',
-    );
-  });
-
-  it('surfaces bounded response context when Azure returns invalid JSON', async () => {
-    const invalidBody = `<html>${'x'.repeat(500)}</html>`;
-    const readBody = jest.fn().mockResolvedValue(invalidBody);
-    (global as any).fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: readBody,
-    });
-
-    const svc = makeService();
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      /Azure Responses API 200 returned invalid JSON: <html>x+/,
-    );
-    expect(readBody).toHaveBeenCalledTimes(1);
-  });
-
-  it('throws when AZURE_OPENAI_ENDPOINT / API_KEY are unset', async () => {
-    const svc = makeService();
-    delete process.env.AZURE_OPENAI_API_KEY;
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      /AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set/,
-    );
-  });
-
-  it('emits wire-level debug logs when LLM_WEB_SEARCH_DEBUG=1', async () => {
-    const fetchMock = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => '{"output_text":"{\\"ok\\":1}"}',
-    });
-    (global as any).fetch = fetchMock;
-    process.env.LLM_WEB_SEARCH_DEBUG = '1';
-    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
-
-    try {
-      const svc = makeService();
-      await svc.generateJSONContentWithWebSearch('s', 'u');
-
-      const logged = logSpy.mock.calls.map(c => c.join(' ')).join('\n');
-      expect(logged).toMatch(/\[llm\.webSearch\] → POST /);
-      expect(logged).toMatch(/\[llm\.webSearch\] → headers: api-key=\[redacted\]/);
-      expect(logged).toMatch(/\[llm\.webSearch\] → body: /);
-      expect(logged).toMatch(/\[llm\.webSearch\] ← status=200 in \d+ms/);
-      expect(logged).toMatch(/\[llm\.webSearch\] ← body: /);
-    } finally {
-      logSpy.mockRestore();
-      delete process.env.LLM_WEB_SEARCH_DEBUG;
-    }
-  });
-
-  it('strips a trailing slash from AZURE_OPENAI_ENDPOINT', async () => {
-    const fetchMock = jest.fn().mockResolvedValue({
-      ok: true,
-      text: async () => '{"output_text":"{\\"ok\\":1}"}',
-    });
-    (global as any).fetch = fetchMock;
-
-    const svc = makeService();
-    process.env.AZURE_OPENAI_ENDPOINT = 'https://example.openai.azure.com/';
-    delete process.env.AZURE_OPENAI_RESPONSES_API_VERSION;
-    await svc.generateJSONContentWithWebSearch('s', 'u');
-    const url = fetchMock.mock.calls[0][0] as string;
-    expect(url).toBe(
-      'https://example.openai.azure.com/openai/responses?api-version=2025-03-01-preview',
-    );
-  });
-
-  it('fails closed when a successful Azure payload contains no text output', async () => {
-    (global as any).fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: async () => '{}',
-    });
-
-    const svc = makeService();
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toBeDefined();
-  });
+const completion = (content = '{"company":"Acme"}') => ({
+  id: 'generation-web-1',
+  choices: [{ message: { content } }],
+  usage: {
+    prompt_tokens: 11,
+    completion_tokens: 7,
+    total_tokens: 18,
+  },
 });
 
-// ─── Gemini path — separate dynamic import, separate failure modes ───────────
-
-const mockGenerateContent = jest.fn();
-jest.mock('@google/genai', () => ({
-  GoogleGenAI: jest.fn().mockImplementation(() => ({
-    models: { generateContent: mockGenerateContent },
-  })),
-}));
-
-describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
+describe('LLMService.generateJSONContentWithWebSearch — shared gateway', () => {
   beforeEach(() => {
-    mockGenerateContent.mockReset();
-    process.env.GEMINI_API_KEY = '  test-gemini-key  '; // intentional whitespace
-  });
-
-  it('routes Gemini models through @google/genai with googleSearch tool and parses .text', async () => {
-    mockGenerateContent.mockResolvedValueOnce({
-      text: '{"city":"Boston","industry":"SaaS"}',
-      usageMetadata: {
-        promptTokenCount: 7,
-        candidatesTokenCount: 5,
-        totalTokenCount: 12,
-        cachedContentTokenCount: 3,
-      },
-    });
-
-    const svc = new LLMService('gemini-2.0-flash', 0);
-    expect((svc as any).chatModel).toEqual(expect.objectContaining({ invoke: expect.any(Function) }));
-
-    const out = await svc.generateJSONContentWithWebSearch<{ city: string; industry: string }>(
-      'sys', 'user',
-    );
-
-    expect(out).toEqual({ city: 'Boston', industry: 'SaaS' });
-    expect(mockGenerateContent).toHaveBeenCalledTimes(1);
-    expect(mockGenerateContent.mock.calls[0][0]).toMatchObject({
-      model: 'gemini-2.0-flash',
-      contents: 'user',
-      config: {
-        systemInstruction: 'sys',
-        tools: [{ googleSearch: {} }],
-        httpOptions: { timeout: 2 * 60 * 1000 },
-      },
-    });
-
-    // API key is trimmed before being passed to GoogleGenAI.
-    const { GoogleGenAI } = jest.requireMock('@google/genai');
-    expect(GoogleGenAI).toHaveBeenCalledWith({ apiKey: 'test-gemini-key' });
-  });
-
-  it('throws a clear error when GEMINI_API_KEY is unset', async () => {
+    jest.clearAllMocks();
+    mockCallLLM.mockResolvedValue(completion());
     delete process.env.GEMINI_API_KEY;
-    const svc = new LLMService('gemini-2.0-flash', 0);
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toThrow(
-      /GEMINI_API_KEY not set/,
-    );
-    expect(mockGenerateContent).not.toHaveBeenCalled();
+    delete process.env.AZURE_OPENAI_API_KEY;
+    delete process.env.AZURE_OPENAI_ENDPOINT;
   });
 
-  it('treats an empty .text response as an empty extraction (passes through extractJson failure)', async () => {
-    mockGenerateContent.mockResolvedValueOnce({ text: undefined });
-    const svc = new LLMService('gemini-2.0-flash', 0);
-    // extractJson on '' throws — Gemini path doesn't swallow it, so callers
-    // see the original error (the v3 deps wrapper catches it one level up).
-    await expect(svc.generateJSONContentWithWebSearch('s', 'u')).rejects.toBeDefined();
+  it('routes a GPT web-search request through callLLM with the OpenRouter server tool', async () => {
+    const result = await new LLMService('gpt-5.5', 0.2, 4096)
+      .generateJSONContentWithWebSearch<{ company: string }>('system', 'user');
+
+    expect(result).toEqual({ company: 'Acme' });
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'gpt-5.5',
+      [
+        expect.objectContaining({ role: 'system', content: 'system' }),
+        expect.objectContaining({ role: 'user', content: 'user' }),
+      ],
+      expect.objectContaining({
+        webSearch: true,
+        temperature: 0.2,
+        max_completion_tokens: 4096,
+        timeoutMs: 2 * 60 * 1000,
+        taskClass: 'nonstandard_consumer',
+      }),
+    );
+  });
+
+  it('uses the same gateway path for Gemini without requiring a provider API key', async () => {
+    mockCallLLM.mockResolvedValueOnce(completion('{"city":"Boston"}'));
+
+    await expect(new LLMService('gemini-3.7-flash', 0)
+      .generateJSONContentWithWebSearch<{ city: string }>('system', 'user'))
+      .resolves.toEqual({ city: 'Boston' });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'gemini-3.7-flash',
+      expect.any(Array),
+      expect.objectContaining({ webSearch: true }),
+    );
+  });
+
+  it('preserves usage attribution while leaving metering at the shared callLLM boundary', async () => {
+    await new LLMService('gpt-5.5').generateJSONContentWithWebSearch(
+      'system',
+      'user',
+      {
+        userId: 'user-1',
+        billingUserId: 'owner-1',
+        sessionId: 'session-1',
+        feature: 'enrichment',
+      },
+    );
+
+    expect(mockCallLLM.mock.calls[0][2]).toEqual(expect.objectContaining({
+      usageContext: {
+        userId: 'user-1',
+        billingUserId: 'owner-1',
+        sessionId: 'session-1',
+        feature: 'enrichment',
+      },
+    }));
+    expect(mockMeterUserUsage).not.toHaveBeenCalled();
+  });
+
+  it('extracts JSON from a fenced gateway response', async () => {
+    mockCallLLM.mockResolvedValueOnce(completion('```json\n{"website":"https://acme.example"}\n```'));
+
+    await expect(new LLMService('gpt-5.5').generateJSONContentWithWebSearch(
+      'system',
+      'user',
+    )).resolves.toEqual({ website: 'https://acme.example' });
+  });
+
+  it('fails closed when the gateway response has no JSON', async () => {
+    mockCallLLM.mockResolvedValueOnce(completion('No result available'));
+
+    await expect(new LLMService('gpt-5.5').generateJSONContentWithWebSearch(
+      'system',
+      'user',
+    )).rejects.toBeDefined();
+  });
+
+  it('propagates the one gateway failure without attempting a native-provider fallback', async () => {
+    mockCallLLM.mockRejectedValueOnce(new Error('gateway unavailable'));
+
+    await expect(new LLMService('gemini-3.7-flash').generateJSONContentWithWebSearch(
+      'system',
+      'user',
+    )).rejects.toThrow('gateway unavailable');
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
   });
 });

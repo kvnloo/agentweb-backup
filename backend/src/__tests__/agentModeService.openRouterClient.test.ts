@@ -239,6 +239,69 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     }));
   });
 
+  it('forces web search through OpenRouter and emits its current server-tool shape', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gpt-5.5',
+      [{ role: 'user', content: 'Find the official company website' }],
+      { webSearch: true } as any,
+    );
+
+    expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      model: 'openai/gpt-5.5',
+      tools: [{ type: 'openrouter:web_search' }],
+      provider: { allow_fallbacks: true, require_parameters: true },
+    }));
+    expect(create.mock.calls[0][0]).not.toHaveProperty('tool_choice');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves a server tool while sanitizing Gemini function-tool schemas', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Search, then save the result' }],
+      {
+        webSearch: true,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'save_result',
+            parameters: {
+              type: 'object',
+              additionalProperties: false,
+              properties: { result: { type: 'string', 'x-aliases': ['value'] } },
+            },
+          },
+        }],
+      } as any,
+    );
+
+    expect(create.mock.calls[0][0].tools).toEqual([
+      {
+        type: 'function',
+        function: {
+          name: 'save_result',
+          parameters: {
+            type: 'object',
+            properties: { result: { type: 'string' } },
+          },
+        },
+      },
+      { type: 'openrouter:web_search' },
+    ]);
+  });
+
   it('delegates ordered model fallback to OpenRouter on the wire', async () => {
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
