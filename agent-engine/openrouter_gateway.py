@@ -63,7 +63,7 @@ def resolve_openrouter_model(full_llm_name: str) -> str:
 
 
 def create_openrouter_llm(model: str):
-    """Create one zero-retry LangChain client and delegate routing to OpenRouter."""
+    """Create one gateway client; OpenRouter owns routing and provider fallback."""
     api_key = (secrets_manager.get_openrouter_api_key() or "").strip()
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY is not set")
@@ -83,7 +83,9 @@ def create_openrouter_llm(model: str):
         "base_url": OPENROUTER_BASE_URL,
         "model": model,
         "api_key": SecretStr(api_key),
-        "max_retries": 0,
+        # One SDK retry covers transient network/gateway failures. Agent Engine
+        # has no provider-specific transport retry loop.
+        "max_retries": 1,
         "default_headers": {
             "HTTP-Referer": "https://app.agentweb.pro",
             "X-Title": "AgentWeb Agent Engine",
