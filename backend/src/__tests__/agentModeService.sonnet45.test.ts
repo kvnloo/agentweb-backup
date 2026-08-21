@@ -661,6 +661,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.1-flash-lite'].maxTools).toBe(128);
       expect(llmModels['gemini-3.5-flash'].maxTools).toBe(128);
       expect(llmModels['gemini-3.7-flash'].maxTools).toBe(128);
+      expect(llmModels['gemini-3-flash-preview'].maxTools).toBe(128);
       expect(llmModels['anthropic.claude-sonnet-4-6'].maxTools).toBeUndefined();
     });
 
