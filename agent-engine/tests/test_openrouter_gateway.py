@@ -59,6 +59,18 @@ def test_openrouter_key_uses_the_existing_environment_aware_secret_seam():
     assert "_env_or_string_secret('OPENROUTER_API_KEY', 'openrouter')" in source
 
 
+def test_gateway_does_not_repeat_the_managed_fallback_as_the_primary(monkeypatch):
+    gateway = load_gateway()
+    captured = {}
+
+    monkeypatch.setattr(gateway, "ChatOpenAI", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(gateway.secrets_manager, "get_openrouter_api_key", lambda: "or-test-key")
+
+    gateway.create_openrouter_llm("google/gemini-3.5-flash")
+
+    assert "models" not in captured["extra_body"]
+
+
 def test_legacy_execution_name_is_attributed_to_the_openrouter_transport():
     # The persisted task label remains unchanged; the usage provider reflects
     # the gateway that actually served and billed the request.

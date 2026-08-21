@@ -29,14 +29,16 @@ except Exception:  # pragma: no cover - exercised only when langchain is absent
 
 
 def parse_full_llm_name(full_llm_name):
-    """Split 'platform->provider->model' into (provider, model).
+    """Split a persisted route into its billing transport and model.
 
-    Falls back to ('unknown', <raw name>) for anything malformed.
+    Agent-engine persists the legacy ``platform->provider->model`` selector for
+    backwards compatibility, but every valid text/tool route is served through
+    OpenRouter. Falls back to ('unknown', <raw name>) for malformed input.
     """
     try:
         parts = (full_llm_name or "").split("->")
         if len(parts) == 3 and parts[1].strip() and parts[2].strip():
-            return parts[1].strip().lower(), parts[2].strip()
+            return "openrouter", parts[2].strip()
     except Exception:
         pass
     return "unknown", (full_llm_name or "unknown")

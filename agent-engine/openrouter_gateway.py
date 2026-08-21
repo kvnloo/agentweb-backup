@@ -70,6 +70,15 @@ def create_openrouter_llm(model: str):
 
     # browser-use checks this conventional variable independently of the client.
     os.environ["OPENAI_API_KEY"] = api_key
+    extra_body = {
+        "provider": {"allow_fallbacks": True, "require_parameters": True},
+        "plugins": [{"id": "context-compression"}],
+    }
+    # Agent-engine tasks can include browser screenshots, so its
+    # gateway-managed overflow fallback must remain multimodal.
+    if model != "google/gemini-3.5-flash":
+        extra_body["models"] = ["google/gemini-3.5-flash"]
+
     kwargs = {
         "base_url": OPENROUTER_BASE_URL,
         "model": model,
@@ -79,10 +88,7 @@ def create_openrouter_llm(model: str):
             "HTTP-Referer": "https://app.agentweb.pro",
             "X-Title": "AgentWeb Agent Engine",
         },
-        "extra_body": {
-            "provider": {"allow_fallbacks": True, "require_parameters": True},
-            "plugins": [{"id": "context-compression"}],
-        },
+        "extra_body": extra_body,
     }
     # OpenAI reasoning families reject temperature. Other incumbent routes used
     # temperature=0 before the cutover, so retain it where the model accepts it.
