@@ -4849,6 +4849,7 @@ export async function generateChatResponse(
     // callLLM owns provider transport, retries/fallback, and exactly-once metering;
     // the sidebar owns only conversation/tool behavior.
     const activeModel = model || session.llmModel || await agentModeService.getDefaultModel();
+    const isEmmaInteractive = portalType === 'customer' || portalType === 'emma-sidebar';
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
@@ -4875,7 +4876,7 @@ export async function generateChatResponse(
         }),
         {
           ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' as const } : {}),
-          taskClass: 'interactive_chat',
+          ...(isEmmaInteractive ? { taskClass: 'interactive_chat' as const } : {}),
           humanPaced: true,
           usageContext: { userId, sessionId, feature: 'chat' },
         },

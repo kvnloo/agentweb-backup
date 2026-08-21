@@ -141,6 +141,22 @@ describe('generateChatResponse — shared interactive gateway', () => {
     expect(typeof result === 'string' ? result : result.content).toBe('Gateway says hi');
   });
 
+  it('does not include the legacy partner portal in the Emma canary', async () => {
+    seedSession();
+
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'partner',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    });
+
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'gpt-5.4',
+      expect.any(Array),
+      expect.not.objectContaining({ taskClass: 'interactive_chat' }),
+    );
+  });
+
   it('uses the persisted session model before the system default', async () => {
     seedSession('gemini-3.7-flash');
 
