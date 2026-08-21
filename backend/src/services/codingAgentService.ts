@@ -13,6 +13,7 @@ import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
 import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
+import { getModelPrice, MODEL_PRICING } from '../utils/llmPricing';
 import { normalizeAnthropicCacheCreation } from '../utils/llmClients';
 import { resolveOpenRouterUpstreamModelId } from '../utils/openRouterGatewayContract';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
@@ -114,6 +115,8 @@ interface CodingAgentUsageAccumulator {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  /** Sum of each turn priced from OpenRouter's served model (or reported cost). */
+  costMicroUsd: number;
   /** ENG-893: cache-write tokens by the TTL the response reported, for pricing. */
   cacheWriteByTtl: Record<string, number>;
 }
@@ -1570,7 +1573,7 @@ async function getOpenRouterClient(): Promise<AnthropicLikeClient> {
     const client = new Anthropic({
       apiKey,
       baseURL: 'https://openrouter.ai/api',
-      maxRetries: 0,
+      maxRetries: 1,
       timeout: 5 * 60 * 1000,
       defaultHeaders: {
         'HTTP-Referer': 'https://app.agentweb.pro',
@@ -1622,9 +1625,18 @@ async function callOpenRouter(
     ...(sessionId.length <= 256 ? { session_id: sessionId } : {}),
   };
 
-  // OpenRouter owns provider retry/fallback; the SDK is configured with zero
-  // retries so AgentWeb never multiplies gateway attempts.
+  // OpenRouter owns provider retry/fallback. The SDK gets one bounded retry for
+  // transient network/gateway failures; AgentWeb has no custom retry loop.
   return client.messages.create(request as Anthropic.MessageCreateParamsNonStreaming);
+}
+
+function resolveOpenRouterUsagePricingModel(servedModel: string, requestedModel: string): string | null {
+  const openRouterLogicalModel = servedModel.includes('/') && !servedModel.startsWith('openrouter/')
+    ? `openrouter/${servedModel}`
+    : servedModel;
+  if (MODEL_PRICING[openRouterLogicalModel]) return openRouterLogicalModel;
+  if (MODEL_PRICING[servedModel]) return servedModel;
+  return getModelPrice(requestedModel) ? requestedModel : null;
 }
 
 // ─── Failure Summary ─────────────────────────────────────────────────────────
@@ -1748,8 +1760,18 @@ async function runCodingAgentInternal(
   model: string,
   usageAcc: CodingAgentUsageAccumulator
 ): Promise<CodingAgentResult> {
-
-  const client = await getOpenRouterClient();
+  let client: AnthropicLikeClient;
+  try {
+    client = await getOpenRouterClient();
+  } catch (error) {
+    return {
+      success: false,
+      message: `Coding agent encountered an error: ${error instanceof Error ? error.message : String(error)}`,
+      iterations: 0,
+      branch: context.draftBranch,
+      editedFiles: [],
+    };
+  }
   const tools = getToolDefinitions();
 
   // Resolve this run's editable boundary so a single-page task can't bleed edits
@@ -1829,12 +1851,19 @@ async function runCodingAgentInternal(
       try {
         const u: any = response.usage;
         if (u) {
+          const inputTokens = u.input_tokens || 0;
+          const outputTokens = u.output_tokens || 0;
+          const cacheReadTokens = u.cache_read_input_tokens || 0;
+          const cacheWriteTokens = u.cache_creation_input_tokens || 0;
+          const servedModel = typeof response.model === 'string' && response.model
+            ? response.model
+            : model;
           // Accumulate for the per-user cap (charged once by the caller from
           // result.usageTotals). Same numbers the shadow meter records below.
-          usageAcc.inputTokens += u.input_tokens || 0;
-          usageAcc.outputTokens += u.output_tokens || 0;
-          usageAcc.cacheReadTokens += u.cache_read_input_tokens || 0;
-          usageAcc.cacheWriteTokens += u.cache_creation_input_tokens || 0;
+          usageAcc.inputTokens += inputTokens;
+          usageAcc.outputTokens += outputTokens;
+          usageAcc.cacheReadTokens += cacheReadTokens;
+          usageAcc.cacheWriteTokens += cacheWriteTokens;
           // ENG-893: this loop never requests a 1-hour TTL, so its writes are
           // 5-minute writes even on a model agent-mode asks 1h for. Carry the
           // response's own breakdown so cost follows the TTL actually applied.
@@ -1844,17 +1873,37 @@ async function runCodingAgentInternal(
               usageAcc.cacheWriteByTtl[ttl] = (usageAcc.cacheWriteByTtl[ttl] || 0) + tokens;
             }
           }
+          const gatewayCostUsd = typeof u.cost === 'number' && Number.isFinite(u.cost) && u.cost >= 0
+            ? u.cost
+            : undefined;
+          const pricingModel = resolveOpenRouterUsagePricingModel(servedModel, model);
+          const turnCostMicroUsd = gatewayCostUsd !== undefined
+            ? Math.round(gatewayCostUsd * 1e6)
+            : pricingModel
+              ? computeCostMicroUsd(
+                  pricingModel,
+                  inputTokens,
+                  outputTokens,
+                  cacheReadTokens,
+                  cacheWriteTokens,
+                  turnCacheByTtl,
+                )
+              : 0;
+          usageAcc.costMicroUsd += turnCostMicroUsd;
           void recordUsage({
             userId: context.userId,
             sessionId: context.sessionId,
-            model,
+            model: servedModel,
             provider: 'openrouter',
             feature: 'coding_agent',
-            inputTokens: u.input_tokens || 0,
-            outputTokens: u.output_tokens || 0,
-            cacheReadTokens: u.cache_read_input_tokens || 0,
-            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens,
             cacheWriteByTtl: turnCacheByTtl,
+            ...(gatewayCostUsd !== undefined || pricingModel
+              ? { costUsdOverride: turnCostMicroUsd / 1e6 }
+              : {}),
           });
         }
       } catch {
@@ -2020,16 +2069,13 @@ export async function runCodingAgent(
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    costMicroUsd: 0,
     cacheWriteByTtl: {} as Record<string, number>,
   };
 
   const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => {
     const totalTokens =
       usageAcc.inputTokens + usageAcc.outputTokens + usageAcc.cacheReadTokens + usageAcc.cacheWriteTokens;
-    // `model` is only accessed here (in the totalTokens > 0 branch), which cannot
-    // be reached until the loop has run — i.e. after model resolution below — so
-    // there is no temporal-dead-zone hazard on the early-return paths (auth denial,
-    // preview-branch reset failure) where no LLM call was made.
     const usageTotals =
       totalTokens > 0
         ? {
@@ -2038,17 +2084,7 @@ export async function runCodingAgent(
             cacheReadTokens: usageAcc.cacheReadTokens,
             cacheWriteTokens: usageAcc.cacheWriteTokens,
             totalTokens,
-            costUsd:
-              computeCostMicroUsd(
-                model,
-                usageAcc.inputTokens,
-                usageAcc.outputTokens,
-                usageAcc.cacheReadTokens,
-                usageAcc.cacheWriteTokens,
-                Object.keys(usageAcc.cacheWriteByTtl).length > 0
-                  ? usageAcc.cacheWriteByTtl
-                  : undefined
-              ) / 1e6,
+            costUsd: usageAcc.costMicroUsd / 1e6,
           }
         : undefined;
     return {
