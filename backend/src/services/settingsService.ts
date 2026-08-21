@@ -12,10 +12,18 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 // Make sure we have a DynamoDB instance
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Do not replace the SDK credential-provider chain with empty credentials.
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 export interface Setting {
@@ -204,6 +212,60 @@ export class SettingsService {
       console.error('Error deleting setting:', error);
       throw error;
     }
+  }
+
+  /**
+   * Compare-and-swap primitives (ENG-965) for callers that must consume a stored value
+   * exactly once: read a setting, decide what to do with it, then persist that decision
+   * ONLY IF nothing else touched the row in between. Conditioned on the exact raw
+   * `settingValue` the caller already read (optimistic concurrency — no separate lock).
+   *
+   * On a race (another writer changed the row since the read), or if the row no longer
+   * exists when a caller expected it to, DynamoDB rejects with
+   * `ConditionalCheckFailedException` — the caller must treat that as "my read was stale,
+   * do not trust it," not as an ordinary error. Any other failure means the write was never
+   * even attempted server-side, so the row is provably unchanged from what was read.
+   *
+   * Same table, same item shape as `setSetting`/`deleteSetting` — this only changes which
+   * DynamoDB API parameters are used, not the persistence contract.
+   */
+  async setSettingIfValueMatches(
+    settingName: string,
+    settingValue: string,
+    expectedValue: string,
+    description?: string,
+    updatedBy: string = 'system',
+    ttl?: number,
+  ): Promise<void> {
+    if (ttl !== undefined && !Number.isFinite(ttl)) {
+      throw new Error(`Invalid ttl for setting "${settingName}": must be a finite epoch-second number, got ${ttl}`);
+    }
+
+    const setting: Setting = {
+      settingName,
+      settingValue,
+      description,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+      ...(ttl !== undefined ? { ttl } : {}),
+    };
+
+    await dynamodb.put({
+      TableName: this.tableName,
+      Item: setting,
+      ConditionExpression: 'settingValue = :expected',
+      ExpressionAttributeValues: { ':expected': expectedValue },
+    }).promise();
+  }
+
+  /** Delete counterpart of `setSettingIfValueMatches` — see its doc comment. */
+  async deleteSettingIfValueMatches(settingName: string, expectedValue: string): Promise<void> {
+    await dynamodb.delete({
+      TableName: this.tableName,
+      Key: { settingName },
+      ConditionExpression: 'settingValue = :expected',
+      ExpressionAttributeValues: { ':expected': expectedValue },
+    }).promise();
   }
 
   async syncPlan(planId: string, direction: 'prod-to-dev' | 'dev-to-prod'): Promise<PredefinedPlan | null> {

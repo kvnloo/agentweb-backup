@@ -12,6 +12,7 @@ import {
   logCompletionMetric,
 } from "../services/brandBuildStatusService";
 import { canEditItem } from "../services/orgShareService";
+import { resolveOrgProfileField } from "../services/orgProfileResolver";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -63,6 +64,87 @@ async function uploadBrandFile(
   return { url, key };
 }
 
+/**
+ * Recover the S3 key from a stored asset URL, for legacy attachments saved
+ * before we persisted `key` alongside them.
+ *
+ * This used to be a `startsWith` against a hardcoded
+ * `https://<bucket>.s3.us-west-2.amazonaws.com/` prefix, while uploads build
+ * their URL from `process.env.AWS_REGION`. Any deployment not in us-west-2
+ * therefore wrote URLs its own delete path could not parse: the key came back
+ * undefined, the object delete was skipped entirely, and the attachment was
+ * dereferenced anyway — a silent orphan reported as a clean delete. Path-style
+ * and region-less URLs failed the same way.
+ *
+ * Matching on the bucket rather than on one spelling of its hostname covers
+ * virtual-hosted, path-style, region-less and cross-region forms alike.
+ * Returns undefined for anything not in our bucket — an externally hosted
+ * asset (e.g. a brand-guide link) has no object of ours to delete.
+ */
+function deriveOwnBucketKey(rawUrl: string): string | undefined {
+  const bucket = process.env.AWS_S3_BUCKET || "agentweb-user-files";
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!host.endsWith(".amazonaws.com")) return undefined;
+
+  let path: string;
+  try {
+    path = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  } catch {
+    path = parsed.pathname.replace(/^\//, "");
+  }
+  if (!path) return undefined;
+
+  // Virtual-hosted: <bucket>.s3.amazonaws.com/<key>, <bucket>.s3.<region>...,
+  // <bucket>.s3-<region>..., including dualstack spellings.
+  const marker = host.indexOf(".s3.") >= 0 ? host.indexOf(".s3.") : host.indexOf(".s3-");
+  if (marker > 0 && host.slice(0, marker) === bucket) return path;
+
+  // Path-style: s3.amazonaws.com/<bucket>/<key>, s3.<region>.../<bucket>/<key>.
+  if (host === "s3.amazonaws.com" || host.startsWith("s3.") || host.startsWith("s3-")) {
+    const slash = path.indexOf("/");
+    if (slash > 0 && path.slice(0, slash) === bucket) {
+      return path.slice(slash + 1) || undefined;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Delete an S3 object, retrying transient failures before giving up.
+ *
+ * DeleteObject is idempotent — deleting an absent key succeeds — so a retry is
+ * always safe. Worth doing because the caller's fallback is to roll back the
+ * metadata prune and fail the request, and most deleteObject failures are
+ * throttling or a blip rather than anything a retry will not clear.
+ */
+async function deleteObjectWithRetry(key: string, attempts = 3): Promise<void> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await s3
+        .deleteObject({
+          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+          Key: key,
+        })
+        .promise();
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // Get user's brand guidelines
 router.get("/guidelines", authenticateToken, async (req, res) => {
   try {
@@ -87,13 +169,15 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // If user is in an org, always read brand guidelines from the org (not the user)
+    // If user is in an org, read brand guidelines from the org — falling back to
+    // the org owner's user record when the org was created without copying the
+    // owner's profile over, so the pillar does not silently go blank (ENG-927).
     let brandGuidelines = user.brandGuidelines;
     let isOrgLevel = false;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       if (org) {
-        brandGuidelines = org.brandGuidelines;
+        brandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
         isOrgLevel = true;
       }
     }
@@ -278,8 +362,27 @@ router.post(
       let postOrg: Awaited<ReturnType<typeof orgDb.getOrgById>> | undefined;
       if (user.orgId) {
         postOrg = await orgDb.getOrgById(user.orgId);
-        if (postOrg?.brandGuidelines) {
-          existingBrandGuidelines = postOrg.brandGuidelines;
+        // Authorize BEFORE resolving. The owner-record fallback can issue a
+        // read of another user's record, and an unauthorized caller must not
+        // trigger that — they are getting a 403 either way, so check first
+        // (this gate used to sit further down, just above the org write).
+        const allowed = canEditItem(
+          { userId: postOrg?.ownerUserId } as any,
+          { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
+          postOrg ?? null,
+          user.orgId,
+          "brandGuidelines",
+        );
+        if (!allowed) {
+          return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
+        }
+        if (postOrg) {
+          existingBrandGuidelines = await resolveOrgProfileField(
+            user,
+            postOrg,
+            "brandGuidelines",
+            { forWrite: true }
+          );
         }
       }
 
@@ -364,18 +467,9 @@ router.post(
         `[BRAND DEBUG] About to update user with email: ${user.email}`
       );
 
-      // If user is in an org, save to org (admin or listed editor only); otherwise save to user
+      // If user is in an org, save to org; otherwise save to user. The
+      // admin-or-listed-editor gate ran above, before the owner-record read.
       if (user.orgId) {
-        const allowed = canEditItem(
-          { userId: postOrg?.ownerUserId } as any,
-          { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
-          postOrg ?? null,
-          user.orgId,
-          "brandGuidelines",
-        );
-        if (!allowed) {
-          return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
-        }
         await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
         console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
         // Onboarding v2 Phase 1: flip brand-build status to ready if we were
@@ -468,6 +562,50 @@ router.post(
   }
 );
 
+/**
+ * Identity of one specific brand value, for the conditional writes below.
+ *
+ * `updatedAt` on its own cannot serve: it is millisecond granular and every
+ * other brand writer stamps its own (`POST /guidelines` above uses a plain
+ * `new Date().toISOString()`), so a save landing in the same millisecond as a
+ * delete's prune produces a byte-identical token. A guard comparing only the
+ * stamp would then pass against a value it never read — the rollback would
+ * restore its stale attachment list over the other writer's save, and a second
+ * delete would prune from a snapshot that no longer reflects the record.
+ * Pairing the stamp with an opaque per-write revision closes that: the pair
+ * identifies one write rather than one millisecond. Values written by any other
+ * path carry no revision at all, which the absence form matches exactly.
+ */
+const brandVersionGuard = (
+  version: { updatedAt?: string; rev?: string } | undefined,
+  names: { updatedAt: string; rev: string }
+): { expression: string; values: Record<string, any> } => {
+  const clauses: string[] = [];
+  const values: Record<string, any> = {};
+  if (version?.updatedAt) {
+    clauses.push(`brandGuidelines.updatedAt = ${names.updatedAt}`);
+    values[names.updatedAt] = version.updatedAt;
+  } else {
+    clauses.push("attribute_not_exists(brandGuidelines.updatedAt)");
+  }
+  if (version?.rev) {
+    clauses.push(`brandGuidelines.rev = ${names.rev}`);
+    values[names.rev] = version.rev;
+  } else {
+    clauses.push("attribute_not_exists(brandGuidelines.rev)");
+  }
+  return { expression: clauses.join(" AND "), values };
+};
+
+const EXPECTED_BRAND_NAMES = {
+  updatedAt: ":expectedBrandUpdatedAt",
+  rev: ":expectedBrandRev",
+};
+const JUST_WRITTEN_BRAND_NAMES = {
+  updatedAt: ":justWritten",
+  rev: ":justWrittenRev",
+};
+
 // Delete a brand asset
 router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
   try {
@@ -505,6 +643,9 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     // Determine source: org-level or user-level
     let brandGuidelines: any;
     let isOrgLevel = false;
+    // Set when the attachments came from the org OWNER's user record rather than
+    // the org record, so the same attachment can be pruned there too (below).
+    let fallbackOwnerUserId: string | undefined;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       const allowed = canEditItem(
@@ -517,9 +658,13 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       if (!allowed) {
         return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
       }
-      if (org?.brandGuidelines) {
-        brandGuidelines = org.brandGuidelines;
+      if (org) {
+        // Same owner-record fallback the GET uses, so an asset the settings page
+        // shows for an un-copied org can actually be deleted (ENG-927). The write
+        // still targets the org record, which is authoritative from here on.
+        brandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
         isOrgLevel = true;
+        if (!org.brandGuidelines && brandGuidelines) fallbackOwnerUserId = org.ownerUserId;
       }
     } else {
       brandGuidelines = user.brandGuidelines;
@@ -529,28 +674,34 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
-    // Determine S3 key for deletion. For legacy assets without a key field,
-    // extract the S3 key from the asset URL as a fallback.
+    // Resolve the request against the caller's OWN attachments before deleting
+    // anything. `key` and `?url=` come straight from the request, so using them
+    // as the S3 key directly let any authenticated user with brand guidelines
+    // delete any object in the bucket.
+    // For keyless legacy assets, match by URL instead of key.
     const isValidKey = key && key !== "undefined";
-    let s3Key: string | undefined = isValidKey ? key : undefined;
-    if (!s3Key && urlFallback) {
-      const bucketPrefix = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"}.s3.us-west-2.amazonaws.com/`;
-      if (urlFallback.startsWith(bucketPrefix)) {
-        s3Key = urlFallback.slice(bucketPrefix.length);
-      }
+    const attachments: any[] = brandGuidelines.attachments || [];
+    const target = attachments.find((attachment: any) =>
+      isValidKey
+        ? attachment.key === key
+        : !!urlFallback && attachment.url === urlFallback
+    );
+    if (!target) {
+      return res.status(404).json({ error: "Asset not found" });
     }
 
-    // Remove the asset from attachments.
-    // For keyless legacy assets, match by URL instead of key.
-    const updatedAttachments = (brandGuidelines.attachments || []).filter(
-      (attachment: any) => {
-        if (isValidKey) {
-          return attachment.key !== key;
-        } else if (urlFallback) {
-          return attachment.url !== urlFallback;
-        }
-        return true; // Can't identify, keep all
-      }
+    // Determine S3 key for deletion from the matched attachment. Legacy assets
+    // have no key field, so fall back to extracting it from the asset URL.
+    let s3Key: string | undefined =
+      typeof target.key === "string" && target.key !== "undefined" ? target.key : undefined;
+    if (!s3Key && typeof target.url === "string") {
+      s3Key = deriveOwnBucketKey(target.url);
+    }
+
+    // A match is guaranteed here, so this drops the target (and any duplicate
+    // entries pointing at the same object, as before).
+    const updatedAttachments = attachments.filter((attachment: any) =>
+      isValidKey ? attachment.key !== key : attachment.url !== urlFallback
     );
 
     console.log(
@@ -559,48 +710,265 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       }, after: ${updatedAttachments.length}`
     );
 
-    // Delete from S3
-    if (s3Key) {
-      try {
-        await s3
-          .deleteObject({
-            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-            Key: s3Key,
-          })
-          .promise();
-      } catch (s3Error) {
-        console.warn("Failed to delete from S3:", s3Error);
-        // Continue with database update even if S3 deletion fails
-      }
-    }
+    // The value this prune is derived from, and a replacement token guaranteed
+    // to differ from it (a same-millisecond write would otherwise leave the
+    // stamp unchanged). The revision this request stamps alongside it is what
+    // actually makes the write identifiable — see `brandVersionGuard`.
+    const sourceUpdatedAt = brandGuidelines?.updatedAt;
+    const sourceNowMs = Date.now();
+    const prunedUpdatedAt =
+      new Date(sourceNowMs).toISOString() === sourceUpdatedAt
+        ? new Date(sourceNowMs + 1).toISOString()
+        : new Date(sourceNowMs).toISOString();
+    const prunedRev = uuidv4();
+
+    // Only write if the brand still holds the value this prune was computed
+    // from. Without it, two concurrent deletes each write a full snapshot and
+    // the later one restores the attachment the earlier one removed — whose
+    // object is already gone — and a brand save overlapping a delete is erased
+    // outright. Legacy records carry neither marker, matched by their absence.
+    const pruneCondition = brandVersionGuard(brandGuidelines, EXPECTED_BRAND_NAMES);
+
+    const brandMovedResponse = () =>
+      res.status(409).json({
+        error: "Brand guidelines changed while deleting this asset. Please refresh and try again.",
+      });
 
     // Update brand guidelines
     const updatedBrandGuidelines = {
       ...brandGuidelines,
       attachments: updatedAttachments,
-      updatedAt: new Date().toISOString(),
+      updatedAt: prunedUpdatedAt,
+      rev: prunedRev,
     };
 
-    if (isOrgLevel) {
-      await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
+    // Set by whichever branch below actually writes, so a failed S3 delete can
+    // put that exact record back instead of stranding the object.
+    let rollbackPrune: (() => Promise<void>) | null = null;
+
+    if (fallbackOwnerUserId) {
+      // The attachments live on the OWNER's record, not the org's, so prune them
+      // there — and only there. Writing the pruned copy to the org as well would
+      // take two coordinated writes with no transaction between them, and would
+      // also promote the owner's whole brand onto the org as a side effect of
+      // deleting one asset: the org record would become populated, reads would
+      // stop falling back, and the owner's later brandData edits would silently
+      // stop reaching the org. Deleting an asset must not fork the brand. One
+      // write to the record that actually holds the data leaves nothing to
+      // coordinate and keeps the org un-copied, exactly as it was.
+      // Re-read the owner strong-consistently. `getUserById` goes through the
+      // eventually consistent UserIdIndex GSI, which can hand back a row from
+      // before a just-landed brand edit; this write replaces the whole
+      // brandGuidelines value, so a stale snapshot would silently roll that
+      // edit back. (The caller-is-owner branch already holds a ConsistentRead.)
+      let ownerRecord: any;
+      if (fallbackOwnerUserId === user.userId) {
+        ownerRecord = user;
+      } else {
+        const indexed: any = await userDb.getUserById(fallbackOwnerUserId);
+        ownerRecord = indexed?.email
+          ? (await userDb.getUserByEmailConsistent(indexed.email)) ?? indexed
+          : indexed;
+      }
+      // The resolver just read this owner's brand to answer the request, so a
+      // miss on this second lookup means the GSI briefly stopped returning the
+      // row, not that the owner is gone. Spreading `ownerRecord.brandGuidelines`
+      // below would throw on undefined and surface as a blanket 500 — after
+      // which nothing at all is deleted. Abort explicitly instead, while the S3
+      // object and both records are still untouched, and say it is retryable.
+      if (!ownerRecord?.brandGuidelines) {
+        console.error(
+          `[BRAND] Owner ${fallbackOwnerUserId} of org ${user.orgId} resolved a brand for the read but no record for the write — aborting the delete`
+        );
+        return res.status(409).json({
+          error: "Brand guidelines are being updated. Please refresh and try again.",
+        });
+      }
+
+      const ownerAttachments: any[] = ownerRecord.brandGuidelines.attachments || [];
+      const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
+        isValidKey ? attachment.key !== key : attachment.url !== urlFallback
+      );
+
+      // A consistent read still leaves the read-modify-write window itself, so
+      // guard the write on the brand not having moved since we read it. An
+      // owner editing their brand concurrently loses nothing: the condition
+      // fails, we abort before touching S3, and the retry sees fresh data.
+      const expectedBrandUpdatedAt = ownerRecord?.brandGuidelines?.updatedAt;
+      // The stamp has to actually move, or it carries no information at all:
+      // updatedAt is millisecond granular, so a write landing in the same
+      // millisecond as the value it read would leave it unchanged. The revision
+      // stamped beside it is what makes this write identifiable to the rollback.
+      const nowMs = Date.now();
+      const nextUpdatedAt =
+        new Date(nowMs).toISOString() === expectedBrandUpdatedAt
+          ? new Date(nowMs + 1).toISOString()
+          : new Date(nowMs).toISOString();
+      try {
+        await userDb.updateUser(
+          fallbackOwnerUserId,
+          {
+            brandGuidelines: {
+              ...ownerRecord.brandGuidelines,
+              attachments: prunedOwnerAttachments,
+              updatedAt: nextUpdatedAt,
+              rev: prunedRev,
+            },
+          } as any,
+          {
+            condition: brandVersionGuard(
+              ownerRecord.brandGuidelines,
+              EXPECTED_BRAND_NAMES
+            ),
+          }
+        );
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") {
+          return res.status(409).json({
+            error: "Brand guidelines changed while deleting this asset. Please refresh and try again.",
+          });
+        }
+        throw casError;
+      }
+      console.log(`[BRAND DEBUG] Successfully pruned owner source attachments after asset deletion`);
+      // Undo of exactly this write, used only if the S3 delete below fails.
+      // Conditioned on the stamp AND revision we just wrote, so a concurrent
+      // edit landing in between is never clobbered by the compensation — not
+      // even one that happens to share the millisecond.
+      rollbackPrune = async () => {
+        await userDb.updateUser(
+          fallbackOwnerUserId!,
+          {
+            brandGuidelines: {
+              ...ownerRecord.brandGuidelines,
+              attachments: ownerAttachments,
+              updatedAt: new Date(
+                Math.max(Date.now(), new Date(nextUpdatedAt).getTime() + 1)
+              ).toISOString(),
+            },
+          } as any,
+          {
+            condition: brandVersionGuard(
+              { updatedAt: nextUpdatedAt, rev: prunedRev },
+              JUST_WRITTEN_BRAND_NAMES
+            ),
+          }
+        );
+      };
+    } else if (isOrgLevel) {
+      try {
+        await orgDb.updateOrg(
+          user.orgId!,
+          { brandGuidelines: updatedBrandGuidelines },
+          { condition: pruneCondition }
+        );
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") return brandMovedResponse();
+        throw casError;
+      }
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
+      rollbackPrune = async () => {
+        // Conditioned on the value this request wrote, exactly like the owner
+        // branch. The S3 delete retries for a few hundred ms before we get
+        // here, which is plenty of room for another authorized editor to save
+        // the brand — and an unconditional restore would silently erase them
+        // while telling the caller nothing changed. If the guard fires, the
+        // caller reports the orphan rather than clobbering the newer value.
+        await orgDb.updateOrg(
+          user.orgId!,
+          { brandGuidelines },
+          { condition: brandVersionGuard(updatedBrandGuidelines, JUST_WRITTEN_BRAND_NAMES) }
+        );
+      };
     } else {
-      await dynamodb
-        .update({
-          TableName: `${TABLE_PREFIX}AW-Users`,
-          Key: { email: user.email },
-          UpdateExpression:
-            "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
-          ExpressionAttributeValues: {
-            ":brandGuidelines": updatedBrandGuidelines,
-            ":updatedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
+      try {
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Users`,
+            Key: { email: user.email },
+            UpdateExpression:
+              "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+            ConditionExpression: pruneCondition.expression,
+            ExpressionAttributeValues: {
+              ":brandGuidelines": updatedBrandGuidelines,
+              ":updatedAt": new Date().toISOString(),
+              ...(pruneCondition.values || {}),
+            },
+          })
+          .promise();
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") return brandMovedResponse();
+        throw casError;
+      }
       console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
+      rollbackPrune = async () => {
+        // Same guard as the org and owner branches — restore only if this
+        // request's write is still the current value.
+        const rollbackCondition = brandVersionGuard(
+          updatedBrandGuidelines,
+          JUST_WRITTEN_BRAND_NAMES
+        );
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Users`,
+            Key: { email: user.email },
+            UpdateExpression:
+              "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+            ConditionExpression: rollbackCondition.expression,
+            ExpressionAttributeValues: {
+              ":brandGuidelines": brandGuidelines,
+              ":updatedAt": new Date().toISOString(),
+              ...rollbackCondition.values,
+            },
+          })
+          .promise();
+      };
     }
 
-    res.json({ message: "Asset deleted successfully" });
+    // Delete the S3 object LAST, once every record has stopped pointing at it,
+    // so a reference can never outlive the object it points at.
+    //
+    // If the object will not delete, undo the prune rather than reporting a
+    // partial success. Dereferencing the attachment and leaving the bytes was
+    // the worst of both: the object stays live at a URL that still resolves,
+    // and it is no longer reachable through this endpoint at all — the retry
+    // 404s because the attachment it matches on is gone, so nothing can ever
+    // clean it up. Restoring the attachment keeps the delete atomic from the
+    // caller's side: either the asset and its object are both gone, or nothing
+    // moved and the request can simply be retried.
+    if (s3Key) {
+      try {
+        await deleteObjectWithRetry(s3Key);
+      } catch (s3Error) {
+        console.error(`[BRAND] Could not delete S3 object ${s3Key}, rolling back the prune`, s3Error);
+        try {
+          if (rollbackPrune) await rollbackPrune();
+          return res.status(502).json({
+            error:
+              "The stored file could not be deleted, so nothing was changed. Please try again.",
+          });
+        } catch (rollbackError: any) {
+          // The delete failed and its compensation did not apply — either it
+          // errored, or its guard fired because someone else has since changed
+          // the brand and restoring would erase them. Both leave the object
+          // stranded, so name the key loudly: it is only reclaimable out of band.
+          console.error(
+            `[BRAND] Rollback did not apply after a failed S3 delete — object ${s3Key} is orphaned and needs manual cleanup. ` +
+              (rollbackError?.code === "ConditionalCheckFailedException"
+                ? "The brand was updated by someone else in the meantime, so the restore was deliberately skipped rather than erase their change."
+                : "The restore itself failed."),
+            rollbackError
+          );
+          return res.status(500).json({
+            error:
+              "The asset was removed but its stored file could not be deleted and may still be reachable by direct link.",
+            objectDeleted: false,
+          });
+        }
+      }
+    }
+
+    res.json({ message: "Asset deleted successfully", objectDeleted: true });
   } catch (error) {
     console.error("[BRAND DEBUG] Error deleting brand asset:", error);
     res.status(500).json({ error: "Failed to delete brand asset" });

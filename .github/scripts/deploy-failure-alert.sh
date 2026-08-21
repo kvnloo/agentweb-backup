@@ -302,9 +302,22 @@ resolve_failure_reason() {
       break
     fi
 
+    # ENG-1412: `first(...)` inside jq, not `jq ... | head -n 1`.
+    #
+    # `head` exits after one line while jq may still be writing, and this file
+    # runs under `set -euo pipefail` with a bare ASSIGNMENT — not an `if`, which
+    # would suspend -e. Measured directly:
+    #
+    #   set -euo pipefail; step="$(printf '%s\n%s\n' first "$big" | head -n 1)"
+    #   -> script exit=141, the next line never runs
+    #
+    # So a SIGPIPE here does not corrupt a value, it ABORTS THE ALERTER — and
+    # this script exists to post the Slack notification for a failed production
+    # deploy. The one moment it matters is the one moment it would vanish.
+    # Limiting inside jq leaves no pipe to break.
     step="$(jq -r --arg id "${job_id}" \
-      '(.jobs // [])[] | select((.id|tostring) == $id) | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name' \
-      "${jobs_file}" 2>/dev/null | head -n 1)"
+      'first((.jobs // [])[] | select((.id|tostring) == $id) | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name)' \
+      "${jobs_file}" 2>/dev/null)"
 
     # NO `break` here, deliberately. A classified EB_DEPLOY_FAILED annotation on
     # ANY failed job beats a generic fallback from whichever job the API happened

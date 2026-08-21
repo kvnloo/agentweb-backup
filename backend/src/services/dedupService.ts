@@ -17,8 +17,8 @@ import { extractJson } from './util/extractJson';
  * - The judge returns a 1-based INDEX into the shown list (not a free-form id) so it cannot
  *   hallucinate an identifier; we map the index back to the candidate.
  * - Model is sourced from settings via agentModeService.getDedupJudgeModel() — NOT a
- *   hardcoded literal. TODO(ENG-9): route this LLM call through OpenRouter so model choice
- *   is gateway/routing config.
+ *   hardcoded literal. ENG-9: setting that config value to an `openrouter/<provider>/<model>`
+ *   id already routes this call through OpenRouter — no code change needed here.
  * - Best-effort: any error returns null so a filing is never blocked.
  */
 

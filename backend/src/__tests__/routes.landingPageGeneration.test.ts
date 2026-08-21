@@ -51,8 +51,18 @@ const mockUpdateLeadList = jest.fn();
 const mockGetLeadListsForUser = jest.fn();
 const mockCreateLeadList = jest.fn();
 const mockCanOrgMemberAccessList = jest.fn();
+// ENG-827: the publish route's last-moment consent re-check reads these two for real.
+const mockGetScheduleById = jest.fn();
+const mockGetChatSession = jest.fn();
+
+jest.mock("../services/chatbotService", () => ({
+  chatbotDb: { getChatSession: (...args: any[]) => mockGetChatSession(...args) },
+}));
 
 jest.mock("../services/db", () => ({
+  scheduleDb: {
+    getScheduleById: (...args: any[]) => mockGetScheduleById(...args),
+  },
   userDb: {
     getUserById: mockGetUserById,
     setLandingSiteMode: jest.fn(async (_id: string, m: string) => m),
@@ -174,6 +184,11 @@ jest.mock("../services/settingsService", () => ({
 const mockVerifyLanderLiveMapping = jest.fn();
 jest.mock("../services/landerLiveMappingCheck", () => ({
   verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
+}));
+
+const mockAssertOwnedMetaPixel = jest.fn();
+jest.mock("../services/metaAccountCredentials", () => ({
+  assertOwnedMetaPixel: (...args: any[]) => mockAssertOwnedMetaPixel(...args),
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -723,6 +738,96 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
   });
 
+  describe("ENG-1141: meta_pixel_override", () => {
+    it("FAIL: meta_pixel_override missing pixelId → 400, generateLandingPage never called", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: meta_pixel_override missing accountId → 400", async () => {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/meta_pixel_override must be an object with pixelId and accountId/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    it("FAIL: the pixel/account pair is not owned by the caller → 400, generateLandingPage never called", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      // assertOwnedMetaPixel tags genuine ownership rejections; anything untagged means
+      // "couldn't reach Meta to check", which must NOT block generation (test below).
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(
+        Object.assign(
+          new Error('Meta ad account "acc-1" is not one of your connected accounts.'),
+          { ownershipViolation: true },
+        )
+      );
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/not one of your connected accounts/);
+      expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    });
+
+    // Verification needs a live Graph call, so Meta being down would otherwise turn "I picked
+    // a pixel" into "I can't create a landing page at all" — a far worse outcome than the
+    // pre-feature behavior, which shipped the page and resolved tracking normally.
+    it("SUCCESS: an unverifiable override (Meta unreachable) still generates, just without the override", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockRejectedValueOnce(new Error("ETIMEDOUT graph.facebook.com"));
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage).toHaveBeenCalled();
+      expect(mockGenerateLandingPage.mock.calls[0][6]?.metaPixelOverride).toBeUndefined();
+    });
+
+    it("SUCCESS: a valid, owned override is threaded through to generateLandingPage's opts.metaPixelOverride", async () => {
+      mockGetUserById.mockResolvedValue({ userId: "test-user-id", connected_accounts: [] });
+      mockAssertOwnedMetaPixel.mockResolvedValueOnce({ accountId: "resolved-acc-1" });
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1", meta_pixel_override: { pixelId: "px-1", accountId: "acc-1" } });
+
+      expect(res.status).toBe(201);
+      expect(mockAssertOwnedMetaPixel).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "test-user-id" }), "test-user-id", "px-1", "acc-1"
+      );
+      expect(mockGenerateLandingPage.mock.calls[0][6]).toMatchObject({
+        metaPixelOverride: { pixelId: "px-1", accountId: "resolved-acc-1" },
+      });
+    });
+
+    it("SUCCESS: meta_pixel_override omitted → generateLandingPage's opts.metaPixelOverride is undefined, assertOwnedMetaPixel never called", async () => {
+      mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+      expect(res.status).toBe(201);
+      expect(mockGenerateLandingPage.mock.calls[0][6].metaPixelOverride).toBeUndefined();
+      expect(mockAssertOwnedMetaPixel).not.toHaveBeenCalled();
+    });
+  });
+
   it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
     mockedExtractOutline.mockReturnValue("");
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
@@ -880,6 +985,20 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     customDomainUrl: "https://everyio-day-zero-founders.agentwebforms.com",
   };
 
+  // jest's `clearMocks` only calls mockClear(), which does NOT drain queued
+  // `mockResolvedValueOnce` values. The refusal cases below deliberately stop before
+  // consuming theirs, so without an explicit reset those leftovers surface in a later
+  // test as a GitHub call that mysteriously returns the wrong thing. Reset on both
+  // sides so this block neither inherits nor exports axios state.
+  const resetGitHubStubs = () => {
+    mockAxios.get.mockReset();
+    mockAxios.post.mockReset();
+    mockAxios.patch.mockReset();
+    mockAxios.delete.mockReset();
+  };
+  beforeEach(resetGitHubStubs);
+  afterEach(resetGitHubStubs);
+
   const stubGitHubMergeFlow = () => {
     // GET pre-merge main ref → POST /merges → DELETE branch ref
     mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } });
@@ -924,6 +1043,189 @@ describe("POST /api/landing-pages/v0/generated/:id/publish", () => {
     expect(mockResolveLandingPageLiveUrl).toHaveBeenCalledWith(
       expect.objectContaining({ vercelProjectId: "vercel-proj-123", userId: "test-user-id" })
     );
+  });
+
+  // ===========================================================================
+  // ENG-827 — consent is re-checked at the MERGE, not at the tool that asks for it.
+  //
+  // `publish_landing_page_changes` is gated at dispatch, but the merge that makes
+  // the page public happens here, on the far side of a self-call, after a secrets
+  // fetch and a GitHub read that is allowed 30s. These drive the REAL guard (only
+  // its two storage reads are mocked) so the scope binding and the fail-closed
+  // branches are exercised, not just the wiring.
+  //
+  // The assertion that matters in every case is the SIDE EFFECT — was main
+  // advanced? — because that is the part that cannot be undone.
+  // ===========================================================================
+  const SESSION_HEADER = "X-AgentWeb-Session";
+  const TOOL = "publish_landing_page_changes";
+
+  /** An unattended run admitted with consent for the landing publish tool. */
+  const authorizedRun = () => ({
+    sessionType: "scheduled",
+    pageIdentifier: `Weekly site refresh|scheduleId:3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21`,
+    publishAdmission: { authorized: true, tools: [TOOL] },
+  });
+
+  const expectNothingPublished = () => {
+    expect(mockAxios.post).not.toHaveBeenCalled();
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+  };
+
+  it("FAIL: consent revoked after the tool was admitted → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // The owner switched it off while the route was fetching the token and the SHA.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: false,
+      autopublishAuthorizedTools: [],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/not authorized to publish/i);
+    expectNothingPublished();
+    // Proves the check sits at the LAST moment rather than at the top of the route:
+    // the read work ahead of the merge still ran.
+    expect(mockAxios.get).toHaveBeenCalled();
+  });
+
+  it("FAIL: consent stands but not for THIS tool → main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Granted for social posting only. A landing deploy is not what the owner approved.
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ["post_on_connected_account"],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("FAIL: the run's session cannot be read → fails closed, main is never merged", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    // Both the call and its one retry fail. An unconfirmed permission is withheld.
+    mockGetChatSession.mockRejectedValue(new Error("DynamoDB unavailable"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    expectNothingPublished();
+  });
+
+  it("SUCCESS: consent still held at the merge → the page publishes", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    // The gate must not become a blanket block on authorized runs.
+    expect(mockAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining("/merges"), expect.anything(), expect.anything()
+    );
+    // It really did consult live schedule state rather than trusting the admission.
+    expect(mockGetScheduleById).toHaveBeenCalledWith("3f2a1c8e-11bd-4a6f-9c3d-0e7b5a4d6f21");
+  });
+
+  // The 409 fallback force-advances main instead of merging. It reaches that write
+  // through a FAILED merge and a second branch-tip read, each allowed 30s, so it
+  // needs its own re-check — the one before the standard merge is by then ~a minute
+  // stale. Same public outcome, so the same rule applies.
+  const stub409Fallback = () => {
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: "premerge-sha" } } })  // pre-merge main
+      .mockResolvedValueOnce({ data: { object: { sha: "draft-tip-sha" } } }); // branch tip
+    mockAxios.post.mockRejectedValueOnce({ response: { status: 409 } });
+    mockAxios.delete.mockResolvedValueOnce({ data: {} });
+  };
+
+  it("FAIL: consent revoked during the 409 fallback → main is never force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    // Authorized when the merge was attempted; revoked by the time the fallback
+    // has looked up the branch tip.
+    mockGetScheduleById
+      .mockResolvedValueOnce({ autopublishAuthorized: true, autopublishAuthorizedTools: [TOOL] })
+      .mockResolvedValue({ autopublishAuthorized: false, autopublishAuthorizedTools: [] });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(403);
+    // The force-update is the write that would have made the page public here.
+    expect(mockAxios.patch).not.toHaveBeenCalled();
+    expect(mockTriggerVercelDeployment).not.toHaveBeenCalled();
+    expect(mockRecordLandingPagePublish).not.toHaveBeenCalled();
+    // It really did re-read rather than reusing the pre-merge decision.
+    expect(mockGetScheduleById).toHaveBeenCalledTimes(2);
+  });
+
+  it("SUCCESS: consent holds through the 409 fallback → main is force-advanced", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stub409Fallback();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+    mockGetChatSession.mockResolvedValue(authorizedRun());
+    mockGetScheduleById.mockResolvedValue({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [TOOL],
+    });
+    mockAxios.patch.mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .set(SESSION_HEADER, "sess-1")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.merge_commit_sha).toBe("draft-tip-sha");
+    expect(mockAxios.patch).toHaveBeenCalled();
+  });
+
+  it("BOUNDARY: an interactive publish carries no session header → not gated, no consent read", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE);
+    stubGitHubMergeFlow();
+    mockResolveLandingPageLiveUrl.mockResolvedValueOnce("https://everyio.agentwebforms.com");
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/publish")
+      .send({ branch: "draft/agentweb-preview" });
+
+    expect(res.status).toBe(200);
+    // A human clicking Publish must not pay for a session read, let alone be refused.
+    expect(mockGetChatSession).not.toHaveBeenCalled();
+    expect(mockGetScheduleById).not.toHaveBeenCalled();
   });
 });
 

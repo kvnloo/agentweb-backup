@@ -40,8 +40,17 @@ jest.mock('../services/db', () => ({
     updateLead: jest.fn(async () => undefined),
     addEngagement: jest.fn(async () => undefined),
   },
-  userDb: { getUserById: jest.fn(async () => ({ userId: OWNER })) },
-  orgDb: { getOrgMembers: jest.fn(async () => []) },
+  userDb: {
+    getUserById: jest.fn(async (id: string) => ({ userId: id, orgId: 'org-A' })),
+  },
+  orgDb: {
+    getOrgMembers: jest.fn(async () => []),
+    getOrgById: jest.fn(async () => ({
+      orgId: 'org-A',
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [ACTOR] } },
+    })),
+  },
 }));
 
 const { settingsService } = require('../services/settingsService');

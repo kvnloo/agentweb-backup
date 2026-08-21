@@ -52,7 +52,7 @@ describe('TwitterAdapter', () => {
 
       const result = await adapter.createPost(makeAccount(), 'Hello X!', [], USER_ID);
 
-      expect(mockPostTweet).toHaveBeenCalledWith(USER_ID, 'tw-user-123', 'Hello X!');
+      expect(mockPostTweet).toHaveBeenCalledWith(USER_ID, 'tw-user-123', 'Hello X!', undefined, undefined);
       expect(result.success).toBe(true);
       expect(result.postId).toBe('tweet-999');
       expect(result.postUrl).toBe('https://x.com/i/web/status/tweet-999');

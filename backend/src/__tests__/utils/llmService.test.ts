@@ -155,11 +155,11 @@ describe('llmService', () => {
     // inference-profile map, which had drifted (no opus-4-8) and built its
     // BedrockRuntimeClient without pinning SigV4.
 
-    it('AC #3: maps Opus 4.8 to its profile id, matching agentModeService', () => {
-      new LLMService('anthropic.claude-opus-4-8');
-      expect(ChatBedrockConverse).toHaveBeenCalledWith(
-        expect.objectContaining({ model: 'us.anthropic.claude-opus-4-8' })
+    it('AC #3: rejects bearer-only Opus 4.8 instead of constructing an unreachable SigV4 client', () => {
+      expect(() => new LLMService('anthropic.claude-opus-4-8')).toThrow(
+        /anthropic\.claude-opus-4-8.*bearer-token account/,
       );
+      expect(ChatBedrockConverse).not.toHaveBeenCalled();
     });
 
     it('AC #4: pins SigV4 so a set AWS_BEARER_TOKEN_BEDROCK cannot hijack auth', () => {

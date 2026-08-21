@@ -101,6 +101,70 @@ export async function pruneStaleSentInvitations(
   return stale.length;
 }
 
+/**
+ * Drop specific pending-invitation rows the moment we learn they are no longer
+ * pending, rather than waiting for the next full-feed prune (ENG-1197).
+ *
+ * An invitation leaves the pending set in exactly two ways, and we observe both
+ * directly: the recipient accepts (the 10-minute connection sync sees the new
+ * connection) or we withdraw it ourselves. Deleting on those events keeps the cache
+ * fresh independently of how often the whole feed is walked — which matters because
+ * that walk is now hourly, and a lead showing "invite pending" in the CRM an hour
+ * after they accepted is a visible lie.
+ *
+ * The full-feed prune remains the backstop for everything else: invites that expired
+ * on LinkedIn's side, or were withdrawn outside this product.
+ */
+export async function deleteSentInvitationsByProfileUrls(
+  accountId: string,
+  publicProfileUrls: string[],
+): Promise<number> {
+  // Normalize BEFORE discarding empties: a whitespace-only string is truthy and
+  // survives filter(Boolean), but normalizes to '' — which would then match any
+  // malformed cached row that also normalizes to '' and delete it.
+  // Keep the Set: `includes` on an array made this O(rows x urls), and both sides
+  // scale with the account's backlog — the reported account had 1,540 pending rows.
+  const urls = new Set(
+    publicProfileUrls.map((u) => (u ? normalizeLinkedInUrl(u) : '')).filter(Boolean),
+  );
+  if (urls.size === 0) return 0;
+
+  const rows = (await getAllSentInvitationsByAccount(accountId)).filter((inv) =>
+    urls.has(normalizeLinkedInUrl(inv.publicProfileUrl)),
+  );
+  return deleteRows(accountId, rows.map((r) => r.invitedUserPublicId));
+}
+
+/**
+ * Drop the row for an invitation we just withdrew. Keyed by the invitation id
+ * because that is what the withdraw call carries; the table's key is the invitee's
+ * public id, so this resolves one from the other off the account's own partition.
+ */
+export async function deleteSentInvitationByInvitationId(
+  accountId: string,
+  invitationId: string,
+): Promise<number> {
+  if (!invitationId) return 0;
+  const rows = (await getAllSentInvitationsByAccount(accountId)).filter(
+    (inv) => inv.invitationId === invitationId,
+  );
+  return deleteRows(accountId, rows.map((r) => r.invitedUserPublicId));
+}
+
+/** Delete rows by their sort key, batched the same way the prune does. */
+async function deleteRows(accountId: string, invitedUserPublicIds: string[]): Promise<number> {
+  const BATCH = 25;
+  for (let i = 0; i < invitedUserPublicIds.length; i += BATCH) {
+    await Promise.all(invitedUserPublicIds.slice(i, i + BATCH).map((invitedUserPublicId) =>
+      dynamodb.delete({
+        TableName: TABLE,
+        Key: { accountId, invitedUserPublicId },
+      }).promise()
+    ));
+  }
+  return invitedUserPublicIds.length;
+}
+
 /** Look up a pending invitation by profile URL for a specific account. Returns the record or null. */
 export async function getSentInvitationByProfileUrlAndAccount(
   publicProfileUrl: string,

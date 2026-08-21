@@ -9,7 +9,12 @@ jest.mock('../services/subscriptionService', () => ({
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    // ENG-827 publish-scope cases below: the subscription check runs on the raw
+    // required list, so both must be allowed for the run to reach the checker.
+    'read_brand_guidelines',
+    'post_on_connected_account',
   ]),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -20,6 +25,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionPublishAdmission: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -51,6 +57,7 @@ jest.mock('../services/agentModeService', () => ({
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     runInWorker: jest.fn(),
+    releaseSessionClients: jest.fn(),
   },
 }));
 
@@ -700,6 +707,335 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           message: 'Scheduled chat updated successfully'
+        })
+      );
+    });
+  });
+
+  // ENG-827: the persisted run record must report the requirements the run was
+  // actually HELD TO. Building it from the raw schedule config instead recorded
+  // `post_on_connected_account {required: 1, actual: 0}` next to an empty
+  // functionCallMisses on a passing run — a contradiction nothing downstream can
+  // tell apart from a genuine silent miss (the ENG-479 / ENG-764 false-failure
+  // shape). Observed on a live preview run before it was fixed.
+  describe('run record reflects the publish-scope-filtered requirements (ENG-827)', () => {
+    const publishSchedule = {
+      ...baseSchedule,
+      keywords: [],
+      requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
+      functionCallMinCalls: {},
+    };
+
+    it('OMITS an unauthorized publish tool from functionCallDetails, and still passes in ONE attempt', async () => {
+      // The owner opted OUT of unattended publishing, so the publish requirement is
+      // outside this run's scope and must not be nudged for.
+      const withheld = { ...publishSchedule, requirePublishApproval: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue(withheld as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted the post; holding publication for your approval.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(withheld as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
+        })
+      );
+    });
+
+    // ENG-827 (Greptile P1, security): consent revoked while a run is IN FLIGHT must
+    // stop that run publishing. Authorization is resolved once at admission, so
+    // without a per-turn re-check the owner's kill switch does nothing for the
+    // several minutes a publishing run takes.
+    it('STOPS requiring the publish tool when consent is revoked mid-run', async () => {
+      const admitted = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      // The owner revokes after the run was admitted: every later re-read is revoked.
+      // An EXPLICIT false — absence of the field is the never-asked legacy state and
+      // still publishes, so it would not exercise the kill switch at all.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+      } as any);
+      // The model does NOT publish. Under the admitted (authorized) snapshot the
+      // checker would nudge for post_on_connected_account until maxAttempts.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Consent was withdrawn, so I drafted the post instead of publishing.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(admitted as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
+        })
+      );
+    });
+
+    // The system prompt (and its PUBLISH AUTHORIZATION directive) is assembled ONCE on
+    // the session's first message, so narrowing the authorization reaches the checker
+    // but NOT the model. Without carrying the withdrawal in the turn message, a revoked
+    // run would stop being nudged while still believing it was authorized to publish.
+    it('TELLS THE MODEL the authorization is void after a mid-run revocation', async () => {
+      const admitted = {
+        ...publishSchedule,
+        requiredFunctionCalls: ['read_brand_guidelines', 'analyze_competitors', 'post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+      } as any);
+      // Never satisfies analyze_competitors, so the run takes more than one turn and we
+      // can inspect what the SECOND turn actually sent to the model.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted only.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(admitted as any, mockUserId, true);
+
+      const messagesSent = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls
+        .map((c: any[]) => JSON.stringify(c));
+      const revocationTurns = messagesSent.filter((m: string) => m.includes('PUBLISH AUTHORIZATION WITHDRAWN'));
+      expect(revocationTurns.length).toBeGreaterThan(0);
+      expect(revocationTurns[0]).toContain('no longer authorized to publish with any tool');
+    });
+
+    it('KEEPS an AUTHORIZED publish tool in functionCallDetails — the scope filters, not the tool name', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Published the post.',
+        toolCalls: [
+          { name: 'read_brand_guidelines', arguments: {} },
+          { name: 'post_on_connected_account', arguments: {} },
+        ],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(authorized as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: {
+            'read_brand_guidelines': { actual: 1, required: 1 },
+            'post_on_connected_account': { actual: 1, required: 1 },
+          },
+          passed: true,
+        })
+      );
+    });
+
+    // ENG-827 (Greptile P1, security): the dispatch guard re-reads live schedule
+    // state, which on its own would let consent granted DURING a run widen it. It
+    // intersects that read with the scope stamped here instead, so the stamp is what
+    // makes "a run keeps the permissions it began with" enforceable at all.
+    it('STAMPS the admitted publish scope on the session before the first turn', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Published the post.',
+        toolCalls: [
+          { name: 'read_brand_guidelines', arguments: {} },
+          { name: 'post_on_connected_account', arguments: {} },
+        ],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(authorized as any, mockUserId, true);
+
+      expect(mockChatbotDb.updateSessionPublishAdmission).toHaveBeenCalledWith(
+        expect.any(String),
+        { authorized: true, tools: ['post_on_connected_account'] }
+      );
+      // Stamped BEFORE any turn ran — a stamp written after the fact would leave the
+      // first turn's publishes ungated.
+      const stampOrder = mockChatbotDb.updateSessionPublishAdmission.mock.invocationCallOrder[0];
+      const firstTurnOrder = mockGenerateMarketingResponseWorkerService.runInWorker.mock.invocationCallOrder[0];
+      expect(stampOrder).toBeLessThan(firstTurnOrder);
+    });
+
+    it('does NOT stamp a draft-only run — an absent stamp IS the withheld state', async () => {
+      const withheld = { ...publishSchedule, requirePublishApproval: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue(withheld as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted only.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(withheld as any, mockUserId, true);
+
+      expect(mockChatbotDb.updateSessionPublishAdmission).not.toHaveBeenCalled();
+    });
+
+    // If the stamp cannot be written, the guard will refuse the publish. Carrying on
+    // as authorized would tell the model to publish and demand the call while the
+    // guard blocked it — the prompt-versus-checker contradiction that looped the
+    // reported runs. The whole run downgrades to draft-only instead.
+    it('DOWNGRADES the run to draft-only when the admission cannot be recorded', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockChatbotDb.updateSessionPublishAdmission.mockRejectedValueOnce(new Error('throttled'));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted the post; holding publication.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(authorized as any, mockUserId, true);
+
+      // Not nudged for a publish it would not be allowed to make: passes in one turn.
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
+        })
+      );
+    });
+  });
+
+  // ENG-1045: the retry nudge must be satisfied by the mandated publish OUTCOME,
+  // not by the literal tool name. A 2+ tweet thread can ONLY go out through
+  // twitter_manage_post/post_thread (the backend rejects a 1-item thread), so a
+  // name-keyed check on post_on_connected_account was unsatisfiable after one —
+  // and the only way to clear it was a SECOND, irreversible post to a live
+  // customer timeline. Reported on a scheduled X run that published successfully
+  // and was then nudged ten-plus consecutive times.
+  describe('publish-outcome satisfaction of the retry nudge (ENG-1045)', () => {
+    const xPostSchedule = {
+      ...baseSchedule,
+      keywords: [],
+      startingMessage: "Publish tonight's X post.",
+      requiredFunctionCalls: ['post_on_connected_account'],
+      functionCallMinCalls: {},
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    };
+
+    const threadPublishTurn = {
+      content: 'Published tonight’s two-tweet thread on eLife’s peer review data.',
+      toolCalls: [
+        {
+          name: 'twitter_manage_post',
+          arguments: { action: 'post_thread', tweets: ['first tweet', 'second tweet'] },
+          result: {},
+        },
+      ],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    };
+
+    it('accepts a successful thread publish and never re-presses for a duplicate post', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      const capturedMessages: string[] = [];
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation((params: any) => {
+        capturedMessages.push(params.messageContent || '');
+        return Promise.resolve(threadPublishTurn);
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      // One turn, no nudge: the publish outcome was already achieved.
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(capturedMessages.some((m) => m.includes('Please try again. Make sure to'))).toBe(false);
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'success',
+          passed: true,
+          attempt: 1,
+          functionCallMatches: ['post_on_connected_account'],
+          functionCallMisses: [],
+          // The persisted record must agree with the verdict — a
+          // `{actual: 0, required: 1}` next to `passed: true` is the
+          // self-contradicting shape ENG-827 had to unpick.
+          functionCallDetails: { 'post_on_connected_account': { actual: 1, required: 1 } },
+        })
+      );
+    });
+
+    it('still presses when the thread publish FAILED — nothing went live to credit', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...threadPublishTurn,
+        content: 'The thread could not be posted.',
+        toolCalls: [{ ...threadPublishTurn.toolCalls[0], error: 'Twitter action failed' }],
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          status: 'failure',
+          passed: false,
+          functionCallMisses: ['post_on_connected_account'],
+          functionCallDetails: { 'post_on_connected_account': { actual: 0, required: 1 } },
+        })
+      );
+    });
+
+    it('does NOT credit a non-publishing action of the same tool', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(xPostSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...threadPublishTurn,
+        content: 'Pulled the metrics for last week’s tweets.',
+        toolCalls: [
+          { name: 'twitter_manage_post', arguments: { action: 'get_tweet_metrics', tweet_ids: ['1'] }, result: {} },
+        ],
+      });
+
+      const result = await runScheduledChat(xPostSchedule as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          passed: false,
+          functionCallMisses: ['post_on_connected_account'],
         })
       );
     });

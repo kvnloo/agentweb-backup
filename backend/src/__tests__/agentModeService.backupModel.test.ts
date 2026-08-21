@@ -72,6 +72,31 @@ describe('AgentModeService - Backup Model Fallback', () => {
   });
 
   describe('getBackupModel()', () => {
+    it('uses the policy-approved fallback instead of the global premium backup', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6'
+      });
+
+      const backup = await agentModeService.getBackupModel(
+        'gemini-3.1-flash-lite',
+        'anthropic.claude-haiku-4-5-20251001-v1:0'
+      );
+
+      expect(backup).toBe('anthropic.claude-haiku-4-5-20251001-v1:0');
+      expect(settingsService.getSetting).not.toHaveBeenCalled();
+    });
+
+    it('disables transient fallback when optimized policy has no second approved model', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6'
+      });
+
+      const backup = await agentModeService.getBackupModel('gemini-3.1-flash-lite', null);
+
+      expect(backup).toBeNull();
+      expect(settingsService.getSetting).not.toHaveBeenCalled();
+    });
+
     it('should return admin-configured backup model when setting exists and is valid', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: 'anthropic.claude-sonnet-4-6'
@@ -124,11 +149,24 @@ describe('AgentModeService - Backup Model Fallback', () => {
 
     it('should return valid backup model for any primary model', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'gpt-5.5'
+      });
+
+      const backup = await agentModeService.getBackupModel('anthropic.claude-sonnet-4-6');
+      expect(backup).toBe('gpt-5.5');
+    });
+
+    // 2026-08-19: gpt-5-chat-2 was removed from the registry (Rui-owned Azure
+    // resource migration) and now resolves through LEGACY_MODEL_ALIASES to
+    // gpt-5.5 — a stale-configured backup must still fail over, not silently
+    // stop working.
+    it('resolves a retired backup-model setting (gpt-5-chat-2) to its current replacement', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: 'gpt-5-chat-2'
       });
 
       const backup = await agentModeService.getBackupModel('anthropic.claude-sonnet-4-6');
-      expect(backup).toBe('gpt-5-chat-2');
+      expect(backup).toBe('gpt-5.5');
     });
   });
 });

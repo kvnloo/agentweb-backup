@@ -236,3 +236,100 @@ describe('ENG-335 launch gate — ASSET_GROUP CREATE on a live campaign', () => 
     expect(googleAdsService.createAssetGroup).toHaveBeenCalled();
   });
 });
+
+describe('ENG-1358 — a GTM-only page warns, and the warning must ESCAPE the gate', () => {
+  // The reachability lesson from ENG-1328 AC1: a value computed and then discarded is
+  // the same as no value at all, and every unit test below the gap passes either way.
+  // These drive the real consumer and assert on what an operator and an auditor see.
+  const warnedGate = {
+    ok: true,
+    results: [{ url: 'https://acme.com/compare', status: 'measured', mechanisms: ['GTM:GTM-NFWK798Z'], checkedFor: [] }],
+    blockedUrls: [],
+    warnings: [{ url: 'https://acme.com/compare', mechanisms: ['GTM:GTM-NFWK798Z'] }],
+    message: 'Pre-flight tracking check passed with a warning. …GTM-NFWK798Z… no Google Ads conversion tag (AW-…)',
+  };
+  const resume = () => service.handleCallGoogleAdsApi('user-123', {
+    customer_id: '1234567890', entity_type: 'CAMPAIGN', action: 'RESUME', campaign_resource_name: CAMPAIGN,
+  }, { sessionId: 'sess-1' });
+
+  it('still LAUNCHES — this is a warning, never a block', async () => {
+    // Blocking legitimate GTM-hosted conversions would be the mirror image of today's
+    // false pass, and would train people to set override_tracking_check.
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    const result = await resume();
+    expect(result.success).toBe(true);
+    expect(googleAdsService.resumeCampaign).toHaveBeenCalled();
+  });
+
+  it('surfaces the warning on the result rather than swallowing it', async () => {
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    const result: any = await resume();
+    expect(result.trackingWarning).toContain('GTM-NFWK798Z');
+  });
+
+  it('records passed_with_warning, distinct from passed', async () => {
+    // Collapsing the two would have the audit trail claim the conversion path was
+    // verified when all that was verified is that SOME Google tag exists.
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    await resume();
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'passed_with_warning' }));
+  });
+
+  it('a clean AW- pass carries no warning and still records "passed"', async () => {
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(passedGate);
+    const result: any = await resume();
+    expect(result.trackingWarning).toBeUndefined();
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'passed' }));
+  });
+
+  it('UPDATE status=ENABLED relays the warning too, not just RESUME', async () => {
+    // Enabling via UPDATE is the same launch by another route; a warning on one path and
+    // silence on the other is how a gate gets quietly bypassed.
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    const result: any = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'CAMPAIGN', action: 'UPDATE',
+      campaign_resource_name: CAMPAIGN, status: 'ENABLED',
+    }, { sessionId: 'sess-1' });
+    expect(result.trackingWarning).toContain('GTM-NFWK798Z');
+  });
+});
+
+describe('ENG-1358 — every launch route relays the warning, not just RESUME/UPDATE (CodeRabbit, #2516)', () => {
+  // CodeRabbit caught this, and it is the exact failure the fix's own comment names:
+  // "a warning that is computed and discarded is the same as no warning at all". Adding a
+  // creative to an already-ENABLED campaign is a launch by another route, and both of
+  // those call sites read gate.proceed while ignoring gate.warning.
+  const warnedGate = {
+    ok: true,
+    results: [{ url: 'https://acme.com/compare', status: 'measured', mechanisms: ['GTM:GTM-NFWK798Z'], checkedFor: [] }],
+    blockedUrls: [],
+    warnings: [{ url: 'https://acme.com/compare', mechanisms: ['GTM:GTM-NFWK798Z'] }],
+    message: 'Pre-flight tracking check passed with a warning. …GTM-NFWK798Z… no Google Ads conversion tag (AW-…)',
+  };
+
+  it('AD CREATE on an ENABLED campaign relays the warning', async () => {
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(warnedGate);
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({
+      campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED',
+    });
+    (googleAdsService.createAd as jest.Mock).mockResolvedValue({ resourceName: `${CAMPAIGN}/ads/1` });
+    const result: any = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE',
+      ad_group_resource_name: 'customers/1234567890/adGroups/1', type: 'SEARCH',
+      headlines: ['a', 'b', 'c'], descriptions: ['d', 'e'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+    expect(result.success).toBe(true);
+    expect(result.trackingWarning).toContain('GTM-NFWK798Z');
+  });
+
+  it('the two creative routes read gate.warning at all', () => {
+    // Guards the wiring itself: if a future edit drops the capture, this fails even when
+    // the mock-heavy handler test above cannot reach its success path.
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '../services/agentModeService.ts'), 'utf8');
+    const captures = src.match(/creativeTrackingWarning = gate\.warning;/g) || [];
+    expect(captures).toHaveLength(2);
+    const relays = src.match(/trackingWarning: creativeTrackingWarning/g) || [];
+    expect(relays).toHaveLength(2);
+  });
+});

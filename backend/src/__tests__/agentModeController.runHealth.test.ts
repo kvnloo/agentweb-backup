@@ -29,6 +29,7 @@ describe('computeScheduleRunHealth', () => {
       lastRunStatus: null,
       lastRunAt: null,
       consecutiveFailures: 0,
+      lastRunBlockedBy: null,
     });
   });
 
@@ -39,6 +40,7 @@ describe('computeScheduleRunHealth', () => {
         lastRunStatus: null,
         lastRunAt: null,
         consecutiveFailures: 0,
+        lastRunBlockedBy: null,
       });
     },
   );
@@ -54,6 +56,7 @@ describe('computeScheduleRunHealth', () => {
       lastRunStatus: 'failure',
       lastRunAt: '2026-08-01T13:45:00.000Z',
       consecutiveFailures: 3,
+      lastRunBlockedBy: null,
     });
   });
 

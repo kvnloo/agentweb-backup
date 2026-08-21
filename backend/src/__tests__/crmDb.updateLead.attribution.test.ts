@@ -119,3 +119,91 @@ describe('crmDb.updateLead — attribution fields persistence', () => {
     expect(params.ExpressionAttributeValues).not.toHaveProperty(':utmMedium');
   });
 });
+
+/**
+ * ENG-926 §B — the match-quality signals that survive to the relay.
+ *
+ * `client_ip_address` and `client_user_agent` are, in Meta's own guidance, among the most
+ * commonly skipped and most valuable Event Match Quality inputs. Both were already in hand
+ * at capture (routes/webhooks.ts reads them off the request), were used for the immediate
+ * Lead event, and were then thrown away — so every conversion §C relays WEEKS later, when a
+ * deal closes, reached Meta with weaker identity than we held at the moment of capture.
+ *
+ * `metaFbp` is fixed here in the same pass, and its absence is the reason this file exists:
+ * db.ts's own comment says a field missing from updateLead is "silently dropped with every
+ * test still passing, which is exactly how §C's metaFbp shipped doing nothing." It was
+ * added to createLead only, so a lead that first arrived WITHOUT an fbp and later submitted
+ * WITH one never received it. Adding new fields to one path and not the other would have
+ * repeated the bug this very file was written about.
+ */
+describe('crmDb.updateLead — match-quality fields persistence (ENG-926 §B)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    updatePromiseMock.mockResolvedValue({ Attributes: {} });
+    getPromiseMock.mockResolvedValue({
+      Item: { listId: 'list-1', leadId: 'lead-1', email: 'jane@acme.com' },
+    });
+  });
+
+  it('writes clientIp write-once, atomically', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { clientIp: '203.0.113.7' });
+    const params = leadUpdateParams();
+    // if_not_exists, NOT a plain SET. A caller's read-then-write is TOCTOU: two repeat
+    // submissions racing while the field is absent would both decide to backfill, and the
+    // later SET would replace the acquisition identity Meta matches on months later.
+    expect(params.UpdateExpression).toMatch(/clientIp = if_not_exists\(clientIp, :clientIp\)/);
+    expect(params.ExpressionAttributeValues[':clientIp']).toBe('203.0.113.7');
+  });
+
+  it('writes clientUserAgent write-once, atomically', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { clientUserAgent: 'Mozilla/5.0 (iPhone)' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(
+      /clientUserAgent = if_not_exists\(clientUserAgent, :clientUserAgent\)/,
+    );
+    expect(params.ExpressionAttributeValues[':clientUserAgent']).toBe('Mozilla/5.0 (iPhone)');
+  });
+
+  it('writes metaFbp write-once — the field db.ts documents as having shipped doing nothing', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { metaFbp: 'fb.1.1754000000000.987654321' });
+    const params = leadUpdateParams();
+    expect(params.UpdateExpression).toMatch(/metaFbp = if_not_exists\(metaFbp, :metaFbp\)/);
+    expect(params.ExpressionAttributeValues[':metaFbp']).toBe('fb.1.1754000000000.987654321');
+  });
+
+  it('does NOT guard the whole update — a lost race must not reject the caller\'s real edits', async () => {
+    // A ConditionExpression would have been the obvious fix and the wrong one: it guards the
+    // entire UpdateExpression, so losing the race on an IP would also throw away the
+    // firstName the caller was legitimately changing in the same write.
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: 'Jane', clientIp: '203.0.113.7' });
+    const params = leadUpdateParams();
+    expect(params.ConditionExpression).toBeUndefined();
+    expect(params.UpdateExpression).toMatch(/firstName/);
+    expect(params.UpdateExpression).toMatch(/if_not_exists\(clientIp/);
+  });
+
+  it('SETs all three together, alongside the touch blobs', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', {
+      firstTouch,
+      metaFbp: 'fb.1.1754000000000.987654321',
+      clientIp: '203.0.113.7',
+      clientUserAgent: 'Mozilla/5.0 (iPhone)',
+    });
+    const params = leadUpdateParams();
+    expect(params.ExpressionAttributeValues[':firstTouch']).toEqual(firstTouch);
+    expect(params.ExpressionAttributeValues[':metaFbp']).toBe('fb.1.1754000000000.987654321');
+    expect(params.ExpressionAttributeValues[':clientIp']).toBe('203.0.113.7');
+    expect(params.ExpressionAttributeValues[':clientUserAgent']).toBe('Mozilla/5.0 (iPhone)');
+    // firstTouch keeps its plain SET — its immutability is a caller contract with a
+    // different shape (backfill-only on the merge path), not a write-once attribute.
+    expect(params.UpdateExpression).toMatch(/firstTouch = :firstTouch/);
+  });
+
+  it('does NOT include any of them when none are supplied', async () => {
+    await crmDb.updateLead('list-1', 'lead-1', { firstName: 'Jane' });
+    const params = leadUpdateParams();
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':clientIp');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':clientUserAgent');
+    expect(params.ExpressionAttributeValues).not.toHaveProperty(':metaFbp');
+  });
+});

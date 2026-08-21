@@ -296,6 +296,12 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  llmUsageCredits?: {
+    month: string;
+    totalPurchasedMicroUsd?: number;
+    totalAdminGrantedMicroUsd?: number;
+    totalMigrationOffsetMicroUsd?: number;
+  };
   extraCostUsage?: {
     month: string;
     totalCost: number;
@@ -957,11 +963,13 @@ export default function AdminDashboard() {
   const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
   const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
   const xBreakdownReqRef = useRef(0);
-  const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
-  const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
-  const [grantBonusEmail, setGrantBonusEmail] = useState("");
-  const [grantBonusAmount, setGrantBonusAmount] = useState("");
-  const [grantBonusLoading, setGrantBonusLoading] = useState(false);
+  const [usageCreditDialogOpen, setUsageCreditDialogOpen] = useState(false);
+  const [usageCreditUserId, setUsageCreditUserId] = useState<string | null>(null);
+  const [usageCreditEmail, setUsageCreditEmail] = useState("");
+  const [usageCreditAmount, setUsageCreditAmount] = useState("");
+  const [usageCreditReason, setUsageCreditReason] = useState("");
+  const [usageCreditIdempotencyKey, setUsageCreditIdempotencyKey] = useState("");
+  const [usageCreditLoading, setUsageCreditLoading] = useState(false);
   const [introEmailDialogOpen, setIntroEmailDialogOpen] = useState(false);
   const [introEmailUserId, setIntroEmailUserId] = useState<string | null>(null);
   const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
@@ -1120,7 +1128,9 @@ export default function AdminDashboard() {
       const costAllowanceMap: Record<string, number | null> = {};
       types.forEach((t: any) => {
         allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
-        costAllowanceMap[t.name] = t.monthlyCostAllowance ?? null;
+        costAllowanceMap[t.name] = t.llmUsagePolicy?.hardCostThresholdMicroUsd != null
+          ? t.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000
+          : (t.monthlyCostAllowance ?? null);
       });
       setSubscriptionTypeAllowanceMap(allowanceMap);
       setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
@@ -3119,35 +3129,48 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleGrantTokenBonus = async () => {
-    if (!grantBonusUserId || !grantBonusAmount) return;
-    const amount = parseInt(grantBonusAmount.replace(/,/g, ''), 10);
-    if (isNaN(amount) || amount <= 0) {
-      setError("Bonus amount must be a positive number");
+  const handleGrantUsageCredit = async () => {
+    if (!usageCreditUserId || !usageCreditAmount || !usageCreditReason.trim()) return;
+    const amountUsd = Number(usageCreditAmount.replace(/,/g, ''));
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      setError("Usage credit must be a positive dollar amount");
       return;
     }
     try {
-      setGrantBonusLoading(true);
+      setUsageCreditLoading(true);
       const response = await axios.post(
-        buildApiUrl(`/api/admin/users/${grantBonusUserId}/token-bonus`),
-        { bonusTokens: amount },
+        buildApiUrl(`/api/admin/users/${usageCreditUserId}/llm-usage-credit`),
+        {
+          amountUsd,
+          reason: usageCreditReason.trim(),
+          idempotencyKey: usageCreditIdempotencyKey,
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       if (response.status === 200) {
         setUsers((prevUsers: User[]) =>
           prevUsers.map((user: User) =>
-            user.userId === grantBonusUserId
-              ? { ...user, tokenAllowanceBonus: response.data.tokenAllowanceBonus }
+            user.userId === usageCreditUserId
+              ? {
+                  ...user,
+                  llmUsageCredits: {
+                    ...(user.llmUsageCredits || { month: response.data.month }),
+                    month: response.data.month,
+                    totalAdminGrantedMicroUsd: Math.round(response.data.totalAdminGrantedUsd * 1_000_000),
+                  },
+                }
               : user
           )
         );
-        setSuccess(`Granted ${amount.toLocaleString()} bonus tokens to ${grantBonusEmail}`);
-        setGrantBonusDialogOpen(false);
+        setSuccess(response.data.granted
+          ? `Granted $${amountUsd.toFixed(2)} of one-time usage to ${usageCreditEmail}`
+          : "This usage credit was already granted; no duplicate was added.");
+        setUsageCreditDialogOpen(false);
       }
     } catch (error: any) {
-      setError(error.response?.data?.message || "Failed to grant token bonus");
+      setError(error.response?.data?.message || "Failed to grant usage credit");
     } finally {
-      setGrantBonusLoading(false);
+      setUsageCreditLoading(false);
     }
   };
 
@@ -3363,7 +3386,9 @@ export default function AdminDashboard() {
     "Market Research",
     "Competitor Analysis",
     "Other",
-  ];
+];
+
+const DEFAULT_ADMIN_USAGE_CREDIT_USD = 500;
 
   const marketingChannelOptions = [
     "Meta",
@@ -4953,11 +4978,6 @@ export default function AdminDashboard() {
                                         </Typography>
                                       );
                                     })() : <Typography variant="body2" color="text.disabled">—</Typography>}
-                                    {user.roles?.includes("customer") && (
-                                      <Tooltip title="Grant Bonus Tokens">
-                                        <IconButton size="small" onClick={() => { setGrantBonusUserId(user.userId); setGrantBonusEmail(user.email); setGrantBonusAmount(""); setGrantBonusDialogOpen(true); }} color="primary"><AddIcon fontSize="small" /></IconButton>
-                                      </Tooltip>
-                                    )}
                                   </Box>
                                   {user.roles?.includes("customer") && user.tokenUsageHistory && user.tokenUsageHistory.length > 0 && (
                                     <Box sx={{ mt: 0.5 }}>
@@ -4981,17 +5001,33 @@ export default function AdminDashboard() {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
                                       const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
                                       const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      const credits = user.llmUsageCredits?.month === currentMonth
+                                        ? ((user.llmUsageCredits.totalPurchasedMicroUsd || 0) + (user.llmUsageCredits.totalAdminGrantedMicroUsd || 0)) / 1_000_000
+                                        : 0;
                                       return (
                                         <Typography variant="body2">
-                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : "∞"}
+                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${(costAllowance + credits).toFixed(2)}` : "∞"}
+                                          {credits > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+${credits.toFixed(2)} credits)</Typography>}
                                           <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
                                         </Typography>
                                       );
                                     })() : <Typography variant="body2" color="text.disabled">—</Typography>}
                                     {user.roles?.includes("customer") && (
-                                      <Tooltip title="View per-model burn breakdown">
-                                        <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
-                                      </Tooltip>
+                                      <>
+                                        <Tooltip title="Grant one-time usage credit">
+                                          <IconButton size="small" onClick={() => {
+                                            setUsageCreditUserId(user.userId);
+                                            setUsageCreditEmail(user.email);
+                                            setUsageCreditAmount(String(DEFAULT_ADMIN_USAGE_CREDIT_USD));
+                                            setUsageCreditReason("");
+                                            setUsageCreditIdempotencyKey(globalThis.crypto?.randomUUID?.() || `grant_${Date.now()}`);
+                                            setUsageCreditDialogOpen(true);
+                                          }} color="primary"><AddIcon fontSize="small" /></IconButton>
+                                        </Tooltip>
+                                        <Tooltip title="View per-model burn breakdown">
+                                          <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                        </Tooltip>
+                                      </>
                                     )}
                                   </Box>
                                 </Grid>
@@ -6793,34 +6829,46 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Bonus Tokens Dialog */}
-      <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
-        <DialogTitle>Grant Bonus Tokens</DialogTitle>
+      {/* Grant one-time provider-cost usage credit dialog */}
+      <Dialog open={usageCreditDialogOpen} onClose={() => setUsageCreditDialogOpen(false)}>
+        <DialogTitle>Grant One-Time Usage Credit</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
-            Grant additional tokens to <strong>{grantBonusEmail}</strong> for the current month.
+            Extend <strong>{usageCreditEmail}</strong>&apos;s cost-based hard limit for the current month. This expires at the monthly reset and is recorded in the audit ledger.
+            {" "}The standard one-time grant is ${DEFAULT_ADMIN_USAGE_CREDIT_USD}; edit the amount only when a different approved grant applies.
           </DialogContentText>
           <TextField
             autoFocus
             fullWidth
-            label="Bonus Tokens"
-            value={grantBonusAmount}
-            onChange={(e) => setGrantBonusAmount(e.target.value)}
-            placeholder="e.g. 50000"
-            type="text"
-            inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+            label="Provider usage credit (USD)"
+            value={usageCreditAmount}
+            onChange={(e) => setUsageCreditAmount(e.target.value)}
+            placeholder={`${DEFAULT_ADMIN_USAGE_CREDIT_USD}.00`}
+            type="number"
+            inputProps={{ min: 0.01, step: 0.01 }}
+          />
+          <TextField
+            fullWidth
+            required
+            multiline
+            minRows={2}
+            sx={{ mt: 2 }}
+            label="Reason / campaign"
+            value={usageCreditReason}
+            onChange={(e) => setUsageCreditReason(e.target.value)}
+            placeholder="e.g. GROW-106 founder event credit"
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setGrantBonusDialogOpen(false)} disabled={grantBonusLoading}>
+          <Button onClick={() => setUsageCreditDialogOpen(false)} disabled={usageCreditLoading}>
             Cancel
           </Button>
           <Button
-            onClick={handleGrantTokenBonus}
+            onClick={handleGrantUsageCredit}
             variant="contained"
-            disabled={grantBonusLoading || !grantBonusAmount}
+            disabled={usageCreditLoading || !usageCreditAmount || !usageCreditReason.trim()}
           >
-            {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
+            {usageCreditLoading ? <CircularProgress size={24} /> : "Grant Credit"}
           </Button>
         </DialogActions>
       </Dialog>

@@ -293,7 +293,8 @@ function buildPerIcpUserPrompt(
  *     multiple ICPs)
  *   - description = first 2 distinct offer_angles joined; falls back to
  *     "Identified during onboarding" if none
- *   - cap at 10 (matches the rough ceiling agentMode's MAX_COMPETITORS uses)
+ *   - cap at 10 (a deliberate onboarding-only ceiling; agentMode no longer
+ *     caps the stored competitor list — see ENG-945)
  *
  * Exported for unit testing.
  */

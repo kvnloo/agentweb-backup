@@ -2362,6 +2362,85 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
   });
 });
 
+// ─── Unknown page id must not be reported as a missing repository (ENG-1192) ───
+
+describe('runCodingAgent — an unresolvable page id says so (ENG-1192)', () => {
+  const previewContext: CodingAgentContext = {
+    pageId: 'not-a-real-page-id',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: LANDING_PAGE_PREVIEW_BRANCH,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+    mockedAxios.patch.mockReset();
+    mockedAxios.post.mockReset();
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  // Live-caught on env1: a truncated page id produced "landing page has no GitHub
+  // repository" for a page that has one. Emma relayed it verbatim and told the user to
+  // deploy the page first — wrong advice generated from a wrong error.
+  test('reports the page as not found rather than blaming the repository', async () => {
+    mockGetLandingPageById.mockResolvedValue(undefined);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('not-a-real-page-id');
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+
+  test('does not claim a missing repository when the page itself is null', async () => {
+    mockGetLandingPageById.mockResolvedValue(null as any);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+
+  // The original message is correct for this case and must survive.
+  test('still reports a missing repository when the page exists without one', async () => {
+    mockGetLandingPageById.mockResolvedValue({ id: 'not-a-real-page-id' } as any);
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('no GitHub repository');
+  });
+
+  test('proceeds normally when the page resolves and has a repository', async () => {
+    mockGetLandingPageById.mockResolvedValue({
+      id: 'not-a-real-page-id',
+      githubRepoUrl: 'https://github.com/AgentWebPro/lp-free-ai-seo-geo-audit-37343865',
+    } as any);
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockResolvedValueOnce({ data: {} } as any);
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('install a tracking snippet', previewContext);
+
+    expect(result.success).toBe(true);
+    expect(result.message).not.toContain('no GitHub repository');
+  });
+});
+
 // ─── Preview-branch reset: preserve unpublished sequential edits (ENG-176) ─────
 
 describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {

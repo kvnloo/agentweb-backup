@@ -193,3 +193,182 @@ describe('googleAdsTrackingPreflight — preflightTrackingGate', () => {
     expect(fetchHtml).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-1358 — a GTM container is not proof an Ads conversion tag is in it', () => {
+  // Found on a live campaign, not hypothesised. During the ENG-1182 run, Step 5 audited
+  // the only ENABLED campaign's destination and found GTM-NFWK798Z with NO AW- id
+  // anywhere in the served HTML. The gate passed it. The campaign's goal was
+  // SUBMIT_LEAD_FORM, biddable — bidding toward an event that page could not report.
+  //
+  // A container is a PLACE where tags may live, not evidence any particular tag is in
+  // it, and its contents are not readable over HTTP. So this is WARN, never BLOCK:
+  // plenty of legitimate setups do fire the Ads conversion from inside GTM, and blocking
+  // them would be the mirror-image error — training people to set override_tracking_check,
+  // which is worse than the problem it solves.
+  const page = (body: string) => `<html><head>${body}</head><body>hi</body></html>`;
+  const withAw = page('<script src="https://www.googletagmanager.com/gtag/js?id=AW-18192751758"></script>');
+  const withGtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const withGa4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+  const withNothing = page('<title>nothing here</title>');
+  const gate = (html: string) => preflightTrackingGate(['https://x.test/'], { fetchHtml: async () => html });
+
+  it('AC1: a page carrying AW- still passes unchanged', async () => {
+    const out = await gate(withAw);
+    expect(out.ok).toBe(true);
+    expect(out.blockedUrls).toEqual([]);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('AC2: GTM-only does NOT block — a launch is still permitted', async () => {
+    const out = await gate(withGtmOnly);
+    expect(out.ok).toBe(true);
+    expect(out.blockedUrls).toEqual([]);
+  });
+
+  it('AC2: GTM-only produces a warning rather than a clean pass', async () => {
+    const out = await gate(withGtmOnly);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings![0].url).toBe('https://x.test/');
+  });
+
+  it('AC2: the warning names the specific unverifiable thing', async () => {
+    // Not "tracking may be incomplete" — that is unactionable. It has to say that the
+    // container may or may not contain an Ads conversion tag and that we cannot see in.
+    const out = await gate(withGtmOnly);
+    expect(out.message).toMatch(/GTM-NFWK798Z/);
+    expect(out.message).toMatch(/cannot (see inside|be read)/i);
+  });
+
+  it('AC4: the warning states how to resolve it', async () => {
+    // A warning with no route to resolution is one people learn to ignore.
+    const out = await gate(withGtmOnly);
+    expect(out.message).toMatch(/GTM Preview|beacon/i);
+  });
+
+  it('AC2: GA4-only warns for the same reason', async () => {
+    const out = await gate(withGa4Only);
+    expect(out.ok).toBe(true);
+    expect(out.warnings).toHaveLength(1);
+  });
+
+  it('AC3: a page with none of the three still BLOCKS', async () => {
+    const out = await gate(withNothing);
+    expect(out.ok).toBe(false);
+    expect(out.blockedUrls).toHaveLength(1);
+  });
+
+  it('a page with BOTH GTM and AW passes clean — the AW is what matters', async () => {
+    const out = await gate(page(
+      '<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>'
+      + '<script src="https://www.googletagmanager.com/gtag/js?id=AW-18192751758"></script>',
+    ));
+    expect(out.ok).toBe(true);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('an unverifiable fetch still blocks, and is not downgraded to a warning', async () => {
+    // Blocked-by-default must survive this change: a page we could not read is not a
+    // page we may assume is tagged.
+    const out = await preflightTrackingGate(['https://x.test/'], {
+      fetchHtml: async () => { throw new Error('timeout'); },
+    });
+    expect(out.ok).toBe(false);
+    expect(out.warnings ?? []).toEqual([]);
+  });
+
+  it('warns per URL, so a mixed set names only the containers', async () => {
+    const out = await preflightTrackingGate(
+      ['https://tagged.test/', 'https://container.test/'],
+      { fetchHtml: async (u) => (u.includes('tagged') ? withAw : withGtmOnly) },
+    );
+    expect(out.ok).toBe(true);
+    expect(out.warnings).toHaveLength(1);
+    expect(out.warnings![0].url).toBe('https://container.test/');
+  });
+});
+
+describe('fetch-failure fallbacks (pre-existing branches, closed while here)', () => {
+  it('falls back to a generic reason when the error carries no message', async () => {
+    const out = await preflightTrackingGate(['https://x.test/'], {
+      fetchHtml: async () => { throw {}; },
+    });
+    expect(out.ok).toBe(false);
+    expect(out.message).toMatch(/Could not fetch URL|unknown error/);
+  });
+
+  it('tolerates a null url list rather than throwing', async () => {
+    const out = await preflightTrackingGate(null as any, {});
+    expect(out.ok).toBe(true);
+    expect(out.results).toEqual([]);
+  });
+});
+
+describe('the warning must describe what was actually found (CodeRabbit, #2516)', () => {
+  // Telling someone with a GA4-only page to "open GTM Preview on the container" sends
+  // them looking for a container that does not exist. Advice that does not match what the
+  // operator can see is how a warning gets written off as noise.
+  const page = (b: string) => `<html><head>${b}</head><body>x</body></html>`;
+  const gtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const ga4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+  const gate = (html: string) => preflightTrackingGate(['https://x.test/'], { fetchHtml: async () => html });
+
+  it('a GA4-only page is not described as having a GTM container', async () => {
+    const out = await gate(ga4Only);
+    expect(out.message).not.toMatch(/GTM container/);
+    expect(out.message).not.toMatch(/GTM Preview/);
+  });
+
+  it('a GA4-only page is told the GA4-specific thing to check', async () => {
+    const out = await gate(ga4Only);
+    expect(out.message).toMatch(/GA4 property measures analytics/);
+    expect(out.message).toMatch(/imported into Google Ads/);
+  });
+
+  it('a GTM page still gets the GTM advice', async () => {
+    const out = await gate(gtmOnly);
+    expect(out.message).toMatch(/GTM Preview/);
+    expect(out.message).toMatch(/place where tags may live/);
+  });
+
+  it('both messages still name the beacon check, which works either way', async () => {
+    for (const html of [gtmOnly, ga4Only]) {
+      expect((await gate(html)).message).toMatch(/googleadservices\.com/);
+    }
+  });
+});
+
+describe('mixed GTM and GA4 sets get the right advice each (CodeRabbit, #2522)', () => {
+  // anyGtm picked ONE message for the whole array, so a set containing a GTM URL and a
+  // GA4-only URL told the GA4 one to open GTM Preview. Same class as the bug it replaced.
+  const page = (b: string) => `<html><head>${b}</head><body>x</body></html>`;
+  const gtmOnly = page('<script>(function(){})(window,document,"script","dataLayer","GTM-NFWK798Z");</script>');
+  const ga4Only = page('<script src="https://www.googletagmanager.com/gtag/js?id=G-ABC1234"></script>');
+
+  const mixed = () => preflightTrackingGate(
+    ['https://gtm.test/', 'https://ga4.test/'],
+    { fetchHtml: async (u) => (u.includes('gtm') ? gtmOnly : ga4Only) },
+  );
+
+  it('warns on both URLs', async () => {
+    expect((await mixed()).warnings).toHaveLength(2);
+  });
+
+  it('the GA4 line does not mention GTM Preview', async () => {
+    const out = await mixed();
+    const ga4Line = out.message.split('\n').find((l) => l.includes('https://ga4.test/'))!;
+    expect(ga4Line).not.toMatch(/GTM Preview/);
+    expect(ga4Line).toMatch(/imported into Google Ads/);
+  });
+
+  it('the GTM line does mention GTM Preview', async () => {
+    const out = await mixed();
+    const gtmLine = out.message.split('\n').find((l) => l.includes('https://gtm.test/'))!;
+    expect(gtmLine).toMatch(/GTM Preview/);
+  });
+
+  it('both explanations appear when both mechanisms are present', async () => {
+    const out = await mixed();
+    expect(out.message).toMatch(/place where tags may live/);
+    expect(out.message).toMatch(/GA4 property measures analytics/);
+  });
+});

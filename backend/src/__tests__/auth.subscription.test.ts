@@ -22,6 +22,7 @@ jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(async () => 'Pro'),
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
   getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
+  getAllowedFeatures: jest.fn(async () => ['scheduled_chats']),
   getHiddenPages: jest.fn(async () => []),
 }));
 
@@ -81,6 +82,7 @@ describe('GET /api/auth/me subscription fields', () => {
       { skillId: 'skill-1', name: 'Web Search' },
       { skillId: 'skill-2', name: 'Image Gen' },
     ]);
+    expect(res.body.allowedFeatures).toEqual(['scheduled_chats']);
 
     expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('user-1');
     expect(mockedGetAllowedPages).toHaveBeenCalledWith('user-1');
@@ -190,6 +192,10 @@ describe('GET /api/auth/me subscription fields', () => {
       orgId: 'org-1',
       ownerUserId: 'owner-1',
       name: 'Test Org',
+      // Populated so the ENG-927 owner-record fallback does not fire here: the
+      // guard below is that the BILLING overlay never reads the owner record,
+      // and an unrelated brand lookup would blunt it.
+      brandGuidelines: { brandData: { brandName: 'Test Org Brand' } },
     } as any);
 
     mockedGetUserSubscriptionType.mockResolvedValueOnce('Pro');

@@ -379,6 +379,48 @@ export async function getOutlookCredentials(): Promise<OutlookCredentials> {
 }
 
 /**
+ * Interface for Calendly OAuth credentials returned from Secrets Manager
+ */
+export interface CalendlyCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Calendly OAuth credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Calendly (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Calendly OAuth client credentials
+ */
+export async function getCalendlyCredentials(): Promise<CalendlyCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Calendly'
+      : 'dev/AgentWeb/Calendly';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Calendly credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as CalendlyCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Calendly credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Calendly credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Calendly credentials from Secrets Manager');
+  }
+}
+
+/**
  * Interface for Twitter/X OAuth2 credentials returned from Secrets Manager
  */
 export interface TwitterCredentials {

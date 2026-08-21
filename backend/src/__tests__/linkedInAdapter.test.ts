@@ -48,13 +48,14 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { linkedInService } from '../services/linkedInService';
-import { ConnectedAccount } from '../services/connectedAccountsDb';
+import { ConnectedAccount, updateAccountTokens } from '../services/connectedAccountsDb';
 import * as linkedInPostsDb from '../services/linkedInPostsDb';
 const mockPostsDb = linkedInPostsDb as jest.Mocked<typeof linkedInPostsDb>;
 
 describe('LinkedInAdapter', () => {
   let adapter: LinkedInAdapter;
   const mockLinkedInService = linkedInService as jest.Mocked<typeof linkedInService>;
+  const mockUpdateAccountTokens = updateAccountTokens as jest.MockedFunction<typeof updateAccountTokens>;
 
   // Test fixtures
   const mockPersonalAccount: ConnectedAccount = {
@@ -92,6 +93,7 @@ describe('LinkedInAdapter', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
     adapter = new LinkedInAdapter();
   });
 
@@ -105,6 +107,9 @@ describe('LinkedInAdapter', () => {
         'test-access-token',
         'urn:li:person:abc123',
         'Hello LinkedIn!',
+        undefined,
+        // ENG-827: the consent re-check is handed down so linkedInService can run it
+        // at the request itself, after the link-preview work. Absent here (no hook).
         undefined
       );
       expect(result).toEqual({
@@ -124,6 +129,7 @@ describe('LinkedInAdapter', () => {
         'test-org-token',
         'urn:li:organization:123456',
         'Company announcement',
+        undefined,
         undefined
       );
       expect(result.success).toBe(true);
@@ -149,7 +155,8 @@ describe('LinkedInAdapter', () => {
         'test-org-token',
         'urn:li:organization:123456',
         'Post with image',
-        ['urn:li:image:123']
+        ['urn:li:image:123'],
+        undefined
       );
       expect(result.success).toBe(true);
     });
@@ -180,6 +187,41 @@ describe('LinkedInAdapter', () => {
       mockLinkedInService.createPost.mockRejectedValue(error);
 
       await expect(adapter.createPost(mockPersonalAccount, 'Test')).rejects.toThrow('Network error');
+    });
+  });
+
+  describe('disconnect during token refresh', () => {
+    it('does not create a reaction if persisting a refreshed token loses to disconnect', async () => {
+      const expiredAccount: ConnectedAccount = {
+        ...mockPersonalAccount,
+        config: {
+          ...mockPersonalAccount.config,
+          token_expires_at: Date.now() - 1000,
+        },
+      };
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'refreshed-token',
+        refresh_token: 'refreshed-refresh-token',
+        expires_in: 3600,
+      });
+      mockUpdateAccountTokens.mockRejectedValue(
+        Object.assign(new Error('LinkedIn account changed or disconnected while refreshing; retry'), {
+          code: 'ConnectedAccountChanged',
+        }),
+      );
+
+      await expect(
+        adapter.createReaction(expiredAccount, 'urn:li:share:123', 'LIKE', 'user-123'),
+      ).rejects.toThrow('changed or disconnected');
+
+      expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
+        'user-123',
+        'linkedin',
+        expect.objectContaining({ access_token: 'refreshed-token' }),
+        expiredAccount.account_id,
+        expiredAccount,
+      );
+      expect(mockLinkedInService.createReaction).not.toHaveBeenCalled();
     });
   });
   describe('listPosts', () => {
@@ -1527,4 +1569,3 @@ describe('LinkedInAdapter', () => {
     });
   });
 });
-

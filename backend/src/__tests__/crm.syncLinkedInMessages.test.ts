@@ -32,6 +32,7 @@ const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
 const mockUpdateLeadLinkedInSyncAt = jest.fn();
 const mockGetUserById = jest.fn();
+const mockGetOrgById = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -43,6 +44,7 @@ jest.mock('../services/db', () => ({
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
   userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
+  orgDb: { getOrgById: (...args: any[]) => mockGetOrgById(...args) },
 }));
 
 const mockAddLinkedInMessageEvent = jest.fn();
@@ -180,20 +182,25 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/sync-linkedin-messages', () 
     expect(res.status).toHaveBeenCalledWith(403);
   });
 
-  it('allows org member to sync LinkedIn messages on org owner list', async () => {
+  it('returns 403 when org member is not the list owner and not a CRM editor (ENG-686)', async () => {
+    // ENG-686: write access requires being the list owner, org owner, or a listed crm.editor.
+    // A plain org member (same org, different userId, not in editors) is denied.
     mockGetLeadListById.mockResolvedValue(ORG_MEMBER_LIST);
     mockGetUserById
       .mockResolvedValueOnce({ userId: 'test-user-id', orgId: 'org-abc' })   // requesting user
       .mockResolvedValueOnce({ userId: 'org-owner-id', orgId: 'org-abc' });  // list owner
-    mockGetMessagesWithContact.mockResolvedValue([]);
+    mockGetOrgById.mockResolvedValue({
+      orgId: 'org-abc',
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] } },
+    });
     const req: any = {
       user: { userId: 'test-user-id' },
       params: { listId: 'list-123', leadId: 'lead-456' },
     };
     const res = makeRes();
     await handler!(req, res);
-    expect(res.status).not.toHaveBeenCalled();
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ synced: 0 }));
+    expect(res.status).toHaveBeenCalledWith(403);
   });
 
   it('returns 404 when lead not found', async () => {

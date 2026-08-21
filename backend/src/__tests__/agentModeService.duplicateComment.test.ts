@@ -16,6 +16,7 @@ jest.mock('../services/db', () => ({
 const mockGetAccountById = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountById: (...args: any[]) => mockGetAccountById(...args),
+  getAccountByIdConsistent: (...args: any[]) => mockGetAccountById(...args),
 }));
 
 const mockCreateComment = jest.fn();

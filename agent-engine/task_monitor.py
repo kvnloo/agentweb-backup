@@ -2,6 +2,7 @@
 import asyncio
 import boto3
 import os
+import sys
 import json
 import uuid
 import logging
@@ -14,6 +15,7 @@ from decimal import Decimal
 import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
+import secrets_manager
 import yaml
 import random
 from typing import Dict, Any, List, Optional
@@ -305,7 +307,7 @@ async def trigger_scheduled_chats():
         # enforces it once its own SCHEDULED_CHATS_SERVICE_SECRET is set, so
         # set the env var here BEFORE setting it on the backend.
         headers = {'Content-Type': 'application/json'}
-        service_secret = os.getenv('SCHEDULED_CHATS_SERVICE_SECRET')
+        service_secret = secrets_manager.get_scheduled_chats_service_secret()
         if service_secret:
             headers['x-service-secret'] = service_secret
 
@@ -792,7 +794,16 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         
         # Build command with logging redirection
         cmd = [
-            'python3', '-u',  # -u for unbuffered output
+            # sys.executable, not a bare 'python3' — 'python3' resolves via
+            # PATH at the time this subprocess spawns, which under systemd
+            # (no shell init / conda activation) may not be the same
+            # interpreter running this process at all. Observed live during
+            # ENG-389 testing: bare 'python3' resolved to a pre-3.12 system
+            # interpreter, and web_agent.py's f-string syntax (PEP 701,
+            # backslash inside an expression part) only parses on 3.12+ —
+            # every single web_agent.py invocation failed with a
+            # SyntaxError at parse time, for every LLM in the fallback list.
+            sys.executable, '-u',  # -u for unbuffered output
             'web_agent.py',
             '--user_id', user_id,
             '--llm_name', llm_name,
@@ -1012,7 +1023,20 @@ async def execute_task(execution):
     agent = None
     filtered_activity_log = None
     log_sync_manager = None  # Initialize to None
-    
+    # Read from `execution` (always available) rather than inside the
+    # `task_id.startswith('task-')` branch below (only entered when there's
+    # a real AW-Tasks entry) — referenced unconditionally later (revision
+    # handling), so they must be defined regardless of which branch runs.
+    # Previously caused UnboundLocalError for any ad-hoc ("task-"-prefixed)
+    # execution, e.g. workflow step tasks — found via ENG-389 live testing.
+    revision_prompt = execution.get('revision_prompt')
+    original_image_url = execution.get('original_image_url')
+    original_report_url = execution.get('original_report_url')
+    # Same class of bug as above — only ever set inside the task-lookup
+    # branch, referenced unconditionally later (prompt augmentation,
+    # run_web_agent_cli call).
+    lead_list_identifier = None
+
     try:
         # Get task details from tasks table if taskId doesn't start with 'task-'
         task_id = execution['taskId']
@@ -1022,15 +1046,15 @@ async def execute_task(execution):
             
             if not task:
                 raise Exception(f"Task {task_id} not found")
-                
+
+            lead_list_identifier = task.get('leadListIdentifier')
+
             # Check if this is a deep research task and track it
             is_deep_research = task.get('isDeepResearch', False)
             if is_deep_research:
                 running_task_ids[execution_id] = 'deep_research'
             else:
                 running_task_ids[execution_id] = 'standard'
-
-            lead_list_identifier = task.get('leadListIdentifier') if task else None
 
             # Get both accepted and rejected executions
             accepted_executions = executions_table.query(
@@ -1078,10 +1102,8 @@ async def execute_task(execution):
             # Prepare the prompt with previous feedback and user_id context
             base_prompt = execution.get('prompt') or task['prompt']
             
-            # Check if this is a revision execution
-            revision_prompt = execution.get('revision_prompt')
-            original_image_url = execution.get('original_image_url')
-            original_report_url = execution.get('original_report_url')
+            # Check if this is a revision execution (revision_prompt/original_image_url/
+            # original_report_url already set above, unconditionally)
             original_execution_id = execution.get('original_execution_id')
             
             if revision_prompt and (original_image_url or original_report_url):
@@ -1882,19 +1904,25 @@ async def monitor_executions():
             if pending_executions:
                 for execution in pending_executions:
                     user_id = execution['userId']
-                    
-                    if running_task_count < MAX_CONCURRENT:
-                        # Increment the counter to reserve the slot
-                        running_task_count += 1
-                        running_user_ids.add(user_id)
-                        logger.info(f"Running task count: {running_task_count}, user_id: {user_id}")
 
-                        task = asyncio.create_task(execute_task(execution))
-
-                        executed_count += 1
-                    else:
+                    if running_task_count >= MAX_CONCURRENT:
                         # If we can't start more tasks, break out of the loop
                         break
+
+                    if user_id in running_user_ids:
+                        # This user already has a task running - skip for now,
+                        # try the next pending execution instead of starving
+                        # everyone behind them this cycle (ENG-798).
+                        continue
+
+                    # Increment the counter to reserve the slot
+                    running_task_count += 1
+                    running_user_ids.add(user_id)
+                    logger.info(f"Running task count: {running_task_count}, user_id: {user_id}")
+
+                    task = asyncio.create_task(execute_task(execution))
+
+                    executed_count += 1
                 
                 # Only update last_execution_time if we executed all pending executions
                 if executed_count == len(pending_executions):

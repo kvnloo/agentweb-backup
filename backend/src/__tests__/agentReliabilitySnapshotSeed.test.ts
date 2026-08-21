@@ -30,6 +30,20 @@ jest.mock('../loops/adapters/awsAdapters', () => ({
   awsDynamoAdapter: () => dynamo,
 }));
 
+// ENG-1312: runAgentReliabilitySnapshot/seedReliabilitySnapshotsIfEmpty now
+// wire in readSatisfactionDimensionSamplesFromChatbotDb by default, which
+// lazy-imports chatbotService. Without this mock the real chatbotService
+// module (and its real AWS.DynamoDB.DocumentClient) would load and attempt a
+// live network call from what must stay a hermetic, network-free unit test
+// (per this repo's "Mocking AWS services with Jest" testing convention) — the
+// getRecentSessionsPage mock below keeps that call fully in-process.
+const getRecentSessionsPage = jest.fn().mockResolvedValue({ sessions: [] });
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    getRecentSessionsPage: (...a: unknown[]) => getRecentSessionsPage(...a),
+  },
+}));
+
 import {
   seedReliabilitySnapshotsIfEmpty,
   runAgentReliabilitySnapshot,
@@ -148,6 +162,14 @@ describe('runAgentReliabilitySnapshot', () => {
     expect(dynamo.putItem).toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('[AgentReliabilitySnapshot] 2026-06-14'));
     log.mockRestore();
+  });
+
+  it('ENG-1312: wires readSatisfactionDimensionSamplesFromChatbotDb by default — the reliability-trend endpoint actually gets fed real satisfaction-dimension data, not just a computation function nobody calls', async () => {
+    seedVerdict('2026-06-14T10:00:00.000Z', 'ok', 'r1');
+
+    await runAgentReliabilitySnapshot();
+
+    expect(getRecentSessionsPage).toHaveBeenCalled();
   });
 
   it('notes catch-up rows in the summary line', async () => {

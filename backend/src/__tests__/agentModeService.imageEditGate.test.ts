@@ -39,7 +39,7 @@ const genImage = (
     'gemini-3-pro-image-preview',
     undefined,
     opts.confirm
-  );
+  , 'ad');
 
 describe('AgentModeService - generateImage edit-confirmation gate', () => {
   let service: AgentModeService;

@@ -21,6 +21,7 @@ jest.mock('../services/db', () => ({
     setLeadFields: jest.fn(),
   },
   userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
 }));
 
 const mockApollo = {
@@ -32,10 +33,12 @@ jest.mock('../services/apolloService', () => ({
 }));
 
 import crmApolloRouter, { __resetBulkEnrichLockForTesting } from '../routes/crmApollo';
-import { crmDb } from '../services/db';
+import { crmDb, userDb, orgDb } from '../services/db';
 import { authenticateToken } from '../middleware/auth';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 
 const app = express();
 app.use(express.json());
@@ -171,5 +174,56 @@ describe('Bulk Apollo enrich — race-safe writes', () => {
     // enrichmentMetadata is per-key, never the full map.
     expect(optsArg.enrichmentMetadata).toBeDefined();
     expect(typeof optsArg.enrichmentMetadata).toBe('object');
+  });
+});
+
+describe('POST /api/crm/lists/:listId/leads/enrich-with-apollo — org-aware access control (ENG-686)', () => {
+  // authenticateToken (mocked above) always authenticates as 'u1'. The list is
+  // owned by a different same-org member, 'owner-2'.
+  function setSameOrgUsers() {
+    mockUserDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? ({ userId: 'owner-2', orgId: 'org-A' } as any) : ({ userId: 'u1', orgId: 'org-A' } as any))
+    );
+  }
+  function orgWithCrm(overrides: Record<string, any> = {}) {
+    return {
+      orgId: 'org-A',
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+      ...overrides,
+    };
+  }
+
+  it('returns 403 for a same-org member who is not the owner and not a CRM editor', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+    const res = await request(app).post('/api/crm/lists/L1/leads/enrich-with-apollo').send({});
+
+    expect(res.status).toBe(403);
+    expect(mockCrmDb.setLeadFields).not.toHaveBeenCalled();
+  });
+
+  it('allows a listed crm.editor to bulk-enrich another member\'s list', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['u1'] } } }) as any);
+
+    const res = await request(app).post('/api/crm/lists/L1/leads/enrich-with-apollo').send({});
+
+    expect(res.status).toBe(202);
+  });
+
+  it('allows the org owner to bulk-enrich another member\'s list', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'u1' }) as any);
+
+    const res = await request(app).post('/api/crm/lists/L1/leads/enrich-with-apollo').send({});
+
+    expect(res.status).toBe(202);
   });
 });

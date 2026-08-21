@@ -12,10 +12,17 @@ const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [
 jest.mock('../services/agentModeService', () => ({
   agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
 }));
+// chatbotService loads its knowledge base at module import time. Keep this
+// enrichment test on the in-process fixture instead of fetching Mintlify docs.
+jest.mock('../services/docsKnowledgeSource', () => {
+  const actual = jest.requireActual('../services/docsKnowledgeSource');
+  return { ...actual, fetchMintlifyDocsContent: jest.fn().mockResolvedValue('') };
+});
 
 import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
+import * as llmServiceModule from '../utils/llmService';
 import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
@@ -36,6 +43,23 @@ function mockApolloService(matchPerson = makeMatchPerson()): jest.SpyInstance {
   const svc = { matchPerson, matchOrg: jest.fn(), findEmail: jest.fn() } as unknown as ApolloService;
   jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(true);
   return jest.spyOn(apolloServiceModule, 'getApolloService').mockReturnValue(svc);
+}
+
+// ENG-1111: when Apollo's mapped fields don't cover every requested field (e.g.
+// linkedin_url isn't in Apollo's raw person data), the person_identity waterfall step
+// falls through to an LLM confirmation call via generateJSONContent
+// (enrichmentV3RealDeps.ts's apollo-tier extraction branch) regardless of what a given
+// test is actually exercising. Without stubbing it, that call reached the real,
+// unmocked LLM client. Resolving to {} matches the "LLM found nothing" path these tests
+// already rely on for their assertions (none of them assert on the LLM-derived value).
+function mockLLMNoData() {
+  const generateJSONContent = jest.fn().mockResolvedValue({});
+  const generateJSONContentWithWebSearch = jest.fn().mockResolvedValue({});
+  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({
+    generateJSONContent,
+    generateJSONContentWithWebSearch,
+  } as any);
+  return { generateJSONContent, generateJSONContentWithWebSearch };
 }
 
 function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
@@ -171,6 +195,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
   it('calls matchPerson with email when email present', async () => {
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({ email: 'jane@acme.com' });
@@ -192,6 +217,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
   it('prefers email over name+domain when both present', async () => {
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({
@@ -223,6 +249,7 @@ describe('fetchApolloPerson — email path (existing behaviour)', () => {
     // trusted. The name must be threaded even when email is present.
     const matchPersonSpy = jest.fn().mockResolvedValue(MATCH_RESULT);
     mockApolloService(matchPersonSpy);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     const lead = makeLead({ email: 'joe@us.com', firstName: 'Joe', lastName: 'Hio' });
@@ -308,6 +335,7 @@ describe('enrichSoReverseLookup adapter', () => {
     const reverseLookup = jest.fn().mockResolvedValue(null);
     mockEnrichSoService(reverseLookup);
     jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     await deps.resolveIdentity({

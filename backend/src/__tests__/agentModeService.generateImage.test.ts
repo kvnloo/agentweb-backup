@@ -57,7 +57,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview'
-      );
+      , undefined, undefined, 'ad');
 
       expect(result.success).toBe(true);
       expect(enqueueAutoHumanEvalSpy).toHaveBeenCalledWith(expect.objectContaining({
@@ -93,7 +93,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini_2.5_flash'
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -125,7 +125,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini_2.5_flash'
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -156,7 +156,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -187,7 +187,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       // Should pass undefined, which will trigger default behavior in imageService
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
@@ -222,7 +222,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gen4_image'
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -257,7 +257,7 @@ describe('AgentModeService - generate_image function', () => {
           'user123',
           'session123',
           model
-        );
+        , undefined, undefined, 'ad');
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -288,7 +288,7 @@ describe('AgentModeService - generate_image function', () => {
           'user123',
           'session123',
           'gemini-3-pro-image-preview'
-        );
+        , undefined, undefined, 'ad');
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith({
           prompt: 'Test prompt',
@@ -327,7 +327,7 @@ describe('AgentModeService - generate_image function', () => {
         undefined, // imageModel
         undefined, // logoImage
         true       // confirm: bypass the image-edit confirmation gate
-      );
+      , 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -358,7 +358,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -398,7 +398,7 @@ describe('AgentModeService - generate_image function', () => {
         'gemini-3-pro-image-preview',
         undefined, // logoImage
         true       // confirm: bypass the image-edit confirmation gate
-      );
+      , 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Add the logo to the top right corner of the image',
@@ -441,7 +441,7 @@ describe('AgentModeService - generate_image function', () => {
           model,
           undefined, // logoImage
           true       // confirm: bypass the image-edit confirmation gate
-        );
+        , 'ad');
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -467,7 +467,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('not available');
@@ -487,7 +487,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Generation failed');
@@ -513,7 +513,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(true);
       expect(result.imageUrl).toBe('https://example.com/fallback-image.png');
@@ -546,7 +546,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gpt-image-2'
-      );
+      , undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('503 temporarily unavailable');
@@ -570,7 +570,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(true);
       expect(result.fallbackUsed).toBe(true);
@@ -595,7 +595,7 @@ describe('AgentModeService - generate_image function', () => {
         'gemini-3-pro-image-preview',
         undefined,
         true
-      );
+      , 'ad');
 
       expect(result.success).toBe(false);
       expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
@@ -616,7 +616,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview'
-      );
+      , undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Safety policy blocked this image prompt');
@@ -634,7 +634,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Service error');
@@ -658,7 +658,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gpt-image-1'
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -690,7 +690,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview'
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Test prompt',
@@ -722,7 +722,7 @@ describe('AgentModeService - generate_image function', () => {
         [],
         'user123',
         'session123'
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -754,7 +754,7 @@ describe('AgentModeService - generate_image function', () => {
           'user123',
           'session123',
           'gpt-image-1'
-        );
+        , undefined, undefined, 'ad');
 
         expect(mockImageService.generateImage).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -786,7 +786,7 @@ describe('AgentModeService - generate_image function', () => {
         'gemini-3-pro-image-preview',
         'https://example.com/logo.png',
         true // confirm: bypass the image-edit confirmation gate
-      );
+      , 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Create a banner with the company logo',
@@ -819,7 +819,7 @@ describe('AgentModeService - generate_image function', () => {
         'session123',
         'gemini-3-pro-image-preview'
         // logoImage not provided
-      );
+      , undefined, undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -847,7 +847,7 @@ describe('AgentModeService - generate_image function', () => {
         'session123',
         'gemini-3-pro-image-preview',
         'https://example.com/my-logo.png'
-      );
+      , undefined, 'ad');
 
       expect(mockImageService.generateImage).toHaveBeenCalledWith({
         prompt: 'Generate a social media banner with this logo',
@@ -932,7 +932,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123'
         // no explicit imageModel → the admin default is resolved internally
-      );
+      , undefined, undefined, undefined, 'ad');
 
       expect(result.success).toBe(true);
       expect(result.imageUrl).toBe('https://example.com/fallback-image.png');
@@ -970,7 +970,7 @@ describe('AgentModeService - generate_image function', () => {
         'user123',
         'session123',
         'gemini-3-pro-image-preview' // explicit choice
-      );
+      , undefined, undefined, 'ad');
 
       expect(result.success).toBe(false);
       expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
@@ -979,5 +979,78 @@ describe('AgentModeService - generate_image function', () => {
 
       defaultSpy.mockRestore();
     });
+  });
+});
+
+describe('Category declaration at the enqueue boundary (ENG-343)', () => {
+  let agentModeService: AgentModeService;
+  let mockImageService: any;
+  let enqueueSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    enqueueSpy = jest
+      .spyOn(autoHumanEvalService, 'enqueueAutoHumanEval')
+      .mockResolvedValue(null as any);
+    mockImageService = {
+      generateImage: jest.fn().mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      }),
+      isAvailable: jest.fn().mockResolvedValue(true)
+    };
+    (imageGeneration.imageService as any).isAvailable = mockImageService.isAvailable;
+    (imageGeneration.imageService as any).generateImage = mockImageService.generateImage;
+    agentModeService = new AgentModeService();
+  });
+
+  afterEach(() => {
+    enqueueSpy?.mockRestore();
+  });
+
+  const call = (category?: any) =>
+    (agentModeService as any).generateImage(
+      'Test prompt', 'test.png', '1024x1024', 'medium', [],
+      'user123', 'session123', undefined, undefined, undefined, category
+    );
+
+  it('fails visibly when category is missing: no generation, no eval candidate', async () => {
+    const result = await call(undefined);
+    expect(result.success).toBe(false);
+    expect(String(result.error)).toContain('category');
+    expect(mockImageService.generateImage).not.toHaveBeenCalled();
+    expect(enqueueSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails visibly on an invalid category: no generation, no eval candidate', async () => {
+    const result = await call('banner');
+    expect(result.success).toBe(false);
+    expect(String(result.error)).toContain('category');
+    expect(mockImageService.generateImage).not.toHaveBeenCalled();
+    expect(enqueueSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails visibly on a non-string category: no generation, no eval candidate', async () => {
+    const result = await call(42);
+    expect(result.success).toBe(false);
+    expect(mockImageService.generateImage).not.toHaveBeenCalled();
+    expect(enqueueSpy).not.toHaveBeenCalled();
+  });
+
+  it("threads category 'ad' onto the enqueued eval candidate", async () => {
+    const result = await call('ad');
+    expect(result.success).toBe(true);
+    expect(enqueueSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewType: 'creative_image', category: 'ad' })
+    );
+  });
+
+  it("threads category 'organic_post' onto the enqueued eval candidate", async () => {
+    const result = await call('organic_post');
+    expect(result.success).toBe(true);
+    expect(enqueueSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewType: 'creative_image', category: 'organic_post' })
+    );
   });
 });

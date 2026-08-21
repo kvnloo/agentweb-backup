@@ -1,4 +1,8 @@
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
+import {
+  appendConfirmedPublishNotice,
+  ledgerFromSucceededFunctions,
+} from "../utils/falseFailureReport";
 
 export const SCORING_MODEL = "gemini-3.1-flash-lite";
 
@@ -146,6 +150,90 @@ ADDITIONAL REQUIRED FIELD — "taskRequested":
 
 Include it in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
+
+/**
+ * ENG-1312: the judge originally scored only goalCompletion / dataAccuracy /
+ * outputQuality, so it had no way to flag a reply that was technically correct
+ * but drastically over length, ignored an explicit instruction, or asked
+ * permission for a safe (read-only/draft/test) action — exactly the shape of
+ * the regression Ed (xCures) and Phoenix (Vince) reported on 08-17. This adds
+ * three signals plus a rule against rewarding pushback.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE: production
+ * carries a live `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to these fields — the same masking failure (ENG-392)
+ * that let the judge miss this regression for two weeks in the first place.
+ */
+export const VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE = `
+
+ADDITIONAL REQUIRED DIMENSIONS — include these in the SAME "dimensions" object as goalCompletion/dataAccuracy/outputQuality:
+- "concision" (0-5): Did the reply's length match what the question or the user's explicit length instruction called for? 5 = tightly matched; lower scores = further from the target length (too long is the common case, but an answer too short to actually answer the question also scores low). A short, correct, complete answer to a short question scores 5 even though it is short. A multi-page answer to a request for "a couple sentences", "one page", or "keep it brief" scores low regardless of how well-written it is.
+- "instructionCompliance" (0-5): When the user gave an explicit, unambiguous instruction — a length limit, a yes/no question, "don't guess", "do X now", a specific format — was it followed on the FIRST attempt, without the user having to repeat or correct it? 5 = followed immediately; 0 = ignored or contradicted. If the user gave no explicit instruction of this kind in the turn(s) being evaluated, score 5 — do not penalize for an instruction that was never given.
+- "unnecessaryPermissionRequest" (true/false): Did the assistant ask the user to confirm or approve a read-only, draft-only, or test/simulation action (e.g. "should I go ahead and run this test?", "want me to draft this for you?") where nothing was spent, nothing was published or sent, and no irreversible action was taken? Set true only when such an unnecessary confirmation prompt actually occurred. Set false otherwise — including when confirmation was correctly requested for a spend change, a publish/send action, or an irreversible action, since that confirmation is NOT unnecessary.
+
+ADDITIONAL SCORING RULE for outputQuality — pushback is not automatically excellent:
+When the user gives an explicit instruction that does NOT involve spending money, publishing, sending, or an otherwise irreversible action, and the assistant responds by arguing, countering, or otherwise not complying instead of doing what was asked — even if the assistant's reasoning is well-articulated — outputQuality for that turn's session may NOT score 5. Score it 3 or lower. A brief, single-sentence note of disagreement ALONGSIDE actually complying (do the thing, then note a concern in one sentence) is not pushback under this rule and is not penalized by it. EXCEPTION: this cap does NOT apply when noncompliance is a valid safety refusal — the instruction itself was harmful, illegal, or privacy-violating (e.g. asking the assistant to expose another user's private data, bypass a security control, or perform something clearly unsafe) and refusing was the correct response. A required safety refusal remains eligible for outputQuality 5.
+
+Include the new fields in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
+
+/**
+ * ENG-1245: judges scored a REAL "Require approval before publishing" hold
+ * on a schedule as a fabricated/simulated restriction ("falsely claiming",
+ * "simulated"), because the only text they ever see is the schedule's own
+ * prompt prose (e.g. "(Autonomous)", "no approval needed") plus the tool
+ * error / final report text describing the block. This clause stops the
+ * judge from scoring a correctly-withheld publish as an assistant fabrication.
+ *
+ * RE-VERIFIED, NOT JUST RE-FILED: the clause originally also told the judge
+ * this is always "an owner-configured account/schedule setting". Pulling the
+ * live schedule record for the exact session that motivated this ticket
+ * (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)")
+ * showed `requirePublishApproval: false` — the owner never turned that
+ * setting on. It had posted nothing since 2026-08-13 (the day after
+ * PR #2263/ENG-827 deployed) because it was simply never granted standing
+ * publish authorization, a distinct and far more common condition for a
+ * legacy schedule than a deliberate owner hold (see
+ * describePublishAuthorizationWithholdReason in schedulePublishAuthorization.ts,
+ * and the parallel accuracy fix in getScheduledSessionOverride /
+ * publishApprovalBlock, which stopped telling the owner to toggle a setting
+ * that was already off). Both cases are real, both are account-level, and
+ * the assistant is not fabricating either one — but the judge must not
+ * itself assert "the owner deliberately turned this on" when the transcript
+ * does not actually say that, or the same fabrication just relocates from
+ * the assistant's report into the judge's own "reason" text.
+ *
+ * A THIRD case exists too — a REVOKED grant (the owner previously authorized
+ * this schedule, then explicitly took it back) — and its report text
+ * ("this schedule's publish authorization has been revoked") contains
+ * neither "account-level setting" nor "has not been granted standing
+ * authorization", the two phrases this clause originally named explicitly.
+ * Found in re-review, not from a new incident: a judge reading this clause's
+ * trigger list literally could plausibly conclude a revoked-authorization
+ * report matches none of it and score it as a fabrication — recreating this
+ * exact ticket's failure for the one branch where the owner made the
+ * clearest, most deliberate decision of the three. Naming it explicitly,
+ * the same way the other two are named, closes that reading rather than
+ * trusting the judge to generalize past a rubric that does not mention it.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
+ * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
+ * `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge — the two judges
+ * that actually reproduced this bug) is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to this rule (ENG-392).
+ */
+export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
+
+IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
+- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because a schedule's publish authorization has been revoked, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
+- Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
+- Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
+- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
 
 /**
  * Read the judge's zero-task verdict, failing OPEN.
@@ -469,9 +557,18 @@ function hasRunFailureNotice(messages: ChatMessage[] = []): boolean {
 async function surfaceFailedRun(session: ChatSession): Promise<void> {
   if (hasRunFailureNotice(session.messages)) return;
   const nowIso = new Date().toISOString();
+  // ENG-971: "please send your message again to retry" is blanket advice, and a
+  // turn-less death does NOT mean nothing happened — see the note above about a run
+  // whose side-effecting tool call landed before the instance was terminated. If the
+  // ledger confirms a publish, name it, so the retry does not become a second
+  // production deploy. Append-only and idempotent; the isRunFailureNotice marker the
+  // dedup check keys off is metadata, so it survives untouched.
   const notice: ChatMessage = {
     role: "assistant",
-    content: RUN_FAILED_USER_MESSAGE,
+    content: appendConfirmedPublishNotice(
+      RUN_FAILED_USER_MESSAGE,
+      ledgerFromSucceededFunctions(session.calledFunctions),
+    ),
     timestamp: nowIso,
     metadata: { timestamp: nowIso, isErrorMessage: true, isRunFailureNotice: true },
   } as any;
@@ -579,7 +676,19 @@ type ScoringResult = {
   score: number;
   reason: string;
   evaluatedMessageIndex: number;
-  dimensions?: { goalCompletion: number; dataAccuracy: number; outputQuality: number };
+  dimensions?: {
+    goalCompletion: number;
+    dataAccuracy: number;
+    outputQuality: number;
+    /**
+     * ENG-1312 additions. Optional and parsed independently of the base three:
+     * a stale custom judge prompt (predating this change) will never populate
+     * them, and that must not invalidate goalCompletion/dataAccuracy/outputQuality.
+     */
+    concision?: number; // 0-5: did reply length match the question/instruction?
+    instructionCompliance?: number; // 0-5: explicit instruction followed on first attempt?
+    unnecessaryPermissionRequest?: boolean; // asked to confirm a safe (read-only/draft/test) action?
+  };
   /**
    * `false` when the judge reported that the user never requested anything, so
    * the session belongs outside the satisfaction cohort. `undefined` means the
@@ -589,16 +698,43 @@ type ScoringResult = {
   taskRequested?: boolean;
 };
 
+/** A finite number in `raw`, or undefined if missing/non-numeric. Distinguishes
+ * "the judge didn't answer" (leave undefined, fail open) from "the judge
+ * answered 0" (a real, in-range score). */
+function finiteNumber(v: any): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
   const d = raw?.dimensions;
   if (!d || typeof d !== "object") return undefined;
-  const clamp = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
+  const clamp1to5 = (v: any) => Math.max(1, Math.min(5, Math.round(Number(v))));
   if (!d.goalCompletion || !d.dataAccuracy || !d.outputQuality) return undefined;
-  return {
-    goalCompletion: clamp(d.goalCompletion),
-    dataAccuracy: clamp(d.dataAccuracy),
-    outputQuality: clamp(d.outputQuality),
+
+  const dimensions: NonNullable<ScoringResult["dimensions"]> = {
+    goalCompletion: clamp1to5(d.goalCompletion),
+    dataAccuracy: clamp1to5(d.dataAccuracy),
+    outputQuality: clamp1to5(d.outputQuality),
   };
+
+  // ENG-1312: each new field is optional and parsed independently — a missing
+  // or malformed one is simply omitted, never falls back to a default value
+  // that would masquerade as a real judge answer, and never invalidates the
+  // base three dimensions parsed above.
+  const clamp0to5 = (v: number) => Math.max(0, Math.min(5, Math.round(v)));
+  const concision = finiteNumber(d.concision);
+  if (concision !== undefined) dimensions.concision = clamp0to5(concision);
+  const instructionCompliance = finiteNumber(d.instructionCompliance);
+  if (instructionCompliance !== undefined) {
+    dimensions.instructionCompliance = clamp0to5(instructionCompliance);
+  }
+  if (typeof d.unnecessaryPermissionRequest === "boolean") {
+    dimensions.unnecessaryPermissionRequest = d.unnecessaryPermissionRequest;
+  }
+
+  return dimensions;
 }
 
 const SESSION_TYPE_HEADERS: Record<string, string> = {
@@ -634,9 +770,15 @@ export async function scoreSession(
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  // Append the zero-task clause to whatever prompt is configured — the stored
-  // override, if any, would otherwise mask it entirely (ENG-392/ENG-830).
-  const systemPrompt = (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE;
+  // Append the zero-task clause, the ENG-1312 verbosity/permission clause, and
+  // the ENG-1245 publish-approval-withholding clause to whatever prompt is
+  // configured — the stored override, if any, would otherwise mask them
+  // entirely (ENG-392/ENG-830).
+  const systemPrompt =
+    (await getDefaultScoringPrompt()) +
+    NO_TASK_JUDGMENT_CLAUSE +
+    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -706,10 +848,20 @@ export async function scoreSessionWithJudge(
   const llmPromise = agentModeService.callLLM(
     judgeModel,
     [
-      // Same appended clause as the general scorer, so a custom judge cannot
+      // Same appended clauses as the general scorer, so a custom judge cannot
       // disagree with it about whether a zero-task session is in the cohort
-      // (the Matt-5 vs Fangfang-3 split in ENG-830).
-      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE },
+      // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
+      // ENG-1312 verbosity/permission dimensions, or score a real
+      // publish-approval hold as fabricated (ENG-1245) just because its own
+      // prompt predates these rules.
+      {
+        role: "system",
+        content:
+          judge.systemPrompt +
+          NO_TASK_JUDGMENT_CLAUSE +
+          VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE,
+      },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
@@ -1011,11 +1163,13 @@ export async function scoreSessionIfNeeded(
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
   };
 
-  // Persist to DB
-  await chatbotDb.updateSessionSatisfactionScore(
+  // Persist to DB. A null return means an admin override landed on this row
+  // between the read above and this write (ENG-1332) — nothing was persisted,
+  // so report no score rather than claiming one that isn't actually stored.
+  const persisted = await chatbotDb.updateSessionSatisfactionScore(
     session.sessionId,
     satisfactionScore
   );
 
-  return satisfactionScore;
+  return persisted ? satisfactionScore : null;
 }

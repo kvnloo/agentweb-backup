@@ -1,6 +1,7 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
+import { isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 import { getLinkedInConfig } from '../../config/integrations';
 
 /**
@@ -52,12 +53,19 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           access_token: newTokens.access_token,
           refresh_token: newTokens.refresh_token,
           token_expires_at: Date.now() + (newTokens.expires_in * 1000),
-        }, account.account_id);
+        }, account.account_id, account);
       }
 
       return { token: newTokens.access_token, wasRefreshed: true };
     } catch (error: any) {
       console.error('[LinkedInAdapter] Token refresh failed:', error);
+
+      // A conditional token write lost to an account change or disconnect.
+      // Never turn that into a fresh in-memory credential for the provider
+      // call that follows.
+      if (error?.code === 'ConnectedAccountChanged') {
+        throw error;
+      }
       
       // Detect deactivated app (invalid_client error)
       const errorMessage = error?.message || '';
@@ -75,7 +83,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
@@ -102,8 +110,25 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         }
       }
 
-      // Create post (with or without images)
-      const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
+      // ENG-827: the image uploads above are network round-trips that can take a
+      // while, and the dispatcher's consent check ran BEFORE this method was entered.
+      // Re-check here — the last point at which nothing is public yet. An owner who
+      // revoked during the upload stops the post; an already-uploaded image is an
+      // unreferenced asset, not a publication.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning post — publish consent was withdrawn during media upload.');
+        return { success: false, message: withdrawn.error };
+      }
+
+      // Create post (with or without images). The hook goes down with it: a post that
+      // carries a URL and no image builds a link preview first — OG discovery, possibly
+      // a headless browser, a thumbnail upload — so the check above is not the last
+      // moment for that shape. linkedInService re-runs it at the request itself.
+      const postUrn = await linkedInService.createPost(
+        token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined,
+        assertStillAuthorized
+      );
 
       // Store post in database for both personal and company page accounts
       if (userId && (config.account_type === 'personal' || config.account_type === 'company_page')) {
@@ -133,6 +158,13 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       
       return result;
     } catch (error: any) {
+      // A consent withdrawn while the preview was being built is a deliberate stop,
+      // not a platform fault — report it as the refusal the caller already handles
+      // rather than letting it surface as a LinkedIn error someone might retry.
+      if (isPublishConsentWithdrawn(error)) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning post — publish consent was withdrawn before the write.');
+        return { success: false, message: error.message };
+      }
       // Rate limit handling
       if (error.response?.status === 429) {
         throw new Error('LinkedIn rate limit exceeded. Please try again later.');
@@ -144,13 +176,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult> {
+  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const actorUrn = account.account_id; // The account creating the comment
 
     try {
       // Get valid token (refreshes if expired)
       const { token } = await this.getValidToken(account, userId);
+
+      // ENG-827: the token refresh above is a network round-trip taken on a consent
+      // decision read before it. This is the last moment before the comment is public.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning comment — publish consent was withdrawn during the token refresh.');
+        return { success: false, message: withdrawn.error };
+      }
 
       // Create comment
       const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn);
@@ -193,11 +233,19 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createRepost(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult> {
+  async createRepost(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const authorUrn = account.account_id;
 
     try {
       const { token } = await this.getValidToken(account, userId);
+
+      // ENG-827: the token refresh above is a network round-trip taken on a consent
+      // decision read before it. This is the last moment before the repost is public.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning repost — publish consent was withdrawn during the token refresh.');
+        return { success: false, message: withdrawn.error };
+      }
 
       const repostUrn = await linkedInService.createRepost(token, authorUrn, originalPostUrn, commentary);
 

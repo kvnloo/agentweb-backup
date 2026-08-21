@@ -129,14 +129,17 @@ function configHasSecretPlaceholders(config: McpServerConfig): boolean {
 function resolveUserSecrets(env: Record<string, string>, userSecrets: Record<string, string>): Record<string, string> {
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
-    resolved[key] = value.replace(/\{\{(\w+)\}\}/g, (match, varName) => {
-      const secret = userSecrets[varName];
-      if (secret !== undefined) return secret;
-      console.warn(`MCP: Unresolved secret placeholder {{${varName}}}`);
-      return match; // Leave unresolved placeholder as-is
-    });
+    resolved[key] = resolveUserSecretPlaceholders(value, userSecrets);
   }
   return resolved;
+}
+
+function resolveUserSecretPlaceholders(value: string, userSecrets: Record<string, string>): string {
+  return value.replace(/\{\{(\w+)\}\}/g, (_match, varName) => {
+    const secret = userSecrets[varName];
+    if (secret !== undefined) return secret;
+    throw new Error(`MCP: Required user secret "${varName}" is not configured`);
+  });
 }
 
 /**
@@ -154,7 +157,11 @@ function getTransportType(config: McpServerConfig): "sse" | "stdio" | "streamabl
 // Session-based client pool entry
 interface SessionClientPool {
   clients: Map<string, Client>;
+  pendingClients: Map<string, Promise<Client>>;
   lastActivity: number;
+  released: boolean;
+  /** Tool calls currently executing against this pool. A busy pool is never reclaimed. */
+  inFlight: number;
 }
 
 // Circuit breaker state for a server
@@ -182,11 +189,52 @@ function isConnectionError(error: unknown): boolean {
   );
 }
 
+// A page-URL probe is a cheap in-page eval, not a page load — keep it short so a wedged
+// browser can never make it a tax on the caller.
+const PAGE_PROVENANCE_TIMEOUT_MS = 10000;
+
 const BROWSER_TOOL_MAX_RETRIES = 2;
 const BROWSER_TOOL_RETRY_DELAY_MS = 2000;
 
+// How often idle session client pools are swept (the idle TTL itself is SESSION_TIMEOUT_MS).
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
 function isBrowserTool(toolName: string): boolean {
   return toolName.startsWith('playwright_') || toolName.startsWith('browser_');
+}
+
+/**
+ * DOM reads that come back with no indication of which page they were read from.
+ * Playwright MCP reports the page for navigate and run_code but not for evaluate, so an
+ * evaluate() result is the one place a caller cannot tell a real "no results" from a read
+ * of the wrong page (ENG-1118).
+ */
+function isUnattributedDomRead(toolName: string): boolean {
+  return toolName === 'browser_evaluate' || toolName === 'playwright_browser_evaluate';
+}
+
+/**
+ * True when a server drives a real browser (Playwright MCP and friends).
+ *
+ * A browser MCP process owns ONE browser with one live page, so its client can
+ * never be shared by two chat sessions: whichever session navigates last owns
+ * the page, and the other session's evaluate() silently reads the wrong site
+ * (ENG-1118). Detected from the server name, tool prefix and launch command so
+ * a renamed or DB-configured browser server is still recognised.
+ */
+function isBrowserServer(serverName: string, entry?: { config: McpServerConfig; toolPrefix?: string }): boolean {
+  const config = entry?.config as Record<string, any> | undefined;
+  const haystack = [
+    serverName,
+    entry?.toolPrefix,
+    config?.command,
+    config?.url,
+    ...(Array.isArray(config?.args) ? config!.args : []),
+  ]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes('playwright') || haystack.includes('browser');
 }
 
 function sleep(ms: number): Promise<void> {
@@ -206,9 +254,43 @@ export class McpClientService {
   // Servers that have {{...}} secret placeholders and need per-user resolution
   private serversWithSecretPlaceholders: Set<string> = new Set();
 
+  // Generated Playwright --config / stealth-script files, by pool key, so they can be
+  // deleted along with the pool that owns them.
+  private playwrightConfigFiles: Map<string, Set<string>> = new Map();
+
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
+
+  // Browser pools are far more expensive than the rest (one Chromium each) and, since
+  // ENG-1118, there is one per chat session rather than one per user. They all live in the
+  // single long-lived generateMarketingResponse worker and no caller releases them at
+  // session end, so they get their own, much shorter idle TTL plus a hard cap. Both are
+  // env-tunable so prod can be retuned without a deploy.
+  // Defaults to the ordinary pool TTL: the cap below bounds how many browsers exist at
+  // once, so the TTL is only garbage collection and has no reason to be stricter — and
+  // shortening it would narrow an existing guarantee (a user who steps away mid-chat must
+  // still come back to the page their session left behind). Scheduled runs don't depend on
+  // it at all; they hand their browser back at run end.
+  private readonly BROWSER_IDLE_TIMEOUT_MS = parseInt(
+    process.env.MCP_BROWSER_IDLE_TIMEOUT_MS || String(this.SESSION_TIMEOUT_MS), 10);
+  private readonly MAX_BROWSER_CLIENTS = parseInt(process.env.MCP_MAX_BROWSER_CLIENTS || '6', 10);
+  // At the cap we wait for a slot rather than spawning another Chromium: a cron burst then
+  // costs a little latency instead of unbounded memory. Bounded, so a genuinely stuck fleet
+  // degrades to running over the cap instead of blocking a run forever.
+  private readonly BROWSER_SLOT_WAIT_MS = parseInt(process.env.MCP_BROWSER_SLOT_WAIT_MS || '30000', 10);
+  private readonly BROWSER_SLOT_POLL_MS = parseInt(process.env.MCP_BROWSER_SLOT_POLL_MS || '1000', 10);
+  // Slots taken by sessions that are still spawning their browser. Without this, sessions
+  // that ask at the same moment all measure capacity before any of them has registered a
+  // client, and every one of them is admitted — which is exactly the burst the cap exists
+  // for. Reserved is incremented at the instant admission is granted (no await in between,
+  // so the check and the reservation cannot interleave) and released once creation settles.
+  private browserSlotsReserved = 0;
+  // A pool is only evictable once it has been quiet for this long. 5 min, because "quiet"
+  // is not "finished": an agent turn can easily spend minutes on LLM thinking or a long
+  // tool result between two browser calls, and evicting there would hand that session a
+  // blank page mid-run — a milder version of the very bug this ticket is about.
+  private readonly BROWSER_EVICTION_GRACE_MS = parseInt(process.env.MCP_BROWSER_EVICTION_GRACE_MS || String(5 * 60 * 1000), 10);
 
   // Circuit breaker: fail fast when a server has timed out repeatedly
   private readonly CIRCUIT_BREAKER_THRESHOLD = parseInt(process.env.MCP_CIRCUIT_BREAKER_THRESHOLD || '3', 10);
@@ -217,6 +299,11 @@ export class McpClientService {
 
   // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
   private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
+  // Generated --config / stealth-script files for Playwright MCP processes.
+  private static readonly PLAYWRIGHT_CONFIG_DIR = '/tmp/playwright-mcp-configs';
+  // Orphans older than this (left by a hard kill) are swept at startup. Deliberately not
+  // "anything not ours": another process may be mid-launch with a config we didn't write.
+  private static readonly PLAYWRIGHT_CONFIG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
   private static playwrightBrowsersInstall: Promise<void> | null = null;
 
   constructor() {
@@ -269,9 +356,65 @@ export class McpClientService {
   }
 
   /**
+   * Connect a client with one bounded timeout path. On every failure the SDK
+   * client owns and closes its transport, so callers cannot retain a half-open
+   * HTTP stream or stdio subprocess.
+   */
+  private async connectClient(
+    client: Client,
+    transport: Transport,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      });
+      await Promise.race([
+        client.connect(transport, { timeout: timeoutMs }),
+        timeout,
+      ]);
+    } catch (error) {
+      await this.closeClient(client);
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async closeClient(client: Client): Promise<void> {
+    try {
+      await client.close();
+    } catch (error) {
+      // Preserve the original lifecycle error while making cleanup failures visible.
+      console.error('MCP: Failed to close client during lifecycle cleanup:', error);
+    }
+  }
+
+  private async evictSessionClient(poolKey: string, serverName: string, expectedClient?: Client): Promise<void> {
+    const pool = this.sessionClientPools.get(poolKey);
+    const client = pool?.clients.get(serverName);
+    if (!pool || !client || (expectedClient && client !== expectedClient)) return;
+
+    pool.clients.delete(serverName);
+    try {
+      await client.close();
+    } catch (error) {
+      console.error(`[MCP-SESSION] Error closing evicted client for ${serverName}:`, error);
+    }
+  }
+
+  /**
    * Initialize MCP clients and discover tools
    */
   async initialize(): Promise<void> {
+    if (!this.cleanupInterval) {
+      this.startSessionCleanup();
+    }
+    // Clear Playwright configs orphaned by a previous process that died without releasing
+    // its pools; the per-pool cleanup can't reach those.
+    this.sweepStalePlaywrightConfigs();
     try {
       // 1. Load Internal Config (from code)
       // Skip servers marked isInternal: true — they connect back to ourselves
@@ -350,12 +493,16 @@ export class McpClientService {
   }
 
   /**
-   * Start periodic cleanup of stale session client pools
+   * Start periodic cleanup of stale session client pools.
+   * Sweeps at most every 5 minutes: browser servers pool per chat session, so an
+   * ended session's browser process must be reclaimed soon after its idle TTL
+   * expires rather than up to a full TTL later.
    */
   private startSessionCleanup() {
+    const sweepIntervalMs = Math.min(this.SESSION_TIMEOUT_MS, SESSION_SWEEP_INTERVAL_MS);
     this.cleanupInterval = setInterval(() => {
       this.cleanupStaleSessions();
-    }, this.SESSION_TIMEOUT_MS);
+    }, sweepIntervalMs);
     // Don't let this periodic timer keep the process (or a test run) alive on its own.
     this.cleanupInterval.unref?.();
   }
@@ -368,56 +515,322 @@ export class McpClientService {
     const staleSessionIds: string[] = [];
 
     for (const [sessionId, pool] of this.sessionClientPools.entries()) {
-      if (now - pool.lastActivity > this.SESSION_TIMEOUT_MS) {
+      // A pool with a call in progress is live work, however old lastActivity looks —
+      // reclaiming it would pull the browser out from under a running step.
+      if (pool.inFlight > 0) continue;
+      const idleLimit = this.isBrowserPool(pool) ? this.BROWSER_IDLE_TIMEOUT_MS : this.SESSION_TIMEOUT_MS;
+      if (now - pool.lastActivity > idleLimit) {
         staleSessionIds.push(sessionId);
       }
     }
 
     for (const sessionId of staleSessionIds) {
       console.log(`[MCP-CLEANUP] Removing stale session client pool: ${sessionId.substring(0, 8)}`);
-      await this.releaseSessionClients(sessionId);
+      await this.releasePool(sessionId);
     }
   }
 
   /**
-   * Update last activity timestamp for a session
+   * Remember the generated Playwright config files belonging to a pool so releasing the
+   * pool can delete them. Startup/shared clients pass no pool key — those are keyed by
+   * server name, are created once, and live as long as the process does.
    */
-  private touchSession(sessionId: string) {
-    const pool = this.sessionClientPools.get(sessionId);
-    if (pool) {
-      pool.lastActivity = Date.now();
+  private trackPlaywrightConfigFiles(poolKey: string | undefined, files: string[]): void {
+    if (!poolKey) return;
+    const tracked = this.playwrightConfigFiles.get(poolKey) || new Set<string>();
+    files.forEach(file => tracked.add(file));
+    this.playwrightConfigFiles.set(poolKey, tracked);
+  }
+
+  /** Best-effort delete of a pool's generated Playwright config files. */
+  private removePlaywrightConfigFiles(poolKey: string): void {
+    const tracked = this.playwrightConfigFiles.get(poolKey);
+    if (!tracked) return;
+    this.playwrightConfigFiles.delete(poolKey);
+    for (const file of tracked) {
+      try {
+        fs.unlinkSync(file);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          console.warn(`MCP: Could not remove Playwright config file ${file}:`, (error as Error).message);
+        }
+      }
     }
+  }
+
+  /**
+   * Sweep Playwright config files old enough that no live process can still be reading them.
+   * Covers the case our per-pool cleanup cannot: a hard kill (SIGKILL/OOM) that leaves the
+   * files with no pool to release them.
+   */
+  private sweepStalePlaywrightConfigs(): void {
+    const dir = McpClientService.PLAYWRIGHT_CONFIG_DIR;
+    try {
+      if (!fs.existsSync(dir)) return;
+      const cutoff = Date.now() - McpClientService.PLAYWRIGHT_CONFIG_MAX_AGE_MS;
+      let removed = 0;
+      for (const entry of fs.readdirSync(dir)) {
+        const file = path.join(dir, entry);
+        try {
+          if (fs.statSync(file).mtimeMs < cutoff) {
+            fs.unlinkSync(file);
+            removed++;
+          }
+        } catch {
+          // Raced with another process cleaning the same file — nothing to do.
+        }
+      }
+      if (removed > 0) {
+        console.log(`MCP: Swept ${removed} stale Playwright MCP config file(s) from ${dir}`);
+      }
+    } catch (error) {
+      console.warn('MCP: Failed to sweep stale Playwright MCP config files:', (error as Error).message);
+    }
+  }
+
+  /** True when a pool holds at least one browser-backed client (i.e. owns a Chromium). */
+  private isBrowserPool(pool: SessionClientPool): boolean {
+    for (const serverName of pool.clients.keys()) {
+      if (isBrowserServer(serverName, this.serverConfigs.get(serverName))) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Mark a tool call as started (+1) or settled (-1) against a pool.
+   * Keeps a pool off both reclaim paths for the duration of the call, and refreshes
+   * lastActivity when the call settles so a long step doesn't age out mid-flight.
+   */
+  private markPoolBusy(poolKey: string, delta: 1 | -1): void {
+    const pool = this.sessionClientPools.get(poolKey);
+    if (!pool) return;
+    pool.inFlight = Math.max(0, pool.inFlight + delta);
+    pool.lastActivity = Date.now();
+  }
+
+  /**
+   * Bound the number of live browser clients, evicting the least-recently-used one.
+   *
+   * Only pools that are idle (no in-flight call) and past the grace window are eligible,
+   * and the pool that just asked for a client is never a candidate. If nothing is safely
+   * evictable we deliberately overshoot the cap and say so — memory pressure is recoverable,
+   * yanking a browser out of a running session is exactly the ENG-1118 failure we're fixing.
+   */
+  private async acquireBrowserSlot(currentPoolKey: string): Promise<void> {
+    if (this.MAX_BROWSER_CLIENTS <= 0) {
+      this.browserSlotsReserved++;
+      return;
+    }
+    const deadline = Date.now() + this.BROWSER_SLOT_WAIT_MS;
+
+    while (true) {
+      // Reclaim whatever is safely reclaimable first — that alone usually frees the slot.
+      await this.evictIdleBrowserPools(currentPoolKey);
+
+      const inUse = this.countBrowserPools() + this.browserSlotsReserved;
+      if (inUse < this.MAX_BROWSER_CLIENTS) {
+        this.browserSlotsReserved++;
+        return;
+      }
+
+      if (Date.now() >= deadline) {
+        console.warn(
+          `[MCP-SESSION] ${inUse} browser client(s) live or starting, over the browser client cap `
+          + `of ${this.MAX_BROWSER_CLIENTS}, and none became idle within ${this.BROWSER_SLOT_WAIT_MS}ms — `
+          + `starting another rather than blocking this run. Raise MCP_MAX_BROWSER_CLIENTS if this recurs.`
+        );
+        this.browserSlotsReserved++;
+        return;
+      }
+      // Another session's call may settle and age out while we wait.
+      await sleep(this.BROWSER_SLOT_POLL_MS);
+    }
+  }
+
+  /**
+   * Append the page a DOM read came from, so a caller can tell "this site has no results"
+   * from "this is not the site I asked for".
+   *
+   * Deliberately provenance and not a gate: an assertion strict enough to catch a wrong
+   * page also fails the legitimate redirects this workload relies on (the reporter's own
+   * run needed healthit.gov -> healthit.gov/data/search and gao.gov -> files.gao.gov). And
+   * it is best-effort — if the page cannot be read, the caller's result is returned
+   * untouched rather than failed.
+   */
+  private async attachPageProvenance(
+    toolName: string,
+    content: string,
+    client: Client,
+  ): Promise<string> {
+    if (!isUnattributedDomRead(toolName)) return content;
+    if (typeof content !== 'string' || content.includes('Page URL:')) return content;
+
+    try {
+      const probe = await client.callTool(
+        { name: 'browser_evaluate', arguments: { function: '() => window.location.href' } },
+        undefined,
+        { timeout: PAGE_PROVENANCE_TIMEOUT_MS },
+      );
+      const probeText = ((probe.content as any[]) || [])
+        .filter((c: any) => c.type === 'text')
+        .map((c: any) => c.text)
+        .join('\n');
+      const url = probeText.match(/https?:\/\/[^\s"'\\]+/)?.[0];
+      return url ? `${content}\n### Page\n- Page URL: ${url}` : content;
+    } catch (error) {
+      // Never turn a successful DOM read into a failure over a missing annotation.
+      console.warn(`[MCP-SESSION] Could not read the page URL for ${toolName}:`, (error as Error).message);
+      return content;
+    }
+  }
+
+  /** Hand back a slot taken by acquireBrowserSlot once the client is live (or failed). */
+  private releaseBrowserSlot(): void {
+    this.browserSlotsReserved = Math.max(0, this.browserSlotsReserved - 1);
+  }
+
+  private countBrowserPools(): number {
+    let count = 0;
+    for (const pool of this.sessionClientPools.values()) {
+      if (this.isBrowserPool(pool)) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Release browser pools that are over the cap, least-recently-used first. Only pools
+   * that are idle (no in-flight call) and past the grace window are eligible, and never
+   * the pool asking for the slot.
+   */
+  private async evictIdleBrowserPools(currentPoolKey: string): Promise<void> {
+    const now = Date.now();
+
+    while (this.countBrowserPools() + this.browserSlotsReserved >= this.MAX_BROWSER_CLIENTS) {
+      const evictable = Array.from(this.sessionClientPools.entries())
+        .filter(([key, pool]) =>
+          this.isBrowserPool(pool)
+          && key !== currentPoolKey
+          && pool.inFlight === 0
+          && now - pool.lastActivity >= this.BROWSER_EVICTION_GRACE_MS)
+        .sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+
+      if (evictable.length === 0) return;
+
+      const [victimKey] = evictable[0];
+      console.log(
+        `[MCP-SESSION] Browser client cap (${this.MAX_BROWSER_CLIENTS}) reached — evicting `
+        + `least-recently-used idle browser pool: ${victimKey.substring(0, 8)}`
+      );
+      await this.releasePool(victimKey);
+    }
+  }
+
+  /**
+   * Pool key for a session client.
+   *
+   * Default: userId, so the same user shares one MCP process across chat
+   * sessions. Different users always get separate clients (security isolation).
+   *
+   * Browser servers are the exception: they are pooled per chat session, because
+   * one browser process has one live page and two concurrent sessions sharing it
+   * steal each other's navigation (ENG-1118). Playwright MCP runs with
+   * --isolated (its own temp profile per process), so concurrent processes do
+   * not fight over a user-data-dir lock.
+   */
+  private getPoolKey(serverName: string, chatSessionId: string, userId?: string, toolName?: string): string {
+    const owner = userId || chatSessionId;
+    if (this.isBrowserBacked(serverName, toolName)) {
+      return `${owner}::${chatSessionId}`;
+    }
+    return owner;
+  }
+
+  /**
+   * True when this call drives a browser and therefore must not share a client.
+   *
+   * Two independent signals, because either alone can miss:
+   *  - the server config (our own naming — a rename or a re-host defeats it), and
+   *  - the tool name, which comes from the SERVER (Playwright MCP exposes
+   *    `browser_navigate`, `browser_evaluate`, ...) and so survives any renaming
+   *    on our side.
+   *
+   * The tool signal is what stops ENG-1118 silently returning if that MCP server is
+   * ever reconfigured under a name we don't recognise.
+   */
+  private isBrowserBacked(serverName: string, toolName?: string): boolean {
+    if (toolName && isBrowserTool(toolName)) return true;
+    return isBrowserServer(serverName, this.serverConfigs.get(serverName));
   }
 
   /**
    * Get or create a client for a specific chat session.
-   * Uses userId as pool key so the same user shares MCP clients (e.g. browser)
-   * across chat sessions, avoiding "browser in use" lock conflicts.
-   * Different users still get separate clients for security isolation.
+   * Pool key comes from getPoolKey(): per user for ordinary servers, per chat
+   * session for browser servers.
    */
-  private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
-    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
-    // Pool by userId so same user shares one browser/MCP process across sessions.
-    // Fall back to chatSessionId if userId not available.
-    const poolKey = userId || chatSessionId;
-
-    // Touch session to update last activity
-    this.touchSession(poolKey);
+  private async getSessionClient(serverName: string, chatSessionId: string, userId?: string, toolName?: string): Promise<Client> {
+    const poolKey = this.getPoolKey(serverName, chatSessionId, userId, toolName);
 
     // Get or create session pool
-    if (!this.sessionClientPools.has(poolKey)) {
+    let sessionPool = this.sessionClientPools.get(poolKey);
+    if (!sessionPool || sessionPool.released) {
       console.log(`[MCP-SESSION] Creating new client pool for session: ${poolKey.substring(0, 8)}`);
-      this.sessionClientPools.set(poolKey, {
+      sessionPool = {
         clients: new Map(),
-        lastActivity: Date.now()
-      });
+        pendingClients: new Map(),
+        lastActivity: Date.now(),
+        released: false,
+        inFlight: 0,
+      };
+      this.sessionClientPools.set(poolKey, sessionPool);
     }
-
-    const sessionPool = this.sessionClientPools.get(poolKey)!;
+    sessionPool.lastActivity = Date.now();
 
     // Check if client already exists for this session
     if (sessionPool.clients.has(serverName)) {
       return sessionPool.clients.get(serverName)!;
+    }
+
+    const pendingClient = sessionPool.pendingClients.get(serverName);
+    if (pendingClient) return pendingClient;
+
+    // Waiting for a browser slot has to happen INSIDE the memoised creation, not before it.
+    // An agent issues parallel browser calls in one turn, and anything awaited between the
+    // pendingClients lookup above and its registration below lets both callers build their
+    // own client — the second overwrites the first in the pool, orphaning a browser nothing
+    // will close and splitting the session's page across two of them.
+    let slotReserved = false;
+    const creation = (async () => {
+      if (this.isBrowserBacked(serverName, toolName)) {
+        await this.acquireBrowserSlot(poolKey);
+        slotReserved = true;
+      }
+      return this.createSessionClient(serverName, poolKey, userId, sessionPool);
+    })();
+    // Runs in the same synchronous turn as the call above (which yields at its first await),
+    // so a concurrent caller cannot slip between them.
+    sessionPool.pendingClients.set(serverName, creation);
+    try {
+      return await creation;
+    } finally {
+      // The client is now counted as a live pool (or failed outright), so the reservation
+      // that stood in for it while it spawned can go back.
+      if (slotReserved) this.releaseBrowserSlot();
+      if (sessionPool.pendingClients.get(serverName) === creation) {
+        sessionPool.pendingClients.delete(serverName);
+      }
+    }
+  }
+
+  private async createSessionClient(
+    serverName: string,
+    poolKey: string,
+    userId: string | undefined,
+    sessionPool: SessionClientPool,
+  ): Promise<Client> {
+    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
+    if (needsUserSecrets && !userId) {
+      throw new Error(`MCP: User identity is required for server "${serverName}"`);
     }
 
     // Circuit breaker: fail fast if the server has timed out too many times recently
@@ -476,9 +889,7 @@ export class McpClientService {
       }
       // Resolve accessToken placeholders (use the decrypted value which contains {{...}})
       if (hasAccessTokenPlaceholder) {
-        const resolvedToken = accessTokenToCheck.replace(
-          /\{\{(\w+)\}\}/g, (match, varName) => decryptedSecrets[varName] ?? match
-        );
+        const resolvedToken = resolveUserSecretPlaceholders(accessTokenToCheck, decryptedSecrets);
         configForTransport = { ...configForTransport, accessToken: resolvedToken } as McpServerConfig;
       }
     }
@@ -497,16 +908,10 @@ export class McpClientService {
     // Add timeout to connection — stdio subprocesses (e.g. Playwright) need more time to start
     const transportType = getTransportType(serverConfig.config);
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), connectTimeoutMs)
-    );
-
     transport.onclose = () => {
       console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
-      // Fix 4: Evict the dead client so the next tool call triggers a fresh reconnect
       const pool = this.sessionClientPools.get(poolKey);
-      if (pool?.clients.has(serverName)) {
+      if (pool?.clients.get(serverName) === client) {
         pool.clients.delete(serverName);
         console.warn(`[MCP-SESSION] Evicted dead client for "${serverName}" from pool after transport close`);
       }
@@ -524,7 +929,12 @@ export class McpClientService {
     };
 
     try {
-      await Promise.race([connectPromise, timeoutPromise]);
+      await this.connectClient(
+        client,
+        transport,
+        connectTimeoutMs,
+        `Connection timeout for ${serverName}`,
+      );
     } catch (connectError) {
       // Fix 3: Don't trigger circuit breaker for stdio servers — each spawn is independent
       if (transportType !== 'stdio') {
@@ -575,6 +985,7 @@ export class McpClientService {
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                let sessionClient: Client | undefined;
                 try {
                   const toolArgs = { ...args };
                   if (isInternal) {
@@ -584,7 +995,7 @@ export class McpClientService {
                       llmModel: context.llmModel
                     });
                   }
-                  const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
+                  sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId, originalToolName);
                   const clientTransport = (sessionClient as any)._transport;
                   const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
                   console.log(JSON.stringify(buildMcpToolTelemetry({
@@ -597,10 +1008,17 @@ export class McpClientService {
                     maxAttempts,
                     phase: 'call',
                   })));
-                  const result = await sessionClient.callTool({
-                    name: originalToolName,
-                    arguments: toolArgs
-                  }, undefined, { timeout: 3600000 });
+                  const callPoolKey = this.getPoolKey(serverName, context.sessionId, context.userId, originalToolName);
+                  this.markPoolBusy(callPoolKey, 1);
+                  let result;
+                  try {
+                    result = await sessionClient.callTool({
+                      name: originalToolName,
+                      arguments: toolArgs
+                    }, undefined, { timeout: 3600000 });
+                  } finally {
+                    this.markPoolBusy(callPoolKey, -1);
+                  }
                   const contentArray = (result.content as any[]) || [];
                   if (result.isError) {
                     throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
@@ -609,16 +1027,14 @@ export class McpClientService {
                     .filter((c: any) => c.type === 'text')
                     .map((c: any) => c.text)
                     .join('\n');
-                  return { content, raw: result };
+                  const attributed = await this.attachPageProvenance(originalToolName, content, sessionClient);
+                  return { content: attributed, raw: result };
                 } catch (error) {
                   lastError = error;
                   // Evict dead client from session pool so the next call reconnects
                   if (isConnectionError(error)) {
-                    const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-                    if (execPool?.clients.has(serverName)) {
-                      console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
-                      execPool.clients.delete(serverName);
-                    }
+                    console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
+                    await this.evictSessionClient(this.getPoolKey(serverName, context.sessionId, context.userId, originalToolName), serverName, sessionClient);
                   }
                   if (attempt < maxAttempts) {
                     console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -654,7 +1070,14 @@ export class McpClientService {
         console.log(`[MCP-SESSION] Discovered tools for secret-placeholder server "${serverName}"`);
       } catch (error) {
         console.error(`[MCP-SESSION] Failed to discover tools for "${serverName}":`, error);
+        await this.closeClient(client);
+        throw error;
       }
+    }
+
+    if (sessionPool.released) {
+      await this.closeClient(client);
+      throw new Error(`MCP: Client pool "${poolKey}" was released while connecting to "${serverName}"`);
     }
 
     // Store in session pool
@@ -666,14 +1089,47 @@ export class McpClientService {
   /**
    * Release all clients for a specific chat session
    * Call this when a chat session ends to free resources
+   *
+   * Browser pools are keyed `${owner}::${chatSessionId}` (see getPoolKey), so a
+   * bare session id must also release its compound pools — otherwise this
+   * no-ops for exactly the per-session browser processes it exists to reclaim.
    */
   async releaseSessionClients(chatSessionId: string): Promise<void> {
-    const sessionPool = this.sessionClientPools.get(chatSessionId);
+    const suffix = `::${chatSessionId}`;
+    const poolKeys = Array.from(this.sessionClientPools.keys()).filter(
+      key => key === chatSessionId || key.endsWith(suffix)
+    );
+
+    for (const poolKey of poolKeys) {
+      // A run can end with a tool call still executing — a timed-out request keeps running
+      // in the worker after the caller's `finally` has moved on. Closing the client there
+      // would abort a live browser call, so leave it to the idle sweep instead.
+      const pool = this.sessionClientPools.get(poolKey);
+      if (pool && pool.inFlight > 0) {
+        console.warn(
+          `[MCP-SESSION] Not releasing pool ${poolKey.substring(0, 8)} — ${pool.inFlight} tool call(s) `
+          + `still in flight; the idle sweep will reclaim it.`
+        );
+        continue;
+      }
+      await this.releasePool(poolKey);
+    }
+  }
+
+  /**
+   * Release one client pool by its exact pool key.
+   * Used by the stale sweep and shutdown, which already hold real pool keys and
+   * must not release sibling pools that merely share an owner.
+   */
+  private async releasePool(poolKey: string): Promise<void> {
+    const sessionPool = this.sessionClientPools.get(poolKey);
     if (!sessionPool) {
       return;
     }
 
-    console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${chatSessionId.substring(0, 8)}`);
+    sessionPool.released = true;
+    this.sessionClientPools.delete(poolKey);
+    console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${poolKey.substring(0, 8)}`);
 
     for (const [serverName, client] of sessionPool.clients.entries()) {
       try {
@@ -683,7 +1139,13 @@ export class McpClientService {
       }
     }
 
-    this.sessionClientPools.delete(chatSessionId);
+    await Promise.allSettled(sessionPool.pendingClients.values());
+    sessionPool.pendingClients.clear();
+    sessionPool.clients.clear();
+
+    // Only once every client is closed — the subprocess reads its --config at launch,
+    // but deleting underneath a still-starting one would be a race.
+    this.removePlaywrightConfigFiles(poolKey);
   }
 
   /**
@@ -886,7 +1348,7 @@ export class McpClientService {
       // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
       // a config file and pass --config instead.
       if (!resolvedArgs.some(arg => arg.startsWith('--config'))) {
-        const configDir = '/tmp/playwright-mcp-configs';
+        const configDir = McpClientService.PLAYWRIGHT_CONFIG_DIR;
         if (!fs.existsSync(configDir)) {
           fs.mkdirSync(configDir, { recursive: true });
         }
@@ -947,6 +1409,9 @@ export class McpClientService {
         };
         fs.writeFileSync(configPath, JSON.stringify(config));
         resolvedArgs.push('--config', configPath);
+        // Remembered so the pair dies with its pool — since ENG-1118 these are written per
+        // chat session, not per user, so leaving them behind grows /tmp without bound.
+        this.trackPlaywrightConfigFiles(poolKey, [configPath, stealthScriptPath]);
       }
       console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
     }
@@ -1104,11 +1569,6 @@ export class McpClientService {
 
     // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), connectTimeoutMs)
-    );
-
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
     transport.onerror = (err: any) => {
       // Suppress expected errors during shutdown/reload
@@ -1123,7 +1583,12 @@ export class McpClientService {
       console.error(`MCP: Transport error for ${name}:`, err);
     };
 
-    await Promise.race([connectPromise, timeoutPromise]);
+    await this.connectClient(
+      client,
+      transport,
+      connectTimeoutMs,
+      `Connection timeout for ${name}`,
+    );
 
     // CRITICAL FIX: For StreamableHTTP, ensure session is established before proceeding
     if (transportType === 'streamable-http') {
@@ -1138,10 +1603,12 @@ export class McpClientService {
       }
     }
 
-    this.clients.set(name, client);
-
     // Discover tools
-    const response = await client.listTools();
+    const response = await client.listTools().catch(async error => {
+      await this.closeClient(client);
+      throw error;
+    });
+    this.clients.set(name, client);
     const isInternal = 'isInternal' in config ? config.isInternal : false;
     
     for (const tool of response.tools) {
@@ -1163,6 +1630,7 @@ export class McpClientService {
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            let sessionClient: Client | undefined;
             try {
               // Conditionally inject technical parameters if server is internal
               const toolArgs = { ...args };
@@ -1176,7 +1644,7 @@ export class McpClientService {
 
               // CRITICAL FIX: Get session-specific client instead of using shared client
               // This ensures each chat session has its own isolated MCP connection
-              const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
+              sessionClient = await this.getSessionClient(name, context.sessionId, context.userId, originalToolName);
 
               // Log MCP tool call with structured reliability telemetry (ENG-107)
               const clientTransport = (sessionClient as any)._transport;
@@ -1192,10 +1660,17 @@ export class McpClientService {
                 phase: 'call',
               })));
 
-              const result = await sessionClient.callTool({
-                name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
-                arguments: toolArgs
-              }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
+              const callPoolKey = this.getPoolKey(name, context.sessionId, context.userId, originalToolName);
+              this.markPoolBusy(callPoolKey, 1);
+              let result;
+              try {
+                result = await sessionClient.callTool({
+                  name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
+                  arguments: toolArgs
+                }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
+              } finally {
+                this.markPoolBusy(callPoolKey, -1);
+              }
 
               // Cast content to any to access properties safely
               const contentArray = (result.content as any[]) || [];
@@ -1212,18 +1687,15 @@ export class McpClientService {
                 .join('\n');
 
               return {
-                content,
+                content: await this.attachPageProvenance(originalToolName, content, sessionClient),
                 raw: result
               };
             } catch (error) {
               lastError = error;
               // Evict dead client from session pool so the next call reconnects
               if (isConnectionError(error)) {
-                const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-                if (execPool?.clients.has(name)) {
-                  console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
-                  execPool.clients.delete(name);
-                }
+                console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
+                await this.evictSessionClient(this.getPoolKey(name, context.sessionId, context.userId, originalToolName), name, sessionClient);
               }
               if (attempt < maxAttempts) {
                 console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -1325,13 +1797,10 @@ export class McpClientService {
       { capabilities: {} }
     );
 
-    let connectTimer: NodeJS.Timeout | undefined;
+    let connected = false;
     try {
-      const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
-      });
-      await Promise.race([connectPromise, timeoutPromise]);
+      await this.connectClient(client, transport, 60000, "MCP connection timeout");
+      connected = true;
 
       return await client.callTool(
         { name: toolName, arguments: args },
@@ -1339,8 +1808,7 @@ export class McpClientService {
         { timeout: options?.timeoutMs ?? 3600000 }
       );
     } finally {
-      if (connectTimer) clearTimeout(connectTimer); // don't leave a 60s timer pending on success
-      await client.close().catch(() => {});
+      if (connected) await this.closeClient(client);
     }
   }
 
@@ -1367,14 +1835,10 @@ export class McpClientService {
       { capabilities: {} }
     );
 
-    let connectTimer: NodeJS.Timeout | undefined;
+    let connected = false;
     try {
-      const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
-      });
-      await Promise.race([connectPromise, timeoutPromise]);
-      if (connectTimer) clearTimeout(connectTimer); // connected — cancel the pending timeout
+      await this.connectClient(client, transport, 60000, "MCP connection timeout");
+      connected = true;
 
       // Hard-abort wrapper: a half-aborted streamable-HTTP stream can leave the
       // SDK's callTool pending past its own `timeout`, hanging until the caller's
@@ -1405,8 +1869,7 @@ export class McpClientService {
 
       return await fn(callTool);
     } finally {
-      if (connectTimer) clearTimeout(connectTimer); // also covers the connect-throw path
-      await client.close().catch(() => {});
+      if (connected) await this.closeClient(client);
     }
   }
 
@@ -1431,8 +1894,8 @@ export class McpClientService {
     }
 
     // Close all session client pools
-    for (const sessionId of this.sessionClientPools.keys()) {
-      await this.releaseSessionClients(sessionId);
+    for (const poolKey of Array.from(this.sessionClientPools.keys())) {
+      await this.releasePool(poolKey);
     }
 
     // Close shared clients (from initial initialization)
@@ -1446,5 +1909,8 @@ export class McpClientService {
     }
     this.clients.clear();
     this.mcpTools = [];
+    this.serverConfigs.clear();
+    this.serversWithSecretPlaceholders.clear();
+    this.serverCircuits.clear();
   }
 }

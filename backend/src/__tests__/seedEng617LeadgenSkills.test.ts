@@ -69,10 +69,18 @@ describe('seed-eng617-leadgen-skills', () => {
       );
     });
 
-    it('carries the absolute PUBLISH GATE and never publishes unattended', () => {
+    it('carries the PUBLISH GATE, deferring the unattended call to the run', () => {
+      // ENG-947: this used to assert "never publish" unattended. That blanket
+      // refusal outranked the run's PUBLISH AUTHORIZATION block and deadlocked
+      // authorized schedules, so the gate now defers rather than decides.
+      // ENG-1311: the block's heading changed from "(ABSOLUTE — overrides
+      // every other instruction in this prompt)" to "(scoped — governs ONLY
+      // the moment ... about to call a tool that posts/publishes/...)" so it
+      // no longer colours the whole session — see applyHardening.ts.
       const skill = buildAeoSkill();
-      expect(skill.systemPrompt).toContain('## PUBLISH GATE (ABSOLUTE');
-      expect(skill.systemPrompt).toContain('save as a draft and notify; never publish');
+      expect(skill.systemPrompt).toContain('## PUBLISH GATE (scoped');
+      expect(skill.systemPrompt).not.toContain('save as a draft and notify; never publish');
+      expect(skill.systemPrompt!.replace(/\s+/g, ' ')).toContain('PUBLISH AUTHORIZATION');
       expect(skill.systemPrompt).toContain('## FAILURE HANDLING');
     });
 

@@ -209,6 +209,11 @@ describe('GmailService', () => {
       mockGetAccountById.mockResolvedValue(VALID_ACCOUNT);
       mockMessagesList.mockResolvedValue(mockListResponse);
       mockMessagesGet.mockResolvedValue(makeMessageDetail('hello'));
+      // searchEmails() goes on to batch-fetch message metadata over fetch() after the
+      // token-refresh check this test actually covers -- ENG-1111 found it unmocked here,
+      // reaching the real Gmail API (assertions below only cover token refresh, not the
+      // batch results, so this was always incidental to what the test verifies).
+      global.fetch = jest.fn().mockResolvedValue(makeBatchMetaResponse(mockListResponse.data.messages));
 
       await service.searchEmails('user-123', ACCOUNT_ID, 'test');
       expect(mockUpdateAccountTokens).not.toHaveBeenCalled();
@@ -218,6 +223,8 @@ describe('GmailService', () => {
       mockGetAccountById.mockResolvedValue(EXPIRING_ACCOUNT);
       mockMessagesList.mockResolvedValue(mockListResponse);
       mockMessagesGet.mockResolvedValue(makeMessageDetail('hello'));
+      // Same as above -- the batch metadata fetch after refresh was unmocked.
+      global.fetch = jest.fn().mockResolvedValue(makeBatchMetaResponse(mockListResponse.data.messages));
 
       await service.searchEmails('user-123', ACCOUNT_ID, 'test');
       expect(mockUpdateAccountTokens).toHaveBeenCalledWith(

@@ -295,7 +295,14 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
   const page = await getLandingPageById(context.pageId);
-  if (!page?.githubRepoUrl) {
+  // ENG-1192: keep "no such page" and "page without a repo" apart. They were collapsed into
+  // the repo message, so an id that resolved to nothing was reported as a repository problem
+  // on a page that was never found — caught live when a truncated id produced that error for
+  // a page that does have a repo, and the agent relayed it as "deploy the page first".
+  if (!page) {
+    throw new Error(`Cannot prepare preview branch: no landing page found with id ${context.pageId}`);
+  }
+  if (!page.githubRepoUrl) {
     throw new Error('Cannot prepare preview branch: landing page has no GitHub repository');
   }
 

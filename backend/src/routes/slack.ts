@@ -41,6 +41,35 @@ function citeForSlack(response: any): string {
 
 const router = express.Router();
 
+// ENG-1263: known-internal Slack user IDs, checked independently of email resolution.
+// getSlackUserEmail() returns null on several paths that do NOT mean "external author" — rate
+// limiting, a missing users:read.email scope, or (most relevant for customer channels, which are
+// Slack-Connect/externally-shared) a cross-workspace profile users.info can't resolve an email
+// for. Gating solely on a resolved @agentweb.pro email means any of those failures silently falls
+// through as "external", which is how Harsha's own outbound weekly reports got classified as
+// inbound client questions on 2026-08-16. A positive ID allowlist doesn't depend on email
+// resolution succeeding at all. Comma-separated env override; defaults to Harsha's Slack ID
+// (reference-ids.md).
+const INTERNAL_SLACK_USER_IDS = new Set(
+  (process.env.AGENTWEB_INTERNAL_SLACK_USER_IDS || 'U08TM4QFQ1L')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
+// Shared by every path that gates on "is this our own team talking, not the customer" — the
+// initial top-level message check and the monitored triggered-thread reply check both need the
+// same two-signal predicate (CodeRabbit flagged the latter still being email-only on PR #2508:
+// an allowlisted internal user replying in a monitored thread with an unresolved email fell
+// through the same fail-open gap this row exists to close). Email comparison is
+// case-insensitive — Slack profile emails aren't guaranteed lowercase.
+function isInternalSlackAuthor(slackUserId: string, senderEmail: string | null): boolean {
+  return (
+    INTERNAL_SLACK_USER_IDS.has(slackUserId) ||
+    (!!senderEmail && senderEmail.toLowerCase().endsWith('@agentweb.pro'))
+  );
+}
+
 function userMatchesChannel(u: any, channel: string): boolean {
   // Skip tombstoned (deleted) users
   if (u.userId?.startsWith('deleted_')) return false;
@@ -146,11 +175,24 @@ async function handleSlackTriggeredSession(params: {
 
     if (!rawMessage) return;
 
-    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments
+    // Skip messages from AgentWeb team members — no need to suggest replies for our own team's comments.
+    // Two independent signals, either one is sufficient: a resolved @agentweb.pro email, or a known
+    // internal Slack user ID (checked first — it doesn't depend on email resolution succeeding).
     const senderEmail = await getSlackUserEmail(slackUserId);
-    if (senderEmail && senderEmail.endsWith('@agentweb.pro')) {
-      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${senderEmail})`);
+
+    if (isInternalSlackAuthor(slackUserId, senderEmail)) {
+      console.log(`📨 [slack-triggered] skipping message from AgentWeb team member (${slackUserId}${senderEmail ? `, ${senderEmail}` : ''})`);
       return;
+    }
+
+    if (!senderEmail) {
+      // Author identity could not be resolved (rate limit, missing users:read.email scope, or a
+      // cross-workspace profile in a Slack-Connect channel) and the ID isn't on the known-internal
+      // list. Do NOT fail closed here — treating "unresolvable" as "internal" would silently drop
+      // genuine customer questions with no signal, which is strictly worse than the noise this row
+      // is fixing. Fall through to triage as before, but log distinguishably from both the internal
+      // skip above and the normal triage-continues path so a repeat is diagnosable from logs.
+      console.log(`📨 [slack-triggered] could not resolve author identity for Slack user ${slackUserId} — proceeding as external (unresolved)`);
     }
 
     // Look up user by slackChannel field (with cache)
@@ -787,10 +829,39 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
             }
 
+            // ENG-1292: no channel binding — fall back to the mentioning Slack
+            // user's own verified identity instead of failing outright. Only
+            // an exact match on Slack's verified profile email resolves a
+            // user (never a fuzzy/partial match), so a Slack user with no
+            // matching AgentWeb account can never resolve to someone else's
+            // account (no cross-tenant leak). Deliberately NOT cached as a
+            // channel mapping: an internal channel can have several different
+            // AgentWeb users mention Emma, and caching the first one would
+            // silently misroute everyone else who mentions Emma there.
+            let requesterEmail: string | null = null;
             if (!user) {
+              requesterEmail = await getSlackUserEmail(slackUserId);
+              if (requesterEmail) {
+                const identityUser = await userDb.getUserByEmail(requesterEmail);
+                // Skip tombstoned (deleted) users — mirrors the explicit guard on every
+                // other resolution path above, even though getUserByEmail already filters
+                // deleted_* userIds at the DB layer (belt-and-suspenders, not load-bearing).
+                if (identityUser && !identityUser.userId?.startsWith('deleted_')) {
+                  user = identityUser;
+                  console.log(`📝 [app-mention] no channel binding for ${channel}, resolved via Slack identity (${requesterEmail})`);
+                }
+              }
+            }
+
+            if (!user) {
+              const remedy = 'An AgentWeb admin or the account owner can link it by posting ' +
+                '`@Emma for user <their-agentweb-email> link this channel` in this channel.';
+              const text = requesterEmail
+                ? `❌ Sorry, this channel isn't linked to an AgentWeb account, and there's no AgentWeb user with the email ${requesterEmail}. ${remedy}`
+                : `❌ Sorry, this channel isn't linked to an AgentWeb account, and I couldn't verify a Slack email for you to match one. ${remedy}`;
               await slackClient.chat.postMessage({
                 channel,
-                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+                text,
                 thread_ts: ts
               });
               return;
@@ -913,10 +984,12 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             if (isTriggered) {
               // Monitored (email-only) session — continue it and send email, do NOT post to Slack
               if (text) {
-                // Skip replies from AgentWeb team members — no suggest needed for our own team's comments
+                // Skip replies from AgentWeb team members — no suggest needed for our own team's
+                // comments. Same two-signal predicate as the top-level message guard (ENG-1263):
+                // a known-internal ID doesn't depend on email resolution succeeding.
                 const replySenderEmail = await getSlackUserEmail(slackUserId);
-                if (replySenderEmail && replySenderEmail.endsWith('@agentweb.pro')) {
-                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${replySenderEmail})`);
+                if (isInternalSlackAuthor(slackUserId, replySenderEmail)) {
+                  console.log(`📨 [slack-triggered] skipping thread reply from AgentWeb team member (${slackUserId}${replySenderEmail ? `, ${replySenderEmail}` : ''})`);
                   return;
                 }
 
@@ -1366,31 +1439,19 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   throw new Error('Session not found');
                 }
                 
-                // Format revision message based on asset type (similar to Images/Reports pages)
-                let revisionMessage: string;
-                let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                
-                if (originalApproval.assetType === 'image') {
-                  // For images, use generate_image function
-                  revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'generate_image',
-                      minCount: 1
-                    }
-                  ];
-                } else if (originalApproval.assetType === 'html') {
-                  // For HTML reports, use update_html_file function
-                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'update_html_file',
-                      minCount: 1
-                    }
-                  ];
-                } else {
-                  throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                }
+                // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                  '../services/revisionService'
+                );
+                const revisionMessage = buildAgentModeRevisionMessage(
+                  originalApproval.assetType,
+                  originalApproval.assetUrl,
+                  feedbackValue
+                );
+                const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                  originalApproval.assetType === 'image'
+                    ? [{ functionName: 'generate_image', minCount: 1 }]
+                    : [{ functionName: 'update_html_file', minCount: 1 }];
                 
                 // Use runVerifiedChat function (same as verified-generate endpoint)
                 const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1404,7 +1465,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   requiredFunctions,
                   keywords: [],
                   attachments: [],
-                  maxAttempts: 5
+                  maxAttempts: 5,
+                  approvedRevisionImageSources:
+                    originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                 }).then(async (result) => {
                   console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1412,6 +1475,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   let newAssetUrl: string | null = null;
                   let newAssetFilename: string | null = null;
                   let toolCallFailed = false;
+                  let awaitingConfirmation = false;
                   let toolCallFailureMessage = '';
 
                   if (result.success && result.toolCalls.length > 0) {
@@ -1419,10 +1483,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     for (const toolCall of result.toolCalls) {
                       const toolResult = toolCall?.result || {};
 
+                      // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                      // asset and never will — no user is watching this auto-revision.
+                      if (toolResult.awaitingUserConfirmation === true) {
+                        awaitingConfirmation = true;
+                        continue;
+                      }
+
                       if (originalApproval.assetType === 'image') {
                         // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                         // Only extract if the tool call succeeded
                         if (toolResult.success) {
+                          if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                            toolCallFailed = true;
+                            toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                            continue;
+                          }
+
                           const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                           if (imageUrl) {
                             newAssetUrl = imageUrl;
@@ -1484,9 +1561,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                   } else {
                     // Determine the failure reason for better logging
-                    const failureReason = toolCallFailed
-                      ? `Tool call failed: ${toolCallFailureMessage}`
-                      : 'Could not extract new asset URL from toolCalls';
+                    const { describeRevisionFailure } = await import('../services/revisionService');
+                    const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                    const failureReason = failure.reason;
 
                     console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1506,12 +1583,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       }
 
                       await sendAgentModeOncallAlert({
-                        subject: toolCallFailed
-                          ? 'Agent Mode Revision: Tool Call Failed'
-                          : 'Agent Mode Revision: Failed to Extract Asset URL',
-                        message: toolCallFailed
-                          ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                          : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        subject: failure.subject,
+                        message: `${failure.reason}\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                         sessionId: agentSessionId,
                         context: {
                           'iShare Link': ishareLink,
@@ -1521,6 +1594,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           'Feedback': feedbackValue,
                           'Revision Success': result.success,
                           'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                           'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                           'Tool Calls Count': result.toolCalls.length,
                           'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
@@ -1593,31 +1667,19 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       throw new Error('Session not found');
                     }
                     
-                    // Format revision message based on asset type (similar to Images/Reports pages)
-                    let revisionMessage: string;
-                    let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                    
-                    if (originalApproval.assetType === 'image') {
-                      // For images, use generate_image function
-                      revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'generate_image',
-                          minCount: 1
-                        }
-                      ];
-                    } else if (originalApproval.assetType === 'html') {
-                      // For HTML reports, use update_html_file function
-                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'update_html_file',
-                          minCount: 1
-                        }
-                      ];
-                    } else {
-                      throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                    }
+                    // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                    const { buildAgentModeRevisionMessage, isApprovedRevisionSource } = await import(
+                      '../services/revisionService'
+                    );
+                    const revisionMessage = buildAgentModeRevisionMessage(
+                      originalApproval.assetType,
+                      originalApproval.assetUrl,
+                      feedbackValue
+                    );
+                    const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                      originalApproval.assetType === 'image'
+                        ? [{ functionName: 'generate_image', minCount: 1 }]
+                        : [{ functionName: 'update_html_file', minCount: 1 }];
                     
                     // Use runVerifiedChat function (same as verified-generate endpoint)
                     const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1631,7 +1693,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       requiredFunctions,
                       keywords: [],
                       attachments: [],
-                      maxAttempts: 5
+                      maxAttempts: 5,
+                      approvedRevisionImageSources:
+                        originalApproval.assetType === 'image' ? [originalApproval.assetUrl] : undefined,
                     }).then(async (result) => {
                       console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1639,6 +1703,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       let newAssetUrl: string | null = null;
                       let newAssetFilename: string | null = null;
                       let toolCallFailed = false;
+                      let awaitingConfirmation = false;
                       let toolCallFailureMessage = '';
 
                       if (result.success && result.toolCalls.length > 0) {
@@ -1646,10 +1711,23 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         for (const toolCall of result.toolCalls) {
                           const toolResult = toolCall?.result || {};
 
+                          // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                          // asset and never will — no user is watching this auto-revision.
+                          if (toolResult.awaitingUserConfirmation === true) {
+                            awaitingConfirmation = true;
+                            continue;
+                          }
+
                           if (originalApproval.assetType === 'image') {
                             // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                             // Only extract if the tool call succeeded
                             if (toolResult.success) {
+                              if (!isApprovedRevisionSource(toolCall, originalApproval.assetUrl)) {
+                                toolCallFailed = true;
+                                toolCallFailureMessage = `generate_image used an unapproved source image. Expected "${originalApproval.assetUrl}".`;
+                                continue;
+                              }
+
                               const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                               if (imageUrl) {
                                 newAssetUrl = imageUrl;
@@ -1711,9 +1789,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         }
                       } else {
                         // Determine the failure reason for better logging
-                        const failureReason = toolCallFailed
-                          ? `Tool call failed: ${toolCallFailureMessage}`
-                          : 'Could not extract new asset URL from toolCalls';
+                        const { describeRevisionFailure } = await import('../services/revisionService');
+                        const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                        const failureReason = failure.reason;
 
                         console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1733,12 +1811,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           }
 
                           await sendAgentModeOncallAlert({
-                            subject: toolCallFailed
-                              ? 'Agent Mode Revision: Tool Call Failed'
-                              : 'Agent Mode Revision: Failed to Extract Asset URL',
-                            message: toolCallFailed
-                              ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                              : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            subject: failure.subject,
+                            message: `${failure.reason}\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                             sessionId: task.sessionId,
                             context: {
                               'iShare Link': ishareLink,
@@ -1748,6 +1822,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               'Feedback': feedbackValue,
                               'Revision Success': result.success,
                               'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                               'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                               'Tool Calls Count': result.toolCalls.length,
                               'Tool Calls': JSON.stringify(result.toolCalls, null, 2),

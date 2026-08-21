@@ -11,7 +11,12 @@
  */
 
 import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
-import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { linkedInOutreachService, isProvenDisconnectError } from '../services/linkedInOutreachService';
+import {
+  getUnipileHealth,
+  recordUnipileAccountHealth,
+  SessionState,
+} from '../services/linkedInConnectionHealth';
 import { settingsService } from '../services/settingsService';
 import { dripSequenceDb } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
@@ -24,60 +29,15 @@ import {
   normalizeLinkedInUrl,
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
-import {
-  upsertSentInvitations,
-  pruneStaleSentInvitations,
-  profileUrlFromPublicId,
-  getAllSentInvitationsByAccount,
-  UnipileSentInvitation,
-} from '../services/unipileSentInvitationsDb';
+import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
+import { deleteSentInvitationsByProfileUrls } from '../services/unipileSentInvitationsDb';
 
+export {
+  sentInvitationChanged,
+  syncSentInvitationsForAccount,
+} from '../services/linkedInSentInvitationsSyncService';
 
 const TAG = '[linkedInConnectionSync]';
-
-/**
- * True when a freshly-read invitation differs from its cached row in any way a
- * consumer can observe (ENG-875).
- *
- * `syncedAt` is deliberately excluded. It is stamped `now` on every run, so
- * including it would make every row differ and defeat the check entirely. It is
- * written but never read anywhere in the codebase — no query, filter or branch
- * depends on it — so a skipped row keeps its previous value, which then means
- * "when this row last changed" rather than "when the cron last ran".
- *
- * `sentAt` is also excluded, and this one was learned the hard way. The first
- * version of this function compared it, on the assumption that a changed send
- * time meant Unipile had corrected it. Production proved that false: LinkedIn
- * exposes invitation age RELATIVELY ("3 months ago") and Unipile resolves that
- * to an absolute datetime at the moment of the API call, so `parsed_datetime`
- * moves every single request. Two real rows, hours after the first deploy:
- *
- *   sentAt 2026-05-04T04:38:52.378Z  syncedAt 2026-08-04T04:38:44.973Z
- *   sentAt 2026-04-04T04:38:25.256Z  syncedAt 2026-08-04T04:38:24.877Z
- *
- * — exact whole-month offsets landing on the sync's own time-of-day. Comparing
- * it made every row differ on every cycle, so the skip never fired once:
- * `1547 upserted, 0 unchanged` on every account.
- *
- * Only the COMPARISON drops it. The write still prefers Unipile's value
- * (ENG-787, `parsed_datetime ?? cached.sentAt ?? now`) — that contract is
- * unchanged, and a skipped row simply keeps the value it already had, which is
- * the stability ENG-787 was after.
- *
- * Every other field IS compared. Those are stable identity/content fields, and
- * a change in one is a real change that must be persisted.
- */
-export function sentInvitationChanged(
-  cached: UnipileSentInvitation,
-  candidate: UnipileSentInvitation,
-): boolean {
-  return (
-    cached.publicProfileUrl !== candidate.publicProfileUrl ||
-    cached.invitationId !== candidate.invitationId ||
-    cached.invitedUserName !== candidate.invitedUserName ||
-    cached.invitationText !== candidate.invitationText
-  );
-}
 
 /**
  * Kill-switches for the side effects of detecting a newly-accepted LinkedIn
@@ -247,114 +207,6 @@ export async function syncConnectionsForAccount(
 
   console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page}, fullSync=${fullSync})`);
   return newConnections;
-}
-
-/**
- * Sync PENDING sent invitations for one Unipile account into the
- * AW-UnipileSentInvitations cache, then prune rows that are no longer pending.
- *
- * Unipile's getAllInvitationsSent feed contains only invitations that are still
- * outstanding — once accepted or withdrawn they drop off. So we pull the full
- * feed, upsert each, and delete any cached row not present in the feed. A cached
- * row therefore means "we invited this person and they haven't accepted yet",
- * which the CRM uses to suppress re-inviting.
- *
- * Always paginates fully (the feed is bounded by LinkedIn's pending-invite cap).
- */
-export async function syncSentInvitationsForAccount(accountId: string): Promise<number> {
-  const toUpsert: UnipileSentInvitation[] = [];
-  const stillPendingPublicIds = new Set<string>();
-  const now = new Date().toISOString();
-  let unchanged = 0;
-
-  // Unipile occasionally omits parsed_datetime. Stamping `now` in that case would
-  // move sentAt on every ~10-min sync, so downstream consumers keyed on it (the
-  // CRM invite mirror dedupes an engagement by send time) would see the same
-  // invitation as a new one each run. Carry the first-observed value forward
-  // instead — a pending invitation's send time never legitimately changes.
-  // The whole cached row is kept, not just sentAt, so an unchanged invitation
-  // can be recognised and skipped instead of rewritten (ENG-875). Rewriting
-  // every pending invitation on every 10-minute cycle pinned a production CPU
-  // at ~93% for 85 minutes on an account with 700+ pending invites, and cost
-  // the same number of DynamoDB writes each time for no change in content.
-  const cachedByPublicId = new Map<string, UnipileSentInvitation>();
-  let cachePreloaded = false;
-  try {
-    for (const inv of await getAllSentInvitationsByAccount(accountId)) {
-      cachedByPublicId.set(inv.invitedUserPublicId, inv);
-    }
-    cachePreloaded = true;
-  } catch (err) {
-    // Non-fatal — worst case a timestamp-less invitation re-stamps to now and
-    // every row is rewritten, i.e. exactly the previous behaviour.
-    console.warn(`${TAG} could not preload cached invitations for account ${accountId}:`, err);
-  }
-
-  let cursor: string | undefined;
-  let page = 0;
-  const MAX_PAGES = 50; // 50 × 100 = 5000 pending invites — well above LinkedIn's limits
-
-  do {
-    const result = await linkedInOutreachService.listSentInvitations(accountId, cursor);
-    const items: any[] = result?.items ?? [];
-    if (items.length === 0) break;
-
-    for (const item of items) {
-      // Unipile may return the public id directly, or only a profile/public URL.
-      const publicId: string =
-        item.invited_user_public_id ||
-        item.invited_user_public_identifier ||
-        '';
-      if (!publicId) continue;
-
-      // EVERY pending invitation is recorded here, on every cycle. This set is
-      // what pruneStaleSentInvitations reconciles against, so it must stay a
-      // complete picture of the feed — narrowing the walk would delete valid
-      // rows. The full pagination is load-bearing for correctness.
-      stillPendingPublicIds.add(publicId);
-
-      const cached = cachedByPublicId.get(publicId);
-      const candidate: UnipileSentInvitation = {
-        accountId,
-        invitedUserPublicId: publicId,
-        publicProfileUrl: profileUrlFromPublicId(publicId),
-        invitationId: item.id ?? '',
-        invitedUserName: item.invited_user ?? '',
-        invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? cached?.sentAt ?? now,
-        syncedAt: now,
-      };
-
-      // Only the WRITE is skipped when nothing meaningful changed; the row is
-      // still counted as pending above. `syncedAt` is excluded from the
-      // comparison because it is `now` on every run and would make every row
-      // differ — it is written but never read anywhere in the codebase, so a
-      // skipped row simply keeps its previous value, which then honestly means
-      // "when this row last changed" rather than "when the cron last ran".
-      if (cached && !sentInvitationChanged(cached, candidate)) {
-        unchanged += 1;
-        continue;
-      }
-
-      toUpsert.push(candidate);
-    }
-
-    cursor = (result as any)?.cursor ?? undefined;
-    page++;
-  } while (cursor && page < MAX_PAGES);
-
-  await upsertSentInvitations(toUpsert);
-  // Reuse the rows already loaded above rather than scanning the account a
-  // second time in the same cycle. Skipped when the preload failed, so the
-  // prune falls back to reading for itself and stays correct.
-  const pruned = await pruneStaleSentInvitations(
-    accountId,
-    stillPendingPublicIds,
-    cachePreloaded ? Array.from(cachedByPublicId.values()) : undefined,
-  );
-
-  console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${unchanged} unchanged (skipped), ${pruned} pruned (pages=${page})`);
-  return toUpsert.length;
 }
 
 /**
@@ -651,6 +503,114 @@ export async function notifyNewConnections(newConnections: UnipileConnection[]):
   }
 }
 
+// ─── Disconnected-account backoff (ENG-1197) ─────────────────────────────────
+
+/**
+ * How long a known-dead account waits between liveness re-checks.
+ *
+ * Deliberately in memory rather than persisted: pacing a probe is not state worth a
+ * DynamoDB write on every cycle, and the worst a process restart can cost is one
+ * extra probe.
+ */
+export const DISCONNECTED_RECHECK_MS = 30 * 60 * 1000;
+
+const lastRecheckAtByAccount = new Map<string, number>();
+
+/** Test-only: clears the backoff state so each test starts from a clean slate. */
+export function __resetDisconnectBackoffForTests(): void {
+  lastRecheckAtByAccount.clear();
+}
+
+/**
+ * True when this account is known dead and its next re-check is not due yet.
+ *
+ * A dead account used to cost exactly as much to poll as a live one, every ten
+ * minutes, on both instances, forever. Two accounts have been in that state for
+ * weeks. When the re-check IS due this runs the cheap session probe rather than a
+ * full sync — a live session then clears the flag and the next cycle syncs normally.
+ */
+async function shouldSkipDisconnectedAccount(
+  accountId: string,
+  ownerUserId: string | undefined,
+): Promise<boolean> {
+  // Site-wide accounts have no owner record to carry a flag, so they are never
+  // skipped — they also aren't anyone's to notify about.
+  if (!ownerUserId) return false;
+
+  try {
+    const health = await getUnipileHealth(accountId, ownerUserId);
+    if (!health?.needs_reconnect) return false;
+
+    const lastRecheck = lastRecheckAtByAccount.get(accountId);
+    if (lastRecheck !== undefined && Date.now() - lastRecheck < DISCONNECTED_RECHECK_MS) {
+      return true;
+    }
+
+    lastRecheckAtByAccount.set(accountId, Date.now());
+    const state = await linkedInOutreachService.probeAccountSession(accountId);
+    await recordUnipileAccountHealth({ accountId, ownerUserId, state });
+    if (state === 'connected') {
+      console.log(`${TAG} account=${accountId} reconnected — resuming full sync`);
+      return false;
+    }
+    // 'unknown' skips too: an indeterminate probe is no reason to spend a full sync
+    // on an account we already have proof is dead.
+    return true;
+  } catch (err) {
+    // This runs OUTSIDE the per-account try blocks below, so an unexpected throw
+    // here would abort the whole cycle for every remaining account rather than one.
+    // Fail toward syncing: a wasted sync is cheaper than a stalled sweep.
+    console.error(`${TAG} health pre-check failed for account ${accountId}; syncing anyway:`, err);
+    return false;
+  }
+}
+
+// ─── Invite-feed walk pacing (ENG-1197) ──────────────────────────────────────
+
+/**
+ * How often the sent-invitation walk is a FULL one.
+ *
+ * This is a BACKSTOP, not the freshness mechanism. The two ways an invitation
+ * actually stops being pending — the recipient accepts, or we withdraw it — each
+ * delete their own row the moment we observe them, so an accepted invite still
+ * clears within one 10-minute connection sync exactly as it did before, and one we
+ * withdraw clears immediately. The full walk only catches the residue: invites that
+ * expired on LinkedIn's side, or were withdrawn outside this product.
+ *
+ * Env-tunable so the interval can be tightened without a deploy.
+ */
+export const FULL_INVITATION_WALK_INTERVAL_MS = (() => {
+  const raw = Number(process.env.LINKEDIN_FULL_INVITE_WALK_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60 * 60 * 1000;
+})();
+
+const lastFullWalkAtByAccount = new Map<string, number>();
+
+/** Test-only: clears the walk pacing so each test starts from a clean slate. */
+export function __resetWalkPacingForTests(): void {
+  lastFullWalkAtByAccount.clear();
+}
+
+function chooseWalkMode(accountId: string): 'full' | 'incremental' {
+  const last = lastFullWalkAtByAccount.get(accountId);
+  if (last !== undefined && Date.now() - last < FULL_INVITATION_WALK_INTERVAL_MS) {
+    return 'incremental';
+  }
+  return 'full';
+}
+
+/**
+ * Record that a full walk actually completed.
+ *
+ * Kept separate from choosing the mode: stamping at selection time marks the walk
+ * done even when it then throws on a timeout or a 5xx — and since only a full walk
+ * prunes, one failed attempt would push the next prune out by another whole
+ * interval, doubling the staleness the interval is supposed to bound.
+ */
+function markFullWalkCompleted(accountId: string): void {
+  lastFullWalkAtByAccount.set(accountId, Date.now());
+}
+
 // ─── Main cron entry point ────────────────────────────────────────────────────
 
 let isRunning = false;
@@ -674,6 +634,13 @@ export async function runLinkedInConnectionSync(): Promise<void> {
 
     const allNewConnections: UnipileConnection[] = [];
     for (const accountId of accountIds) {
+      const ownerUserId = ownerByAccountId.get(accountId);
+      if (await shouldSkipDisconnectedAccount(accountId, ownerUserId)) continue;
+
+      // Health is derived from the calls this loop already makes; adding a probe
+      // per account per cycle would undo the saving above.
+      let observed: SessionState = 'unknown';
+      let acceptedProfileUrls: string[] = [];
       try {
         // Detect a one-time full backfill BEFORE syncing. syncConnectionsForAccount
         // forces a full backfill (then sets the __fullsync__ marker) whenever that
@@ -687,20 +654,73 @@ export async function runLinkedInConnectionSync(): Promise<void> {
         const wasBackfill = (await getFullSyncCompletedAt(accountId).catch(() => null)) === null;
 
         const newConns = await syncConnectionsForAccount(accountId);
+        observed = 'connected';
+        // Only on a NON-backfill run. A backfill returns the account's entire
+        // connection history, and feeding thousands of URLs into the cleanup below
+        // turns a tidy-up into a full scan of the cache on the cron path — for
+        // people who were connected long before any invitation we track.
+        if (!wasBackfill) acceptedProfileUrls = newConns.map((c) => c.publicProfileUrl);
         if (wasBackfill) {
           console.log(`${TAG} account=${accountId} one-time backfill cached ${newConns.length} connection(s) — skipping accepted-notifications and enrollment`);
         } else {
           allNewConnections.push(...newConns);
         }
       } catch (err) {
+        // Only a proven-dead signal downgrades health. A timeout or 5xx here must
+        // stay 'unknown', or a brief Unipile wobble would flag a live account and
+        // email its owner to reconnect for nothing.
+        if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sync failed for account ${accountId}:`, err);
+        // Classify before notifying the owner — a timeout/5xx proves nothing about
+        // the session (probeAccountSession's own contract), so only a definitive
+        // 'disconnected' triggers the owner-facing path. Never let this block sync.
+        try {
+          const sessionState = await linkedInOutreachService.probeAccountSession(accountId);
+          if (sessionState === 'disconnected') {
+            const { notifyAccountOwnerOfDisconnect } = await import('../services/linkedInDisconnectNotifyService');
+            await notifyAccountOwnerOfDisconnect(accountId, ownerByAccountId.get(accountId));
+          }
+        } catch (notifyErr) {
+          console.error(`${TAG} Owner disconnect notify failed for account ${accountId}:`, notifyErr);
+        }
       }
+      // A newly-detected connection means that person's invitation was accepted, so
+      // it is no longer pending. Drop it now rather than leaving it for the hourly
+      // full walk — the CRM reads this cache to show "invite pending" on a lead, and
+      // an hour of showing that after they accepted is a visible lie (ENG-1197).
+      //
+      // Deliberately OUTSIDE the sync try/catch above: a failure to tidy our own
+      // cache says nothing about the LinkedIn session, and that catch is where
+      // session health is judged.
+      if (acceptedProfileUrls.length > 0) {
+        try {
+          await deleteSentInvitationsByProfileUrls(accountId, acceptedProfileUrls);
+        } catch (err) {
+          console.error(`${TAG} Failed to drop accepted invitations for ${accountId}:`, err);
+        }
+      }
+
       // Refresh pending sent-invitations independently — a failure here must not
       // block connection sync (and vice versa).
       try {
-        await syncSentInvitationsForAccount(accountId);
+        // Cheap walk most cycles; a full one — which is what prunes — hourly.
+        const walkMode = chooseWalkMode(accountId);
+        await syncSentInvitationsForAccount(accountId, { mode: walkMode });
+        if (walkMode === 'full') markFullWalkCompleted(accountId);
+        if (observed !== 'disconnected') observed = 'connected';
       } catch (err) {
+        // 'disconnected' wins over 'connected': proof of a dead session from either
+        // call outranks the other having succeeded before it died.
+        if (isProvenDisconnectError(err)) observed = 'disconnected';
         console.error(`${TAG} Sent-invitation sync failed for account ${accountId}:`, err);
+      }
+      await recordUnipileAccountHealth({ accountId, ownerUserId, state: observed });
+      if (observed === 'disconnected') {
+        // Nothing below can succeed against a dead session, and reconciling a
+        // half-read invitation feed into a customer's CRM would be worse than
+        // skipping it.
+        lastRecheckAtByAccount.set(accountId, Date.now());
+        continue;
       }
       // Then mirror those pending invitations into the CRM (ENG-787). Runs here, right
       // after the refresh, because a pending invitation is the ONLY window in which an
@@ -708,7 +728,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       // feed and is pruned from the cache. Attribution that depends on a manual backfill
       // therefore races acceptance, and loses for invites sent outside this product,
       // sent without a resolvable list, or whose send-time mirror write failed.
-      await reconcileInvitesToCrmForAccount(accountId, ownerByAccountId.get(accountId));
+      await reconcileInvitesToCrmForAccount(accountId, ownerUserId);
     }
 
     // Auto-enroll leads and send email notifications for newly accepted connections

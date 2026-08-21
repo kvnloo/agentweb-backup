@@ -11,6 +11,7 @@ from urllib.parse import quote
 import aiohttp
 from browser_use.agent.views import ActionResult
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
+import secrets_manager
 from pydantic import SecretStr
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
@@ -99,7 +100,7 @@ def create_jwt_token(user_id: str) -> str:
         import jwt
         from datetime import datetime, timedelta
         
-        jwt_secret = os.getenv('JWT_SECRET')
+        jwt_secret = secrets_manager.get_jwt_secret()
         if not jwt_secret:
             logger.error("JWT_SECRET environment variable not set")
             return None
@@ -263,10 +264,10 @@ def get_azure_openai_llm(model_name: str):
         
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key(),
+            api_version=secrets_manager.get_azure_openai_api_version(),
             temperature=0.0
         )
     except Exception as e:
@@ -278,13 +279,13 @@ def get_azure_openai_llm2(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT2'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint2(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY2'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION2', '2024-12-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key2(),
+            api_version=secrets_manager.get_azure_openai_api_version2(),
             temperature=0.0
         )
     except Exception as e:
@@ -296,13 +297,13 @@ def get_azure_openai_llm3(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT3'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint3(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY3'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION3', '2025-01-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key3(),
+            api_version=secrets_manager.get_azure_openai_api_version3(),
         )
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
@@ -313,14 +314,14 @@ def get_azure_openai_llm_o1(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         # O1 series model does not support temperature
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12')
+            api_key=secrets_manager.get_azure_openai_api_key(),
+            api_version=secrets_manager.get_azure_openai_api_version(default='2024-09-12')
         )
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
@@ -332,7 +333,7 @@ def get_deepseek_llm(model_name: str):
     global global_use_vision
     try:
         global_use_vision = False
-        api_key = os.getenv('DEEPSEEK_API_KEY')
+        api_key = secrets_manager.get_deepseek_api_key()
         if not api_key:
             raise ValueError('DEEPSEEK_API_KEY is not set')
             
@@ -352,7 +353,7 @@ def get_pld_deepseek_llm(model_name: str):
     global global_use_vision
     try:
         global_use_vision = False
-        api_key = os.getenv('PLD_DEEPSEEK_API_KEY')
+        api_key = secrets_manager.get_pld_deepseek_api_key()
         if not api_key:
             raise ValueError('PLD_DEEPSEEK_API_KEY is not set')
             
@@ -374,10 +375,17 @@ def get_openai_llm(model_name: str):
     
     """Initialize OpenAI language model"""
     try:
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
-            
+        # browser-use's own preflight check reads OPENAI_API_KEY directly
+        # from os.environ (browser_use/agent/views.py's REQUIRED_LLM_API_ENV_VARS),
+        # independent of the api_key passed to ChatOpenAI below. Without this,
+        # every openai->openai-> task fails with "The api_key client option
+        # must be set..." even though the secret itself is fine - found via
+        # ENG-389 live testing (2026-08-01).
+        os.environ['OPENAI_API_KEY'] = api_key
+
         return ChatOpenAI(
             model=model_name,
             api_key=SecretStr(api_key),
@@ -392,10 +400,12 @@ def get_openai_llm_think(model_name: str):
     """Initialize OpenAI language model"""
     global global_use_vision
     try:
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
-            
+        # See get_openai_llm() above for why this is needed.
+        os.environ['OPENAI_API_KEY'] = api_key
+
         # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
         global_use_vision = False
         logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
@@ -412,7 +422,7 @@ def get_openai_llm_think(model_name: str):
 def get_gemini_llm(model_name: str, code_execution: bool = False):
     """Initialize Google Gemini language model"""
     try:
-        api_key = os.getenv('GEMINI_API_KEY')
+        api_key = secrets_manager.get_gemini_api_key()
         if not api_key:
             raise ValueError('GEMINI_API_KEY is not set')
             
@@ -1437,7 +1447,7 @@ async def call_github_api(
     repo = "agentweb-agentcode"
     
     # Get GitHub API key
-    github_api_key = os.getenv('GITHUB_API_KEY')
+    github_api_key = secrets_manager.get_github_api_key()
     if not github_api_key:
         return 401, {}, "GitHub API key not found in environment"
     
@@ -1722,7 +1732,7 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
                 iterations=100000,
             )
             # Convert JWT_SECRET to bytes for key derivation
-            secret_bytes = os.getenv('JWT_SECRET').encode('utf-8')
+            secret_bytes = secrets_manager.get_jwt_secret().encode('utf-8')
             key = kdf.derive(secret_bytes)
             
             # Create AESGCM instance with derived key
@@ -1733,11 +1743,11 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
             signed_password = decrypted.decode('utf-8')
             
             # Decode the signed password
-            decoded = jwt.decode(signed_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(signed_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
         except Exception as e:
             # If decryption fails, try as old signed format
             logger.info("Decryption failed, trying old signed format")
-            decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(encrypted_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
 
         # For shared passwords, verify against the original sharer's userId
         expected_user_id = shared_by if shared_by else user_id

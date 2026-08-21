@@ -102,6 +102,20 @@ const visibilityColor = (v: string) => {
   }
 };
 
+/**
+ * What `PUT /api/admin/work-plans/:id` returns when it refuses a destructive
+ * replace (ENG-1221). `blanked` is a step that came back with a field emptied;
+ * `unpaired` is one the payload could not account for at all — most often a
+ * step renamed while its content was edited, which is indistinguishable from a
+ * different step taking its number.
+ */
+interface StepLossRefusal {
+  message?: string;
+  stepsWouldBeRemoved?: number;
+  removedStepTitles?: string[];
+  stepContentLoss?: { stepCount?: number; title?: string; fields?: string[]; kind?: "blanked" | "unpaired" }[];
+}
+
 export default function WorkPlans() {
   const { token } = useAuth();
   const [plans, setPlans] = useState<WorkPlan[]>([]);
@@ -139,6 +153,9 @@ export default function WorkPlans() {
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<WorkPlan | null>(null);
+
+  /** The endpoint's step-loss refusal, held so the admin can confirm it (ENG-1221). */
+  const [stepLoss, setStepLoss] = useState<StepLossRefusal | null>(null);
 
   // Available function calls for autocomplete
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<string[]>([]);
@@ -303,7 +320,21 @@ export default function WorkPlans() {
     }
   };
 
-  const handleSave = async () => {
+  /**
+   * Save, optionally confirming a step-loss refusal (ENG-1221).
+   *
+   * The endpoint refuses a replace that would drop steps or blank fields on the
+   * ones it keeps, unless `confirm_step_removal` is set. This editor always
+   * sends the WHOLE steps array, so two ordinary actions land on that refusal:
+   * renaming a step while editing its content, and removing a step. Before this
+   * the admin got the server's message verbatim — which ends by telling them to
+   * retry with an API flag the portal cannot send — and no way forward.
+   *
+   * `confirmStepRemoval` MUST be passed explicitly. The Save button previously
+   * read `onClick={handleSave}`, which hands React's MouseEvent to the first
+   * parameter; a truthy event would confirm every destructive save silently.
+   */
+  const handleSave = async (confirmStepRemoval: boolean = false) => {
     if (!title.trim()) {
       setError("Title is required");
       return;
@@ -322,6 +353,7 @@ export default function WorkPlans() {
         showInAgentMode, autocomplete, requireLogin, visibility,
         ...(defaultModel && { defaultModel }),
         ...(category && { category }),
+        ...(confirmStepRemoval && { confirm_step_removal: true }),
       };
       if (editingPlan) {
         // This save replaces the whole steps array with what the dialog loaded,
@@ -339,18 +371,35 @@ export default function WorkPlans() {
         });
         setSuccess("Work plan created");
       }
+      setStepLoss(null);
       setDialogOpen(false);
       fetchPlans();
     } catch (err: any) {
+      const data = err.response?.data as StepLossRefusal | undefined;
+      // The guard's refusal carries exactly what would be lost. Show it as
+      // something the admin can decide on rather than an error they cannot act
+      // on. Anything else is still a plain error.
+      const describesLoss = (data?.stepsWouldBeRemoved ?? 0) > 0
+        || (data?.stepContentLoss?.length ?? 0) > 0;
+      if (err.response?.status === 400 && describesLoss) {
+        setStepLoss(data ?? null);
+        return;
+      }
+      // Every other failure closes the confirmation first. A retry that comes
+      // back a stale-write conflict — or anything else — would otherwise leave
+      // the modal sitting over the error that explains it, offering a "Save
+      // anyway" that cannot work: the admin clicks it, fails the same way, and
+      // never sees why.
+      setStepLoss(null);
       if (err.response?.status === 409) {
-        // Keep the dialog open — their edits are still in it, and closing would
+        // Keep the EDITOR open — their edits are still in it, and closing would
         // throw away the work while the plan on screen is the outdated one.
         setError(
           "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
         );
         return;
       }
-      setError(err.response?.data?.message || "Failed to save work plan");
+      setError(data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
     }
@@ -966,7 +1015,7 @@ export default function WorkPlans() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleSave} variant="contained" disabled={saving}>
+          <Button onClick={() => handleSave()} variant="contained" disabled={saving}>
             {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
           </Button>
         </DialogActions>
@@ -988,6 +1037,57 @@ export default function WorkPlans() {
         <DialogActions>
           <Button onClick={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }}>Cancel</Button>
           <Button onClick={handleReject} variant="contained" color="error" disabled={!rejectFeedback.trim()}>Reject</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Step-loss confirmation (ENG-1221) — the endpoint refuses a destructive
+          replace; this turns that refusal into a decision the admin can make. */}
+      <Dialog open={!!stepLoss} onClose={() => setStepLoss(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>Saving this would lose step content</DialogTitle>
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Nothing has been saved yet. Review what would be lost, then choose.
+          </Alert>
+          {(stepLoss?.removedStepTitles?.length ?? 0) > 0 && (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                Steps that would be removed ({stepLoss?.stepsWouldBeRemoved})
+              </Typography>
+              <ul style={{ marginTop: 4 }}>
+                {stepLoss?.removedStepTitles?.map((t, i) => (
+                  <li key={`removed-${i}`}><Typography variant="body2">{t}</Typography></li>
+                ))}
+              </ul>
+            </>
+          )}
+          {(stepLoss?.stepContentLoss?.length ?? 0) > 0 && (
+            <>
+              <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                Steps that would lose content ({stepLoss?.stepContentLoss?.length})
+              </Typography>
+              <ul style={{ marginTop: 4 }}>
+                {stepLoss?.stepContentLoss?.map((l, i) => (
+                  <li key={`loss-${i}`}>
+                    <Typography variant="body2">
+                      <strong>{l.title || `Step ${l.stepCount}`}</strong>
+                      {l.kind === "unpaired"
+                        ? " — this step is not recognisable in what you are saving. Renaming a step while editing it looks the same as replacing it with a different one, so it is reported either way."
+                        : (l.fields?.length ? ` — would clear: ${l.fields.join(", ")}` : "")}
+                    </Typography>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <Typography variant="body2" sx={{ mt: 2, color: "text.secondary" }}>
+            If this is what you meant, save anyway. If not, go back — your edits are still open.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setStepLoss(null)}>Go back</Button>
+          <Button onClick={() => handleSave(true)} variant="contained" color="warning" disabled={saving}>
+            Save anyway
+          </Button>
         </DialogActions>
       </Dialog>
 

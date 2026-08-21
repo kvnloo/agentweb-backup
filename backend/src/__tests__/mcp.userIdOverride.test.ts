@@ -45,6 +45,11 @@ jest.mock('../mcp/server/registry', () => ({
 }));
 
 jest.mock('../mcp/server/apiTools', () => ({}));
+// ENG-982 added a second registering module to mcpServerCore's import chain.
+// Stubbed for the same reason as apiTools: this suite exercises the IDOR
+// dispatch, not tool registration, and the registry above is a partial mock
+// with no `register`.
+jest.mock('../mcp/server/workflowTools', () => ({}));
 
 import { createMcpServer, McpSessionContext } from '../mcp/server/mcpServerCore';
 

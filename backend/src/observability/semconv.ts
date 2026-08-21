@@ -26,6 +26,9 @@ export const ATTR_GEN_AI_REQUEST_MODEL = 'gen_ai.request.model';
 export const ATTR_GEN_AI_USAGE_INPUT_TOKENS = 'gen_ai.usage.input_tokens';
 export const ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = 'gen_ai.usage.output_tokens';
 export const ATTR_GEN_AI_RESPONSE_FINISH_REASONS = 'gen_ai.response.finish_reasons';
+/** Model that actually served the run — differs from the request model when a
+ * legacy id was mapped forward or a transient error moved the run to a backup. */
+export const ATTR_GEN_AI_RESPONSE_MODEL = 'gen_ai.response.model';
 export const ATTR_GEN_AI_TOOL_NAME = 'gen_ai.tool.name';
 export const ATTR_GEN_AI_CONVERSATION_ID = 'gen_ai.conversation.id';
 /** Full prompt/completion content — only set when content capture is env-enabled. */
@@ -53,11 +56,13 @@ export const ATTR_TOOL_ERROR_CLASS = 'agentweb.tool.error_class';
 
 /**
  * Provider name for a model id — mirrors the routing branch in
- * `agentModeService.callLLM` (gemini-* / anthropic.* Bedrock / claude-* Vertex /
- * everything else Azure OpenAI). Values follow semconv gen_ai.provider.name
- * well-known values where they exist.
+ * `agentModeService.callLLM` for model-id-native routes. Task-class canaries can
+ * override this at the span boundary because a GPT/Gemini/Claude logical id may
+ * deliberately travel through OpenRouter. Values follow semconv
+ * gen_ai.provider.name well-known values where they exist.
  */
 export function providerForModel(model: string): string {
+  if (model.startsWith('openrouter/')) return 'openrouter';
   if (model.startsWith('gemini-')) return 'gemini';
   if (model.startsWith('anthropic.')) return 'aws.bedrock';
   if (model.startsWith('claude-')) return 'gcp.vertex_ai';

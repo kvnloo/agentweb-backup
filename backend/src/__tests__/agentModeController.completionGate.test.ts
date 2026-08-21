@@ -19,6 +19,7 @@
 import {
   scheduledRunSignalsIncompleteWork,
   scheduledRunSignalsIncompleteResponse,
+  classifyScheduledContinuation,
 } from '../controllers/agentModeController';
 
 describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () => {
@@ -62,6 +63,29 @@ describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () =>
 
   it('scheduledRunSignalsIncompleteResponse fires on the flag even with empty content', () => {
     expect(scheduledRunSignalsIncompleteResponse({ content: '', truncatedByStepBudget: true })).toBe(true);
+  });
+
+  // ── Wall-clock truncation (ENG-907) is the same kind of STATE signal ────────
+  // A broad research turn can stay under the step budget and still run out of
+  // wall-clock time; the loop then forces a tool-free synthesis that delivers a
+  // labelled partial answer. For a scheduled run that partial answer is not the
+  // deliverable, so the gate must continue it exactly like a step-budget
+  // truncation — and again the text alone ("Partial results — 6 of 10 …") gives
+  // the text detector nothing to match.
+  it('scheduledRunSignalsIncompleteResponse fires when truncatedByTimeBudget is set', () => {
+    expect(scheduledRunSignalsIncompleteResponse({
+      content: 'Partial results — here are the 6 posts I found before the time limit.',
+      truncatedByTimeBudget: true,
+    })).toBe(true);
+  });
+
+  it('classifies a wall-clock truncation as a budget continuation', () => {
+    expect(classifyScheduledContinuation({ content: 'Partial results.', truncatedByTimeBudget: true })).toBe('budget');
+    expect(classifyScheduledContinuation({ content: 'Partial results.', truncatedByTimeBudget: false })).toBeNull();
+  });
+
+  it('scheduledRunSignalsIncompleteResponse fires on the time flag even with empty content', () => {
+    expect(scheduledRunSignalsIncompleteResponse({ content: '', truncatedByTimeBudget: true })).toBe(true);
   });
 
   it('scheduledRunSignalsIncompleteWork does NOT rely on the apology text (flag-based detection only)', () => {

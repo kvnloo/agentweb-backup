@@ -88,9 +88,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 13 items', () => {
+  it('returns exactly 14 items', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(13);
+    expect(result).toHaveLength(14);
   });
 
   it('does not include unexpected platforms', () => {
@@ -101,6 +101,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'meta',
       'gmail',
       'outlook',
+      'calendly',
       'youtube',
       'fathom',
       'instagram',

@@ -1345,6 +1345,7 @@ describe('McpClientService', () => {
 
       // First execute fails with connection error — dead client should be evicted
       await expect(tools[0].execute({}, context)).rejects.toThrow('Connection timeout');
+      expect(mockClient.close).toHaveBeenCalledTimes(1);
 
       // Second execute: new client is created (eviction worked), succeeds
       const result = await tools[0].execute({}, context);

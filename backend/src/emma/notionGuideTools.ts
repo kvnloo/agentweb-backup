@@ -1,6 +1,10 @@
 import { emmaToolRegistry } from './registry';
 import { getUserGuideContent } from '../services/notionService';
-import { buildDocumentationReference, searchDocumentation } from './documentationSite';
+import {
+  buildDocumentationReference,
+  getDocumentationReference,
+  searchDocumentation,
+} from './documentationSite';
 
 // Available to all users — Emma uses this to answer user guide questions
 emmaToolRegistry.register({
@@ -22,16 +26,18 @@ emmaToolRegistry.register({
   },
   execute: async (args: { query?: string }) => {
     const query = args?.query?.trim() || '';
-    const docsReference = buildDocumentationReference();
-
-    if (!query) {
-      return { success: true, content: docsReference.trim(), results: [] };
-    }
 
     try {
+      if (!query) {
+        // Integration links come from the live corpus, never a copy kept here.
+        return { success: true, content: (await getDocumentationReference()).trim(), results: [] };
+      }
+
       const result = await searchDocumentation(query);
       return { success: true, ...result };
     } catch (mintlifyError: any) {
+      // No link list: the docs site is unreachable, so its deep links are too.
+      const docsReference = buildDocumentationReference();
       // The old Notion guide remains a degraded fallback, never the canonical
       // source. This keeps help available during a docs-site outage without
       // making every healthy request depend on Notion.

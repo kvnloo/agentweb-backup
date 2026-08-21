@@ -20,10 +20,10 @@
  */
 
 import { Request, Response } from 'express';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, generateSessionResponse } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { userDb } from '../services/db';
+import { userDb, scheduleDb } from '../services/db';
 
 // ── Mocks (mirror agentModeController.errorHandling.test.ts) ──────────────────
 jest.mock('../services/chatbotService', () => ({
@@ -32,6 +32,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     updateSessionContextLimitReported: jest.fn().mockResolvedValue(undefined),
     createOrReuseInteractiveShare: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
@@ -140,6 +141,10 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // Default owner-admin lookup to a deterministic non-admin so the base suite
     // never makes a real DB call; admin-gating cases below override this per-test.
     jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
+    // ENG-827: publish authorization comes solely from the schedule's dedicated
+    // `autopublishAuthorized` consent flag. Default the lookup to a schedule without
+    // it (draft-and-notify); authorized cases below override this per-test.
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, autopublishAuthorized: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -214,6 +219,10 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('[Schedule Context]');
     expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp).toContain('PER-ENTITY COMPLETION LOOP');
+    // ENG-827: with no scheduleId there is nothing to look up, and the publish
+    // decision is not stated on this path at all, so no schedule read may happen.
+    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
+    expect(sp).not.toContain('pre-authorized to publish');
   });
 
   it('does NOT inject the unattended directive for a regular (non-scheduled) session', async () => {
@@ -277,5 +286,29 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toBeDefined();
     expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp!).not.toContain('IDENTITY RESOLUTION');
+  });
+
+  // ── The publish decision is NOT stated here (ENG-827) ────────────────────────
+  // This system prompt is stored as the session's FIRST message, and
+  // buildMarketingContext slices that message off (startIdx = 1) before the model
+  // sees it. A publish decision written here is therefore a decision nobody reads —
+  // confirmed on a live preview run, where the block was present in the stored
+  // message and had no effect on behaviour. The block is emitted by
+  // AgentModeService instead, appended AFTER the conversation; see
+  // agentModeService.scheduledSessionContext.test.ts. These assertions pin that
+  // split so the decision cannot drift back to the unread copy.
+  it('states NO publish decision — that block belongs on the delivered path', async () => {
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
+  });
+
+  it('does not read the schedule just to assemble this prompt', async () => {
+    // The publish decision moved out, so the only remaining lookup reason went with
+    // it. A re-appearing read here means the unread copy is being rebuilt.
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
   });
 });

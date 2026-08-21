@@ -118,6 +118,13 @@ describe('readTargetLifecycleState', () => {
 });
 
 describe('startAsgTerminationGuard', () => {
+  function lifecycleActionNotReady(): Error & { code: string } {
+    return Object.assign(
+      new Error('No active Lifecycle Action found with instance ID i-dead'),
+      { code: 'ValidationError' }
+    );
+  }
+
   it('disables itself permanently off-ASG and never drains', async () => {
     const clock = makeClock();
     const onTerminating = jest.fn(async () => {});
@@ -274,6 +281,114 @@ describe('startAsgTerminationGuard', () => {
     // before its drain could be reported.
     await expect(clock.advance(CONFIRMING_READS_REQUIRED)).resolves.toBeUndefined();
     expect(onTerminating).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries the exact AWS lifecycle-action propagation race until completion succeeds', async () => {
+    const clock = makeClock();
+    const sleepImpl = jest.fn(async () => {});
+    const completeAction = jest
+      .fn<Promise<void>, [string]>()
+      .mockRejectedValueOnce(lifecycleActionNotReady())
+      .mockRejectedValueOnce(lifecycleActionNotReady())
+      .mockResolvedValue(undefined);
+    const deps = {
+      fetchImpl: makeFetch({
+        stateReplies: [{ status: 200, body: 'Terminated' }],
+        instanceId: 'i-dead',
+      }),
+      completeAction,
+      sleepImpl,
+      logger: silentLogger,
+      ...clock,
+    };
+
+    startAsgTerminationGuard(jest.fn(async () => {}), deps);
+    await clock.advance(CONFIRMING_READS_REQUIRED);
+
+    expect(completeAction).toHaveBeenCalledTimes(3);
+    expect(sleepImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds lifecycle-action propagation retries to fifteen attempts', async () => {
+    const clock = makeClock();
+    const sleepImpl = jest.fn(async () => {});
+    const completeAction = jest.fn(async () => {
+      throw lifecycleActionNotReady();
+    });
+    const deps = {
+      fetchImpl: makeFetch({
+        stateReplies: [{ status: 200, body: 'Terminated' }],
+        instanceId: 'i-dead',
+      }),
+      completeAction,
+      sleepImpl,
+      logger: silentLogger,
+      ...clock,
+    };
+
+    startAsgTerminationGuard(jest.fn(async () => {}), deps);
+    await expect(clock.advance(CONFIRMING_READS_REQUIRED)).resolves.toBeUndefined();
+
+    // This is a behavioral ceiling, intentionally not derived from production constants.
+    expect(completeAction).toHaveBeenCalledTimes(15);
+    expect(sleepImpl).toHaveBeenCalledTimes(14);
+    expect(silentLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining('the hook will time out'),
+      expect.objectContaining({ code: 'ValidationError' })
+    );
+  });
+
+  it('records lifecycle propagation retries before the eventual successful release', async () => {
+    const clock = makeClock();
+    const completeAction = jest
+      .fn<Promise<void>, [string]>()
+      .mockRejectedValueOnce(lifecycleActionNotReady())
+      .mockResolvedValue(undefined);
+    const deps = {
+      fetchImpl: makeFetch({
+        stateReplies: [{ status: 200, body: 'Terminated' }],
+        instanceId: 'i-dead',
+      }),
+      completeAction,
+      sleepImpl: jest.fn(async () => {}),
+      logger: silentLogger,
+      ...clock,
+    };
+
+    startAsgTerminationGuard(jest.fn(async () => {}), deps);
+    await clock.advance(CONFIRMING_READS_REQUIRED);
+
+    expect(silentLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('lifecycle action is not active yet')
+    );
+    expect(silentLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('lifecycle action completed')
+    );
+  });
+
+  it('does not retry a non-propagation completion error', async () => {
+    const clock = makeClock();
+    const sleepImpl = jest.fn(async () => {});
+    const completeAction = jest.fn(async () => {
+      throw Object.assign(new Error('not authorized'), { code: 'AccessDenied' });
+    });
+    const deps = {
+      fetchImpl: makeFetch({
+        stateReplies: [{ status: 200, body: 'Terminated' }],
+        instanceId: 'i-dead',
+      }),
+      completeAction,
+      sleepImpl,
+      logger: silentLogger,
+      ...clock,
+    };
+
+    startAsgTerminationGuard(jest.fn(async () => {}), deps);
+    await expect(clock.advance(CONFIRMING_READS_REQUIRED)).resolves.toBeUndefined();
+
+    expect(completeAction).toHaveBeenCalledTimes(1);
+    expect(sleepImpl).not.toHaveBeenCalled();
+    expect(silentLogger.error).toHaveBeenCalledTimes(1);
   });
 
   it('survives a transient IMDS error without disabling or draining', async () => {

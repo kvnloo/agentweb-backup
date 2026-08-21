@@ -11,8 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - AI agents own qualifying engineering work through merge. Merge only from a
   branch current with `main`, after the full relevant local suite, regression
   coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, latest-head Greptile 5/5 with no unresolved actionable P1/P2,
-  attribution, rollback evidence, and acceptance-contract completeness all pass.
+  check, attribution, rollback evidence, and acceptance-contract completeness
+  all pass.
+- Greptile is retired (ENG-1371, 2026-08-19). It is no longer a merge
+  criterion, the `Require Greptile Review` job and its scripts are deleted, and
+  `greptile.json` is gone. Do not wait for a Greptile verdict and do not
+  reintroduce a reviewer job in front of the test suites — ENG-1039 measured
+  that coupling skipping the backend suite 303 times, and `merge-evidence.sh`
+  now uses `Detect changed projects` as its draft discriminator. CodeRabbit
+  still comments on every PR and remains advisory only: it has never been a
+  required check and reports `pass` regardless of its own rate-limit state, so
+  read its findings, but nothing mechanical is gating on it.
 - Establish "every relevant GitHub check" with
   `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
   (exit 0), never with `gh pr checks` alone. `gh pr checks` answers "did anything
@@ -20,6 +29,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   cannot schedule a run at all, and on a stale draft-time run in which every job
   skipped. Exit 3 is `NO_EVIDENCE`: nothing ever executed against this head,
   which is not the same as passing and never satisfies the gate (ENG-757).
+  Note the exit codes: 0 PASS, 1 FAIL, 2 PENDING, 3 NO_EVIDENCE, 4 ERROR. Only
+  0 is a merge.
 - Database/data-plane work requires Harsha before merge: migrations or persistent
   schema/table/index/key/model changes; backfills, bulk mutations, deletes, or
   production data repair; persistence provisioning/retention/backup/access
@@ -478,7 +489,7 @@ Uses browser-use library with Playwright:
 **Production:**
 - Backend: AWS Elastic Beanstalk (Node.js platform), environment `Agentweb-backend-env-prod-3` → `https://api.agentweb.pro`
 - Partner Portal: AWS Elastic Beanstalk → `https://agentweb.pro`
-- Agent Engine: Google Cloud VM (manually deployed)
+- Agent Engine: Google Cloud VM, systemd-managed (dedicated `agentengine` OS user, auto-restart on crash + boot). See `agent-engine/deploy/RUNBOOK.md` for provisioning, secrets, deploy, and rollback.
 
 **Staging:**
 - Backend: AWS Elastic Beanstalk, environment `Agentweb-backend-env-1` → `https://api-stage.agentweb.pro`
@@ -561,14 +572,16 @@ zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 ```
 
 **Agent Engine:**
+
+Runs under systemd on `agentweb-agentengine-instance-prod2`, as the `agentengine`
+OS user. Full deploy/restart/rollback steps: `agent-engine/deploy/RUNBOOK.md`.
+Quick reference:
 ```bash
-# SSH to Google Cloud VM
-cd ~/agentweb
-git pull
-conda activate agent-engine
-pip install -r requirements.txt
-playwright install
-# Restart task_monitor.py
+sudo -u agentengine -i
+cd /opt/agent-engine/agentweb
+git pull origin main   # see RUNBOOK.md for the deploy-token auth step
+exit   # agentengine has no sudo (ENG-914) — restart with your own
+sudo systemctl restart agent-engine
 ```
 
 ## Environment Configuration
@@ -595,6 +608,16 @@ Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
 - `dev/AgentWeb/LinkedIn/Personal` - LinkedIn personal profile credentials
 - `dev/AgentWeb/LinkedIn/Company` - LinkedIn company page credentials
+
+### Agent Engine `.env`
+
+Agent-engine's own secrets (API keys, AWS credentials for DynamoDB/S3/Bedrock,
+SMTP, etc.) are **not** in AWS Secrets Manager above — they're in **GCP Secret
+Manager** (project `agent-engine-460619`, IDs `agentengine-<env>-<name>`),
+since the VM has no AWS-facing identity federation. See
+`agent-engine/deploy/RUNBOOK.md`'s Secrets section for the full list and why.
+Local dev still uses `agent-engine/.env` (see `.env.example`) exactly as
+before — env vars always take precedence over Secret Manager.
 
 ### Frontend `.env` (Build Time)
 

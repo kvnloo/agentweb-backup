@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import sharp from "sharp";
 import { workPlanService } from "../services/workPlanService";
-import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
+import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -115,8 +115,191 @@ router.put("/:planId", async (req, res) => {
       ? { expectedStepsRev: req.body.expectedStepsRev }
       : {};
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
-    const normalizedSteps = normalized?.steps;
+    let normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
+
+    // ENG-1221. These guards used to live only inside manage_predefined_work_plan,
+    // one layer ABOVE the write — so a caller reaching this endpoint directly got
+    // no protection, `steps_mode` silently ignored, and every omitted field on a
+    // partial steps array erased. That destroyed all ten step descriptions on the
+    // Google Pre-Launch Gate plan and answered HTTP 200 with a null diff.
+    // The rules now live where the damage happens, and the tool shares them.
+    let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+    // Validated whether or not steps came with it. Nesting this under "steps
+    // were supplied" is accept-and-disregard by another name: the caller is
+    // answered 200 for a mode we never looked at.
+    // BOTH spellings are validated, not just whichever wins. `steps_mode ??
+    // stepsMode` never looks at the second key once the first is set, so a
+    // request carrying a good mode and a garbage one had the garbage accepted
+    // and disregarded — the behaviour this check exists to eliminate. `null` is
+    // rejected rather than coalesced away for the same reason: it was supplied,
+    // so answering 200 with replace semantics is a silent downgrade of what the
+    // caller asked for.
+    const suppliedModes = ['steps_mode', 'stepsMode']
+      .filter((key) => key in (req.body as any))
+      .map((key) => (req.body as any)[key]);
+    const badMode = suppliedModes.find((m) => m !== 'merge' && m !== 'replace');
+    if (badMode !== undefined || suppliedModes.some((m) => m === undefined)) {
+      return res.status(400).json({
+        message: `Unrecognised steps_mode ${JSON.stringify(badMode)}. Use "merge" to amend named steps, or "replace" to store exactly what you send.`,
+      });
+    }
+    // Two valid but contradictory modes pass the check above, and taking the
+    // first would apply semantics the caller explicitly also denied — with
+    // `confirm_step_removal` present that resolves to an unintended replace.
+    if (suppliedModes.length > 1 && new Set(suppliedModes).size > 1) {
+      return res.status(400).json({
+        message: `Conflicting modes: steps_mode="${(req.body as any).steps_mode}" and stepsMode="${(req.body as any).stepsMode}". Supply one, or the same value for both.`,
+      });
+    }
+    const rawMode = suppliedModes[0];
+    if (normalizedSteps !== undefined) {
+      const mode: 'merge' | 'replace' = rawMode === 'merge' ? 'merge' : 'replace';
+      const existingSteps: any[] = Array.isArray(plan.steps) ? plan.steps : [];
+
+      if (mode === 'merge') {
+        // `normalizeWorkPlanSteps` FILLS IN what a partial step omits — `title`
+        // becomes "Step N", `stepCount` the array position, the two list fields
+        // []. Merging those invented values over real ones is the same data loss
+        // by a different route: it is exactly how the Pre-Launch Gate titles
+        // were truncated from "Step 1: Scope the launch" to "Step 1". A
+        // synthesised stepCount is worse still, because merge resolution trusts
+        // stepCount ahead of title — so a title-only entry would silently amend
+        // whichever step happened to sit at that array position.
+        //
+        // So: normalized VALUES, but the raw payload as the authority on which
+        // keys the caller actually sent. Only camelCase is consulted, because
+        // that is all `normalizeWorkPlanSteps` reads; the MCP tool resolves its
+        // snake_case aliases before it ever reaches this route (ENG-889).
+        // Treating `required_function_calls` as supplied here would merge the
+        // normalizer's default [] over the stored list.
+        const rawSteps: any[] = steps;
+        const supplied = normalizedSteps.map((norm: any, i: number) => {
+          const raw = rawSteps[i] ?? {};
+          const has = (key: string) => raw[key] !== undefined;
+          const out: any = {};
+          // The rule for every field below: a value counts as SUPPLIED only if
+          // normalization would keep it rather than invent a replacement.
+          // Presence alone is not enough, because the normalizer substitutes for
+          // falsy input — `stepCount` and `title` become the array position and
+          // "Step N", and a null list becomes []. Merging any of those writes a
+          // value the caller never sent over one that was really there, under
+          // the mode whose whole promise is that it does not do that. A
+          // synthesised `stepCount` is worst of all, because merge resolution
+          // trusts it ahead of title and so silently edits the wrong step.
+          //
+          // Truthiness for the two `||` fields mirrors the normalizer exactly,
+          // so the two cannot disagree; `Array.isArray` mirrors `listOf`.
+          // `description` and `userInstructions` pass through unchanged, so
+          // presence is the right test — and mergeWorkPlanStep drops a null.
+          if (raw.stepCount) out.stepCount = norm.stepCount;
+          if (raw.title) out.title = norm.title;
+          if (has('description')) out.description = norm.description;
+          if (has('userInstructions')) out.userInstructions = norm.userInstructions;
+          if (Array.isArray(raw.requiredFunctionCalls)) out.requiredFunctionCalls = norm.requiredFunctionCalls;
+          if (Array.isArray(raw.skillIds)) out.skillIds = norm.skillIds;
+          if (has('expectedAssetCount')) out.expectedAssetCount = norm.expectedAssetCount;
+          return out;
+        });
+
+        // An entry carrying neither selector names no step. Amending whatever
+        // sits at its array position is the same silent wrong-step edit the
+        // ambiguity check below already refuses to make.
+        const untargeted = supplied
+          .map((s: any, i: number) => ({ s, position: i + 1 }))
+          .filter(({ s }: any) => s.stepCount === undefined && s.title === undefined)
+          .map(({ position }: any) => position);
+        if (untargeted.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: a supplied step names neither stepCount nor title, so there is no way to tell which step it amends.',
+            untargetedStepPositions: untargeted,
+            howToProceed: [
+              'Give each step a stepCount to amend an existing step, or a title to amend it by name (a title matching nothing is appended as a new step).',
+            ],
+          });
+        }
+
+        const ambiguous = findAmbiguousMergeTargets(existingSteps, supplied);
+        if (ambiguous.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: a step title matches more than one step, so there is no way to tell which one to amend.',
+            ambiguousSteps: ambiguous,
+            howToProceed: ['Retry with stepCount on each ambiguous step to name the one you mean.'],
+          });
+        }
+        const conflicting = findConflictingMergeTargets(existingSteps, supplied);
+        if (conflicting.length > 0) {
+          return res.status(400).json({
+            message: 'Refusing to merge: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.',
+            conflictingSteps: conflicting,
+            howToProceed: ['Combine the changes for each step into a single entry, then retry.'],
+          });
+        }
+        normalizedSteps = mergeWorkPlanSteps(existingSteps, supplied);
+      } else if (req.body.confirm_step_removal !== true) {
+        // A replace stores exactly what was sent, so both a shrink and a
+        // gutting of the steps it keeps are destructive. Refuse either.
+        if (normalizedSteps.length < existingSteps.length) {
+          const preview = summarizeStepChange(existingSteps, normalizedSteps, 'replace');
+          return res.status(400).json({
+            message: `Refusing to update: this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+            stepsWouldBeRemoved: preview.stepsRemoved,
+            removedStepTitles: preview.droppedStepTitles,
+            howToProceed: [
+              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+              'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true.',
+            ],
+          });
+        }
+        // Compare against the titles the CALLER sent, not the ones
+        // normalization invented. A partial payload — `{stepCount, skillIds}`,
+        // the shape that destroyed this plan — arrives here with `title` filled
+        // in as "Step N", which reads as a deliberate rename of every step
+        // rather than as "no title supplied". Step identity is then unresolvable
+        // and the loss goes unreported. The raw payload is the authority on
+        // which keys were present, exactly as in the merge branch above.
+        const rawReplace: any[] = steps;
+        const forCompare = normalizedSteps.map((norm: any, i: number) => {
+          if (rawReplace[i]?.title) return norm;
+          const { title, ...rest } = norm;
+          return rest;
+        });
+        const contentLoss = findStepContentLoss(existingSteps, forCompare);
+        if (contentLoss.length > 0) {
+          // Two different accidents reach here, and saying "fields would be
+          // blanked" for both misdescribes one of them. `blanked` is a step that
+          // came back with a field emptied. `unpaired` is a step that did not
+          // come back recognisably at all — most often renamed while a field was
+          // edited, which is indistinguishable from a different step taking its
+          // number, so it is reported rather than guessed at. Naming which is
+          // which is what lets the caller tell "I typo'd a field" from "the plan
+          // no longer contains the step I thought I was editing".
+          const blanked = contentLoss.filter((l: any) => l.kind === 'blanked');
+          const unpaired = contentLoss.filter((l: any) => l.kind === 'unpaired');
+          const parts = [
+            blanked.length > 0
+              && `${blanked.length} step(s) would come back with fields that are currently set emptied`,
+            unpaired.length > 0
+              && `${unpaired.length} step(s) are not recognisable in what you sent (renamed, or replaced by a different step at the same stepCount)`,
+          ].filter(Boolean);
+          return res.status(400).json({
+            message: `Refusing to update: ${parts.join('; and ')}. A replace stores exactly what you send, so anything you omit or fail to carry over is erased.`,
+            stepsWouldBeRemoved: 0,
+            stepContentLoss: contentLoss,
+            howToProceed: [
+              'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing — merge renames and edits a step in one call without this check.',
+              'To keep these steps as they are, re-send each one with its current fields.',
+              'To intentionally rename, replace or clear them, retry with confirm_step_removal=true.',
+            ],
+          });
+        }
+      }
+
+      // AC3: a step change always reports a diff. A 200 with a null diff used to
+      // be indistinguishable from a successful no-op, which is exactly why a
+      // destructive write could pass unnoticed.
+      stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
+    }
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
@@ -134,7 +317,13 @@ router.put("/:planId", async (req, res) => {
     // `updated` was built by spreading the plan we read, so it carries the
     // pre-write revision. Answer with the one the write produced.
     const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
-    const saved = { ...updated, steps_rev };
+    const saved = {
+      ...updated,
+      steps_rev,
+      // ENG-1221 AC3 — always surface the diff when steps moved, so a
+      // destructive write can never read as a successful no-op.
+      ...(stepsChange && { stepsChange }),
+    };
     res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
     // A competing write landed between the caller's read and this one, so the

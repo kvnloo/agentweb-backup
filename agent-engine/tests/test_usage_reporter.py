@@ -176,6 +176,40 @@ class TestUsageReporterFlush(unittest.TestCase):
         self.assertFalse(ok)
         mock_post.assert_not_called()
 
+    def test_flush_includes_a_stable_report_id(self):
+        # ENG-1251: a genuine per-instance nonce, distinct from content-based
+        # heuristics, is what lets the backend tell a retried HTTP submission
+        # (same instance, same id) apart from a genuinely new execution (a
+        # new instance -- new WebAgent, new UsageReporter -- always gets a
+        # new one).
+        mock_response = MagicMock(status_code=202)
+        with patch("requests.post", return_value=mock_response) as mock_post:
+            self.reporter.flush("user-1", "task-9")
+        report_id = mock_post.call_args.kwargs["json"]["reportId"]
+        self.assertTrue(report_id)
+        self.assertEqual(report_id, self.reporter.report_id)
+
+    def test_report_id_is_stable_across_a_retried_flush_of_the_same_instance(self):
+        # flush() only clears the buffer on success, so a caller retrying
+        # flush() after a failed attempt reuses the same instance and must
+        # send the identical report_id both times.
+        with patch("requests.post", side_effect=ConnectionError("backend down")):
+            self.reporter.flush("user-1", "task-9")
+        first_id = self.reporter.report_id
+
+        mock_response = MagicMock(status_code=202)
+        with patch("requests.post", return_value=mock_response) as mock_post:
+            self.reporter.flush("user-1", "task-9")
+        second_id = mock_post.call_args.kwargs["json"]["reportId"]
+
+        self.assertEqual(first_id, second_id)
+
+    def test_two_reporter_instances_get_different_report_ids(self):
+        # A distinct execution (a new WebAgent/UsageReporter) must never
+        # collide with a prior one's id, even for identical measurements.
+        other = UsageReporter("azure->openai->gpt-4o", token_factory=lambda uid: "test-token")
+        self.assertNotEqual(self.reporter.report_id, other.report_id)
+
 
 class TestCallbackHandler(unittest.TestCase):
     def test_on_llm_end_feeds_reporter(self):

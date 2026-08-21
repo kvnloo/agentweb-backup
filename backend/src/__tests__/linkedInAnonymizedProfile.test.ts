@@ -1,0 +1,167 @@
+/**
+ * ENG-1198 follow-up — one definition of "LinkedIn anonymized this".
+ *
+ * ENG-1198 fixed three call sites with three separate inline comparisons and left
+ * one half of the problem open: Unipile also sends `public_profile_url` already
+ * built from the bad identifier, so a caller that correctly rejected the identifier
+ * still recreated the fake URL from its own fallback field.
+ */
+
+import {
+  isAnonymizedIdentifier,
+  isFabricatedProfileUrl,
+  usablePublicIdentifier,
+  usableProfileUrl,
+  withoutFabricatedProfileFields,
+} from '../utils/linkedInAnonymizedProfile';
+
+describe('isAnonymizedIdentifier', () => {
+  it('catches the literal string LinkedIn actually sends', () => {
+    // Not null, not absent — the four-letter string, which is truthy and so
+    // survives every naive `identifier ? ... : null` guard.
+    expect(isAnonymizedIdentifier('undefined')).toBe(true);
+  });
+
+  it('does not touch a real slug, including ones containing the word', () => {
+    expect(isAnonymizedIdentifier('powell-li-wang-63692786')).toBe(false);
+    expect(isAnonymizedIdentifier('undefined-industries-ceo')).toBe(false);
+  });
+
+  it('is not fooled by a genuinely absent value', () => {
+    expect(isAnonymizedIdentifier(undefined)).toBe(false);
+    expect(isAnonymizedIdentifier(null)).toBe(false);
+  });
+});
+
+describe('isFabricatedProfileUrl', () => {
+  it('catches the URL Unipile builds from the placeholder', () => {
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined')).toBe(true);
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined/')).toBe(true);
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined?trk=x')).toBe(true);
+  });
+
+  it('catches a fabricated URL carrying a fragment', () => {
+    // split('?') alone leaves '#about' attached, which pushes the path off the end
+    // of the anchored match — so the fake URL passed validation and could reach
+    // enrichment context as a resolved profile.
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined#about')).toBe(true);
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/undefined/?x=1#exp')).toBe(true);
+    expect(usableProfileUrl('https://www.linkedin.com/in/undefined#about')).toBeNull();
+  });
+
+  it('strips a fragment from a real URL too', () => {
+    expect(usableProfileUrl('https://www.linkedin.com/in/jian-liang#experience')).toBe(
+      'https://www.linkedin.com/in/jian-liang',
+    );
+  });
+
+  it('leaves a real profile URL alone, including a slug ending in the word', () => {
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/li-wang-cpa-5035b311')).toBe(false);
+    // Guards the regex: only the WHOLE final segment counts, not a suffix.
+    expect(isFabricatedProfileUrl('https://www.linkedin.com/in/notundefined')).toBe(false);
+  });
+
+  it('handles non-strings without throwing', () => {
+    expect(isFabricatedProfileUrl(undefined)).toBe(false);
+    expect(isFabricatedProfileUrl(null)).toBe(false);
+    expect(isFabricatedProfileUrl(42)).toBe(false);
+  });
+});
+
+describe('usablePublicIdentifier', () => {
+  it('collapses both failure shapes to null', () => {
+    expect(usablePublicIdentifier('undefined')).toBeNull();
+    expect(usablePublicIdentifier('')).toBeNull();
+    expect(usablePublicIdentifier('   ')).toBeNull();
+    expect(usablePublicIdentifier(undefined)).toBeNull();
+  });
+
+  it('returns a real slug, trimmed', () => {
+    expect(usablePublicIdentifier(' powell-li-wang-63692786 ')).toBe('powell-li-wang-63692786');
+  });
+});
+
+describe('usableProfileUrl', () => {
+  it('rejects the fabricated URL the identifier check alone would miss', () => {
+    // The regression: crmEnrichmentService rejected the identifier, then fell back
+    // to Unipile's own public_profile_url and rebuilt the same dead link.
+    expect(usableProfileUrl('https://www.linkedin.com/in/undefined')).toBeNull();
+    expect(usableProfileUrl('https://www.linkedin.com/in/undefined?utm=x')).toBeNull();
+  });
+
+  it('strips query params from a real URL, as the previous inline code did', () => {
+    expect(usableProfileUrl('https://www.linkedin.com/in/jian-liang?trk=search')).toBe(
+      'https://www.linkedin.com/in/jian-liang',
+    );
+  });
+
+  it('returns null for absent or empty input', () => {
+    expect(usableProfileUrl(null)).toBeNull();
+    expect(usableProfileUrl('')).toBeNull();
+  });
+});
+
+describe('withoutFabricatedProfileFields', () => {
+  // The blob itself reaches the LLM: gatherLinkedInContext serializes the whole
+  // profile into the prompt and stores it for cache replay. Rejecting the sentinel
+  // only where a URL is constructed leaves the fake one readable straight out of
+  // the JSON — and citation verification then accepts it, because the slug really
+  // does appear in the source context.
+  const anonymized = {
+    public_identifier: 'undefined',
+    public_profile_url: 'https://www.linkedin.com/in/undefined',
+    provider_id: 'ACoAAA123',
+    first_name: 'Wei',
+  };
+
+  it('removes the sentinel identifier and the URL built from it', () => {
+    const sanitized = withoutFabricatedProfileFields(anonymized);
+
+    expect(sanitized).not.toHaveProperty('public_identifier');
+    expect(sanitized).not.toHaveProperty('public_profile_url');
+    expect(JSON.stringify(sanitized)).not.toContain('/in/undefined');
+  });
+
+  it('keeps everything that is not fabricated', () => {
+    const sanitized = withoutFabricatedProfileFields(anonymized);
+
+    expect(sanitized.provider_id).toBe('ACoAAA123');
+    expect(sanitized.first_name).toBe('Wei');
+  });
+
+  it('does not mutate the profile it was given', () => {
+    const original = { ...anonymized };
+
+    withoutFabricatedProfileFields(original);
+
+    expect(original.public_identifier).toBe('undefined');
+    expect(original.public_profile_url).toBe('https://www.linkedin.com/in/undefined');
+  });
+
+  it('leaves a real profile untouched, including its query string', () => {
+    const real = {
+      public_identifier: 'jian-liang',
+      public_profile_url: 'https://www.linkedin.com/in/jian-liang?trk=search',
+      url: 'https://www.linkedin.com/in/jian-liang',
+    };
+
+    expect(withoutFabricatedProfileFields(real)).toEqual(real);
+  });
+
+  it('clears every URL field Unipile derives from the identifier, not just the first', () => {
+    const sanitized = withoutFabricatedProfileFields({
+      public_profile_url: 'https://www.linkedin.com/in/undefined',
+      url: 'https://www.linkedin.com/in/undefined/',
+      profile_url: 'https://www.linkedin.com/in/undefined#about',
+    });
+
+    expect(Object.keys(sanitized)).toEqual([]);
+  });
+
+  it('drops an absent identifier too, so a truthiness check reads "not there"', () => {
+    const sanitized = withoutFabricatedProfileFields({ public_identifier: '   ', first_name: 'Wei' });
+
+    expect(sanitized).not.toHaveProperty('public_identifier');
+    expect(sanitized.first_name).toBe('Wei');
+  });
+});

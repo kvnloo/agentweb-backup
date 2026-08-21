@@ -532,6 +532,12 @@ describe("DELETE /api/html-templates/:templateId — delete", () => {
       if (uid === mockOrgMemberId) return Promise.resolve({ userId: mockOrgMemberId, orgId: mockOrgId, orgRole: "member" });
       return Promise.resolve(null);
     });
+    // Set this test's own org. Without it, the `org-different` fixture from the
+    // preceding cross-org test leaks in (mockResolvedValue, no reset), so the
+    // caller's orgId and the org being tested disagree. That used to be
+    // invisible because roleOf ignored org identity entirely — which is the
+    // bug ENG-954's tenant guard closes, so the leak now surfaces as a 403.
+    mockGetOrgById.mockResolvedValue(orgEnabled);
     mockDeleteTemplate.mockResolvedValue(true);
 
     const res = await request(orgOwnerApp)
