@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import type { WorkPlanInputRequest } from '../services/agentMode/core/workPlanInputRequest';
 
 // Mock all dependencies before importing the controller
 jest.mock('../services/chatbotService', () => ({
@@ -234,7 +235,7 @@ describe('AgentModeController - ishare Model Selection', () => {
     });
 
     it('should expose a pending work-plan input request to interactive plan clients', async () => {
-      const pendingWorkPlanInput = {
+      const pendingWorkPlanInput: WorkPlanInputRequest = {
         requestId: 'request-1',
         stepCount: 1,
         title: 'Connect your event',
@@ -247,7 +248,7 @@ describe('AgentModeController - ishare Model Selection', () => {
       };
       mockChatbotDb.getChatSession.mockResolvedValue({
         ...mockSessionWithModel,
-        pendingWorkPlanInput: pendingWorkPlanInput as any,
+        pendingWorkPlanInput,
       });
 
       const mockReq = {
@@ -265,11 +266,15 @@ describe('AgentModeController - ishare Model Selection', () => {
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           session: expect.objectContaining({
-            pendingWorkPlanInput: expect.objectContaining({
+            pendingWorkPlanInput: {
               requestId: 'request-1',
+              stepCount: 1,
               title: 'Connect your event',
-              fields: [expect.objectContaining({ id: 'guestListUrl', type: 'url' })],
-            }),
+              prompt: 'Add the guest-list URL and registration window.',
+              fields: [{ id: 'guestListUrl', label: 'Guest-list URL', type: 'url', required: true }],
+              status: 'awaiting',
+              createdAt: pendingWorkPlanInput.createdAt,
+            },
           }),
         }),
       );

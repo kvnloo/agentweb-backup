@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import WorkPlanInputEditor from '../WorkPlanInputEditor';
 import type { EditableWorkPlanInputRequest } from '../workPlanInputSchema';
+import { validateEditableInputRequest } from '../workPlanInputSchema';
 
 const fixture: EditableWorkPlanInputRequest = {
   title: 'Choose the business to audit',
@@ -43,5 +44,38 @@ describe('WorkPlanInputEditor', () => {
   it('shows validation beside the editor before save', () => {
     render(<Harness initial={{ ...fixture, title: '' }} />);
     expect(screen.getByText('Add a card title.')).toBeInTheDocument();
+  });
+
+  it('rejects blank select choice labels', () => {
+    expect(validateEditableInputRequest({
+      ...fixture,
+      fields: [{ id: 'kind', label: 'Kind', type: 'select', options: [{ value: 'a', label: '' }, { value: 'b', label: 'B' }] }],
+    })).toContain("Kind's choices need labels.");
+  });
+
+  it('rejects defaults whose runtime type does not match the field type', () => {
+    expect(validateEditableInputRequest({
+      ...fixture,
+      fields: [{ id: 'enabled', label: 'Enabled', type: 'boolean', defaultValue: 'true' as unknown as boolean }],
+    })).toContain("Enabled's default has the wrong type.");
+  });
+
+  it('returns a recoverable error for malformed persisted cards', () => {
+    expect(validateEditableInputRequest({ title: 'Broken' })).toEqual([
+      'This answer card is malformed. Remove it and add it again.',
+    ]);
+  });
+
+  it.each([
+    ['non-array options', 'not-an-array'],
+    ['null option entries', [null, { value: 'b', label: 'B' }]],
+    ['option entries with non-string properties', [{ value: 1, label: 'A' }, { value: 'b', label: 'B' }]],
+  ])('returns a recoverable error for select fields with %s', (_case, options) => {
+    expect(validateEditableInputRequest({
+      ...fixture,
+      fields: [{ id: 'kind', label: 'Kind', type: 'select', options }],
+    })).toEqual([
+      'This answer card is malformed. Remove it and add it again.',
+    ]);
   });
 });

@@ -99,6 +99,8 @@ export function decideWorkPlanTurnDisposition({
   if (failed) return { kind: 'failed', retryable: true };
   if (stillRunning) return { kind: 'continuing' };
 
+  if (before.pendingStepCount === undefined) return { kind: 'not_applicable' };
+
   if (
     before.pendingStepCount !== undefined
     && before.pendingStepCount !== after.pendingStepCount

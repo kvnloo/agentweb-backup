@@ -18,7 +18,35 @@ export interface EditableWorkPlanInputRequest {
   fields: EditableWorkPlanInputField[];
 }
 
-export function validateEditableInputRequest(value: EditableWorkPlanInputRequest): string[] {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isEditableWorkPlanInputRequest(value: unknown): value is EditableWorkPlanInputRequest {
+  if (!isRecord(value) || typeof value.title !== 'string' || typeof value.prompt !== 'string' || !Array.isArray(value.fields)) {
+    return false;
+  }
+  return value.fields.every((field) => (
+    isRecord(field)
+    && typeof field.id === 'string'
+    && typeof field.label === 'string'
+    && ['text', 'url', 'number', 'boolean', 'select'].includes(String(field.type))
+    && (
+      field.type !== 'select'
+      || (
+        Array.isArray(field.options)
+        && field.options.every((option) => (
+          isRecord(option)
+          && typeof option.value === 'string'
+          && typeof option.label === 'string'
+        ))
+      )
+    )
+  ));
+}
+
+export function validateEditableInputRequest(value: unknown): string[] {
+  if (!isEditableWorkPlanInputRequest(value)) return ['This answer card is malformed. Remove it and add it again.'];
   const errors: string[] = [];
   if (!value.title.trim()) errors.push('Add a card title.');
   if (!value.prompt.trim()) errors.push('Add a short question.');
@@ -32,6 +60,16 @@ export function validateEditableInputRequest(value: EditableWorkPlanInputRequest
     if (!field.label.trim()) errors.push(`Answer ${index + 1} needs a label.`);
     if (field.type === 'select' && (!field.options || field.options.length < 2)) {
       errors.push(`${name} needs at least two choices.`);
+    } else if (field.type === 'select' && field.options?.some((option) => !option.label.trim())) {
+      errors.push(`${name}'s choices need labels.`);
+    }
+    if (field.defaultValue !== undefined) {
+      const validDefaultType = field.type === 'number'
+        ? typeof field.defaultValue === 'number'
+        : field.type === 'boolean'
+          ? typeof field.defaultValue === 'boolean'
+          : typeof field.defaultValue === 'string';
+      if (!validDefaultType) errors.push(`${name}'s default has the wrong type.`);
     }
     if (
       field.type === 'number'

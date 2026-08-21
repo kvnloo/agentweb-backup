@@ -67,6 +67,13 @@ describe('workplan turn disposition', () => {
     expect(decideWorkPlanTurnDisposition({ before: snapshot, after: snapshot })).toEqual({ kind: 'not_applicable' });
   });
 
+  it('is not applicable when the workplan was already complete before the turn', () => {
+    const snapshot = snapshotWorkPlanTurn({
+      workPlan: { steps: [{ stepCount: 1, title: 'Done', status: 'completed' }] },
+    });
+    expect(decideWorkPlanTurnDisposition({ before: snapshot, after: snapshot })).toEqual({ kind: 'not_applicable' });
+  });
+
   it('ignores malformed persisted array elements instead of trusting the outer array', () => {
     expect(snapshotWorkPlanTurn({
       workPlan: { steps: [null, 'bad', { status: 'pending', stepCount: '2' }, { status: 'pending', stepCount: 3 }] },
