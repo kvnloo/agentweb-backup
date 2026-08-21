@@ -1,5 +1,18 @@
 import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setOpenRouterClientForTest, _setDeploymentSleepForTest, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
+import Anthropic from '@anthropic-ai/sdk';
+import { getSecret } from '../utils/secretsManager';
+import { recordUsage } from '../services/usageRecorderService';
+
+jest.mock('@anthropic-ai/sdk', () => ({
+  __esModule: true,
+  default: jest.fn(() => ({ messages: { create: jest.fn() } })),
+}));
+
+jest.mock('../services/usageRecorderService', () => ({
+  ...jest.requireActual('../services/usageRecorderService'),
+  recordUsage: jest.fn(async () => undefined),
+}));
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
@@ -30,7 +43,12 @@ const mockedAxios = axios as jest.Mocked<typeof axios>;
 jest.mock('../utils/secretsManager', () => ({
   ...jest.requireActual('../utils/secretsManager'),
   getGitHubOrgToken: jest.fn(async () => ({ token: 'gh-test-token', org: 'AgentWebPro' })),
+  getSecret: jest.fn(async () => 'or-test-key'),
 }));
+
+const mockedGetSecret = getSecret as jest.MockedFunction<typeof getSecret>;
+const mockedRecordUsage = recordUsage as jest.MockedFunction<typeof recordUsage>;
+const MockAnthropic = Anthropic as unknown as jest.Mock;
 
 // Build an axios-style error carrying a GitHub response body.
 const githubAxiosError = (status: number, data: any): any => {
@@ -1632,6 +1650,7 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
     _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
     modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel');
+    mockedGetSecret.mockResolvedValue('or-test-key');
   });
 
   afterEach(() => modelSpy.mockRestore());
@@ -1689,6 +1708,100 @@ describe('ENG-1451 — coding-agent OpenRouter gateway contract', () => {
     const result = await runCodingAgent('change the heading', context);
 
     expect(result).toEqual(expect.objectContaining({ success: true, message: 'Done.' }));
+  });
+
+  test('attributes fallback usage to the model OpenRouter actually served', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'deepseek/deepseek-v4-flash',
+      usage: { input_tokens: 1_000, output_tokens: 1_000 },
+    });
+
+    await runCodingAgent('change the heading', context);
+
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'deepseek/deepseek-v4-flash',
+      provider: 'openrouter',
+    }));
+  });
+
+  test('prices usage totals from the model OpenRouter actually served', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce({
+      ...successfulTurn(),
+      model: 'deepseek/deepseek-v4-flash',
+      usage: { input_tokens: 1_000, output_tokens: 1_000 },
+    });
+
+    const result = await runCodingAgent('change the heading', context);
+
+    // DeepSeek V4 Flash: $0.068/M input + $0.168/M output.
+    expect(result.usageTotals?.costUsd).toBeCloseTo(0.000236, 9);
+    expect(mockedRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
+      costUsdOverride: 0.000236,
+    }));
+  });
+
+  test('uses one SDK retry for transient gateway transport failures', async () => {
+    const originalEnvKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    _setOpenRouterClientForTest(null);
+    MockAnthropic.mockImplementationOnce(() => ({ messages: { create: gatewayCreate } }));
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    try {
+      await runCodingAgent('change the heading', context);
+      expect(MockAnthropic).toHaveBeenCalledWith(expect.objectContaining({ maxRetries: 1 }));
+    } finally {
+      if (originalEnvKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalEnvKey;
+      _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
+    }
+  });
+
+  test('omits session_id when the local session id exceeds OpenRouter limits', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    gatewayCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', { ...context, sessionId: 's'.repeat(257) });
+
+    expect(gatewayCreate.mock.calls[0][0]).not.toHaveProperty('session_id');
+  });
+
+  test('fails closed before the gateway call for an unmapped logical model', async () => {
+    modelSpy.mockResolvedValue('unmapped-model');
+
+    const result = await runCodingAgent('change the heading', context);
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      message: expect.stringMatching(/no verified OpenRouter upstream mapping/i),
+    }));
+    expect(gatewayCreate).not.toHaveBeenCalled();
+  });
+
+  test('an empty OpenRouter key fails before any model call or edit', async () => {
+    const originalEnvKey = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    _setOpenRouterClientForTest(null);
+    mockedGetSecret.mockResolvedValueOnce('   ');
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+
+    try {
+      const result = await runCodingAgent('change the heading', context);
+      expect(result).toEqual(expect.objectContaining({
+        success: false,
+        message: expect.stringMatching(/OpenRouter API key is empty/i),
+      }));
+      expect(gatewayCreate).not.toHaveBeenCalled();
+      expect(mockedMcpFetch.mock.calls.some(([path]) => String(path).includes('github-edit'))).toBe(false);
+    } finally {
+      if (originalEnvKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalEnvKey;
+      _setOpenRouterClientForTest({ messages: { create: gatewayCreate } } as any);
+    }
   });
 });
 
