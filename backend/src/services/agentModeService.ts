@@ -3482,6 +3482,11 @@ export class AgentModeService {
       // routing flag so metering can distinguish BYOK from a genuinely free
       // OpenRouter call and fall back to our provider price book when needed.
       params.usage = { include: true };
+      // OpenRouter applies this managed transform only when a request exceeds
+      // the selected model's context window. One gateway-level opt-in keeps
+      // smaller-context selectable models usable without rebuilding prompt
+      // truncation or provider-specific fallback logic in AgentWeb.
+      params.plugins = [{ id: 'context-compression' }];
       if (fallbackModels?.length) {
         params.models = fallbackModels.map((fallbackModel) => {
           const normalizedFallback = this.normalizeModelId(fallbackModel);
@@ -3490,6 +3495,22 @@ export class AgentModeService {
           }
           return resolveOpenRouterUpstreamModelId(normalizedFallback);
         });
+      } else {
+        // Compression can still leave a request above a small primary model's
+        // context limit. Keep failover inside OpenRouter: a cheap 1M-context
+        // text/tool model for normal calls, or a multimodal 1M-context model
+        // when any message contains an image. Explicit caller fallbacks above
+        // remain authoritative.
+        const hasImageInput = messages.some((message: any) =>
+          Array.isArray(message?.content) && message.content.some((part: any) =>
+            part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
+          )
+        );
+        const managedFallbackId = hasImageInput
+          ? 'gemini-3.5-flash'
+          : 'openrouter/deepseek/deepseek-v4-flash';
+        const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
+        if (upstreamModel !== managedFallback) params.models = [managedFallback];
       }
       if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
         params.session_id = usageContext.sessionId;
