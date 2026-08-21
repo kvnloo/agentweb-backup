@@ -4704,7 +4704,16 @@ export async function generateChatResponse(
     const agentModeService = new AgentModeService();
     let toolDefinitions: any[] = [];
 
-    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin) {
+    // ENG-1222: a session with skills installed (session.associatedSkills) expects
+    // its skill tools to be callable no matter which portalType the request landed
+    // under — e.g. the partner-portal's global chat widget sends messages via
+    // socket.emit('message') with no `portal` field, which the server defaults to
+    // 'partner'. Gating tool loading on portalType/isDelegatedAdmin alone silently
+    // dropped `tools` from the LLM call for those sessions, and the model then
+    // denied having the capability or fabricated a result instead of calling it.
+    const sessionHasInstalledSkills = Array.isArray(session.associatedSkills) && session.associatedSkills.length > 0;
+
+    if (portalType === 'customer' || (portalType as string) === 'emma-sidebar' || isDelegatedAdmin || sessionHasInstalledSkills) {
       try {
         // Initialize AgentModeService to access tool registry and executeTool
         await agentModeService.initialize();
