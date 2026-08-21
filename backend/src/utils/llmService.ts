@@ -50,14 +50,13 @@ type InvokeResponse = {
  * Compatibility facade for legacy content/enrichment callers.
  *
  * Model selection, transport, fallback and charging now live in
- * AgentModeService.callLLM. This class retains only response parsing and the
- * narrow web-search APIs that are proven separately in ENG-1432.
+ * AgentModeService.callLLM. This class retains only response parsing and
+ * compatibility method names for older callers.
  */
 export class LLMService {
   private chatModel: { invoke(messages: unknown[]): Promise<InvokeResponse> };
   private readonly gatewayAdapter: { invoke(messages: unknown[]): Promise<InvokeResponse> };
   private readonly modelName: string;
-  private readonly isGemini: boolean;
   private readonly provider: string;
   private readonly temperature: number | null;
   private readonly maxTokens?: number;
@@ -71,8 +70,7 @@ export class LLMService {
     options: LLMServiceOptions = {},
   ) {
     this.modelName = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5';
-    this.isGemini = this.modelName.toLowerCase().includes('gemini');
-    this.provider = this.isGemini
+    this.provider = this.modelName.toLowerCase().includes('gemini')
       ? 'gemini'
       : this.modelName.toLowerCase().includes('claude') || this.modelName.startsWith('anthropic.')
         ? 'bedrock'
@@ -88,6 +86,7 @@ export class LLMService {
   private async invokeGateway(
     messages: unknown[],
     usageContext?: LLMUsageContext,
+    requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
   ): Promise<InvokeResponse> {
     // Dynamic import avoids a module-init cycle: AgentModeService imports this
     // file's public types and compatibility factory for older tool handlers.
@@ -99,7 +98,8 @@ export class LLMService {
     const response = await agentModeService.callLLM(this.modelName, normalizedMessages, {
       temperature: this.temperature,
       max_completion_tokens: this.maxTokens,
-      timeoutMs: this.longRunning ? 30 * 60 * 1000 : undefined,
+      timeoutMs: requestOptions.timeoutMs ?? (this.longRunning ? 30 * 60 * 1000 : undefined),
+      webSearch: requestOptions.webSearch,
       usageContext: usageContext || { feature: 'unknown' },
       taskClass: this.taskClass,
     });
@@ -178,13 +178,14 @@ export class LLMService {
     userPrompt: string,
     usageContext?: LLMUsageContext,
     onUsage?: OnUsageCallback,
+    requestOptions: { webSearch?: boolean; timeoutMs?: number } = {},
   ): Promise<string> {
     const messages = [
       new SystemMessage(systemPrompt),
       new HumanMessage(userPrompt),
     ];
     const response = this.chatModel === this.gatewayAdapter
-      ? await this.invokeGateway(messages, usageContext)
+      ? await this.invokeGateway(messages, usageContext, requestOptions)
       : await this.requireChatModel().invoke(messages);
     this.observeUsage(response, usageContext, onUsage);
     return typeof response.content === 'string' ? response.content : String(response.content || '');
@@ -286,95 +287,19 @@ export class LLMService {
     return htmlEnd >= 0 ? html.slice(0, htmlEnd + '</html>'.length).trim() : html;
   }
 
-  /**
-   * Temporary capability exception: these two provider-native web-search APIs
-   * remain until ENG-1432 proves the OpenRouter web plugin against the same
-   * enrichment fixtures. Ordinary text generation no longer uses them.
-   */
+  /** Web search uses the same gateway, metering, and provider-fallback boundary as every text call. */
   async generateJSONContentWithWebSearch<T = any>(
     systemPrompt: string,
     userPrompt: string,
     usageContext?: LLMUsageContext,
   ): Promise<T> {
-    if (this.isGemini) {
-      const { GoogleGenAI } = await import('@google/genai');
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) throw new Error('GEMINI_API_KEY not set');
-      const response = await new GoogleGenAI({ apiKey: apiKey.trim() }).models.generateContent({
-        model: this.modelName,
-        contents: userPrompt,
-        config: {
-          systemInstruction: systemPrompt,
-          tools: [{ googleSearch: {} }],
-          httpOptions: { timeout: WEB_SEARCH_TIMEOUT_MS },
-        },
-      });
-      const usage = (response as any)?.usageMetadata;
-      this.observeUsage({
-        content: response.text || '',
-        usage_metadata: {
-          input_tokens: usage?.promptTokenCount || 0,
-          output_tokens: usage?.candidatesTokenCount || 0,
-          total_tokens: usage?.totalTokenCount || 0,
-          input_token_details: { cache_read: usage?.cachedContentTokenCount || 0 },
-        },
-      }, usageContext);
-      return extractJson<T>(response.text || '');
-    }
-
-    const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-    const apiKey = process.env.AZURE_OPENAI_API_KEY;
-    if (!apiKey || !endpoint) throw new Error('AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set');
-    const apiVersion = process.env.AZURE_OPENAI_RESPONSES_API_VERSION || '2025-03-01-preview';
-    const url = `${endpoint.replace(/\/$/, '')}/openai/responses?api-version=${apiVersion}`;
-    const requestBody = JSON.stringify({
-      model: this.modelName,
-      instructions: systemPrompt,
-      input: userPrompt,
-      tools: [{ type: 'web_search' }],
-    });
-    const debug = process.env.LLM_WEB_SEARCH_DEBUG === '1';
-    const requestStartedAt = Date.now();
-    if (debug) {
-      console.log('[llm.webSearch] → POST', url);
-      console.log('[llm.webSearch] → headers: api-key=[redacted], Content-Type=application/json');
-      console.log('[llm.webSearch] → body:', requestBody.slice(0, 500));
-    }
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
-      body: requestBody,
-      signal: AbortSignal.timeout(WEB_SEARCH_TIMEOUT_MS),
-    });
-    const responseBody = await response.text().catch(() => '');
-    if (debug) {
-      console.log(`[llm.webSearch] ← status=${response.status} in ${Date.now() - requestStartedAt}ms`);
-      console.log('[llm.webSearch] ← body:', responseBody.slice(0, 800));
-    }
-    if (!response.ok) {
-      throw new Error(`Azure Responses API ${response.status}: ${responseBody.slice(0, 300)}`);
-    }
-    let payload: {
-      output_text?: string;
-      output?: Array<{ content?: Array<{ text?: string }> }>;
-      usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
-    };
-    try {
-      payload = JSON.parse(responseBody);
-    } catch {
-      throw new Error(`Azure Responses API ${response.status} returned invalid JSON: ${responseBody.slice(0, 300)}`);
-    }
-    const text = payload.output_text || payload.output?.flatMap((item) => item.content || [])
-      .map((content) => content.text || '').filter(Boolean).join('') || '';
-    this.observeUsage({
-      content: text,
-      usage_metadata: {
-        input_tokens: payload.usage?.input_tokens || 0,
-        output_tokens: payload.usage?.output_tokens || 0,
-        total_tokens: payload.usage?.total_tokens || 0,
-      },
-    }, usageContext);
-    return extractJson<T>(text);
+    return extractJson<T>(await this.invoke(
+      systemPrompt,
+      userPrompt,
+      usageContext,
+      undefined,
+      { webSearch: true, timeoutMs: WEB_SEARCH_TIMEOUT_MS },
+    ));
   }
 }
 
