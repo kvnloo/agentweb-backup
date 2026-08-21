@@ -158,6 +158,17 @@ BACKEND_PATHS='backend/
 BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend tests (agentMode)
 Backend tests (all other + coverage)}"
 
+# ENG-1376 added a third backend job, "Backend coverage", and deliberately left
+# it OUT of this list. Not an oversight:
+#   - A coverage regression already blocks the merge. Section 6 fails on any
+#     check whose conclusion is in `bad`, named here or not.
+#   - What this list uniquely catches is a job that never reported. "Backend
+#     coverage" needs both jobs above, so it can only fail to report when one of
+#     them skipped or failed — and both of those are already required here.
+#   - Naming it would immediately fail every open backend PR whose head predates
+#     that job, forcing ~20 rebases to close a hole that does not exist.
+# Add it here if it ever stops depending on both test jobs.
+
 log() { printf 'merge-evidence: %s\n' "$*"; }
 
 # Fields are joined on US (0x1f), never on tab. `read` treats tab as IFS
