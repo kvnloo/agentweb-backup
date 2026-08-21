@@ -7,6 +7,7 @@ import { fork, ChildProcess } from 'child_process';
 import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
 import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
+import type { WorkPlanTurnDisposition } from './agentMode/core/workPlanTurnDisposition';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -40,6 +41,7 @@ interface GenerateMarketingResponseParams {
   // the tool dispatcher rejects confirm=true generate_image calls that reference
   // any unapproved source image for this run.
   approvedRevisionImageSources?: string[];
+  requireWorkPlanDisposition?: boolean;
 }
 
 interface GenerateMarketingResponseResult {
@@ -55,6 +57,7 @@ interface GenerateMarketingResponseResult {
   // ENG-473: count of responseMessages already persisted incrementally during the
   // run, so the caller's final batch persists only the remaining tail.
   persistedResponseCount?: number;
+  workPlanTurnDisposition?: WorkPlanTurnDisposition;
 }
 
 export class GenerateMarketingResponseWorkerService {
