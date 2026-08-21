@@ -42,6 +42,7 @@ describe('ENG-1423 executable baseline evidence', () => {
       'coding_agent',
       'nonstandard_consumer',
     ];
+    expect(BASELINE_FIXTURES).toHaveLength(expected.length);
     expect(new Set(BASELINE_FIXTURES.map((f) => f.taskClass)))
       .toEqual(new Set(expected));
   });
@@ -189,6 +190,55 @@ describe('ENG-1423 executable baseline evidence', () => {
       async () => ({ status: 404, body: { error: 'not found' } }),
       { maxAttempts: 2, delayMs: 0 },
     )).rejects.toThrow('not indexed after 2 attempts');
+  });
+
+  it('caps slow generation polling at the aggregate deadline', async () => {
+    let now = 0;
+    const fetchDetail = jest.fn(async (_generationId: string, timeoutMs?: number) => {
+      expect(timeoutMs).toBe(30);
+      now += 20;
+      return { status: 404, body: { error: 'not found' } };
+    });
+    const sleep = jest.fn(async (ms: number) => { now += ms; });
+
+    await expect(pollOpenRouterGenerationDetail('gen-slow', fetchDetail, {
+      maxAttempts: 30,
+      delayMs: 15,
+      maxElapsedMs: 30,
+      nowMs: () => now,
+      sleep,
+    })).rejects.toThrow('not indexed within 30ms');
+    expect(fetchDetail).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(10);
+    expect(now).toBe(30);
+  });
+
+  it('rejects a successful generation detail that arrives at the deadline', async () => {
+    let now = 0;
+
+    await expect(pollOpenRouterGenerationDetail('gen-late-success', async () => {
+      now = 30;
+      return { status: 200, body: { data: {
+        id: 'gen-late-success', model: 'openai/gpt-4o-mini', provider_name: 'OpenAI', latency: 5,
+        generation_time: 6, native_tokens_prompt: 3, native_tokens_completion: 1,
+        native_tokens_cached: 0, total_cost: 0.000001, finish_reason: 'stop',
+      } } };
+    }, {
+      maxElapsedMs: 30,
+      nowMs: () => now,
+    })).rejects.toThrow('not indexed within 30ms');
+  });
+
+  it('converts a transport rejection at the deadline to the deadline error', async () => {
+    let now = 0;
+
+    await expect(pollOpenRouterGenerationDetail('gen-timeout', async () => {
+      now = 30;
+      throw new Error('request aborted');
+    }, {
+      maxElapsedMs: 30,
+      nowMs: () => now,
+    })).rejects.toThrow('not indexed within 30ms');
   });
 
   it('fails loudly on a non-404 generation lookup response', async () => {

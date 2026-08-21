@@ -64,13 +64,16 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   return { revision, out, model, ...(value('--fixture') ? { fixtureId: value('--fixture') } : {}) };
 }
 
-function openRouterGenerationFetcher(apiKey: string): (generationId: string) => Promise<GenerationDetailResponse> {
-  return async (generationId: string): Promise<GenerationDetailResponse> => {
+function openRouterGenerationFetcher(
+  apiKey: string,
+): (generationId: string, timeoutMs?: number) => Promise<GenerationDetailResponse> {
+  return async (generationId: string, timeoutMs = 10_000): Promise<GenerationDetailResponse> => {
     const url = new URL('https://openrouter.ai/api/v1/generation');
     url.searchParams.set('id', generationId);
+    const requestTimeoutMs = Math.max(1, Math.min(10_000, Math.floor(timeoutMs)));
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(requestTimeoutMs),
     });
     let body: unknown;
     try {
@@ -86,7 +89,7 @@ async function executeFixture(
   fixture: BaselineFixture,
   logicalModel: string,
   client: any,
-  fetchDetail: (generationId: string) => Promise<GenerationDetailResponse>,
+  fetchDetail: (generationId: string, timeoutMs?: number) => Promise<GenerationDetailResponse>,
 ): Promise<BaselineArtifact> {
   const request = buildBaselineRequest(fixture, logicalModel);
   let responseId: string | undefined;
@@ -102,6 +105,7 @@ async function executeFixture(
     // after the initial 7.5-second window. Stay bounded while allowing 30s.
     maxAttempts: 30,
     delayMs: 1_000,
+    maxElapsedMs: 30_000,
   });
   const correlated = applyOpenRouterGenerationDetail(artifact, detail);
   const errors = validateBaselineArtifact(correlated);
