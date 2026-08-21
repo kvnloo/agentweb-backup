@@ -103,6 +103,11 @@ import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import {
+  isOpenRouterGatewayEnabledForTaskClass,
+  resolveOpenRouterUpstreamModelId,
+  type GatewayTaskClass,
+} from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -1014,6 +1019,8 @@ interface LLMCallOptions {
    * behaviour instead of silently buying the 2x rate.
    */
   humanPaced?: boolean;
+  /** Stable product taxonomy used by the reversible OpenRouter cutover canary. */
+  taskClass?: GatewayTaskClass;
 }
 
 // Diagnosis agent configuration
@@ -2076,6 +2083,10 @@ export class AgentModeService {
         this.openrouter_client = new OpenAI({
           apiKey: openRouterApiKey.trim(),
           baseURL: 'https://openrouter.ai/api/v1',
+          // OpenRouter owns provider retry/fallback. SDK retries here would
+          // multiply with the gateway's own routing attempts.
+          maxRetries: 0,
+          timeout: 5 * 60 * 1000,
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
@@ -3359,13 +3370,16 @@ export class AgentModeService {
       temperature = null,
       response_format = { type: "text" },
       usageContext = null,
-      humanPaced = false
+      humanPaced = false,
+      taskClass,
     } = options || {};
 
-    // `openrouter/` is our internal routing namespace. OpenRouter's API only
-    // accepts the upstream provider/model suffix (for example `z-ai/glm-5.2`).
-    const upstreamModel = model.startsWith('openrouter/')
-      ? model.slice('openrouter/'.length)
+    // Explicit openrouter/* models have always used the gateway. Direct-provider
+    // logical IDs move only when their task class is enabled in the canary.
+    const useOpenRouterGateway = model.startsWith('openrouter/') ||
+      isOpenRouterGatewayEnabledForTaskClass(taskClass);
+    const upstreamModel = useOpenRouterGateway
+      ? resolveOpenRouterUpstreamModelId(model)
       : model;
     const params: any = {
       model: upstreamModel,
@@ -3373,13 +3387,30 @@ export class AgentModeService {
       response_format: response_format || { type: "text" },
     };
 
+    if (useOpenRouterGateway) {
+      // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
+      // compatibility for migrated calls.
+      params.provider = { allow_fallbacks: true, require_parameters: true };
+      if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
+        params.session_id = usageContext.sessionId;
+      }
+      if (upstreamModel.startsWith('anthropic/')) {
+        // Top-level automatic caching advances the breakpoint as the agent
+        // conversation grows. Five minutes is the OpenRouter default; only a
+        // human-paced conversation pays for the existing one-hour behavior.
+        params.cache_control = humanPaced
+          ? { type: 'ephemeral', ttl: '1h' }
+          : { type: 'ephemeral' };
+      }
+    }
+
     // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
     // off `params` and never forwards it to ConverseCommand. Set ONLY for
     // Bedrock models: `params` is handed verbatim to
     // `client.chat.completions.create()` for every provider, and the OpenAI SDK
     // forwards unknown body fields to the API — Azure OpenAI rejects an
     // unrecognised argument with a 400, which would break every GPT turn.
-    if (model.startsWith('anthropic.')) {
+    if (!useOpenRouterGateway && model.startsWith('anthropic.')) {
       params.humanPaced = humanPaced;
     }
 
@@ -3418,9 +3449,19 @@ export class AgentModeService {
     // Bedrock/Vertex client is cached on the registry after its first call,
     // same as an Azure client is pre-populated at construction time, so
     // "client is already set" cannot distinguish the providers).
-    let client = this.llmModels[model].client;
+    let client = useOpenRouterGateway && !model.startsWith('openrouter/')
+      ? null
+      : this.llmModels[model].client;
     let providerLabel: string;
-    if (model.startsWith('gemini-')) {
+    if (useOpenRouterGateway) {
+      providerLabel = 'openrouter';
+      if (!client) {
+        client = await this.getOpenRouterClient();
+        // Existing explicit OpenRouter rows have no direct-provider client to
+        // preserve, so caching the shared client on their registry entry is safe.
+        if (model.startsWith('openrouter/')) this.llmModels[model].client = client;
+      }
+    } else if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
@@ -3437,15 +3478,6 @@ export class AgentModeService {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
       }
-    } else if (model.startsWith('openrouter/')) {
-      // ENG-9: lazy-loaded and cached on the registry, same as Bedrock/Vertex —
-      // must be its own branch, not the azure-openai fallback below, since an
-      // openrouter/* entry is registered with client: null (see llmModels).
-      providerLabel = 'openrouter';
-      if (!client) {
-        client = await this.getOpenRouterClient();
-        this.llmModels[model].client = client;
-      }
     } else {
       providerLabel = 'azure-openai';
       if (!client) {
@@ -3458,7 +3490,7 @@ export class AgentModeService {
     }
 
     // Retry loop with exponential backoff for transient LLM errors (503, 429, timeouts)
-    const maxAttempts = 3;
+    const maxAttempts = useOpenRouterGateway ? 1 : 3;
     const baseDelayMs = 2000;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -3517,7 +3549,7 @@ export class AgentModeService {
         const isLastAttempt = attempt >= maxAttempts;
 
         // Log Gemini-specific errors with more context for debugging
-        if (model.startsWith('gemini-')) {
+        if (providerLabel === 'gemini') {
           console.error(`AgentMode: Gemini API error on attempt ${attempt}/${maxAttempts}:`, {
             model,
             error: error instanceof Error ? error.message : String(error),
@@ -4622,7 +4654,11 @@ export class AgentModeService {
             // answer "what is my scheduled work costing me".
             usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
-            humanPaced: humanPacedTurn
+            humanPaced: humanPacedTurn,
+            // ENG-1430: only this customer-facing loop participates in the first
+            // reversible OpenRouter cutover. Internal judges/scheduled helpers
+            // remain on their characterized paths until their own slices.
+            taskClass: 'interactive_chat',
           });
         } catch (callError) {
           // ENG-907: the backup-model retry below issues a SECOND full call of the same
@@ -4700,7 +4736,8 @@ export class AgentModeService {
                 // retry of a scheduled run is still scheduled spend.
                 usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
-                humanPaced: humanPacedTurn
+                humanPaced: humanPacedTurn,
+                taskClass: 'interactive_chat',
               }), synthesisRetryDeadlineMs);
               if (response === SYNTHESIS_RETRY_TIMED_OUT) {
                 console.warn(
