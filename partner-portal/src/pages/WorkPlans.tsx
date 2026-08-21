@@ -44,6 +44,11 @@ import {
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
+import WorkPlanInputEditor from "../components/WorkPlanInputEditor";
+import {
+  type EditableWorkPlanInputRequest,
+  validateEditableInputRequest,
+} from "../components/workPlanInputSchema";
 
 /** Backend-enforced cap. Keep in sync with USER_INSTRUCTIONS_MAX_LENGTH in
  *  backend/src/services/workPlanService.ts. */
@@ -61,11 +66,7 @@ interface WorkPlanStep {
   /** Media assets this step must actually produce before it can be marked
    *  completed. Enforced at run time by the session work plan's asset gate. */
   expectedAssetCount?: number;
-  inputRequest?: {
-    title: string;
-    prompt: string;
-    fields: Array<{ id: string; label: string; type: 'text' | 'url' | 'number' | 'boolean'; required?: boolean }>;
-  };
+  inputRequest?: EditableWorkPlanInputRequest;
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -488,6 +489,10 @@ export default function WorkPlans() {
     }
   };
 
+  const inputRequestErrors = steps.flatMap((step) => (
+    step.inputRequest ? validateEditableInputRequest(step.inputRequest) : []
+  ));
+
   if (loading) {
     return (
       <Container maxWidth="lg" sx={{ mt: 4, textAlign: "center" }}>
@@ -859,23 +864,12 @@ export default function WorkPlans() {
                         label="Collect details from the customer before this step"
                       />
                       {step.inputRequest && (
-                        <Stack spacing={1} sx={{ mt: 1 }}>
-                          <TextField label="Card title" value={step.inputRequest.title} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, title: e.target.value })} size="small" fullWidth />
-                          <TextField label="What should we ask?" value={step.inputRequest.prompt} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, prompt: e.target.value })} size="small" fullWidth helperText="This appears in the chat card, not as a wall of instructions." />
-                          {step.inputRequest.fields.map((field, fieldIndex) => (
-                            <Box key={`${field.id}-${fieldIndex}`} sx={{ display: 'grid', gridTemplateColumns: '1fr 150px auto', gap: 1, alignItems: 'start' }}>
-                              <TextField label="Answer label" value={field.label} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.map((candidate, index) => index === fieldIndex ? { ...candidate, label: e.target.value } : candidate) })} size="small" fullWidth />
-                              <FormControl size="small" fullWidth>
-                                <InputLabel>Answer type</InputLabel>
-                                <Select label="Answer type" value={field.type} onChange={(e) => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.map((candidate, index) => index === fieldIndex ? { ...candidate, type: e.target.value as typeof candidate.type } : candidate) })}>
-                                  <MenuItem value="text">Short text</MenuItem><MenuItem value="url">Link (URL)</MenuItem><MenuItem value="number">Number</MenuItem><MenuItem value="boolean">Yes / no</MenuItem>
-                                </Select>
-                              </FormControl>
-                              <IconButton aria-label="Remove answer field" disabled={step.inputRequest!.fields.length === 1} onClick={() => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: step.inputRequest!.fields.filter((_, index) => index !== fieldIndex) })}><CloseIcon fontSize="small" /></IconButton>
-                            </Box>
-                          ))}
-                          <Button size="small" variant="text" startIcon={<AddIcon />} disabled={step.inputRequest!.fields.length >= 8} onClick={() => updateStep(i, 'inputRequest', { ...step.inputRequest!, fields: [...step.inputRequest!.fields, { id: `field_${step.inputRequest!.fields.length + 1}`, label: 'New detail', type: 'text', required: true }] })}>Add another answer</Button>
-                        </Stack>
+                        <Box sx={{ mt: 1 }}>
+                          <WorkPlanInputEditor
+                            value={step.inputRequest}
+                            onChange={(inputRequest) => updateStep(i, 'inputRequest', inputRequest)}
+                          />
+                        </Box>
                       )}
                     </Box>
                     <Box component="details" sx={{ mb: 1 }}>
@@ -1062,7 +1056,12 @@ export default function WorkPlans() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button onClick={() => handleSave()} variant="contained" disabled={saving}>
+          <Button
+            onClick={() => handleSave()}
+            variant="contained"
+            disabled={saving || inputRequestErrors.length > 0}
+            title={inputRequestErrors[0] || undefined}
+          >
             {saving ? <CircularProgress size={20} /> : editingPlan ? "Update" : "Create"}
           </Button>
         </DialogActions>

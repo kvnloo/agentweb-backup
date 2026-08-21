@@ -9,6 +9,11 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import {
+  decideWorkPlanTurnDisposition,
+  snapshotWorkPlanTurn,
+  type WorkPlanTurnDisposition,
+} from './agentMode/core/workPlanTurnDisposition';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
@@ -3799,7 +3804,10 @@ export class AgentModeService {
     // preflight gate rejects confirm=true `generate_image` calls that attempt to
     // edit an unapproved source URL.
     approvedRevisionImageSources?: string[],
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
+    // Workplan progression turns must end in persisted structured state rather
+    // than a provider-dependent prose question buried at the end of a response.
+    requireWorkPlanDisposition: boolean = false,
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3908,6 +3916,7 @@ export class AgentModeService {
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
@@ -4313,6 +4322,8 @@ export class AgentModeService {
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
+      let workPlanDispositionRetries = 0;
+      let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -4954,6 +4965,51 @@ export class AgentModeService {
             if (responseMessage) responseMessage.content = content;
           }
 
+          if (requireWorkPlanDisposition) {
+            const latestSession = await chatbotDb.getChatSession(sessionId);
+            workPlanTurnDisposition = decideWorkPlanTurnDisposition({
+              before: workPlanTurnBefore,
+              after: snapshotWorkPlanTurn(latestSession),
+              failed: finishReason === 'content_filter'
+                || stopReason === 'guardrail_intervened'
+                || stopReason === 'content_filtered',
+            });
+
+            if (workPlanTurnDisposition.kind === 'invalid') {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+                workPlanDispositionRetries += 1;
+                // The invalid assistant turn has not been checkpointed yet. Remove it
+                // before the next iteration so neither the model nor the customer sees
+                // the wall of prose that failed the structured contract.
+                if ((messages as any[])[messages.length - 1] === responseMessage) {
+                  (messages as any[]).pop();
+                }
+                content = '';
+                responseMessage = null;
+                (messages as any[]).push({
+                  role: 'user',
+                  content: '[SYSTEM — workplan control recovery] This workplan progression turn cannot end with a prose-only question or a “Next Step” paragraph. Continue the work and call set_work_plan_status when the current step is complete, or call ask_user_question for the one blocking choice. Do not repeat the prior recap.',
+                });
+                console.warn(`AgentMode: workplan turn missing structured disposition in session ${sessionId}; retrying once`);
+                continue;
+              }
+
+              const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
+              content = retryMessage;
+              if (responseMessage) {
+                responseMessage.content = retryMessage;
+                responseMessage.metadata = {
+                  ...responseMessage.metadata,
+                  workPlanDispositionFailure: {
+                    code: workPlanTurnDisposition.code,
+                    retryable: true,
+                  },
+                };
+              }
+              console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+            }
+          }
+
           // Log the stop reason for debugging
           if (finishReason && finishReason !== 'stop') {
             console.log(`AgentMode: Loop exiting with finish_reason=${finishReason}, stop_reason=${stopReason || 'N/A'}, session=${sessionId}`);
@@ -5476,6 +5532,7 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {

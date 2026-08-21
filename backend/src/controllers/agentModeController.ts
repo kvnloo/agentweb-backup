@@ -15,6 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { buildWorkPlanInputRequest, resolveWorkPlanInputAnswer, WorkPlanInputRequestError } from '../services/agentMode/core/workPlanInputRequest';
+import type { WorkPlanTurnDisposition } from '../services/agentMode/core/workPlanTurnDisposition';
 import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { transcriptHasFinalAssistantAnswer } from '../services/agentMode/core/finalAnswer';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -6390,6 +6391,9 @@ export async function generateSessionResponse(
   // customer-typed (e.g. 'auto-continuation'), so the customer-portal chat renderer
   // can hide it instead of showing the raw [SYSTEM] directive as a user chat bubble.
   userMessageKind?: string,
+  // Enforce a provider-independent structured outcome on workplan progression
+  // turns (step completion or a persisted input/question request).
+  requireWorkPlanDisposition: boolean = false,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -6412,6 +6416,7 @@ export async function generateSessionResponse(
   // customer message) before it could compose a closing reply — content may be empty
   // even though toolCalls shows real work (an already-dispatched call can't be aborted).
   cancelled?: boolean;
+  workPlanTurnDisposition?: WorkPlanTurnDisposition;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -6479,6 +6484,8 @@ export async function generateSessionResponse(
   // Check if this is the first user message (excluding system message)
   const userMessages = session.messages?.filter(msg => msg.role === 'user') || [];
   const isFirstMessage = userMessages.length === 0;
+  const enforceWorkPlanDisposition = requireWorkPlanDisposition
+    || (Boolean(session.workPlan) && isFirstMessage);
 
   // If this is the first message, add system message with version info first
   if (isFirstMessage) {
@@ -6692,6 +6699,7 @@ export async function generateSessionResponse(
       turnStartMs,
       transientFallbackModel,
       approvedRevisionImageSources,
+      requireWorkPlanDisposition: enforceWorkPlanDisposition,
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -7559,7 +7567,10 @@ export const agentModeController = {
         turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
         undefined, // publishAuthorizationOverride — interactive path resolves per turn
         modelPolicyDecision.transientFallbackModel,
-        modelPolicyDecision
+        modelPolicyDecision,
+        undefined, // approvedRevisionImageSources
+        undefined, // userMessageKind
+        Boolean(questionAnswer || workPlanInputAnswer),
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -7771,6 +7782,7 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
         ...(modelPolicyDecision ? {
           requestedModel: modelPolicyDecision.requestedModel,
@@ -8645,7 +8657,10 @@ export const agentModeController = {
           sharedTurnStartMs,
           undefined, // publishAuthorizationOverride — shared path has no schedule consent
           modelPolicyDecision.transientFallbackModel,
-          modelPolicyDecision
+          modelPolicyDecision,
+          undefined, // approvedRevisionImageSources
+          undefined, // userMessageKind
+          Boolean(workPlanInputAnswer),
         ),
         session.sessionId
       );
@@ -8659,6 +8674,7 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
+        ...(response.workPlanTurnDisposition ? { workPlanTurnDisposition: response.workPlanTurnDisposition } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
       } finally {

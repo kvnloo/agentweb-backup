@@ -101,6 +101,7 @@ process.on('message', async (message: any) => {
         turnStartMs,
         transientFallbackModel,
         approvedRevisionImageSources,
+        requireWorkPlanDisposition,
       } = message.params;
 
       // Progress callback to forward progress updates to parent process
@@ -147,7 +148,8 @@ process.on('message', async (message: any) => {
         // the same order as generateMarketingResponse's signature.
         publishAuthorizationOverride,
         transientFallbackModel,
-        approvedRevisionImageSources
+        approvedRevisionImageSources,
+        requireWorkPlanDisposition,
       );
 
       // Clean up cancelled flag
@@ -215,4 +217,3 @@ process.on('unhandledRejection', (reason, promise) => {
   });
   process.exit(1);
 });
-
