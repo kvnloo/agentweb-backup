@@ -33,11 +33,11 @@ def _fake_llm_result(usage_metadata=None, llm_output=None):
 class TestParseFullLlmName(unittest.TestCase):
     def test_valid_triplet(self):
         self.assertEqual(
-            parse_full_llm_name("azure->openai->gpt-4o"), ("openai", "gpt-4o")
+            parse_full_llm_name("azure->openai->gpt-4o"), ("openrouter", "gpt-4o")
         )
         self.assertEqual(
             parse_full_llm_name("aws->Anthropic->anthropic.claude-sonnet-4-6"),
-            ("anthropic", "anthropic.claude-sonnet-4-6"),
+            ("openrouter", "anthropic.claude-sonnet-4-6"),
         )
 
     def test_malformed_names_fall_back(self):
@@ -106,7 +106,7 @@ class TestUsageReporterBuffering(unittest.TestCase):
         self.assertEqual(record["userId"], "user-1")
         self.assertEqual(record["taskId"], "task-9")
         self.assertEqual(record["model"], "anthropic.claude-sonnet-4-6")
-        self.assertEqual(record["provider"], "anthropic")
+        self.assertEqual(record["provider"], "openrouter")
         self.assertEqual(record["feature"], "agent_task")
         self.assertEqual(record["inputTokens"], 150)
         self.assertEqual(record["outputTokens"], 30)

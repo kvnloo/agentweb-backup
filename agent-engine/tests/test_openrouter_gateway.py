@@ -48,6 +48,7 @@ def test_gateway_client_delegates_fallback_and_compression_to_openrouter(monkeyp
     assert captured["extra_body"] == {
         "provider": {"allow_fallbacks": True, "require_parameters": True},
         "plugins": [{"id": "context-compression"}],
+        "models": ["google/gemini-3.5-flash"],
     }
 
 
@@ -58,6 +59,7 @@ def test_openrouter_key_uses_the_existing_environment_aware_secret_seam():
     assert "_env_or_string_secret('OPENROUTER_API_KEY', 'openrouter')" in source
 
 
-def test_legacy_execution_name_remains_available_for_usage_attribution():
-    # Characterization: transport changes must not rewrite the persisted task label.
-    assert parse_full_llm_name("azure->openai->gpt-4.1") == ("openai", "gpt-4.1")
+def test_legacy_execution_name_is_attributed_to_the_openrouter_transport():
+    # The persisted task label remains unchanged; the usage provider reflects
+    # the gateway that actually served and billed the request.
+    assert parse_full_llm_name("azure->openai->gpt-4.1") == ("openrouter", "gpt-4.1")
