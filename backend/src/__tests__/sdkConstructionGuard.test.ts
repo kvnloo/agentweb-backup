@@ -90,7 +90,8 @@ const ALLOWLIST = new Set<string>([
   // not per-token — token metering does not apply. Video/image cost is tracked
   // separately (incrementUserTokenUsage cost-only path in agentModeService).
   'services/videoGeneration.ts',
-  // Transitional, inventory-owned direct text routes; not permanent exceptions.
+  // chatbotService constructs Azure's embeddings client for semantic search;
+  // its chat/text generation path routes through AgentModeService.callLLM.
   'services/chatbotService.ts',
   'services/codingAgentService.ts',
 ]);

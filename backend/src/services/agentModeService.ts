@@ -823,6 +823,8 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Internal workload model: callable by services but never selectable in the customer picker. */
+  internalOnly?: boolean;
   /**
    * Usage/cost tier for the model picker UI. Only used as a fallback when
    * getModelPrice() has no entry for this model — otherwise the picker's
@@ -1015,6 +1017,8 @@ interface LLMCallOptions {
   taskClass?: GatewayTaskClass;
   /** Per-request transport deadline for bounded background and judge calls. */
   timeoutMs?: number;
+  /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
+  fallbackModels?: string[];
 }
 
 // Diagnosis agent configuration
@@ -3092,6 +3096,10 @@ export class AgentModeService {
     //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
     //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
     'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Workload-specific research agent. It is intentionally callable only from
+    // DeepResearchService, not exposed as a general chat-picker model.
+    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
+    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -3178,7 +3186,9 @@ export class AgentModeService {
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
-    const models = Object.keys(this.llmModels).filter(m => isAdmin || !this.llmModels[m].adminOnly);
+    const models = Object.keys(this.llmModels).filter(
+      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
+    );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -3369,11 +3379,12 @@ export class AgentModeService {
       tool_choice = null,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" },
+      response_format = null,
       usageContext = null,
       humanPaced = false,
       taskClass,
       timeoutMs,
+      fallbackModels,
     } = options || {};
 
     // Explicit openrouter/* models have always used the gateway. Direct-provider
@@ -3386,13 +3397,28 @@ export class AgentModeService {
     const params: any = {
       model: upstreamModel,
       messages: messages,
-      response_format: response_format || { type: "text" },
     };
+    // Provider-native clients keep their historical explicit text default.
+    // On OpenRouter, omit that no-op field unless a caller actually requests
+    // structured JSON: require_parameters must not exclude a model such as
+    // Sonar Deep Research merely because it does not advertise response_format.
+    if (!useOpenRouterGateway || response_format) {
+      params.response_format = response_format || { type: 'text' };
+    }
 
     if (useOpenRouterGateway) {
       // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
       // compatibility for migrated calls.
       params.provider = { allow_fallbacks: true, require_parameters: true };
+      if (fallbackModels?.length) {
+        params.models = fallbackModels.map((fallbackModel) => {
+          const normalizedFallback = this.normalizeModelId(fallbackModel);
+          if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
+            throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
+          }
+          return resolveOpenRouterUpstreamModelId(normalizedFallback);
+        });
+      }
       if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
         params.session_id = usageContext.sessionId;
       }
@@ -4681,9 +4707,8 @@ export class AgentModeService {
             usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
             humanPaced: humanPacedTurn,
-            // ENG-1430: only this customer-facing loop participates in the first
-            // reversible OpenRouter cutover. Internal judges/scheduled helpers
-            // remain on their characterized paths until their own slices.
+            // Scheduled and interactive conversations canary independently;
+            // OpenRouter owns provider fallback once either class is enabled.
             taskClass: chatTaskClass,
           });
         } catch (callError) {

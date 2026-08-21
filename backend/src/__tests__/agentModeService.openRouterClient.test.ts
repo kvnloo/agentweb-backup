@@ -216,6 +216,62 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       provider: { allow_fallbacks: true, require_parameters: true },
     }));
     expect(request).not.toHaveProperty('temperature');
+    expect(request).not.toHaveProperty('response_format');
+  });
+
+  it('preserves an explicitly requested JSON response format on the gateway', async () => {
+    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'nonstandard_consumer';
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'gemini-3.7-flash',
+      [{ role: 'user', content: 'Return JSON' }],
+      { taskClass: 'nonstandard_consumer', response_format: { type: 'json_object' } } as any,
+    );
+
+    expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      response_format: { type: 'json_object' },
+    }));
+  });
+
+  it('delegates ordered model fallback to OpenRouter on the wire', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { fallbackModels: ['openrouter/perplexity/sonar-pro-search'] } as any,
+    );
+
+    expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      model: 'perplexity/sonar-deep-research',
+      models: ['perplexity/sonar-pro-search'],
+      provider: { allow_fallbacks: true, require_parameters: true },
+    }));
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unregistered fallback before sending a gateway request', async () => {
+    const service = new AgentModeService();
+    const create = jest.fn();
+    jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
+      chat: { completions: { create } },
+    } as any);
+
+    await expect(service.callLLM(
+      'openrouter/perplexity/sonar-deep-research',
+      [{ role: 'user', content: 'Research' }],
+      { fallbackModels: ['unregistered/model'] } as any,
+    )).rejects.toThrow("Invalid OpenRouter fallback model 'unregistered/model'");
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('has a verified gateway mapping for every selectable direct-provider model', () => {

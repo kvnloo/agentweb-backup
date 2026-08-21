@@ -51,6 +51,7 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
     assertUsesSharedGatewayOnly([
       'controllers/blog.ts',
       'routes/slack.ts',
+      'services/deepResearchService.ts',
     ]);
   });
 
