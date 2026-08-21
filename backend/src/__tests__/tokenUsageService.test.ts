@@ -6,6 +6,7 @@ import {
   grantTokenBonus,
   resolveBillingUserId,
   deriveBlockedByCost,
+  ANONYMOUS_SESSION_COST_CAP_USD,
 } from "../services/tokenUsageService";
 
 // Mock dependencies
@@ -149,7 +150,7 @@ describe("getUserTokenUsage - anonymous session owner (ENG-1163)", () => {
 
     const result = await getUserTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
 
-    expect(result.totalCost).toBeGreaterThan(0);
+    expect(result.totalCost).toBe(ANONYMOUS_SESSION_COST_CAP_USD);
   });
 
   it("still throws for a real (non-anonymous) userId with no AW-Users row", async () => {
@@ -363,6 +364,18 @@ describe("checkTokenUsage - anonymous session owner (ENG-1163 / ENG-705)", () =>
     expect(result.allowed).toBe(false);
     expect(result.costEnforced).toBe(true);
     expect(result.costUsed).toBe(2.1);
+  });
+
+  it("blocks exactly at the cap boundary — cost equal to (not just over) the fixed cap is not allowed", async () => {
+    mockGetUserById.mockResolvedValue(undefined);
+    mockGetUserSessions.mockResolvedValue({
+      sessions: [{ totalCost: ANONYMOUS_SESSION_COST_CAP_USD }],
+    });
+
+    const result = await checkTokenUsage("anon_19b7943e-a5a4-40a2-a5d6-4d78c3aa5049");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costUsed).toBe(ANONYMOUS_SESSION_COST_CAP_USD);
   });
 
   it("never queries user/subscription records for an anon_ userId (short-circuits before any lookup)", async () => {
