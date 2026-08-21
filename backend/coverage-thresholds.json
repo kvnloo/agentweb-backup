@@ -1,0 +1,9 @@
+{
+  "_comment": "ENG-1376: the single backend coverage threshold. jest.config.js carries no coverageThreshold and the workflow no longer re-implements one; scripts/coverage-report.mjs is the only enforcer, and it judges the MERGED coverage of both backend test jobs.",
+  "_ratchet": "These are floors, not goals. They were set to the measured value at the time so the gate is real from day one rather than aspirational-and-disabled. Raise them when coverage rises; never lower them to make a red build green - fix the tests or justify the drop on the PR.",
+  "_history": "2026-08-21 (ENG-1376): first honest numbers. The bar this replaced claimed 95% but measured only src/utils (112 of 811 source files) and only job B's half of the suite.",
+  "statements": 64,
+  "branches": 54,
+  "functions": 65,
+  "lines": 64
+}

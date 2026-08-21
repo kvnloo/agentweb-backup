@@ -56,17 +56,38 @@ module.exports = {
     // node-fetch after the same local-or-allowlisted check. See __mocks__/node-fetch.ts.
     '^node-fetch$': '<rootDir>/__mocks__/node-fetch.ts',
   },
+  // ENG-1376: this used to read `src/utils/**/*.ts` only — 112 of the 811
+  // source files under src/. The 98.35% the CI comment advertised was 98.35%
+  // *of src/utils*, and nothing said so, so it read as a backend-wide number.
+  // Measured over the widened scope the same suites score ~64% statements /
+  // ~55% branches. Nothing regressed; the denominator was wrong.
+  //
+  // Exclusions, and why each one is not a dodge:
+  //   *.d.ts          - ambient declarations, no executable statements.
+  //   **/__tests__/** - the tests themselves. Must be `**/`, not `src/__tests__/`:
+  //                     there are 12 more __tests__ dirs nested under services/,
+  //                     routes/, mcp/, etc., and an anchored pattern leaks them
+  //                     into the denominator as ~100%-covered "source".
+  //   **/__mocks__/** - hand-written module stubs (see moduleNameMapper above).
+  //   src/types/**    - type-only declarations.
+  //   src/scripts/**  - 69 one-off operational scripts run by hand against real
+  //                     AWS/DB, not importable units. Listed in the coverage
+  //                     comment as an explicit exclusion so the number stays
+  //                     honest about what it skipped.
   collectCoverageFrom: [
-    'src/utils/**/*.ts',
+    'src/**/*.ts',
     '!src/**/*.d.ts',
-    '!src/__tests__/**',
+    '!src/**/__tests__/**',
+    '!src/**/__mocks__/**',
+    '!src/types/**',
+    '!src/scripts/**',
   ],
-  coverageThreshold: {
-    global: {
-      branches: 95,
-      functions: 95,
-      lines: 95,
-      statements: 95,
-    },
-  },
+  // ENG-1376: no `coverageThreshold` here on purpose. Coverage is now collected
+  // by BOTH backend jobs and merged before it is judged (see the
+  // backend-coverage job in .github/workflows/tests.yml), so a per-job jest
+  // threshold would fail each job against a fraction of the evidence. The
+  // single enforcement point is backend/coverage-thresholds.json, applied once
+  // by scripts/coverage-report.mjs. Previously there were two mechanisms and
+  // this one was dead: CI passed `--coverageThreshold='{}'` to disable it and
+  // re-implemented the same 95% bar in a github-script step.
 };

@@ -7,8 +7,9 @@ on:
 permissions:
   contents: read
   checks: read
-  # The coverage comment in `backend-tests-b` reads and writes a PR comment,
-  # which is served by the issues comments endpoint.
+  # The coverage comment in `backend-coverage` (ENG-1376; it lived in
+  # `backend-tests-b` until that job stopped judging coverage on its own) reads
+  # and writes a PR comment, which is served by the issues comments endpoint.
   issues: read
   pull-requests: write
   # ENG-1371: `id-token: write` removed. It was never used — no step in this
@@ -249,12 +250,38 @@ jobs:
       # diagnostics since ENG-1059 pointed the deploy build at
       # tsconfig.build.json). Nothing here depends on the type-check having
       # already run in this job — Jest resolves and transpiles independently.
-      - name: Run tests (agentMode files)
+      # ENG-1376: this job collects coverage now. It used not to, and that one
+      # fact was the largest single distortion in the backend coverage number:
+      # every module whose tests live here read as near-zero no matter how well
+      # tested it was, because the only job measuring anything was job B.
+      # Measured on the widened scope before this change,
+      # `services/agentModeService.ts` (12,790 statements) scored 13.4% and
+      # `controllers/agentModeController.ts` (3,908) scored 15.5% — together
+      # ~15% of the whole backend, mis-reported purely because of which job
+      # their tests were scheduled into.
+      #
+      # `npm run test:coverage` already carries `--maxWorkers=2 --forceExit`
+      # and a 4GB heap; only the reporter is set here. `json` (not
+      # `json-summary`) because the backend-coverage job below needs the
+      # per-statement counters to merge the two halves — a summary has already
+      # thrown away everything a merge needs.
+      - name: Run tests with coverage (agentMode files)
         working-directory: backend
         run: >
-          npm test --
+          npm run test:coverage --
           --testPathPattern="agentMode"
-          --forceExit
+          --coverageReporters=json
+
+      # No `if: always()`. A failed suite produces partial counters, and the
+      # backend-coverage job is skipped when this job fails anyway, so uploading
+      # them would only leave a misleading artifact behind.
+      - name: Upload coverage (agentMode half)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-coverage-a
+          path: backend/coverage/coverage-final.json
+          if-no-files-found: error
+          retention-days: 1
 
   # Job B: everything else + coverage reporting
   backend-tests-b:
@@ -320,85 +347,180 @@ jobs:
       # backend PR.
       #
       # Making the two lists exact complements was tried here and reverted,
-      # because it is not the cost cleanup it looks like. Coverage is collected
-      # ONLY from `src/utils/**` (jest.config.js `collectCoverageFrom`) and ONLY
-      # by this job — job A produces none. Two files in that 23 are
-      # `src/__tests__/utils/agentModeAlerts.test.ts` and
-      # `.../agentModeErrors.test.ts`, whose targets `src/utils/agentModeAlerts.ts`
-      # and `src/utils/agentModeErrors.ts` are inside the coverage scope; every
-      # other test touching those two modules is also `agentMode`-named. So
-      # excluding the 23 sends both modules to zero coverage and the gate below
-      # fails — measured on PR #2491: branches 95.2% -> 93.99%, statements
-      # 98.35% -> 97.55%.
+      # because it used to destroy coverage. Coverage was collected ONLY from
+      # `src/utils/**` and ONLY by this job — job A produced none — so the 23
+      # overlapping files were load-bearing: two of them
+      # (`src/__tests__/utils/agentModeAlerts.test.ts` and `.../agentModeErrors.test.ts`)
+      # were the only non-`agentMode`-named tests of two in-scope utils, and
+      # excluding them sent both modules to zero. Measured on PR #2491:
+      # branches 95.2% -> 93.99%, statements 98.35% -> 97.55%.
       #
-      # Deduplicating the split therefore cannot be done without first deciding
-      # what coverage measures. Tracked with that decision on ENG-1376; do not
-      # "fix" this line in isolation.
+      # ENG-1376 removed that constraint. Both jobs now collect coverage and the
+      # backend-coverage job merges the two before judging them, so a file that
+      # runs in job A instead of job B no longer costs anything — its counters
+      # arrive either way. The 23 overlapping files are now pure duplicated
+      # runtime (~23 files executed twice on every backend PR) and nothing but
+      # inertia keeps them there.
+      #
+      # Left alone in THIS change on purpose: ENG-1376 is about what coverage
+      # measures, and re-partitioning the suite in the same PR would mean any
+      # movement in the merged number could be either the new scope or the new
+      # split. Deduplicate it in its own change, where the before/after is one
+      # variable — and confirm the merged coverage holds when you do.
+      # ENG-1376: `--coverageThreshold='{}'` is gone, and so is the
+      # github-script step that used to re-implement the same 95% bar in
+      # JavaScript. There is now exactly one threshold in the backend:
+      # backend/coverage-thresholds.json, applied once by the backend-coverage
+      # job below against the MERGED coverage of both halves. Judging this job
+      # alone against a whole-suite bar would fail it on missing evidence, not
+      # on missing tests.
       - name: Run tests with coverage (non-agentMode files)
         working-directory: backend
         run: >
           npm run test:coverage --
           --testPathIgnorePatterns="/node_modules/" "/__tests__/e2e/" "/__tests__/twins/" "/__tests__/agentMode"
-          --coverageThreshold='{}'
-          --coverageReporters=text --coverageReporters=json-summary
+          --coverageReporters=json
 
+      - name: Upload coverage (non-agentMode half)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-coverage-b
+          path: backend/coverage/coverage-final.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # ENG-1376: the backend's coverage gate. It exists as a separate job because
+  # the backend suite is split across two of them, and a coverage number is only
+  # meaningful once both halves are counted — see the comment on job B's
+  # testPathIgnorePatterns for the history of why splitting the suite silently
+  # broke the number.
+  #
+  # This is the ONLY place a backend coverage threshold is enforced. It replaces
+  # two mechanisms that both claimed to be it: a `coverageThreshold` in
+  # jest.config.js that CI disabled with `--coverageThreshold='{}'` on every
+  # run, and a github-script step that re-implemented the same 95% bar against
+  # `coverage.total`. Neither measured what it said: the scope was
+  # `src/utils/**` alone (112 of 811 source files) and the evidence was one of
+  # two jobs.
+  #
+  # It does NOT stand in front of the test jobs — the ENG-1039 lesson (see
+  # backend-tests-a) is about what gates the suite, and nothing here does. It
+  # runs after, on the artifacts they produce. If either test job fails or
+  # skips, GitHub skips this job too, and merge-evidence.sh already demands a
+  # positive `success` from both of them.
+  backend-coverage:
+    name: Backend coverage
+    needs: [detect-changes, backend-tests-a, backend-tests-b]
+    # Same gates as the two test jobs, restated rather than inherited: a job
+    # that can silently become a no-op is not a gate.
+    #
+    # Deliberately NOT added to MERGE_EVIDENCE_BACKEND_JOBS. It does not need to
+    # be: merge-evidence.sh fails on ANY check with a `failure` conclusion, not
+    # just the ones it names, so a real coverage regression blocks the merge on
+    # its own. The only thing the named list adds is catching a job that never
+    # reported at all — and this job can only fail to report when job A or job B
+    # skipped or failed, both of which are already in that list. Adding it would
+    # buy nothing and would block every open backend PR until it rebased onto
+    # this commit. See the note by BACKEND_JOBS in merge-evidence.sh.
+    if: >-
+      needs.detect-changes.outputs.backend == 'true'
+      && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # Minutes, not tens of minutes: this job runs no tests. It installs, merges
+    # two JSON files and posts a comment.
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-backend-coverage-${{ github.ref }}-${{ github.event.pull_request.draft }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Download coverage (agentMode half)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backend-coverage-a
+          path: coverage-a
+
+      - name: Download coverage (non-agentMode half)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backend-coverage-b
+          path: coverage-b
+
+      # The gate script has its own regression suite (~2s). It is the only thing
+      # standing between a coverage regression and main, so it does not get to
+      # be the untested script in the repo.
+      - name: Run coverage-report regression suite
+        working-directory: backend
+        run: node --test scripts/coverage-report.test.mjs
+
+      - name: Merge coverage and enforce the threshold
+        working-directory: backend
+        env:
+          COVERAGE_MARKDOWN_OUT: ${{ github.workspace }}/coverage-comment.md
+        run: >
+          node scripts/coverage-report.mjs
+          "${{ github.workspace }}/coverage-a/coverage-final.json"
+          "${{ github.workspace }}/coverage-b/coverage-final.json"
+
+      # `always()` so the comment lands even when the step above exited 1 — a
+      # PR that drops below the bar is exactly the one whose author needs to see
+      # the number. The job still fails: this step does not swallow the status.
+      #
+      # The `event_name` guard is redundant today (this workflow has only a
+      # `pull_request` trigger) and is kept as a guard for tomorrow: on a `push`
+      # run `context.issue.number` is undefined and every call below would throw
+      # on an otherwise-passing job.
       - name: Post coverage comment on PR
-        if: always()
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
-            const coveragePath = 'backend/coverage/coverage-summary.json';
-            if (!fs.existsSync(coveragePath)) {
-              console.log('Coverage summary not found, skipping comment');
+            const bodyPath = `${process.env.GITHUB_WORKSPACE}/coverage-comment.md`;
+            if (!fs.existsSync(bodyPath)) {
+              console.log('No coverage markdown produced, skipping comment');
               return;
             }
-            const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
-            const { statements, branches, functions, lines } = coverage.total;
-            const allMet = statements.pct >= 95 && branches.pct >= 95 && functions.pct >= 95 && lines.pct >= 95;
+            const body = fs.readFileSync(bodyPath, 'utf8');
 
-            const body = `## 📊 Backend Test Coverage
-
-            | Metric | Coverage | Threshold | Status |
-            |--------|----------|-----------|--------|
-            | Statements | ${statements.pct}% | 95% | ${statements.pct >= 95 ? '✅' : '❌'} |
-            | Branches | ${branches.pct}% | 95% | ${branches.pct >= 95 ? '✅' : '❌'} |
-            | Functions | ${functions.pct}% | 95% | ${functions.pct >= 95 ? '✅' : '❌'} |
-            | Lines | ${lines.pct}% | 95% | ${lines.pct >= 95 ? '✅' : '❌'} |
-
-            ${allMet ? '✅' : '❌'} **All thresholds must be ≥ 95%**`;
-
-            // Find existing coverage comment
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
+              per_page: 100,
             });
+            const existing = comments.find(
+              (c) => c.user.type === 'Bot' && c.body.includes('📊 Backend Test Coverage'),
+            );
 
-            const coverageComment = comments.find(c => c.body.includes('📊 Backend Test Coverage'));
-
-            if (coverageComment) {
+            if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                comment_id: coverageComment.id,
-                body: body
+                comment_id: existing.id,
+                body,
               });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: body
+                body,
               });
-            }
-
-            if (!allMet) {
-              core.setFailed(
-                `Backend coverage below 95% threshold: ` +
-                `statements=${statements.pct}%, branches=${branches.pct}%, ` +
-                `functions=${functions.pct}%, lines=${lines.pct}%`
-              );
             }
 
   # These scripts are the ones that decide whether a deploy really happened
@@ -593,6 +715,12 @@ jobs:
   # been in that set, so a Dependabot PR still has to pass the same tests as
   # anything else. Contract pinned by
   # .github/scripts/staging-deploy-gate.test.sh.
+  #
+  # ENG-1376: `needs` stays at the two test jobs and does NOT pick up
+  # `backend-coverage`. This job already queues behind a single global
+  # concurrency lane; putting a report-and-compare job in front of it would add
+  # latency to every staging deploy to gate it on something that is not a
+  # correctness signal. A coverage regression blocks the merge, not the deploy.
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
     needs: [detect-changes, backend-tests-a, backend-tests-b]
