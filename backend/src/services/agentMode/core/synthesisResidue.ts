@@ -380,20 +380,43 @@ function countsInclude(
  * `detectFalseCompletionClaim` is the orthogonal truth check: instead of judging
  * whether the text looks like an answer, it parses any explicit numeric completion
  * claim ("all N <asset noun>", "N of N", "N/N") out of the content and compares it
- * against the ledger's actual count of succeeded asset-producing tool calls. Only
- * tool calls made THIS turn are in `toolCalls` (the caller resets the ledger per
- * user turn), so this is naturally scoped the same way ENG-1188 scoped the
- * `expectedAssetCount` gate — a prior variant's already-delivered assets can never
- * paper over a later variant's shortfall.
+ * against the ledger's actual count of succeeded asset-producing tool calls.
+ *
+ * `toolCalls` holds every call made THIS TURN, but "this turn" is not "this step":
+ * in an AUTOCOMPLETE-mode work-plan session the whole loop — including every
+ * `set_work_plan_status` call between steps/variants — runs inside one turn, so a
+ * multi-variant turn can carry several steps' worth of successful assets in one
+ * ledger. Comparing a claim about the LATEST step/variant ("all 12 sizes for
+ * Variant 4") against the WHOLE ledger reproduces the exact ENG-1188 masking bug on
+ * this new mechanism: variants 1-3's already-succeeded renders paper over variant
+ * 4's shortfall, and the guard built to catch that shortfall goes silent on it.
+ * `sinceLastStepBoundary` below scopes the count to calls made after the last
+ * completed/skipped `set_work_plan_status` in the ledger, mirroring the `sinceIso`
+ * cutoff agentModeService.ts already uses for the `expectedAssetCount` gate — same
+ * idea, expressed as a ledger-index cut since this pure module only ever sees one
+ * turn's tool-call array in call order, not the session messages `sinceIso` reads
+ * timestamps from.
  */
 const ASSET_NOUN = '(?:sizes?|images?|banners?|ads?|assets?|variants?|creatives?|renders?|screenshots?|photos?|videos?|templates?|graphics?)';
 
+/**
+ * Appends the same "an asset noun follows within a few words" requirement
+ * `ALL_N_NOUN_PATTERN` already used, onto any other numeric-claim core pattern. Live
+ * repro: without this, N_OF_N/N_SLASH_N matched an unrelated same-number ratio —
+ * "10 of 10 pages", "3/3 of the brief" — and misread it as an asset-completion
+ * claim. `ALL_N_NOUN_PATTERN` never had that hole because it always required a noun;
+ * the other two patterns need the identical suffix, not a separate ad-hoc check.
+ */
+function withNounProximity(coreSource: string): string {
+  return `${coreSource}(?:\\s+\\S+){0,6}?\\s+${ASSET_NOUN}\\b`;
+}
+
 /** "all 12 sizes", "all 12 of the requested display sizes" (up to 6 words between). */
-const ALL_N_NOUN_PATTERN = new RegExp(`\\ball\\s+(\\d+)(?:\\s+\\S+){0,6}?\\s+${ASSET_NOUN}\\b`, 'gi');
-/** "12 of 12" — the backreference requires the SAME number twice, so "4 of 12" never matches. */
-const N_OF_N_PATTERN = /\b(\d+)\s+of\s+\1\b/gi;
-/** "12/12". */
-const N_SLASH_N_PATTERN = /\b(\d+)\s*\/\s*\1\b/g;
+const ALL_N_NOUN_PATTERN = new RegExp(withNounProximity('\\ball\\s+(\\d+)'), 'gi');
+/** "12 of 12 banners" — the backreference requires the SAME number twice, so "4 of 12" never matches. */
+const N_OF_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s+of\\s+\\1'), 'gi');
+/** "12/12 images". */
+const N_SLASH_N_PATTERN = new RegExp(withNounProximity('\\b(\\d+)\\s*\\/\\s*\\1'), 'gi');
 
 const ASSET_PRODUCING_TOOL_NAMES = new Set([
   'generate_image',
@@ -404,6 +427,30 @@ const ASSET_PRODUCING_TOOL_NAMES = new Set([
   'save_file',
   'playwright_browser_take_screenshot',
 ]);
+
+/**
+ * The tool that closes a work-plan step/variant (`set_work_plan_status`) is
+ * recorded in this same per-turn ledger, so a completed/skipped call to it is a
+ * real boundary between "the previous step's work" and "this step's work".
+ */
+const STEP_BOUNDARY_TOOL_NAME = 'set_work_plan_status';
+
+/**
+ * Slices `toolCalls` down to calls made AFTER the most recent successful
+ * `set_work_plan_status` call, so a claim about the step/variant currently being
+ * closed is never checked against an earlier step's already-counted assets. With no
+ * such boundary in the ledger (a single-step turn, or a turn with no work plan at
+ * all) the whole ledger is the current step's, matching prior behavior exactly.
+ */
+function sinceLastStepBoundary(toolCalls: ExecutedToolCall[]): ExecutedToolCall[] {
+  for (let i = toolCalls.length - 1; i >= 0; i--) {
+    const call = toolCalls[i];
+    if (!call || call.name !== STEP_BOUNDARY_TOOL_NAME) continue;
+    if ('error' in call || isReportedFailure(call)) continue;
+    return toolCalls.slice(i + 1);
+  }
+  return toolCalls;
+}
 
 /** Total succeeded calls across every known asset-producing tool in the ledger. */
 function countProducedAssets(toolCalls: ExecutedToolCall[]): number {
@@ -447,7 +494,7 @@ export function detectFalseCompletionClaim(
   if (claims.size === 0) return null;
 
   const claimed = Math.max(...claims);
-  const actual = countProducedAssets(toolCalls);
+  const actual = countProducedAssets(sinceLastStepBoundary(toolCalls));
   if (actual >= claimed) return null;
   return { claimed, actual };
 }
@@ -457,12 +504,17 @@ export function detectFalseCompletionClaim(
  * cannot back up. Keeps the model's original prose (it may still hold other real,
  * useful detail) but states the real count and the named shortfall right underneath
  * it, so the user is never left believing more happened than actually did.
+ *
+ * Scoped to the same `sinceLastStepBoundary` slice `detectFalseCompletionClaim`
+ * used to compute `claim.actual` — showing a wider ledger here would contradict the
+ * very count the correction is stating (e.g. "only 4 of 12" next to a list that
+ * includes 40 unrelated successes from earlier steps).
  */
 export function buildFalseClaimCorrectionFooter(
   claim: FalseCompletionClaim,
   toolCalls: ExecutedToolCall[],
 ): string {
-  const counts = tallyExecutedActions(toolCalls);
+  const counts = tallyExecutedActions(sinceLastStepBoundary(toolCalls));
   const ledgerLines = counts.size > 0 ? renderLedgerLines(counts) : '(No assets were actually produced.)';
 
   return [
