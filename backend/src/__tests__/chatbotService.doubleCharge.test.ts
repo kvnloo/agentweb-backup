@@ -1,27 +1,7 @@
 /**
- * ENG-1134: agent-mode turns were charged to the per-user quota counter TWICE.
- *
- * `agentModeService.callLLM` meters at the LLM call (ledger row + counter charge,
- * counting input + output + cache tokens). The assistant message is then persisted
- * through `chatbotDb.addMessageToSession` / `addMessagesToSession`, which charged
- * `incrementUserTokenUsage` a SECOND time from `message.usage.estimated_cost`.
- *
- * Measured in dev against a single ledger row: cost exactly 2.000x, tokens 1.034x.
- * The token ratio stayed near 1 because `usage.total_tokens` carries only
- * prompt+completion while the real charge includes cache tokens (~73% of traffic) —
- * which is precisely why the double charge hid for three weeks.
- *
- * The persist-time charge is the wrong charging point regardless of the double:
- * it writes no ledger row, so it breaks ENG-200's rule that nothing is deducted
- * without also being recorded, and it under-counts tokens by excluding cache.
- * Charging belongs at the LLM call site, which records and charges together.
- *
- * Removing it alone would open a hole: Emma reaches Claude via
- * `agentModeService.getBedrockClient()` and Gemini via `getGeminiClient()`, and
- * NEITHER of those clients meters — only `callLLM` does, and Emma does not go
- * through it. So those two call sites must start metering as the charge moves off
- * the persist path. Azure must NOT, because its factory client already meters —
- * metering it here would recreate the very double-charge this fixes.
+ * ENG-1134 / ENG-1430: quota charging belongs at the shared LLM-call boundary.
+ * Persisting a message must never charge again, and the Emma sidebar must not
+ * create a second provider client or meter beside AgentModeService.callLLM.
  */
 
 const queryPromiseMock = jest.fn();
@@ -46,51 +26,36 @@ jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
 }));
 
-const mockBedrockCreate = jest.fn();
-const mockGeminiCreate = jest.fn();
-const mockGetBedrockClient = jest.fn().mockResolvedValue({
-  chat: { completions: { create: mockBedrockCreate } },
-});
-const mockGetGeminiClient = jest.fn().mockResolvedValue({
-  chat: { completions: { create: mockGeminiCreate } },
-});
+const mockCallLLM = jest.fn();
+const mockGetDefaultModel = jest.fn().mockResolvedValue('gpt-5.4');
+const mockAgentModeService = {
+  callLLM: mockCallLLM,
+  getDefaultModel: mockGetDefaultModel,
+  executeTool: jest.fn(),
+  initialize: jest.fn().mockResolvedValue(undefined),
+  getAdminToolNames: jest.fn().mockReturnValue([]),
+};
 
-jest.mock('../services/agentModeService', () => ({
-  AgentModeService: jest.fn().mockImplementation(() => ({
-    getBedrockClient: mockGetBedrockClient,
-    getGeminiClient: mockGetGeminiClient,
-    executeTool: jest.fn(),
-  })),
-  agentModeService: {
-    getBedrockClient: mockGetBedrockClient,
-    getGeminiClient: mockGetGeminiClient,
-    executeTool: jest.fn(),
-  },
-}));
+jest.mock('../services/agentModeService', () => {
+  const AgentModeService = jest.fn().mockImplementation(() => mockAgentModeService);
+  Object.assign(AgentModeService, {
+    FOUNDATION_TOOLS: [],
+    buildWorkPlanContextMessages: jest.fn().mockReturnValue([]),
+  });
+  return { AgentModeService, agentModeService: mockAgentModeService };
+});
 
 const mockIncrementUserTokenUsage = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/tokenUsageService', () => ({
   incrementUserTokenUsage: (...args: unknown[]) => mockIncrementUserTokenUsage(...args),
 }));
 
-const mockGetAzureClient = jest.fn(() => ({
-  chat: { completions: { create: jest.fn() } },
-}));
+const mockGetAzureClient = jest.fn();
 jest.mock('../utils/llmClients', () => ({
   getAzureClient: (...args: unknown[]) => mockGetAzureClient(...(args as [])),
 }));
 
-const mockMeterUserUsage = jest.fn();
-jest.mock('../services/usageRecorderService', () => ({
-  // Keep the real module — chatbotService also imports computeCostMicroUsd from
-  // here for calculateCost. Only the meter is stubbed.
-  ...jest.requireActual('../services/usageRecorderService'),
-  meterUserUsage: (...args: unknown[]) => mockMeterUserUsage(...args),
-}));
-
-jest.mock('openai', () => jest.fn().mockImplementation(() => ({
-  chat: { completions: { create: jest.fn() } },
-})));
+jest.mock('openai', () => jest.fn());
 jest.mock('@google-cloud/discoveryengine', () => ({
   EngineServiceClient: jest.fn(),
   SearchServiceClient: jest.fn(),
@@ -112,18 +77,17 @@ import { chatbotDb, generateChatResponse, __resetEmmaSystemContextCache } from '
 
 function completion(content = 'Hi') {
   return {
+    id: 'completion-1',
     choices: [{ message: { role: 'assistant', content, tool_calls: null } }],
     usage: {
       prompt_tokens: 10,
       completion_tokens: 20,
       total_tokens: 30,
-      // Bedrock Converse answers in OpenAI shape but carries Anthropic-style
-      // cache fields. normalizeOpenAIUsage does NOT read these, which is why the
-      // meter reads them explicitly.
       cache_read_input_tokens: 5000,
       cache_creation_input_tokens: 700,
+      cost: 0.00123,
     },
-    model: 'test-model',
+    model: 'openai/gpt-5.4',
   };
 }
 
@@ -148,6 +112,8 @@ beforeEach(() => {
   putPromiseMock.mockResolvedValue({});
   updatePromiseMock.mockResolvedValue({});
   seedSession();
+  mockGetDefaultModel.mockResolvedValue('gpt-5.4');
+  mockCallLLM.mockResolvedValue(completion());
 });
 
 describe('ENG-1134: message persistence must not charge the quota counter', () => {
@@ -158,10 +124,7 @@ describe('ENG-1134: message persistence must not charge the quota counter', () =
   };
 
   it('does not charge the counter when a usage-carrying message is appended', async () => {
-    // The LLM call site already charged this exact spend AND wrote the ledger row.
-    // Charging again here is the 2.000x double.
     await chatbotDb.addMessageToSession('sess-1', usageMessage as never);
-
     expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
   });
 
@@ -170,84 +133,53 @@ describe('ENG-1134: message persistence must not charge the quota counter', () =
       usageMessage,
       { ...usageMessage, content: 'second' },
     ] as never);
-
     expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
   });
 });
 
-describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => {
-  it('meters the Bedrock path, which no client wrapper covers', async () => {
-    mockBedrockCreate.mockResolvedValue(completion());
-
+describe('ENG-1430: Emma has one shared record-and-charge point', () => {
+  it('delegates the billable turn and its attribution to callLLM exactly once', async () => {
     await generateChatResponse('sess-1', 'Hello', {
       portalType: 'customer',
       userId: 'user-1',
-      model: 'anthropic.claude-sonnet-4-6',
-    } as never);
-
-    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
-    const [ctx] = mockMeterUserUsage.mock.calls[0];
-    expect(ctx).toMatchObject({ userId: 'user-1', feature: 'chat', provider: 'bedrock' });
-    // The regression this guards: routing through meterUsageFromResponse would
-    // take normalizeOpenAIUsage and record both of these as 0, under-counting
-    // Bedrock spend by ~4x since cache is the bulk of the traffic.
-    expect(ctx).toMatchObject({ cacheReadTokens: 5000, cacheWriteTokens: 700 });
-  });
-
-  it('meters the Gemini path, which no client wrapper covers', async () => {
-    mockGeminiCreate.mockResolvedValue(completion());
-
-    await generateChatResponse('sess-1', 'Hello', {
-      portalType: 'customer',
-      userId: 'user-1',
-      model: 'gemini-2.5-flash',
-    } as never);
-
-    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
-    const [ctx] = mockMeterUserUsage.mock.calls[0];
-    expect(ctx).toMatchObject({ userId: 'user-1', feature: 'chat', provider: 'gemini' });
-  });
-
-  it('meters the Azure path too, requesting the client UN-metered', async () => {
-    // The llmClients factories fire recordUsage only — a ledger row, no charge.
-    // With persistence no longer charging, skipping the meter here would have let
-    // Emma-on-Azure spend for free. The client must be asked for un-metered, or
-    // its factory record plus this meter would write two ledger rows per call.
-    const azureCreate = jest.fn().mockResolvedValue(completion());
-    mockGetAzureClient.mockReturnValue({ chat: { completions: { create: azureCreate } } });
-
-    await generateChatResponse('sess-1', 'Hello', {
-      portalType: 'customer',
-      userId: 'user-1',
-    } as never);
-
-    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
-    expect(mockMeterUserUsage.mock.calls[0][0]).toMatchObject({
-      userId: 'user-1',
-      feature: 'chat',
-      provider: 'azure-openai',
+      model: 'gpt-5.4',
     });
-    // Third arg is the overrides object carrying the metered:false opt-out.
-    expect((mockGetAzureClient.mock.calls[0] as unknown[])[2]).toMatchObject({ metered: false });
-  });
-});
 
-describe('ENG-1134: nothing to meter means nothing is charged', () => {
-  it('does not meter a response that carries no usage block', async () => {
-    // A provider can answer without usage (streaming edge cases, truncated
-    // responses). Metering a missing block would charge zero tokens at zero cost
-    // and write a meaningless ledger row on every such call.
-    mockBedrockCreate.mockResolvedValue({
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockCallLLM).toHaveBeenCalledWith(
+      'gpt-5.4',
+      expect.any(Array),
+      expect.objectContaining({
+        taskClass: 'interactive_chat',
+        usageContext: { userId: 'user-1', sessionId: 'sess-1', feature: 'chat' },
+      }),
+    );
+  });
+
+  it('does not instantiate an Azure chat client beside callLLM', async () => {
+    await generateChatResponse('sess-1', 'Hello', {
+      portalType: 'customer',
+      userId: 'user-1',
+      model: 'gpt-5.4',
+    });
+
+    expect(mockGetAzureClient).not.toHaveBeenCalled();
+  });
+
+  it('still delegates responses with no usage block; callLLM owns the fail-open meter', async () => {
+    mockCallLLM.mockResolvedValue({
+      id: 'completion-no-usage',
       choices: [{ message: { role: 'assistant', content: 'Hi', tool_calls: null } }],
-      model: 'test-model',
+      model: 'openai/gpt-5.4',
     });
 
-    await generateChatResponse('sess-1', 'Hello', {
+    const result = await generateChatResponse('sess-1', 'Hello', {
       portalType: 'customer',
       userId: 'user-1',
-      model: 'anthropic.claude-sonnet-4-6',
-    } as never);
+      model: 'gpt-5.4',
+    });
 
-    expect(mockMeterUserUsage).not.toHaveBeenCalled();
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(typeof result === 'string' ? result : result.content).toBe('Hi');
   });
 });
