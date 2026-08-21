@@ -75,7 +75,7 @@ function makeLLMResponse(text = 'Done.') {
   };
 }
 
-async function capture(session: any, schedule: any) {
+async function capture(session: any, schedule: any, captureOptions?: (options: any) => void) {
   const service = new AgentModeService();
   mockDeps(session, schedule);
 
@@ -84,7 +84,10 @@ async function capture(session: any, schedule: any) {
   // reference afterwards inspects a mutated array, not what the model was sent.
   let sent: any[] = [];
   jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
-    if (!sent.length) sent = (args[1] as any[]).map(m => ({ role: m.role, content: m.content }));
+    if (!sent.length) {
+      sent = (args[1] as any[]).map(m => ({ role: m.role, content: m.content }));
+      captureOptions?.(args[2]);
+    }
     return makeLLMResponse();
   });
 
@@ -212,5 +215,21 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
       (m: any) => typeof m.content === 'string' && m.content.includes('pre-authorized to publish')
     );
     expect(anyPublishBlock).toBe(false);
+  });
+
+  it('keeps scheduled/background runs out of the interactive OpenRouter canary', async () => {
+    let options: any;
+    await capture(ADMITTED_SESSION, { scheduleId: SCHEDULE_ID }, (value) => { options = value; });
+    expect(options.taskClass).toBeUndefined();
+  });
+
+  it('labels a regular customer run as interactive for the OpenRouter canary', async () => {
+    let options: any;
+    await capture(
+      { sessionId: 'sess-2', sessionType: 'regular', messages: [], associatedSkills: null },
+      { scheduleId: SCHEDULE_ID },
+      (value) => { options = value; },
+    );
+    expect(options.taskClass).toBe('interactive_chat');
   });
 });
