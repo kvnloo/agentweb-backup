@@ -81,6 +81,34 @@ fail() {
 # invent a pipeline that does not exist.
 logical_lines() {
   awk '
+    BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34) }
+
+    # A heredoc delimiter is a shell WORD, not an identifier: quoting is legal,
+    # and so are characters like `-` and `.`, so `<<` followed by a quoted
+    # `fixture-data` is a valid opener. An identifier-only pattern read that as
+    # `fixture`; the body then never met its terminator, in_heredoc stayed set,
+    # and EVERY REMAINING LINE OF THE FILE WAS SKIPPED — the detector reported
+    # a file clean while a real hazard sat below the heredoc. Raised by
+    # CodeRabbit on #2541, reproduced before fixing. Parsed, not pattern-matched.
+    function heredoc_delim_of(s,   p, rest, q, e, d) {
+      p = index(s, "<<")
+      if (p == 0) return ""
+      rest = substr(s, p + 2)
+      if (substr(rest, 1, 1) == "<") return ""      # <<< is a here-string
+      sub(/^-/, "", rest)                           # <<- strips leading tabs
+      sub(/^[[:space:]]+/, "", rest)
+      q = substr(rest, 1, 1)
+      if (q == SQ || q == DQ) {                     # quoted: delimiter is verbatim
+        e = index(substr(rest, 2), q)
+        if (e == 0) return ""
+        return substr(rest, 2, e - 1)
+      }
+      d = rest                                      # unquoted: ends at whitespace
+      sub(/[[:space:]].*$/, "", d)                  # or at an operator
+      sub(/[;&|<>()].*$/, "", d)
+      return d
+    }
+
     {
       line = $0
       sub(/[[:space:]]+$/, "", line)
@@ -127,12 +155,9 @@ logical_lines() {
       buf = ""
     }
     {
-      if (!in_heredoc && match($0, /<<-?[[:space:]]*['"'"'"]?[A-Za-z_][A-Za-z0-9_]*['"'"'"]?/)) {
-        d = substr($0, RSTART, RLENGTH)
-        sub(/^<<-?[[:space:]]*/, "", d)
-        gsub(/['"'"'"]/, "", d)
-        heredoc_delim = d
-        in_heredoc = 1
+      if (!in_heredoc) {
+        d = heredoc_delim_of($0)
+        if (d != "") { heredoc_delim = d; in_heredoc = 1 }
       }
     }
     END { if (buf != "") print start ":" buf }
@@ -279,6 +304,10 @@ if printf '%s' "${content}" | grep -e "${needle}" -q; then :; fi
 if printf '%s' "${content}" | grep --quiet "${needle}"; then :; fi
 if printf '%s' "${content}" | grep --silent "${needle}"; then :; fi
 if printf '%s' "${content}" | grep -sq "${needle}"; then :; fi
+cat >"${tmp}" <<'fixture-data'
+printf '%s' "ignored, this is heredoc DATA" | grep -qF "x"
+fixture-data
+if printf '%s' "${content}" | grep -qE "${needle}"; then :; fi
 PROBE
 # `|| n=0` would reintroduce exactly the masking removed from the scan above:
 # `grep -c` exits 1 for "no matches", so the fallback cannot tell that from a
@@ -290,10 +319,10 @@ if probe_norm="$(normalise "${probe}")"; then
 else
   n_flagged='normalisation-failed'
 fi
-if [ "${n_flagged}" = "9" ]; then
+if [ "${n_flagged}" = "10" ]; then
   pass "the rule actually detects the shape it exists to ban"
 else
-  fail "the detector flagged ${n_flagged} of 9 known-bad pipelines." \
+  fail "the detector flagged ${n_flagged} of 10 known-bad pipelines." \
        "The probe carries -qF, -Fxq and 'head -n 1' precisely because an" \
        "earlier expression anchored the q at the end of the flag group and" \
        "matched none of them, reporting every file clean. A detector that" \
@@ -302,7 +331,10 @@ else
        "the second escaped the detector entirely before normalisation." \
        "The last two are 'grep -e X -q' and 'grep --quiet': the quiet flag" \
        "is not always the final option token, and --quiet/--silent are the" \
-       "same flag spelled long. All of them still exit on first match."
+       "same flag spelled long. All of them still exit on first match." \
+       "The last sits AFTER a heredoc whose delimiter is not an identifier:" \
+       "mis-parse that terminator and the rest of the file is skipped, so a" \
+       "missing tenth hit means the scanner went blind rather than clean."
 fi
 
 # A detector that over-reports is not "safe by default" — it makes the check
