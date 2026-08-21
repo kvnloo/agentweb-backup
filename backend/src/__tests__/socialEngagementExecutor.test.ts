@@ -1,5 +1,3 @@
-import { SocialEngagementExecutor, SocialEngagementTimerScheduler, sanitizeGeneratedComment } from '../cron/socialEngagementExecutor';
-
 // ─── Mock all external dependencies ─────────────────────────────────────────
 
 jest.mock('../services/db', () => ({
@@ -29,9 +27,15 @@ jest.mock('../services/adapters/linkedInAdapter', () => ({
   })),
 }));
 
+const mockGetGeminiClient = jest.fn();
+const mockCallLLM = jest.fn(async (model: string, messages: unknown[], options: Record<string, any> = {}) => {
+  const client = await mockGetGeminiClient();
+  return client.chat.completions.create({ model, messages, ...options });
+});
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getGeminiClient: jest.fn(),
+    getGeminiClient: mockGetGeminiClient,
+    callLLM: mockCallLLM,
   },
 }));
 
@@ -55,6 +59,7 @@ jest.mock('../utils/cronJobRegistry', () => ({
 import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { agentModeService } from '../services/agentModeService';
+import { SocialEngagementExecutor, SocialEngagementTimerScheduler, sanitizeGeneratedComment } from '../cron/socialEngagementExecutor';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;

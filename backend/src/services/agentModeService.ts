@@ -8,6 +8,12 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { buildWorkPlanInputRequest } from './agentMode/core/workPlanInputRequest';
+import {
+  decideWorkPlanTurnDisposition,
+  snapshotWorkPlanTurn,
+  type WorkPlanTurnDisposition,
+} from './agentMode/core/workPlanTurnDisposition';
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
@@ -23,7 +29,11 @@ import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFa
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
-import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import {
+  createGeminiNativeClient,
+  normalizeProviderRequestTimeoutMs,
+  sanitizeGeminiSchema,
+} from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -103,6 +113,12 @@ import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import {
+  applyOpenRouterCacheBreakpoints,
+  isOpenRouterGatewayEnabledForTaskClass,
+  resolveOpenRouterUpstreamModelId,
+  type GatewayTaskClass,
+} from '../utils/openRouterGatewayContract';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -388,15 +404,6 @@ import {
   META_GOAL_BID_STRATEGY_MAP,
   META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
-
-// Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
-// Used for updateEmailDraftForLead to match generateBlogContent pattern
-const openai = new OpenAI({
-  apiKey: process.env.AZURE_OPENAI_API_KEY,
-  baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-  defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION },
-  defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-});
 
 /**
  * Self-learning loop telemetry for agent-mode tool calls.
@@ -826,6 +833,8 @@ interface LLMModelConfig {
   maxTools?: number;
   /** True to restrict model to admin users only */
   adminOnly?: boolean;
+  /** Internal workload model: callable by services but never selectable in the customer picker. */
+  internalOnly?: boolean;
   /**
    * Usage/cost tier for the model picker UI. Only used as a fallback when
    * getModelPrice() has no entry for this model — otherwise the picker's
@@ -991,6 +1000,8 @@ const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
 interface LLMCallOptions {
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
+  /** Execute search through OpenRouter's provider-independent server tool. */
+  webSearch?: boolean;
   max_completion_tokens?: number | null;
   temperature?: number | null;
   response_format?: { type: 'text' | 'json_object' } | null;
@@ -1014,6 +1025,66 @@ interface LLMCallOptions {
    * behaviour instead of silently buying the 2x rate.
    */
   humanPaced?: boolean;
+  /** Stable product taxonomy used by the reversible OpenRouter cutover canary. */
+  taskClass?: GatewayTaskClass;
+  /** Per-request transport deadline for bounded background and judge calls. */
+  timeoutMs?: number;
+  /** Ordered logical model fallbacks executed by OpenRouter, never by AgentWeb. */
+  fallbackModels?: string[];
+}
+
+function nonNegativeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.round(value))
+    : 0;
+}
+
+/**
+ * Convert an OpenAI-compatible usage object into the ledger's disjoint token
+ * dimensions. OpenRouter follows OpenAI's contract: `prompt_tokens` includes
+ * cache reads/writes and `prompt_tokens_details` identifies those subsets. Our
+ * ledger prices uncached input, cache reads, and cache writes separately, so
+ * forwarding the inclusive prompt total double-counts the cached portion.
+ *
+ * Provider-native Bedrock/Vertex adapters already report uncached input and
+ * cache reads as disjoint counters; their existing semantics stay unchanged.
+ * External counters are finite/non-negative and the OpenRouter cache subset is
+ * bounded by its prompt total so malformed provider data cannot inflate usage.
+ */
+function normalizeCallUsageTokens(usage: any, provider: string): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+} {
+  const promptTokens = nonNegativeTokenCount(usage?.prompt_tokens);
+  const outputTokens = nonNegativeTokenCount(usage?.completion_tokens);
+  const providerCacheReadTokens = nonNegativeTokenCount(usage?.cache_read_input_tokens);
+  const openAiCacheReadTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cached_tokens);
+  const reportedCacheReadTokens = providerCacheReadTokens || openAiCacheReadTokens;
+  const providerCacheWriteTokens = nonNegativeTokenCount(usage?.cache_creation_input_tokens);
+  const openAiCacheWriteTokens = nonNegativeTokenCount(usage?.prompt_tokens_details?.cache_write_tokens);
+
+  if (provider !== 'openrouter') {
+    return {
+      inputTokens: promptTokens,
+      outputTokens,
+      cacheReadTokens: reportedCacheReadTokens,
+      cacheWriteTokens: providerCacheWriteTokens,
+    };
+  }
+
+  const cacheReadTokens = Math.min(promptTokens, reportedCacheReadTokens);
+  const remainingPromptTokens = promptTokens - cacheReadTokens;
+  const reportedCacheWriteTokens = providerCacheWriteTokens || openAiCacheWriteTokens;
+  const cacheWriteTokens = Math.min(remainingPromptTokens, reportedCacheWriteTokens);
+
+  return {
+    inputTokens: remainingPromptTokens - cacheWriteTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  };
 }
 
 // Diagnosis agent configuration
@@ -1050,6 +1121,7 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-opus-4-8': 'anthropic.claude-opus-4-8',
   'gpt-5-chat-2': 'gpt-5.5',
   'gpt-5.2-chat': 'gpt-5.5',
+  'gemini-2.5-flash': 'gemini-3.1-flash-lite',
 };
 
 // Context passed to the diagnosis agent when the main agent fails
@@ -2076,6 +2148,10 @@ export class AgentModeService {
         this.openrouter_client = new OpenAI({
           apiKey: openRouterApiKey.trim(),
           baseURL: 'https://openrouter.ai/api/v1',
+          // OpenRouter owns provider retry/fallback. SDK retries here would
+          // multiply with the gateway's own routing attempts.
+          maxRetries: 0,
+          timeout: 5 * 60 * 1000,
           defaultHeaders: {
             'HTTP-Referer': 'https://app.agentweb.pro',
             'X-Title': 'AgentWeb',
@@ -2148,7 +2224,7 @@ export class AgentModeService {
           _projectId: projectId,
           chat: {
             completions: {
-              create: async (params: any) => {
+              create: async (params: any, requestOptions?: { timeout?: number }) => {
                 const token = await auth.getAccessToken();
                 const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
 
@@ -2224,7 +2300,13 @@ export class AgentModeService {
                 }
 
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+                const timeout = setTimeout(
+                  () => controller.abort(),
+                  normalizeProviderRequestTimeoutMs(
+                    requestOptions?.timeout,
+                    VERTEX_REQUEST_TIMEOUT_MS,
+                  ),
+                );
                 let response: Response;
                 try {
                   response = await fetch(url, {
@@ -2389,7 +2471,6 @@ export class AgentModeService {
         authSchemePreference: ['httpBearerAuth'],
         requestHandler: {
           connectionTimeout: 10_000,
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     } else {
@@ -2407,7 +2488,6 @@ export class AgentModeService {
         } : undefined,
         requestHandler: {
           connectionTimeout: 10_000, // 10s to establish connection
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     }
@@ -2431,7 +2511,7 @@ export class AgentModeService {
     return {
       chat: {
         completions: {
-          create: async (params: any) => {
+          create: async (params: any, requestOptions?: { timeout?: number }) => {
             // Convert OpenAI messages to Bedrock Converse format
             const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
 
@@ -2490,7 +2570,10 @@ export class AgentModeService {
             });
 
             const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+              abortSignal: AbortSignal.timeout(normalizeProviderRequestTimeoutMs(
+                requestOptions?.timeout,
+                BEDROCK_REQUEST_TIMEOUT_MS,
+              )),
             });
 
             // Extract response content
@@ -3035,10 +3118,15 @@ export class AgentModeService {
     // default-visible pick regardless of how they benchmark).
     // resolveGenerationModel/resolveFallbackModel are untouched — an
     // existing session or schedule pinned to either id is unaffected.
-    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Google accepts at most 128 function declarations per request. This limit
+    // applies whether Gemini is reached directly or through OpenRouter: the
+    // gateway can fail over transports, but it cannot make an invalid upstream
+    // request valid. Fresh Emma sidebar sessions expose the legacy full tool
+    // catalog, so omitting this cap made Gemini fail deterministically with 400.
+    'gemini-3-flash-preview': { name: 'Gemini 3 Flash (Preview)', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 28, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-pro-preview': { name: 'Gemini 3.1 Pro (Preview)', provider: 'google', tier: 'medium', description: 'Google\'s capable general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 48, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.1-flash-lite': { name: 'Gemini 3.1 Flash Lite', provider: 'google', tier: 'ultra_cheap', description: 'Google\'s lightest, fastest model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 26, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gemini-3.5-flash': { name: 'Gemini 3.5 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // 2026-08-19: Gemini 3.7 Flash (GA, released 2026-08-13) added — verified
     // live against three independent sources (ai.google.dev/deepmind.google/
     // blog.google, OpenRouter, Artificial Analysis), no Gemini 3.7 Pro or
@@ -3050,7 +3138,7 @@ export class AgentModeService {
     // dominance rule do its job: 3.7 Flash is both cheaper (cost tier 'cheap'
     // vs 3.5's 'medium') and higher quality (56 vs 52) than 3.5 Flash, so 3.5
     // Flash is now correctly auto-flagged legacy.
-    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
+    'gemini-3.7-flash': { name: 'Gemini 3.7 Flash', family: 'gemini-flash', provider: 'google', tier: 'cheap', description: 'Fast, inexpensive Google model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, "gemini-3-7-flash" (high reasoning effort — the canonical/default page), snapshot 2026-08-19' },
     // Gemini Live voice model — uses persistent WebSocket via liveVoiceService (no vision)
     'gemini-3.1-flash-live-preview': { client: null, supportsTemperature: false, isLive: true },
     // ENG-9: OpenRouter models — id is `openrouter/<upstream-provider>/<upstream-model>`,
@@ -3080,6 +3168,10 @@ export class AgentModeService {
     //   to non-OpenRouter adminOnly entries elsewhere in this registry (e.g.
     //   anthropic.claude-opus-4-6-v1), which are gated for unrelated reasons.
     'openrouter/openai/gpt-4o-mini': { name: 'GPT-4o Mini', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Legacy lightweight model', client: null, supportsTemperature: true , qualityScore: 7, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    // Workload-specific research agent. It is intentionally callable only from
+    // DeepResearchService, not exposed as a general chat-picker model.
+    'openrouter/perplexity/sonar-deep-research': { client: null, supportsTemperature: true, internalOnly: true },
+    'openrouter/perplexity/sonar-pro-search': { client: null, supportsTemperature: true, internalOnly: true },
     // 2026-08-17 (fourth pass — quality cleanup, not additive): six entries added
     // in the third pass are REMOVED here on Artificial-Analysis benchmark evidence
     // (cited in the ENG-9 PR, not repeated per-line here): grok-4.3 (AA-flagged
@@ -3166,7 +3258,9 @@ export class AgentModeService {
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
-    const models = Object.keys(this.llmModels).filter(m => isAdmin || !this.llmModels[m].adminOnly);
+    const models = Object.keys(this.llmModels).filter(
+      m => !this.llmModels[m].internalOnly && (isAdmin || !this.llmModels[m].adminOnly),
+    );
     const defaultModel = await this.getDefaultModel();
     // Put the default model first so frontends that use [0] pick the right one
     if (defaultModel && models.includes(defaultModel)) {
@@ -3355,23 +3449,85 @@ export class AgentModeService {
     const {
       tools = null,
       tool_choice = null,
+      webSearch = false,
       max_completion_tokens = null,
       temperature = null,
-      response_format = { type: "text" },
+      response_format = null,
       usageContext = null,
-      humanPaced = false
+      humanPaced = false,
+      taskClass,
+      timeoutMs,
+      fallbackModels,
     } = options || {};
 
-    // `openrouter/` is our internal routing namespace. OpenRouter's API only
-    // accepts the upstream provider/model suffix (for example `z-ai/glm-5.2`).
-    const upstreamModel = model.startsWith('openrouter/')
-      ? model.slice('openrouter/'.length)
+    // Explicit openrouter/* models and provider-independent server tools always
+    // use the gateway. Other logical IDs move when their task-class canary is on.
+    const useOpenRouterGateway = webSearch || model.startsWith('openrouter/') ||
+      isOpenRouterGatewayEnabledForTaskClass(taskClass);
+    const upstreamModel = useOpenRouterGateway
+      ? resolveOpenRouterUpstreamModelId(model)
       : model;
     const params: any = {
       model: upstreamModel,
       messages: messages,
-      response_format: response_format || { type: "text" },
     };
+    // Provider-native clients keep their historical explicit text default.
+    // On OpenRouter, omit that no-op field unless a caller actually requests
+    // structured JSON: require_parameters must not exclude a model such as
+    // Sonar Deep Research merely because it does not advertise response_format.
+    if (!useOpenRouterGateway || response_format) {
+      params.response_format = response_format || { type: 'text' };
+    }
+
+    if (useOpenRouterGateway) {
+      // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
+      // compatibility for migrated calls.
+      params.provider = { allow_fallbacks: true, require_parameters: true };
+      // OpenRouter reports its own billed amount as zero for BYOK requests even
+      // though Bedrock/Vertex still bill the underlying inference. Request the
+      // routing flag so metering can distinguish BYOK from a genuinely free
+      // OpenRouter call and fall back to our provider price book when needed.
+      params.usage = { include: true };
+      // OpenRouter applies this managed transform only when a request exceeds
+      // the selected model's context window. One gateway-level opt-in keeps
+      // smaller-context selectable models usable without rebuilding prompt
+      // truncation or provider-specific fallback logic in AgentWeb.
+      params.plugins = [{ id: 'context-compression' }];
+      if (fallbackModels?.length) {
+        params.models = fallbackModels.map((fallbackModel) => {
+          const normalizedFallback = this.normalizeModelId(fallbackModel);
+          if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
+            throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
+          }
+          return resolveOpenRouterUpstreamModelId(normalizedFallback);
+        });
+      } else {
+        // Compression can still leave a request above a small primary model's
+        // context limit. Keep failover inside OpenRouter: a cheap 1M-context
+        // text/tool model for normal calls, or a multimodal 1M-context model
+        // when any message contains an image. Explicit caller fallbacks above
+        // remain authoritative.
+        const hasImageInput = messages.some((message: any) =>
+          Array.isArray(message?.content) && message.content.some((part: any) =>
+            part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
+          )
+        );
+        const managedFallbackId = hasImageInput
+          ? 'gemini-3.5-flash'
+          : 'openrouter/deepseek/deepseek-v4-flash';
+        const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
+        if (upstreamModel !== managedFallback) params.models = [managedFallback];
+      }
+      if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
+        params.session_id = usageContext.sessionId;
+      }
+      if (upstreamModel.startsWith('anthropic/')) {
+        // Explicit content-block breakpoints retain OpenRouter's full Anthropic,
+        // Bedrock, and Vertex fallback pool. Its top-level automatic cache flag
+        // would silently restrict this request to Anthropic first-party only.
+        params.messages = applyOpenRouterCacheBreakpoints(messages, humanPaced);
+      }
+    }
 
     // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
     // off `params` and never forwards it to ConverseCommand. Set ONLY for
@@ -3379,29 +3535,75 @@ export class AgentModeService {
     // `client.chat.completions.create()` for every provider, and the OpenAI SDK
     // forwards unknown body fields to the API — Azure OpenAI rejects an
     // unrecognised argument with a 400, which would break every GPT turn.
-    if (model.startsWith('anthropic.')) {
+    if (!useOpenRouterGateway && model.startsWith('anthropic.')) {
       params.humanPaced = humanPaced;
     }
 
-    // Only add tools and tool_choice if tools are provided
-    if (tools && tools.length > 0) {
+    // Function tools and OpenRouter server tools share one wire-level array.
+    // Server-side web search forces the gateway above and must not be run by a
+    // provider-native adapter, which is the final ENG-1432 dual-path removal.
+    const callerTools = tools && tools.length > 0 ? tools : [];
+    let boundedTools = callerTools;
+    if (callerTools.length > 0) {
       const maxTools = this.llmModels[model].maxTools;
-      if (maxTools && tools.length > maxTools) {
-        console.warn(`AgentMode: callLLM truncating tools for model "${model}": ${tools.length} tools exceeds limit of ${maxTools}. Keeping first ${maxTools}.`);
-        params.tools = tools.slice(0, maxTools);
-      } else {
-        params.tools = tools;
+      const callerToolLimit = typeof maxTools === 'number'
+        ? Math.max(0, maxTools - (webSearch ? 1 : 0))
+        : undefined;
+      if (callerToolLimit !== undefined && callerTools.length > callerToolLimit) {
+        console.warn(
+          `AgentMode: callLLM truncating tools for model "${model}": ${callerTools.length} caller tools exceeds limit of ${callerToolLimit}` +
+          `${webSearch ? ' after reserving one web-search slot' : ''}. Keeping first ${callerToolLimit}.`,
+        );
+        boundedTools = callerTools.slice(0, callerToolLimit);
       }
+    }
+    // OpenRouter normalizes the transport, but the selected provider still
+    // validates its own function-declaration schema. Preserve non-function
+    // server tools rather than trying to sanitize a nonexistent `.function`.
+    const normalizedCallerTools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
+      ? boundedTools.map((tool: any) => tool?.type === 'function' ? ({
+          ...tool,
+          function: {
+            ...tool.function,
+            parameters: sanitizeGeminiSchema(tool.function?.parameters) || {
+              type: 'object',
+              properties: {},
+            },
+          },
+        }) : tool)
+      : boundedTools;
+    const requestTools = webSearch
+      ? [...normalizedCallerTools, { type: 'openrouter:web_search' }]
+      : normalizedCallerTools;
+    if (requestTools.length > 0) {
+      params.tools = requestTools;
+    }
+    // A server-only tool is selected by OpenRouter. Preserve the historical
+    // `auto` default only for caller-supplied function tools.
+    if (callerTools.length > 0) {
       params.tool_choice = tool_choice || 'auto';
     }
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
-      params.max_completion_tokens = max_completion_tokens;
+      // OpenRouter normalizes the cross-provider limit as max_tokens. Gemini's
+      // endpoints do not advertise max_completion_tokens, so require_parameters
+      // would correctly reject the old provider-native field.
+      if (useOpenRouterGateway) params.max_tokens = max_completion_tokens;
+      else params.max_completion_tokens = max_completion_tokens;
     }
 
     // Only add temperature if model supports it and value is provided
-    if (this.llmModels[model].supportsTemperature && temperature !== null) {
+    // OpenRouter's live model metadata marks GPT-5.x temperature unsupported,
+    // even though the legacy Azure deployments accepted it. Suppress it only
+    // on the gateway route; the default-off direct path remains unchanged.
+    const gatewaySupportsTemperature = !useOpenRouterGateway ||
+      !upstreamModel.startsWith('openai/gpt-5.');
+    if (
+      this.llmModels[model].supportsTemperature &&
+      gatewaySupportsTemperature &&
+      temperature !== null
+    ) {
       params.temperature = temperature;
     }
 
@@ -3418,9 +3620,19 @@ export class AgentModeService {
     // Bedrock/Vertex client is cached on the registry after its first call,
     // same as an Azure client is pre-populated at construction time, so
     // "client is already set" cannot distinguish the providers).
-    let client = this.llmModels[model].client;
+    let client = useOpenRouterGateway && !model.startsWith('openrouter/')
+      ? null
+      : this.llmModels[model].client;
     let providerLabel: string;
-    if (model.startsWith('gemini-')) {
+    if (useOpenRouterGateway) {
+      providerLabel = 'openrouter';
+      if (!client) {
+        client = await this.getOpenRouterClient();
+        // Existing explicit OpenRouter rows have no direct-provider client to
+        // preserve, so caching the shared client on their registry entry is safe.
+        if (model.startsWith('openrouter/')) this.llmModels[model].client = client;
+      }
+    } else if (model.startsWith('gemini-')) {
       // ENG-737: always the native adapter — no fallback transport, resolved
       // per-call (not cached on the registry).
       client = this.getGeminiNativeClient();
@@ -3437,15 +3649,6 @@ export class AgentModeService {
         client = await this.getVertexClient(model);
         this.llmModels[model].client = client;
       }
-    } else if (model.startsWith('openrouter/')) {
-      // ENG-9: lazy-loaded and cached on the registry, same as Bedrock/Vertex —
-      // must be its own branch, not the azure-openai fallback below, since an
-      // openrouter/* entry is registered with client: null (see llmModels).
-      providerLabel = 'openrouter';
-      if (!client) {
-        client = await this.getOpenRouterClient();
-        this.llmModels[model].client = client;
-      }
     } else {
       providerLabel = 'azure-openai';
       if (!client) {
@@ -3458,11 +3661,16 @@ export class AgentModeService {
     }
 
     // Retry loop with exponential backoff for transient LLM errors (503, 429, timeouts)
-    const maxAttempts = 3;
+    const maxAttempts = useOpenRouterGateway ? 1 : 3;
     const baseDelayMs = 2000;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const res = await client.chat.completions.create(params);
+        const res = await client.chat.completions.create(
+          params,
+          timeoutMs || useOpenRouterGateway
+            ? { timeout: timeoutMs ?? 5 * 60 * 1000, ...(useOpenRouterGateway ? { maxRetries: 0 } : {}) }
+            : undefined,
+        );
         // Shadow usage metering (Ship 1): every client returned above (Azure
         // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
         // wrapper) responds in OpenAI shape, so `res.usage` is the single
@@ -3472,6 +3680,7 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
+            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
             // ENG-200: meter the main agent turn — record shadow burn AND charge
             // the per-user cost cap when a real user is attributable (org members
             // resolve to the owner). Cost (incl. cache tokens) is computed once
@@ -3491,20 +3700,18 @@ export class AgentModeService {
               // the "retries defeat charge dedup" Greptile P1 for the highest-
               // volume metering site in the codebase.
               eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: usage.prompt_tokens || 0,
-              outputTokens: usage.completion_tokens || 0,
-              cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
-              cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+              inputTokens: normalizedUsage.inputTokens,
+              outputTokens: normalizedUsage.outputTokens,
+              cacheReadTokens: normalizedUsage.cacheReadTokens,
+              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
-              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
-              // present, not opt-in) — ground truth from the vendor that actually
-              // billed us, not a static per-token guess our own price table (which
-              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
-              // otherwise have to estimate. Omitted for every other provider, so
-              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              // OpenRouter's cost is authoritative for OpenRouter-billed calls.
+              // BYOK calls report zero because the upstream provider bills us
+              // directly, so omit the override and let the provider price book
+              // calculate economic cost from the returned tokens instead.
               costUsdOverride:
-                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                providerLabel === 'openrouter' && usage.is_byok !== true && typeof usage.cost === 'number'
                   ? usage.cost
                   : undefined,
             });
@@ -3517,7 +3724,7 @@ export class AgentModeService {
         const isLastAttempt = attempt >= maxAttempts;
 
         // Log Gemini-specific errors with more context for debugging
-        if (model.startsWith('gemini-')) {
+        if (providerLabel === 'gemini') {
           console.error(`AgentMode: Gemini API error on attempt ${attempt}/${maxAttempts}:`, {
             model,
             error: error instanceof Error ? error.message : String(error),
@@ -3808,7 +4015,10 @@ export class AgentModeService {
     // preflight gate rejects confirm=true `generate_image` calls that attempt to
     // edit an unapproved source URL.
     approvedRevisionImageSources?: string[],
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
+    // Workplan progression turns must end in persisted structured state rather
+    // than a provider-dependent prose question buried at the end of a response.
+    requireWorkPlanDisposition: boolean = false,
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3917,6 +4127,7 @@ export class AgentModeService {
       const hasAdminAccess = (isAdmin || isDelegatedAccess) && !isInteractiveShare;
 
       const workPlan = currentSession?.workPlan;
+      const workPlanTurnBefore = snapshotWorkPlanTurn(currentSession);
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
@@ -4330,6 +4541,8 @@ export class AgentModeService {
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
+      let workPlanDispositionRetries = 0;
+      let workPlanTurnDisposition: WorkPlanTurnDisposition | undefined;
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
@@ -4590,13 +4803,21 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        const chatTaskClass: GatewayTaskClass = isScheduledSession
+          ? 'scheduled_background'
+          : 'interactive_chat';
+        const providerForChatRoute = (logicalModel: string): string =>
+          logicalModel.startsWith('openrouter/') ||
+          isOpenRouterGatewayEnabledForTaskClass(chatTaskClass)
+            ? 'openrouter'
+            : providerForModel(logicalModel);
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
         const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
           [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
           [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
-          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForChatRoute(llmModel),
           [ATTR_SESSION_ID]: sessionId,
         });
         try {
@@ -4622,7 +4843,10 @@ export class AgentModeService {
             // answer "what is my scheduled work costing me".
             usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
             // ENG-893: only the interactive conversation loop waits on a human.
-            humanPaced: humanPacedTurn
+            humanPaced: humanPacedTurn,
+            // Scheduled and interactive conversations canary independently;
+            // OpenRouter owns provider fallback once either class is enabled.
+            taskClass: chatTaskClass,
           });
         } catch (callError) {
           // ENG-907: the backup-model retry below issues a SECOND full call of the same
@@ -4700,7 +4924,8 @@ export class AgentModeService {
                 // retry of a scheduled run is still scheduled spend.
                 usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
                 // ENG-893: same pacing as the primary call it is retrying.
-                humanPaced: humanPacedTurn
+                humanPaced: humanPacedTurn,
+                taskClass: chatTaskClass,
               }), synthesisRetryDeadlineMs);
               if (response === SYNTHESIS_RETRY_TIMED_OUT) {
                 console.warn(
@@ -4721,7 +4946,12 @@ export class AgentModeService {
             throw callError;
           }
         } finally {
-          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
+          endChatSpan(chatSpan, {
+            model: llmModel,
+            provider: providerForChatRoute(llmModel),
+            response,
+            inputMessages: trimmedMessages,
+          });
         }
         // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
         // loop instead of raising — the caller is milliseconds from its cap, and an
@@ -4969,6 +5199,51 @@ export class AgentModeService {
               }
             }
             if (responseMessage) responseMessage.content = content;
+          }
+
+          if (requireWorkPlanDisposition) {
+            const latestSession = await chatbotDb.getChatSession(sessionId, true);
+            workPlanTurnDisposition = decideWorkPlanTurnDisposition({
+              before: workPlanTurnBefore,
+              after: snapshotWorkPlanTurn(latestSession),
+              failed: finishReason === 'content_filter'
+                || stopReason === 'guardrail_intervened'
+                || stopReason === 'content_filtered',
+            });
+
+            if (workPlanTurnDisposition.kind === 'invalid') {
+              if (workPlanDispositionRetries < 1 && !timeBudgetBlocksContinuation) {
+                workPlanDispositionRetries += 1;
+                // The invalid assistant turn has not been checkpointed yet. Remove it
+                // before the next iteration so neither the model nor the customer sees
+                // the wall of prose that failed the structured contract.
+                if ((messages as any[])[messages.length - 1] === responseMessage) {
+                  (messages as any[]).pop();
+                }
+                content = '';
+                responseMessage = null;
+                (messages as any[]).push({
+                  role: 'system',
+                  content: '[SYSTEM — workplan control recovery, internal instruction, not from the user] This workplan progression turn cannot end with a prose-only question or a “Next Step” paragraph. Continue the work and call set_work_plan_status when the current step is complete, or call ask_user_question for the one blocking choice. Do not repeat the prior recap.',
+                });
+                console.warn(`AgentMode: workplan turn missing structured disposition in session ${sessionId}; retrying once`);
+                continue;
+              }
+
+              const retryMessage = 'I couldn’t create the decision card needed to continue this step. Please retry.';
+              content = retryMessage;
+              if (responseMessage) {
+                responseMessage.content = retryMessage;
+                responseMessage.metadata = {
+                  ...responseMessage.metadata,
+                  workPlanDispositionFailure: {
+                    code: workPlanTurnDisposition.code,
+                    retryable: true,
+                  },
+                };
+              }
+              console.error(`AgentMode: workplan turn missing structured disposition after recovery in session ${sessionId}`);
+            }
           }
 
           // Log the stop reason for debugging
@@ -5493,6 +5768,7 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -14032,10 +14308,9 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
-      // Call LLM to generate email using direct chat completion (same as generateBlogContent)
-      const completion = await openai.chat.completions.create({
-        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
-        messages: [
+      const completion = await this.callLLM(
+        process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+        [
           {
             role: "system",
             content: emailDraftFormat === 'text'
@@ -14044,24 +14319,14 @@ ${emailDraftFormat === 'text'
           },
           { role: "user", content: emailPrompt },
         ],
+        {
         temperature: 0.8,
-        max_tokens: 3000,
-        response_format: { type: 'json_object' }
-      });
-
-      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
-      if ((completion as any)?.usage) {
-        meterUsageFromResponse(
-          {
-            userId,
-            sessionId,
-            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
-            provider: 'azure-openai',
-            feature: 'email_draft',
-          },
-          completion
-        );
-      }
+          max_completion_tokens: 3000,
+          response_format: { type: 'json_object' },
+          usageContext: { userId, sessionId, feature: 'email_draft' },
+          taskClass: 'content_generation',
+        },
+      );
 
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
@@ -14154,22 +14419,14 @@ Good: "Sarah, Island's browser-isolation is one of the smarter takes on shadow I
 
 Reply with ONLY valid JSON: {"content": "the note text"}`;
 
-      // Use Gemini for message drafting (fast, cost-effective)
-      const geminiClient = await this.getGeminiClient();
-      const messageCompletion = await geminiClient.chat.completions.create({
-        model: 'gemini-3.5-flash',
-        messages: [{ role: "user", content: messagePrompt }],
+      const messageCompletion = await this.callLLM('gemini-3.5-flash', [
+        { role: 'user', content: messagePrompt },
+      ], {
         temperature: 0.8,
-        max_tokens: 2048,
-      } as any);
-
-      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-      if ((messageCompletion as any)?.usage) {
-        meterUsageFromResponse(
-          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
-          messageCompletion
-        );
-      }
+        max_completion_tokens: 2048,
+        usageContext: { userId, sessionId, feature: 'invite_message' },
+        taskClass: 'content_generation',
+      });
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
@@ -14205,7 +14462,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
+          noteText = await shortenInviteNoteToLimit(this, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -15814,7 +16071,7 @@ Write it like a task name: "Competitive Analysis Report", "SaaS Product Launch A
 Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference content quality.`
         },
         { role: 'user', content: userMessage.slice(0, 500) }
-      ], { response_format: { type: 'json_object' } });
+      ], { response_format: { type: 'json_object' }, taskClass: 'interactive_chat' });
       // response_format: json_object forces Gemini/GPT to output valid JSON.
       // For Bedrock (Claude), response_format is ignored but the prompt instruction is sufficient.
       // No max_completion_tokens — Gemini treats it as total (input+output) tokens, causing empty
@@ -15909,6 +16166,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 200,
         temperature: 0.3,
+        taskClass: 'nonstandard_consumer',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -15957,6 +16215,7 @@ TRUTHFULNESS RULES (these override tone):
       ], {
         max_completion_tokens: 20,
         temperature: 0.3,
+        taskClass: 'scheduled_background',
       });
 
       const summary = (response_ as any).choices?.[0]?.message?.content?.trim();
@@ -16020,6 +16279,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 150,
         temperature: 0,
         response_format: { type: 'json_object' },
+        taskClass: 'scheduled_background',
       });
 
       const timeoutPromise = new Promise<null>((resolve) =>
@@ -16079,6 +16339,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
         max_completion_tokens: 120,
         temperature: 0.7,
         response_format: { type: 'text' },
+        taskClass: 'interactive_chat',
       });
 
       const timeoutPromise = new Promise<null>(resolve =>
@@ -16136,7 +16397,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
           + finalText,
       },
-    ], { max_completion_tokens: 500, temperature: 0 });
+    ], { max_completion_tokens: 500, temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16172,7 +16433,7 @@ Return ONLY a JSON object, no other text: {"decision": "proceed" | "skip", "conf
           + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
           + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
       },
-    ], { temperature: 0 });
+    ], { temperature: 0, taskClass: 'nonstandard_consumer' });
 
     const text = (response as any)?.choices?.[0]?.message?.content;
     if (typeof text !== 'string' || !text.trim()) {
@@ -16199,6 +16460,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ], {
         max_completion_tokens: 10,
         temperature: 0,
+        taskClass: 'mcp_api',
       });
 
       const content = (response as any)?.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
@@ -29074,7 +29336,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         ], {
           temperature: 0.1,
           response_format: { type: 'json_object' },
-          max_completion_tokens: maxTokens
+          max_completion_tokens: maxTokens,
+          taskClass: 'content_generation',
         });
 
         const finishReason = substitutionResponse.choices[0].finish_reason;
@@ -30666,6 +30929,25 @@ ${strippedHtml}`;
         workPlan.updatedAt = new Date().toISOString();
         // Update the session (will throw error if stepCount is not sequential)
         await chatbotDb.updateSessionWorkPlan(sessionId, workPlan);
+
+        // A configured input belongs to the step that just became active, not
+        // to a particular portal. Persist the same request the customer portal
+        // renders and an MCP client elicits natively. Answered historical
+        // requests may be replaced; a concurrent live request never is.
+        const nextInputStep = workPlan.steps
+          .sort((a: any, b: any) => a.stepCount - b.stepCount)
+          .find((s: any) => s.status === 'pending' && s.inputRequest);
+        if (nextInputStep?.inputRequest) {
+          await chatbotDb.updateSessionWorkPlanInputRequest(
+            sessionId,
+            buildWorkPlanInputRequest({
+              ...nextInputStep.inputRequest,
+              requestId: uuidv4(),
+              stepCount: nextInputStep.stepCount,
+            }),
+            { failIfAwaitingExists: true },
+          );
+        }
 
         // Update function counts if they were modified
         if (countsModified) {
@@ -34657,8 +34939,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
       if (llmTitles.length > 0) {
         try {
-          const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, this, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
@@ -35050,11 +35331,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         const { buildClickConversion } = await import('../utils/googleAdsOfflineConversions');
         /*
-         * The account's own time zone, read from Google rather than assumed. Google
-         * interprets the timestamp in it, so guessing UTC would silently shift every
-         * conversion by the account's real offset — and the only symptom is conversions
-         * landing on the wrong day, which nobody reads as a bug.
+         * Validate BEFORE resolving the time zone. getAccountTimeZone is a live Google
+         * call, so doing it first meant a future-dated timestamp or a value with no
+         * currency — both refusable locally — still cost a network round trip before
+         * being rejected. On a background sweep that is a request per bad row.
+         *
+         * The zone is only needed to FORMAT a conversion we have already accepted, so a
+         * throwaway placeholder validates everything else first. UTC is safe here purely
+         * because the result is discarded; the real formatting below uses the account's
+         * own zone, and getting that wrong would shift every conversion by the real
+         * offset with no symptom beyond conversions landing on the wrong day.
          */
+        const validateOnlyArgs = {
+          gclid: args.gclid,
+          conversionActionResourceName: args.conversion_action_resource_name,
+          conversionAt: new Date(args.conversion_at),
+          value: args.conversion_value,
+          currencyCode: args.currency_code,
+          orderId: args.order_id,
+        };
+        try {
+          buildClickConversion({ ...validateOnlyArgs, timeZone: 'UTC' });
+        } catch (err: any) {
+          return { success: false, error: err?.message || 'Invalid offline conversion.' };
+        }
+
         const tz = args.time_zone || await googleAdsService.getAccountTimeZone(userId, customer_id);
         let conversion: Record<string, unknown>;
         try {
@@ -35286,11 +35587,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
           // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
           // lookup failure must NOT break an otherwise-valid ad creation.
+          // ENG-1358: adding a creative to an already-ENABLED campaign is a launch too. The
+          // gate already computes the warning; relaying it here is what stops it being
+          // computed and discarded — the exact failure this ticket's own comment names.
+          let creativeTrackingWarning: string | undefined;
           try {
             const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
             if (parent) {
               const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
               if (!gate.proceed) return gate.blockResult;
+              creativeTrackingWarning = gate.warning;
             }
           } catch (gateErr) {
             console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
@@ -35306,7 +35612,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             finalUrl: args.final_url,
             imageAssetResourceNames: args.image_asset_resource_names,
           });
-          return { success: true, adResourceName: ad.resourceName };
+          return { success: true, adResourceName: ad.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
@@ -35365,10 +35671,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
         // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
         // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        // Same relay as AD CREATE — a PMax asset group on an ENABLED campaign is a launch.
+        let creativeTrackingWarning: string | undefined;
         try {
           const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
           const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
           if (!gate.proceed) return gate.blockResult;
+          creativeTrackingWarning = gate.warning;
         } catch (gateErr) {
           console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
         }
@@ -35384,7 +35693,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           videoAssets: args.video_assets,
           finalUrl: args.final_url,
         });
-        return { success: true, assetGroupResourceName: assetGroup.resourceName };
+        return { success: true, assetGroupResourceName: assetGroup.resourceName, ...(creativeTrackingWarning ? { trackingWarning: creativeTrackingWarning } : {}) };
       }
 
       if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
@@ -35982,19 +36291,19 @@ function parseCompanyFromTitle(title: any): string | null {
 }
 
 /**
- * Tier 3 of company resolution: ONE Gemini Flash call per page that takes the
+ * Tier 3 of company resolution: ONE shared-gateway call per page that takes the
  * full batch of titles and returns a parallel array of company names (or
- * "NONE"). Caller passes the resolved llmClient so the helper stays pure and
+ * "NONE"). Caller passes the gateway seam so the helper stays pure and
  * easily mockable. On any error or response-shape mismatch, returns an
  * all-"NONE" array so callers fall through to Tier 4 (Unipile getProfile).
  */
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
-  llmClient: any,
+  gateway: Pick<AgentModeService, 'callLLM'> | null,
   userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
-  if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
+  if (!gateway?.callLLM) return titles.map(() => 'NONE');
   try {
     const systemPrompt = [
       'You extract company names from professional / LinkedIn titles in batch.',
@@ -36011,24 +36320,19 @@ async function batchParseCompaniesFromTitlesWithLLM(
       '- Use "NONE" (uppercase) when uncertain.',
     ].join('\n');
     const userPrompt = `Titles: ${JSON.stringify(titles)}`;
-    const completion = await llmClient.chat.completions.create({
-      model: 'gemini-2.5-flash',
-      messages: [
+    const completion = await gateway.callLLM(
+      'gemini-3.1-flash-lite',
+      [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_completion_tokens: Math.max(500, titles.length * 30),
-      temperature: 0.1,
-    });
-    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
-    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
-    // until a price row exists) — token visibility is still worth having.
-    if ((completion as any)?.usage) {
-      meterUsageFromResponse(
-        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
-        completion
-      );
-    }
+      {
+        max_completion_tokens: Math.max(500, titles.length * 30),
+        temperature: 0.1,
+        usageContext: { userId, feature: 'title_company_parse' },
+        taskClass: 'nonstandard_consumer',
+      },
+    );
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

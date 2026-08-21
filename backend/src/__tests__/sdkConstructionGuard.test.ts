@@ -71,13 +71,11 @@ function findDirectProviderSdkImports(content: string, fileName = 'source.ts'): 
  * Files allowed to construct SDK clients directly, relative to src/.
  *
  * - utils/llmClients.ts — the metered factory itself (the ONLY long-term home)
- * - utils/llmService.ts — metered internally via usageRecorderService
- * - temporary migration inventory entries name their owning slice and are not
- *   capability exceptions. They must shrink, never grow, as ENG-1415/1416 land.
+ * - capability exceptions are documented below and must remain non-text or
+ *   independently metered. The list must shrink, never grow, as migrations land.
  */
 const ALLOWLIST = new Set<string>([
   'utils/llmClients.ts',
-  'utils/llmService.ts',
   // ── metered internally (constructions are justified, usage IS recorded) ──
   // agentModeService: every client funnels through callLLM, which has a
   // recordUsage hook — constructions here are metered without the factory.
@@ -90,10 +88,10 @@ const ALLOWLIST = new Set<string>([
   // not per-token — token metering does not apply. Video/image cost is tracked
   // separately (incrementUserTokenUsage cost-only path in agentModeService).
   'services/videoGeneration.ts',
-  // Transitional, inventory-owned direct text routes; not permanent exceptions.
+  // chatbotService constructs Azure's embeddings client for semantic search;
+  // its chat/text generation path routes through AgentModeService.callLLM.
   'services/chatbotService.ts',
   'services/codingAgentService.ts',
-  'loops/instances/ai-eval-funnel/rcaEnricher.ts',
 ]);
 
 const DIRECT_PYTHON_TEXT_PROVIDER_MODULES = [

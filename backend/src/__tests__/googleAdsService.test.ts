@@ -1697,3 +1697,41 @@ describe('createCampaign — PMax with brand guidelines', () => {
     expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
   });
 });
+
+describe('every Google Ads call is bounded by a timeout (CodeRabbit, #2519)', () => {
+  // callApi had none. An axios request without a timeout waits forever on a stalled
+  // connection — which blocks the agent-mode tool call that made it, and on the
+  // offline-conversion path would stall a background sweep with no error anywhere.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '../services/googleAdsService.ts'), 'utf8');
+
+  it('bounds both callApi paths', () => {
+    // Deliberately not an exact count across the file — three more calls were bounded
+    // afterwards, and a fixed number turns every correct addition into a failing test.
+    expect(src).toMatch(/axios\.get\(url, \{ headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS/);
+    expect(src).toMatch(/axios\.post\(url, body, \{ headers, timeout: GOOGLE_ADS_HTTP_TIMEOUT_MS/);
+  });
+
+  it('leaves no bare axios call in callApi', () => {
+    expect(src).not.toMatch(/await axios\.get\(url, \{ headers \}\)/);
+    expect(src).not.toMatch(/await axios\.post\(url, body, \{ headers \}\)/);
+  });
+
+  it('pins the ceiling at exactly 60s', () => {
+    // A range assertion would let a regression to 30s pass silently. 60s is the contract:
+    // generous enough that a slow GAQL read over a large account is not turned into a
+    // spurious failure, which is worse than having no timeout at all.
+    const m = src.match(/const GOOGLE_ADS_HTTP_TIMEOUT_MS = ([0-9_]+);/);
+    expect(m).toBeTruthy();
+    expect(Number(m[1].replace(/_/g, ''))).toBe(60_000);
+  });
+
+  it('leaves NO unbounded axios call anywhere in the service', () => {
+    // callApi was fixed first and three others were missed — refreshAccessToken's OAuth
+    // call, listAccessibleCustomers and geoTargetConstants:suggest. Asserting the class
+    // rather than the instances is what stops the next one.
+    const calls = src.match(/await axios\.(get|post)\(/g) || [];
+    const bounded = src.match(/timeout: (GOOGLE_ADS_HTTP_TIMEOUT_MS|15000)/g) || [];
+    expect(bounded.length).toBeGreaterThanOrEqual(calls.length);
+  });
+});

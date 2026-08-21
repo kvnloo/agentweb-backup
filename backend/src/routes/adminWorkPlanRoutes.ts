@@ -199,6 +199,7 @@ router.put("/:planId", async (req, res) => {
           if (Array.isArray(raw.requiredFunctionCalls)) out.requiredFunctionCalls = norm.requiredFunctionCalls;
           if (Array.isArray(raw.skillIds)) out.skillIds = norm.skillIds;
           if (has('expectedAssetCount')) out.expectedAssetCount = norm.expectedAssetCount;
+          if (has('inputRequest')) out.inputRequest = norm.inputRequest;
           return out;
         });
 

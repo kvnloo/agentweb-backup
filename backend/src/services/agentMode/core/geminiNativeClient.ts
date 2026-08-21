@@ -33,6 +33,18 @@ export interface OpenAIChatParams {
 /** Per-request timeout matching the Vertex/Bedrock adapters (5 min). */
 export const GEMINI_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Keep provider SDKs from interpreting invalid caller deadlines as immediate or unbounded. */
+export function normalizeProviderRequestTimeoutMs(
+  requestedTimeoutMs: unknown,
+  fallbackTimeoutMs: number,
+): number {
+  return typeof requestedTimeoutMs === 'number'
+    && Number.isFinite(requestedTimeoutMs)
+    && requestedTimeoutMs > 0
+    ? requestedTimeoutMs
+    : fallbackTimeoutMs;
+}
+
 export interface GeminiRequestOptions {
   /** maxOutputTokens fallback when the caller does not specify one. */
   defaultMaxTokens: number;
@@ -394,7 +406,12 @@ export function toGeminiRequest(
     maxOutputTokens: params.max_completion_tokens || opts.defaultMaxTokens,
     // Match the 5-min per-request budget of the Vertex/Bedrock adapters instead of
     // inheriting the SDK default (long research turns are exactly where this runs).
-    httpOptions: { timeout: opts.requestTimeoutMs ?? GEMINI_REQUEST_TIMEOUT_MS },
+    httpOptions: {
+      timeout: normalizeProviderRequestTimeoutMs(
+        opts.requestTimeoutMs,
+        GEMINI_REQUEST_TIMEOUT_MS,
+      ),
+    },
   };
   if (systemParts.length > 0) config.systemInstruction = systemParts.join('\n');
   if (params.temperature !== undefined && params.temperature !== null) {
@@ -589,14 +606,17 @@ export interface GeminiNativeClientDeps {
  * gemini branch of callLLM.
  */
 export function createGeminiNativeClient(deps: GeminiNativeClientDeps): {
-  chat: { completions: { create: (params: OpenAIChatParams) => Promise<any> } };
+  chat: { completions: { create: (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => Promise<any> } };
 } {
   return {
     chat: {
       completions: {
-        create: async (params: OpenAIChatParams) => {
+        create: async (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => {
           const client = await deps.getClient();
-          const req = toGeminiRequest(params, { defaultMaxTokens: deps.defaultMaxTokens });
+          const req = toGeminiRequest(params, {
+            defaultMaxTokens: deps.defaultMaxTokens,
+            requestTimeoutMs: requestOptions?.timeout,
+          });
           const resp = await client.models.generateContent(req);
           return fromGeminiResponse(resp);
         },

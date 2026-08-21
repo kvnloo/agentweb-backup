@@ -35,6 +35,30 @@ afterEach(() => {
   __setUsageTelemetrySinkForTests(null);
 });
 
+describe("ENG-1436 — the shown event must carry whether it could be shown", () => {
+  it("keeps `onTrack` through redaction, so the funnel can exclude what was never rendered", async () => {
+    // The panel renders recommendations only when onTrack === false, but this event fires
+    // on every drivers read. 31 of 60 production events in 48h went to accounts that could
+    // not see them. `onTrack` is what makes those rows separable — if the redactor ever
+    // strips it (it is not an economics field, but the guard is name-based), the funnel
+    // silently goes back to being uninterpretable.
+    await recordUsageTelemetry("root-1", USAGE_TELEMETRY_EVENTS.recommendationShown, {
+      onTrack: true,
+      fromModel: "a",
+      toModel: "b",
+      estimatedSavingsMicroUsd: 999,
+    });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].dimensions.onTrack).toBe(true);
+    // And the economics still go, as always. The redactor removes the VALUE and records
+    // the key name in `redactedKeys` — deliberately, so a stripped field is auditable
+    // rather than invisible. So the assertion is on the value, not on the substring.
+    expect(emitted[0].dimensions.estimatedSavingsMicroUsd).toBeUndefined();
+    expect(JSON.stringify(emitted[0])).not.toMatch(/999/);
+    expect(emitted[0].dimensions.redactedKeys).toContain("estimatedSavingsMicroUsd");
+  });
+});
+
 describe("redactInternalEconomics", () => {
   it("strips internal economics from inside ARRAYS, not just nested objects", () => {
     // Raised in review on PR #2407. `walk` descended plain objects only, so an

@@ -14,6 +14,7 @@ import {
   fromGeminiResponse,
   sanitizeGeminiSchema,
   createGeminiNativeClient,
+  GEMINI_REQUEST_TIMEOUT_MS,
   type OpenAIChatParams,
 } from '../geminiNativeClient';
 
@@ -859,6 +860,60 @@ describe('createGeminiNativeClient (end-to-end wiring)', () => {
     // response was translated + thought filtered
     expect(res.choices[0].message.content).toBe('clean answer');
     expect(res.usage.completion_tokens).toBe(10);
+  });
+
+  it('propagates a per-call timeout into the native Gemini request', async () => {
+    const generateContent = jest.fn().mockResolvedValue({ candidates: [] });
+    const client = createGeminiNativeClient({
+      getClient: async () => ({ models: { generateContent } }),
+      defaultMaxTokens: 32000,
+    });
+
+    await client.chat.completions.create({
+      model: 'gemini-3.5-flash',
+      messages: [{ role: 'user', content: 'q' }],
+    }, { timeout: 30 * 60 * 1000 });
+
+    expect(generateContent).toHaveBeenCalledWith(expect.objectContaining({
+      config: expect.objectContaining({ httpOptions: { timeout: 30 * 60 * 1000 } }),
+    }));
+  });
+
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'normalizes invalid per-call timeout %s to the safe default',
+    async (timeout) => {
+      const generateContent = jest.fn().mockResolvedValue({ candidates: [] });
+      const client = createGeminiNativeClient({
+        getClient: async () => ({ models: { generateContent } }),
+        defaultMaxTokens: 32000,
+      });
+
+      await client.chat.completions.create({
+        model: 'gemini-3.5-flash',
+        messages: [{ role: 'user', content: 'q' }],
+      }, { timeout });
+
+      expect(generateContent).toHaveBeenCalledWith(expect.objectContaining({
+        config: expect.objectContaining({
+          httpOptions: { timeout: GEMINI_REQUEST_TIMEOUT_MS },
+        }),
+      }));
+    },
+  );
+
+  it('propagates the native generateContent rejection unchanged', async () => {
+    const providerError = new Error('Gemini deadline exceeded');
+    const client = createGeminiNativeClient({
+      getClient: async () => ({
+        models: { generateContent: jest.fn().mockRejectedValue(providerError) },
+      }),
+      defaultMaxTokens: 32000,
+    });
+
+    await expect(client.chat.completions.create({
+      model: 'gemini-3.5-flash',
+      messages: [{ role: 'user', content: 'q' }],
+    }, { timeout: 1234 })).rejects.toBe(providerError);
   });
 });
 

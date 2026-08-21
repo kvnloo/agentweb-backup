@@ -12,7 +12,6 @@ import {
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { meterUsageFromResponse } from '../utils/llmClients';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
@@ -4783,21 +4782,14 @@ Good example: "Sarah, Island's browser-isolation approach is one of the smarter 
 
 Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
 
-    const geminiClient = await agentModeService.getGeminiClient();
-    const completion = await (geminiClient as any).chat.completions.create({
-      model: 'gemini-3.5-flash',
-      messages: [{ role: 'user', content: prompt }],
+    const completion = await agentModeService.callLLM('gemini-3.5-flash', [
+      { role: 'user', content: prompt },
+    ], {
       temperature: 0.8,
-      max_tokens: 2048,
+      max_completion_tokens: 2048,
+      usageContext: { userId, feature: 'invite_note_generate' },
+      taskClass: 'content_generation',
     });
-    // Meter this direct Gemini draft generation (bypasses callLLM): shadow analytics +
-    // the per-user cap, matching the invite-note shortener path for the same feature.
-    meterUsageFromResponse({
-      userId,
-      model: 'gemini-3.5-flash',
-      provider: 'gemini',
-      feature: 'invite_note_generate',
-    }, completion);
 
     const raw = completion.choices[0].message.content || '';
     let rawNote = '';
@@ -4838,7 +4830,7 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
     // the same trimInviteMessage() sendInvitation uses, so every invite-note path is consistent.
     if (rawNote.length > inviteCharLimit) {
       const { shortenInviteNoteToLimit } = await import('../services/inviteNoteShortener');
-      rawNote = await shortenInviteNoteToLimit(geminiClient, rawNote, inviteCharLimit, 2);
+      rawNote = await shortenInviteNoteToLimit(undefined, rawNote, inviteCharLimit, 2, userId);
     }
     const content = LinkedInOutreachService.trimInviteMessage(rawNote, inviteCharLimit);
 
