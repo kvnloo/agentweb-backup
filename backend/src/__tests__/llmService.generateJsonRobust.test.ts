@@ -121,6 +121,20 @@ describe('LLMService.generateJsonRobust', () => {
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 
+  it('wraps a strict-retry transport failure without leaking the first raw response', async () => {
+    const invoke = jest.fn()
+      .mockResolvedValueOnce({ content: 'not json' })
+      .mockRejectedValueOnce(new Error('strict retry unavailable'));
+    const svc = makeService(invoke);
+
+    await expect(svc.generateJsonRobust('sys', 'user')).rejects.toMatchObject({
+      name: 'JsonExtractError',
+      message: expect.stringContaining('strict retry unavailable'),
+      rawSnippet: expect.stringContaining('not json'),
+    });
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
   it('invokes the usage callback on every call', async () => {
     const invoke = jest
       .fn()

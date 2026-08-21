@@ -28,11 +28,30 @@ describe('LLMService shared-gateway compatibility facade', () => {
     expect(createLLMService('anthropic.claude-sonnet-4-6')).toBeInstanceOf(LLMService);
   });
 
+  it('uses the documented fallback model when neither an argument nor deployment override exists', () => {
+    const previousDeployment = process.env.AZURE_OPENAI_DEPLOYMENT;
+    try {
+      delete process.env.AZURE_OPENAI_DEPLOYMENT;
+      expect((new LLMService() as any).modelName).toBe('gpt-5.5');
+    } finally {
+      if (previousDeployment === undefined) delete process.env.AZURE_OPENAI_DEPLOYMENT;
+      else process.env.AZURE_OPENAI_DEPLOYMENT = previousDeployment;
+    }
+  });
+
   describe('text and structured output', () => {
     it('returns text content', async () => {
       const invoke = jest.fn().mockResolvedValue({ content: 'Generated text response' });
       const service = withInvoke(new LLMService('gpt-5.5'), invoke);
       await expect(service.generateContent('system', 'user')).resolves.toBe('Generated text response');
+    });
+
+    it('normalizes a null legacy response body to an empty string', async () => {
+      const service = withInvoke(
+        new LLMService('gpt-5.5'),
+        jest.fn().mockResolvedValue({ content: null }),
+      );
+      await expect(service.generateContent('system', 'user')).resolves.toBe('');
     });
 
     it('extracts and stringifies JSON content', async () => {
@@ -62,6 +81,25 @@ describe('LLMService shared-gateway compatibility facade', () => {
       const service = withInvoke(new LLMService('gpt-5.5'), invoke);
       await expect(service.generateJSONContent('system', 'user', 'xml')).resolves.toEqual({
         content: 'partial content',
+      });
+    });
+
+    it('rejects an empty closed XML content element', async () => {
+      const invoke = jest.fn().mockResolvedValue({ content: '<content>   </content>' });
+      const service = withInvoke(new LLMService('gpt-5.5'), invoke);
+      await expect(service.generateJSONContent('system', 'user', 'xml')).rejects.toThrow(
+        'Could not extract content from XML response',
+      );
+    });
+
+    it('keeps the closed-tag XML fallback when the structured parser yields no object', async () => {
+      const service = withInvoke(
+        new LLMService('gpt-5.5'),
+        jest.fn().mockResolvedValue({ content: '<content>fallback</content>' }),
+      );
+      jest.spyOn(service as any, 'parseXML').mockReturnValue(null);
+      await expect(service.generateJSONContent('system', 'user', 'xml')).resolves.toEqual({
+        content: 'fallback',
       });
     });
 
@@ -108,6 +146,15 @@ describe('LLMService shared-gateway compatibility facade', () => {
         content: 'Plain text',
       }));
       await expect(service.generateHTML('system', 'user')).resolves.toBe('Plain text');
+    });
+
+    it('returns an unterminated HTML document from its opening tag', async () => {
+      const service = withInvoke(new LLMService('gpt-5.5'), jest.fn().mockResolvedValue({
+        content: 'preamble <html><body>partial',
+      }));
+      await expect(service.generateHTML('system', 'user')).resolves.toBe(
+        '<html><body>partial',
+      );
     });
   });
 
