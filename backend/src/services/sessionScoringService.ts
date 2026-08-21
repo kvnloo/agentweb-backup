@@ -123,6 +123,17 @@ function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: 
 }
 
 /**
+ * Matches "simulat..." language only when it's crediting the simulation as if
+ * it were a completed/successful action (e.g. "successfully simulated",
+ * "simulated/executed", "simulation succeeded") — not bare mentions of
+ * "simulate" in a genuine, tool-free simulation/roleplay request the judge
+ * correctly scored well (e.g. "the user asked the assistant to simulate a
+ * role-play scenario, which it did well").
+ */
+const CREDITS_SIMULATION_AS_SUCCESS_RE =
+  /successfully simulat|simulat(?:ed|ion)[\s\S]{0,20}(?:execut|success|complet)/i;
+
+/**
  * Structural backstop for ENG-1223: a judge that still credits a fabricated
  * simulation as success despite FABRICATION_GROUNDING_CLAUSE and the tool-call
  * manifest — the exact way Fangfang Judge scored dataAccuracy 5 while its own
@@ -130,9 +141,11 @@ function buildToolCallManifest(messages: ChatMessage[]): { count: number; text: 
  * trusted.
  *
  * Scoped narrowly on purpose: it only fires when the session made ZERO tool
- * calls AND the judge's own reason text still uses "simulat" language to
- * describe the outcome. A normal, accurate, tool-free chat reply (where
- * dataAccuracy 5 is correct and "simulat" never appears) is never touched.
+ * calls AND the judge's own reason text credits the simulation as
+ * completed/successful (see CREDITS_SIMULATION_AS_SUCCESS_RE). A normal,
+ * accurate, tool-free chat reply (where dataAccuracy 5 is correct and
+ * "simulat" never appears), AND a genuine tool-free simulation/roleplay
+ * request the judge scored correctly, are both left untouched.
  */
 function applyFabricationGuard(
   toolCallCount: number,
@@ -140,7 +153,7 @@ function applyFabricationGuard(
   score: number,
   dimensions: ScoringResult["dimensions"]
 ): { score: number; dimensions: ScoringResult["dimensions"] } {
-  if (toolCallCount > 0 || !/simulat/i.test(reason)) {
+  if (toolCallCount > 0 || !CREDITS_SIMULATION_AS_SUCCESS_RE.test(reason)) {
     return { score, dimensions };
   }
 
@@ -888,7 +901,12 @@ export async function scoreSession(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(pageIdentifier, sessionType);
-  const manifest = buildToolCallManifest(recentMessages);
+  // ENG-1223: computed from the FULL session, not recentMessages — a session
+  // with >MAX_MESSAGES_FOR_SCORING messages that made tool calls earlier would
+  // otherwise get a manifest falsely claiming zero calls "anywhere in this
+  // session", which both misleads the judge and wrongly triggers
+  // applyFabricationGuard's zero-call cap below.
+  const manifest = buildToolCallManifest(messages);
   const conversationText = header
     ? `${header}\n${manifest.text}\n\n${baseConversationText}`
     : `${manifest.text}\n\n${baseConversationText}`;
@@ -964,7 +982,11 @@ export async function scoreSessionWithJudge(
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
   const baseConversationText = serializeMessagesForScoring(recentMessages);
   const header = getSessionTypeHeader(undefined, sessionType);
-  const manifest = buildToolCallManifest(recentMessages);
+  // ENG-1223: see scoreSession — computed from the full session, not
+  // recentMessages, so the manifest's "anywhere in this session" claim is
+  // actually true and applyFabricationGuard isn't fooled by an out-of-window
+  // tool call.
+  const manifest = buildToolCallManifest(messages);
   const conversationText = header
     ? `${header}\n${manifest.text}\n\n${baseConversationText}`
     : `${manifest.text}\n\n${baseConversationText}`;
