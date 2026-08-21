@@ -141,7 +141,7 @@ check() {
       "${label}" "${want_status}" "${STATUS}" "${STDOUT}"
     return
   fi
-  # ENG-1277: a here-string, not `printf ... | grep -qF`. Under `set -o
+  # ENG-1277: a here-string, not a producer/grep pipeline. Under `set -o
   # pipefail` (line 28), `grep -q` exits as soon as it finds a match — if
   # `want_text` appears early in a long STDOUT (e.g. "UNKNOWN" as the first
   # line of a multi-line fixture), grep closes the pipe before printf finishes

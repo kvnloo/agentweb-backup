@@ -405,13 +405,13 @@ else
   fi
   assert_contains "${DEPLOY_CI_PATTERNS}" ".github/{workflows/tests.yml,scripts/eb-deploy.sh}" \
     "one brace pattern independently matches either deploy-path file (ENG-743)"
-  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/workflows/tests.yml"; then
+  if grep -Fxq ".github/workflows/tests.yml" <<<"${DEPLOY_CI_PATTERNS}"; then
     fail_test "tests.yml is not a separate deploy_ci entry" \
       "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
   else
     pass_test "tests.yml is not a separate deploy_ci entry"
   fi
-  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/scripts/eb-deploy.sh"; then
+  if grep -Fxq ".github/scripts/eb-deploy.sh" <<<"${DEPLOY_CI_PATTERNS}"; then
     fail_test "eb-deploy.sh is not a separate deploy_ci entry" \
       "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
   else

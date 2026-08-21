@@ -180,6 +180,62 @@ Include the new fields in the SAME JSON object as the other fields, e.g.:
 {"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>, "concision": <0-5>, "instructionCompliance": <0-5>, "unnecessaryPermissionRequest": <true|false>}}`;
 
 /**
+ * ENG-1245: judges scored a REAL "Require approval before publishing" hold
+ * on a schedule as a fabricated/simulated restriction ("falsely claiming",
+ * "simulated"), because the only text they ever see is the schedule's own
+ * prompt prose (e.g. "(Autonomous)", "no approval needed") plus the tool
+ * error / final report text describing the block. This clause stops the
+ * judge from scoring a correctly-withheld publish as an assistant fabrication.
+ *
+ * RE-VERIFIED, NOT JUST RE-FILED: the clause originally also told the judge
+ * this is always "an owner-configured account/schedule setting". Pulling the
+ * live schedule record for the exact session that motivated this ticket
+ * (1d001fba-0fb7-4bcd-80f6-6041b244a442, "Harsha Daily X Post (Autonomous)")
+ * showed `requirePublishApproval: false` — the owner never turned that
+ * setting on. It had posted nothing since 2026-08-13 (the day after
+ * PR #2263/ENG-827 deployed) because it was simply never granted standing
+ * publish authorization, a distinct and far more common condition for a
+ * legacy schedule than a deliberate owner hold (see
+ * describePublishAuthorizationWithholdReason in schedulePublishAuthorization.ts,
+ * and the parallel accuracy fix in getScheduledSessionOverride /
+ * publishApprovalBlock, which stopped telling the owner to toggle a setting
+ * that was already off). Both cases are real, both are account-level, and
+ * the assistant is not fabricating either one — but the judge must not
+ * itself assert "the owner deliberately turned this on" when the transcript
+ * does not actually say that, or the same fabrication just relocates from
+ * the assistant's report into the judge's own "reason" text.
+ *
+ * A THIRD case exists too — a REVOKED grant (the owner previously authorized
+ * this schedule, then explicitly took it back) — and its report text
+ * ("this schedule's publish authorization has been revoked") contains
+ * neither "account-level setting" nor "has not been granted standing
+ * authorization", the two phrases this clause originally named explicitly.
+ * Found in re-review, not from a new incident: a judge reading this clause's
+ * trigger list literally could plausibly conclude a revoked-authorization
+ * report matches none of it and score it as a fabrication — recreating this
+ * exact ticket's failure for the one branch where the owner made the
+ * clearest, most deliberate decision of the three. Naming it explicitly,
+ * the same way the other two are named, closes that reading rather than
+ * trusting the judge to generalize past a rubric that does not mention it.
+ *
+ * APPENDED at call time, same reasoning as NO_TASK_JUDGMENT_CLAUSE /
+ * VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE: production carries a live
+ * `default-scoring-prompt` AW-Settings override, and a custom
+ * `ScoringJudge.systemPrompt` (Fangfang Judge, Matt Judge — the two judges
+ * that actually reproduced this bug) is entirely user-authored. Editing only
+ * DEFAULT_SCORING_SYSTEM_PROMPT's literal text would leave whatever prompt is
+ * ACTUALLY configured blind to this rule (ENG-392).
+ */
+export const PUBLISH_APPROVAL_WITHHOLDING_CLAUSE = `
+
+IMPORTANT — a blocked publish tool can be a REAL, correct restriction, not a fabrication:
+- If the conversation transcript contains a tool result or a final report stating that a publish tool was blocked because "Require approval before publishing" is turned on, or because a schedule has not been granted standing authorization to publish unattended, or because a schedule's publish authorization has been revoked, or because "this is an account-level setting on the schedule", that restriction is REAL. It is not something the assistant invented, simulated, or falsely claimed — even if earlier prompt text or a schedule name in the same conversation asserts "autonomous" or "no approval needed" publishing. Prompt text is NOT authoritative over this account-level gate.
+- Do NOT assume this means the owner deliberately switched the "Require approval before publishing" setting on. It can equally mean the schedule was simply never granted standing publish authorization (the most common condition for a legacy schedule), or that a prior grant was later revoked — a real, deliberate owner decision in its own right, just not that specific toggle. Whichever it is, it is real and account-level; describe it the way the assistant's own report described it rather than asserting "the owner turned this on" when the transcript does not say that.
+- Correctly withholding the publish action, saving the draft, and reporting the block plainly is the CORRECT terminal state for such a run. Do NOT describe this in "reason" as the assistant "falsely claiming", "simulating", or "fabricating" a restriction, and do NOT lower goalCompletion, outputQuality, or the overall score because publication did not happen for this reason.
+- Do not lower instructionCompliance either — an instruction to publish/post is not ignored or contradicted when withheld solely due to this real account-level gate.
+- Evaluate goalCompletion based on whether the assistant produced a publishable, on-brief draft and accurately reported the approval hold — not on whether the content was actually posted.`;
+
+/**
  * Read the judge's zero-task verdict, failing OPEN.
  *
  * Only a literal boolean `false` counts as "no task was requested". A missing,
@@ -714,11 +770,15 @@ export async function scoreSession(
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  // Append the zero-task clause and the ENG-1312 verbosity/permission clause to
-  // whatever prompt is configured — the stored override, if any, would
-  // otherwise mask them entirely (ENG-392/ENG-830).
+  // Append the zero-task clause, the ENG-1312 verbosity/permission clause, and
+  // the ENG-1245 publish-approval-withholding clause to whatever prompt is
+  // configured — the stored override, if any, would otherwise mask them
+  // entirely (ENG-392/ENG-830).
   const systemPrompt =
-    (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE + VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE;
+    (await getDefaultScoringPrompt()) +
+    NO_TASK_JUDGMENT_CLAUSE +
+    VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+    PUBLISH_APPROVAL_WITHHOLDING_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -790,10 +850,18 @@ export async function scoreSessionWithJudge(
     [
       // Same appended clauses as the general scorer, so a custom judge cannot
       // disagree with it about whether a zero-task session is in the cohort
-      // (the Matt-5 vs Fangfang-3 split in ENG-830), nor go blind to the
-      // ENG-1312 verbosity/permission dimensions just because its own prompt
-      // predates them.
-      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE + VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE },
+      // (the Matt-5 vs Fangfang-3 split in ENG-830), go blind to the
+      // ENG-1312 verbosity/permission dimensions, or score a real
+      // publish-approval hold as fabricated (ENG-1245) just because its own
+      // prompt predates these rules.
+      {
+        role: "system",
+        content:
+          judge.systemPrompt +
+          NO_TASK_JUDGMENT_CLAUSE +
+          VERBOSITY_PERMISSION_DIMENSIONS_CLAUSE +
+          PUBLISH_APPROVAL_WITHHOLDING_CLAUSE,
+      },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {

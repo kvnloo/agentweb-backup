@@ -409,15 +409,181 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'a genuinely failing check is FAIL' 1 'VERDICT: FAIL'
 
+# ---------------------------------------------------------------------------
+# ENG-1381 — a cancellation is an ABSENT verdict, not a negative one
+# ---------------------------------------------------------------------------
+#
+# This block replaces a test that asserted `a cancelled check is FAIL, not a
+# pass`. That assertion was the defect, not the guarantee: `Backend deploy to
+# staging` sits in a single GLOBAL concurrency lane where a newer waiting
+# request evicts the older, so 37% of its executions were cancelled over the
+# 20h sampled — and every one of those PRs got FAIL from the gate CLAUDE.md
+# mandates. agentweb#2491 had to be merged by overriding it.
+#
+# What replaces it is not "tolerate cancellations". It is the distinction the
+# script already drew everywhere else: jobs whose evidence is REQUIRED must
+# carry a positive success (asserted below), and a job no evidence was required
+# from cannot block by failing to produce any.
+
+# The real agentweb#2491 payload at head 9c07bb78d3, captured 2026-08-20.
+# Every job green; the staging deploy evicted from its lane. This exact shape
+# forced the override, and is the ENG-1381 AC6 regression.
+PR2491_RUNS='[
+  {"id":96166573894,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"cancelled","check_suite":{"id":87513641148}},
+  {"id":96162760452,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760309,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760196,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162634066,"app":{"id":15368},"name":"Dependabot Integrity Check","status":"completed","conclusion":"skipped","check_suite":{"id":87513634173}},
+  {"id":96162640489,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162760245,"app":{"id":15368},"name":"EB resource/instance config conflict","status":"completed","conclusion":"success","check_suite":{"id":87513641148}},
+  {"id":96162761465,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":87513641148}}
+]'
+
+# AC1 + AC6. #2491 changed .github/workflows/tests.yml, which BACKEND_PATHS
+# counts as a backend change, so this also proves the backend requirement is
+# still evaluated (and satisfied) rather than skipped past.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '9c07bb78d38af550af0f2f3bec78d741d7a3a24a'
+checkruns "${d}" "${PR2491_RUNS}"
+changed_files "${d}" '.github/workflows/tests.yml
+.github/scripts/merge-evidence.sh'
+run_gate "${d}"
+check 'ENG-1381 AC1/AC6: the real #2491 shape (only the evicted deploy cancelled) is PASS' 0 'VERDICT: PASS'
+
+# AC2. Tolerating it silently is how a gate stops working unnoticed, so the
+# cancellation must be NAMED on the pass path. Assert the job name and the
+# non-blocking label together — either alone could pass for the wrong reason.
+run_gate "${d}"
+check 'ENG-1381 AC2: the tolerated cancellation is named in the PASS output' 0 'cancelled, NOT blocking'
+run_gate "${d}"
+check 'ENG-1381 AC2: and names the job itself' 0 'Backend deploy to staging (after tests pass)'
+
+# AC3a. The same conclusion on a job the gate DOES require evidence from is not
+# tolerated — it is the absence of the measurement, which is NO_EVIDENCE (3),
+# not FAIL (1). The remedy differs: re-run, do not debug.
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" '[
   {"name":"Detect changed projects","status":"completed","conclusion":"success"},
   {"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381 AC3: a cancelled BACKEND_JOBS member is NO_EVIDENCE, never a pass' 3 'Backend tests (agentMode) (cancelled)'
+
+# AC3b. The discriminator is the job every other conclusion is read against, so
+# a cancelled one makes the whole payload uninterpretable. Fails closed.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"cancelled"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
   {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
 ]'
 run_gate "${d}"
-check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
+check 'ENG-1381 AC3: a cancelled draft discriminator is NO_EVIDENCE, never a pass' 3 'was CANCELLED'
+
+# AC4. The tolerance is for cancellations ONLY. A staging deploy that actually
+# RAN and FAILED is a real negative verdict and still hard-fails — ENG-734/743
+# exist to make that failure honest, and this change must not soften it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success"},
+  {"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"failure"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381 AC4: a FAILED staging deploy still blocks (ENG-734/743 intact)' 1 'Backend deploy to staging (after tests pass) (failure)'
+
+# AC4, the other conclusions in `bad`. None of them moved.
+for conc in neutral timed_out action_required stale; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  checkruns "${d}" '[
+    {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+    {"name":"Some optional check","status":"completed","conclusion":"'"${conc}"'"},
+    {"name":"EB resource/instance config conflict","status":"completed","conclusion":"success"}
+  ]'
+  run_gate "${d}"
+  check "ENG-1381 AC4: '${conc}' is still a negative verdict and blocks" 1 "VERDICT: FAIL"
+done
+
+# A wholly cancelled run has no success to report, so the positive-execution
+# requirement catches it even though nothing is in `bad` any more.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled"},
+  {"name":"EB resource/instance config conflict","status":"completed","conclusion":"cancelled"}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a run cancelled after the discriminator cannot pass a backend PR' 3 'VERDICT: NO_EVIDENCE'
+
+# ENG-1381, raised by CodeRabbit on #2523 and confirmed as a real defect before
+# being acted on.
+#
+# Section 7 accepts a required backend job on "did it EVER pass at this head",
+# so a job with a cancelled attempt in one suite and a success in another
+# passes — correctly, because the head SHA is immutable and a green suite at it
+# tested exactly this code. But that job then ALSO appears in the cancelled
+# list, and the first version of the PASS line claimed every name in that list
+# was "outside the evidence set". For this job that is simply false.
+#
+# The verdict was right and only the explanation was wrong, which is exactly
+# the failure this line exists to prevent: AC2 makes the gate trustworthy by
+# saying out loud what it tolerated, and a message that misdescribes what it
+# tolerated is worse than no message at all.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"cancelled","check_suite":{"id":10}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":5,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"cancelled","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a required job with a cancelled attempt AND a success still PASSes' 0 'VERDICT: PASS'
+
+# The cancelled ATTEMPT of a required job is reported as separately accounted
+# for — never as something no evidence was required from.
+run_gate "${d}"
+check 'ENG-1381: a required job cancelled-attempt is not called outside the evidence set' 0 'not a tolerated gap: Backend tests (agentMode) (cancelled)'
+
+# ...while a genuinely unrelated cancellation in the SAME payload is still
+# named as outside it. Both lines have to be able to appear at once, which is
+# why this is one fixture rather than two.
+run_gate "${d}"
+check 'ENG-1381: an unrelated cancellation is still named as outside the evidence set' 0 'none was required from these: Backend deploy to staging (after tests pass) (cancelled)'
+
+# Evidence-set membership is EXACT. Written after the first implementation used
+# jq's `inside`, which for strings matches on substring — so a job named
+# "Backend tests" was classified as a member of the set purely because
+# "Backend tests (agentMode)" contains it. Everywhere else in the gate a name
+# is matched exactly so a rename fails closed instead of being absorbed by a
+# partial match; this asserts the cancelled split obeys the same rule.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests","status":"completed","conclusion":"cancelled","check_suite":{"id":20}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":20}},
+  {"id":4,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":20}}
+]'
+changed_files "${d}" 'backend/src/index.ts'
+run_gate "${d}"
+check 'ENG-1381: a name that is only a SUBSTRING of a required job is outside the set' 0 'none was required from these: Backend tests (cancelled)'
+
+
 
 # A ready flip and a synchronize event can race and schedule two workflow runs
 # for the same head. GitHub's commit check-runs endpoint returns both suites,
@@ -681,9 +847,14 @@ pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
 checkruns "${d}" "${SUPERSEDED_2231}"
 workflowruns "${d}" '[]'
 run_gate "${d}"
-# Nothing is proven superseded, so the cancelled row survives and blocks. Exit 1
-# rather than 3, but the guarantee that matters holds: never green.
-check 'with no workflow-run data nothing is dropped and the cancelled row blocks' 1 'EB resource/instance config conflict (cancelled)'
+# Nothing is proven superseded, so the cancelled row SURVIVES narrowing — which
+# is the property under test, and it is unchanged. ENG-1381 changed only what a
+# surviving cancellation means: it is named on the pass path rather than
+# counted as a failure. The assertion still proves survival, because this name
+# is carried by two rows at this head (id 14 success, id 15 cancelled) and only
+# the cancelled one renders with the conclusion suffix. Were the row wrongly
+# dropped, the suffix would be absent.
+check 'with no workflow-run data nothing is dropped and the cancelled row survives' 0 'EB resource/instance config conflict (cancelled)'
 
 # A cancelled run with no newer run of the same workflow is the only evidence
 # there is, and it is bad evidence. It is not superseded.
@@ -697,7 +868,12 @@ workflowruns "${d}" '[
   {"id":901,"workflow_id":191827888,"run_number":1,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":10}
 ]'
 run_gate "${d}"
-check 'a lone cancelled run is not superseded and still blocks' 1 'cancelled)'
+# Still not superseded — nothing newer exists — so the row survives to be
+# reported. This fixture is the agentweb#2491 shape in miniature (discriminator
+# green, one evicted job, run conclusion `cancelled`), and 21 of 21 sampled
+# evictions produced exactly it, so it MUST NOT block: treating it as bad is
+# precisely what forced the override.
+check 'a lone cancelled run is not superseded, and is reported rather than dropped' 0 'EB resource/instance config conflict (cancelled)'
 
 # The workflow-run API being unreadable is blindness, not a pass.
 d="$(new_fixture_dir)"
