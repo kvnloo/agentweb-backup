@@ -1722,6 +1722,88 @@ describe('runCodingAgent — model provider routing', () => {
   });
 });
 
+describe('ENG-1451 RED — coding-agent OpenRouter gateway contract', () => {
+  const context: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+  };
+
+  const bedrockCreate = jest.fn();
+  const vertexCreate = jest.fn();
+  let modelSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    bedrockCreate.mockReset();
+    vertexCreate.mockReset();
+    _setBedrockClientForTest({ messages: { create: bedrockCreate } } as any);
+    _setVertexClientForTest({ messages: { create: vertexCreate } } as any);
+    _setSleepFnForTest(async () => {});
+    mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 100 }] });
+    modelSpy = jest.spyOn(agentModeService, 'getCodingAgentDefaultModel');
+  });
+
+  afterEach(() => modelSpy.mockRestore());
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+    _setVertexClientForTest(null);
+  });
+
+  const successfulTurn = () => ({
+    content: [{
+      type: 'tool_use',
+      id: 'tu_1',
+      name: 'report_to_user',
+      input: { message: 'Done.', status: 'success' },
+    }],
+    stop_reason: 'tool_use',
+  });
+
+  test('maps the logical coding model to the OpenRouter upstream model id', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    bedrockCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(bedrockCreate.mock.calls[0][0].model).toBe('anthropic/claude-sonnet-4.6');
+  });
+
+  test('delegates fallback and context overflow handling to OpenRouter', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    bedrockCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(bedrockCreate.mock.calls[0][0]).toEqual(expect.objectContaining({
+      provider: { allow_fallbacks: true, require_parameters: true },
+      plugins: [{ id: 'context-compression' }],
+      session_id: context.sessionId,
+    }));
+  });
+
+  test('normalizes the legacy Vertex logical id through the same gateway', async () => {
+    modelSpy.mockResolvedValue('claude-sonnet-4-6');
+    vertexCreate.mockResolvedValueOnce(successfulTurn());
+
+    await runCodingAgent('change the heading', context);
+
+    expect(vertexCreate.mock.calls[0][0].model).toBe('anthropic/claude-sonnet-4.6');
+  });
+
+  test('preserves the Anthropic-native tool loop response contract', async () => {
+    modelSpy.mockResolvedValue('anthropic.claude-sonnet-4-6');
+    bedrockCreate.mockResolvedValueOnce(successfulTurn());
+
+    const result = await runCodingAgent('change the heading', context);
+
+    expect(result).toEqual(expect.objectContaining({ success: true, message: 'Done.' }));
+  });
+});
+
 // ─── Bedrock streaming: frame parser + accumulator ────────────────────────────
 // The bearer-token Opus path streams `application/vnd.amazon.eventstream` frames.
 // These tests build real frames (matching AWS framing) and verify we reconstruct
