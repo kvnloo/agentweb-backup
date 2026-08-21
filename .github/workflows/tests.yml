@@ -503,6 +503,17 @@ jobs:
             }
             const body = fs.readFileSync(bodyPath, 'utf8');
 
+            // Identity is the hidden marker, NOT the visible heading, and the
+            // author must be this workflow's own bot.
+            //
+            // Matching on the heading is not a hypothetical failure: it
+            // happened on PR #2547, the PR that introduced this job. Linear's
+            // linkback comment quotes the ticket body, the ticket body quotes
+            // the old coverage comment verbatim — heading and emoji included —
+            // so the search matched Linear's comment and the update overwrote
+            // it. Any bot that ever quotes this report would do the same. A
+            // marker nothing else emits, plus an author check, is the fix.
+            const MARKER = '<!-- backend-coverage-report -->';
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -510,7 +521,7 @@ jobs:
               per_page: 100,
             });
             const existing = comments.find(
-              (c) => c.user.type === 'Bot' && c.body.includes('📊 Backend Test Coverage'),
+              (c) => c.user.login === 'github-actions[bot]' && c.body.includes(MARKER),
             );
 
             if (existing) {

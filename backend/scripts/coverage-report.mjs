@@ -132,7 +132,14 @@ const dirRows = [...byDir.entries()]
   })
   .join('\n');
 
-const markdown = `## 📊 Backend Test Coverage
+// A hidden marker is this report's identity for the comment-update step. The
+// visible heading cannot be: Linear's linkback quotes the ticket, the ticket
+// quotes this report, and on PR #2547 the update step matched Linear's comment
+// on the heading and overwrote it.
+const MARKER = '<!-- backend-coverage-report -->';
+
+const markdown = `${MARKER}
+## 📊 Backend Test Coverage
 
 Merged across **both** backend test jobs (agentMode + everything else) over ${files.length} source files.
 

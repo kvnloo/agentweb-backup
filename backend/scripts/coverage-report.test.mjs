@@ -182,6 +182,24 @@ test('the markdown names its measured scope and every threshold', () => {
   assert.match(md, /src\/scripts\//);
   assert.match(md, /Merged across \*\*both\*\* backend test jobs/);
   assert.match(md, /`src\/routes`/, 'per-directory breakdown present');
+  // The comment-update step keys off this marker. Without it, it falls back to
+  // matching the visible heading, which on PR #2547 matched Linear's linkback
+  // comment (it quotes the ticket, which quotes this report) and overwrote it.
+  assert.ok(md.startsWith('<!-- backend-coverage-report -->'), 'marker must lead the body');
+  const workflow = fs.readFileSync(
+    path.join(BACKEND_ROOT, '..', '.github', 'workflows', 'tests.yml'),
+    'utf8',
+  );
+  assert.match(
+    workflow,
+    /const MARKER = '<!-- backend-coverage-report -->';/,
+    'the workflow must look for the same marker this script emits',
+  );
+  assert.doesNotMatch(
+    workflow,
+    /c\.body\.includes\('📊/,
+    'the workflow must not identify its comment by the visible heading',
+  );
   for (const metric of ['Statements', 'Branches', 'Functions', 'Lines']) {
     assert.match(md, new RegExp(`\\| ${metric} \\|`));
   }
