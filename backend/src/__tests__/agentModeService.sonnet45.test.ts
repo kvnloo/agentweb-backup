@@ -754,7 +754,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should place the configured default model first in the list', async () => {
       const { settingsService } = require('../services/settingsService');
       const llmModels = (agentModeService as any).llmModels;
-      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const allModels = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Configure a model that is NOT first in the natural object-key order
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
@@ -770,7 +771,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
     it('should place the configured default model first in the list for admins (including opus)', async () => {
       const { settingsService } = require('../services/settingsService');
-      const allModels = Object.keys((agentModeService as any).llmModels);
+      const llmModels = (agentModeService as any).llmModels;
+      const allModels = Object.keys(llmModels).filter((m: string) => !llmModels[m].internalOnly);
       const nonFirstModel = allModels[allModels.length - 1];
       (settingsService.getSetting as jest.Mock).mockResolvedValue({
         settingValue: nonFirstModel,
@@ -823,7 +825,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       const models = await agentModeService.getSupportedModels();
-      const naturalOrder = Object.keys(llmModels).filter((m: string) => !llmModels[m].adminOnly);
+      const naturalOrder = Object.keys(llmModels).filter((m: string) =>
+        !llmModels[m].adminOnly && !llmModels[m].internalOnly);
       // Falls back to env/hardcoded default which is likely first anyway
       expect(models.length).toBe(naturalOrder.length);
     });

@@ -181,7 +181,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
       expect(create).toHaveBeenCalledWith(expect.objectContaining({
         model: modelId.slice('openrouter/'.length),
-      }));
+      }), { maxRetries: 0, timeout: 5 * 60 * 1000 });
     }
   });
 
@@ -193,7 +193,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
     await service.callLLM('gpt-5.4', [{ role: 'user', content: 'Hello' }]);
 
-    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }));
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.4' }), undefined);
   });
 
   it('canary-routes an interactive GPT call through OpenRouter', async () => {
@@ -324,7 +324,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       model: 'gpt-5.4',
       max_completion_tokens: 321,
       temperature: 0.1,
-    }));
+    }), undefined);
   });
 
   it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
@@ -358,7 +358,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
           }],
         },
       ],
-    }));
+    }), { maxRetries: 0, timeout: 5 * 60 * 1000 });
     expect(create.mock.calls[0][0]).not.toHaveProperty('cache_control');
   });
 
