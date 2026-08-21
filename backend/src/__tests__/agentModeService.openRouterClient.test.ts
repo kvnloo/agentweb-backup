@@ -214,6 +214,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
       provider: { allow_fallbacks: true, require_parameters: true },
+      usage: { include: true },
     }));
     expect(request).not.toHaveProperty('temperature');
     expect(request).not.toHaveProperty('response_format');
@@ -255,6 +256,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       model: 'perplexity/sonar-deep-research',
       models: ['perplexity/sonar-pro-search'],
       provider: { allow_fallbacks: true, require_parameters: true },
+      usage: { include: true },
     }));
     expect(create).toHaveBeenCalledTimes(1);
   });

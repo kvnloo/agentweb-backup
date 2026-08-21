@@ -203,6 +203,40 @@ describe('AgentModeService.callLLM — OpenRouter provider + cost (ENG-9)', () =
     );
   });
 
+  it('falls back to the price book for BYOK usage instead of recording OpenRouter billed cost as economic cost', async () => {
+    create.mockResolvedValue({
+      id: 'gen-byok',
+      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: true },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: undefined })
+    );
+  });
+
+  it('preserves a provider-reported zero for non-BYOK OpenRouter usage', async () => {
+    create.mockResolvedValue({
+      id: 'gen-free',
+      usage: { prompt_tokens: 9, completion_tokens: 3, cost: 0, is_byok: false },
+      choices: [{ message: { content: 'ok' } }],
+    });
+    (svc as any).llmModels[OR_MODEL].client = { chat: { completions: { create } } };
+
+    await svc.callLLM(OR_MODEL, [{ role: 'user', content: 'hi' }], {
+      usageContext: { userId: 'u1', feature: 'agent_task' },
+    });
+
+    expect(mockMeterUser).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', costUsdOverride: 0 })
+    );
+  });
+
   it('does not send costUsdOverride for a non-openrouter provider (bedrock unaffected)', async () => {
     const bedrockCreate = jest.fn().mockResolvedValue(fakeResponse);
     (svc as any).llmModels[MODEL].client = { chat: { completions: { create: bedrockCreate } } };

@@ -3419,6 +3419,11 @@ export class AgentModeService {
       // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
       // compatibility for migrated calls.
       params.provider = { allow_fallbacks: true, require_parameters: true };
+      // OpenRouter reports its own billed amount as zero for BYOK requests even
+      // though Bedrock/Vertex still bill the underlying inference. Request the
+      // routing flag so metering can distinguish BYOK from a genuinely free
+      // OpenRouter call and fall back to our provider price book when needed.
+      params.usage = { include: true };
       if (fallbackModels?.length) {
         params.models = fallbackModels.map((fallbackModel) => {
           const normalizedFallback = this.normalizeModelId(fallbackModel);
@@ -3582,14 +3587,12 @@ export class AgentModeService {
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
               // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
               cacheWriteByTtl: usage.cache_creation_by_ttl,
-              // ENG-9: OpenRouter returns real per-call cost in `usage.cost` (always
-              // present, not opt-in) — ground truth from the vendor that actually
-              // billed us, not a static per-token guess our own price table (which
-              // has no entry for arbitrary openrouter/<provider>/<model> ids) would
-              // otherwise have to estimate. Omitted for every other provider, so
-              // ENG-700's isUnpriced()/"unpriced" fallback still governs them.
+              // OpenRouter's cost is authoritative for OpenRouter-billed calls.
+              // BYOK calls report zero because the upstream provider bills us
+              // directly, so omit the override and let the provider price book
+              // calculate economic cost from the returned tokens instead.
               costUsdOverride:
-                providerLabel === 'openrouter' && typeof usage.cost === 'number'
+                providerLabel === 'openrouter' && usage.is_byok !== true && typeof usage.cost === 'number'
                   ? usage.cost
                   : undefined,
             });
