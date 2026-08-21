@@ -30,7 +30,7 @@ describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', (
 
   it('keeps task attribution, event id, and capability payload in the gateway request contract', () => {
     const request: GatewayRequest = {
-      taskClass: 'interactive',
+      taskClass: 'interactive_chat',
       logicalModelId: 'openrouter/openai/gpt-4o-mini',
       eventId: 'completion-1',
       stream: true,
@@ -41,7 +41,7 @@ describe('OpenRouter gateway contract — model identity boundary (ENG-1414)', (
     };
 
     expect(request).toEqual(expect.objectContaining({
-      taskClass: 'interactive',
+      taskClass: 'interactive_chat',
       logicalModelId: 'openrouter/openai/gpt-4o-mini',
       eventId: 'completion-1',
     }));

@@ -61,11 +61,12 @@ scope and is not a reason to retain native Gemini text generation.
 | Gemini Live voice | OpenRouter's chat gateway does not provide the bidirectional live-audio session used by `ai.live.connect`. This exception excludes ordinary Gemini text generation. | ENG-1416 | 2026-09-20 | OpenRouter supports the required realtime audio/session semantics and parity passes. | `services/liveVoiceService.ts` |
 | Veo video generation | Video generation is not a supported text/chat/tool completion and is billed per video, not completion tokens. | ENG-1416 | 2026-09-20 | OpenRouter offers the required video generation contract and parity passes. | `services/videoGeneration.ts` |
 
-## Baseline evidence required before consumer cutover
+## Baseline evidence completed before consumer cutover
 
-1. Characterization tests covering message, streaming, tool, structured-output,
-   malformed usage/error, and exactly-once metering behavior for each task class.
-2. Existing-ledger snapshots for logical model, task class, actual cost, cache
-   tokens, latency, and outcome signal.
-3. Okareo baseline-versus-changed simulation result per LLM-path slice.
-4. Shared-staging and bounded live-matrix result recorded against an exact SHA.
+ENG-1423's executable fixtures and observed matrix live in
+`src/loops/eval/openRouterBaselineEvidence.ts` and
+`eval-artifacts/openrouter-baseline/eng1423-9354ce5c6.json`. The shared
+`GATEWAY_TASK_CLASSES` taxonomy is the single source used by both the gateway
+contract and those fixtures. Each traffic-moving slice must now compare against
+that baseline with Okareo, shared staging, and a bounded live matrix before its
+direct transport is deleted.

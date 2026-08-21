@@ -17,14 +17,17 @@ export class GatewayContractError extends Error {
 
 const UPSTREAM_MODEL_ID = /^[^/\s]+\/[^/\s]+$/;
 
-export type GatewayTaskClass =
-  | 'interactive'
-  | 'scheduled'
-  | 'content'
-  | 'judge'
-  | 'mcp'
-  | 'agent-engine'
-  | 'coding-agent';
+export const GATEWAY_TASK_CLASSES = [
+  'interactive_chat',
+  'scheduled_background',
+  'content_generation',
+  'mcp_api',
+  'agent_engine',
+  'coding_agent',
+  'nonstandard_consumer',
+] as const;
+
+export type GatewayTaskClass = typeof GATEWAY_TASK_CLASSES[number];
 
 export interface GatewayUsage {
   inputTokens: number;
