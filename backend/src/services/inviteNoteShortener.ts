@@ -56,7 +56,7 @@ function extractContent(raw: string): string {
  * The caller is responsible for the final hard trim.
  */
 export async function shortenInviteNoteToLimit(
-  _legacyClient: unknown,
+  gateway: Pick<typeof agentModeService, 'callLLM'> | undefined,
   note: string,
   limit: number,
   attempts: number = 2,
@@ -74,7 +74,7 @@ Reply with ONLY valid JSON: {"content": "the shorter note"}
 Note to shorten:
 ${best}`;
     try {
-      const completion = await agentModeService.callLLM('gemini-3.5-flash', [
+      const completion = await (gateway || agentModeService).callLLM('gemini-3.5-flash', [
         { role: 'user', content: prompt },
       ], {
         temperature: 0.4,

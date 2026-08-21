@@ -149,9 +149,7 @@ describe('LLMService.generateJSONContentWithWebSearch — Gemini path', () => {
     mockGenerateContent.mockResolvedValueOnce({ text: '{"city":"Boston","industry":"SaaS"}' });
 
     const svc = new LLMService('gemini-2.0-flash', 0);
-    // Constructor short-circuit branch — Gemini service must not initialize the
-    // Azure/Bedrock chatModel since the Gemini call uses a fresh GoogleGenAI client.
-    expect((svc as any).chatModel).toBeNull();
+    expect((svc as any).chatModel).toEqual(expect.objectContaining({ invoke: expect.any(Function) }));
 
     const out = await svc.generateJSONContentWithWebSearch<{ city: string; industry: string }>(
       'sys', 'user',

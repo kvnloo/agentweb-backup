@@ -205,6 +205,13 @@ export class LLMService {
     if (format === 'json') return extractJson<T>(raw);
     const parsed = this.parseXML<T>(raw);
     if ((parsed as any)?.content) return parsed;
+    const contentStart = raw.indexOf('<content>');
+    if (contentStart >= 0) {
+      const start = contentStart + '<content>'.length;
+      const end = raw.indexOf('</content>', start);
+      const content = raw.slice(start, end >= 0 ? end : undefined).trim();
+      if (content) return { content } as T;
+    }
     throw new Error('Could not extract content from XML response');
   }
 

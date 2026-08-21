@@ -7,16 +7,13 @@
  */
 
 import { shortenInviteNoteToLimit } from '../services/inviteNoteShortener';
-import { meterUserUsage } from '../services/usageRecorderService';
-
-jest.mock('../services/usageRecorderService', () => ({ meterUserUsage: jest.fn() }));
 
 const makeClient = (responses: string[]) => {
   const create = jest.fn();
   responses.forEach((r) =>
     create.mockResolvedValueOnce({ choices: [{ message: { content: r } }] }),
   );
-  return { create, client: { chat: { completions: { create } } } };
+  return { create, client: { callLLM: create } };
 };
 
 const json = (s: string) => JSON.stringify({ content: s });
@@ -62,7 +59,7 @@ describe('shortenInviteNoteToLimit', () => {
   it('falls back to the original note when the model call throws', async () => {
     const longNote = 'x'.repeat(260);
     const create = jest.fn().mockRejectedValue(new Error('gemini down'));
-    const client = { chat: { completions: { create } } };
+    const client = { callLLM: create };
     const out = await shortenInviteNoteToLimit(client, longNote, 200, 2);
     expect(out).toBe(longNote);
   });
@@ -139,7 +136,7 @@ describe('shortenInviteNoteToLimit', () => {
   it('tolerates a response object with no choices (keeps the original)', async () => {
     const longNote = 'x'.repeat(260);
     const create = jest.fn().mockResolvedValue({}); // no .choices at all
-    const client = { chat: { completions: { create } } };
+    const client = { callLLM: create };
     const out = await shortenInviteNoteToLimit(client, longNote, 200, 2);
     expect(out).toBe(longNote);
   });
@@ -147,7 +144,7 @@ describe('shortenInviteNoteToLimit', () => {
   it('tolerates a null completion (keeps the original)', async () => {
     const longNote = 'x'.repeat(260);
     const create = jest.fn().mockResolvedValue(null); // model client returns nothing
-    const client = { chat: { completions: { create } } };
+    const client = { callLLM: create };
     const out = await shortenInviteNoteToLimit(client, longNote, 200, 2);
     expect(out).toBe(longNote);
   });
@@ -155,7 +152,7 @@ describe('shortenInviteNoteToLimit', () => {
   it('tolerates a choice whose message has no content field', async () => {
     const longNote = 'x'.repeat(260);
     const create = jest.fn().mockResolvedValue({ choices: [{ message: {} }] }); // message present, content missing
-    const client = { chat: { completions: { create } } };
+    const client = { callLLM: create };
     const out = await shortenInviteNoteToLimit(client, longNote, 200, 2);
     expect(out).toBe(longNote);
   });
@@ -177,39 +174,39 @@ describe('shortenInviteNoteToLimit', () => {
   });
 });
 
-describe('shortenInviteNoteToLimit — per-user metering', () => {
-  beforeEach(() => (meterUserUsage as jest.Mock).mockClear());
-
-  it('meters each Gemini rewrite (shadow + per-user cap) with userId/sessionId and token counts', async () => {
+describe('shortenInviteNoteToLimit — gateway attribution', () => {
+  it('sends each rewrite through the shared gateway with user/session attribution', async () => {
     const longNote = 'x'.repeat(260);
     const shortNote = 'Fang, tight and done.';
     const create = jest.fn().mockResolvedValueOnce({
       choices: [{ message: { content: json(shortNote) } }],
       usage: { prompt_tokens: 120, completion_tokens: 40 },
     });
-    const client = { chat: { completions: { create } } };
+    const client = { callLLM: create };
 
     await shortenInviteNoteToLimit(client, longNote, 200, 2, 'user-1', 'sess-1');
 
-    expect(meterUserUsage).toHaveBeenCalledTimes(1);
-    expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-1',
-      sessionId: 'sess-1',
-      model: 'gemini-3.5-flash',
-      provider: 'gemini',
-      feature: 'invite_note_shorten',
-      inputTokens: 120,
-      outputTokens: 40,
-    }));
+    expect(create).toHaveBeenCalledWith(
+      'gemini-3.5-flash',
+      expect.any(Array),
+      expect.objectContaining({
+        usageContext: {
+          userId: 'user-1',
+          sessionId: 'sess-1',
+          feature: 'invite_note_shorten',
+        },
+        taskClass: 'content_generation',
+      }),
+    );
   });
 
-  it('does not meter when the response carries no usage', async () => {
+  it('does not require usage metadata from the gateway response', async () => {
     const longNote = 'x'.repeat(260);
     const shortNote = 'Fang, fits fine.';
     const { client } = makeClient([json(shortNote)]);
 
     await shortenInviteNoteToLimit(client, longNote, 200, 2, 'user-1', 'sess-1');
 
-    expect(meterUserUsage).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
   });
 });
