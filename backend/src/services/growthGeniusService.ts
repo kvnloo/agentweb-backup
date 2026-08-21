@@ -91,7 +91,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         ], {
           max_completion_tokens: 20,
           usageContext: { userId, feature: 'growth_genius_title' },
-          taskClass: 'scheduled_background',
+          taskClass: 'interactive_chat',
         });
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
@@ -152,7 +152,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         tool_choice: 'auto',
           max_completion_tokens: 1500,
           usageContext: { userId, feature: 'growth_genius' },
-          taskClass: 'scheduled_background',
+          taskClass: 'interactive_chat',
         });
 
       const responseMessage = response.choices[0].message;
@@ -221,7 +221,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
           ], {
             max_completion_tokens: 1500,
             usageContext: { userId, feature: 'growth_genius' },
-            taskClass: 'scheduled_background',
+            taskClass: 'interactive_chat',
           });
 
         const finalContent = finalResponse.choices[0]?.message?.content || 'Sorry, I could not generate a response.';

@@ -93,7 +93,6 @@ const ALLOWLIST = new Set<string>([
   // Transitional, inventory-owned direct text routes; not permanent exceptions.
   'services/chatbotService.ts',
   'services/codingAgentService.ts',
-  'loops/instances/ai-eval-funnel/rcaEnricher.ts',
 ]);
 
 const DIRECT_PYTHON_TEXT_PROVIDER_MODULES = [

@@ -210,7 +210,7 @@ If creating a new task, provide a prompt that describes what the task should do.
       tools: [{ type: 'function', function: functionDefinition }],
       tool_choice: { type: 'function', function: { name: 'generate_workflow' } },
       usageContext: { userId, feature: 'workflow_gen' },
-      taskClass: 'scheduled_background',
+      taskClass: 'content_generation',
     },
   );
 
@@ -275,7 +275,7 @@ export async function generateWorkflowFromDescription(
         temperature: 0.7,
         max_completion_tokens: 150,
         usageContext: { userId, feature: 'workflow_explain' },
-        taskClass: 'scheduled_background',
+        taskClass: 'content_generation',
       },
     );
 

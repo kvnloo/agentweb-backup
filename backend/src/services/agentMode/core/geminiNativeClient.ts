@@ -589,14 +589,17 @@ export interface GeminiNativeClientDeps {
  * gemini branch of callLLM.
  */
 export function createGeminiNativeClient(deps: GeminiNativeClientDeps): {
-  chat: { completions: { create: (params: OpenAIChatParams) => Promise<any> } };
+  chat: { completions: { create: (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => Promise<any> } };
 } {
   return {
     chat: {
       completions: {
-        create: async (params: OpenAIChatParams) => {
+        create: async (params: OpenAIChatParams, requestOptions?: { timeout?: number }) => {
           const client = await deps.getClient();
-          const req = toGeminiRequest(params, { defaultMaxTokens: deps.defaultMaxTokens });
+          const req = toGeminiRequest(params, {
+            defaultMaxTokens: deps.defaultMaxTokens,
+            requestTimeoutMs: requestOptions?.timeout,
+          });
           const resp = await client.models.generateContent(req);
           return fromGeminiResponse(resp);
         },

@@ -6,14 +6,27 @@ const SRC_ROOT = path.join(__dirname, '..');
 const read = (relativePath: string): string =>
   fs.readFileSync(path.join(SRC_ROOT, relativePath), 'utf8');
 
+const FORBIDDEN_TEXT_PROVIDER_PATHS = [
+  /getAzureClient/,
+  /getGeminiClient/,
+  /getClientForModel/,
+  /getBedrockClient/,
+  /meterUsageFromResponse/,
+  /BedrockRuntimeClient/,
+  /AzureChatOpenAI/,
+  /ChatBedrockConverse/,
+  /\.chat\.completions\.create\(/,
+  /\.models\.generateContent\(/,
+] as const;
+
 const assertUsesSharedGatewayOnly = (
   files: readonly string[],
-  forbidden: readonly RegExp[],
 ): void => {
   const offenders: string[] = [];
   for (const file of files) {
     const source = read(file);
-    for (const pattern of forbidden) {
+    if (!/\.callLLM\s*\(/.test(source)) offenders.push(`${file}: missing callLLM`);
+    for (const pattern of FORBIDDEN_TEXT_PROVIDER_PATHS) {
       if (pattern.test(source)) offenders.push(`${file}: ${pattern}`);
     }
   }
@@ -31,11 +44,6 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
       'services/growthGeniusService.ts',
       'services/reportRevisionService.ts',
       'services/inviteNoteShortener.ts',
-    ], [
-      /getAzureClient/,
-      /getGeminiClient/,
-      /meterUsageFromResponse/,
-      /\.chat\.completions\.create\(/,
     ]);
   });
 
@@ -43,10 +51,6 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
     assertUsesSharedGatewayOnly([
       'controllers/blog.ts',
       'routes/slack.ts',
-    ], [
-      /getGeminiClient/,
-      /\.models\.generateContent\(/,
-      /meterUsageFromResponse/,
     ]);
   });
 
@@ -56,18 +60,33 @@ describe('ENG-1431 OpenRouter B2 cutover', () => {
       'services/enrichmentFieldAliasService.ts',
       'services/enrichmentClusterService.ts',
       'loops/instances/ai-eval-funnel/rcaEnricher.ts',
-      'utils/llmService.ts',
-    ], [
-      /getClientForModel/,
-      /getBedrockClient/,
-      /meterUsageFromResponse/,
-      /BedrockRuntimeClient/,
-      /AzureChatOpenAI/,
-      /ChatBedrockConverse/,
     ]);
+
+    // llmService retains exactly one provider-native web-search method until
+    // ENG-1432 proves the OpenRouter web plugin; its ordinary path is callLLM.
+    const sharedService = read('utils/llmService.ts');
+    expect(sharedService).toMatch(/\.callLLM\s*\(/);
+    expect(sharedService.match(/\.models\.generateContent\s*\(/g)).toHaveLength(1);
+    for (const pattern of FORBIDDEN_TEXT_PROVIDER_PATHS.filter(
+      (candidate) => String(candidate) !== String(/\.models\.generateContent\(/),
+    )) {
+      expect(sharedService).not.toMatch(pattern);
+    }
   });
 
   it('keeps the documented Gemini Live voice exception outside the text gateway', () => {
-    expect(read('services/liveVoiceService.ts')).toContain('ai.live.connect');
+    const source = read('services/liveVoiceService.ts');
+    expect(source).toMatch(/\.live\.connect\s*\(/);
+    for (const pattern of FORBIDDEN_TEXT_PROVIDER_PATHS) {
+      expect(source).not.toMatch(pattern);
+    }
+  });
+
+  it('propagates caller timeouts through every provider wrapper', () => {
+    const agentModeService = read('services/agentModeService.ts');
+    const geminiNativeClient = read('services/agentMode/core/geminiNativeClient.ts');
+    expect(geminiNativeClient).toMatch(/requestTimeoutMs:\s*requestOptions\?\.timeout/);
+    expect(agentModeService).toMatch(/setTimeout\([\s\S]{0,100}requestOptions\?\.timeout\s*\?\?\s*VERTEX_REQUEST_TIMEOUT_MS/);
+    expect(agentModeService).toMatch(/AbortSignal\.timeout\(requestOptions\?\.timeout\s*\?\?\s*BEDROCK_REQUEST_TIMEOUT_MS\)/);
   });
 });

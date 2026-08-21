@@ -2153,7 +2153,7 @@ export class AgentModeService {
           _projectId: projectId,
           chat: {
             completions: {
-              create: async (params: any) => {
+              create: async (params: any, requestOptions?: { timeout?: number }) => {
                 const token = await auth.getAccessToken();
                 const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
 
@@ -2229,7 +2229,10 @@ export class AgentModeService {
                 }
 
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), VERTEX_REQUEST_TIMEOUT_MS);
+                const timeout = setTimeout(
+                  () => controller.abort(),
+                  requestOptions?.timeout ?? VERTEX_REQUEST_TIMEOUT_MS,
+                );
                 let response: Response;
                 try {
                   response = await fetch(url, {
@@ -2394,7 +2397,6 @@ export class AgentModeService {
         authSchemePreference: ['httpBearerAuth'],
         requestHandler: {
           connectionTimeout: 10_000,
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     } else {
@@ -2412,7 +2414,6 @@ export class AgentModeService {
         } : undefined,
         requestHandler: {
           connectionTimeout: 10_000, // 10s to establish connection
-          requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
         } as any,
       });
     }
@@ -2436,7 +2437,7 @@ export class AgentModeService {
     return {
       chat: {
         completions: {
-          create: async (params: any) => {
+          create: async (params: any, requestOptions?: { timeout?: number }) => {
             // Convert OpenAI messages to Bedrock Converse format
             const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
 
@@ -2495,7 +2496,7 @@ export class AgentModeService {
             });
 
             const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+              abortSignal: AbortSignal.timeout(requestOptions?.timeout ?? BEDROCK_REQUEST_TIMEOUT_MS),
             });
 
             // Extract response content
