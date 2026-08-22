@@ -129,9 +129,9 @@ describe('evaluateAdConnectivity', () => {
   const futureExpiry = Date.now() + 30 * 24 * 60 * 60 * 1000;
   const pastExpiry = Date.now() - 1000;
 
-  it('flags an account with no ad-platform connections at all (ThinkingAI failure mode)', () => {
+  it('does not flag an account with no ad-platform connection until the caller establishes paid-ads intent', () => {
     const result = evaluateAdConnectivity([]);
-    expect(result.flagged).toBe(true);
+    expect(result.flagged).toBe(false);
     expect(result.reason).toMatch(/no.*ad.*platform/i);
   });
 
@@ -150,11 +150,11 @@ describe('evaluateAdConnectivity', () => {
     expect(result.flagged).toBe(false);
   });
 
-  it('ignores non-ad-platform connections (e.g. gmail, linkedin organic) when deciding connectivity', () => {
+  it('does not flag non-ad-platform connections (e.g. gmail, linkedin organic) as an ad failure', () => {
     const result = evaluateAdConnectivity([
       { platform: 'gmail', config: { token_expires_at: futureExpiry } } as any,
     ]);
-    expect(result.flagged).toBe(true);
+    expect(result.flagged).toBe(false);
   });
 
   it('is healthy when at least one of several ad platforms is connected, even if another expired', () => {
@@ -210,15 +210,15 @@ describe('evaluateAccountHealth (composition, no false positives)', () => {
     expect(result.flags.map((f) => f.check)).toEqual(['budget']);
   });
 
-  it('flags exactly the failing check when only connectivity fails (ThinkingAI/TransAmerica reconstruction)', () => {
+  it('does not mark connectivity unhealthy solely because an account has not configured ads', () => {
     const result = evaluateAccountHealth({
-      userId: 'user-thinkingai',
+      userId: 'user-without-ads',
       pixel: { blackouts: 0, destinationAlerts: 0, destinationOk: 0 },
       budget: { configuredCapCents: 0, actualSpendCents: 0 },
       connectedAccounts: [],
     });
-    expect(result.flagged).toBe(true);
-    expect(result.flags.map((f) => f.check)).toEqual(['connectivity']);
+    expect(result.flagged).toBe(false);
+    expect(result.flags).toEqual([]);
   });
 
   it('flags multiple checks at once when more than one signal is bad', () => {
@@ -229,6 +229,6 @@ describe('evaluateAccountHealth (composition, no false positives)', () => {
       connectedAccounts: [],
     });
     expect(result.flagged).toBe(true);
-    expect(result.flags.map((f) => f.check).sort()).toEqual(['budget', 'connectivity', 'pixel']);
+    expect(result.flags.map((f) => f.check).sort()).toEqual(['budget', 'pixel']);
   });
 });
