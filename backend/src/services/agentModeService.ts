@@ -29,11 +29,7 @@ import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFa
 import { ScheduledRunPreCheckLLMResult } from '../utils/scheduledRunPreCheck';
 import { computeTermination } from './agentMode/core/agentStep';
 import { ANTI_LOOP_STOP_MESSAGE } from './agentMode/core/termination';
-import {
-  createGeminiNativeClient,
-  normalizeProviderRequestTimeoutMs,
-  sanitizeGeminiSchema,
-} from './agentMode/core/geminiNativeClient';
+import { sanitizeGeminiSchema } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
@@ -85,7 +81,6 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
-import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
   costScoreFromPrice,
@@ -115,7 +110,6 @@ import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
   applyOpenRouterCacheBreakpoints,
-  isOpenRouterGatewayEnabledForTaskClass,
   resolveOpenRouterUpstreamModelId,
   type GatewayTaskClass,
 } from '../utils/openRouterGatewayContract';
@@ -1228,19 +1222,18 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
   // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
-  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
-  // default AWS account and reachable ONLY through the bearer-token account, so it
-  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // is a capability upgrade at no cost change. Its selected provider is now
+  // owned by OpenRouter rather than by an AgentWeb Bedrock account.
   // This literal is the last-resort fallback; the effective default is the
   // `agent_mode_default_model` setting when one is configured (getDefaultModel).
   // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
-  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
+  // dropped every chat onto a GPT route instead of the intended Claude.
   // 2026-08-19 (Harsha, live picker review): Auto/default moved off Opus,
   // through GLM 5.2 and GPT-5.6 Luna, to Gemini 3.7 Flash — Google's newest
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
   // direct rate — not a multi-provider OpenRouter blend), and it dominates
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
+  default_model: string = 'gemini-3.7-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -2030,99 +2023,13 @@ export class AgentModeService {
     return null;
   }
 
-  // Helper method to create Azure OpenAI client for a specific deployment
-  private getAzureOpenAIClient(deploymentName: string): OpenAI {
-    return new OpenAI({
-      apiKey: process.env.AZURE_OPENAI_API_KEY,
-      baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${deploymentName}`,
-      defaultQuery: {
-        "api-version": process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || process.env.AZURE_OPENAI_API_VERSION || "2025-01-01-preview",
-      },
-      defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-    });
-  }
-
-  private gemini_client: OpenAI | null = null;
-  private gemini_client_promise: Promise<OpenAI> | null = null;
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
-  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
-  // calls use. It filters chain-of-thought at the source (thinkingConfig.
-  // includeThoughts=false + part.thought), so no reasoning leak is possible by
-  // construction — no heuristic, no fallback transport that could reintroduce it.
-  private gemini_native_client: any | null = null;
-  private gemini_native_sdk_promise: Promise<any> | null = null;
-  private gemini_api_key_promise: Promise<string> | null = null;
-
-  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
-  private async getGeminiApiKey(): Promise<string> {
-    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
-    this.gemini_api_key_promise = (async () => {
-      let geminiApiKey = process.env.GEMINI_API_KEY;
-      if (!geminiApiKey) {
-        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
-      }
-      if (!geminiApiKey || !geminiApiKey.trim()) {
-        throw new Error('Gemini API key is empty or not found in env/secrets');
-      }
-      return geminiApiKey.trim();
-    })().catch((err) => {
-      this.gemini_api_key_promise = null; // allow retry on transient secret failures
-      throw err;
-    });
-    return this.gemini_api_key_promise;
-  }
-
-  // Helper method to get Gemini client (lazy-loaded from secrets manager)
-  public async getGeminiClient(): Promise<OpenAI> {
-    // Return cached client if available
-    if (this.gemini_client) {
-      return this.gemini_client;
-    }
-
-    // If already initializing, wait for that promise
-    if (this.gemini_client_promise) {
-      return this.gemini_client_promise;
-    }
-
-    // Initialize client
-    this.gemini_client_promise = (async () => {
-      try {
-        let geminiApiKey = process.env.GEMINI_API_KEY;
-
-        if (!geminiApiKey) {
-          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-          const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
-          geminiApiKey = await getSecret(geminiSecretName);
-        }
-
-        if (!geminiApiKey || !geminiApiKey.trim()) {
-          throw new Error('Gemini API key is empty or not found in env/secrets');
-        }
-
-        this.gemini_client = new OpenAI({
-          apiKey: geminiApiKey.trim(),
-          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
-        });
-
-        return this.gemini_client;
-      } catch (error) {
-        console.error('Error initializing Gemini client:', error);
-        this.gemini_client_promise = null; // Reset promise on error
-        throw error;
-      }
-    })();
-
-    return this.gemini_client_promise;
-  }
-
-  // ENG-9: OpenRouter is an OpenAI-compatible endpoint, so it uses the exact same
-  // lazy-load/cache shape as getGeminiClient — no new abstraction, just another
-  // baseURL. HTTP-Referer/X-Title identify the app for OpenRouter's own analytics
+  // OpenRouter is an OpenAI-compatible endpoint. HTTP-Referer/X-Title identify
+  // the app for OpenRouter's own analytics
   // (openrouter.ai/docs/app-attribution); they carry no auth meaning.
   public async getOpenRouterClient(): Promise<OpenAI> {
     if (this.openrouter_client) {
@@ -2169,924 +2076,9 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
-  /**
-   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
-   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
-   * Unlike the compat endpoint, this filters chain-of-thought natively
-   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
-   * structurally, not via a heuristic. This is the only transport agent-mode
-   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
-   * endpoint, because that endpoint flattens thought parts into plain text and
-   * reintroduces the exact leak this client exists to prevent.
-   */
-  public getGeminiNativeClient(): any {
-    if (this.gemini_native_client) return this.gemini_native_client;
-    this.gemini_native_client = createGeminiNativeClient({
-      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
-      getClient: () => {
-        // Cache the SDK client so each agent turn reuses it (the key fetch is
-        // already cached); reset the promise on failure so a transient secret
-        // error can be retried.
-        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
-        this.gemini_native_sdk_promise = (async () => {
-          const { GoogleGenAI } = await import('@google/genai');
-          const apiKey = await this.getGeminiApiKey();
-          return new GoogleGenAI({ apiKey });
-        })().catch((err) => {
-          this.gemini_native_sdk_promise = null;
-          throw err;
-        });
-        return this.gemini_native_sdk_promise;
-      },
-    });
-    return this.gemini_native_client;
-  }
-
-  public async getVertexClient(modelId: string): Promise<any> {
-    if (this.vertex_client) return this.vertex_client;
-    if (this.vertex_client_promise) return this.vertex_client_promise;
-
-    this.vertex_client_promise = (async () => {
-      try {
-        const { GoogleAuth } = await import('google-auth-library');
-        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-        const secretString = await getSecret(`${environment}/AgentWeb/Google/Vertex`);
-        const credentials = JSON.parse(secretString);
-        const auth = new GoogleAuth({
-          credentials,
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-        });
-        const projectId = credentials.project_id;
-        const VERTEX_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-
-        const client = {
-          _auth: auth,
-          _projectId: projectId,
-          chat: {
-            completions: {
-              create: async (params: any, requestOptions?: { timeout?: number }) => {
-                const token = await auth.getAccessToken();
-                const url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/global/publishers/anthropic/models/${modelId}:rawPredict`;
-
-                // Convert OpenAI-format messages to Anthropic format
-                const systemParts: string[] = [];
-                const messages: any[] = [];
-                for (const msg of params.messages) {
-                  if (msg.role === 'system') {
-                    systemParts.push(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
-                  } else if (msg.role === 'assistant') {
-                    const content: any[] = [];
-                    if (msg.content) {
-                      const text = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-                      if (text) content.push({ type: 'text', text });
-                    }
-                    // Convert OpenAI tool_calls → Anthropic tool_use blocks
-                    if (Array.isArray(msg.tool_calls)) {
-                      for (const tc of msg.tool_calls) {
-                        content.push({
-                          type: 'tool_use',
-                          id: tc.id,
-                          name: tc.function.name,
-                          input: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
-                        });
-                      }
-                    }
-                    if (content.length > 0) messages.push({ role: 'assistant', content });
-                  } else if (msg.role === 'user') {
-                    // Convert OpenAI-style content (incl. image_url blocks) to Anthropic-native
-                    // blocks. Passing image_url through verbatim triggers a Vertex 400.
-                    const content = AgentModeService.convertContentToAnthropicBlocks(msg.content);
-                    messages.push({ role: 'user', content });
-                  } else if (msg.role === 'tool') {
-                    // Append tool result to the last user message or create a new one
-                    const toolResult = {
-                      type: 'tool_result',
-                      tool_use_id: msg.tool_call_id,
-                      content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-                    };
-                    const lastMsg = messages[messages.length - 1];
-                    if (lastMsg?.role === 'user') {
-                      lastMsg.content.push(toolResult);
-                    } else {
-                      messages.push({ role: 'user', content: [toolResult] });
-                    }
-                  }
-                }
-
-                // Merge consecutive same-role messages (Anthropic requires alternating roles)
-                const merged: any[] = [];
-                for (const msg of messages) {
-                  const prev = merged[merged.length - 1];
-                  if (prev && prev.role === msg.role) {
-                    prev.content = [...prev.content, ...msg.content];
-                  } else {
-                    merged.push({ ...msg, content: [...msg.content] });
-                  }
-                }
-
-                const body: any = {
-                  anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
-                  messages: merged,
-                };
-                if (systemParts.length > 0) body.system = systemParts.join('\n');
-                if (params.temperature !== undefined) body.temperature = params.temperature;
-                if (params.tools && params.tools.length > 0) {
-                  body.tools = params.tools.map((t: any) => ({
-                    name: t.function.name,
-                    description: t.function.description || t.function.name,
-                    input_schema: t.function.parameters,
-                  }));
-                }
-
-                const controller = new AbortController();
-                const timeout = setTimeout(
-                  () => controller.abort(),
-                  normalizeProviderRequestTimeoutMs(
-                    requestOptions?.timeout,
-                    VERTEX_REQUEST_TIMEOUT_MS,
-                  ),
-                );
-                let response: Response;
-                try {
-                  response = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                      'Authorization': `Bearer ${token}`,
-                      'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(body),
-                    signal: controller.signal,
-                  });
-                } finally {
-                  clearTimeout(timeout);
-                }
-
-                if (!response.ok) {
-                  const errText = await response.text();
-                  const err: any = new Error(`Vertex AI error ${response.status}: ${errText}`);
-                  err.status = response.status;
-                  throw err;
-                }
-
-                const data: any = await response.json();
-
-                // Convert Anthropic response format to OpenAI format
-                let messageContent = '';
-                let toolCalls: any[] | null = null;
-                if (data.content) {
-                  const textParts: string[] = [];
-                  const toolUseParts: any[] = [];
-                  for (const block of data.content) {
-                    if (block.type === 'text') {
-                      textParts.push(block.text);
-                    } else if (block.type === 'tool_use') {
-                      toolUseParts.push({
-                        id: block.id,
-                        type: 'function',
-                        function: {
-                          name: block.name,
-                          arguments: JSON.stringify(block.input),
-                        },
-                      });
-                    }
-                  }
-                  messageContent = textParts.join('\n');
-                  if (toolUseParts.length > 0) toolCalls = toolUseParts;
-                }
-
-                const usage = data.usage || {};
-                // A max_tokens stop with a tool_use block means the tool call
-                // was truncated mid-argument (e.g. create_html_file's large
-                // content_draft), so its JSON is incomplete and would fail
-                // schema validation with a dropped required arg — the ENG-403
-                // "content_draft is required" retry loop. Do NOT surface it as a
-                // completed tool_calls finish; report finish_reason='length'
-                // with no tool_calls so the main loop's max-tokens continuation
-                // path asks the model to continue.
-                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
-                return {
-                  choices: [{
-                    message: {
-                      role: 'assistant',
-                      content: messageContent || null,
-                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
-                    },
-                    finish_reason: data.stop_reason === 'max_tokens'
-                      ? 'length'
-                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
-                    stop_reason: data.stop_reason,
-                  }],
-                  usage: {
-                    prompt_tokens: usage.input_tokens || 0,
-                    completion_tokens: usage.output_tokens || 0,
-                    total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
-                  },
-                };
-              },
-            },
-          },
-        };
-
-        this.vertex_client = client;
-        return client;
-      } catch (error) {
-        console.error('Error initializing Vertex AI client:', error);
-        this.vertex_client_promise = null;
-        throw error;
-      }
-    })();
-
-    return this.vertex_client_promise;
-  }
-
-  public async getClientForModel(model: string): Promise<any> {
-    if (model.startsWith('anthropic.')) {
-      return this.getBedrockClient(model);
-    }
-    if (model.startsWith('gpt-')) {
-      return this.getAzureOpenAIClient(model);
-    }
-    if (model.startsWith('claude-')) {
-      return this.getVertexClient(model);
-    }
-    // ENG-9: openrouter/<provider>/<model> — the suffix after the prefix passes
-    // straight through as OpenRouter's own model id, so no per-model registry
-    // churn is needed to reach a new upstream model.
-    if (model.startsWith('openrouter/')) {
-      return this.getOpenRouterClient();
-    }
-    return this.getGeminiClient();
-  }
-
-  /**
-   * ENG-893: models that have already reported a TTL other than the one we
-   * asked for. Log-once, so a persistent downgrade does not spam every turn.
-   */
-  private static readonly cacheTtlDowngradeWarned = new Set<string>();
-
-  /** Test seam — reset the log-once guard. */
-  public static __resetCacheTtlDowngradeWarnsForTests(): void {
-    AgentModeService.cacheTtlDowngradeWarned.clear();
-  }
-
-  private static warnCacheTtlDowngradeOnce(
-    modelId: string,
-    requestedTtl: string,
-    appliedTtls: string[]
-  ): void {
-    if (AgentModeService.cacheTtlDowngradeWarned.has(modelId)) return;
-    AgentModeService.cacheTtlDowngradeWarned.add(modelId);
-    console.warn(
-      `AgentMode: Bedrock did NOT honour the requested prompt-cache TTL for "${modelId}" ` +
-        `— asked for '${requestedTtl}', got '${appliedTtls.join(',') || 'none'}'. ` +
-        `Cost is still billed at the applied rate, but the extended-TTL saving is not being realised: ` +
-        `remove this model from BEDROCK_EXTENDED_CACHE_TTL_MODELS (ENG-893).`
-    );
-  }
-
-  public async getBedrockClient(modelId: string): Promise<any> {
-    // Use the Bedrock Converse API directly (instead of LangChain) to support
-    // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
-    // input token costs by caching the system prompt and conversation prefix.
-    const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
-
-    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
-    const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
-
-    // Opus 4.8 is served from a separate AWS account (231030591963) that the app's
-    // default IAM credentials (992382574572) cannot reach. Authenticate that model
-    // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
-    // dedicated client so all other models keep using the default credential chain.
-    // Models served from the separate Bedrock account (231030591963) reached via
-    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
-    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
-    let bedrockClient: any;
-    if (usesBearerToken) {
-      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-      const bearerToken = (await getSecret(`${environment}/AgentWeb/Bedrock/ApiKey`)).trim();
-      bedrockClient = new BedrockRuntimeClient({
-        region,
-        token: { token: bearerToken },
-        authSchemePreference: ['httpBearerAuth'],
-        requestHandler: {
-          connectionTimeout: 10_000,
-        } as any,
-      });
-    } else {
-      // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
-      // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
-      // SDK would otherwise default to bearer-first auth and send that token —
-      // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
-      // 403ing models like Sonnet/Opus 4.6 that live in the default account.
-      bedrockClient = new BedrockRuntimeClient({
-        region,
-        authSchemePreference: ['sigv4'],
-        credentials: process.env.AWS_ACCESS_KEY_ID ? {
-          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-        } : undefined,
-        requestHandler: {
-          connectionTimeout: 10_000, // 10s to establish connection
-        } as any,
-      });
-    }
-
-    // Map certain model IDs to their corresponding inference profile ARNs
-    // Note: Newer Claude models require using inference profiles for cross-region access
-    const actualModelId = resolveBedrockModelId(modelId);
-
-    // ENG-893: human-paced conversations idle past the default 5-minute
-    // prompt-cache TTL between turns, re-writing the whole prefix at 1.25x
-    // input instead of reading it back at 0.1x. Ask for the 1-hour TTL on the
-    // models we have verified honour it. Bedrock does NOT reject an unsupported
-    // `ttl`, so the allowlist guards against silent mispricing, not a crash.
-    //
-    // Resolved PER CALL, never captured here: this client is memoised on the
-    // model registry and shared by every session in the process, so a TTL baked
-    // into the closure would leak one session's pacing to all the others.
-    const modelSupportsExtendedTtl = bedrockCacheTtl(modelId);
-
-    // Create OpenAI-compatible wrapper using direct Converse API
-    return {
-      chat: {
-        completions: {
-          create: async (params: any, requestOptions?: { timeout?: number }) => {
-            // Convert OpenAI messages to Bedrock Converse format
-            const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
-
-            // ENG-893: a 1-hour write costs 2x input where a 5-minute write
-            // costs 1.25x, and a cache HIT refreshes the TTL for free. So the
-            // extended TTL only pays for itself when turns are far enough apart
-            // to have expired the 5-minute window. Machine-paced runs (scheduled
-            // reports, loops) fire their turns back-to-back and never expire it,
-            // so asking for 1h there is a pure 60% surcharge on every write —
-            // measured at +43% of cache-write spend across the ten costliest
-            // scheduled sessions. This mirrors AWS's own guidance: keep the
-            // 5-minute cache for prompts reused more often than every 5 minutes.
-            const cacheTtl = params.humanPaced ? modelSupportsExtendedTtl : undefined;
-            // A fresh object per call site: the two checkpoints must not alias.
-            const cachePointBlock = () => ({
-              cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
-            });
-
-            // --- Prompt caching ---
-            // Add cache point after system prompt (~3.5K tokens cached on every call)
-            if (system.length > 0) {
-              system.push(cachePointBlock());
-            }
-            // Add cache point before the last message to cache the conversation prefix.
-            // Within the tool-call iteration loop, each subsequent call only pays full
-            // price for the newest exchange; all prior turns hit the cache.
-            // Both checkpoints carry the SAME ttl: Bedrock requires longer-TTL
-            // checkpoints to precede shorter ones, and mixing them here would
-            // leave the (much larger) history on the 5-minute expiry anyway.
-            if (messages.length > 2) {
-              const pivotMsg = messages[messages.length - 2];
-              pivotMsg.content = [...pivotMsg.content, cachePointBlock()];
-            }
-
-            // Convert tools to Bedrock toolConfig format
-            const toolConfig = params.tools && params.tools.length > 0 ? {
-              tools: params.tools.map((tool: any) => ({
-                toolSpec: {
-                  name: tool.function.name,
-                  description: tool.function.description || tool.function.name,
-                  inputSchema: { json: AgentModeService.sanitizeSchemaForBedrock(tool.function.parameters) },
-                }
-              }))
-            } : undefined;
-
-            // Send the Converse request
-            const command = new ConverseCommand({
-              modelId: actualModelId,
-              system,
-              messages,
-              ...(toolConfig && { toolConfig }),
-              inferenceConfig: {
-                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
-                ...(params.temperature !== undefined && { temperature: params.temperature }),
-              },
-            });
-
-            const response = await bedrockClient.send(command, {
-              abortSignal: AbortSignal.timeout(normalizeProviderRequestTimeoutMs(
-                requestOptions?.timeout,
-                BEDROCK_REQUEST_TIMEOUT_MS,
-              )),
-            });
-
-            // Extract response content
-            const outputMessage = response.output?.message;
-            let messageContent = '';
-            let toolCalls: any[] | null = null;
-
-            if (outputMessage?.content) {
-              const textParts: string[] = [];
-              const toolUseParts: any[] = [];
-
-              for (const block of outputMessage.content) {
-                if ('text' in block && block.text) {
-                  textParts.push(block.text);
-                } else if ('toolUse' in block && block.toolUse) {
-                  toolUseParts.push({
-                    id: block.toolUse.toolUseId || `call_${Date.now()}_${toolUseParts.length}`,
-                    type: 'function',
-                    function: {
-                      name: block.toolUse.name,
-                      arguments: JSON.stringify(block.toolUse.input),
-                    },
-                  });
-                }
-              }
-
-              messageContent = textParts.join('\n');
-              if (toolUseParts.length > 0) {
-                toolCalls = toolUseParts;
-              }
-            }
-
-            // Extract usage — includes cache metrics when prompt caching is active
-            const usage = response.usage || {} as any;
-            const inputTokens = usage.inputTokens || 0;
-            const outputTokens = usage.outputTokens || 0;
-            const cacheReadTokens = usage.cacheReadInputTokens || 0;
-            const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
-
-            // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
-            // actually applied. It is both the prod-log proof that the 1-hour
-            // checkpoint was honoured rather than silently ignored, AND what the
-            // ledger bills against — asking for `ttl: '1h'` does not guarantee
-            // getting it, so we price what came back.
-            const cacheWriteByTtl: Record<string, number> | undefined =
-              Array.isArray(usage.cacheDetails) && usage.cacheDetails.length > 0
-                ? usage.cacheDetails.reduce((acc: Record<string, number>, d: any) => {
-                    const ttl = typeof d?.ttl === 'string' ? d.ttl : undefined;
-                    const tokens = Number(d?.inputTokens) || 0;
-                    if (ttl && tokens > 0) acc[ttl] = (acc[ttl] || 0) + tokens;
-                    return acc;
-                  }, {})
-                : undefined;
-
-            // ENG-893: we allowlist the 1-hour TTL per model from live probes,
-            // and for Sonnet 4.6 / Opus 4.6 those probes contradict AWS's
-            // published "5 minutes only" table. Billing is already safe either
-            // way (we charge the TTL that came back), but a silent downgrade
-            // would quietly cost us the savings — so say so, once per model,
-            // rather than assuming the measurement holds forever.
-            if (cacheTtl && cacheWriteByTtl && !cacheWriteByTtl[cacheTtl]) {
-              AgentModeService.warnCacheTtlDowngradeOnce(
-                modelId,
-                cacheTtl,
-                Object.keys(cacheWriteByTtl)
-              );
-            }
-
-            if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
-              const ttlBreakdown = Object.entries(cacheWriteByTtl || {})
-                .map(([ttl, tokens]) => `${ttl}:${tokens}`)
-                .join(',');
-              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}${ttlBreakdown ? ` (${ttlBreakdown})` : ''}, uncached input: ${inputTokens}, output: ${outputTokens}`);
-            }
-
-            const stopReason: string = response.stopReason || '';
-
-            // A max_tokens stop with a tool_use block means the tool call was
-            // truncated mid-argument (e.g. create_html_file's content_draft),
-            // so its JSON is incomplete and would fail schema validation with a
-            // dropped required arg — the ENG-403 "content_draft is required"
-            // retry loop. Do NOT surface it as a completed tool_calls finish;
-            // report finish_reason='length' with no tool_calls so the main
-            // loop's max-tokens continuation path asks the model to continue.
-            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
-
-            // Convert response to OpenAI format
-            return {
-              id: `bedrock-${Date.now()}`,
-              object: 'chat.completion',
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{
-                index: 0,
-                message: {
-                  role: 'assistant',
-                  content: messageContent,
-                  tool_calls: truncatedToolCall ? null : toolCalls,
-                },
-                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
-                stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
-              }],
-              usage: {
-                prompt_tokens: inputTokens,
-                completion_tokens: outputTokens,
-                total_tokens: inputTokens + outputTokens,
-                cache_read_input_tokens: cacheReadTokens,
-                cache_creation_input_tokens: cacheWriteTokens,
-                // ENG-893: the TTL Bedrock actually applied per write bucket, so
-                // cost is billed at the honoured rate rather than the one we asked
-                // for. Undefined when the response carried no breakdown.
-                cache_creation_by_ttl: cacheWriteByTtl,
-              },
-            };
-          },
-        },
-      },
-    };
-  }
-
-  /**
-   * Sanitize a JSON Schema for Bedrock Converse API compatibility.
-   * Bedrock rejects schemas with anyOf/oneOf/allOf, $schema, const, $ref/$defs.
-   * anyOf/oneOf with const values are flattened to enum; others are stripped.
-   */
-  static sanitizeSchemaForBedrock(schema: any): any {
-    if (!schema || typeof schema !== 'object') return schema;
-
-    const sanitizeNode = (node: any): any => {
-      if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
-
-      const result: any = {};
-
-      for (const [key, value] of Object.entries(node)) {
-        // Drop JSON Schema meta fields and unsupported keywords
-        if (key === '$schema' || key === '$defs' || key === '$ref' || key === 'const') continue;
-
-        if ((key === 'anyOf' || key === 'oneOf') && Array.isArray(value)) {
-          // If all branches are {type: string, const: X}, flatten to enum
-          const consts = (value as any[]).filter((b: any) => b && b.const !== undefined).map((b: any) => b.const);
-          const nonConst = (value as any[]).filter((b: any) => !b || b.const === undefined);
-          if (consts.length > 0 && nonConst.length === 0) {
-            result.type = 'string';
-            result.enum = consts;
-          } else if (consts.length > 0 && nonConst.length === 1 && nonConst[0]?.type === 'string') {
-            // Mix of consts + plain string (open-ended enum): just use type string
-            result.type = 'string';
-          }
-          // else: drop the anyOf/oneOf entirely (no safe representation for Bedrock)
-          continue;
-        }
-
-        if (key === 'allOf' && Array.isArray(value)) {
-          // Merge allOf branches into the result object
-          for (const branch of value as any[]) {
-            Object.assign(result, sanitizeNode(branch));
-          }
-          continue;
-        }
-
-        if (key === 'properties' && typeof value === 'object' && value !== null) {
-          result.properties = Object.fromEntries(
-            Object.entries(value as object).map(([k, v]) => [k, sanitizeNode(v)])
-          );
-          continue;
-        }
-
-        if (key === 'items') {
-          result.items = sanitizeNode(value);
-          continue;
-        }
-
-        result[key] = value;
-      }
-
-      return result;
-    };
-
-    return sanitizeNode(schema);
-  }
-
-  /**
-   * Convert OpenAI-format messages to Bedrock Converse API format.
-   * Handles system extraction, role alternation, and tool call/result grouping.
-   */
-  static convertToBedrockConverse(openaiMessages: any[]): { system: any[], messages: any[] } {
-    const system: any[] = [];
-    const messages: any[] = [];
-
-    // Find the index of the last screenshot tool message so we only include the image
-    // for the most recent screenshot. Earlier screenshots are pruned to a text placeholder
-    // to prevent Bedrock 400 errors from request payload size exceeding limits (~6MB for 20 screenshots).
-    let lastScreenshotMsgIdx = -1;
-    for (let i = openaiMessages.length - 1; i >= 0; i--) {
-      const m = openaiMessages[i];
-      if (m.role === 'tool' && Array.isArray(m.content) &&
-          m.content.some((c: any) => c.type === 'image_url')) {
-        lastScreenshotMsgIdx = i;
-        break;
-      }
-    }
-
-    for (let msgIdx = 0; msgIdx < openaiMessages.length; msgIdx++) {
-      const msg = openaiMessages[msgIdx];
-      if (msg.role === 'system') {
-        const text = typeof msg.content === 'string'
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
-            : String(msg.content || '');
-        if (text) system.push({ text });
-        continue;
-      }
-
-      let role: string;
-      let contentBlocks: any[] = [];
-
-      if (msg.role === 'user') {
-        role = 'user';
-        contentBlocks = AgentModeService.convertContentToBedrockBlocks(msg.content);
-      } else if (msg.role === 'assistant') {
-        role = 'assistant';
-        // Text content
-        if (msg.content) {
-          const textContent = typeof msg.content === 'string'
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
-              : String(msg.content);
-          if (textContent) contentBlocks.push({ text: textContent });
-        }
-        // Tool use blocks
-        // Guard against tool_calls stored as a JSON string (legacy/corrupt data)
-        const toolCallsArray = typeof msg.tool_calls === 'string'
-          ? (() => { try { return JSON.parse(msg.tool_calls); } catch { return []; } })()
-          : msg.tool_calls;
-        if (toolCallsArray && toolCallsArray.length > 0) {
-          for (const tc of toolCallsArray) {
-            if (!tc?.function) continue;
-            let input: any;
-            try {
-              input = typeof tc.function.arguments === 'string'
-                ? JSON.parse(tc.function.arguments)
-                : tc.function.arguments;
-            } catch {
-              input = { raw: tc.function.arguments };
-            }
-            contentBlocks.push({
-              toolUse: {
-                toolUseId: tc.id,
-                name: tc.function.name,
-                input,
-              }
-            });
-          }
-        }
-        // Bedrock rejects blank text blocks — use a non-empty placeholder if the assistant
-        // message has neither text content nor tool calls (e.g. stored with empty content field).
-        if (contentBlocks.length === 0) contentBlocks.push({ text: '...' });
-      } else if (msg.role === 'tool') {
-        // Tool results become user messages with toolResult blocks
-        role = 'user';
-        // Content may be a string or a multipart array (e.g. screenshot with image)
-        let toolResultContent: any[];
-        if (Array.isArray(msg.content)) {
-          toolResultContent = [];
-          // Only include the screenshot image for the most recent screenshot message.
-          // Earlier screenshots are replaced with a text placeholder to prevent Bedrock
-          // 400 errors from accumulated base64 payloads in long sessions.
-          const includeImage = msgIdx === lastScreenshotMsgIdx;
-          for (const item of msg.content) {
-            if (item.type === 'text') {
-              toolResultContent.push({ text: item.text });
-            } else if (item.type === 'image_url') {
-              if (!includeImage) {
-                // Older screenshot — replace with text placeholder to save payload space
-                toolResultContent.push({ text: '[Screenshot captured — image omitted from context to reduce payload size]' });
-                continue;
-              }
-              const url = item.image_url?.url || '';
-              if (url.startsWith('data:')) {
-                const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
-                if (dataUriMatch) {
-                  const rawFormat = dataUriMatch[1].toLowerCase();
-                  const format = (rawFormat === 'jpg' ? 'jpeg' : rawFormat) as string;
-                  const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
-                  toolResultContent.push({
-                    image: {
-                      format: VALID_BEDROCK_FORMATS.has(format) ? format : 'jpeg',
-                      source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                    }
-                  });
-                }
-              }
-            }
-          }
-          // Bedrock rejects empty text blocks — fall back to a placeholder
-          if (toolResultContent.length === 0) toolResultContent = [{ text: '(empty)' }];
-        } else {
-          toolResultContent = [{ text: String(msg.content || '(empty)') }];
-        }
-        contentBlocks.push({
-          toolResult: {
-            toolUseId: msg.tool_call_id,
-            content: toolResultContent,
-          }
-        });
-      } else {
-        role = 'user';
-        contentBlocks = [{ text: String(msg.content || '') }];
-      }
-
-      // Merge consecutive same-role messages (required by Bedrock Converse API)
-      if (messages.length > 0 && messages[messages.length - 1].role === role) {
-        messages[messages.length - 1].content.push(...contentBlocks);
-      } else {
-        messages.push({ role, content: contentBlocks });
-      }
-    }
-
-    // Bedrock requires first message to be user role
-    if (messages.length > 0 && messages[0].role !== 'user') {
-      messages.unshift({ role: 'user', content: [{ text: '.' }] });
-    }
-
-    return { system, messages };
-  }
-
-  /**
-   * Convert OpenAI content (string, array, or object) to Bedrock content blocks.
-   */
-  private static convertContentToBedrockBlocks(content: any): any[] {
-    if (!content) return [{ text: '' }];
-    if (typeof content === 'string') return [{ text: content }];
-    if (Array.isArray(content)) {
-      const blocks: any[] = [];
-      for (const item of content) {
-        if (typeof item === 'string') {
-          blocks.push({ text: item });
-        } else if (item.type === 'text') {
-          blocks.push({ text: item.text });
-        } else if (item.type === 'image_url') {
-          const url = item.image_url?.url || '';
-          if (url.startsWith('data:')) {
-            // Support data URIs with possible extra params: data:image/png;charset=utf-8;base64,...
-            // or the standard form: data:image/png;base64,...
-            // Extract just the mime type subtype (e.g. "png", "jpeg") and the base64 data
-            const dataUriMatch = url.match(/^data:image\/([\w+]+)(?:;[^;]*)*;base64,(.+)$/s);
-            if (dataUriMatch) {
-              const rawFormat = dataUriMatch[1].toLowerCase();
-              const format = rawFormat === 'jpg' ? 'jpeg' : rawFormat;
-              const VALID_BEDROCK_FORMATS = new Set(['jpeg', 'png', 'gif', 'webp']);
-              if (VALID_BEDROCK_FORMATS.has(format)) {
-                blocks.push({
-                  image: {
-                    format,
-                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                  }
-                });
-              } else {
-                // Unsupported format — convert to JPEG-labeled generic binary; Bedrock may still handle it
-                console.warn(`AgentMode: Bedrock image format "${format}" not in valid set, trying as jpeg`);
-                blocks.push({
-                  image: {
-                    format: 'jpeg',
-                    source: { bytes: Buffer.from(dataUriMatch[2], 'base64') },
-                  }
-                });
-              }
-            } else {
-              console.warn(`AgentMode: Could not parse data URI for Bedrock image block, url prefix="${url.substring(0, 60)}"`);
-            }
-          } else if (url) {
-            blocks.push({ text: `[Image: ${url}]` });
-          }
-        } else {
-          blocks.push({ text: JSON.stringify(item) });
-        }
-      }
-      return blocks.length > 0 ? blocks : [{ text: '.' }];
-    }
-    return [{ text: String(content) }];
-  }
-
-  /**
-   * Convert OpenAI-format content (string, array, or object) to Anthropic-native
-   * content blocks.
-   *
-   * Critically, OpenAI-style `{ type: 'image_url', image_url: { url } }` blocks are
-   * converted to Anthropic `{ type: 'image', source: {...} }` blocks. The Anthropic
-   * Messages API — including Claude models served via Google Vertex AI — rejects the
-   * `image_url` tag with: 400 "Input tag 'image_url' found using 'type' does not match
-   * expected tags (image, document, ...)". Data URIs become base64 image sources;
-   * public http(s) URLs become url image sources.
-   */
-  private static convertContentToAnthropicBlocks(content: any): any[] {
-    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
-
-    const VALID_ANTHROPIC_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-    const blocks: any[] = [];
-    for (const item of content) {
-      if (typeof item === 'string') {
-        blocks.push({ type: 'text', text: item });
-      } else if (!item || typeof item !== 'object') {
-        blocks.push({ type: 'text', text: String(item ?? '') });
-      } else if (item.type === 'text') {
-        blocks.push({ type: 'text', text: item.text || '' });
-      } else if (item.type === 'image_url') {
-        const url = item.image_url?.url || '';
-        if (url.startsWith('data:')) {
-          // data:image/png;base64,... (allow extra params before ;base64,)
-          const m = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
-          if (m) {
-            let mediaType = m[1].toLowerCase();
-            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
-            if (!VALID_ANTHROPIC_MEDIA_TYPES.has(mediaType)) mediaType = 'image/jpeg';
-            blocks.push({
-              type: 'image',
-              source: { type: 'base64', media_type: mediaType, data: m[2] },
-            });
-          } else {
-            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
-          }
-        } else if (url) {
-          // Public URL — Anthropic supports url image sources directly
-          blocks.push({ type: 'image', source: { type: 'url', url } });
-        }
-      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
-        // Already an Anthropic-native block — pass through unchanged
-        blocks.push(item);
-      } else {
-        blocks.push({ type: 'text', text: JSON.stringify(item) });
-      }
-    }
-    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
-  }
-
-  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
-  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-
-  /**
-   * Ensure an image buffer is in a format the vision APIs can actually decode, and
-   * that the returned content-type matches the real bytes (ENG-370).
-   *
-   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
-   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
-   * with a generic/incorrect content-type (commonly `application/octet-stream` when
-   * the browser omits it). Both used to fail silently: the downstream block
-   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
-   * declared media type no longer matches the bytes and the API returns 400; and a
-   * non-`image/*` content-type produced a data URI the `image/` regex dropped
-   * entirely, so the model never saw the image. describe_image would then burn many
-   * retries/workarounds and still fail.
-   *
-   * This decodes the actual bytes with sharp: if they are already a native format it
-   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
-   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
-   * re-encode to their first frame — enough to describe a logo.
-   *
-   * On a decode failure it returns the input unchanged (best effort) but sets
-   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
-   * of burning vision retries on bytes no vision API can read either (ENG-370).
-   */
-  private static async normalizeImageForVision(
-    buffer: Buffer,
-    contentType: string
-  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
-    let ct = (contentType || '').toLowerCase().trim();
-    if (ct === 'image/jpg') ct = 'image/jpeg';
-    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
-      return { buffer, contentType: ct };
-    }
-    try {
-      const sharp = (await import('sharp')).default;
-      const metadata = await sharp(buffer).metadata();
-      const sharpFormatToMedia: Record<string, string> = {
-        jpeg: 'image/jpeg',
-        png: 'image/png',
-        gif: 'image/gif',
-        webp: 'image/webp',
-      };
-      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
-      if (detected) {
-        // Bytes are already vision-native; only the content-type header was wrong/missing.
-        return { buffer, contentType: detected, detectedFormat: metadata.format };
-      }
-      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
-      // sharp(buffer) reads only the first frame by default, so animated inputs
-      // collapse to a single describable frame here (no `{ animated: true }`).
-      const png = await sharp(buffer).png().toBuffer();
-      console.log(
-        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
-      );
-      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
-    } catch (err) {
-      console.error(
-        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
-        err instanceof Error ? err.message : err
-      );
-      // sharp could not decode the bytes at all — a corrupt file or a codec even
-      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
-      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
-      // Only fall back to a native default when we have no usable label at all, so a
-      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
-      return { buffer, contentType: contentType || 'image/png', undecodable: true };
-    }
-  }
-
   private llmModels: Record<string, LLMModelConfig> = {
-    // List openai models - create client dynamically for each deployment
-    // Azure OpenAI enforces a 128-tool limit per request
+    // Logical model metadata only. `callLLM` resolves every text/tool request
+    // through OpenRouter; no provider client is constructed from this registry.
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
     // gpt-5-chat-2 and gpt-5.2-chat REMOVED 2026-08-19 as part of migrating off
@@ -3100,9 +2092,9 @@ export class AgentModeService {
     // id resolves forward instead of throwing "Invalid model". Do not delete a
     // registry entry without an alias first; that was exactly the caution the
     // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
     // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
@@ -3381,8 +2373,8 @@ export class AgentModeService {
   /**
    * Resolve the model to fall back to when a requested id is unavailable.
    * Normally this is the configured default_model, but if that itself has been
-   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
-   * env override pinning a retired deployment) returning it would just re-throw
+   * removed from the allow-list (e.g. a stale legacy configuration pinning a
+   * retired model) returning it would just re-throw
    * "Invalid model" inside callLLM. Guard against that by validating the default
    * and falling back to a known-good served model otherwise (ENG-46).
    */
@@ -3445,6 +2437,12 @@ export class AgentModeService {
       throw new Error(`Invalid model '${model}'. Available models: ${availableModels}`);
     }
 
+    // Live models use WebSocket via liveVoiceService — callLLM is not applicable.
+    // Keep this exception outside the text/tool gateway contract.
+    if (this.llmModels[model].isLive) {
+      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
+    }
+
     // Extract options with defaults
     const {
       tools = null,
@@ -3455,88 +2453,60 @@ export class AgentModeService {
       response_format = null,
       usageContext = null,
       humanPaced = false,
-      taskClass,
       timeoutMs,
       fallbackModels,
     } = options || {};
 
-    // Explicit openrouter/* models and provider-independent server tools always
-    // use the gateway. Other logical IDs move when their task-class canary is on.
-    const useOpenRouterGateway = webSearch || model.startsWith('openrouter/') ||
-      isOpenRouterGatewayEnabledForTaskClass(taskClass);
-    const upstreamModel = useOpenRouterGateway
-      ? resolveOpenRouterUpstreamModelId(model)
-      : model;
+    // AgentWeb owns model selection; OpenRouter owns transport, provider
+    // throttling, and provider fallback for every text/tool call.
+    const upstreamModel = resolveOpenRouterUpstreamModelId(model);
     const params: any = {
       model: upstreamModel,
       messages: messages,
     };
-    // Provider-native clients keep their historical explicit text default.
-    // On OpenRouter, omit that no-op field unless a caller actually requests
+    // Omit the no-op text default unless a caller actually requests
     // structured JSON: require_parameters must not exclude a model such as
     // Sonar Deep Research merely because it does not advertise response_format.
-    if (!useOpenRouterGateway || response_format) {
-      params.response_format = response_format || { type: 'text' };
+    if (response_format) {
+      params.response_format = response_format;
     }
 
-    if (useOpenRouterGateway) {
-      // OpenRouter, not AgentWeb, owns upstream-provider fallback and parameter
-      // compatibility for migrated calls.
-      params.provider = { allow_fallbacks: true, require_parameters: true };
-      // OpenRouter reports its own billed amount as zero for BYOK requests even
-      // though Bedrock/Vertex still bill the underlying inference. Request the
-      // routing flag so metering can distinguish BYOK from a genuinely free
-      // OpenRouter call and fall back to our provider price book when needed.
-      params.usage = { include: true };
-      // OpenRouter applies this managed transform only when a request exceeds
-      // the selected model's context window. One gateway-level opt-in keeps
-      // smaller-context selectable models usable without rebuilding prompt
-      // truncation or provider-specific fallback logic in AgentWeb.
-      params.plugins = [{ id: 'context-compression' }];
-      if (fallbackModels?.length) {
-        params.models = fallbackModels.map((fallbackModel) => {
-          const normalizedFallback = this.normalizeModelId(fallbackModel);
-          if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
-            throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
-          }
-          return resolveOpenRouterUpstreamModelId(normalizedFallback);
-        });
-      } else {
-        // Compression can still leave a request above a small primary model's
-        // context limit. Keep failover inside OpenRouter: a cheap 1M-context
-        // text/tool model for normal calls, or a multimodal 1M-context model
-        // when any message contains an image. Explicit caller fallbacks above
-        // remain authoritative.
-        const hasImageInput = messages.some((message: any) =>
-          Array.isArray(message?.content) && message.content.some((part: any) =>
-            part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
-          )
-        );
-        const managedFallbackId = hasImageInput
-          ? 'gemini-3.5-flash'
-          : 'openrouter/deepseek/deepseek-v4-flash';
-        const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
-        if (upstreamModel !== managedFallback) params.models = [managedFallback];
-      }
-      if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
-        params.session_id = usageContext.sessionId;
-      }
-      if (upstreamModel.startsWith('anthropic/')) {
-        // Explicit content-block breakpoints retain OpenRouter's full Anthropic,
-        // Bedrock, and Vertex fallback pool. Its top-level automatic cache flag
-        // would silently restrict this request to Anthropic first-party only.
-        params.messages = applyOpenRouterCacheBreakpoints(messages, humanPaced);
-      }
+    params.provider = { allow_fallbacks: true, require_parameters: true };
+    // OpenRouter reports its own billed amount as zero for BYOK requests even
+    // though the upstream provider still bills the inference. Request the
+    // routing flag so metering can distinguish BYOK from a genuinely free call.
+    params.usage = { include: true };
+    // Apply compression only when the request exceeds the selected context
+    // window; this keeps context handling at the gateway boundary.
+    params.plugins = [{ id: 'context-compression' }];
+    if (fallbackModels?.length) {
+      params.models = fallbackModels.map((fallbackModel) => {
+        const normalizedFallback = this.normalizeModelId(fallbackModel);
+        if (!normalizedFallback || !this.llmModels[normalizedFallback]) {
+          throw new Error(`Invalid OpenRouter fallback model '${fallbackModel}'`);
+        }
+        return resolveOpenRouterUpstreamModelId(normalizedFallback);
+      });
+    } else {
+      const hasImageInput = messages.some((message: any) =>
+        Array.isArray(message?.content) && message.content.some((part: any) =>
+          part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
+        )
+      );
+      const managedFallbackId = hasImageInput
+        ? 'gemini-3.5-flash'
+        : 'openrouter/deepseek/deepseek-v4-flash';
+      const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
+      if (upstreamModel !== managedFallback) params.models = [managedFallback];
     }
-
-    // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
-    // off `params` and never forwards it to ConverseCommand. Set ONLY for
-    // Bedrock models: `params` is handed verbatim to
-    // `client.chat.completions.create()` for every provider, and the OpenAI SDK
-    // forwards unknown body fields to the API — Azure OpenAI rejects an
-    // unrecognised argument with a 400, which would break every GPT turn.
-    if (!useOpenRouterGateway && model.startsWith('anthropic.')) {
-      params.humanPaced = humanPaced;
+    if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
+      params.session_id = usageContext.sessionId;
+    }
+    if (upstreamModel.startsWith('anthropic/')) {
+      // Explicit content-block breakpoints retain OpenRouter's full Anthropic,
+      // Bedrock, and Vertex fallback pool. Its top-level automatic cache flag
+      // would silently restrict this request to Anthropic first-party only.
+      params.messages = applyOpenRouterCacheBreakpoints(messages, humanPaced);
     }
 
     // Function tools and OpenRouter server tools share one wire-level array.
@@ -3560,7 +2530,7 @@ export class AgentModeService {
     // OpenRouter normalizes the transport, but the selected provider still
     // validates its own function-declaration schema. Preserve non-function
     // server tools rather than trying to sanitize a nonexistent `.function`.
-    const normalizedCallerTools = useOpenRouterGateway && upstreamModel.startsWith('google/gemini-')
+    const normalizedCallerTools = upstreamModel.startsWith('google/gemini-')
       ? boundedTools.map((tool: any) => tool?.type === 'function' ? ({
           ...tool,
           function: {
@@ -3586,19 +2556,11 @@ export class AgentModeService {
 
     // Only add max_completion_tokens if specified
     if (max_completion_tokens) {
-      // OpenRouter normalizes the cross-provider limit as max_tokens. Gemini's
-      // endpoints do not advertise max_completion_tokens, so require_parameters
-      // would correctly reject the old provider-native field.
-      if (useOpenRouterGateway) params.max_tokens = max_completion_tokens;
-      else params.max_completion_tokens = max_completion_tokens;
+      params.max_tokens = max_completion_tokens;
     }
 
-    // Only add temperature if model supports it and value is provided
-    // OpenRouter's live model metadata marks GPT-5.x temperature unsupported,
-    // even though the legacy Azure deployments accepted it. Suppress it only
-    // on the gateway route; the default-off direct path remains unchanged.
-    const gatewaySupportsTemperature = !useOpenRouterGateway ||
-      !upstreamModel.startsWith('openai/gpt-5.');
+    // OpenRouter's metadata marks GPT-5.x temperature unsupported.
+    const gatewaySupportsTemperature = !upstreamModel.startsWith('openai/gpt-5.');
     if (
       this.llmModels[model].supportsTemperature &&
       gatewaySupportsTemperature &&
@@ -3607,159 +2569,48 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
-    // Live models use WebSocket via liveVoiceService — callLLM is not applicable
-    if (this.llmModels[model].isLive) {
-      throw new Error(`Model '${model}' is a live voice model. Use the Socket.IO live:start event instead of the HTTP generate endpoint.`);
-    }
+    const client = await this.getOpenRouterClient();
+    const providerLabel = 'openrouter';
 
-    // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed.
-    // ENG-700: providerLabel is set in the SAME model-id branch that decides
-    // which resolver produces `client`, so the metering label below can never
-    // independently drift from the resolver that actually serves the call —
-    // it is NOT derived from whether `client` happens to be cached yet (a
-    // Bedrock/Vertex client is cached on the registry after its first call,
-    // same as an Azure client is pre-populated at construction time, so
-    // "client is already set" cannot distinguish the providers).
-    let client = useOpenRouterGateway && !model.startsWith('openrouter/')
-      ? null
-      : this.llmModels[model].client;
-    let providerLabel: string;
-    if (useOpenRouterGateway) {
-      providerLabel = 'openrouter';
-      if (!client) {
-        client = await this.getOpenRouterClient();
-        // Existing explicit OpenRouter rows have no direct-provider client to
-        // preserve, so caching the shared client on their registry entry is safe.
-        if (model.startsWith('openrouter/')) this.llmModels[model].client = client;
-      }
-    } else if (model.startsWith('gemini-')) {
-      // ENG-737: always the native adapter — no fallback transport, resolved
-      // per-call (not cached on the registry).
-      client = this.getGeminiNativeClient();
-      providerLabel = 'gemini';
-    } else if (model.startsWith('anthropic.')) {
-      providerLabel = 'bedrock';
-      if (!client) {
-        client = await this.getBedrockClient(model);
-        this.llmModels[model].client = client;
-      }
-    } else if (model.startsWith('claude-')) {
-      providerLabel = 'vertex';
-      if (!client) {
-        client = await this.getVertexClient(model);
-        this.llmModels[model].client = client;
-      }
-    } else {
-      providerLabel = 'azure-openai';
-      if (!client) {
-        throw new Error(`Client not initialized for model: ${model}`);
-      }
-    }
-
-    if (!client) {
-      throw new Error(`Failed to initialize client for model: ${model}`);
-    }
-
-    // Retry loop with exponential backoff for transient LLM errors (503, 429, timeouts)
-    const maxAttempts = useOpenRouterGateway ? 1 : 3;
-    const baseDelayMs = 2000;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await client.chat.completions.create(
+        params,
+        { timeout: timeoutMs ?? 5 * 60 * 1000, maxRetries: 0 },
+      );
+      // Fire-and-forget usage metering; it must never break an LLM call.
       try {
-        const res = await client.chat.completions.create(
-          params,
-          timeoutMs || useOpenRouterGateway
-            ? { timeout: timeoutMs ?? 5 * 60 * 1000, ...(useOpenRouterGateway ? { maxRetries: 0 } : {}) }
-            : undefined,
-        );
-        // Shadow usage metering (Ship 1): every client returned above (Azure
-        // OpenAI, Gemini OpenAI-compat, Bedrock Converse wrapper, Vertex
-        // wrapper) responds in OpenAI shape, so `res.usage` is the single
-        // observation point — including the Bedrock ConverseCommand path,
-        // whose cache metrics surface as cache_read/creation_input_tokens.
-        // Fire-and-forget + fail-open: never awaited, never throws.
-        try {
-          const usage: any = (res as any)?.usage;
-          if (usage) {
-            const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
-            // ENG-200: meter the main agent turn — record shadow burn AND charge
-            // the per-user cost cap when a real user is attributable (org members
-            // resolve to the owner). Cost (incl. cache tokens) is computed once
-            // here; no separate deduction path exists for this call, so this is
-            // the single charge point. No userId → burn-only "system" record.
-            meterUserUsage({
-              userId: usageContext?.userId,
-              sessionId: usageContext?.sessionId,
-              model,
-              // ENG-700: the label of the client that actually served this call
-              // (set above, alongside client resolution) — not re-derived from
-              // the model id, which can diverge for a vendor/model-namespaced id.
-              provider: providerLabel,
-              feature: usageContext?.feature || 'agent_task',
-              // ENG-1251: the response's own id is stable across a retried/
-              // re-processed response and distinct across real calls — closes
-              // the "retries defeat charge dedup" Greptile P1 for the highest-
-              // volume metering site in the codebase.
-              eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
-              inputTokens: normalizedUsage.inputTokens,
-              outputTokens: normalizedUsage.outputTokens,
-              cacheReadTokens: normalizedUsage.cacheReadTokens,
-              cacheWriteTokens: normalizedUsage.cacheWriteTokens,
-              // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
-              cacheWriteByTtl: usage.cache_creation_by_ttl,
-              // OpenRouter's cost is authoritative for OpenRouter-billed calls.
-              // BYOK calls report zero because the upstream provider bills us
-              // directly, so omit the override and let the provider price book
-              // calculate economic cost from the returned tokens instead.
-              costUsdOverride:
-                providerLabel === 'openrouter' && usage.is_byok !== true && typeof usage.cost === 'number'
-                  ? usage.cost
-                  : undefined,
-            });
-          }
-        } catch {
-          // Metering must never break an LLM call.
-        }
-        return res;
-      } catch (error) {
-        const isLastAttempt = attempt >= maxAttempts;
-
-        // Log Gemini-specific errors with more context for debugging
-        if (providerLabel === 'gemini') {
-          console.error(`AgentMode: Gemini API error on attempt ${attempt}/${maxAttempts}:`, {
+        const usage: any = (res as any)?.usage;
+        if (usage) {
+          const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
+          meterUserUsage({
+            userId: usageContext?.userId,
+            sessionId: usageContext?.sessionId,
             model,
-            error: error instanceof Error ? error.message : String(error),
-            errorName: error instanceof Error ? error.name : 'Unknown',
-            isTransient: isTransientLLMError(error),
-            willRetry: !isLastAttempt && isTransientLLMError(error),
-            messageCount: messages.length,
-            hasTools: tools && tools.length > 0
+            provider: providerLabel,
+            feature: usageContext?.feature || 'agent_task',
+            eventId: typeof (res as any)?.id === 'string' ? (res as any).id : undefined,
+            inputTokens: normalizedUsage.inputTokens,
+            outputTokens: normalizedUsage.outputTokens,
+            cacheReadTokens: normalizedUsage.cacheReadTokens,
+            cacheWriteTokens: normalizedUsage.cacheWriteTokens,
+            cacheWriteByTtl: usage.cache_creation_by_ttl,
+            costUsdOverride:
+              usage.is_byok !== true && typeof usage.cost === 'number'
+                ? usage.cost
+                : undefined,
           });
         }
-
-        if (!isTransientLLMError(error) || isLastAttempt) {
-          // On last attempt or non-transient error, log full error details
-          if (isLastAttempt || !isTransientLLMError(error)) {
-            console.error(`AgentMode: callLLM failed for model "${model}":`, {
-              error: error instanceof Error ? error.message : String(error),
-              stack: error instanceof Error ? error.stack : undefined,
-              attempt,
-              maxAttempts
-            });
-          }
-          throw error;
-        }
-        const jitterMs = Math.floor(Math.random() * 500);
-        const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
-        console.warn(
-          `AgentMode: callLLM retry ${attempt}/${maxAttempts} for model "${model}" after ${delayMs}ms due to:`,
-          error instanceof Error ? error.message : error
-        );
-        await this.sleep(delayMs);
+      } catch {
+        // Metering must never break an LLM call.
       }
+      return res;
+    } catch (error) {
+      console.error(`AgentMode: OpenRouter call failed for model "${model}":`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
     }
-
-    // Unreachable, but TypeScript needs it
-    throw new Error('callLLM: unexpected code path');
   }
 
   /**
@@ -4806,18 +3657,13 @@ export class AgentModeService {
         const chatTaskClass: GatewayTaskClass = isScheduledSession
           ? 'scheduled_background'
           : 'interactive_chat';
-        const providerForChatRoute = (logicalModel: string): string =>
-          logicalModel.startsWith('openrouter/') ||
-          isOpenRouterGatewayEnabledForTaskClass(chatTaskClass)
-            ? 'openrouter'
-            : providerForModel(logicalModel);
         // OTel `chat` span (ENG-141): brackets the primary call AND the backup
         // retry; the `finally` closes it with the FINAL model + usage attrs
         // (response undefined there = both attempts threw → status ERROR).
         const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
           [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
           [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
-          [ATTR_GEN_AI_PROVIDER_NAME]: providerForChatRoute(llmModel),
+          [ATTR_GEN_AI_PROVIDER_NAME]: 'openrouter',
           [ATTR_SESSION_ID]: sessionId,
         });
         try {
@@ -4948,7 +3794,7 @@ export class AgentModeService {
         } finally {
           endChatSpan(chatSpan, {
             model: llmModel,
-            provider: providerForChatRoute(llmModel),
+            provider: 'openrouter',
             response,
             inputMessages: trimmedMessages,
           });
@@ -14309,7 +13155,7 @@ ${emailDraftFormat === 'text'
 }`}`;
 
       const completion = await this.callLLM(
-        process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-5.5',
+        'gpt-5.5',
         [
           {
             role: "system",
