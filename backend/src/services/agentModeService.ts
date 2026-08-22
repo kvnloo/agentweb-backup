@@ -1233,7 +1233,7 @@ export class AgentModeService {
   // Flash-line model (GA 2026-08-13), cheap ($0.75/$3.75 per 1M, Google's own
   // direct rate — not a multi-provider OpenRouter blend), and it dominates
   // every other model in the `gemini-flash` family band for band.
-  default_model: string = 'gemini-3.7-flash';
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gemini-3.7-flash';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -2074,6 +2074,48 @@ export class AgentModeService {
     })();
 
     return this.openrouter_client_promise;
+  }
+
+  /** Convert OpenAI-format content into Anthropic-native content blocks. */
+  private static convertContentToAnthropicBlocks(content: any): any[] {
+    if (content === null || content === undefined) return [{ type: 'text', text: '' }];
+    if (typeof content === 'string') return [{ type: 'text', text: content }];
+    if (!Array.isArray(content)) return [{ type: 'text', text: String(content) }];
+
+    const validMediaTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const blocks: any[] = [];
+    for (const item of content) {
+      if (typeof item === 'string') {
+        blocks.push({ type: 'text', text: item });
+      } else if (!item || typeof item !== 'object') {
+        blocks.push({ type: 'text', text: String(item ?? '') });
+      } else if (item.type === 'text') {
+        blocks.push({ type: 'text', text: item.text || '' });
+      } else if (item.type === 'image_url') {
+        const url = item.image_url?.url || '';
+        if (url.startsWith('data:')) {
+          const match = url.match(/^data:(image\/[\w+.-]+)(?:;[^;]*)*;base64,(.+)$/s);
+          if (match) {
+            let mediaType = match[1].toLowerCase();
+            if (mediaType === 'image/jpg') mediaType = 'image/jpeg';
+            if (!validMediaTypes.has(mediaType)) mediaType = 'image/jpeg';
+            blocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: match[2] },
+            });
+          } else {
+            console.warn(`AgentMode: Could not parse data URI for Anthropic image block, url prefix="${url.substring(0, 60)}"`);
+          }
+        } else if (url) {
+          blocks.push({ type: 'image', source: { type: 'url', url } });
+        }
+      } else if (item.type === 'image' || item.type === 'tool_result' || item.type === 'tool_use' || item.type === 'document') {
+        blocks.push(item);
+      } else {
+        blocks.push({ type: 'text', text: JSON.stringify(item) });
+      }
+    }
+    return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
   /** Media types the vision APIs decode natively. */
