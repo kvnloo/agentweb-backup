@@ -34,10 +34,11 @@ export function projectWorkPlanForCustomer(plan: unknown): CustomerWorkPlanProje
     categories,
     ...(display?.channel && { channel: display.channel }),
     ...(display?.suite && { suite: display.suite }),
-    steps: value.steps.filter((step) => step && typeof step.title === 'string').map((step, index) => ({
-      position: index + 1,
-      label: text(display?.stepLabels?.[index], 80) || step.title,
-    })),
+    steps: value.steps.flatMap((step, index) => (
+      step && typeof step.title === 'string'
+        ? [{ position: index + 1, label: text(display?.stepLabels?.[index], 80) || step.title }]
+        : []
+    )),
     nextPlanIds: display?.nextPlanIds || [],
     visibility: value.visibility,
   };
