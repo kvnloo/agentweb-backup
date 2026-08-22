@@ -2706,7 +2706,8 @@ class WebAgent:
                 # Combine all results
                 analysis_result = "\n\n".join(result_parts)
                 
-                return ActionResult(extracted_content=f"{analysis_result}{'\n\nNo code execution was performed.' if not code_executed else ''}")
+                no_code_execution_note = "\n\nNo code execution was performed." if not code_executed else ""
+                return ActionResult(extracted_content=f"{analysis_result}{no_code_execution_note}")
 
             except Exception as e:
                 logger.error(f"Error performing data analysis: {e}")
