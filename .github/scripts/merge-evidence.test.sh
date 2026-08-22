@@ -216,6 +216,7 @@ run_gate() {
     REPO='AgentWebPro/agentweb' \
     PR_NUMBER='2231' \
     GH_TOKEN='mock' \
+    MERGE_EVIDENCE_BACKEND_JOBS=$'Backend tests (agentMode)\nBackend tests (all other + coverage)' \
     bash "${GATE_SCRIPT}" 2>&1)"
   LAST_EXIT=$?
 }
@@ -1382,7 +1383,7 @@ fi
 
 GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
 
-for job_key in backend-tests-a backend-tests-b; do
+for job_key in backend-build partner-build; do
   # Collect the job's whole header (needs + the `>-` if block scalar) so a
   # dependency reintroduced in either field is caught.
   # Comment lines are dropped: they legitimately narrate the ENG-1039 history
@@ -1403,24 +1404,21 @@ for job_key in backend-tests-a backend-tests-b; do
 
   TESTS_RUN=$((TESTS_RUN + 1))
   # ENG-1277: here-string, not a pipe — see the check() fix above for why.
-  if [ "${JOB_NEEDS}" = "[detect-changes]" ]; then
-    printf "ok    invariant: %s depends on detect-changes and nothing else (ENG-1039/1371)\n" "${job_key}"
+  if [ "${JOB_NEEDS}" = "detect-changes" ]; then
+    printf "ok    invariant: %s depends on detect-changes and nothing else\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s must declare exactly 'needs: [detect-changes]'.\n" "${job_key}"
     printf "      Found: '%s'\n" "${JOB_NEEDS}"
-    printf "      ENG-1039: serializing the suite behind another job means that job's\n"
-    printf "      failures decide whether test evidence exists at all. A 61%%-flaky\n"
-    printf "      reviewer check once skipped this suite 303 times. Do not add a\n"
-    printf "      dependency here — gate on the path filter and the draft flag only.\n"
+    printf "      Build evidence must not be serialized behind an unrelated gate.\n"
   fi
 
-  # The suite must still be draft-gated and path-gated — decoupling from the
-  # reviewer check must not turn into running on every draft push.
+  surface='backend'
+  [ "${job_key}" = 'partner-build' ] && surface='partner'
   TESTS_RUN=$((TESTS_RUN + 1))
   if grep -qF "github.event.pull_request.draft == false" <<<"${JOB_HEADER}" \
-     && grep -qF "needs.detect-changes.outputs.backend == 'true'" <<<"${JOB_HEADER}"; then
-    printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
+     && grep -qF "needs.detect-changes.outputs.${surface} == 'true'" <<<"${JOB_HEADER}"; then
+    printf "ok    invariant: %s keeps the draft and %s-path gates\n" "${job_key}" "${surface}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     printf "FAIL  invariant: %s must keep the draft gate and backend path filter.\n" "${job_key}"
@@ -1428,25 +1426,15 @@ for job_key in backend-tests-a backend-tests-b; do
   fi
 done
 
-# The requirement is matched by exact job name. A rename in tests.yml alone
-# would leave merge-evidence.sh demanding a job nobody reports — which fails
-# closed, so it is safe, but it blocks every backend PR until someone finds
-# this. Catch it in the PR that renames the job instead.
-TESTS_RUN=$((TESTS_RUN + 1))
-missing_name=''
-while IFS= read -r job_name; do
-  [ -n "${job_name}" ] || continue
-  grep -qF "name: ${job_name}" "${WORKFLOW}" || missing_name="${job_name}"
-done < <(sed -n '/^BACKEND_JOBS=/,/}"$/p' "${GATE_SH}" \
-  | sed -e 's/^BACKEND_JOBS=.*:-//' -e 's/}"$//')
-
-if [ -z "${missing_name}" ]; then
-  printf "ok    invariant: every MERGE_EVIDENCE_BACKEND_JOBS default names a real job in tests.yml\n"
-else
-  TESTS_FAILED=$((TESTS_FAILED + 1))
-  printf "FAIL  invariant: merge-evidence.sh requires the job '%s', which tests.yml does not define.\n" "${missing_name}"
-  printf "      Rename both together, or the backend-suite requirement blocks every backend PR.\n"
-fi
+for job_name in 'Backend build' 'Partner portal build'; do
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if grep -qF "name: ${job_name}" "${WORKFLOW}"; then
+    printf "ok    invariant: required build job '%s' exists in tests.yml\n" "${job_name}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: required build job '%s' is missing from tests.yml.\n" "${job_name}"
+  fi
+done
 
 # BACKEND_PATHS hand-mirrors the `backend` filter in tests.yml, and the two
 # drift in one direction silently: adding a path to the workflow filter widens
