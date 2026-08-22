@@ -608,9 +608,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4');
     });
 
-    it('should have temperature support enabled for gpt-5.4', () => {
+    it('does not advertise unsupported temperature for gpt-5.4 through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     });
 
     it('does not construct an Azure client for gpt-5.4 at startup', () => {
@@ -623,9 +623,9 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('gpt-5.4-nano');
     });
 
-    it('should have temperature support enabled for gpt-5.4-nano', () => {
+    it('does not advertise unsupported temperature for gpt-5.4-nano through OpenRouter', () => {
       const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(true);
+      expect(llmModels['gpt-5.4-nano'].supportsTemperature).toBe(false);
     });
 
     it('does not construct an Azure client for gpt-5.4-nano at startup', () => {
