@@ -101,6 +101,17 @@ inline. One seam per PR.
 
 ## Push log
 
+- **2026-08-22 · C3b dead Vertex text-adapter deletion (ENG-1459)** — removed the unreachable
+  Vertex Claude text-client fields and OpenAI-to-Anthropic content-block converter after the
+  gateway cutover, along with its obsolete transport-only test. The retained direct Gemini use is
+  the bounded data-analysis/code-execution capability exception, not chat/tool routing. Added an
+  AST-backed guard that rejects reintroducing the three deleted adapter symbols. **Behavior
+  preserving:** the deleted path has no callers after C3a; all text/tool calls still enter
+  `callLLM` through the shared gateway. Validation: SDK construction guard 21/21, all 246
+  `agentMode*` suites green, and backend `tsc --noEmit` clean. Monolith: -44 lines; tests: -127
+  net lines; no new moving parts. Branch `swarm/eng-1459-delete-dead-agentmode-transports` →
+  PR to `main` (pending attribution/CI).
+
 - **2026-06-14 · Foundation** — 7 reliability PRs consolidated (#1882) merged to `harsha/swarm`;
   full suite green. Hardening, NOT re-architecture. Monolith 24,205 lines.
 - **2026-06-14 · Proof slice** — characterization harness (3 scenarios: happy / tool-error→retry /
