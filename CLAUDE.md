@@ -9,10 +9,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Autonomous execution and merge
 
 - AI agents own qualifying engineering work through merge. Merge only from a
-  branch current with `main`, after the full relevant local suite, regression
-  coverage, staging/API/browser smoke where applicable, every relevant GitHub
-  check, attribution, rollback evidence, and acceptance-contract completeness
-  all pass.
+  branch current with `main`, after the affected production build, every
+  relevant GitHub check, attribution, rollback evidence, and acceptance-contract
+  completeness all pass. Routine product suites, coverage targets, and PR
+  staging deploys are not merge gates.
+- Atem is the test compute plane when a test is warranted. Retain or add a test
+  only for a human acceptance criterion, a critical invariant (auth, security,
+  billing, or data integrity), deploy-control integrity, or a reproduced
+  production regression. Do not change a test merely to bless implementation
+  behavior; stale, flaky, or low-signal tests may be removed with a reason.
 - Greptile is retired (ENG-1371, 2026-08-19). It is no longer a merge
   criterion, the `Require Greptile Review` job and its scripts are deleted, and
   `greptile.json` is gone. Do not wait for a Greptile verdict and do not
@@ -56,21 +61,14 @@ Before writing implementation code:
 2. Produce a design or plan and get explicit approval
 3. No approval = no code
 
-### Rule 2: TDD - Tests Before Implementation
+### Rule 2: Contract-first selective tests
 
-**Applies to:** Backend service/logic changes (routes, services, utilities, database operations)
-**Does not apply to:** Frontend UI components, configuration files, documentation, CLAUDE.md itself
-
-For backend logic changes:
-1. Write FAIL test cases first (minimum 3: invalid inputs, boundary conditions, error paths)
-2. Write SUCCESS test cases (minimum 1: happy path)
-3. Verify all new tests FAIL (no implementation yet)
-4. Implement the minimum code to pass all tests
-5. Verify ALL tests pass (new + existing)
-
-**A task is NOT done until all tests pass.** Never skip tests. Never delete failing tests. Never mark a task complete with failing tests.
-
-For frontend and other changes, follow the existing testing strategy section below.
+The production build and deployed runtime are the default proof. Add or retain
+tests only when they protect a human acceptance criterion, a critical invariant,
+deploy-control integrity, or a reproduced production regression. Run selected
+tests on Atem, not as a blanket GitHub Actions requirement. Never change a test
+solely to make new implementation behavior look green; when its invariant no
+longer applies, remove it with the reason recorded in the PR.
 
 ### Rule 3: Workflow Orchestration
 
