@@ -5364,7 +5364,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains, context?.userId);
   }
 });
 
@@ -5395,7 +5395,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness);
+    return await agentModeService.youSearchNews(args.query, args.max_results || 10, args.freshness, context?.userId);
   }
 });
 
@@ -5421,7 +5421,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.googleSearchWeb(args.query, args.max_results || 10, context?.userId);
   }
 });
 

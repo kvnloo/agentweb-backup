@@ -110,7 +110,7 @@ import { enqueueAutoHumanEval } from './autoHumanEvalService';
 import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
-import { SearchResultSource } from '../search/searchProvider';
+import { SearchPurpose, SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import {
@@ -24774,7 +24774,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     query: string,
     maxResults: number = 10,
     freshness?: string,
-    includeDomains?: string[]
+    includeDomains?: string[],
+    userId?: string,
+    purpose: SearchPurpose = 'agent_research',
   ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
@@ -24783,20 +24785,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       resultSource: 'web',
       freshness,
       includeDomains,
+      userId,
+      purpose,
     });
   }
 
-  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string): Promise<any> {
+  public async youSearchNews(query: string, maxResults: number = 10, freshness?: string, userId?: string): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_news',
       query,
       maxResults,
       resultSource: 'news',
       freshness: freshness || inferSearchFreshness(query) || 'week',
+      userId,
+      purpose: 'news',
     });
   }
 
-  public async googleSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async googleSearchWeb(query: string, maxResults: number = 10, userId?: string, purpose: SearchPurpose = 'agent_research'): Promise<any> {
     const toolName = 'google_search_web';
     const resultSource: SearchResultSource = 'web';
     try {
@@ -24805,6 +24811,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResponse = await this.performGoogleSearch({
         query,
         maxResults: limitedMaxResults,
+        userId,
+        purpose,
       });
       const normalizedResults = searchResponse.results || [];
       const formattedContent = this.formatWebSearchResults({
@@ -24845,6 +24853,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose: SearchPurpose;
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -24866,6 +24876,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             resultSource,
             freshness: params.freshness,
             includeDomains: params.includeDomains,
+            userId: params.userId,
+            purpose: params.purpose,
           });
           break;
         } catch (error) {
@@ -25140,6 +25152,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     resultSource?: SearchResultSource;
     freshness?: string;
     includeDomains?: string[];
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -25148,7 +25162,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       count: params.maxResults,
       freshness,
       resultSource: params.resultSource || 'all',
-      purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      purpose: params.purpose || (params.resultSource === 'news' ? 'news' : 'agent_research'),
+      userId: params.userId,
       ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
@@ -25165,13 +25180,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async performGoogleSearch(params: {
     query: string;
     maxResults: number;
+    userId?: string;
+    purpose?: SearchPurpose;
   }) {
     const provider = new GoogleSearchProvider();
     const response = await provider.search({
       query: params.query,
       count: params.maxResults,
       resultSource: 'web',
-      purpose: 'agent_research',
+      purpose: params.purpose || 'agent_research',
+      userId: params.userId,
     });
 
     console.log(`Google Custom Search returned ${response.results.length} web results for query: "${params.query}"`);
