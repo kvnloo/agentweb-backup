@@ -80,12 +80,6 @@ describe('OpenRouter gateway migration resolver (ENG-1430)', () => {
     expect(() => resolveUpstreamModel('unknown-direct-model')).toThrow(GatewayContractError);
   });
 
-  it('enables only an explicitly listed task class', () => {
-    const enabled = (gatewayContract as any).isOpenRouterGatewayEnabledForTaskClass;
-    expect(enabled('interactive_chat', 'interactive_chat,content_generation')).toBe(true);
-    expect(enabled('scheduled_background', 'interactive_chat,content_generation')).toBe(false);
-    expect(enabled(undefined, 'interactive_chat')).toBe(false);
-  });
 
   it('uses explicit cache breakpoints without mutating the caller messages', () => {
     const messages = [

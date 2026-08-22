@@ -197,20 +197,3 @@ export function resolveOpenRouterUpstreamModelId(logicalModelId: string): string
 
   return upstreamModelId;
 }
-
-/**
- * Reversible task-class canary. An empty/unset value preserves today's routing;
- * only exact comma-separated task classes move to the gateway.
- */
-export function isOpenRouterGatewayEnabledForTaskClass(
-  taskClass: GatewayTaskClass | undefined,
-  configuredTaskClasses: string | undefined = process.env.OPENROUTER_GATEWAY_TASK_CLASSES,
-): boolean {
-  if (!taskClass || !configuredTaskClasses) return false;
-
-  return configuredTaskClasses
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .includes(taskClass);
-}

@@ -1,7 +1,7 @@
 # OpenRouter Gateway Contract and Migration Inventory
 
 **Owner:** ENG-1413 program; foundation: ENG-1414
-**Status:** inventory baseline plus ENG-1430 interactive and ENG-1431 background canaries
+**Status:** AgentMode text/tool/vision gateway law; non-text exceptions are listed below.
 
 ## Contract
 
@@ -33,17 +33,13 @@ throttling. AgentWeb must not add a fallback graph after an OpenRouter failure.
 from AgentWeb's direct-provider logical IDs to OpenRouter wire IDs. Both are
 pure: neither performs network access, provider selection, retry, or fallback.
 
-## Runtime canary
+## Runtime boundary
 
-`OPENROUTER_GATEWAY_TASK_CLASSES` is an exact comma-separated allow-list of the
-task classes above. Unset/empty preserves all incumbent routes. ENG-1430
-annotates interactive Agent Mode primary/backup calls and Emma sidebar turns;
-setting `interactive_chat` moves both interactive surfaces to OpenRouter, and
-removing it rolls back without a code deploy or persisted-data change. Both
-surfaces use the same `AgentModeService.callLLM` boundary, so the sidebar no
-longer selects provider clients, retries, or meters independently. OpenRouter receives
-`allow_fallbacks=true` and owns upstream-provider recovery; AgentWeb performs no
-additional retry for a gateway request. Claude prompt caching uses explicit
+All AgentMode text, tool, structured-output, streaming, and vision calls use
+the same `AgentModeService.callLLM` OpenRouter boundary. OpenRouter receives
+`allow_fallbacks=true` and owns upstream-provider recovery; AgentWeb performs
+no additional retry, fallback chain, circuit breaker, or task-class canary.
+Claude prompt caching uses explicit
 content-block breakpoints rather than OpenRouter's top-level automatic flag:
 the explicit form preserves routing across Anthropic, Bedrock, and Vertex while
 retaining the existing five-minute and human-paced one-hour TTL behavior.
@@ -52,13 +48,8 @@ its reported cost; BYOK calls fall back to AgentWeb's provider price book becaus
 the upstream provider bills those calls directly while OpenRouter reports zero
 OpenRouter-billed spend.
 
-ENG-1431 adds `scheduled_background`, `content_generation`, `mcp_api`, and
-`nonstandard_consumer` at that same boundary. Each token is independently
-reversible: adding it moves only that task class to OpenRouter, while removing
-it restores the centralized incumbent provider path without changing customer
-data or deploying code. `agent_engine` and `coding_agent` remain disabled until
-ENG-1416 proves their native tool/streaming contracts; they are not implicit
-fallbacks for this slice.
+`agent_engine` and `coding_agent` retain separately verified contracts; they
+are not implicit fallbacks for AgentMode.
 
 ## Direct text/chat/tool inventory at baseline
 
@@ -71,10 +62,10 @@ inventory.
 
 | Consumer / boundary | Code location(s) | Current SDK, credential, and model-ID path | Required capability | Migration owner |
 | --- | --- | --- | --- | --- |
-| Interactive Agent Mode | `services/agentModeService.ts` (`callLLM`, client constructors), `controllers/agentModeController.ts` | OpenAI SDK -> Azure env endpoint/key/deployment for `gpt-*`; Bedrock SDK -> workload IAM or `prod/AgentWeb/Bedrock/ApiKey` for `anthropic.*`; Google SDK -> `GEMINI_API_KEY` or `prod/AgentWeb/GeminiAPIKey` for `gemini-*`; Vertex REST -> `prod/AgentWeb/Google/Vertex` for `claude-*`; OpenAI SDK -> `prod/AgentWeb/OpenRouter` after stripping `openrouter/` | streaming, tools, JSON, vision, cache usage | ENG-1415 interactive |
-| Agent Mode internal scoring/content callers | `services/reportClassificationService.ts`, `services/sessionScoringService.ts`, `services/sessionSummaryService.ts`, `services/dedupService.ts`, `services/socialPostsService.ts`, plus internal calls in `services/agentModeService.ts` | `AgentModeService.callLLM`; logical model comes from the model registry, AW-Settings defaults, or the named caller constant, then follows the Agent Mode provider branches above | text, JSON, judge output, metering | ENG-1415 interactive/judge |
+| Interactive Agent Mode | `services/agentModeService.ts` (`callLLM`), `controllers/agentModeController.ts` | logical model -> verified OpenRouter ID -> OpenRouter SDK | streaming, tools, JSON, vision, cache usage | ENG-1458 |
+| Agent Mode internal scoring/content callers | `services/reportClassificationService.ts`, `services/sessionScoringService.ts`, `services/sessionSummaryService.ts`, `services/dedupService.ts`, `services/socialPostsService.ts`, plus internal calls in `services/agentModeService.ts` | `AgentModeService.callLLM` -> OpenRouter | text, JSON, judge output, metering | ENG-1458 |
 | Agent Mode native Gemini shim | `services/agentMode/core/geminiNativeClient.ts` | `@google/genai` -> Gemini key path above; caller supplies a `gemini-*` registry ID | tools, structured output, usage, thought filtering | ENG-1415 interactive |
-| Emma sidebar chat | `services/chatbotService.ts` | ENG-1430 consolidates chat completions on `AgentModeService.callLLM`; the logical model remains the request/session/default ID and `interactive_chat` controls the OpenRouter canary. Azure remains only for the narrow embeddings exception below. | tools, streaming-shaped loop, shared gateway metering | ENG-1430 interactive |
+| Emma sidebar chat | `services/chatbotService.ts` | `AgentModeService.callLLM` -> OpenRouter; Azure remains only for the narrow embeddings exception below. | tools, streaming-shaped loop, shared gateway metering | ENG-1458 |
 | Scheduled social and CRM helpers | `cron/socialEngagementExecutor.ts`, `routes/crm.ts` | Agent Mode Gemini OpenAI-compatible client -> Gemini key path; model IDs are the call-site/session-selected `gemini-*` values | text, JSON/content | ENG-1415 scheduled |
 | Scheduled/task/workflow Azure callers | `cron/linkedInConnectionSyncCron.ts`, `routes/tasks.ts`, `services/workflowGenerator.ts`, `services/growthGeniusService.ts`, `services/reportRevisionService.ts`, `services/inviteNoteShortener.ts` | OpenAI-compatible client from `llmClients`/service wrapper -> Azure env endpoint/key/deployment; model is the call-site constant or deployment env value | text, structured output, retries | ENG-1415 scheduled/content |
 | Native Gemini content/API callers | `controllers/blog.ts`, `routes/slack.ts`, `services/deepResearchService.ts` | `@google/genai` via `getGeminiClient` -> explicit key or `GEMINI_API_KEY`; call-site `gemini-*` model | long text, JSON, multimodal input | ENG-1415 content/MCP/API |

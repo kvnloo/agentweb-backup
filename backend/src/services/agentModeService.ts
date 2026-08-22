@@ -209,13 +209,6 @@ export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 
-// ENG-907: sentinel resolved by `withSynthesisRetryDeadline` when a forced-synthesis backup
-// call outlives the time left. A unique symbol so it can never collide with a real response.
-const SYNTHESIS_RETRY_TIMED_OUT = Symbol('synthesis-retry-timed-out');
-// Slack left between the bounded retry and the caller's cap, so the turn still has room to
-// persist and return its partial answer after giving up on the retry.
-const SYNTHESIS_RETRY_MARGIN_MS = 5_000;
-
 // Max size of a NON-HTML content_draft that create_html_file will attempt to
 // render into HTML in a single internal LLM call. The render (llmService
 // generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
@@ -1986,43 +1979,6 @@ export class AgentModeService {
     );
   }
 
-  async getBackupModel(
-    primaryModel: string,
-    // undefined = preserve the admin-managed global fallback. A string or null is
-    // an explicit dispatch policy: use only that model, or do not retry at all.
-    // This distinction prevents optimized-mode requests from escaping to a premium
-    // global backup after the admission policy selected a cheaper model.
-    transientFallbackModel?: string | null,
-  ): Promise<string | null> {
-    if (transientFallbackModel !== undefined) {
-      return transientFallbackModel &&
-        transientFallbackModel !== primaryModel &&
-        Boolean(this.llmModels[transientFallbackModel])
-        ? transientFallbackModel
-        : null;
-    }
-    try {
-      const setting = await settingsService.getSetting('agent_mode_backup_model');
-      const configured = setting?.settingValue?.trim();
-      if (configured) {
-        // Same legacy-alias resolution as resolveConfiguredModel/normalizeModelId
-        // uses (ENG-806) — a stored backup id that's since been retired (e.g. a
-        // superseded gpt-5.x version) must still resolve to its current
-        // replacement, not silently return null and disable failover. Normalize
-        // primaryModel too so a retired id used as BOTH primary and configured
-        // backup still collapses to "same model, skip" instead of appearing to
-        // be a distinct backup once only one side is resolved forward.
-        const normalized = this.normalizeModelId(configured);
-        if (this.llmModels[normalized] && normalized !== this.normalizeModelId(primaryModel)) {
-          return normalized;
-        }
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting backup model setting:', error);
-    }
-    return null;
-  }
-
   private openrouter_client: OpenAI | null = null;
   private openrouter_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
@@ -2470,39 +2426,6 @@ export class AgentModeService {
     return knownGoodModel;
   }
 
-  /**
-   * ENG-907: bound a permitted forced-synthesis backup call to the wall-clock time that is
-   * actually left, rather than trusting the duration estimate that admitted it.
-   *
-   * The estimate is drawn from calls this run already made, and the backup is by definition
-   * a DIFFERENT model — it can be slower than anything measured. If it overruns, the
-   * controller's cap fires and rejects the whole generation, discarding the partial answer
-   * this feature exists to deliver. So stop waiting with time still on the clock and let the
-   * caller fall back to that partial answer.
-   *
-   * Resolves to `SYNTHESIS_RETRY_TIMED_OUT` instead of rejecting, so the timeout is not
-   * mistaken for a model error and misclassified. The in-flight request is left to settle on
-   * its own — there is no abort plumbing through the provider adapters, and the turn is ending
-   * regardless — but its rejection is swallowed so it cannot surface as an unhandled one.
-   * With no deadline the call is awaited unchanged.
-   */
-  private async withSynthesisRetryDeadline(call: Promise<any>, deadlineMs?: number): Promise<any> {
-    if (deadlineMs === undefined) return call;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      return await Promise.race([
-        call,
-        new Promise((resolve) => {
-          timer = setTimeout(() => resolve(SYNTHESIS_RETRY_TIMED_OUT), deadlineMs);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-      // The loser of the race is still in flight; never let it become an unhandled rejection.
-      void Promise.resolve(call).catch(() => {});
-    }
-  }
-
   async callLLM(
     model: string,
     messages: any[],
@@ -2740,39 +2663,6 @@ export class AgentModeService {
     return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
   }
 
-  /**
-   * Should describe_image retry a failed vision call on the OTHER provider?
-   *
-   * This is a superset of isRetryableMediaToolError, and deliberately local to
-   * describe_image. That classifier answers "would this same call succeed if
-   * repeated", so it rejects credential/permission failures — correctly, since
-   * hammering the same model with a bad key is pointless. But describe_image's
-   * fallback switches providers entirely (Gemini -> Bedrock Claude), which
-   * authenticate separately, so a provider-scoped 401/403 is precisely the case
-   * where the other provider WOULD answer. Without this, one bad Gemini key
-   * hard-fails every describe_image call while Bedrock sits healthy beside it —
-   * the same "provider rejection surfaces as a broken tool" shape as ENG-834.
-   *
-   * NOT widened in the shared classifier: image generation relies on its current
-   * narrowness (ENG-510), and switching image models changes output semantics in
-   * a way switching vision models does not.
-   *
-   * Payload rejections (400 INVALID_ARGUMENT) stay excluded — the image is
-   * already normalised and downscaled by the time we call, so a second provider
-   * would only double the latency and cost. Recovery is still observable:
-   * describeImage returns fallbackUsed + primaryError, so a broken key is
-   * diagnosable from the session record rather than silently papered over.
-   */
-  private isVisionFallbackWorthy(error: unknown): boolean {
-    if (this.isRetryableMediaToolError(error)) return true;
-    if (!error) return false;
-    const e = error as any;
-    const status = e?.status ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
-    if (status === 401 || status === 403) return true;
-    const message = error instanceof Error ? error.message : String(error);
-    return /permission.?denied|unauthenticated|api key not valid/i.test(message);
-  }
-
   private getImageGenerationFallbackModel(
     currentModel: string | undefined,
     inputImages: string[] | undefined,
@@ -2875,11 +2765,6 @@ export class AgentModeService {
     }
   }
 
-  private getVisionFallbackModel(primaryModel: string): string | undefined {
-    const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
-    return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
-  }
-
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
@@ -2929,9 +2814,6 @@ export class AgentModeService {
     // required-function checker holds; absent on the interactive path, which resolves
     // per turn below.
     publishAuthorizationOverride?: SchedulePublishAuthorization,
-    // Cost-policy-owned retry target. undefined preserves the global admin backup;
-    // null explicitly disables retry. Optimized callers always send string|null.
-    transientFallbackModel?: string | null,
     // ENG-936: approved source URLs for image revisions. When provided, the
     // preflight gate rejects confirm=true `generate_image` calls that attempt to
     // edit an unapproved source URL.
@@ -2939,7 +2821,7 @@ export class AgentModeService {
     // Workplan progression turns must end in persisted structured state rather
     // than a provider-dependent prose question buried at the end of a response.
     requireWorkPlanDisposition: boolean = false,
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number; workPlanTurnDisposition?: WorkPlanTurnDisposition }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2978,9 +2860,7 @@ export class AgentModeService {
         // than silently masked (ENG-46).
         recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
       }
-      // Track backup model usage
       originalLlmModel = llmModel;
-      let backupModelUsed = false;
 
       // Track memory usage for optimization
       const startMemory = process.memoryUsage();
@@ -3454,9 +3334,6 @@ export class AgentModeService {
       // Set when the forced synthesis call failed with no room left to retry it — the loop
       // then stops instead of starting a second full call it cannot afford (see below).
       let synthesisRetryUnaffordable = false;
-      // Hard wall-clock bound for a permitted forced-synthesis retry, so a slower-than-
-      // predicted backup model still cannot run the turn past the caller's cap.
-      let synthesisRetryDeadlineMs: number | undefined;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3765,98 +3642,12 @@ export class AgentModeService {
             taskClass: chatTaskClass,
           });
         } catch (callError) {
-          // ENG-907: the backup-model retry below issues a SECOND full call of the same
-          // size. During the forced synthesis the only time left is the reserve held for
-          // that one call, so starting a retry it cannot afford runs the turn past the
-          // controller's cap — and the cap discards the answer, which is the failure this
-          // whole change exists to prevent. The attempt that just failed is the best
-          // available estimate of what the retry would cost, so require at least that much
-          // still on the clock. When there is not enough, end the turn here and deliver
-          // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
-          // one) rather than throwing the turn away.
-          //
-          // Scoped tightly to the retry that would otherwise have run: the SAME
-          // `isTransientLLMError(...) && !backupModelUsed` condition guards it. A
-          // non-transient failure (context limit, content policy, malformed request) has no
-          // retry to skip, and reporting one as "I hit the time limit — reply continue"
-          // would be a lie that walks the user straight back into the same error. Those
-          // keep propagating through their existing classification path untouched, as does
-          // any transient failure outside the forced synthesis.
-          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError) && !backupModelUsed) {
-            const retryBudget = evaluateTurnTimeBudget({
-              startedAtMs: turnStartedAtMs,
-              hardCapMs: turnHardCapMs,
-              longestLlmCallMs: longestLlmCallMsThisRun,
-            });
-            // What the retry will cost is a FULL call, so size it against the slowest full
-            // call this run actually made — not against the attempt that just failed. A
-            // primary that fails fast (an immediate 429, a dropped socket) burns almost no
-            // clock, so comparing to it alone waves through a backup that is slower than the
-            // time left and crosses the cap anyway, discarding the very partial answer this
-            // guard protects. Take whichever estimate is larger.
-            const failedCallMs = Date.now() - llmStart;
-            const estimatedRetryMs = Math.max(failedCallMs, longestLlmCallMsThisRun);
-            if (retryBudget.remainingMs <= estimatedRetryMs) {
-              console.warn(
-                `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
-                `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
-                `${Math.round(failedCallMs / 1000)}s; a full call has taken up to ` +
-                `${Math.round(longestLlmCallMsThisRun / 1000)}s this run) — not starting a retry that ` +
-                'would run past the turn cap; delivering the work gathered so far'
-              );
-              recordSpanError(chatSpan, callError);
-              synthesisRetryUnaffordable = true;
-            } else {
-              // The estimate says a retry fits — but an estimate is not a guarantee. The
-              // backup can be a different, slower model than anything measured this run, so
-              // arm a hard bound too: whatever the retry does, this turn stops waiting on it
-              // with time still on the clock and delivers the partial answer. Without it the
-              // original ENG-907 loss stays reachable through the retry.
-              synthesisRetryDeadlineMs = Math.max(1, retryBudget.remainingMs - SYNTHESIS_RETRY_MARGIN_MS);
-            }
-          }
-          if (synthesisRetryUnaffordable) {
-            // handled above — fall through to the break after the span is closed
-          } else if (isTransientLLMError(callError) && !backupModelUsed) {
-            const backup = await this.getBackupModel(llmModel, transientFallbackModel);
-            if (backup) {
-              console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
-              if (onProgress) {
-                runEmitter.emitLegacy({
-                  iteration,
-                  status: 'switching_model',
-                  toolCalls: toolCalls.slice(),
-                  pendingTools: [`Primary model timed out. Switching to ${backup}...`]
-                });
-              }
-              llmModel = backup;
-              backupModelUsed = true;
-              response = await this.withSynthesisRetryDeadline(this.callLLM(llmModel, trimmedMessages, {
-                tools: filteredToolsCache,
-                tool_choice: 'auto',
-                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
-                temperature: 0.1,
-                // Same provenance as the primary call this retries — a backup-model
-                // retry of a scheduled run is still scheduled spend.
-                usageContext: { userId, billingUserId, sessionId, feature: meteringFeature('agent_task', currentSession?.sessionType, extractScheduleId(currentSession?.pageIdentifier)) },
-                // ENG-893: same pacing as the primary call it is retrying.
-                humanPaced: humanPacedTurn,
-                taskClass: chatTaskClass,
-              }), synthesisRetryDeadlineMs);
-              if (response === SYNTHESIS_RETRY_TIMED_OUT) {
-                console.warn(
-                  `AgentMode: backup model "${llmModel}" did not answer within the ${synthesisRetryDeadlineMs}ms ` +
-                  `left for the forced synthesis in session ${sessionId} — delivering the work gathered so far ` +
-                  'rather than letting the turn cap discard it'
-                );
-                recordSpanError(chatSpan, callError);
-                response = undefined;
-                synthesisRetryUnaffordable = true;
-              }
-            } else {
-              recordSpanError(chatSpan, callError);
-              throw callError;
-            }
+          // OpenRouter performs provider/model failover inside the one request. A
+          // transient failure here is therefore final for AgentWeb; do not issue a
+          // second full completion with altered model semantics.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined && isTransientLLMError(callError)) {
+            recordSpanError(chatSpan, callError);
+            synthesisRetryUnaffordable = true;
           } else {
             recordSpanError(chatSpan, callError);
             throw callError;
@@ -4684,8 +4475,7 @@ export class AgentModeService {
         // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
         // because it ran out of time, so a scheduled run must continue it.
         ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
-        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {}),
-        ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
+        ...(workPlanTurnDisposition ? { workPlanTurnDisposition } : {})
       };
     } catch (error: any) {
       // Log with full detail so Bedrock validation errors (e.g. "Input is too long") are visible
@@ -8095,42 +7885,12 @@ export class AgentModeService {
         }
       ];
 
-      let visionModelUsed = llmModel;
-      let fallbackUsed = false;
-      let primaryError: string | undefined;
-      let response: any;
-      try {
-        response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
-          max_completion_tokens: 2000
-        });
-      } catch (primaryFailure: any) {
-        primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
-        if (!fallbackModel || !this.isVisionFallbackWorthy(primaryFailure)) {
-          throw primaryFailure;
-        }
-
-        console.warn(
-          `AgentMode: describeImage with "${visionModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
-          primaryError
-        );
-        try {
-          response = await this.callVisionLLMWithTimeout(fallbackModel, messages, {
-            max_completion_tokens: 2000
-          });
-        } catch (fallbackFailure: any) {
-          const fallbackMessage = fallbackFailure instanceof Error ? fallbackFailure.message : String(fallbackFailure);
-          return {
-            success: false,
-            message: `Failed to analyze image after primary and fallback vision models: ${fallbackMessage}`,
-            error: fallbackMessage,
-            primaryError,
-            fallbackModel
-          };
-        }
-        visionModelUsed = fallbackModel;
-        fallbackUsed = true;
-      }
+      const visionModelUsed = llmModel;
+      // This is one OpenRouter request. Provider failover occurs inside its
+      // gateway, so AgentWeb never makes a second vision completion itself.
+      const response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
+        max_completion_tokens: 2000,
+      });
 
       const description = response.choices[0]?.message?.content || 'Unable to analyze image';
 
@@ -8139,7 +7899,6 @@ export class AgentModeService {
         description: description,
         imageUrl: imageUrl,
         model: visionModelUsed,
-        ...(fallbackUsed ? { fallbackUsed: true, primaryError } : {})
       };
 
     } catch (error) {

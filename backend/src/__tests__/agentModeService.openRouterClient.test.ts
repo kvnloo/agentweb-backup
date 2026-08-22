@@ -52,7 +52,6 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
-    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   function openRouterConfig(): any {
@@ -134,7 +133,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
   afterEach(() => {
     delete process.env.OPENROUTER_API_KEY;
-    delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
   });
 
   it('routes an openrouter/*-prefixed model id to the OpenRouter client', async () => {
@@ -205,7 +203,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
   describe('gateway-only routing law (ENG-1458)', () => {
     beforeEach(() => {
-      delete process.env.OPENROUTER_GATEWAY_TASK_CLASSES;
     });
 
     it('routes GPT text calls through OpenRouter without a rollout flag or task class', async () => {
@@ -263,7 +260,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('canary-routes an interactive GPT call through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -343,7 +339,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     });
 
     it('enables context compression for task-class canary traffic', async () => {
-      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -395,7 +390,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('preserves an explicitly requested JSON response format on the gateway', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'nonstandard_consumer';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -576,7 +570,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('canary-routes an interactive Gemini call through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -645,7 +638,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     ];
 
     const callGateway = async (model: string) => {
-      process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       const gatewayTools = buildGatewayTools();
@@ -711,7 +703,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('preserves Claude conversation caching and stickiness through OpenRouter', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
     jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -746,7 +737,6 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
   });
 
   it('does not add an AgentWeb retry loop on top of OpenRouter provider fallback', async () => {
-    process.env.OPENROUTER_GATEWAY_TASK_CLASSES = 'interactive_chat';
     const service = new AgentModeService();
     const error = Object.assign(new Error('rate limited'), { status: 429 });
     const create = jest.fn().mockRejectedValue(error);

@@ -99,7 +99,6 @@ process.on('message', async (message: any) => {
         persistIncrementally,
         publishAuthorizationOverride,
         turnStartMs,
-        transientFallbackModel,
         approvedRevisionImageSources,
         requireWorkPlanDisposition,
       } = message.params;
@@ -147,7 +146,6 @@ process.on('message', async (message: any) => {
         // clean and silently swaps a deadline for an authorization. Keep this list in
         // the same order as generateMarketingResponse's signature.
         publishAuthorizationOverride,
-        transientFallbackModel,
         approvedRevisionImageSources,
         requireWorkPlanDisposition,
       );
