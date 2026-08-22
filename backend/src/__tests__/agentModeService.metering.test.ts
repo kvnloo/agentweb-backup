@@ -81,7 +81,7 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
 
   it('charges the main agent turn to the per-user cap (meterUserUsage), cache tokens included', async () => {
     await svc.callLLM(MODEL, [{ role: 'user', content: 'hi' }], {
-      usageContext: { userId: 'u1', sessionId: 's1', feature: 'agent_task' },
+      usageContext: { userId: 'u1', billingUserId: 'billing-u1', sessionId: 's1', feature: 'agent_task' },
     });
 
     // Routed through meterUserUsage (records AND deducts), NOT a shadow-only recordUsage.
@@ -89,11 +89,13 @@ describe('AgentModeService.callLLM cost metering (ENG-200)', () => {
     expect(mockMeterUser).toHaveBeenCalledWith(
       expect.objectContaining({
         userId: 'u1',
+        billingUserId: 'billing-u1',
         sessionId: 's1',
         feature: 'agent_task',
         model: MODEL,
-        // OpenRouter reports cache reads inside prompt_tokens, so bill only
-        // the uncached remainder rather than charging those 50 tokens twice.
+        // OpenRouter reports both cache reads and writes inside prompt_tokens,
+        // so report 40 uncached tokens and bill the 50 read / 10 write tokens
+        // independently rather than charging either cache subset twice.
         inputTokens: 40,
         outputTokens: 20,
         cacheReadTokens: 50, // cache cost is charged, not dropped

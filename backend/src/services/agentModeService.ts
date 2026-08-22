@@ -2487,17 +2487,6 @@ export class AgentModeService {
         }
         return resolveOpenRouterUpstreamModelId(normalizedFallback);
       });
-    } else {
-      const hasImageInput = messages.some((message: any) =>
-        Array.isArray(message?.content) && message.content.some((part: any) =>
-          part?.type === 'image' || part?.type === 'image_url' || part?.type === 'input_image'
-        )
-      );
-      const managedFallbackId = hasImageInput
-        ? 'gemini-3.5-flash'
-        : 'openrouter/deepseek/deepseek-v4-flash';
-      const managedFallback = resolveOpenRouterUpstreamModelId(managedFallbackId);
-      if (upstreamModel !== managedFallback) params.models = [managedFallback];
     }
     if (usageContext?.sessionId && usageContext.sessionId.length <= 256) {
       params.session_id = usageContext.sessionId;
@@ -2584,6 +2573,7 @@ export class AgentModeService {
           const normalizedUsage = normalizeCallUsageTokens(usage, providerLabel);
           meterUserUsage({
             userId: usageContext?.userId,
+            billingUserId: usageContext?.billingUserId,
             sessionId: usageContext?.sessionId,
             model,
             provider: providerLabel,
@@ -13154,8 +13144,9 @@ ${emailDraftFormat === 'text'
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
 
+      const reportGenerationModel = await this.getReportGenerationDefaultModel();
       const completion = await this.callLLM(
-        'gpt-5.5',
+        reportGenerationModel,
         [
           {
             role: "system",

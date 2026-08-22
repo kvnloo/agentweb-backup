@@ -61,6 +61,10 @@ describe('ENG-893 — OpenRouter prompt-cache TTL', () => {
     it('returns zero for missing, invalid, or backward timestamps', () => {
       expect(AgentModeService.longestUserPauseMs([])).toBe(0);
       expect(AgentModeService.longestUserPauseMs([
+        { role: 'user', content: 'x' },
+        at('2026-08-05T10:10:00.000Z', 'user'),
+      ] as any)).toBe(0);
+      expect(AgentModeService.longestUserPauseMs([
         at('not-a-date', 'user'),
         at('2026-08-05T10:00:00.000Z', 'user'),
       ])).toBe(0);

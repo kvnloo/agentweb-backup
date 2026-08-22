@@ -62,7 +62,9 @@ describe('AgentModeService - OpenRouter client initialization (ENG-9)', () => {
   it('uses the OpenRouter API base URL', async () => {
     const service = new AgentModeService();
     await service.getOpenRouterClient();
-    expect(openRouterConfig()?.baseURL).toBe('https://openrouter.ai/api/v1');
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.baseURL?.includes('openrouter.ai')
+    )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 
   it('passes OPENROUTER_API_KEY to the client', async () => {
@@ -304,7 +306,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
       }));
     });
 
-    it('configures a cheap long-context managed fallback for text requests', async () => {
+    it('does not replace the selected text model with an AgentWeb-managed fallback', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -316,13 +318,11 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
         [{ role: 'user', content: 'A text payload near the context limit' }],
       );
 
-      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
-        models: ['deepseek/deepseek-v4-flash'],
-        plugins: expectedPlugin,
-      }));
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({ plugins: expectedPlugin }));
+      expect(create.mock.calls[0][0]).not.toHaveProperty('models');
     });
 
-    it('uses a multimodal long-context fallback when the request contains an image', async () => {
+    it('does not replace the selected multimodal model with an AgentWeb-managed fallback', async () => {
       const service = new AgentModeService();
       const create = jest.fn().mockResolvedValue({ choices: [], usage: {} });
       jest.spyOn(service, 'getOpenRouterClient').mockResolvedValue({
@@ -337,10 +337,8 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
         ] }],
       );
 
-      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({
-        models: ['google/gemini-3.5-flash'],
-        plugins: expectedPlugin,
-      }));
+      expect(create.mock.calls[0][0]).toEqual(expect.objectContaining({ plugins: expectedPlugin }));
+      expect(create.mock.calls[0][0]).not.toHaveProperty('models');
     });
 
     it('enables context compression for task-class canary traffic', async () => {
@@ -778,7 +776,9 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
 
   it('uses the OpenRouter transport for a logical Gemini model', async () => {
     const service = new AgentModeService();
-    expect((await service.getOpenRouterClient() as any)._config?.baseURL)
-      .toBe('https://openrouter.ai/api/v1');
+    await service.getOpenRouterClient();
+    expect(MockOpenAI.mock.calls.find((call: any[]) =>
+      call[0]?.baseURL?.includes('openrouter.ai')
+    )?.[0]?.baseURL).toBe('https://openrouter.ai/api/v1');
   });
 });
