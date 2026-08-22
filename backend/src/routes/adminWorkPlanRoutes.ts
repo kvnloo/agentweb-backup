@@ -1,8 +1,9 @@
 import express from "express";
 import multer from "multer";
 import sharp from "sharp";
-import { workPlanService } from "../services/workPlanService";
+import { workPlanService, type WorkPlanDisplayMetadataV1 } from "../services/workPlanService";
 import { normalizeWorkPlanSteps, findAmbiguousMergeTargets, findConflictingMergeTargets, findStepContentLoss, mergeWorkPlanSteps, summarizeStepChange } from "../services/workPlanSteps";
+import { normalizeWorkPlanDisplayMetadata } from "../services/workPlanDisplayMetadata";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -64,13 +65,23 @@ router.get("/:planId", async (req, res) => {
 // Create work plan (admin can set any visibility)
 router.post("/", async (req, res) => {
   try {
-    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility } = req.body;
+    const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility, display } = req.body;
 
     if (!title || !steps || !Array.isArray(steps) || steps.length === 0) {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
     const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
+
+    // No plan id exists yet at create time, so a self-reference in
+    // `nextPlanIds` cannot be checked (and cannot practically occur — the
+    // caller would have to guess a uuid that does not exist yet).
+    let normalizedDisplay: WorkPlanDisplayMetadataV1 | undefined;
+    try {
+      normalizedDisplay = normalizeWorkPlanDisplayMetadata(display, normalizedSteps.length);
+    } catch (err: any) {
+      return res.status(400).json({ message: err.message });
+    }
 
     const plan = await workPlanService.createWorkPlan({
       title,
@@ -83,6 +94,7 @@ router.post("/", async (req, res) => {
       showInAgentMode: showInAgentMode !== false,
       defaultModel,
       category,
+      display: normalizedDisplay,
       visibility: visibility || 'system',
       isBuiltIn: true,
     });
@@ -301,6 +313,32 @@ router.put("/:planId", async (req, res) => {
       // destructive write could pass unnoticed.
       stepsChange = summarizeStepChange(existingSteps, normalizedSteps, mode);
     }
+
+    // `display` is optional customer-facing browse metadata (ENG-1469). Presence
+    // of the key is what counts, exactly like `expectedStepsRev` above: `null`
+    // is a real instruction ("remove it"), so coalescing it away with `??` or
+    // `||` would silently downgrade an explicit clear into a no-op. Validated
+    // against the FINAL step count (after any steps_mode merge/replace above),
+    // since a stepLabels array is checked against the steps it will actually
+    // describe once this write lands, not the steps the plan had before it.
+    const displayProvided = Object.prototype.hasOwnProperty.call(req.body, 'display');
+    let normalizedDisplay: WorkPlanDisplayMetadataV1 | undefined;
+    if (displayProvided) {
+      if (req.body.display === null) {
+        normalizedDisplay = undefined; // REMOVE, not "leave unchanged"
+      } else {
+        try {
+          normalizedDisplay = normalizeWorkPlanDisplayMetadata(
+            req.body.display,
+            (normalizedSteps ?? plan.steps).length,
+            plan.planId,
+          );
+        } catch (err: any) {
+          return res.status(400).json({ message: err.message });
+        }
+      }
+    }
+
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
@@ -314,6 +352,10 @@ router.put("/:planId", async (req, res) => {
       ...(defaultModel !== undefined && { defaultModel }),
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
+      // Absent key -> spread from `...plan` above is left standing (preserved).
+      // Present key -> overridden here, whether to a validated object or to
+      // `undefined` (which updateWorkPlan's OPTIONAL_PLAN_FIELDS loop REMOVEs).
+      ...(displayProvided && { display: normalizedDisplay }),
     };
     // `updated` was built by spreading the plan we read, so it carries the
     // pre-write revision. Answer with the one the write produced.

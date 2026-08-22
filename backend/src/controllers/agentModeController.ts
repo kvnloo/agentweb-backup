@@ -11,6 +11,7 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
+import { projectWorkPlanForCustomer } from '../services/workPlanCustomerProjection';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
@@ -11552,7 +11553,11 @@ export const agentModeController = {
         }
       }
 
-      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId').
+      // `display` carries the new canonical customer-facing projection alongside
+      // the legacy keys above — existing PlanPage/AgentMode consumers keep
+      // working unchanged, and a consumer that wants the safe, deduped
+      // browse/recommendation shape reads `display` instead (ENG-1469).
       const mapPlan = (p: any) => ({
         id: p.planId,
         title: p.title,
@@ -11568,6 +11573,7 @@ export const agentModeController = {
         visibility: p.visibility,
         thumbnail_url: p.thumbnail_url,
         thumbnail_alt_text: p.thumbnail_alt_text,
+        display: projectWorkPlanForCustomer(p),
       });
 
       // Put private plans first, then public — deduplicate by title so user's
@@ -11646,6 +11652,9 @@ export const agentModeController = {
         defaultModel: workPlan.defaultModel,
         steps: workPlan.steps,
         visibility: workPlan.visibility,
+        // Canonical customer-facing projection alongside the legacy keys above
+        // — existing consumers are unaffected (ENG-1469).
+        display: projectWorkPlanForCustomer(workPlan),
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
