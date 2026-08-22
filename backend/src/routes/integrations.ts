@@ -73,6 +73,45 @@ router.post('/linear/webhook', async (req, res) => {
       payload?.data?.id;
 
     if (transitionedIntoDone) {
+      const { addIssueComment, getIssueCommentsDetailed, reopenIssue } = await import('../services/linearService');
+      const hasExpandedLabels = Array.isArray(payload?.data?.labels);
+      const labels = hasExpandedLabels ? payload.data.labels : [];
+      const hasCustomerLabels =
+        labels.some((label: any) => label?.name === 'Bug') &&
+        labels.some((label: any) => label?.name === 'Customer Reported');
+      // Explicit non-customer labels need no new preflight dependency. When expanded labels are
+      // omitted, comments remain authoritative because the reporter-ticket marker is the actual
+      // private-canonical notification rail.
+      const comments = hasCustomerLabels || !hasExpandedLabels
+        ? await getIssueCommentsDetailed(payload.data.id)
+        : [];
+      const hasReporterTicket = comments.some((comment) => /\[reporter-ticket #\d+\s+[^\]\s]+\]/i.test(comment.body));
+      const isCustomerBug = hasCustomerLabels || hasReporterTicket;
+
+      if (isCustomerBug) {
+        const {
+          CUSTOMER_VERIFICATION_BLOCK_MARKER,
+          hasCustomerSymptomVerification,
+        } = await import('../services/customerClosureVerification');
+
+        if (!hasCustomerSymptomVerification(comments)) {
+          await reopenIssue(payload.data.id, 'Verifying');
+          if (!comments.some((comment) => comment.body.includes(CUSTOMER_VERIFICATION_BLOCK_MARKER))) {
+            await addIssueComment(
+              payload.data.id,
+              [
+                'Customer resolution blocked: independent verification of the actual customer-facing symptom is missing.',
+                '',
+                'Record the check with `<!-- customer-symptom-verification:v1 -->`, `Result: pass`, `Evidence type: customer-symptom`, `Checked`, `Method`, and `Verifier`, then retry the Done transition. A merged PR or successful deploy alone is not symptom proof.',
+                '',
+                CUSTOMER_VERIFICATION_BLOCK_MARKER,
+              ].join('\n'),
+            );
+          }
+          return res.json({ ok: false, blocked: 'customer verification required', notified: 0 });
+        }
+      }
+
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });
