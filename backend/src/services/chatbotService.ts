@@ -205,6 +205,13 @@ export interface ChatSession {
     updatedAt: string;
     welcomeMessage?: string; // Custom welcome message for this work plan
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
+    // ENG-1472: the predefined WorkPlan template (AW-WorkPlans planId) this
+    // session's work plan was instantiated from, when it was launched from a
+    // template (launch_predefined_work_plan, the public plan-session route, or
+    // the recommend-then-accept flow). Absent for plans created ad hoc via
+    // create_work_plan. Used for accept-endpoint idempotency and to chain into
+    // a completed template's author-approved "next plan" suggestions.
+    templatePlanId?: string;
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
   // ENG-396: the single structured question Emma is currently blocked on (if any).
@@ -3197,6 +3204,8 @@ export class ChatbotDB {
       updatedAt: string;
       welcomeMessage?: string;
       autocomplete?: boolean;
+      /** ENG-1472: see the matching field on the read-side workPlan type above. */
+      templatePlanId?: string;
     }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
