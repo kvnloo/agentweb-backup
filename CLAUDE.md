@@ -474,7 +474,9 @@ Uses browser-use library with Playwright:
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
   - Does not run routine product suites, enforce coverage, or deploy staging
     environments from PRs
-  - Deploys are triggered by file changes in `backend/` or `partner-portal/`
+  - `backend/**` runs **Backend build**; `partner-portal/**` runs **Partner
+    portal build**; `.github/**` runs the short **CI script tests** control
+    checks. Changes to `tests.yml` and `eb-deploy.sh` also require Backend build.
 - `.github/workflows/deploy.yml` - Deploys path-filtered changes to production
   on every push to `main`
   - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)
@@ -771,12 +773,10 @@ deployment-control integrity, or a reproduced production regression. Do not upda
 to make an implementation pass; remove or quarantine stale, flaky, or low-signal tests with the
 reason recorded in the PR.
 
-```bash
-cd backend
-npm test                  # Run all tests
-npm run test:watch        # Watch mode
-npm run test:coverage     # With coverage
-```
+For a qualifying targeted diagnostic on Atem, run only the relevant test file
+or invariant suite, for example `npm test -- --runTestsByPath src/__tests__/auth/<file>.test.ts`.
+Routine `npm test`, watch, and coverage commands remain available as local
+diagnostics but are not release requirements.
 
 ### Agent Engine Tests
 
