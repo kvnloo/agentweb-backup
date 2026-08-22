@@ -472,7 +472,8 @@ Uses browser-use library with Playwright:
 ### GitHub Actions Workflows
 
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
-  - Automatically deploys backend to staging after tests pass on PRs
+  - Does not run routine product suites, enforce coverage, or deploy staging
+    environments from PRs
   - Deploys are triggered by file changes in `backend/` or `partner-portal/`
 - `.github/workflows/deploy.yml` - Deploys path-filtered changes to production
   on every push to `main`
@@ -633,8 +634,7 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 - Production build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
 - The PR number is extracted from the merge commit message; falls back to the short commit SHA if unavailable
-- Staging labels append the short SHA — `backend-yyyymmdd-pr<number>-<sha>` — because a PR deploys to staging on every push and the deploy verification asserts the environment is running this exact label. Without the SHA that assertion would compare against a label the environment is already on (ENG-743)
-- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed. `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` also count as backend changes, so changes to the backend CI/deploy path run that path
+- Production deployment is triggered automatically by file changes in `backend/` or `partner-portal/` on `main`; no manual version bump is needed. `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` also count as backend changes, so changes to the backend CI/deploy path receive an exact build proof
 - `package.json` versions in backend, partner-portal, and customer-portal are independent but are **not** used for deployment gating
 
 ### DynamoDB Query Optimization
@@ -765,8 +765,11 @@ Located in `backend/src/__tests__/`:
 - Integration tests for API endpoints
 - Mocking AWS services with Jest
 
-**Note:** Ready PRs that change `backend/**` run the split backend suites in CI. Local tests remain
-required because CI is a confirmation gate, not a substitute for pre-push validation.
+**Note:** GitHub CI does not run routine product suites. Run a targeted suite on Atem only when it
+proves a human acceptance criterion, a critical invariant (auth, security, billing, data),
+deployment-control integrity, or a reproduced production regression. Do not update a test merely
+to make an implementation pass; remove or quarantine stale, flaky, or low-signal tests with the
+reason recorded in the PR.
 
 ```bash
 cd backend
@@ -901,11 +904,9 @@ When the user says **"prep for deploy \<date\>"** (default: today's date if omit
    - **Backend changes:** `backend/src/docs/user-release.ts`
    - **Partner portal changes:** `partner-portal/src/docs/release.ts`
 2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: 
-   - **Backend:** Run `npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary` to verify coverage ≥95% on all metrics
-   - **Backend:** Run `npx tsc` to verify TypeScript compilation
-   - **Frontend:** Run `npm test` for unit tests
-   - Fix any failing tests before proceeding
-   - **CI requires ≥95% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
+   - Run the relevant production build(s) on Atem (or rely on the exact-head GitHub build gate).
+   - Run a targeted test only when it meets the selective-test criteria above; do not run or repair
+     a routine suite solely for release ceremony.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
    - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR
