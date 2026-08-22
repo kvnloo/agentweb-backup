@@ -762,7 +762,8 @@ if [ -n "${touches_backend}" ]; then
     job_state="$(printf '%s' "${runs_after_supersession}" | jq -r --arg job "${job}" '
         [ .check_runs[] | select(.name == $job) ] as $rows
         | if ($rows | length) == 0 then "ABSENT"
-          elif any($rows[]; .conclusion == "success") then "success"
+          elif ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | length) > 0
+            then ([ $rows[] | select((.conclusion // "") | IN("cancelled", "skipped") | not) ] | max_by(.id // 0) | .conclusion // "pending")
           else ($rows | max_by(.id // 0) | .conclusion // "pending")
           end' 2>/dev/null)"
     jq_exit=$?
