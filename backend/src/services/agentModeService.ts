@@ -2076,6 +2076,45 @@ export class AgentModeService {
     return this.openrouter_client_promise;
   }
 
+  /** Media types the vision APIs decode natively. */
+  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  /**
+   * Normalize uploaded image bytes to a vision-decodable representation. This
+   * remains local image hygiene; text/tool model routing is handled separately.
+   */
+  private static async normalizeImageForVision(
+    buffer: Buffer,
+    contentType: string,
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
+    let normalizedContentType = (contentType || '').toLowerCase().trim();
+    if (normalizedContentType === 'image/jpg') normalizedContentType = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(normalizedContentType)) {
+      return { buffer, contentType: normalizedContentType };
+    }
+
+    try {
+      const sharp = (await import('sharp')).default;
+      const metadata = await sharp(buffer).metadata();
+      const mediaTypeByFormat: Record<string, string> = {
+        jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+      };
+      const detectedContentType = metadata.format ? mediaTypeByFormat[metadata.format] : undefined;
+      if (detectedContentType) {
+        return { buffer, contentType: detectedContentType, detectedFormat: metadata.format };
+      }
+
+      const png = await sharp(buffer).png().toBuffer();
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
+    } catch (err) {
+      console.error(
+        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
+        err instanceof Error ? err.message : err,
+      );
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
+    }
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // Logical model metadata only. `callLLM` resolves every text/tool request
     // through OpenRouter; no provider client is constructed from this registry.
