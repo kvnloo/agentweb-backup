@@ -277,6 +277,7 @@ describe('AgentModeService.getClientForModel — openrouter/* routing (ENG-9)', 
     );
 
     const request = create.mock.calls[0][0];
+    expect((service as any).llmModels['gpt-5.4'].supportsTemperature).toBe(false);
     expect(request).toEqual(expect.objectContaining({
       model: 'openai/gpt-5.4',
       provider: { allow_fallbacks: true, require_parameters: true },

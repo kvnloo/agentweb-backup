@@ -2092,8 +2092,8 @@ export class AgentModeService {
     // id resolves forward instead of throwing "Invalid model". Do not delete a
     // registry entry without an alias first; that was exactly the caution the
     // prior version of this comment existed to enforce.
-    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: true, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4': { name: 'GPT-5.4', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true, legacy: true , qualityScore: 53, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'gpt-5.4-nano': { name: 'GPT-5.4 Nano', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Lightweight, high-throughput model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 40, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     'gpt-5.5': { name: 'GPT-5.5', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, maxTools: 128, supportsVision: true , qualityScore: 56, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List gemini models - client will be lazy-loaded
     // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
@@ -2139,8 +2139,7 @@ export class AgentModeService {
     //
     // Flags below are sourced from a live GET /api/v1/models[/…/endpoints] snapshot
     // (2026-08-17), not guessed:
-    // - supportsTemperature: true iff `supported_parameters` includes "temperature"
-    //   for that model (all entries below do).
+    // - supportsTemperature: mirrors each model's `supported_parameters` value.
     // - maxTools: deliberately OMITTED for every OpenRouter entry, including this
     //   one — unlike Azure's documented 128-tool cap, OpenRouter's models AND
     //   endpoints APIs expose no numeric tool-call limit for any model (checked
@@ -2222,9 +2221,9 @@ export class AgentModeService {
     // redundant — a coincidence of a volatile promo price, not a real
     // "Terra is superseded" fact. Same principle as keeping Kimi K3 out of
     // a family with Kimi K2.7-Code (a coding-specialized sibling).
-    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: true, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: true, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
-    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: true, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-sol': { name: 'GPT-5.6 Sol', provider: 'openai', tier: 'pro', description: 'Frontier coding and agentic work', client: null, supportsTemperature: false, qualityScore: 61, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-terra': { name: 'GPT-5.6 Terra', family: 'gpt5-chat', provider: 'openai', tier: 'medium', description: 'Balanced general-purpose model', client: null, supportsTemperature: false, qualityScore: 57, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
+    'openrouter/openai/gpt-5.6-luna': { name: 'GPT-5.6 Luna', family: 'gpt5-nano', provider: 'openai', tier: 'ultra_cheap', description: 'Fast and inexpensive, still real GPT-5.6 reasoning', client: null, supportsTemperature: false, qualityScore: 52, qualityScoreSource: 'Artificial Analysis Intelligence Index v4.1.1, snapshot 2026-08-19' },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     // 2026-08-19: all four below are `legacy` (picker-grouping only, see
     // LLMModelConfig.legacy) — each superseded by Sonnet 5 / Opus 5. Still
