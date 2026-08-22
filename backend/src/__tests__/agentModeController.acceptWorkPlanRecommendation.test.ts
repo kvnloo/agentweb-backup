@@ -160,7 +160,7 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     expect(res.json).toHaveBeenCalledWith({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
   });
 
-  it('treats a legacy same-title active plan (no templatePlanId) as already applied', async () => {
+  it('returns conflict for a legacy same-title active plan without template identity', async () => {
     const legacyWorkPlan = { title: 'Client Onboarding', steps: [{ stepCount: 1, title: 'Analyze website', status: 'pending' }] };
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith({ workPlan: legacyWorkPlan }) as any);
     const req = mockRequest(authedUser, { sessionId: 'sess-1', recommendationId: 'reco-abc' });
@@ -169,8 +169,8 @@ describe('agentModeController.acceptWorkPlanRecommendation', () => {
     await agentModeController.acceptWorkPlanRecommendation(req, res);
 
     expect(mockAgentModeService.applyPredefinedWorkPlan).not.toHaveBeenCalled();
-    expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ success: true, alreadyApplied: true, workPlan: legacyWorkPlan });
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'ACTIVE_WORK_PLAN' }));
   });
 
   it('returns 409 ACTIVE_WORK_PLAN when a DIFFERENT plan is active, and never calls force', async () => {

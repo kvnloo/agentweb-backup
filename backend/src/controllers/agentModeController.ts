@@ -9243,16 +9243,13 @@ export const agentModeController = {
       }
       const planId = recommendation.plan.id;
 
-      // Idempotency: the session already has THIS exact plan active. A legacy
-      // (pre-templatePlanId) same-title active plan counts too, but ONLY when
-      // its title matches the recommendation's own canonical title — never a
-      // coincidental match to some other active plan.
+      // Idempotency requires the stable template identity. A legacy work plan
+      // without templatePlanId cannot safely be matched by title: ad-hoc plans
+      // can share a template title, so treating one as applied would silently
+      // suppress the selected recommendation.
       const existingWorkPlan = session.workPlan;
       const hasActivePlan = !!existingWorkPlan && Array.isArray(existingWorkPlan.steps) && existingWorkPlan.steps.length > 0;
-      const alreadyApplied = hasActivePlan && (
-        (existingWorkPlan as any).templatePlanId === planId
-        || (!(existingWorkPlan as any).templatePlanId && !!recommendation.plan.title && existingWorkPlan!.title === recommendation.plan.title)
-      );
+      const alreadyApplied = hasActivePlan && (existingWorkPlan as any).templatePlanId === planId;
       if (alreadyApplied) {
         return res.status(200).json({ success: true, alreadyApplied: true, workPlan: existingWorkPlan });
       }

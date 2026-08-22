@@ -72,6 +72,15 @@ describe('predefinedWorkPlanResolver', () => {
 
       expect(candidates).toEqual(expect.arrayContaining([privatePlanOwnedByUser, systemPlan]));
     });
+
+    it('still includes system/public plans when private-plan loading fails', async () => {
+      mockWorkPlanService.getWorkPlansByOwner.mockRejectedValue(new Error('private lookup unavailable'));
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation(async (v: any) =>
+        v === 'system' ? [systemPlan] : []
+      );
+
+      await expect(getAccessiblePredefinedWorkPlanCandidates('user-1')).resolves.toEqual([systemPlan]);
+    });
   });
 
   describe('resolveAccessiblePredefinedWorkPlan', () => {
